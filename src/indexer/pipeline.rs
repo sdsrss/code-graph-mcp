@@ -238,8 +238,9 @@ fn index_files(
 
             for &src_id in &source_ids {
                 for &tgt_id in &target_ids {
-                    if src_id != tgt_id {
-                        insert_edge(db.conn(), src_id, tgt_id, &rel.relation, None)?;
+                    // Allow self-edges for routes (routes_to maps handler to itself with metadata)
+                    if src_id != tgt_id || rel.relation == "routes_to" {
+                        insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?;
                         edges_created += 1;
                     }
                 }

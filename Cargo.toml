@@ -30,5 +30,11 @@ tree-sitter-css = "0.23"
 [build-dependencies]
 cc = "1"
 
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
 [dev-dependencies]
 tempfile = "3"
