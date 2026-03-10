@@ -51,7 +51,13 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
             if detect_language(&rel_str).is_none() {
                 continue;
             }
-            let hash = hash_file(path)?;
+            let hash = match hash_file(path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
+                    continue;
+                }
+            };
             hashes.insert(rel_str, hash);
         }
     }

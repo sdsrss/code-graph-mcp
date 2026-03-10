@@ -52,7 +52,9 @@ impl McpServer {
                     new_content.push('\n');
                 }
                 new_content.push_str(".code-graph/\n");
-                std::fs::write(&gitignore_path, new_content)?;
+                if let Err(e) = std::fs::write(&gitignore_path, new_content) {
+                    tracing::warn!("Could not update .gitignore: {}", e);
+                }
             }
         }
 
@@ -263,7 +265,7 @@ impl McpServer {
     fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let query = args["query"].as_str()
             .ok_or_else(|| anyhow!("query is required"))?;
-        let top_k = args["top_k"].as_u64().unwrap_or(5) as i64;
+        let top_k = args["top_k"].as_u64().unwrap_or(5).min(100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
 
@@ -506,8 +508,17 @@ impl McpServer {
         let full_snippet = if let Some(ref root) = self.project_root {
             let abs_path = root.join(&file_path);
             // Verify path stays within project root to prevent traversal
-            let canonical = abs_path.canonicalize().unwrap_or(abs_path.clone());
-            let root_canonical = root.canonicalize().unwrap_or(root.clone());
+            let canonical = match abs_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(json!({
+                        "error": format!("Cannot resolve path: {}", file_path),
+                        "node_id": node_id
+                    }));
+                }
+            };
+            let root_canonical = root.canonicalize()
+                .map_err(|e| anyhow!("Cannot resolve project root: {}", e))?;
             if !canonical.starts_with(&root_canonical) {
                 return Ok(json!({
                     "error": "Path traversal detected",

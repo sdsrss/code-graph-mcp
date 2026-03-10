@@ -13,14 +13,32 @@ fn main() -> Result<()> {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut buf = String::new();
+    const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 { break; } // EOF
+        if buf.trim().is_empty() {
+            continue;
+        }
+        if buf.len() > MAX_MESSAGE_SIZE {
+            let err_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32600,
+                    "message": format!("Message too large: {} bytes (max {})", buf.len(), MAX_MESSAGE_SIZE)
+                }
+            });
+            writeln!(stdout, "{}", err_resp)?;
+            stdout.flush()?;
             continue;
         }
 
-        match server.handle_message(&line) {
+        match server.handle_message(&buf) {
             Ok(Some(response)) => {
                 writeln!(stdout, "{}", response)?;
                 stdout.flush()?;
@@ -28,12 +46,17 @@ fn main() -> Result<()> {
             Ok(None) => {}
             Err(e) => {
                 tracing::error!("Error handling message: {}", e);
+                let (code, label) = if e.downcast_ref::<serde_json::Error>().is_some() {
+                    (-32700, "Parse error")
+                } else {
+                    (-32603, "Internal error")
+                };
                 let err_resp = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": null,
                     "error": {
-                        "code": -32700,
-                        "message": format!("Parse error: {}", e)
+                        "code": code,
+                        "message": format!("{}: {}", label, e)
                     }
                 });
                 writeln!(stdout, "{}", err_resp)?;
