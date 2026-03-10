@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use super::languages::get_language;
+use serde_json;
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -17,13 +18,14 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
         .ok_or_else(|| anyhow!("parse failed"))?;
 
     let mut relations = Vec::new();
-    walk_for_relations(tree.root_node(), source, None, &mut relations);
+    walk_for_relations(tree.root_node(), source, language, None, &mut relations);
     Ok(relations)
 }
 
 fn walk_for_relations(
     node: tree_sitter::Node,
     source: &str,
+    language: &str,
     current_scope: Option<&str>,
     results: &mut Vec<ParsedRelation>,
 ) {
@@ -44,6 +46,12 @@ fn walk_for_relations(
     match kind {
         // Call expressions
         "call_expression" => {
+            // Check for HTTP route registration patterns first
+            if let Some(route_rel) = extract_route_pattern(&node, source, language) {
+                results.push(route_rel);
+            }
+
+            // Existing call relation extraction
             if let Some(scope) = active_scope {
                 if let Some(callee) = extract_callee_name(&node, source) {
                     results.push(ParsedRelation {
@@ -84,13 +92,20 @@ fn walk_for_relations(
             }
         }
 
+        // Python decorated definitions (for Flask/FastAPI route decorators)
+        "decorated_definition" => {
+            if let Some(route_rel) = extract_python_route(&node, source) {
+                results.push(route_rel);
+            }
+        }
+
         _ => {}
     }
 
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, active_scope, results);
+            walk_for_relations(child, source, language, active_scope, results);
         }
     }
 }
@@ -222,6 +237,152 @@ fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> 
     None
 }
 
+// --- Route extraction functions ---
+
+fn extract_route_pattern(node: &tree_sitter::Node, source: &str, language: &str) -> Option<ParsedRelation> {
+    match language {
+        "typescript" | "javascript" => extract_express_route(node, source),
+        "go" => extract_go_route(node, source),
+        _ => None,
+    }
+}
+
+fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "member_expression" { return None; }
+
+    let object = function.child_by_field_name("object")?;
+    let property = function.child_by_field_name("property")?;
+
+    let obj_name = node_text(&object, source);
+    let method_name = node_text(&property, source);
+
+    // Check if this looks like an HTTP route registration
+    if !matches!(obj_name, "app" | "router" | "server") { return None; }
+    let http_method = match method_name {
+        "get" => "GET",
+        "post" => "POST",
+        "put" => "PUT",
+        "delete" => "DELETE",
+        "patch" => "PATCH",
+        "use" => "USE",
+        _ => return None,
+    };
+
+    let args = node.child_by_field_name("arguments")?;
+    // First argument is the path (string)
+    let first_arg = args.named_child(0)?;
+    let path = node_text(&first_arg, source)
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_string();
+
+    // Last named argument is the handler
+    let handler_count = args.named_child_count();
+    if handler_count < 2 { return None; }
+    let handler_arg = args.named_child(handler_count - 1)?;
+    let handler_name = node_text(&handler_arg, source).to_string();
+
+    let metadata = serde_json::json!({"method": http_method, "path": path}).to_string();
+
+    Some(ParsedRelation {
+        source_name: handler_name.clone(),
+        target_name: handler_name,
+        relation: "routes_to".into(),
+        metadata: Some(metadata),
+    })
+}
+
+fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "selector_expression" { return None; }
+
+    let operand = function.child_by_field_name("operand")?;
+    let field = function.child_by_field_name("field")?;
+
+    if node_text(&operand, source) != "http" { return None; }
+    let func_name = node_text(&field, source);
+    if !matches!(func_name, "HandleFunc" | "Handle") { return None; }
+
+    let args = node.child_by_field_name("arguments")?;
+    let path_arg = args.named_child(0)?;
+    let path = node_text(&path_arg, source).trim_matches('"').to_string();
+
+    let handler_arg = args.named_child(1)?;
+    let handler = node_text(&handler_arg, source).to_string();
+
+    let metadata = serde_json::json!({"method": "ALL", "path": path}).to_string();
+
+    Some(ParsedRelation {
+        source_name: handler.clone(),
+        target_name: handler,
+        relation: "routes_to".into(),
+        metadata: Some(metadata),
+    })
+}
+
+fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
+    // Look for decorator that matches @app.route(...) or @app.get(...) etc.
+    let mut decorator = None;
+    let mut func_def = None;
+
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            match child.kind() {
+                "decorator" => decorator = Some(child),
+                "function_definition" => func_def = Some(child),
+                _ => {}
+            }
+        }
+    }
+
+    let dec = decorator?;
+    let func = func_def?;
+    let func_name_node = func.child_by_field_name("name")?;
+    let func_name = node_text(&func_name_node, source);
+
+    // Get the decorator expression text
+    let dec_text = node_text(&dec, source);
+
+    // Match patterns like @app.route('/path') or @app.get('/path')
+    if !dec_text.contains("route") && !dec_text.contains("get") && !dec_text.contains("post")
+       && !dec_text.contains("put") && !dec_text.contains("delete") {
+        return None;
+    }
+
+    // Extract path from decorator arguments
+    let path = extract_string_from_subtree(&dec, source)?;
+
+    let method = if dec_text.contains(".get(") || dec_text.contains(".get\"") { "GET" }
+        else if dec_text.contains(".post(") { "POST" }
+        else if dec_text.contains(".put(") { "PUT" }
+        else if dec_text.contains(".delete(") { "DELETE" }
+        else { "ALL" };
+
+    let metadata = serde_json::json!({"method": method, "path": path}).to_string();
+
+    Some(ParsedRelation {
+        source_name: func_name.to_string(),
+        target_name: func_name.to_string(),
+        relation: "routes_to".into(),
+        metadata: Some(metadata),
+    })
+}
+
+fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    if node.kind() == "string" {
+        let text = node_text(node, source);
+        return Some(text.trim_matches(|c| c == '\'' || c == '"').to_string());
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(s) = extract_string_from_subtree(&child, source) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
@@ -274,5 +435,49 @@ class AdminService extends UserService {
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(inherits.contains(&"UserService"), "got inherits: {:?}", inherits);
+    }
+
+    #[test]
+    fn test_extract_express_routes() {
+        let code = r#"
+app.post('/api/login', handleLogin);
+app.get('/api/users/:id', getUser);
+"#;
+        let relations = extract_relations(code, "typescript").unwrap();
+        let routes: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == "routes_to")
+            .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
+            .collect();
+        assert!(routes.iter().any(|(meta, target)| meta.contains("/api/login") && *target == "handleLogin"),
+            "got routes: {:?}", routes);
+    }
+
+    #[test]
+    fn test_extract_python_flask_routes() {
+        let code = r#"
+@app.route('/api/users', methods=['GET'])
+def get_users():
+    return jsonify(users)
+"#;
+        let relations = extract_relations(code, "python").unwrap();
+        let routes: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == "routes_to")
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(routes.contains(&"get_users"), "got routes: {:?}", routes);
+    }
+
+    #[test]
+    fn test_extract_go_http_routes() {
+        let code = r#"
+package main
+
+func main() {
+    http.HandleFunc("/api/health", healthCheck)
+}
+"#;
+        let relations = extract_relations(code, "go").unwrap();
+        assert!(relations.iter().any(|r| r.relation == "routes_to" && r.target_name == "healthCheck"),
+            "got relations: {:?}", relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
     }
 }
