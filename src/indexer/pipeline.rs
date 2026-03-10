@@ -38,7 +38,7 @@ fn try_embed_and_store(db: &Database, model: Option<&EmbeddingModel>, node_id: i
 pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
     let files: Vec<String> = current_hashes.keys().cloned().collect();
-    index_files(db, project_root, &files, &current_hashes, model)
+    index_files(db, project_root, &files, &current_hashes, model, &[])
 }
 
 pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
@@ -46,12 +46,8 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
     let current_hashes = scan_directory(project_root)?;
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
-    // Phase 0: Clean up deleted files (CASCADE handles nodes + edges)
-    if !diff.deleted_files.is_empty() {
-        delete_files_by_paths(db.conn(), &diff.deleted_files)?;
-    }
-
-    // Index changed + new files
+    // Index changed + new files (deletion of removed files happens inside index_files transaction)
+    let deleted_files = diff.deleted_files;
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 
     // Dirty-node propagation: identify dirty nodes BEFORE re-indexing
@@ -62,7 +58,7 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes, model)?;
+    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files)?;
 
     // Regenerate context strings (and embeddings) for dirty nodes in other files
     if !dirty_node_ids.is_empty() {
@@ -130,10 +126,16 @@ fn index_files(
     files: &[String],
     hashes: &HashMap<String, String>,
     model: Option<&EmbeddingModel>,
+    delete_paths: &[String],
 ) -> Result<IndexResult> {
     db.conn().execute_batch("BEGIN")?;
 
     let result = (|| -> Result<IndexResult> {
+    // Phase 0: Delete removed files inside transaction
+    if !delete_paths.is_empty() {
+        delete_files_by_paths(db.conn(), delete_paths)?;
+    }
+
     let mut nodes_created = 0usize;
     let mut edges_created = 0usize;
 
