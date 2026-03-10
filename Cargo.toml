@@ -27,5 +27,8 @@ tree-sitter-cpp = "0.23"
 tree-sitter-html = "0.23"
 tree-sitter-css = "0.23"
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile = "3"

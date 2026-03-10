@@ -80,3 +80,14 @@ CREATE TABLE IF NOT EXISTS merkle_state (
     updated_at  INTEGER NOT NULL
 );
 "#;
+
+pub const CREATE_VEC_TABLES: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(
+    node_id INTEGER PRIMARY KEY,
+    embedding float[384]
+);
+
+CREATE TRIGGER IF NOT EXISTS nodes_vectors_ad AFTER DELETE ON nodes BEGIN
+    DELETE FROM node_vectors WHERE node_id = old.id;
+END;
+"#;

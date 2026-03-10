@@ -235,6 +235,28 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// --- Vector operations ---
+
+pub fn insert_node_vector(conn: &Connection, node_id: i64, embedding: &[f32]) -> Result<()> {
+    let bytes: &[u8] = bytemuck::cast_slice(embedding);
+    conn.execute(
+        "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![node_id, bytes],
+    )?;
+    Ok(())
+}
+
+pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> Result<Vec<(i64, f64)>> {
+    let bytes: &[u8] = bytemuck::cast_slice(query_embedding);
+    let mut stmt = conn.prepare(
+        "SELECT node_id, distance FROM node_vectors WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![bytes, limit], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {

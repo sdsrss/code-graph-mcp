@@ -134,6 +134,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytemuck",
+ "cc",
  "ignore",
  "notify",
  "rusqlite",
