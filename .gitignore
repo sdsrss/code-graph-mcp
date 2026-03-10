@@ -1,5 +1,17 @@
+# Build artifacts
 /target
+
+# Runtime data
 .code-graph/
-.tmp/
 models/
+
+# Temp / tools
+.tmp/
 .gsd/
+
+# Hidden files and directories (IDE, OS, tool configs)
+.*
+!.gitignore
+
+# AI assistant config
+CLAUDE.md

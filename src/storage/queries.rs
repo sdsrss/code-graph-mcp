@@ -3,6 +3,43 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
 
+// --- Shared helpers ---
+
+const NODE_SELECT: &str =
+    "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string";
+
+fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
+    Ok(NodeResult {
+        id: row.get(0)?,
+        file_id: row.get(1)?,
+        node_type: row.get(2)?,
+        name: row.get(3)?,
+        qualified_name: row.get(4)?,
+        start_line: row.get(5)?,
+        end_line: row.get(6)?,
+        code_content: row.get(7)?,
+        signature: row.get(8)?,
+        doc_comment: row.get(9)?,
+        context_string: row.get(10)?,
+    })
+}
+
+fn first_row<T>(
+    mut rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> rusqlite::Result<Option<T>> {
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+fn make_placeholders(start: usize, count: usize) -> String {
+    (start..start + count)
+        .map(|i| format!("?{}", i))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 // --- Index status ---
 
 #[derive(Debug, Serialize)]
@@ -16,7 +53,7 @@ pub struct IndexStatus {
     pub db_size_bytes: i64,
 }
 
-pub fn get_index_status(conn: &Connection) -> Result<IndexStatus> {
+pub fn get_index_status(conn: &Connection, is_watching: bool) -> Result<IndexStatus> {
     let files_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
     let nodes_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
     let edges_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
@@ -35,7 +72,7 @@ pub fn get_index_status(conn: &Connection) -> Result<IndexStatus> {
         nodes_count,
         edges_count,
         last_indexed_at,
-        is_watching: false,
+        is_watching,
         schema_version,
         db_size_bytes,
     })
@@ -90,19 +127,16 @@ pub struct EdgeRecord {
 }
 
 pub fn upsert_file(conn: &Connection, file: &FileRecord) -> Result<i64> {
-    conn.execute(
+    let id: i64 = conn.query_row(
         "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
          VALUES (?1, ?2, ?3, ?4, unixepoch())
          ON CONFLICT(path) DO UPDATE SET
             blake3_hash = excluded.blake3_hash,
             last_modified = excluded.last_modified,
             language = excluded.language,
-            indexed_at = unixepoch()",
+            indexed_at = unixepoch()
+         RETURNING id",
         (&file.path, &file.blake3_hash, file.last_modified, &file.language),
-    )?;
-    let id: i64 = conn.query_row(
-        "SELECT id FROM files WHERE path = ?1",
-        [&file.path],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -112,11 +146,7 @@ pub fn delete_files_by_paths(conn: &Connection, paths: &[String]) -> Result<()> 
     if paths.is_empty() {
         return Ok(());
     }
-    let placeholders: String = (1..=paths.len())
-        .map(|i| format!("?{}", i))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("DELETE FROM files WHERE path IN ({})", placeholders);
+    let sql = format!("DELETE FROM files WHERE path IN ({})", make_placeholders(1, paths.len()));
     let params: Vec<&dyn rusqlite::types::ToSql> =
         paths.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
     conn.execute(&sql, params.as_slice())?;
@@ -149,24 +179,9 @@ pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
 
 pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string
-         FROM nodes WHERE name = ?1"
+        &format!("SELECT {} FROM nodes WHERE name = ?1", NODE_SELECT)
     )?;
-    let rows = stmt.query_map([name], |row| {
-        Ok(NodeResult {
-            id: row.get(0)?,
-            file_id: row.get(1)?,
-            node_type: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            code_content: row.get(7)?,
-            signature: row.get(8)?,
-            doc_comment: row.get(9)?,
-            context_string: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map([name], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -274,71 +289,34 @@ pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> 
 
 pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResult>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string
-         FROM nodes WHERE id = ?1"
+        &format!("SELECT {} FROM nodes WHERE id = ?1", NODE_SELECT)
     )?;
-    let mut rows = stmt.query_map([node_id], |row| {
-        Ok(NodeResult {
-            id: row.get(0)?,
-            file_id: row.get(1)?,
-            node_type: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            code_content: row.get(7)?,
-            signature: row.get(8)?,
-            doc_comment: row.get(9)?,
-            context_string: row.get(10)?,
-        })
-    })?;
-    match rows.next() {
-        Some(r) => Ok(Some(r?)),
-        None => Ok(None),
-    }
+    let rows = stmt.query_map([node_id], map_node_row)?;
+    Ok(first_row(rows)?)
 }
 
 pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<NodeResult>> {
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line,
-                n.code_content, n.signature, n.doc_comment, n.context_string
-         FROM nodes n JOIN files f ON f.id = n.file_id
-         WHERE f.path = ?1
-         ORDER BY n.start_line"
-    )?;
-    let rows = stmt.query_map([file_path], |row| {
-        Ok(NodeResult {
-            id: row.get(0)?,
-            file_id: row.get(1)?,
-            node_type: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            code_content: row.get(7)?,
-            signature: row.get(8)?,
-            doc_comment: row.get(9)?,
-            context_string: row.get(10)?,
-        })
-    })?;
+    let sql = format!(
+        "SELECT n.{} FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1 ORDER BY n.start_line",
+        NODE_SELECT.replace(", ", ", n.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([file_path], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
 
 pub fn get_file_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
     let mut stmt = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
-    let mut rows = stmt.query_map([file_id], |row| row.get::<_, String>(0))?;
-    match rows.next() {
-        Some(r) => Ok(Some(r?)),
-        None => Ok(None),
-    }
+    let rows = stmt.query_map([file_id], |row| row.get::<_, String>(0))?;
+    Ok(first_row(rows)?)
 }
 
 pub fn get_file_language(conn: &Connection, file_id: i64) -> Result<Option<String>> {
     let mut stmt = conn.prepare("SELECT language FROM files WHERE id = ?1")?;
-    let mut rows = stmt.query_map([file_id], |row| row.get::<_, Option<String>>(0))?;
-    match rows.next() {
-        Some(r) => Ok(r?),
+    let rows = stmt.query_map([file_id], |row| row.get::<_, Option<String>>(0))?;
+    match first_row(rows)? {
+        Some(lang) => Ok(lang),
         None => Ok(None),
     }
 }
@@ -350,16 +328,12 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
         return Ok(vec![]);
     }
     let n = changed_file_ids.len();
-    // First set of placeholders for target nodes' file_id
-    let ph1: Vec<String> = (1..=n).map(|i| format!("?{}", i)).collect();
-    // Second set of placeholders for excluding source nodes in changed files
-    let ph2: Vec<String> = (n+1..=2*n).map(|i| format!("?{}", i)).collect();
     let sql = format!(
         "SELECT DISTINCT e.source_id FROM edges e
          JOIN nodes n ON n.id = e.target_id
          WHERE n.file_id IN ({})
          AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-        ph1.join(","), ph2.join(",")
+        make_placeholders(1, n), make_placeholders(n + 1, n)
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -384,29 +358,12 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line,
-                n.code_content, n.signature, n.doc_comment, n.context_string
-         FROM nodes_fts f JOIN nodes n ON n.id = f.rowid
-         WHERE nodes_fts MATCH ?1
-         ORDER BY rank
-         LIMIT ?2"
-    )?;
-    let rows = stmt.query_map(rusqlite::params![sanitized, limit], |row| {
-        Ok(NodeResult {
-            id: row.get(0)?,
-            file_id: row.get(1)?,
-            node_type: row.get(2)?,
-            name: row.get(3)?,
-            qualified_name: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            code_content: row.get(7)?,
-            signature: row.get(8)?,
-            doc_comment: row.get(9)?,
-            context_string: row.get(10)?,
-        })
-    })?;
+    let sql = format!(
+        "SELECT n.{} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        NODE_SELECT.replace(", ", ", n.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![sanitized, limit], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }

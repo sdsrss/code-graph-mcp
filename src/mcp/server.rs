@@ -27,21 +27,12 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(db_path: &Path, project_root: Option<String>) -> Result<Self> {
-        let embedding_model = EmbeddingModel::load()?;
-        let db = if embedding_model.is_some() {
-            Database::open_with_vec(db_path)?
+    fn open_db(db_path: &Path, embedding_model: &Option<EmbeddingModel>) -> Result<Database> {
+        if embedding_model.is_some() {
+            Database::open_with_vec(db_path)
         } else {
-            Database::open(db_path)?
-        };
-        Ok(Self {
-            registry: ToolRegistry::new(),
-            db: Arc::new(db),
-            embedding_model,
-            project_root: project_root.map(PathBuf::from),
-            indexed: Mutex::new(false),
-            watcher: Mutex::new(None),
-        })
+            Database::open(db_path)
+        }
     }
 
     /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
@@ -65,11 +56,7 @@ impl McpServer {
         }
 
         let embedding_model = EmbeddingModel::load()?;
-        let db = if embedding_model.is_some() {
-            Database::open_with_vec(&db_path)?
-        } else {
-            Database::open(&db_path)?
-        };
+        let db = Self::open_db(&db_path, &embedding_model)?;
         Ok(Self {
             registry: ToolRegistry::new(),
             db: Arc::new(db),
@@ -347,9 +334,7 @@ impl McpServer {
         }
 
         // Context Sandbox: compress if results exceed token threshold
-        use crate::sandbox::compressor::{should_compress, compress_results};
-        if should_compress(&node_results, 2000) {
-            let compressed = compress_results(&node_results);
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(self.db.conn(), &node_results, 2000) {
             let compact: Vec<serde_json::Value> = compressed.iter().map(|c| {
                 json!({
                     "node_id": c.node_id,
@@ -379,26 +364,22 @@ impl McpServer {
             self.db.conn(), function_name, direction, depth, file_path,
         )?;
 
-        let nodes: Vec<serde_json::Value> = results.iter().map(|n| {
-            json!({
-                "node_id": n.node_id,
-                "name": n.name,
-                "type": n.node_type,
-                "file_path": n.file_path,
-                "depth": n.depth,
-                "direction": n.direction,
-            })
-        }).collect();
+        use crate::graph::query::Direction;
+
+        let callee_nodes: Vec<serde_json::Value> = results.iter()
+            .filter(|n| n.direction == Direction::Callees && n.depth > 0)
+            .map(|n| json!({"node_id": n.node_id, "name": n.name, "type": n.node_type, "file_path": n.file_path, "depth": n.depth}))
+            .collect();
+        let caller_nodes: Vec<serde_json::Value> = results.iter()
+            .filter(|n| n.direction == Direction::Callers && n.depth > 0)
+            .map(|n| json!({"node_id": n.node_id, "name": n.name, "type": n.node_type, "file_path": n.file_path, "depth": n.depth}))
+            .collect();
 
         Ok(json!({
             "function": function_name,
             "direction": direction,
-            "callees": nodes.iter()
-                .filter(|n| n["direction"].as_str() == Some("callees") && n["depth"].as_i64().unwrap_or(0) > 0)
-                .cloned().collect::<Vec<_>>(),
-            "callers": nodes.iter()
-                .filter(|n| n["direction"].as_str() == Some("callers") && n["depth"].as_i64().unwrap_or(0) > 0)
-                .cloned().collect::<Vec<_>>(),
+            "callees": callee_nodes,
+            "callers": caller_nodes,
         }))
     }
 
@@ -415,14 +396,15 @@ impl McpServer {
              FROM edges e
              JOIN nodes n ON n.id = e.source_id
              JOIN files f ON f.id = n.file_id
-             WHERE e.relation = 'routes_to' AND e.metadata LIKE ?1 ESCAPE '\\'"
+             WHERE e.relation = ?2 AND e.metadata LIKE ?1 ESCAPE '\\'"
         )?;
 
         let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{}%", escaped);
         let mut handlers: Vec<serde_json::Value> = Vec::new();
 
-        let rows: Vec<(i64, Option<String>, String, String, String, i64, i64)> = stmt.query_map([&pattern], |row| {
+        use crate::storage::schema::{REL_CALLS, REL_ROUTES_TO};
+        let rows: Vec<(i64, Option<String>, String, String, String, i64, i64)> = stmt.query_map(rusqlite::params![pattern, REL_ROUTES_TO], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -447,7 +429,7 @@ impl McpServer {
 
             if include_middleware {
                 // Get downstream calls from this handler
-                let downstream = queries::get_edge_target_names(self.db.conn(), *node_id, "calls")?;
+                let downstream = queries::get_edge_target_names(self.db.conn(), *node_id, REL_CALLS)?;
                 handler["downstream_calls"] = json!(downstream);
             }
 
@@ -487,8 +469,9 @@ impl McpServer {
                 });
 
                 if include_refs {
-                    let callees = queries::get_edge_target_names(self.db.conn(), n.id, "calls")?;
-                    let callers = queries::get_edge_source_names(self.db.conn(), n.id, "calls")?;
+                    use crate::storage::schema::REL_CALLS as CALLS;
+                    let callees = queries::get_edge_target_names(self.db.conn(), n.id, CALLS)?;
+                    let callers = queries::get_edge_source_names(self.db.conn(), n.id, CALLS)?;
                     result["calls"] = json!(callees);
                     result["called_by"] = json!(callers);
                 }
@@ -586,8 +569,7 @@ impl McpServer {
     }
 
     fn tool_get_index_status(&self) -> Result<serde_json::Value> {
-        let mut status = queries::get_index_status(self.db.conn())?;
-        status.is_watching = self.is_watching();
+        let status = queries::get_index_status(self.db.conn(), self.is_watching())?;
         Ok(serde_json::to_value(&status)?)
     }
 

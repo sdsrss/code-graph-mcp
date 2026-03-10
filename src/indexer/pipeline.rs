@@ -9,12 +9,30 @@ use crate::parser::relations::extract_relations;
 use crate::parser::treesitter::parse_code;
 use crate::storage::db::Database;
 use crate::storage::queries::*;
+use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_ROUTES_TO};
 use crate::utils::config::detect_language;
 
 pub struct IndexResult {
     pub files_indexed: usize,
     pub nodes_created: usize,
     pub edges_created: usize,
+}
+
+fn try_embed_and_store(db: &Database, model: Option<&EmbeddingModel>, node_id: i64, ctx: &str) {
+    if let Some(m) = model {
+        if db.vec_enabled() {
+            match m.embed(ctx) {
+                Ok(embedding) => {
+                    if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
+                        tracing::warn!("Failed to insert vector for node {}: {}", node_id, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to embed node {}: {}", node_id, e);
+                }
+            }
+        }
+    }
 }
 
 pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
@@ -79,10 +97,10 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
             let file_path = get_file_path(db.conn(), node.file_id)?
                 .unwrap_or_default();
 
-            let callees = get_edge_target_names(db.conn(), node_id, "calls")?;
-            let callers = get_edge_source_names(db.conn(), node_id, "calls")?;
-            let inherits = get_edge_target_names(db.conn(), node_id, "inherits")?;
-            let routes = get_edge_target_names(db.conn(), node_id, "routes_to")?;
+            let callees = get_edge_target_names(db.conn(), node_id, REL_CALLS)?;
+            let callers = get_edge_source_names(db.conn(), node_id, REL_CALLS)?;
+            let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
+            let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
 
             let ctx = build_context_string(&NodeContext {
                 node_type: node.node_type,
@@ -97,22 +115,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
-
-            // Re-embed if model available and vec enabled
-            if let Some(m) = model {
-                if db.vec_enabled() {
-                    match m.embed(&ctx) {
-                        Ok(embedding) => {
-                            if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
-                                eprintln!("[warn] Failed to insert vector for node {}: {}", node_id, e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[warn] Failed to embed node {}: {}", node_id, e);
-                        }
-                    }
-                }
-            }
+            try_embed_and_store(db, model, node_id, &ctx);
         }
     }
     Ok(())
@@ -252,7 +255,7 @@ fn index_files(
             for &src_id in &source_ids {
                 for &tgt_id in &target_ids {
                     // Allow self-edges for routes (routes_to maps handler to itself with metadata)
-                    if src_id != tgt_id || rel.relation == "routes_to" {
+                    if src_id != tgt_id || rel.relation == REL_ROUTES_TO {
                         insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?;
                         edges_created += 1;
                     }
@@ -292,22 +295,7 @@ fn index_files(
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
-
-            // Generate embedding and store in vec0 table
-            if let Some(m) = model {
-                if db.vec_enabled() {
-                    match m.embed(&ctx) {
-                        Ok(embedding) => {
-                            if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
-                                eprintln!("[warn] Failed to insert vector for node {}: {}", node_id, e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[warn] Failed to embed node {}: {}", node_id, e);
-                        }
-                    }
-                }
-            }
+            try_embed_and_store(db, model, node_id, &ctx);
         }
     }
 

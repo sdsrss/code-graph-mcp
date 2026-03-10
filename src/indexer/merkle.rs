@@ -25,10 +25,10 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 
     for entry in walker {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
             continue;
         }
+        let path = entry.path();
         // Skip .gitignore itself and .git directory entries
         if let Some(rel) = path.strip_prefix(root).ok() {
             let rel_str = rel.to_string_lossy().to_string();

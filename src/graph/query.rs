@@ -2,6 +2,21 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    Callees,
+    Callers,
+}
+
+impl Direction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Direction::Callees => "callees",
+            Direction::Callers => "callers",
+        }
+    }
+}
+
 /// A node in a call graph traversal result.
 pub struct CallGraphNode {
     pub node_id: i64,
@@ -9,7 +24,7 @@ pub struct CallGraphNode {
     pub node_type: String,
     pub file_path: String,
     pub depth: i32,
-    pub direction: String,  // "callees" or "callers"
+    pub direction: Direction,
 }
 
 /// Traverse the call graph starting from a function by name.
@@ -36,11 +51,6 @@ pub fn get_call_graph(
     }
 }
 
-enum Direction {
-    Callees,
-    Callers,
-}
-
 fn query_direction(
     conn: &Connection,
     function_name: &str,
@@ -54,11 +64,6 @@ fn query_direction(
         "AND (1=1 OR ?2 = ?2)"  // always true, but consumes ?2
     };
     let file_path_param = file_path.unwrap_or("");
-
-    let direction_label = match direction {
-        Direction::Callees => "callees",
-        Direction::Callers => "callers",
-    };
 
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)
@@ -102,7 +107,6 @@ fn query_direction(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let direction_label_owned = direction_label.to_string();
     let map_row = move |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallGraphNode> {
         Ok(CallGraphNode {
             node_id: row.get(0)?,
@@ -110,7 +114,7 @@ fn query_direction(
             node_type: row.get(2)?,
             file_path: row.get(3)?,
             depth: row.get(4)?,
-            direction: direction_label_owned.clone(),
+            direction,
         })
     };
 
@@ -123,10 +127,10 @@ fn query_direction(
 
 /// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the minimum depth.
 fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
-    let mut by_key: HashMap<(i64, String), CallGraphNode> = HashMap::new();
+    let mut by_key: HashMap<(i64, Direction), CallGraphNode> = HashMap::new();
 
     for node in callees.into_iter().chain(callers.into_iter()) {
-        let key = (node.node_id, node.direction.clone());
+        let key = (node.node_id, node.direction);
         by_key
             .entry(key)
             .and_modify(|existing| {

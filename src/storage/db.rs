@@ -68,7 +68,7 @@ impl Database {
         conn.execute_batch(schema::CREATE_TABLES)?;
 
         if enable_vec {
-            conn.execute_batch(schema::CREATE_VEC_TABLES)?;
+            conn.execute_batch(&schema::create_vec_tables_sql())?;
         }
 
         conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;

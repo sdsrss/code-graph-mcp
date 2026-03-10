@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use super::languages::get_language;
 use super::node_text;
-use serde_json;
+use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO};
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -66,7 +66,7 @@ fn walk_for_relations(
                     results.push(ParsedRelation {
                         source_name: scope.to_string(),
                         target_name: callee,
-                        relation: "calls".into(),
+                        relation: REL_CALLS.into(),
                         metadata: None,
                     });
                 }
@@ -94,7 +94,7 @@ fn walk_for_relations(
                     results.push(ParsedRelation {
                         source_name: cls.clone(),
                         target_name: parent,
-                        relation: "inherits".into(),
+                        relation: REL_INHERITS.into(),
                         metadata: None,
                     });
                 }
@@ -153,7 +153,7 @@ fn extract_import_names(node: &tree_sitter::Node, source: &str, results: &mut Ve
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
-                            relation: "imports".into(),
+                            relation: REL_IMPORTS.into(),
                             metadata: None,
                         });
                     }
@@ -305,7 +305,7 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
     Some(ParsedRelation {
         source_name: handler_name.clone(),
         target_name: handler_name,
-        relation: "routes_to".into(),
+        relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
     })
 }
@@ -333,7 +333,7 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
     Some(ParsedRelation {
         source_name: handler.clone(),
         target_name: handler,
-        relation: "routes_to".into(),
+        relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
     })
 }
@@ -381,7 +381,7 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
     Some(ParsedRelation {
         source_name: func_name.to_string(),
         target_name: func_name.to_string(),
-        relation: "routes_to".into(),
+        relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
     })
 }

@@ -240,7 +240,10 @@ fn extract_function_node(
 fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedNode> {
     // lexical_declaration -> variable_declarator -> arrow_function
     for i in 0..node.named_child_count() {
-        let child = node.named_child(i)?;
+        let child = match node.named_child(i) {
+            Some(c) => c,
+            None => continue,
+        };
         if child.kind() == "variable_declarator" {
             let name = get_child_by_field(&child, "name", source)?;
             let value = child.child_by_field_name("value")?;

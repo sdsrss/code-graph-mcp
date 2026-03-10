@@ -1,5 +1,11 @@
 pub const SCHEMA_VERSION: i32 = 1;
 
+// Relation type constants
+pub const REL_CALLS: &str = "calls";
+pub const REL_INHERITS: &str = "inherits";
+pub const REL_IMPORTS: &str = "imports";
+pub const REL_ROUTES_TO: &str = "routes_to";
+
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     id          INTEGER PRIMARY KEY,
@@ -75,13 +81,16 @@ CREATE TABLE IF NOT EXISTS context_sandbox (
 CREATE INDEX IF NOT EXISTS idx_sandbox_query ON context_sandbox(query_hash);
 "#;
 
-pub const CREATE_VEC_TABLES: &str = r#"
-CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(
-    node_id INTEGER PRIMARY KEY,
-    embedding float[384]
-);
+pub fn create_vec_tables_sql() -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(
+            node_id INTEGER PRIMARY KEY,
+            embedding float[{dim}]
+        );
 
-CREATE TRIGGER IF NOT EXISTS nodes_vectors_ad AFTER DELETE ON nodes BEGIN
-    DELETE FROM node_vectors WHERE node_id = old.id;
-END;
-"#;
+        CREATE TRIGGER IF NOT EXISTS nodes_vectors_ad AFTER DELETE ON nodes BEGIN
+            DELETE FROM node_vectors WHERE node_id = old.id;
+        END;",
+        dim = crate::embedding::model::EMBEDDING_DIM,
+    )
+}
