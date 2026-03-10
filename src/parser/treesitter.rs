@@ -1,0 +1,414 @@
+use anyhow::{anyhow, Result};
+use super::languages::get_language;
+
+pub struct ParsedNode {
+    pub node_type: String,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub code_content: String,
+    pub signature: Option<String>,
+    pub doc_comment: Option<String>,
+}
+
+pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
+    let lang = get_language(language)
+        .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang)?;
+    let tree = parser.parse(source, None)
+        .ok_or_else(|| anyhow!("parse failed"))?;
+    let root = tree.root_node();
+
+    let mut nodes = Vec::new();
+    extract_nodes(root, source, language, None, &mut nodes);
+    Ok(nodes)
+}
+
+fn extract_nodes(
+    node: tree_sitter::Node,
+    source: &str,
+    language: &str,
+    parent_class: Option<&str>,
+    results: &mut Vec<ParsedNode>,
+) {
+    let kind = node.kind();
+
+    match kind {
+        // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
+        "function_declaration" | "function" => {
+            if let Some(parsed) = extract_function_node(&node, source, "function", parent_class) {
+                results.push(parsed);
+            }
+        }
+        "function_definition" => {
+            if language == "c" || language == "cpp" {
+                // C/C++: name is in declarator child, not name field
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    if let Some(name) = extract_declarator_name(&declarator, source) {
+                        results.push(ParsedNode {
+                            node_type: "function".into(),
+                            name: name.clone(),
+                            qualified_name: Some(name),
+                            start_line: node.start_position().row as u32 + 1,
+                            end_line: node.end_position().row as u32 + 1,
+                            code_content: node_text(&node, source).into(),
+                            signature: extract_c_signature(&node, source),
+                            doc_comment: get_preceding_comment(&node, source),
+                        });
+                    }
+                }
+            } else {
+                // Python and others: name is in "name" field
+                let nt = if parent_class.is_some() { "method" } else { "function" };
+                if let Some(parsed) = extract_function_node(&node, source, nt, parent_class) {
+                    results.push(parsed);
+                }
+            }
+        }
+        "function_item" => {
+            // Rust functions
+            if let Some(parsed) = extract_function_node(&node, source, "function", parent_class) {
+                results.push(parsed);
+            }
+        }
+
+        // Arrow functions (TS/JS)
+        "lexical_declaration" => {
+            if let Some(parsed) = extract_named_arrow(&node, source) {
+                results.push(parsed);
+            }
+        }
+
+        // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition)
+        "class_declaration" | "class" | "class_definition" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(ParsedNode {
+                    node_type: "class".into(),
+                    name: name.clone(),
+                    qualified_name: Some(name.clone()),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    code_content: node_text(&node, source).into(),
+                    signature: None,
+                    doc_comment: get_preceding_comment(&node, source),
+                });
+                extract_children(node, source, language, Some(&name), results);
+                return;
+            }
+        }
+
+        // Methods: TS/JS (method_definition), Go/Java (method_declaration)
+        "method_definition" | "method_declaration" => {
+            if let Some(parsed) = extract_function_node(&node, source, "method", parent_class) {
+                results.push(parsed);
+            }
+        }
+
+        // Interfaces (TS)
+        "interface_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(ParsedNode {
+                    node_type: "interface".into(),
+                    name: name.clone(),
+                    qualified_name: Some(name),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    code_content: node_text(&node, source).into(),
+                    signature: None,
+                    doc_comment: get_preceding_comment(&node, source),
+                });
+            }
+        }
+
+        // Go type declarations (struct, interface)
+        "type_declaration" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "type_spec" {
+                        if let Some(name) = get_child_by_field(&child, "name", source) {
+                            let node_type = if child.named_child_count() > 1 {
+                                match child.named_child(1).map(|c| c.kind()) {
+                                    Some("struct_type") => "struct",
+                                    Some("interface_type") => "interface",
+                                    _ => "type",
+                                }
+                            } else {
+                                "type"
+                            };
+                            results.push(ParsedNode {
+                                node_type: node_type.into(),
+                                name: name.clone(),
+                                qualified_name: Some(name),
+                                start_line: child.start_position().row as u32 + 1,
+                                end_line: child.end_position().row as u32 + 1,
+                                code_content: node_text(&child, source).into(),
+                                signature: None,
+                                doc_comment: get_preceding_comment(&child, source),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rust-specific
+        "struct_item" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("struct", name, &node, source));
+            }
+        }
+        "enum_item" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("enum", name, &node, source));
+            }
+        }
+        "impl_item" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                let impl_name = node_text(&type_node, source);
+                extract_children(node, source, language, Some(impl_name), results);
+                return;
+            }
+        }
+        "trait_item" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("interface", name, &node, source));
+            }
+        }
+
+        _ => {}
+    }
+
+    // Recurse into children
+    extract_children(node, source, language, parent_class, results);
+}
+
+fn extract_children(
+    node: tree_sitter::Node,
+    source: &str,
+    language: &str,
+    parent_class: Option<&str>,
+    results: &mut Vec<ParsedNode>,
+) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            extract_nodes(child, source, language, parent_class, results);
+        }
+    }
+}
+
+fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str) -> ParsedNode {
+    ParsedNode {
+        node_type: node_type.into(),
+        name: name.clone(),
+        qualified_name: Some(name),
+        start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        code_content: node_text(node, source).into(),
+        signature: None,
+        doc_comment: get_preceding_comment(node, source),
+    }
+}
+
+fn extract_function_node(
+    node: &tree_sitter::Node,
+    source: &str,
+    node_type: &str,
+    parent_class: Option<&str>,
+) -> Option<ParsedNode> {
+    let name = get_child_by_field(node, "name", source)?;
+    let qualified_name = match parent_class {
+        Some(cls) => Some(format!("{}.{}", cls, name)),
+        None => Some(name.clone()),
+    };
+    let signature = extract_signature(node, source);
+
+    Some(ParsedNode {
+        node_type: node_type.into(),
+        name,
+        qualified_name,
+        start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        code_content: node_text(node, source).into(),
+        signature,
+        doc_comment: get_preceding_comment(node, source),
+    })
+}
+
+fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedNode> {
+    // lexical_declaration -> variable_declarator -> arrow_function
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i)?;
+        if child.kind() == "variable_declarator" {
+            let name = get_child_by_field(&child, "name", source)?;
+            let value = child.child_by_field_name("value")?;
+            if value.kind() == "arrow_function" {
+                return Some(ParsedNode {
+                    node_type: "function".into(),
+                    name: name.clone(),
+                    qualified_name: Some(name),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    code_content: node_text(node, source).into(),
+                    signature: extract_signature(&value, source),
+                    doc_comment: get_preceding_comment(node, source),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn extract_signature(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let params = node.child_by_field_name("parameters")
+        .map(|p| node_text(&p, source).to_string());
+    let ret = node.child_by_field_name("return_type")
+        .map(|r| node_text(&r, source).to_string());
+
+    match (params, ret) {
+        (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
+        (Some(p), None) => Some(p),
+        _ => None,
+    }
+}
+
+fn extract_c_signature(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    let params = declarator.child_by_field_name("parameters")
+        .map(|p| node_text(&p, source).to_string());
+    let ret_type = node.child_by_field_name("type")
+        .map(|t| node_text(&t, source).to_string());
+
+    match (ret_type, params) {
+        (Some(t), Some(p)) => Some(format!("{} {}", t, p)),
+        (Some(t), None) => Some(t),
+        (None, Some(p)) => Some(p),
+        _ => None,
+    }
+}
+
+fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    // C/C++ function_declarator -> identifier
+    if node.kind() == "function_declarator" {
+        return get_child_by_field(node, "declarator", source)
+            .or_else(|| {
+                // Try first named child as identifier
+                node.named_child(0).map(|c| node_text(&c, source).to_string())
+            });
+    }
+    // Might be a pointer_declarator wrapping a function_declarator
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if let Some(name) = extract_declarator_name(&child, source) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn get_child_by_field(node: &tree_sitter::Node, field: &str, source: &str) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|n| node_text(&n, source).to_string())
+}
+
+fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
+    &source[node.byte_range()]
+}
+
+fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let prev = node.prev_sibling()?;
+    if prev.kind() == "comment" || prev.kind() == "line_comment" || prev.kind() == "block_comment" {
+        Some(node_text(&prev, source).to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_typescript_functions() {
+        let code = r#"
+function handleLogin(req: Request, res: Response): void {
+    validateToken(req.token);
+    res.send(200);
+}
+
+const processPayment = async (amount: number): Promise<void> => {
+    await chargeCard(amount);
+};
+
+class UserService {
+    async findUser(id: string): Promise<User> {
+        return db.query(id);
+    }
+}
+"#;
+        let nodes = parse_code(code, "typescript").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"handleLogin"), "missing handleLogin, got: {:?}", names);
+        assert!(names.contains(&"processPayment"), "missing processPayment, got: {:?}", names);
+        assert!(names.contains(&"UserService"), "missing UserService, got: {:?}", names);
+        assert!(names.contains(&"findUser"), "missing findUser, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_extracts_signatures() {
+        let code = "function add(a: number, b: number): number { return a + b; }";
+        let nodes = parse_code(code, "typescript").unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].signature.is_some(), "signature should be present");
+    }
+
+    #[test]
+    fn test_parse_extracts_line_numbers() {
+        let code = "// line 1\nfunction foo() {\n  return 1;\n}\n";
+        let nodes = parse_code(code, "typescript").unwrap();
+        assert_eq!(nodes[0].start_line, 2);
+        assert_eq!(nodes[0].end_line, 4);
+    }
+
+    #[test]
+    fn test_parse_go_functions() {
+        let code = "package main\nfunc handleRequest(w http.ResponseWriter, r *http.Request) {\n}\n";
+        let nodes = parse_code(code, "go").unwrap();
+        assert!(nodes.iter().any(|n| n.name == "handleRequest"), "got: {:?}", nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_parse_python_functions() {
+        let code = "def process_data(items: list) -> dict:\n    return {}\n\nclass DataProcessor:\n    def run(self):\n        pass\n";
+        let nodes = parse_code(code, "python").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"process_data"), "got: {:?}", names);
+        assert!(names.contains(&"DataProcessor"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_rust_functions() {
+        let code = "pub fn calculate(x: i32, y: i32) -> i32 { x + y }\nstruct Config { name: String }\n";
+        let nodes = parse_code(code, "rust").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"calculate"), "got: {:?}", names);
+        assert!(names.contains(&"Config"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_java_methods() {
+        let code = "public class UserController {\n    public void getUser(String id) {}\n}\n";
+        let nodes = parse_code(code, "java").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"UserController"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_c_functions() {
+        let code = "int main(int argc, char *argv[]) { return 0; }\n";
+        let nodes = parse_code(code, "c").unwrap();
+        assert!(nodes.iter().any(|n| n.name == "main"), "got: {:?}", nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    }
+}
