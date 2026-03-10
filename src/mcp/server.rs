@@ -188,7 +188,9 @@ impl McpServer {
 
         let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
-            "notifications/initialized" | "notifications/cancelled" => return Ok(None),
+            "notifications/initialized" | "notifications/cancelled" => {
+                return Ok(Some(serde_json::to_string(&JsonRpcResponse::success(req.id, json!({})))?));
+            }
             "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_tools_list(req.id),
             "tools/call" => self.handle_tools_call(req.id, req.params),
@@ -239,9 +241,9 @@ impl McpServer {
             Some(name) => name,
             None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'name' in tool call params".into()),
         };
-        let arguments = params["arguments"].clone();
+        let arguments = &params["arguments"];
 
-        match self.handle_tool(tool_name, &arguments) {
+        match self.handle_tool(tool_name, arguments) {
             Ok(result) => {
                 let text = serde_json::to_string_pretty(&result).unwrap_or_default();
                 JsonRpcResponse::success(id, json!({

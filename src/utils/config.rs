@@ -1,12 +1,11 @@
 pub fn detect_language(path: &str) -> Option<&'static str> {
-    // Get the filename portion, then extract extension
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    // Must have a non-empty name before the dot (skip dotfiles like ".gitignore")
-    let dot_pos = filename.rfind('.')?;
-    if dot_pos == 0 {
-        return None; // dotfile with no name before the dot
+    let p = std::path::Path::new(path);
+    // Skip dotfiles (e.g., .gitignore) - file_stem is empty for dotfiles
+    let stem = p.file_stem()?.to_str()?;
+    if stem.is_empty() {
+        return None;
     }
-    let ext = &filename[dot_pos + 1..];
+    let ext = p.extension()?.to_str()?;
     match ext {
         "rs" => Some("rust"),
         "ts" => Some("typescript"),

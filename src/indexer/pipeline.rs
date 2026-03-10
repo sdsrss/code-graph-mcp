@@ -166,7 +166,8 @@ fn index_files(
 
         // Skip files larger than 1MB to avoid OOM on generated/bundled files
         const MAX_FILE_SIZE: u64 = 1_048_576;
-        if let Ok(meta) = std::fs::metadata(&abs_path) {
+        let file_meta = std::fs::metadata(&abs_path).ok();
+        if let Some(ref meta) = file_meta {
             if meta.len() > MAX_FILE_SIZE {
                 tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
                 continue;
@@ -185,16 +186,15 @@ fn index_files(
         };
 
         // Delete old nodes for this file if it was previously indexed
+        let last_modified = file_meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let file_id = upsert_file(db.conn(), &FileRecord {
             path: rel_path.clone(),
             blake3_hash: hash,
-            last_modified: std::fs::metadata(&abs_path)
-                .map(|m| m.modified().ok())
-                .ok()
-                .flatten()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
+            last_modified,
             language: Some(language.to_string()),
         })?;
 
@@ -254,8 +254,8 @@ fn index_files(
     }
 
     for pf in &parsed_files {
-        // Reuse the already-parsed tree (no re-parsing)
         let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
 
         for rel in &relations {
             // Find source node ID
@@ -271,7 +271,7 @@ fn index_files(
 
             // Prefer same-file targets to reduce false-positive cross-file edges
             let same_file_targets: Vec<i64> = all_target_ids.iter()
-                .filter(|id| pf.node_ids.contains(id))
+                .filter(|id| local_ids.contains(id))
                 .copied()
                 .collect();
             let target_ids = if !same_file_targets.is_empty() {

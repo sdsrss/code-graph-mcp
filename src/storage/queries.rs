@@ -339,14 +339,8 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
         make_placeholders(1, n), make_placeholders(n + 1, n)
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    for id in changed_file_ids {
-        all_params.push(Box::new(*id));
-    }
-    for id in changed_file_ids {
-        all_params.push(Box::new(*id));
-    }
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let doubled: Vec<i64> = changed_file_ids.iter().chain(changed_file_ids.iter()).copied().collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)

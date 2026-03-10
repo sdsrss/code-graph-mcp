@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
+CREATE INDEX IF NOT EXISTS idx_edges_source_rel ON edges(source_id, relation);
+CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
 
 CREATE TABLE IF NOT EXISTS context_sandbox (
     id          INTEGER PRIMARY KEY,

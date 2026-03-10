@@ -15,7 +15,9 @@ pub fn compress_if_needed(
     file_paths: &[String],
     token_threshold: usize,
 ) -> Option<Vec<CompressedResult>> {
-    let _ = cleanup_expired_sandbox(conn); // opportunistic cleanup
+    if let Err(e) = cleanup_expired_sandbox(conn) {
+        tracing::warn!("Sandbox cleanup failed: {}", e);
+    }
     if should_compress(results, token_threshold) {
         Some(compress_results(results, file_paths))
     } else {

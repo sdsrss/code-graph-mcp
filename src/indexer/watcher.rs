@@ -14,12 +14,17 @@ pub struct FileWatcher {
 impl FileWatcher {
     pub fn start(root: &Path, tx: mpsc::Sender<WatchEvent>) -> Result<Self> {
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                let paths: Vec<String> = event.paths.iter()
-                    .filter_map(|p| p.to_str().map(String::from))
-                    .collect();
-                if !paths.is_empty() {
-                    let _ = tx.send(WatchEvent::Changed(paths));
+            match res {
+                Ok(event) => {
+                    let paths: Vec<String> = event.paths.iter()
+                        .filter_map(|p| p.to_str().map(String::from))
+                        .collect();
+                    if !paths.is_empty() {
+                        let _ = tx.send(WatchEvent::Changed(paths));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("File watcher error: {}", e);
                 }
             }
         })?;

@@ -44,7 +44,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
             // Skip .git files and .gitignore
-            if rel_str.starts_with(".git") {
+            if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
                 continue;
             }
             // Only hash files with supported language extensions

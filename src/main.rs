@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use code_graph_mcp::mcp::server::McpServer;
 
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 
     loop {
         buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = reader.by_ref().take((MAX_MESSAGE_SIZE + 1) as u64).read_line(&mut buf)?;
         if n == 0 { break; } // EOF
         if buf.trim().is_empty() {
             continue;
