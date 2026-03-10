@@ -906,6 +906,72 @@ function handleLogin(req: Request) {
     }
 
     #[test]
+    fn test_malformed_json_returns_error() {
+        let server = McpServer::new_test();
+        let result = server.handle_message("not valid json");
+        assert!(result.is_err(), "malformed JSON should return Err");
+    }
+
+    #[test]
+    fn test_wrong_jsonrpc_version() {
+        let server = McpServer::new_test();
+        let req = r#"{"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}"#;
+        let resp = server.handle_message(req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_object());
+        assert_eq!(parsed["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn test_notification_returns_none() {
+        let server = McpServer::new_test();
+        // JSON-RPC notification: no "id" field
+        let req = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+        let resp = server.handle_message(req).unwrap();
+        assert!(resp.is_none(), "notifications should return None");
+    }
+
+    #[test]
+    fn test_ping_returns_empty_object() {
+        let server = McpServer::new_test();
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+        let resp = server.handle_message(req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["result"].is_object());
+    }
+
+    #[test]
+    fn test_tools_call_missing_params() {
+        let server = McpServer::new_test();
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#;
+        let resp = server.handle_message(req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_object());
+        assert_eq!(parsed["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn test_tools_call_missing_name() {
+        let server = McpServer::new_test();
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}"#;
+        let resp = server.handle_message(req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_object());
+        assert_eq!(parsed["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn test_unknown_tool_returns_error() {
+        let server = McpServer::new_test();
+        let req = tool_call_json("nonexistent_tool", json!({}));
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Error"), "unknown tool should return error in content");
+        assert!(parsed["result"]["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
     fn test_semantic_search_language_filter() {
         let project_dir = TempDir::new().unwrap();
         std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();

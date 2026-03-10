@@ -9,7 +9,7 @@ use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::*;
-use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_ROUTES_TO};
+use crate::storage::schema::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO};
 use crate::utils::config::detect_language;
 
 pub struct IndexResult {
@@ -102,6 +102,8 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
             let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
             let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
 
+            let imports = get_edge_target_names(db.conn(), node_id, REL_IMPORTS)?;
+
             let ctx = build_context_string(&NodeContext {
                 node_type: node.node_type,
                 name: node.name,
@@ -111,6 +113,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                 callees,
                 callers,
                 inherits,
+                imports,
                 doc_comment: node.doc_comment,
             });
 
@@ -300,6 +303,8 @@ fn index_files(
             let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
             // Get routes
             let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
+            // Get imports
+            let imports = get_edge_target_names(db.conn(), node_id, REL_IMPORTS)?;
 
             // Get node details for signature/doc
             let node_detail = get_node_by_id(db.conn(), node_id)?;
@@ -313,6 +318,7 @@ fn index_files(
                 callees,
                 callers,
                 inherits,
+                imports,
                 doc_comment: node_detail.as_ref().and_then(|n| n.doc_comment.clone()),
             });
 

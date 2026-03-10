@@ -42,10 +42,10 @@ mod inner {
             let mut tokenizer = Tokenizer::from_bytes(&tokenizer_data)
                 .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))?;
 
-            // Truncate to 128 tokens — sufficient for code context strings
+            // Truncate to 256 tokens — context strings can include calls, callers, imports, etc.
             tokenizer
                 .with_truncation(Some(tokenizers::TruncationParams {
-                    max_length: 128,
+                    max_length: 256,
                     ..Default::default()
                 }))
                 .map_err(|e| anyhow::anyhow!("truncation config error: {}", e))?;

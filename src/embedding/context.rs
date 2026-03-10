@@ -7,6 +7,7 @@ pub struct NodeContext {
     pub callees: Vec<String>,
     pub callers: Vec<String>,
     pub inherits: Vec<String>,
+    pub imports: Vec<String>,
     pub doc_comment: Option<String>,
 }
 
@@ -27,6 +28,9 @@ pub fn build_context_string(info: &NodeContext) -> String {
     }
     if !info.inherits.is_empty() {
         parts.push(format!("inherits: {}", info.inherits.join(", ")));
+    }
+    if !info.imports.is_empty() {
+        parts.push(format!("imports: {}", info.imports.join(", ")));
     }
     if let Some(doc) = &info.doc_comment {
         parts.push(format!("doc: {}", doc));
@@ -49,6 +53,7 @@ mod tests {
             callees: vec!["jwt.verify".into(), "UserRepo.findById".into()],
             callers: vec!["authMiddleware".into(), "handleLogin".into()],
             inherits: vec![],
+            imports: vec!["jwt".into(), "UserRepo".into()],
             doc_comment: Some("Validates JWT token and returns the associated user".into()),
         };
 
@@ -58,6 +63,7 @@ mod tests {
         assert!(ctx.contains("calls: jwt.verify, UserRepo.findById"));
         assert!(ctx.contains("called_by: authMiddleware, handleLogin"));
         assert!(ctx.contains("routes: POST /api/login, GET /api/profile"));
+        assert!(ctx.contains("imports: jwt, UserRepo"));
     }
 
     #[test]
@@ -71,6 +77,7 @@ mod tests {
             callees: vec![],
             callers: vec![],
             inherits: vec![],
+            imports: vec![],
             doc_comment: None,
         };
 
