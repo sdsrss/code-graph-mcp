@@ -1,7 +1,9 @@
 pub mod embedding;
+pub mod graph;
 pub mod indexer;
 pub mod mcp;
 pub mod parser;
+pub mod sandbox;
 pub mod search;
 pub mod storage;
 pub mod utils;
