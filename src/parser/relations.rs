@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use super::languages::get_language;
+use super::node_text;
 use serde_json;
 
 pub struct ParsedRelation {
@@ -37,6 +38,14 @@ fn walk_for_relations(
         | "method_definition" | "method_declaration" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
+        }
+        "arrow_function" => {
+            // Try to get name from parent variable_declarator: const foo = () => {}
+            node.parent()
+                .filter(|p| p.kind() == "variable_declarator")
+                .and_then(|p| p.child_by_field_name("name"))
+                .map(|n| node_text(&n, source).to_string())
+                .or_else(|| Some("<anonymous>".to_string()))
         }
         _ => None,
     };
@@ -228,8 +237,17 @@ fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> 
                 }
             }
             "superclass" => {
-                // Python: class Foo(Bar)
-                return Some(node_text(&child, source).to_string());
+                // Python: class Foo(Bar) — navigate into child identifier if possible,
+                // otherwise strip parentheses from the raw text.
+                for k in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(k) {
+                        if inner.kind() == "identifier" || inner.kind() == "dotted_name" {
+                            return Some(node_text(&inner, source).to_string());
+                        }
+                    }
+                }
+                let text = node_text(&child, source);
+                return Some(text.trim_start_matches('(').trim_end_matches(')').trim().to_string());
             }
             _ => {}
         }
@@ -381,10 +399,6 @@ fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option
         }
     }
     None
-}
-
-fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
 }
 
 #[cfg(test)]

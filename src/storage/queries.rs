@@ -109,9 +109,17 @@ pub fn upsert_file(conn: &Connection, file: &FileRecord) -> Result<i64> {
 }
 
 pub fn delete_files_by_paths(conn: &Connection, paths: &[String]) -> Result<()> {
-    for path in paths {
-        conn.execute("DELETE FROM files WHERE path = ?1", [path])?;
+    if paths.is_empty() {
+        return Ok(());
     }
+    let placeholders: String = (1..=paths.len())
+        .map(|i| format!("?{}", i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("DELETE FROM files WHERE path IN ({})", placeholders);
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        paths.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    conn.execute(&sql, params.as_slice())?;
     Ok(())
 }
 
@@ -120,8 +128,7 @@ pub fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>>
     let map = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?
-    .filter_map(|r| r.ok())
-    .collect();
+    .collect::<Result<HashMap<_, _>, _>>()?;
     Ok(map)
 }
 
@@ -160,7 +167,8 @@ pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult
             context_string: row.get(10)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 pub fn delete_nodes_by_file(conn: &Connection, file_id: i64) -> Result<()> {
@@ -184,7 +192,7 @@ pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: 
          VALUES (?1, ?2, ?3, ?4)",
         (source_id, target_id, relation, metadata),
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(conn.changes() as i64)
 }
 
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
@@ -200,7 +208,8 @@ pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>
             metadata: row.get(4)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 // --- Graph query helpers ---
@@ -210,7 +219,8 @@ pub fn get_all_node_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
@@ -221,7 +231,8 @@ pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) 
     let rows = stmt.query_map(rusqlite::params![source_id, relation], |row| {
         row.get::<_, String>(0)
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<String>> {
@@ -232,7 +243,8 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
         row.get::<_, String>(0)
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 // --- Vector operations ---
@@ -254,7 +266,8 @@ pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> 
     let rows = stmt.query_map(rusqlite::params![bytes, limit], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 // --- Additional node queries ---
@@ -279,7 +292,10 @@ pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResu
             context_string: row.get(10)?,
         })
     })?;
-    Ok(rows.next().and_then(|r| r.ok()))
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
 }
 
 pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<NodeResult>> {
@@ -305,13 +321,26 @@ pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<
             context_string: row.get(10)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 pub fn get_file_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
     let mut stmt = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
     let mut rows = stmt.query_map([file_id], |row| row.get::<_, String>(0))?;
-    Ok(rows.next().and_then(|r| r.ok()))
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+pub fn get_file_language(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT language FROM files WHERE id = ?1")?;
+    let mut rows = stmt.query_map([file_id], |row| row.get::<_, Option<String>>(0))?;
+    match rows.next() {
+        Some(r) => Ok(r?),
+        None => Ok(None),
+    }
 }
 
 /// Find node IDs in other files that have edges pointing to nodes in the given file IDs.
@@ -342,12 +371,19 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
     }
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
+    // Sanitize FTS5 query: quote each token to prevent FTS5 operator injection
+    let sanitized: String = query
+        .split_whitespace()
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut stmt = conn.prepare(
         "SELECT n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line,
                 n.code_content, n.signature, n.doc_comment, n.context_string
@@ -356,7 +392,7 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
          ORDER BY rank
          LIMIT ?2"
     )?;
-    let rows = stmt.query_map(rusqlite::params![query, limit], |row| {
+    let rows = stmt.query_map(rusqlite::params![sanitized, limit], |row| {
         Ok(NodeResult {
             id: row.get(0)?,
             file_id: row.get(1)?,
@@ -371,7 +407,8 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
             context_string: row.get(10)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 #[cfg(test)]

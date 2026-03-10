@@ -1,3 +1,5 @@
 /target
 .code-graph/
 .tmp/
+models/
+.gsd/

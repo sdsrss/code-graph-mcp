@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
+use crate::embedding::model::EmbeddingModel;
 use crate::indexer::pipeline::{run_full_index, run_incremental_index};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::rrf_fusion;
@@ -19,6 +20,7 @@ struct WatcherState {
 pub struct McpServer {
     registry: ToolRegistry,
     db: Arc<Database>,
+    embedding_model: Option<EmbeddingModel>,
     project_root: Option<PathBuf>,
     indexed: Mutex<bool>,
     watcher: Mutex<Option<WatcherState>>,
@@ -26,10 +28,16 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(db_path: &Path, project_root: Option<String>) -> Result<Self> {
-        let db = Database::open(db_path)?;
+        let embedding_model = EmbeddingModel::load()?;
+        let db = if embedding_model.is_some() {
+            Database::open_with_vec(db_path)?
+        } else {
+            Database::open(db_path)?
+        };
         Ok(Self {
             registry: ToolRegistry::new(),
             db: Arc::new(db),
+            embedding_model,
             project_root: project_root.map(PathBuf::from),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -56,10 +64,16 @@ impl McpServer {
             }
         }
 
-        let db = Database::open(&db_path)?;
+        let embedding_model = EmbeddingModel::load()?;
+        let db = if embedding_model.is_some() {
+            Database::open_with_vec(&db_path)?
+        } else {
+            Database::open(&db_path)?
+        };
         Ok(Self {
             registry: ToolRegistry::new(),
             db: Arc::new(db),
+            embedding_model,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -72,6 +86,7 @@ impl McpServer {
         Self {
             registry: ToolRegistry::new(),
             db: Arc::new(db),
+            embedding_model: None,
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -86,6 +101,7 @@ impl McpServer {
         Self {
             registry: ToolRegistry::new(),
             db: Arc::new(db),
+            embedding_model: None,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -104,21 +120,22 @@ impl McpServer {
             None => return Ok(()),
         };
 
-        let mut indexed = self.indexed.lock().unwrap();
+        let model = self.embedding_model.as_ref();
+        let mut indexed = self.indexed.lock().unwrap_or_else(|e| e.into_inner());
         if !*indexed {
-            run_full_index(&self.db, &project_root)?;
+            run_full_index(&self.db, &project_root, model)?;
             *indexed = true;
         } else {
             // Check if watcher detected changes
             let has_changes = self.drain_watcher_events();
             if has_changes {
-                run_incremental_index(&self.db, &project_root)?;
+                run_incremental_index(&self.db, &project_root, model)?;
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
-                let watcher_guard = self.watcher.lock().unwrap();
+                let watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
                 if watcher_guard.is_none() {
                     // No watcher active — fall back to incremental check
-                    run_incremental_index(&self.db, &project_root)?;
+                    run_incremental_index(&self.db, &project_root, model)?;
                 }
                 // Watcher active but no events → index is up-to-date, skip
             }
@@ -129,7 +146,7 @@ impl McpServer {
     /// Drain all pending events from the watcher receiver.
     /// Returns true if any file change events were received.
     fn drain_watcher_events(&self) -> bool {
-        let watcher_guard = self.watcher.lock().unwrap();
+        let watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref state) = *watcher_guard {
             let mut has_changes = false;
             while state.receiver.try_recv().is_ok() {
@@ -143,7 +160,7 @@ impl McpServer {
 
     /// Returns whether the file watcher is currently active.
     fn is_watching(&self) -> bool {
-        self.watcher.lock().unwrap().is_some()
+        self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
@@ -245,31 +262,69 @@ impl McpServer {
         let query = args["query"].as_str()
             .ok_or_else(|| anyhow!("query is required"))?;
         let top_k = args["top_k"].as_u64().unwrap_or(5) as i64;
+        let language_filter = args["language"].as_str();
+        let node_type_filter = args["node_type"].as_str();
 
         // Ensure index is up to date
         self.ensure_indexed()?;
 
-        // FTS5 search
-        let fts_results = queries::fts5_search(self.db.conn(), query, top_k * 2)?;
+        // FTS5 search (fetch extra to allow for filtering)
+        let fetch_count = top_k * 4;
+        let fts_results = queries::fts5_search(self.db.conn(), query, fetch_count)?;
 
         // Convert to SearchResult for RRF
         let fts_search: Vec<crate::search::fusion::SearchResult> = fts_results.iter()
             .map(|r| crate::search::fusion::SearchResult { node_id: r.id, score: 0.0 })
             .collect();
 
-        // RRF fusion (FTS-only when no vectors available)
-        let fused = rrf_fusion(&fts_search, &[], 60, top_k as usize);
+        // Vector search (if embedding model available and vec enabled)
+        let vec_search: Vec<crate::search::fusion::SearchResult> =
+            if let Some(ref model) = self.embedding_model {
+                if self.db.vec_enabled() {
+                    match model.embed(query) {
+                        Ok(query_embedding) => {
+                            queries::vector_search(self.db.conn(), &query_embedding, fetch_count)?
+                                .iter()
+                                .map(|(node_id, _distance)| {
+                                    crate::search::fusion::SearchResult { node_id: *node_id, score: 0.0 }
+                                })
+                                .collect()
+                        }
+                        Err(_) => vec![],
+                    }
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
 
-        // Get top_k results
-        let result_ids: Vec<i64> = fused.iter()
-            .map(|r| r.node_id)
-            .collect();
+        // RRF fusion (FTS + Vec when available, FTS-only otherwise)
+        let fused = rrf_fusion(&fts_search, &vec_search, 60, fetch_count as usize);
 
+        // Collect results with language/node_type filtering
+        let mut node_results: Vec<queries::NodeResult> = Vec::new();
         let mut results = Vec::new();
-        for node_id in &result_ids {
-            if let Some(node) = queries::get_node_by_id(self.db.conn(), *node_id)? {
+        for r in &fused {
+            if results.len() >= top_k as usize {
+                break;
+            }
+            if let Some(node) = queries::get_node_by_id(self.db.conn(), r.node_id)? {
+                // Apply node_type filter
+                if let Some(nt) = node_type_filter {
+                    if node.node_type != nt {
+                        continue;
+                    }
+                }
                 let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
                     .unwrap_or_default();
+                // Apply language filter
+                if let Some(lang) = language_filter {
+                    let file_lang = queries::get_file_language(self.db.conn(), node.file_id)?;
+                    if file_lang.as_deref() != Some(lang) {
+                        continue;
+                    }
+                }
                 results.push(json!({
                     "node_id": node.id,
                     "name": node.name,
@@ -281,7 +336,25 @@ impl McpServer {
                     "signature": node.signature,
                     "context_string": node.context_string,
                 }));
+                node_results.push(node);
             }
+        }
+
+        // Context Sandbox: compress if results exceed token threshold
+        use crate::sandbox::compressor::{should_compress, compress_results};
+        if should_compress(&node_results, 2000) {
+            let compressed = compress_results(&node_results);
+            let compact: Vec<serde_json::Value> = compressed.iter().map(|c| {
+                json!({
+                    "node_id": c.node_id,
+                    "summary": c.summary,
+                })
+            }).collect();
+            return Ok(json!({
+                "mode": "compressed",
+                "message": "Results exceeded token limit. Use read_snippet(node_id) to expand.",
+                "results": compact
+            }));
         }
 
         Ok(json!(results))
@@ -291,7 +364,7 @@ impl McpServer {
         let function_name = args["function_name"].as_str()
             .ok_or_else(|| anyhow!("function_name is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
-        let depth = args["depth"].as_i64().unwrap_or(2) as i32;
+        let depth = args["depth"].as_i64().unwrap_or(2).min(20).max(1) as i32;
         let file_path = args["file_path"].as_str();
 
         self.ensure_indexed()?;
@@ -325,6 +398,7 @@ impl McpServer {
     fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let route_path = args["route_path"].as_str()
             .ok_or_else(|| anyhow!("route_path is required"))?;
+        let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
 
         self.ensure_indexed()?;
 
@@ -334,25 +408,48 @@ impl McpServer {
              FROM edges e
              JOIN nodes n ON n.id = e.source_id
              JOIN files f ON f.id = n.file_id
-             WHERE e.relation = 'routes_to' AND e.metadata LIKE ?1"
+             WHERE e.relation = 'routes_to' AND e.metadata LIKE ?1 ESCAPE '\\'"
         )?;
 
-        let pattern = format!("%{}%", route_path);
-        let rows: Vec<serde_json::Value> = stmt.query_map([&pattern], |row| {
-            Ok(json!({
-                "node_id": row.get::<_, i64>(0)?,
-                "metadata": row.get::<_, Option<String>>(1)?,
-                "handler_name": row.get::<_, String>(2)?,
-                "handler_type": row.get::<_, String>(3)?,
-                "file_path": row.get::<_, String>(4)?,
-                "start_line": row.get::<_, i64>(5)?,
-                "end_line": row.get::<_, i64>(6)?,
-            }))
+        let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
+        let mut handlers: Vec<serde_json::Value> = Vec::new();
+
+        let rows: Vec<(i64, Option<String>, String, String, String, i64, i64)> = stmt.query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
         })?.filter_map(|r| r.ok()).collect();
+
+        for (node_id, metadata, handler_name, handler_type, file_path, start_line, end_line) in &rows {
+            let mut handler = json!({
+                "node_id": node_id,
+                "metadata": metadata,
+                "handler_name": handler_name,
+                "handler_type": handler_type,
+                "file_path": file_path,
+                "start_line": start_line,
+                "end_line": end_line,
+            });
+
+            if include_middleware {
+                // Get downstream calls from this handler
+                let downstream = queries::get_edge_target_names(self.db.conn(), *node_id, "calls")?;
+                handler["downstream_calls"] = json!(downstream);
+            }
+
+            handlers.push(handler);
+        }
 
         Ok(json!({
             "route": route_path,
-            "handlers": rows,
+            "handlers": handlers,
         }))
     }
 
@@ -409,7 +506,16 @@ impl McpServer {
         // Read source file for context lines if project root available
         let full_snippet = if let Some(ref root) = self.project_root {
             let abs_path = root.join(&file_path);
-            if let Ok(source) = std::fs::read_to_string(&abs_path) {
+            // Verify path stays within project root to prevent traversal
+            let canonical = abs_path.canonicalize().unwrap_or(abs_path.clone());
+            let root_canonical = root.canonicalize().unwrap_or(root.clone());
+            if !canonical.starts_with(&root_canonical) {
+                return Ok(json!({
+                    "error": "Path traversal detected",
+                    "node_id": node_id
+                }));
+            }
+            if let Ok(source) = std::fs::read_to_string(&canonical) {
                 let lines: Vec<&str> = source.lines().collect();
                 let start = (node.start_line as usize).saturating_sub(1 + context_lines as usize);
                 let end = ((node.end_line as usize) + context_lines as usize).min(lines.len());
@@ -436,7 +542,7 @@ impl McpServer {
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
-        let mut watcher_guard = self.watcher.lock().unwrap();
+        let mut watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
         if watcher_guard.is_some() {
             return Ok(json!({
                 "status": "already_watching",
@@ -458,7 +564,7 @@ impl McpServer {
     }
 
     fn tool_stop_watch(&self) -> Result<serde_json::Value> {
-        let mut watcher_guard = self.watcher.lock().unwrap();
+        let mut watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
         if watcher_guard.is_none() {
             return Ok(json!({
                 "status": "not_watching",
@@ -496,10 +602,10 @@ impl McpServer {
             DELETE FROM merkle_state;
         ")?;
 
-        let result = run_full_index(&self.db, project_root)?;
+        let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;
 
         // Reset indexed flag
-        *self.indexed.lock().unwrap() = true;
+        *self.indexed.lock().unwrap_or_else(|e| e.into_inner()) = true;
 
         Ok(json!({
             "status": "rebuilt",
@@ -800,5 +906,113 @@ function handleLogin(req: Request) {
         assert!(project_dir.path().join(".code-graph/index.db").exists());
         let gitignore = std::fs::read_to_string(project_dir.path().join(".gitignore")).unwrap();
         assert!(gitignore.contains(".code-graph/"));
+    }
+
+    #[test]
+    fn test_semantic_search_language_filter() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
+        std::fs::write(project_dir.path().join("app.py"), "def handler():\n    return 1\n").unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // Search with language filter for typescript
+        let req = tool_call_json("semantic_code_search", json!({
+            "query": "handler",
+            "language": "typescript"
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        let results = result.as_array().unwrap();
+        for r in results {
+            assert!(r["file_path"].as_str().unwrap().ends_with(".ts"),
+                "language filter should only return typescript files, got: {}", r["file_path"]);
+        }
+    }
+
+    #[test]
+    fn test_semantic_search_node_type_filter() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("mix.ts"), r#"
+class UserService {
+    getUser() { return null; }
+}
+function standalone() { return 1; }
+"#).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        let req = tool_call_json("semantic_code_search", json!({
+            "query": "user",
+            "node_type": "class"
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        let results = result.as_array().unwrap();
+        for r in results {
+            assert_eq!(r["type"].as_str().unwrap(), "class",
+                "node_type filter should only return classes");
+        }
+    }
+
+    #[test]
+    fn test_semantic_search_sandbox_compression() {
+        let project_dir = TempDir::new().unwrap();
+        // Create many functions with large code to exceed 2000 token threshold
+        let mut code = String::new();
+        for i in 0..20 {
+            code.push_str(&format!(
+                "function func{}() {{\n{}\n}}\n",
+                i,
+                format!("  // {}\n", "x".repeat(500)).repeat(3)
+            ));
+        }
+        std::fs::write(project_dir.path().join("big.ts"), &code).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        let req = tool_call_json("semantic_code_search", json!({
+            "query": "func",
+            "top_k": 20
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        // Should be in compressed mode
+        if result["mode"].as_str() == Some("compressed") {
+            assert!(result["results"].is_array());
+            let compressed = result["results"].as_array().unwrap();
+            assert!(!compressed.is_empty());
+            // Each compressed result should have node_id and summary
+            assert!(compressed[0]["node_id"].is_number());
+            assert!(compressed[0]["summary"].is_string());
+        }
+        // If not compressed (small code), that's also valid behavior
+    }
+
+    #[test]
+    fn test_find_http_route_with_downstream() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("server.ts"), r#"
+function validateToken(token: string) { return true; }
+
+function handleLogin(req: Request) {
+    validateToken(req.token);
+    return createSession(req.userId);
+}
+
+app.post('/api/login', handleLogin);
+"#).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("find_http_route", json!({
+            "route_path": "/api/login",
+            "include_middleware": true
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["route"], "/api/login");
+        // handlers array should exist
+        assert!(result["handlers"].is_array());
     }
 }

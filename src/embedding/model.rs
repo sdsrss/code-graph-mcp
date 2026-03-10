@@ -1,38 +1,141 @@
 use anyhow::Result;
+use candle_core::{Device, DType, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::bert::{BertModel, Config};
+use tokenizers::Tokenizer;
 
 pub const EMBEDDING_DIM: usize = 384;
 
 pub struct EmbeddingModel {
-    available: bool,
+    model: BertModel,
+    tokenizer: Tokenizer,
+    device: Device,
 }
 
 impl EmbeddingModel {
-    /// Try to load the embedding model. Returns a model that gracefully
-    /// degrades to unavailable if model files are not present.
-    pub fn load() -> Result<Self> {
-        // TODO: Load candle model from models/ directory or include_bytes!
-        // For now, return unavailable — system falls back to FTS5-only search
-        Ok(Self { available: false })
-    }
-
-    pub fn is_available(&self) -> bool {
-        self.available
-    }
-
-    pub fn embed(&self, _text: &str) -> Result<Vec<f32>> {
-        if !self.available {
-            anyhow::bail!("Embedding model not available");
+    /// Load the embedding model. Returns Ok(None) if model files are not available
+    /// (graceful degradation to FTS5-only search).
+    pub fn load() -> Result<Option<Self>> {
+        match Self::try_load() {
+            Ok(m) => {
+                tracing::info!("Embedding model loaded successfully");
+                Ok(Some(m))
+            }
+            Err(e) => {
+                tracing::warn!("Embedding model not available, falling back to FTS5-only: {}", e);
+                Ok(None)
+            }
         }
-        // TODO: Implement candle inference
-        Ok(vec![0.0; EMBEDDING_DIM])
     }
 
-    pub fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if !self.available {
-            anyhow::bail!("Embedding model not available");
+    fn try_load() -> Result<Self> {
+        let device = Device::Cpu;
+
+        let (model_data, tokenizer_data, config_data) = Self::load_model_data()?;
+
+        let config: Config = serde_json::from_slice(&config_data)?;
+        let vb = VarBuilder::from_buffered_safetensors(model_data, DType::F32, &device)?;
+        let model = BertModel::load(vb, &config)?;
+
+        let mut tokenizer = Tokenizer::from_bytes(&tokenizer_data)
+            .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))?;
+
+        // Truncate to 128 tokens — sufficient for code context strings
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 128,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("truncation config error: {}", e))?;
+
+        Ok(Self { model, tokenizer, device })
+    }
+
+    fn load_model_data() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        #[cfg(feature = "embed-model")]
+        {
+            Ok((
+                include_bytes!("../../models/model.safetensors").to_vec(),
+                include_bytes!("../../models/tokenizer.json").to_vec(),
+                include_bytes!("../../models/config.json").to_vec(),
+            ))
         }
-        // TODO: Implement candle batch inference
-        Ok(vec![vec![0.0; EMBEDDING_DIM]; _texts.len()])
+
+        #[cfg(not(feature = "embed-model"))]
+        {
+            let models_dir = Self::find_models_dir()?;
+            Ok((
+                std::fs::read(models_dir.join("model.safetensors"))?,
+                std::fs::read(models_dir.join("tokenizer.json"))?,
+                std::fs::read(models_dir.join("config.json"))?,
+            ))
+        }
+    }
+
+    #[cfg(not(feature = "embed-model"))]
+    fn find_models_dir() -> Result<std::path::PathBuf> {
+        // Check relative to current working directory (dev environment)
+        let cwd = std::env::current_dir()?;
+        let models = cwd.join("models");
+        if models.join("model.safetensors").exists() {
+            return Ok(models);
+        }
+
+        // Check relative to executable
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let models = exe_dir.join("models");
+                if models.join("model.safetensors").exists() {
+                    return Ok(models);
+                }
+            }
+        }
+
+        // Check CARGO_MANIFEST_DIR (for cargo test)
+        if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+            let models = std::path::PathBuf::from(manifest).join("models");
+            if models.join("model.safetensors").exists() {
+                return Ok(models);
+            }
+        }
+
+        anyhow::bail!("Model files not found in models/ directory")
+    }
+
+    /// Generate a 384-dim embedding for a single text.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let encoding = self.tokenizer.encode(text, true)
+            .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))?;
+
+        let ids = encoding.get_ids();
+        let type_ids = encoding.get_type_ids();
+
+        let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
+
+        let embeddings = self.model.forward(&input_ids, &token_type_ids, None)?;
+
+        // Mean pooling: average across token dimension
+        let (_batch, n_tokens, _hidden) = embeddings.dims3()?;
+        let pooled = (embeddings.sum(1)? / (n_tokens as f64))?;
+        let pooled = pooled.squeeze(0)?;
+
+        let mut result: Vec<f32> = pooled.to_vec1()?;
+        l2_normalize(&mut result);
+
+        Ok(result)
+    }
+
+    /// Generate embeddings for multiple texts (sequential, no padding needed).
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+}
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
     }
 }
 
@@ -42,14 +145,78 @@ mod tests {
 
     #[test]
     fn test_model_loads_gracefully() {
+        // Should never panic, even if model files are missing
         let model = EmbeddingModel::load().unwrap();
-        // Model should load without error even without model files
-        assert!(!model.is_available());
+        // Model availability depends on whether files exist
+        if model.is_some() {
+            println!("Model loaded successfully");
+        } else {
+            println!("Model not available (expected in CI without model files)");
+        }
     }
 
     #[test]
-    fn test_embed_returns_error_when_unavailable() {
+    fn test_embed_produces_correct_dims() {
         let model = EmbeddingModel::load().unwrap();
-        assert!(model.embed("test").is_err());
+        if let Some(model) = model {
+            let embedding = model.embed("function validateToken handles JWT auth").unwrap();
+            assert_eq!(embedding.len(), EMBEDDING_DIM);
+
+            // Verify L2 normalization: ||v|| ≈ 1.0
+            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 0.01, "norm should be ~1.0, got {}", norm);
+        }
+    }
+
+    #[test]
+    fn test_embed_batch() {
+        let model = EmbeddingModel::load().unwrap();
+        if let Some(model) = model {
+            let texts = vec!["function foo", "class Bar", "route /api/login"];
+            let embeddings = model.embed_batch(&texts).unwrap();
+            assert_eq!(embeddings.len(), 3);
+            for emb in &embeddings {
+                assert_eq!(emb.len(), EMBEDDING_DIM);
+            }
+        }
+    }
+
+    #[test]
+    fn test_similar_texts_closer() {
+        let model = EmbeddingModel::load().unwrap();
+        if let Some(model) = model {
+            let auth = model.embed("function validateToken JWT authentication").unwrap();
+            let login = model.embed("function handleLogin user authentication").unwrap();
+            let sort = model.embed("function bubbleSort array sorting algorithm").unwrap();
+
+            let sim_auth_login = cosine_sim(&auth, &login);
+            let sim_auth_sort = cosine_sim(&auth, &sort);
+
+            assert!(
+                sim_auth_login > sim_auth_sort,
+                "auth-login similarity ({}) should be > auth-sort similarity ({})",
+                sim_auth_login, sim_auth_sort
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn test_l2_normalize() {
+        let mut v = vec![3.0, 4.0];
+        l2_normalize(&mut v);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_l2_normalize_zero_vector() {
+        let mut v = vec![0.0, 0.0, 0.0];
+        l2_normalize(&mut v);
+        assert_eq!(v, vec![0.0, 0.0, 0.0]);
     }
 }

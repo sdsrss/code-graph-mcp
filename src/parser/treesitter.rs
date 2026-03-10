@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use super::languages::get_language;
+use super::node_text;
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -311,10 +312,6 @@ fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<Str
 fn get_child_by_field(node: &tree_sitter::Node, field: &str, source: &str) -> Option<String> {
     node.child_by_field_name(field)
         .map(|n| node_text(&n, source).to_string())
-}
-
-fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
 }
 
 fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {

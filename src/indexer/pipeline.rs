@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::embedding::context::{build_context_string, NodeContext};
+use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, hash_file, scan_directory};
 use crate::parser::relations::extract_relations;
 use crate::parser::treesitter::parse_code;
@@ -16,13 +17,13 @@ pub struct IndexResult {
     pub edges_created: usize,
 }
 
-pub fn run_full_index(db: &Database, project_root: &Path) -> Result<IndexResult> {
+pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
     let files: Vec<String> = current_hashes.keys().cloned().collect();
-    index_files(db, project_root, &files, &current_hashes)
+    index_files(db, project_root, &files, &current_hashes, model)
 }
 
-pub fn run_incremental_index(db: &Database, project_root: &Path) -> Result<IndexResult> {
+pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let current_hashes = scan_directory(project_root)?;
     let diff = compute_diff(&stored_hashes, &current_hashes);
@@ -43,11 +44,11 @@ pub fn run_incremental_index(db: &Database, project_root: &Path) -> Result<Index
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes)?;
+    let result = index_files(db, project_root, &to_index, &current_hashes, model)?;
 
-    // Regenerate context strings for dirty nodes in other files
+    // Regenerate context strings (and embeddings) for dirty nodes in other files
     if !dirty_node_ids.is_empty() {
-        regenerate_context_strings(db, &dirty_node_ids)?;
+        regenerate_context_strings(db, &dirty_node_ids, model)?;
     }
 
     Ok(result)
@@ -71,8 +72,8 @@ fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<Has
     Ok(ids.into_iter().collect())
 }
 
-/// Regenerate context strings for the given set of dirty nodes.
-fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>) -> Result<()> {
+/// Regenerate context strings (and embeddings) for the given set of dirty nodes.
+fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Option<&EmbeddingModel>) -> Result<()> {
     for &node_id in dirty_ids {
         if let Some(node) = get_node_by_id(db.conn(), node_id)? {
             let file_path = get_file_path(db.conn(), node.file_id)?
@@ -96,6 +97,22 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>) -> Result
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
+
+            // Re-embed if model available and vec enabled
+            if let Some(m) = model {
+                if db.vec_enabled() {
+                    match m.embed(&ctx) {
+                        Ok(embedding) => {
+                            if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
+                                eprintln!("[warn] Failed to insert vector for node {}: {}", node_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[warn] Failed to embed node {}: {}", node_id, e);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -106,14 +123,19 @@ fn index_files(
     root: &Path,
     files: &[String],
     hashes: &HashMap<String, String>,
+    model: Option<&EmbeddingModel>,
 ) -> Result<IndexResult> {
+    db.conn().execute_batch("BEGIN")?;
+
+    let result = (|| -> Result<IndexResult> {
     let mut nodes_created = 0usize;
     let mut edges_created = 0usize;
 
     // Collect all parsed data first
     struct FileParsed {
-        file_id: i64,
         rel_path: String,
+        source: String,
+        language: String,
         node_ids: Vec<i64>,
         node_names: Vec<String>,
     }
@@ -182,8 +204,9 @@ fn index_files(
         }
 
         parsed_files.push(FileParsed {
-            file_id,
             rel_path: rel_path.clone(),
+            source,
+            language: language.to_string(),
             node_ids,
             node_names,
         });
@@ -209,17 +232,7 @@ fn index_files(
     }
 
     for pf in &parsed_files {
-        let abs_path = root.join(&pf.rel_path);
-        let language = match detect_language(&pf.rel_path) {
-            Some(lang) => lang,
-            None => continue,
-        };
-        let source = match std::fs::read_to_string(&abs_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let relations = match extract_relations(&source, language) {
+        let relations = match extract_relations(&pf.source, &pf.language) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -279,6 +292,22 @@ fn index_files(
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
+
+            // Generate embedding and store in vec0 table
+            if let Some(m) = model {
+                if db.vec_enabled() {
+                    match m.embed(&ctx) {
+                        Ok(embedding) => {
+                            if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
+                                eprintln!("[warn] Failed to insert vector for node {}: {}", node_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[warn] Failed to embed node {}: {}", node_id, e);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -287,6 +316,13 @@ fn index_files(
         nodes_created,
         edges_created,
     })
+    })(); // end of transaction closure
+
+    match &result {
+        Ok(_) => { db.conn().execute_batch("COMMIT")?; }
+        Err(_) => { let _ = db.conn().execute_batch("ROLLBACK"); }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -314,7 +350,7 @@ function handleLogin(req: Request) {
 "#).unwrap();
 
         let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-        let result = run_full_index(&db, project_dir.path()).unwrap();
+        let result = run_full_index(&db, project_dir.path(), None).unwrap();
 
         assert!(result.files_indexed > 0);
         assert!(result.nodes_created > 0);
@@ -340,13 +376,13 @@ function handleLogin(req: Request) {
 
         // Initial index
         fs::write(project_dir.path().join("a.ts"), "function foo() {}").unwrap();
-        run_full_index(&db, project_dir.path()).unwrap();
+        run_full_index(&db, project_dir.path(), None).unwrap();
 
         // Modify file
         fs::write(project_dir.path().join("a.ts"), "function bar() {}").unwrap();
 
         // Incremental index
-        let result = run_incremental_index(&db, project_dir.path()).unwrap();
+        let result = run_incremental_index(&db, project_dir.path(), None).unwrap();
         assert_eq!(result.files_indexed, 1);
 
         let foo = get_nodes_by_name(db.conn(), "foo").unwrap();
@@ -364,7 +400,7 @@ function handleLogin(req: Request) {
         // Initial: B (in b.ts) calls A (in a.ts)
         fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
         fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
-        run_full_index(&db, project_dir.path()).unwrap();
+        run_full_index(&db, project_dir.path(), None).unwrap();
 
         let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
         assert_eq!(beta_nodes.len(), 1);
@@ -372,7 +408,7 @@ function handleLogin(req: Request) {
 
         // Change A: rename function (alpha -> alphaRenamed)
         fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
-        run_incremental_index(&db, project_dir.path()).unwrap();
+        run_incremental_index(&db, project_dir.path(), None).unwrap();
 
         // beta's context_string should be updated (calls list changed because
         // the old alpha node is gone and edge was cascade-deleted)
@@ -389,10 +425,10 @@ function handleLogin(req: Request) {
         let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
         fs::write(project_dir.path().join("a.ts"), "function foo() {}").unwrap();
-        run_full_index(&db, project_dir.path()).unwrap();
+        run_full_index(&db, project_dir.path(), None).unwrap();
 
         fs::remove_file(project_dir.path().join("a.ts")).unwrap();
-        run_incremental_index(&db, project_dir.path()).unwrap();
+        run_incremental_index(&db, project_dir.path(), None).unwrap();
 
         let foo = get_nodes_by_name(db.conn(), "foo").unwrap();
         assert_eq!(foo.len(), 0);

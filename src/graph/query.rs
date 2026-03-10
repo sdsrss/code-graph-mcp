@@ -50,8 +50,9 @@ fn query_direction(
     let file_filter = if file_path.is_some() {
         "AND f.path = ?2"
     } else {
-        ""
+        "AND (1=1 OR ?2 = ?2)"  // always true, but consumes ?2
     };
+    let file_path_param = file_path.unwrap_or("");
 
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)
@@ -105,15 +106,9 @@ fn query_direction(
         })
     };
 
-    let results: Vec<CallGraphNode> = if let Some(fp) = file_path {
-        stmt.query_map(rusqlite::params![function_name, fp, max_depth], map_row)?
-            .filter_map(|r| r.ok())
-            .collect()
-    } else {
-        stmt.query_map(rusqlite::params![function_name, "", max_depth], map_row)?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
+    let results: Vec<CallGraphNode> = stmt
+        .query_map(rusqlite::params![function_name, file_path_param, max_depth], map_row)?
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
 }
