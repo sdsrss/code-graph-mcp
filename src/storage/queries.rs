@@ -1,6 +1,45 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::HashMap;
+
+// --- Index status ---
+
+#[derive(Debug, Serialize)]
+pub struct IndexStatus {
+    pub files_count: i64,
+    pub nodes_count: i64,
+    pub edges_count: i64,
+    pub last_indexed_at: Option<i64>,
+    pub is_watching: bool,
+    pub schema_version: i32,
+    pub db_size_bytes: i64,
+}
+
+pub fn get_index_status(conn: &Connection) -> Result<IndexStatus> {
+    let files_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+    let nodes_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    let edges_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+    let last_indexed_at: Option<i64> = conn.query_row(
+        "SELECT MAX(indexed_at) FROM files", [], |r| r.get(0)
+    ).ok().flatten();
+    let schema_version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+
+    // For in-memory DBs, page_count * page_size gives size
+    let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+    let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
+    let db_size_bytes = page_count * page_size;
+
+    Ok(IndexStatus {
+        files_count,
+        nodes_count,
+        edges_count,
+        last_indexed_at,
+        is_watching: false,
+        schema_version,
+        db_size_bytes,
+    })
+}
 
 // --- File records ---
 
