@@ -592,12 +592,19 @@ impl McpServer {
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
         // Clear all data in a single transaction (CASCADE handles nodes→edges)
-        self.db.conn().execute_batch("
-            BEGIN;
-            DELETE FROM context_sandbox;
-            DELETE FROM files;
-            COMMIT;
-        ")?;
+        self.db.conn().execute_batch("BEGIN")?;
+        let cleanup = (|| -> anyhow::Result<()> {
+            self.db.conn().execute("DELETE FROM context_sandbox", [])?;
+            self.db.conn().execute("DELETE FROM files", [])?;
+            Ok(())
+        })();
+        match cleanup {
+            Ok(()) => { self.db.conn().execute_batch("COMMIT")?; }
+            Err(e) => {
+                let _ = self.db.conn().execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
 
         let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;
 
