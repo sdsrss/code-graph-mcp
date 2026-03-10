@@ -3,43 +3,55 @@ use rusqlite::Connection;
 
 pub struct CompressedResult {
     pub node_id: i64,
+    pub file_path: String,
     pub summary: String,
 }
 
 /// Compress results if needed, with opportunistic sandbox cleanup.
+/// `file_paths` maps each result's index to its file path.
 pub fn compress_if_needed(
     conn: &Connection,
     results: &[crate::storage::queries::NodeResult],
+    file_paths: &[String],
     token_threshold: usize,
 ) -> Option<Vec<CompressedResult>> {
     let _ = cleanup_expired_sandbox(conn); // opportunistic cleanup
     if should_compress(results, token_threshold) {
-        Some(compress_results(results))
+        Some(compress_results(results, file_paths))
     } else {
         None
     }
 }
 
-/// Check if results exceed token threshold (rough estimate: 1 token ~ 4 chars)
+/// Check if results exceed token threshold (estimate: 1 token ~ 3 chars for code)
 pub fn should_compress(
     results: &[crate::storage::queries::NodeResult],
     token_threshold: usize,
 ) -> bool {
-    let total_chars: usize = results.iter().map(|r| r.code_content.len()).sum();
-    total_chars / 4 > token_threshold
+    let total_chars: usize = results.iter().map(|r| {
+        r.code_content.len()
+            + r.name.len()
+            + r.signature.as_ref().map_or(0, |s| s.len())
+            + r.context_string.as_ref().map_or(0, |s| s.len())
+    }).sum();
+    total_chars / 3 > token_threshold
 }
 
 /// Compress results to summaries with node IDs for read_snippet expansion
 pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
+    file_paths: &[String],
 ) -> Vec<CompressedResult> {
     results
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
+            let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
             let summary = format!(
-                "{} {} (lines {}-{}){}",
+                "{} {} in {} (lines {}-{}){}",
                 r.node_type,
                 r.name,
+                fp,
                 r.start_line,
                 r.end_line,
                 r.signature
@@ -49,6 +61,7 @@ pub fn compress_results(
             );
             CompressedResult {
                 node_id: r.id,
+                file_path: fp.to_string(),
                 summary,
             }
         })
@@ -121,10 +134,12 @@ mod tests {
                 ..default_node()
             },
         ];
-        let compressed = compress_results(&results);
+        let file_paths = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+        let compressed = compress_results(&results, &file_paths);
         assert_eq!(compressed.len(), 2);
         assert_eq!(compressed[0].node_id, 1);
         assert!(compressed[0].summary.contains("foo"));
+        assert!(compressed[0].summary.contains("src/main.rs"));
         assert!(compressed[0].summary.contains("() -> i32"));
     }
 

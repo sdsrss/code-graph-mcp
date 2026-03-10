@@ -60,12 +60,10 @@ fn query_direction(
     file_path: Option<&str>,
     direction: Direction,
 ) -> Result<Vec<CallGraphNode>> {
-    let file_filter = if file_path.is_some() {
-        "AND f.path = ?2"
-    } else {
-        "AND (1=1 OR ?2 = ?2)"  // always true, but consumes ?2
-    };
-    let file_path_param = file_path.unwrap_or("");
+    let max_depth = max_depth.min(20); // Hard cap to prevent CTE blowup on deep graphs
+    // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
+    let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
+    let file_path_param: Option<&str> = file_path;
 
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)

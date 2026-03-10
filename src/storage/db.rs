@@ -18,7 +18,14 @@ static VEC_INIT: Once = Once::new();
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
                 sqlite3_vec_init as *const (),
             )));
         }
@@ -53,6 +60,7 @@ impl Database {
             PRAGMA mmap_size = 268435456;
             PRAGMA temp_store = MEMORY;
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
         ")?;
 
         // Check existing schema version before creating/updating tables

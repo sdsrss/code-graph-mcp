@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
@@ -17,9 +17,10 @@ struct WatcherState {
     receiver: mpsc::Receiver<WatchEvent>,
 }
 
+/// MCP server for code graph operations. Single-threaded (stdio loop).
 pub struct McpServer {
     registry: ToolRegistry,
-    db: Arc<Database>,
+    db: Database,
     embedding_model: Option<EmbeddingModel>,
     project_root: Option<PathBuf>,
     indexed: Mutex<bool>,
@@ -43,7 +44,7 @@ impl McpServer {
 
         // Ensure .code-graph/ is in .gitignore
         let gitignore_path = project_root.join(".gitignore");
-        if gitignore_path.exists() {
+        {
             let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
             if !content.contains(".code-graph") {
                 let mut new_content = content;
@@ -59,7 +60,7 @@ impl McpServer {
         let db = Self::open_db(&db_path, &embedding_model)?;
         Ok(Self {
             registry: ToolRegistry::new(),
-            db: Arc::new(db),
+            db,
             embedding_model,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
@@ -72,7 +73,7 @@ impl McpServer {
         let db = Database::open(Path::new(":memory:")).unwrap();
         Self {
             registry: ToolRegistry::new(),
-            db: Arc::new(db),
+            db,
             embedding_model: None,
             project_root: None,
             indexed: Mutex::new(false),
@@ -87,7 +88,7 @@ impl McpServer {
         let db = Database::open(&db_dir.join("index.db")).unwrap();
         Self {
             registry: ToolRegistry::new(),
-            db: Arc::new(db),
+            db,
             embedding_model: None,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
@@ -169,6 +170,8 @@ impl McpServer {
 
         let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
+            "notifications/initialized" | "notifications/cancelled" => return Ok(None),
+            "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_tools_list(req.id),
             "tools/call" => self.handle_tools_call(req.id, req.params),
             _ => JsonRpcResponse::error(
@@ -214,7 +217,10 @@ impl McpServer {
             None => return JsonRpcResponse::error(id, -32602, "Missing params".into()),
         };
 
-        let tool_name = params["name"].as_str().unwrap_or("");
+        let tool_name = match params["name"].as_str() {
+            Some(name) => name,
+            None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'name' in tool call params".into()),
+        };
         let arguments = params["arguments"].clone();
 
         match self.handle_tool(tool_name, &arguments) {
@@ -308,6 +314,7 @@ impl McpServer {
 
         // Collect results with language/node_type filtering
         let mut node_results: Vec<queries::NodeResult> = Vec::new();
+        let mut file_paths: Vec<String> = Vec::new();
         let mut results = Vec::new();
         for r in &fused {
             if results.len() >= top_k as usize {
@@ -351,14 +358,16 @@ impl McpServer {
                     doc_comment: node.doc_comment.clone(),
                     context_string: node.context_string.clone(),
                 });
+                file_paths.push(nwf.file_path.clone());
             }
         }
 
         // Context Sandbox: compress if results exceed token threshold
-        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(self.db.conn(), &node_results, 2000) {
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(self.db.conn(), &node_results, &file_paths, 2000) {
             let compact: Vec<serde_json::Value> = compressed.iter().map(|c| {
                 json!({
                     "node_id": c.node_id,
+                    "file_path": c.file_path,
                     "summary": c.summary,
                 })
             }).collect();
@@ -411,46 +420,23 @@ impl McpServer {
 
         self.ensure_indexed()?;
 
-        // Search edges with relation "routes_to" where metadata contains the route path
-        let mut stmt = self.db.conn().prepare(
-            "SELECT e.source_id, e.metadata, n.name, n.type, f.path, n.start_line, n.end_line
-             FROM edges e
-             JOIN nodes n ON n.id = e.source_id
-             JOIN files f ON f.id = n.file_id
-             WHERE e.relation = ?2 AND e.metadata LIKE ?1 ESCAPE '\\'"
-        )?;
-
-        let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{}%", escaped);
-        let mut handlers: Vec<serde_json::Value> = Vec::new();
-
         use crate::storage::schema::{REL_CALLS, REL_ROUTES_TO};
-        let rows: Vec<(i64, Option<String>, String, String, String, i64, i64)> = stmt.query_map(rusqlite::params![pattern, REL_ROUTES_TO], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?.filter_map(|r| r.ok()).collect();
+        let rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
 
-        for (node_id, metadata, handler_name, handler_type, file_path, start_line, end_line) in &rows {
+        let mut handlers: Vec<serde_json::Value> = Vec::new();
+        for rm in &rows {
             let mut handler = json!({
-                "node_id": node_id,
-                "metadata": metadata,
-                "handler_name": handler_name,
-                "handler_type": handler_type,
-                "file_path": file_path,
-                "start_line": start_line,
-                "end_line": end_line,
+                "node_id": rm.node_id,
+                "metadata": rm.metadata,
+                "handler_name": rm.handler_name,
+                "handler_type": rm.handler_type,
+                "file_path": rm.file_path,
+                "start_line": rm.start_line,
+                "end_line": rm.end_line,
             });
 
             if include_middleware {
-                // Get downstream calls from this handler
-                let downstream = queries::get_edge_target_names(self.db.conn(), *node_id, REL_CALLS)?;
+                let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
                 handler["downstream_calls"] = json!(downstream);
             }
 
@@ -504,6 +490,8 @@ impl McpServer {
     }
 
     fn tool_read_snippet(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
         let node_id = args["node_id"].as_i64()
             .ok_or_else(|| anyhow!("node_id is required"))?;
         let context_lines = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
@@ -603,13 +591,11 @@ impl McpServer {
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
-        // Clear all data in a single transaction
+        // Clear all data in a single transaction (CASCADE handles nodes→edges)
         self.db.conn().execute_batch("
             BEGIN;
-            DELETE FROM edges;
-            DELETE FROM nodes;
-            DELETE FROM files;
             DELETE FROM context_sandbox;
+            DELETE FROM files;
             COMMIT;
         ")?;
 

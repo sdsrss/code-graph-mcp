@@ -27,9 +27,6 @@ impl FileWatcher {
         Ok(Self { _watcher: watcher })
     }
 
-    pub fn stop(self) {
-        drop(self._watcher);
-    }
 }
 
 #[cfg(test)]
@@ -51,6 +48,6 @@ mod tests {
         let events: Vec<WatchEvent> = rx.try_iter().collect();
         assert!(!events.is_empty());
 
-        watcher.stop();
+        drop(watcher);
     }
 }

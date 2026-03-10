@@ -136,11 +136,11 @@ impl EmbeddingModel {
     }
 
     pub fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-        unreachable!("EmbeddingModel::embed called without embed-model feature")
+        anyhow::bail!("Embedding model not compiled — enable the 'embed-model' feature")
     }
 
     pub fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        unreachable!("EmbeddingModel::embed_batch called without embed-model feature")
+        anyhow::bail!("Embedding model not compiled — enable the 'embed-model' feature")
     }
 }
 

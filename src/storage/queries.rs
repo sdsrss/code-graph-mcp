@@ -123,7 +123,6 @@ pub struct NodeResult {
 // --- Edge records ---
 
 pub struct EdgeRecord {
-    pub id: i64,
     pub source_id: i64,
     pub target_id: i64,
     pub relation: String,
@@ -217,15 +216,14 @@ pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: 
 
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1"
+        "SELECT source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1"
     )?;
     let rows = stmt.query_map([node_id], |row| {
         Ok(EdgeRecord {
-            id: row.get(0)?,
-            source_id: row.get(1)?,
-            target_id: row.get(2)?,
-            relation: row.get(3)?,
-            metadata: row.get(4)?,
+            source_id: row.get(0)?,
+            target_id: row.get(1)?,
+            relation: row.get(2)?,
+            metadata: row.get(3)?,
         })
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
@@ -388,6 +386,44 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
     Ok(results)
 }
 
+// --- Route queries ---
+
+pub struct RouteMatch {
+    pub node_id: i64,
+    pub metadata: Option<String>,
+    pub handler_name: String,
+    pub handler_type: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) -> Result<Vec<RouteMatch>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.source_id, e.metadata, n.name, n.type, f.path, n.start_line, n.end_line
+         FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         JOIN files f ON f.id = n.file_id
+         WHERE e.relation = ?2 AND e.metadata LIKE ?1 ESCAPE '\\'"
+    )?;
+
+    let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{}%", escaped);
+    let rows = stmt.query_map(rusqlite::params![pattern, relation], |row| {
+        Ok(RouteMatch {
+            node_id: row.get(0)?,
+            metadata: row.get(1)?,
+            handler_name: row.get(2)?,
+            handler_type: row.get(3)?,
+            file_path: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+        })
+    })?;
+    let results = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
@@ -397,6 +433,10 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ");
+    // Empty/whitespace-only queries would cause FTS5 MATCH error
+    if sanitized.is_empty() {
+        return Ok(vec![]);
+    }
     let sql = format!(
         "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
         NODE_SELECT_ALIASED

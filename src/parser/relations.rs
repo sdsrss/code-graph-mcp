@@ -132,7 +132,7 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String>
                 Some(node_text(&function, source).to_string())
             }
         }
-        _ => Some(node_text(&function, source).to_string()),
+        _ => None, // Unknown callee expression — skip to avoid noise in call graph
     }
 }
 
@@ -416,7 +416,7 @@ function handleLogin(req) {
 "#;
         let relations = extract_relations(code, "typescript").unwrap();
         let calls: Vec<&str> = relations.iter()
-            .filter(|r| r.relation == "calls")
+            .filter(|r| r.relation == REL_CALLS)
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(calls.contains(&"validateToken"), "got calls: {:?}", calls);
@@ -431,7 +431,7 @@ import jwt from 'jsonwebtoken';
 "#;
         let relations = extract_relations(code, "typescript").unwrap();
         let imports: Vec<&str> = relations.iter()
-            .filter(|r| r.relation == "imports")
+            .filter(|r| r.relation == REL_IMPORTS)
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(imports.contains(&"UserService"), "got imports: {:?}", imports);
@@ -446,7 +446,7 @@ class AdminService extends UserService {
 "#;
         let relations = extract_relations(code, "typescript").unwrap();
         let inherits: Vec<&str> = relations.iter()
-            .filter(|r| r.relation == "inherits")
+            .filter(|r| r.relation == REL_INHERITS)
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(inherits.contains(&"UserService"), "got inherits: {:?}", inherits);
@@ -460,7 +460,7 @@ app.get('/api/users/:id', getUser);
 "#;
         let relations = extract_relations(code, "typescript").unwrap();
         let routes: Vec<(&str, &str)> = relations.iter()
-            .filter(|r| r.relation == "routes_to")
+            .filter(|r| r.relation == REL_ROUTES_TO)
             .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
             .collect();
         assert!(routes.iter().any(|(meta, target)| meta.contains("/api/login") && *target == "handleLogin"),
@@ -476,7 +476,7 @@ def get_users():
 "#;
         let relations = extract_relations(code, "python").unwrap();
         let routes: Vec<&str> = relations.iter()
-            .filter(|r| r.relation == "routes_to")
+            .filter(|r| r.relation == REL_ROUTES_TO)
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(routes.contains(&"get_users"), "got routes: {:?}", routes);
@@ -492,7 +492,7 @@ func main() {
 }
 "#;
         let relations = extract_relations(code, "go").unwrap();
-        assert!(relations.iter().any(|r| r.relation == "routes_to" && r.target_name == "healthCheck"),
+        assert!(relations.iter().any(|r| r.relation == REL_ROUTES_TO && r.target_name == "healthCheck"),
             "got relations: {:?}", relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
     }
 }

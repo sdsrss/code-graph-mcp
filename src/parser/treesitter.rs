@@ -19,8 +19,9 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang)?;
+    parser.set_timeout_micros(5_000_000); // 5 second timeout to prevent hangs on pathological input
     parser.parse(source, None)
-        .ok_or_else(|| anyhow!("parse failed"))
+        .ok_or_else(|| anyhow!("parse failed or timed out"))
 }
 
 pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
@@ -326,11 +327,21 @@ fn get_child_by_field(node: &tree_sitter::Node, field: &str, source: &str) -> Op
 }
 
 fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    if prev.kind() == "comment" || prev.kind() == "line_comment" || prev.kind() == "block_comment" {
-        Some(node_text(&prev, source).to_string())
-    } else {
+    let mut comments = Vec::new();
+    let mut current = node.prev_sibling();
+    while let Some(prev) = current {
+        if prev.kind() == "comment" || prev.kind() == "line_comment" || prev.kind() == "block_comment" {
+            comments.push(node_text(&prev, source).to_string());
+            current = prev.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    if comments.is_empty() {
         None
+    } else {
+        comments.reverse();
+        Some(comments.join("\n"))
     }
 }
 

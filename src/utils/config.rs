@@ -1,5 +1,12 @@
 pub fn detect_language(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit('.').next()?;
+    // Get the filename portion, then extract extension
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    // Must have a non-empty name before the dot (skip dotfiles like ".gitignore")
+    let dot_pos = filename.rfind('.')?;
+    if dot_pos == 0 {
+        return None; // dotfile with no name before the dot
+    }
+    let ext = &filename[dot_pos + 1..];
     match ext {
         "rs" => Some("rust"),
         "ts" | "tsx" => Some("typescript"),
@@ -33,5 +40,13 @@ mod tests {
         assert_eq!(detect_language("index.html"), Some("html"));
         assert_eq!(detect_language("style.css"), Some("css"));
         assert_eq!(detect_language("image.png"), None);
+    }
+
+    #[test]
+    fn test_detect_language_edge_cases() {
+        assert_eq!(detect_language("Makefile"), None);
+        assert_eq!(detect_language(".gitignore"), None);
+        assert_eq!(detect_language("file.test.ts"), Some("typescript"));
+        assert_eq!(detect_language("path/to/no_ext"), None);
     }
 }

@@ -159,6 +159,15 @@ fn index_files(
             None => hash_file(&abs_path)?,
         };
 
+        // Skip files larger than 1MB to avoid OOM on generated/bundled files
+        const MAX_FILE_SIZE: u64 = 1_048_576;
+        if let Ok(meta) = std::fs::metadata(&abs_path) {
+            if meta.len() > MAX_FILE_SIZE {
+                tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                continue;
+            }
+        }
+
         let source = match std::fs::read_to_string(&abs_path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -251,17 +260,27 @@ fn index_files(
                 .map(|(_, id)| *id)
                 .collect::<Vec<_>>();
 
-            let target_ids = name_to_ids.get(&rel.target_name)
+            let all_target_ids = name_to_ids.get(&rel.target_name)
                 .cloned()
                 .unwrap_or_default();
+
+            // Prefer same-file targets to reduce false-positive cross-file edges
+            let same_file_targets: Vec<i64> = all_target_ids.iter()
+                .filter(|id| pf.node_ids.contains(id))
+                .copied()
+                .collect();
+            let target_ids = if !same_file_targets.is_empty() {
+                same_file_targets
+            } else {
+                all_target_ids
+            };
 
             for &src_id in &source_ids {
                 for &tgt_id in &target_ids {
                     // Allow self-edges for routes (routes_to maps handler to itself with metadata)
-                    if src_id != tgt_id || rel.relation == REL_ROUTES_TO {
-                        if insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
-                            edges_created += 1;
-                        }
+                    if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
+                        && insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                        edges_created += 1;
                     }
                 }
             }
@@ -353,7 +372,7 @@ function handleLogin(req: Request) {
 
         // Verify edges: handleLogin → calls → validateToken
         let edges = get_edges_from(db.conn(), nodes[0].id).unwrap();
-        assert!(edges.iter().any(|e| e.relation == "calls"), "should have call edges");
+        assert!(edges.iter().any(|e| e.relation == REL_CALLS), "should have call edges");
 
         // Verify context string was built
         assert!(nodes[0].context_string.is_some(), "context string should be set after Phase 3");
