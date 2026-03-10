@@ -6,6 +6,20 @@ pub struct CompressedResult {
     pub summary: String,
 }
 
+/// Compress results if needed, with opportunistic sandbox cleanup.
+pub fn compress_if_needed(
+    conn: &Connection,
+    results: &[crate::storage::queries::NodeResult],
+    token_threshold: usize,
+) -> Option<Vec<CompressedResult>> {
+    let _ = cleanup_expired_sandbox(conn); // opportunistic cleanup
+    if should_compress(results, token_threshold) {
+        Some(compress_results(results))
+    } else {
+        None
+    }
+}
+
 /// Check if results exceed token threshold (rough estimate: 1 token ~ 4 chars)
 pub fn should_compress(
     results: &[crate::storage::queries::NodeResult],

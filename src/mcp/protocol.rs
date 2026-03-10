@@ -8,6 +8,16 @@ pub struct JsonRpcRequest {
     pub params: Option<serde_json::Value>,
 }
 
+impl JsonRpcRequest {
+    /// Validate that the request conforms to JSON-RPC 2.0.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.jsonrpc != "2.0" {
+            return Err("Invalid JSON-RPC version");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,

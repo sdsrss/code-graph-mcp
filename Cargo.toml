@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
-embed-model = []
+default = ["embed-model"]
+embed-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.38", features = ["bundled-full"] }
 blake3 = "1"
 ignore = "0.4"
@@ -19,10 +18,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
 bytemuck = "1"
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"], optional = true }
 tree-sitter = "0.24"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
@@ -39,7 +38,7 @@ tree-sitter-css = "0.23"
 cc = "1"
 
 [profile.release]
-opt-level = "z"
+opt-level = 2
 lto = true
 strip = true
 codegen-units = 1

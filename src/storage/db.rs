@@ -55,6 +55,16 @@ impl Database {
             PRAGMA foreign_keys = ON;
         ")?;
 
+        // Check existing schema version before creating/updating tables
+        let existing_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if existing_version > 0 && existing_version != schema::SCHEMA_VERSION {
+            anyhow::bail!(
+                "Database schema version mismatch: found v{}, expected v{}. Please rebuild your index.",
+                existing_version,
+                schema::SCHEMA_VERSION
+            );
+        }
+
         conn.execute_batch(schema::CREATE_TABLES)?;
 
         if enable_vec {
@@ -98,7 +108,6 @@ mod tests {
         assert!(tables.contains(&"nodes".to_string()));
         assert!(tables.contains(&"edges".to_string()));
         assert!(tables.contains(&"context_sandbox".to_string()));
-        assert!(tables.contains(&"merkle_state".to_string()));
     }
 
     #[test]

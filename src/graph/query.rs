@@ -9,6 +9,7 @@ pub struct CallGraphNode {
     pub node_type: String,
     pub file_path: String,
     pub depth: i32,
+    pub direction: String,  // "callees" or "callers"
 }
 
 /// Traverse the call graph starting from a function by name.
@@ -54,6 +55,11 @@ fn query_direction(
     };
     let file_path_param = file_path.unwrap_or("");
 
+    let direction_label = match direction {
+        Direction::Callees => "callees",
+        Direction::Callers => "callers",
+    };
+
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)
     // - callers: follow edges backward (target_id = current, source_id = next)
@@ -96,13 +102,15 @@ fn query_direction(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallGraphNode> {
+    let direction_label_owned = direction_label.to_string();
+    let map_row = move |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallGraphNode> {
         Ok(CallGraphNode {
             node_id: row.get(0)?,
             name: row.get(1)?,
             node_type: row.get(2)?,
             file_path: row.get(3)?,
             depth: row.get(4)?,
+            direction: direction_label_owned.clone(),
         })
     };
 
@@ -113,13 +121,14 @@ fn query_direction(
     Ok(results)
 }
 
-/// Merge callee and caller results, deduplicating by node_id and keeping the minimum depth.
+/// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the minimum depth.
 fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
-    let mut by_id: HashMap<i64, CallGraphNode> = HashMap::new();
+    let mut by_key: HashMap<(i64, String), CallGraphNode> = HashMap::new();
 
     for node in callees.into_iter().chain(callers.into_iter()) {
-        by_id
-            .entry(node.node_id)
+        let key = (node.node_id, node.direction.clone());
+        by_key
+            .entry(key)
             .and_modify(|existing| {
                 if node.depth < existing.depth {
                     existing.depth = node.depth;
@@ -128,7 +137,7 @@ fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Ve
             .or_insert(node);
     }
 
-    let mut results: Vec<CallGraphNode> = by_id.into_values().collect();
+    let mut results: Vec<CallGraphNode> = by_key.into_values().collect();
     results.sort_by_key(|n| n.depth);
     results
 }

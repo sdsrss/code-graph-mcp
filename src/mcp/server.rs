@@ -166,8 +166,14 @@ impl McpServer {
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
         let req: JsonRpcRequest = serde_json::from_str(line)?;
 
-        // Notifications (no id) don't get responses
-        if req.method == "notifications/initialized" {
+        // Validate JSON-RPC version
+        if let Err(msg) = req.validate() {
+            let resp = JsonRpcResponse::error(req.id, -32600, msg.to_string());
+            return Ok(Some(serde_json::to_string(&resp)?));
+        }
+
+        // Per JSON-RPC 2.0, any request without an id is a notification — no response
+        if req.id.is_none() {
             return Ok(None);
         }
 
@@ -380,18 +386,19 @@ impl McpServer {
                 "type": n.node_type,
                 "file_path": n.file_path,
                 "depth": n.depth,
+                "direction": n.direction,
             })
         }).collect();
 
         Ok(json!({
             "function": function_name,
             "direction": direction,
-            "callees": if direction == "callees" || direction == "both" {
-                nodes.iter().filter(|n| n["depth"].as_i64().unwrap_or(0) > 0).cloned().collect::<Vec<_>>()
-            } else { vec![] },
-            "callers": if direction == "callers" || direction == "both" {
-                nodes.iter().filter(|n| n["depth"].as_i64().unwrap_or(0) > 0).cloned().collect::<Vec<_>>()
-            } else { vec![] },
+            "callees": nodes.iter()
+                .filter(|n| n["direction"].as_str() == Some("callees") && n["depth"].as_i64().unwrap_or(0) > 0)
+                .cloned().collect::<Vec<_>>(),
+            "callers": nodes.iter()
+                .filter(|n| n["direction"].as_str() == Some("callers") && n["depth"].as_i64().unwrap_or(0) > 0)
+                .cloned().collect::<Vec<_>>(),
         }))
     }
 
@@ -599,7 +606,6 @@ impl McpServer {
             DELETE FROM nodes;
             DELETE FROM files;
             DELETE FROM context_sandbox;
-            DELETE FROM merkle_state;
         ")?;
 
         let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;

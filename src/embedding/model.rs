@@ -1,68 +1,59 @@
-use anyhow::Result;
-use candle_core::{Device, DType, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
-use tokenizers::Tokenizer;
-
 pub const EMBEDDING_DIM: usize = 384;
 
-pub struct EmbeddingModel {
-    model: BertModel,
-    tokenizer: Tokenizer,
-    device: Device,
-}
+#[cfg(feature = "embed-model")]
+mod inner {
+    use anyhow::Result;
+    use candle_core::{Device, DType, Tensor};
+    use candle_nn::VarBuilder;
+    use candle_transformers::models::bert::{BertModel, Config};
+    use tokenizers::Tokenizer;
 
-impl EmbeddingModel {
-    /// Load the embedding model. Returns Ok(None) if model files are not available
-    /// (graceful degradation to FTS5-only search).
-    pub fn load() -> Result<Option<Self>> {
-        match Self::try_load() {
-            Ok(m) => {
-                tracing::info!("Embedding model loaded successfully");
-                Ok(Some(m))
-            }
-            Err(e) => {
-                tracing::warn!("Embedding model not available, falling back to FTS5-only: {}", e);
-                Ok(None)
-            }
-        }
+    pub struct EmbeddingModel {
+        model: BertModel,
+        tokenizer: Tokenizer,
+        device: Device,
     }
 
-    fn try_load() -> Result<Self> {
-        let device = Device::Cpu;
-
-        let (model_data, tokenizer_data, config_data) = Self::load_model_data()?;
-
-        let config: Config = serde_json::from_slice(&config_data)?;
-        let vb = VarBuilder::from_buffered_safetensors(model_data, DType::F32, &device)?;
-        let model = BertModel::load(vb, &config)?;
-
-        let mut tokenizer = Tokenizer::from_bytes(&tokenizer_data)
-            .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))?;
-
-        // Truncate to 128 tokens — sufficient for code context strings
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: 128,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("truncation config error: {}", e))?;
-
-        Ok(Self { model, tokenizer, device })
-    }
-
-    fn load_model_data() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        #[cfg(feature = "embed-model")]
-        {
-            Ok((
-                include_bytes!("../../models/model.safetensors").to_vec(),
-                include_bytes!("../../models/tokenizer.json").to_vec(),
-                include_bytes!("../../models/config.json").to_vec(),
-            ))
+    impl EmbeddingModel {
+        /// Load the embedding model. Returns Ok(None) if model files are not available
+        /// (graceful degradation to FTS5-only search).
+        pub fn load() -> Result<Option<Self>> {
+            match Self::try_load() {
+                Ok(m) => {
+                    tracing::info!("Embedding model loaded successfully");
+                    Ok(Some(m))
+                }
+                Err(e) => {
+                    tracing::warn!("Embedding model not available, falling back to FTS5-only: {}", e);
+                    Ok(None)
+                }
+            }
         }
 
-        #[cfg(not(feature = "embed-model"))]
-        {
+        fn try_load() -> Result<Self> {
+            let device = Device::Cpu;
+
+            let (model_data, tokenizer_data, config_data) = Self::load_model_data()?;
+
+            let config: Config = serde_json::from_slice(&config_data)?;
+            let vb = VarBuilder::from_buffered_safetensors(model_data, DType::F32, &device)?;
+            let model = BertModel::load(vb, &config)?;
+
+            let mut tokenizer = Tokenizer::from_bytes(&tokenizer_data)
+                .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))?;
+
+            // Truncate to 128 tokens — sufficient for code context strings
+            tokenizer
+                .with_truncation(Some(tokenizers::TruncationParams {
+                    max_length: 128,
+                    ..Default::default()
+                }))
+                .map_err(|e| anyhow::anyhow!("truncation config error: {}", e))?;
+
+            Ok(Self { model, tokenizer, device })
+        }
+
+        fn load_model_data() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
             let models_dir = Self::find_models_dir()?;
             Ok((
                 std::fs::read(models_dir.join("model.safetensors"))?,
@@ -70,68 +61,90 @@ impl EmbeddingModel {
                 std::fs::read(models_dir.join("config.json"))?,
             ))
         }
-    }
 
-    #[cfg(not(feature = "embed-model"))]
-    fn find_models_dir() -> Result<std::path::PathBuf> {
-        // Check relative to current working directory (dev environment)
-        let cwd = std::env::current_dir()?;
-        let models = cwd.join("models");
-        if models.join("model.safetensors").exists() {
-            return Ok(models);
-        }
+        fn find_models_dir() -> Result<std::path::PathBuf> {
+            // Check relative to current working directory (dev environment)
+            let cwd = std::env::current_dir()?;
+            let models = cwd.join("models");
+            if models.join("model.safetensors").exists() {
+                return Ok(models);
+            }
 
-        // Check relative to executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let models = exe_dir.join("models");
+            // Check relative to executable
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    let models = exe_dir.join("models");
+                    if models.join("model.safetensors").exists() {
+                        return Ok(models);
+                    }
+                }
+            }
+
+            // Check CARGO_MANIFEST_DIR (for cargo test)
+            if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+                let models = std::path::PathBuf::from(manifest).join("models");
                 if models.join("model.safetensors").exists() {
                     return Ok(models);
                 }
             }
+
+            anyhow::bail!("Model files not found in models/ directory")
         }
 
-        // Check CARGO_MANIFEST_DIR (for cargo test)
-        if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-            let models = std::path::PathBuf::from(manifest).join("models");
-            if models.join("model.safetensors").exists() {
-                return Ok(models);
-            }
+        /// Generate a 384-dim embedding for a single text.
+        pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            let encoding = self.tokenizer.encode(text, true)
+                .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))?;
+
+            let ids = encoding.get_ids();
+            let type_ids = encoding.get_type_ids();
+
+            let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
+            let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
+
+            let embeddings = self.model.forward(&input_ids, &token_type_ids, None)?;
+
+            // Mean pooling: average across token dimension
+            let (_batch, n_tokens, _hidden) = embeddings.dims3()?;
+            let pooled = (embeddings.sum(1)? / (n_tokens as f64))?;
+            let pooled = pooled.squeeze(0)?;
+
+            let mut result: Vec<f32> = pooled.to_vec1()?;
+            super::l2_normalize(&mut result);
+
+            Ok(result)
         }
 
-        anyhow::bail!("Model files not found in models/ directory")
-    }
-
-    /// Generate a 384-dim embedding for a single text.
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let encoding = self.tokenizer.encode(text, true)
-            .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))?;
-
-        let ids = encoding.get_ids();
-        let type_ids = encoding.get_type_ids();
-
-        let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
-        let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
-
-        let embeddings = self.model.forward(&input_ids, &token_type_ids, None)?;
-
-        // Mean pooling: average across token dimension
-        let (_batch, n_tokens, _hidden) = embeddings.dims3()?;
-        let pooled = (embeddings.sum(1)? / (n_tokens as f64))?;
-        let pooled = pooled.squeeze(0)?;
-
-        let mut result: Vec<f32> = pooled.to_vec1()?;
-        l2_normalize(&mut result);
-
-        Ok(result)
-    }
-
-    /// Generate embeddings for multiple texts (sequential, no padding needed).
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
+        /// Generate embeddings for multiple texts (sequential, no padding needed).
+        pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
     }
 }
 
+#[cfg(feature = "embed-model")]
+pub use inner::EmbeddingModel;
+
+#[cfg(not(feature = "embed-model"))]
+pub struct EmbeddingModel;
+
+#[cfg(not(feature = "embed-model"))]
+impl EmbeddingModel {
+    pub fn load() -> anyhow::Result<Option<Self>> {
+        tracing::info!("Embedding model support not compiled (enable 'embed-model' feature), falling back to FTS5-only");
+        Ok(None)
+    }
+
+    pub fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        unreachable!("EmbeddingModel::embed called without embed-model feature")
+    }
+
+    pub fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        unreachable!("EmbeddingModel::embed_batch called without embed-model feature")
+    }
+}
+
+#[cfg_attr(not(feature = "embed-model"), allow(dead_code))]
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -155,6 +168,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed-model")]
     #[test]
     fn test_embed_produces_correct_dims() {
         let model = EmbeddingModel::load().unwrap();
@@ -168,6 +182,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed-model")]
     #[test]
     fn test_embed_batch() {
         let model = EmbeddingModel::load().unwrap();
@@ -181,6 +196,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed-model")]
     #[test]
     fn test_similar_texts_closer() {
         let model = EmbeddingModel::load().unwrap();
@@ -200,7 +216,7 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "embed-model")]
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }

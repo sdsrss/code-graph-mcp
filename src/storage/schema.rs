@@ -73,12 +73,6 @@ CREATE TABLE IF NOT EXISTS context_sandbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sandbox_query ON context_sandbox(query_hash);
-
-CREATE TABLE IF NOT EXISTS merkle_state (
-    dir_path    TEXT PRIMARY KEY,
-    tree_hash   TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
-);
 "#;
 
 pub const CREATE_VEC_TABLES: &str = r#"
