@@ -103,6 +103,42 @@ fn walk_for_relations(
             }
         }
 
+        // Rust: use std::collections::HashMap;
+        "use_declaration" => {
+            let text = node_text(&node, source).trim().trim_end_matches(';').to_string();
+            if let Some(name) = text.rsplit("::").next() {
+                // Skip glob imports like `use foo::*`
+                if name != "*" && !name.is_empty() {
+                    let clean_name = name.trim();
+                    if !clean_name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: active_scope.unwrap_or("<module>").to_string(),
+                            target_name: clean_name.to_string(),
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Go: import "fmt" or import alias "fmt"
+        "import_spec" => {
+            if let Some(path_node) = node.child_by_field_name("path") {
+                let path_text = node_text(&path_node, source).trim_matches('"').to_string();
+                if let Some(pkg_name) = path_text.rsplit('/').next() {
+                    if !pkg_name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: active_scope.unwrap_or("<module>").to_string(),
+                            target_name: pkg_name.to_string(),
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // Python decorated definitions (for Flask/FastAPI route decorators)
         "decorated_definition" => {
             if let Some(route_rel) = extract_python_route(&node, source) {
@@ -464,20 +500,26 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
     // Get the decorator expression text
     let dec_text = node_text(&dec, source);
 
-    // Match patterns like @app.route('/path') or @app.get('/path')
-    if !dec_text.contains("route") && !dec_text.contains("get") && !dec_text.contains("post")
-       && !dec_text.contains("put") && !dec_text.contains("delete") {
+    // Check for route-like decorator patterns (e.g., @app.route, @app.get, @bp.post)
+    if !dec_text.contains(".route(")
+        && !dec_text.contains(".route\"")
+        && !dec_text.contains(".get(")
+        && !dec_text.contains(".post(")
+        && !dec_text.contains(".put(")
+        && !dec_text.contains(".delete(")
+        && !dec_text.contains(".patch(") {
         return None;
     }
 
     // Extract path from decorator arguments
     let path = extract_string_from_subtree(&dec, source)?;
 
-    let method = if dec_text.contains(".get(") || dec_text.contains(".get\"") { "GET" }
+    let method = if dec_text.contains(".get(") { "GET" }
         else if dec_text.contains(".post(") { "POST" }
         else if dec_text.contains(".put(") { "PUT" }
         else if dec_text.contains(".delete(") { "DELETE" }
-        else { "ALL" };
+        else if dec_text.contains(".patch(") { "PATCH" }
+        else { "ANY" };
 
     let metadata = serde_json::json!({"method": method, "path": path}).to_string();
 
@@ -633,6 +675,75 @@ def get_users():
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(inherits.contains(&"Animal"), "got: {:?}", inherits);
+    }
+
+    #[test]
+    fn test_extract_rust_use_imports() {
+        let source = r#"
+use std::collections::HashMap;
+use anyhow::Result;
+
+fn main() {
+    let m: HashMap<String, String> = HashMap::new();
+}
+"#;
+        let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+        let relations = extract_relations_from_tree(&tree, source, "rust");
+        let imports: Vec<&ParsedRelation> = relations.iter().filter(|r| r.relation == REL_IMPORTS).collect();
+        assert!(imports.iter().any(|r| r.target_name == "HashMap"), "should import HashMap, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+        assert!(imports.iter().any(|r| r.target_name == "Result"), "should import Result, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_extract_go_import_relations() {
+        let source = r#"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    fmt.Println("hello")
+}
+"#;
+        let tree = crate::parser::treesitter::parse_tree(source, "go").unwrap();
+        let relations = extract_relations_from_tree(&tree, source, "go");
+        let imports: Vec<&ParsedRelation> = relations.iter().filter(|r| r.relation == REL_IMPORTS).collect();
+        assert!(imports.iter().any(|r| r.target_name == "fmt"), "should import fmt, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+        assert!(imports.iter().any(|r| r.target_name == "http"), "should import http, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_python_route_no_false_positive_on_getter() {
+        // A decorator containing "get" as substring (e.g., @target) should NOT be detected as a route
+        let code = r#"
+@cache_target('/dashboard')
+def get_dashboard():
+    return render_template('dashboard.html')
+"#;
+        let relations = extract_relations(code, "python").unwrap();
+        let routes: Vec<&ParsedRelation> = relations.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .collect();
+        assert!(routes.is_empty(), "should not detect route from @login_required, got: {:?}", routes.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_python_route_detects_dotted_pattern() {
+        // @app.get('/path') should still be detected
+        let code = r#"
+@app.get('/api/items')
+def list_items():
+    return items
+"#;
+        let relations = extract_relations(code, "python").unwrap();
+        let routes: Vec<&ParsedRelation> = relations.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .collect();
+        assert!(!routes.is_empty(), "should detect route from @app.get, got no routes");
+        assert!(routes[0].target_name == "list_items", "target should be list_items");
     }
 
     #[test]
