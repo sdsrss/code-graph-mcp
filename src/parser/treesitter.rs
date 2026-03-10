@@ -430,4 +430,28 @@ class UserService {
         let nodes = parse_code(code, "c").unwrap();
         assert!(nodes.iter().any(|n| n.name == "main"), "got: {:?}", nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn test_parse_tsx_jsx_syntax() {
+        // Use generic arrow + JSX — the TS parser misparses <T> as JSX tag,
+        // only the TSX grammar handles the ambiguity correctly.
+        let code = r#"
+function App() {
+    return <div className="app"><span>hello</span></div>;
+}
+
+function Container() {
+    const items = [1, 2, 3];
+    return (
+        <ul>
+            {items.map(i => <li key={i}>{i}</li>)}
+        </ul>
+    );
+}
+"#;
+        let nodes = parse_code(code, "tsx").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"App"), "TSX function with JSX should be parsed, got: {:?}", names);
+        assert!(names.contains(&"Container"), "TSX function with complex JSX should be parsed, got: {:?}", names);
+    }
 }

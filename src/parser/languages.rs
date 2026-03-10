@@ -2,7 +2,8 @@ use tree_sitter::Language;
 
 pub fn get_language(name: &str) -> Option<Language> {
     match name {
-        "typescript" | "tsx" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "javascript" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),

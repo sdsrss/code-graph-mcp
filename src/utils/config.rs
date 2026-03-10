@@ -9,7 +9,8 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
     let ext = &filename[dot_pos + 1..];
     match ext {
         "rs" => Some("rust"),
-        "ts" | "tsx" => Some("typescript"),
+        "ts" => Some("typescript"),
+        "tsx" => Some("tsx"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
         "go" => Some("go"),
         "py" | "pyi" => Some("python"),
@@ -30,7 +31,7 @@ mod tests {
     fn test_detect_language_from_extension() {
         assert_eq!(detect_language("src/main.rs"), Some("rust"));
         assert_eq!(detect_language("app.ts"), Some("typescript"));
-        assert_eq!(detect_language("app.tsx"), Some("typescript"));
+        assert_eq!(detect_language("app.tsx"), Some("tsx"));
         assert_eq!(detect_language("index.js"), Some("javascript"));
         assert_eq!(detect_language("main.go"), Some("go"));
         assert_eq!(detect_language("app.py"), Some("python"));
