@@ -13,5 +13,8 @@ models/
 .*
 !.gitignore
 
+# Documentation (local only)
+docs/
+
 # AI assistant config
 CLAUDE.md
