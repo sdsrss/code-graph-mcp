@@ -88,29 +88,47 @@ fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<Has
 
 /// Regenerate context strings (and embeddings) for the given set of dirty nodes.
 fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Option<&EmbeddingModel>) -> Result<()> {
+    let id_vec: Vec<i64> = dirty_ids.iter().copied().collect();
+    let all_edges = get_edges_batch(db.conn(), &id_vec)?;
+    let all_nodes: HashMap<i64, (NodeResult, String)> = {
+        let nwfs = get_nodes_with_files_by_ids(db.conn(), &id_vec)?;
+        nwfs.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path))).collect()
+    };
+
     for &node_id in dirty_ids {
-        if let Some(node) = get_node_by_id(db.conn(), node_id)? {
-            let file_path = get_file_path(db.conn(), node.file_id)?
-                .unwrap_or_default();
+        if let Some((node, file_path)) = all_nodes.get(&node_id) {
+            let edges = all_edges.get(&node_id);
 
-            let callees = get_edge_target_names(db.conn(), node_id, REL_CALLS)?;
-            let callers = get_edge_source_names(db.conn(), node_id, REL_CALLS)?;
-            let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
-            let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
+            let mut callees = Vec::new();
+            let mut callers = Vec::new();
+            let mut inherits = Vec::new();
+            let mut routes = Vec::new();
+            let mut imports = Vec::new();
 
-            let imports = get_edge_target_names(db.conn(), node_id, REL_IMPORTS)?;
+            if let Some(edge_list) = edges {
+                for (relation, direction, name) in edge_list {
+                    match (relation.as_str(), direction.as_str()) {
+                        (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
+                        (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
+                        (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
+                        (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
+                        (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
+                        _ => {}
+                    }
+                }
+            }
 
             let ctx = build_context_string(&NodeContext {
-                node_type: node.node_type,
-                name: node.name,
-                file_path,
-                signature: node.signature,
+                node_type: node.node_type.clone(),
+                name: node.name.clone(),
+                file_path: file_path.clone(),
+                signature: node.signature.clone(),
                 routes,
                 callees,
                 callers,
                 inherits,
                 imports,
-                doc_comment: node.doc_comment,
+                doc_comment: node.doc_comment.clone(),
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
@@ -145,6 +163,7 @@ fn index_files(
         source: String,
         language: String,
         tree: tree_sitter::Tree,
+        file_id: i64,
         node_ids: Vec<i64>,
         node_names: Vec<String>,
     }
@@ -229,6 +248,7 @@ fn index_files(
             source,
             language: language.to_string(),
             tree,
+            file_id,
             node_ids,
             node_names,
         });
@@ -242,8 +262,9 @@ fn index_files(
             name_to_ids.entry(name.clone()).or_default().push(*id);
         }
     }
-    // Also include existing nodes not being re-indexed
-    let all_existing = get_all_node_names(db.conn())?;
+    // Also include existing nodes not being re-indexed (exclude files we just re-indexed)
+    let indexed_file_ids: Vec<i64> = parsed_files.iter().map(|pf| pf.file_id).collect();
+    let all_existing = get_node_names_excluding_files(db.conn(), &indexed_file_ids)?;
     for (name, id) in &all_existing {
         name_to_ids.entry(name.clone()).or_default().push(*id);
     }
@@ -292,36 +313,58 @@ fn index_files(
         }
     }
 
-    // Phase 3: Build context strings and update nodes
+    // Commit core data (Phases 0-2), then start new transaction for Phase 3.
+    // This releases the write lock so search queries can access fresh node/edge data,
+    // and embedding CPU time doesn't hold a write lock.
+    db.conn().execute_batch("COMMIT")?;
+    db.conn().execute_batch("BEGIN")?;
+
+    // Phase 3: Build context strings and update nodes (batch edge fetch)
+    let all_node_ids: Vec<i64> = parsed_files.iter().flat_map(|pf| pf.node_ids.iter().copied()).collect();
+    let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
+    // Batch-fetch node details for signature/doc
+    let all_node_details: HashMap<i64, NodeResult> = {
+        let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
+        nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
+    };
+
     for pf in &parsed_files {
         for (idx, &node_id) in pf.node_ids.iter().enumerate() {
             let node_name = &pf.node_names[idx];
+            let edges = all_edges.get(&node_id);
 
-            // Get callees (this node calls -> targets)
-            let callees = get_edge_target_names(db.conn(), node_id, REL_CALLS)?;
-            // Get callers (other nodes -> call this node)
-            let callers = get_edge_source_names(db.conn(), node_id, REL_CALLS)?;
-            // Get inheritance
-            let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
-            // Get routes
-            let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
-            // Get imports
-            let imports = get_edge_target_names(db.conn(), node_id, REL_IMPORTS)?;
+            let mut callees = Vec::new();
+            let mut callers = Vec::new();
+            let mut inherits = Vec::new();
+            let mut routes = Vec::new();
+            let mut imports = Vec::new();
 
-            // Get node details for signature/doc
-            let node_detail = get_node_by_id(db.conn(), node_id)?;
+            if let Some(edge_list) = edges {
+                for (relation, direction, name) in edge_list {
+                    match (relation.as_str(), direction.as_str()) {
+                        (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
+                        (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
+                        (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
+                        (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
+                        (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
+                        _ => {}
+                    }
+                }
+            }
+
+            let node_detail = all_node_details.get(&node_id);
 
             let ctx = build_context_string(&NodeContext {
-                node_type: node_detail.as_ref().map(|n| n.node_type.clone()).unwrap_or_default(),
+                node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
                 name: node_name.clone(),
                 file_path: pf.rel_path.clone(),
-                signature: node_detail.as_ref().and_then(|n| n.signature.clone()),
+                signature: node_detail.and_then(|n| n.signature.clone()),
                 routes,
                 callees,
                 callers,
                 inherits,
                 imports,
-                doc_comment: node_detail.as_ref().and_then(|n| n.doc_comment.clone()),
+                doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;

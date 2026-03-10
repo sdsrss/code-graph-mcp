@@ -241,6 +241,21 @@ pub fn get_all_node_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
     Ok(results)
 }
 
+pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64]) -> Result<Vec<(String, i64)>> {
+    if exclude_file_ids.is_empty() {
+        return get_all_node_names(conn);
+    }
+    let placeholders = make_placeholders(1, exclude_file_ids.len());
+    let sql = format!("SELECT name, id FROM nodes WHERE file_id NOT IN ({})", placeholders);
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = exclude_file_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.target_id
@@ -263,6 +278,48 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Batch-fetch all edge names for a set of node IDs, grouped by (node_id, direction, relation).
+/// Returns: HashMap<i64, Vec<(String, String, String)>> where tuple is (relation, direction, target_name)
+/// direction is "out" for outgoing edges (source=node), "in" for incoming edges (target=node)
+pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, Vec<(String, String, String)>>> {
+    if node_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut result: HashMap<i64, Vec<(String, String, String)>> = HashMap::new();
+
+    // Outgoing edges: node is source
+    let placeholders = make_placeholders(1, node_ids.len());
+    let sql_out = format!(
+        "SELECT e.source_id, e.relation, n.name FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
+        placeholders
+    );
+    let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let mut stmt = conn.prepare(&sql_out)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (source_id, relation, name) = row?;
+        result.entry(source_id).or_default().push((relation, "out".into(), name));
+    }
+
+    // Incoming edges: node is target
+    let sql_in = format!(
+        "SELECT e.target_id, e.relation, n.name FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql_in)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (target_id, relation, name) = row?;
+        result.entry(target_id).or_default().push((relation, "in".into(), name));
+    }
+
+    Ok(result)
 }
 
 // --- Vector operations ---
