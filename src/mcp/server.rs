@@ -1,20 +1,27 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::indexer::pipeline::{run_full_index, run_incremental_index};
+use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::rrf_fusion;
 use crate::storage::db::Database;
 use crate::storage::queries;
+
+struct WatcherState {
+    _watcher: FileWatcher,
+    receiver: mpsc::Receiver<WatchEvent>,
+}
 
 pub struct McpServer {
     registry: ToolRegistry,
     db: Arc<Database>,
     project_root: Option<PathBuf>,
     indexed: Mutex<bool>,
+    watcher: Mutex<Option<WatcherState>>,
 }
 
 impl McpServer {
@@ -25,6 +32,7 @@ impl McpServer {
             db: Arc::new(db),
             project_root: project_root.map(PathBuf::from),
             indexed: Mutex::new(false),
+            watcher: Mutex::new(None),
         })
     }
 
@@ -54,6 +62,7 @@ impl McpServer {
             db: Arc::new(db),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
+            watcher: Mutex::new(None),
         })
     }
 
@@ -65,6 +74,7 @@ impl McpServer {
             db: Arc::new(db),
             project_root: None,
             indexed: Mutex::new(false),
+            watcher: Mutex::new(None),
         }
     }
 
@@ -78,6 +88,7 @@ impl McpServer {
             db: Arc::new(db),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
+            watcher: Mutex::new(None),
         }
     }
 
@@ -86,6 +97,7 @@ impl McpServer {
     }
 
     /// Ensure index is up-to-date. On first call, runs full index.
+    /// If watcher is active, checks for pending events to decide if incremental needed.
     fn ensure_indexed(&self) -> Result<()> {
         let project_root = match &self.project_root {
             Some(p) => p.clone(),
@@ -97,9 +109,41 @@ impl McpServer {
             run_full_index(&self.db, &project_root)?;
             *indexed = true;
         } else {
-            run_incremental_index(&self.db, &project_root)?;
+            // Check if watcher detected changes
+            let has_changes = self.drain_watcher_events();
+            if has_changes {
+                run_incremental_index(&self.db, &project_root)?;
+            } else {
+                // No watcher or no events: still run incremental (cheap if nothing changed)
+                let watcher_guard = self.watcher.lock().unwrap();
+                if watcher_guard.is_none() {
+                    // No watcher active — fall back to incremental check
+                    run_incremental_index(&self.db, &project_root)?;
+                }
+                // Watcher active but no events → index is up-to-date, skip
+            }
         }
         Ok(())
+    }
+
+    /// Drain all pending events from the watcher receiver.
+    /// Returns true if any file change events were received.
+    fn drain_watcher_events(&self) -> bool {
+        let watcher_guard = self.watcher.lock().unwrap();
+        if let Some(ref state) = *watcher_guard {
+            let mut has_changes = false;
+            while state.receiver.try_recv().is_ok() {
+                has_changes = true;
+            }
+            has_changes
+        } else {
+            false
+        }
+    }
+
+    /// Returns whether the file watcher is currently active.
+    fn is_watching(&self) -> bool {
+        self.watcher.lock().unwrap().is_some()
     }
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
@@ -389,14 +433,39 @@ impl McpServer {
     }
 
     fn tool_start_watch(&self) -> Result<serde_json::Value> {
-        // File watching requires async runtime — return info for now
+        let project_root = self.project_root.as_ref()
+            .ok_or_else(|| anyhow!("No project root configured"))?;
+
+        let mut watcher_guard = self.watcher.lock().unwrap();
+        if watcher_guard.is_some() {
+            return Ok(json!({
+                "status": "already_watching",
+                "message": "File watcher is already running"
+            }));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let fw = FileWatcher::start(project_root, tx)?;
+        *watcher_guard = Some(WatcherState {
+            _watcher: fw,
+            receiver: rx,
+        });
+
         Ok(json!({
             "status": "watching",
-            "message": "File watcher started (incremental indexing will run on next tool call)"
+            "message": "File watcher started. Changes will be detected and indexed on next tool call."
         }))
     }
 
     fn tool_stop_watch(&self) -> Result<serde_json::Value> {
+        let mut watcher_guard = self.watcher.lock().unwrap();
+        if watcher_guard.is_none() {
+            return Ok(json!({
+                "status": "not_watching",
+                "message": "File watcher was not running"
+            }));
+        }
+        *watcher_guard = None; // Drops the FileWatcher, stopping it
         Ok(json!({
             "status": "stopped",
             "message": "File watcher stopped"
@@ -404,7 +473,8 @@ impl McpServer {
     }
 
     fn tool_get_index_status(&self) -> Result<serde_json::Value> {
-        let status = queries::get_index_status(self.db.conn())?;
+        let mut status = queries::get_index_status(self.db.conn())?;
+        status.is_watching = self.is_watching();
         Ok(serde_json::to_value(&status)?)
     }
 
@@ -644,6 +714,80 @@ function handleLogin(req: Request) {
         let result = parse_tool_result(&resp);
         assert_eq!(result["status"], "rebuilt");
         assert!(result["files_indexed"].as_i64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_start_stop_watch() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("a.ts"), "function a() {}").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // Start watching
+        let req = tool_call_json("start_watch", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["status"], "watching");
+        assert!(server.is_watching());
+
+        // Starting again should say already watching
+        let req = tool_call_json("start_watch", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["status"], "already_watching");
+
+        // Status should reflect watching
+        let req = tool_call_json("get_index_status", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["is_watching"], true);
+
+        // Stop watching
+        let req = tool_call_json("stop_watch", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["status"], "stopped");
+        assert!(!server.is_watching());
+
+        // Stopping again should say not watching
+        let req = tool_call_json("stop_watch", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["status"], "not_watching");
+    }
+
+    #[test]
+    fn test_watcher_detects_changes_and_reindexes() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("a.ts"), "function original() {}").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // Initial index
+        server.ensure_indexed().unwrap();
+
+        // Verify original is indexed
+        let nodes = queries::get_nodes_by_name(server.db().conn(), "original").unwrap();
+        assert_eq!(nodes.len(), 1);
+
+        // Start watching
+        let req = tool_call_json("start_watch", json!({}));
+        let _ = server.handle_message(&req).unwrap();
+
+        // Modify file
+        std::fs::write(project_dir.path().join("a.ts"), "function changed() {}").unwrap();
+
+        // Give watcher time to detect change
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Next ensure_indexed should detect change via watcher and run incremental
+        server.ensure_indexed().unwrap();
+
+        // Verify changed is now indexed
+        let nodes = queries::get_nodes_by_name(server.db().conn(), "changed").unwrap();
+        assert_eq!(nodes.len(), 1, "changed function should be indexed after watcher-triggered reindex");
+
+        // Stop watching
+        let req = tool_call_json("stop_watch", json!({}));
+        let _ = server.handle_message(&req).unwrap();
     }
 
     #[test]
