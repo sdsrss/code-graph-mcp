@@ -17,6 +17,13 @@ struct WatcherState {
     receiver: mpsc::Receiver<WatchEvent>,
 }
 
+/// Debounce interval for no-watcher incremental checks.
+/// In tests, use 0s so incremental checks always run immediately.
+#[cfg(not(test))]
+const INCREMENTAL_DEBOUNCE_SECS: u64 = 30;
+#[cfg(test)]
+const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
+
 /// MCP server for code graph operations. Single-threaded (stdio loop).
 pub struct McpServer {
     registry: ToolRegistry,
@@ -25,6 +32,7 @@ pub struct McpServer {
     project_root: Option<PathBuf>,
     indexed: Mutex<bool>,
     watcher: Mutex<Option<WatcherState>>,
+    last_incremental_check: Mutex<std::time::Instant>,
 }
 
 impl McpServer {
@@ -67,6 +75,7 @@ impl McpServer {
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
+            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
         })
     }
 
@@ -80,6 +89,7 @@ impl McpServer {
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
+            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
         }
     }
 
@@ -95,6 +105,7 @@ impl McpServer {
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
+            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
         }
     }
 
@@ -127,8 +138,13 @@ impl McpServer {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
                 let has_watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                 if !has_watcher {
-                    // No watcher active — fall back to incremental check
-                    run_incremental_index(&self.db, &project_root, model)?;
+                    // No watcher active — debounce to avoid rescanning on every tool call
+                    let mut last_check = self.last_incremental_check.lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
+                        run_incremental_index(&self.db, &project_root, model)?;
+                        *last_check = std::time::Instant::now();
+                    }
                 }
                 // Watcher active but no events → index is up-to-date, skip
             }
@@ -1095,5 +1111,46 @@ app.post('/api/login', handleLogin);
         assert_eq!(result["route"], "/api/login");
         // handlers array should exist
         assert!(result["handlers"].is_array());
+    }
+
+    #[test]
+    fn test_semantic_search_clamps_top_k() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("small.ts"),
+            "function hello() { return 1; }\n",
+        ).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        // Request absurdly large top_k — should not error, just return clamped results
+        let req = tool_call_json("semantic_code_search", json!({
+            "query": "hello",
+            "top_k": 999999
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        // Should succeed (array or compressed mode) — not crash or OOM
+        assert!(result.is_array() || result["mode"].as_str() == Some("compressed"),
+            "search with huge top_k should return valid results, got: {}", result);
+    }
+
+    #[test]
+    fn test_read_snippet_handles_missing_node() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("a.ts"),
+            "function exists() { return 1; }\n",
+        ).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        // Request a non-existent node_id — should return error gracefully, not panic
+        let req = tool_call_json("read_snippet", json!({"node_id": 999999}));
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Error") || text.contains("not found"),
+            "missing node should return error message, got: {}", text);
     }
 }
