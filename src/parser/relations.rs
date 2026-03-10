@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Result};
-use super::languages::get_language;
+use anyhow::Result;
 use super::node_text;
 use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO};
 
@@ -11,16 +10,15 @@ pub struct ParsedRelation {
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
-    let lang = get_language(language)
-        .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&lang)?;
-    let tree = parser.parse(source, None)
-        .ok_or_else(|| anyhow!("parse failed"))?;
+    let tree = super::treesitter::parse_tree(source, language)?;
+    Ok(extract_relations_from_tree(&tree, source, language))
+}
 
+/// Extract relations from a pre-parsed tree (avoids re-parsing).
+pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     walk_for_relations(tree.root_node(), source, language, None, &mut relations);
-    Ok(relations)
+    relations
 }
 
 fn walk_for_relations(
@@ -173,7 +171,7 @@ fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &m
             results.push(ParsedRelation {
                 source_name: "<module>".into(),
                 target_name: name,
-                relation: "imports".into(),
+                relation: REL_IMPORTS.into(),
                 metadata: None,
             });
         }
@@ -199,7 +197,7 @@ fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, result
             results.push(ParsedRelation {
                 source_name: "<module>".into(),
                 target_name: name,
-                relation: "imports".into(),
+                relation: REL_IMPORTS.into(),
                 metadata: None,
             });
         }
@@ -215,7 +213,10 @@ fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, result
 fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> {
     // Look for "extends" clause / superclass
     for i in 0..node.named_child_count() {
-        let child = node.named_child(i)?;
+        let child = match node.named_child(i) {
+            Some(c) => c,
+            None => continue,
+        };
         match child.kind() {
             "class_heritage" | "extends_clause" => {
                 // TS/JS: class_heritage -> extends_clause -> type_identifier

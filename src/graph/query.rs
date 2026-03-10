@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
+use crate::storage::schema::REL_CALLS;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Callees,
@@ -70,11 +72,11 @@ fn query_direction(
     // - callers: follow edges backward (target_id = current, source_id = next)
     let (edge_join, next_node_join) = match direction {
         Direction::Callees => (
-            "JOIN edges e ON e.source_id = cg.node_id AND e.relation = 'calls'",
+            "JOIN edges e ON e.source_id = cg.node_id AND e.relation = ?4",
             "JOIN nodes t ON t.id = e.target_id",
         ),
         Direction::Callers => (
-            "JOIN edges e ON e.target_id = cg.node_id AND e.relation = 'calls'",
+            "JOIN edges e ON e.target_id = cg.node_id AND e.relation = ?4",
             "JOIN nodes t ON t.id = e.source_id",
         ),
     };
@@ -119,7 +121,7 @@ fn query_direction(
     };
 
     let results: Vec<CallGraphNode> = stmt
-        .query_map(rusqlite::params![function_name, file_path_param, max_depth], map_row)?
+        .query_map(rusqlite::params![function_name, file_path_param, max_depth, REL_CALLS], map_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -151,6 +153,7 @@ mod tests {
     use super::*;
     use crate::storage::db::Database;
     use crate::storage::queries::{upsert_file, insert_node, insert_edge, FileRecord, NodeRecord};
+    use crate::storage::schema::REL_CALLS;
     use tempfile::TempDir;
 
     fn test_db() -> (Database, TempDir) {
@@ -193,9 +196,9 @@ mod tests {
         let c = insert_node(conn, &node("C", fid)).unwrap();
         let d = insert_node(conn, &node("D", fid)).unwrap();
 
-        insert_edge(conn, a, b, "calls", None).unwrap();
-        insert_edge(conn, b, c, "calls", None).unwrap();
-        insert_edge(conn, d, b, "calls", None).unwrap();
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, b, c, REL_CALLS, None).unwrap();
+        insert_edge(conn, d, b, REL_CALLS, None).unwrap();
 
         let result = get_call_graph(conn, "A", "callees", 2, None).unwrap();
 
@@ -233,9 +236,9 @@ mod tests {
         let c = insert_node(conn, &node("C", fid)).unwrap();
         let d = insert_node(conn, &node("D", fid)).unwrap();
 
-        insert_edge(conn, a, b, "calls", None).unwrap();
-        insert_edge(conn, b, c, "calls", None).unwrap();
-        insert_edge(conn, d, b, "calls", None).unwrap();
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, b, c, REL_CALLS, None).unwrap();
+        insert_edge(conn, d, b, REL_CALLS, None).unwrap();
 
         let result = get_call_graph(conn, "B", "callers", 2, None).unwrap();
 
@@ -270,8 +273,8 @@ mod tests {
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
 
-        insert_edge(conn, a, b, "calls", None).unwrap();
-        insert_edge(conn, b, a, "calls", None).unwrap();
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, b, a, REL_CALLS, None).unwrap();
 
         let result = get_call_graph(conn, "A", "callees", 10, None).unwrap();
 
@@ -301,9 +304,9 @@ mod tests {
         let c = insert_node(conn, &node("C", fid)).unwrap();
         let d = insert_node(conn, &node("D", fid)).unwrap();
 
-        insert_edge(conn, a, b, "calls", None).unwrap();
-        insert_edge(conn, b, c, "calls", None).unwrap();
-        insert_edge(conn, d, b, "calls", None).unwrap();
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, b, c, REL_CALLS, None).unwrap();
+        insert_edge(conn, d, b, REL_CALLS, None).unwrap();
 
         let result = get_call_graph(conn, "B", "both", 2, None).unwrap();
 

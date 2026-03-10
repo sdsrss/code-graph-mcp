@@ -108,19 +108,22 @@ impl McpServer {
         };
 
         let model = self.embedding_model.as_ref();
-        let mut indexed = self.indexed.lock().unwrap_or_else(|e| e.into_inner());
-        if !*indexed {
+
+        // Read the indexed flag (short lock scope to avoid holding across I/O)
+        let is_indexed = *self.indexed.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !is_indexed {
             run_full_index(&self.db, &project_root, model)?;
-            *indexed = true;
+            *self.indexed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         } else {
-            // Check if watcher detected changes
+            // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
                 run_incremental_index(&self.db, &project_root, model)?;
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
-                let watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
-                if watcher_guard.is_none() {
+                let has_watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                if !has_watcher {
                     // No watcher active — fall back to incremental check
                     run_incremental_index(&self.db, &project_root, model)?;
                 }
@@ -295,6 +298,14 @@ impl McpServer {
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
         let fused = rrf_fusion(&fts_search, &vec_search, 60, fetch_count as usize);
 
+        // Batch-fetch all candidate nodes with file info (single query instead of N+1)
+        let candidate_ids: Vec<i64> = fused.iter().map(|r| r.node_id).collect();
+        let nodes_with_files = queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
+
+        // Build a lookup by node_id preserving the fused ranking order
+        let mut nwf_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
+            nodes_with_files.iter().map(|nwf| (nwf.node.id, nwf)).collect();
+
         // Collect results with language/node_type filtering
         let mut node_results: Vec<queries::NodeResult> = Vec::new();
         let mut results = Vec::new();
@@ -302,19 +313,17 @@ impl McpServer {
             if results.len() >= top_k as usize {
                 break;
             }
-            if let Some(node) = queries::get_node_by_id(self.db.conn(), r.node_id)? {
+            if let Some(nwf) = nwf_map.remove(&r.node_id) {
+                let node = &nwf.node;
                 // Apply node_type filter
                 if let Some(nt) = node_type_filter {
                     if node.node_type != nt {
                         continue;
                     }
                 }
-                let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
-                    .unwrap_or_default();
                 // Apply language filter
                 if let Some(lang) = language_filter {
-                    let file_lang = queries::get_file_language(self.db.conn(), node.file_id)?;
-                    if file_lang.as_deref() != Some(lang) {
+                    if nwf.language.as_deref() != Some(lang) {
                         continue;
                     }
                 }
@@ -322,14 +331,26 @@ impl McpServer {
                     "node_id": node.id,
                     "name": node.name,
                     "type": node.node_type,
-                    "file_path": file_path,
+                    "file_path": nwf.file_path,
                     "start_line": node.start_line,
                     "end_line": node.end_line,
                     "code_content": node.code_content,
                     "signature": node.signature,
                     "context_string": node.context_string,
                 }));
-                node_results.push(node);
+                node_results.push(queries::NodeResult {
+                    id: node.id,
+                    file_id: node.file_id,
+                    node_type: node.node_type.clone(),
+                    name: node.name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    code_content: node.code_content.clone(),
+                    signature: node.signature.clone(),
+                    doc_comment: node.doc_comment.clone(),
+                    context_string: node.context_string.clone(),
+                });
             }
         }
 
@@ -355,7 +376,7 @@ impl McpServer {
         let function_name = args["function_name"].as_str()
             .ok_or_else(|| anyhow!("function_name is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
-        let depth = args["depth"].as_i64().unwrap_or(2).min(20).max(1) as i32;
+        let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
 
         self.ensure_indexed()?;
@@ -485,7 +506,7 @@ impl McpServer {
     fn tool_read_snippet(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let node_id = args["node_id"].as_i64()
             .ok_or_else(|| anyhow!("node_id is required"))?;
-        let context_lines = args["context_lines"].as_i64().unwrap_or(3);
+        let context_lines = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
 
         let node = queries::get_node_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
@@ -507,8 +528,8 @@ impl McpServer {
             }
             if let Ok(source) = std::fs::read_to_string(&canonical) {
                 let lines: Vec<&str> = source.lines().collect();
-                let start = (node.start_line as usize).saturating_sub(1 + context_lines as usize);
-                let end = ((node.end_line as usize) + context_lines as usize).min(lines.len());
+                let start = (node.start_line as usize).saturating_sub(1 + context_lines);
+                let end = ((node.end_line as usize) + context_lines).min(lines.len());
                 lines[start..end].join("\n")
             } else {
                 node.code_content.clone()
@@ -582,12 +603,14 @@ impl McpServer {
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
-        // Clear all data
+        // Clear all data in a single transaction
         self.db.conn().execute_batch("
+            BEGIN;
             DELETE FROM edges;
             DELETE FROM nodes;
             DELETE FROM files;
             DELETE FROM context_sandbox;
+            COMMIT;
         ")?;
 
         let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;

@@ -8,6 +8,10 @@ use std::collections::HashMap;
 const NODE_SELECT: &str =
     "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string";
 
+/// NODE_SELECT with `n.` table alias prefix on every column (for JOINs).
+const NODE_SELECT_ALIASED: &str =
+    "n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line, n.code_content, n.signature, n.doc_comment, n.context_string";
+
 fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
     Ok(NodeResult {
         id: row.get(0)?,
@@ -201,13 +205,14 @@ pub fn update_context_string(conn: &Connection, node_id: i64, context_string: &s
 
 // --- Edge CRUD ---
 
-pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: &str, metadata: Option<&str>) -> Result<i64> {
+/// Insert an edge, ignoring duplicates. Returns true if a new row was actually inserted.
+pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: &str, metadata: Option<&str>) -> Result<bool> {
     conn.execute(
         "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
          VALUES (?1, ?2, ?3, ?4)",
         (source_id, target_id, relation, metadata),
     )?;
-    Ok(conn.changes() as i64)
+    Ok(conn.changes() > 0)
 }
 
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
@@ -297,8 +302,8 @@ pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResu
 
 pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<NodeResult>> {
     let sql = format!(
-        "SELECT n.{} FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1 ORDER BY n.start_line",
-        NODE_SELECT.replace(", ", ", n.")
+        "SELECT {} FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1 ORDER BY n.start_line",
+        NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([file_path], map_node_row)?;
@@ -349,6 +354,40 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
     Ok(results)
 }
 
+// --- Batch node queries ---
+
+/// Result combining node info with its file path and language (for search results).
+pub struct NodeWithFile {
+    pub node: NodeResult,
+    pub file_path: String,
+    pub language: Option<String>,
+}
+
+/// Batch-fetch nodes with their file path and language by node IDs.
+/// Avoids N+1 queries when loading search results.
+pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<NodeWithFile>> {
+    if node_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = make_placeholders(1, node_ids.len());
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
+        NODE_SELECT_ALIASED, placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        node_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(11)?,
+            language: row.get(12)?,
+        })
+    })?;
+    let results = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
@@ -359,8 +398,8 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         .collect::<Vec<_>>()
         .join(" ");
     let sql = format!(
-        "SELECT n.{} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-        NODE_SELECT.replace(", ", ", n.")
+        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![sanitized, limit], map_node_row)?;

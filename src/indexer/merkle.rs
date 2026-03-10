@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use anyhow::Result;
 use ignore::WalkBuilder;
+
+use crate::utils::config::detect_language;
 
 pub struct DiffResult {
     pub new_files: Vec<String>,
@@ -9,9 +12,18 @@ pub struct DiffResult {
     pub deleted_files: Vec<String>,
 }
 
+/// Hash a file using streaming blake3 (constant memory, handles large files).
 pub fn hash_file(path: &Path) -> Result<String> {
-    let content = std::fs::read(path)?;
-    Ok(blake3::hash(&content).to_hex().to_string())
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
@@ -25,15 +37,18 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 
     for entry in walker {
         let entry = entry?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
-        // Skip .gitignore itself and .git directory entries
-        if let Some(rel) = path.strip_prefix(root).ok() {
+        if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
             // Skip .git files and .gitignore
             if rel_str.starts_with(".git") {
+                continue;
+            }
+            // Only hash files with supported language extensions
+            if detect_language(&rel_str).is_none() {
                 continue;
             }
             let hash = hash_file(path)?;

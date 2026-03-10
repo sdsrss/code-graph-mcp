@@ -13,18 +13,26 @@ pub struct ParsedNode {
     pub doc_comment: Option<String>,
 }
 
-pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
+/// Parse source code into a Tree-sitter tree. Shared by node extraction and relation extraction.
+pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
     let lang = get_language(language)
         .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang)?;
-    let tree = parser.parse(source, None)
-        .ok_or_else(|| anyhow!("parse failed"))?;
-    let root = tree.root_node();
+    parser.parse(source, None)
+        .ok_or_else(|| anyhow!("parse failed"))
+}
 
+pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
+    let tree = parse_tree(source, language)?;
+    Ok(extract_nodes_from_tree(&tree, source, language))
+}
+
+/// Extract nodes from a pre-parsed tree (avoids re-parsing).
+pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
-    extract_nodes(root, source, language, None, &mut nodes);
-    Ok(nodes)
+    extract_nodes(tree.root_node(), source, language, None, &mut nodes);
+    nodes
 }
 
 fn extract_nodes(
@@ -75,8 +83,8 @@ fn extract_nodes(
             }
         }
 
-        // Arrow functions (TS/JS)
-        "lexical_declaration" => {
+        // Arrow functions (TS/JS): covers const/let (lexical) and var (variable)
+        "lexical_declaration" | "variable_declaration" => {
             if let Some(parsed) = extract_named_arrow(&node, source) {
                 results.push(parsed);
             }

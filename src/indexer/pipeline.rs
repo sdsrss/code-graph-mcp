@@ -5,8 +5,8 @@ use std::path::Path;
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, hash_file, scan_directory};
-use crate::parser::relations::extract_relations;
-use crate::parser::treesitter::parse_code;
+use crate::parser::relations::extract_relations_from_tree;
+use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::*;
 use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_ROUTES_TO};
@@ -139,13 +139,14 @@ fn index_files(
         rel_path: String,
         source: String,
         language: String,
+        tree: tree_sitter::Tree,
         node_ids: Vec<i64>,
         node_names: Vec<String>,
     }
 
     let mut parsed_files: Vec<FileParsed> = Vec::new();
 
-    // Phase 1: Parse files, insert nodes
+    // Phase 1: Parse files once, extract nodes, insert into DB
     for rel_path in files {
         let abs_path = root.join(rel_path);
         let language = match detect_language(rel_path) {
@@ -161,6 +162,12 @@ fn index_files(
         let source = match std::fs::read_to_string(&abs_path) {
             Ok(s) => s,
             Err(_) => continue,
+        };
+
+        // Parse once — shared by Phase 1 (nodes) and Phase 2 (relations)
+        let tree = match parse_tree(&source, language) {
+            Ok(t) => t,
+            Err(_) => continue, // Skip files that fail to parse
         };
 
         // Delete old nodes for this file if it was previously indexed
@@ -180,10 +187,7 @@ fn index_files(
         // Delete old nodes for this file (they'll be re-created)
         delete_nodes_by_file(db.conn(), file_id)?;
 
-        let parsed_nodes = match parse_code(&source, language) {
-            Ok(nodes) => nodes,
-            Err(_) => continue, // Skip files that fail to parse
-        };
+        let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
 
         let mut node_ids = Vec::new();
         let mut node_names = Vec::new();
@@ -210,6 +214,7 @@ fn index_files(
             rel_path: rel_path.clone(),
             source,
             language: language.to_string(),
+            tree,
             node_ids,
             node_names,
         });
@@ -235,10 +240,8 @@ fn index_files(
     }
 
     for pf in &parsed_files {
-        let relations = match extract_relations(&pf.source, &pf.language) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        // Reuse the already-parsed tree (no re-parsing)
+        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
 
         for rel in &relations {
             // Find source node ID
@@ -256,8 +259,9 @@ fn index_files(
                 for &tgt_id in &target_ids {
                     // Allow self-edges for routes (routes_to maps handler to itself with metadata)
                     if src_id != tgt_id || rel.relation == REL_ROUTES_TO {
-                        insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?;
-                        edges_created += 1;
+                        if insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                            edges_created += 1;
+                        }
                     }
                 }
             }
@@ -270,28 +274,27 @@ fn index_files(
             let node_name = &pf.node_names[idx];
 
             // Get callees (this node calls -> targets)
-            let callees = get_edge_target_names(db.conn(), node_id, "calls")?;
+            let callees = get_edge_target_names(db.conn(), node_id, REL_CALLS)?;
             // Get callers (other nodes -> call this node)
-            let callers = get_edge_source_names(db.conn(), node_id, "calls")?;
+            let callers = get_edge_source_names(db.conn(), node_id, REL_CALLS)?;
             // Get inheritance
-            let inherits = get_edge_target_names(db.conn(), node_id, "inherits")?;
+            let inherits = get_edge_target_names(db.conn(), node_id, REL_INHERITS)?;
             // Get routes
-            let routes = get_edge_target_names(db.conn(), node_id, "routes_to")?;
+            let routes = get_edge_target_names(db.conn(), node_id, REL_ROUTES_TO)?;
 
             // Get node details for signature/doc
-            let nodes = get_nodes_by_name(db.conn(), node_name)?;
-            let node_detail = nodes.iter().find(|n| n.id == node_id);
+            let node_detail = get_node_by_id(db.conn(), node_id)?;
 
             let ctx = build_context_string(&NodeContext {
-                node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
+                node_type: node_detail.as_ref().map(|n| n.node_type.clone()).unwrap_or_default(),
                 name: node_name.clone(),
                 file_path: pf.rel_path.clone(),
-                signature: node_detail.and_then(|n| n.signature.clone()),
+                signature: node_detail.as_ref().and_then(|n| n.signature.clone()),
                 routes,
                 callees,
                 callers,
                 inherits,
-                doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
+                doc_comment: node_detail.as_ref().and_then(|n| n.doc_comment.clone()),
             });
 
             update_context_string(db.conn(), node_id, &ctx)?;
