@@ -21,7 +21,9 @@ fn register_sqlite_vec() {
         // sqlite3_auto_extension: (sqlite3*, char**, sqlite3_api_routines*) -> int.
         // The transmute converts between equivalent C function pointer types.
         // NOTE: sqlite3_auto_extension registers globally for ALL future SQLite
-        // connections in this process, not just the current one.
+        // connections in this process. We always register it since it's harmless
+        // if vec tables are not created — the extension just adds the vec0 virtual
+        // table type without creating any tables.
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
                 *const (),
@@ -52,9 +54,8 @@ impl Database {
     }
 
     fn open_impl(path: &Path, enable_vec: bool) -> Result<Self> {
-        if enable_vec {
-            register_sqlite_vec();
-        }
+        // Always register sqlite-vec extension (it's process-global anyway via auto_extension)
+        register_sqlite_vec();
 
         let conn = Connection::open(path)?;
 
