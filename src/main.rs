@@ -9,11 +9,7 @@ fn main() -> Result<()> {
         .init();
 
     let project_root = std::env::current_dir()?;
-    let db_dir = project_root.join(".code-graph");
-    std::fs::create_dir_all(&db_dir)?;
-    let db_path = db_dir.join("index.db");
-
-    let server = McpServer::new(&db_path, Some(project_root.to_string_lossy().into()))?;
+    let server = McpServer::from_project_root(&project_root)?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();

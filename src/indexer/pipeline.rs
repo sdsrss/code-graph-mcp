@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::embedding::context::{build_context_string, NodeContext};
@@ -34,7 +34,71 @@ pub fn run_incremental_index(db: &Database, project_root: &Path) -> Result<Index
 
     // Index changed + new files
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
-    index_files(db, project_root, &to_index, &current_hashes)
+
+    // Dirty-node propagation: identify dirty nodes BEFORE re-indexing
+    // (because cascade delete will remove old edges)
+    let dirty_node_ids = if !to_index.is_empty() {
+        collect_dirty_node_ids(db, &to_index)?
+    } else {
+        HashSet::new()
+    };
+
+    let result = index_files(db, project_root, &to_index, &current_hashes)?;
+
+    // Regenerate context strings for dirty nodes in other files
+    if !dirty_node_ids.is_empty() {
+        regenerate_context_strings(db, &dirty_node_ids)?;
+    }
+
+    Ok(result)
+}
+
+/// Collect node IDs in OTHER files that have edges pointing to nodes in the changed files.
+/// Must be called BEFORE re-indexing (cascade delete removes old edges).
+fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<HashSet<i64>> {
+    let mut changed_file_ids = Vec::new();
+    for path in changed_paths {
+        let file_id: Option<i64> = db.conn().query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        ).ok();
+        if let Some(id) = file_id {
+            changed_file_ids.push(id);
+        }
+    }
+    let ids = get_dirty_node_ids(db.conn(), &changed_file_ids)?;
+    Ok(ids.into_iter().collect())
+}
+
+/// Regenerate context strings for the given set of dirty nodes.
+fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>) -> Result<()> {
+    for &node_id in dirty_ids {
+        if let Some(node) = get_node_by_id(db.conn(), node_id)? {
+            let file_path = get_file_path(db.conn(), node.file_id)?
+                .unwrap_or_default();
+
+            let callees = get_edge_target_names(db.conn(), node_id, "calls")?;
+            let callers = get_edge_source_names(db.conn(), node_id, "calls")?;
+            let inherits = get_edge_target_names(db.conn(), node_id, "inherits")?;
+            let routes = get_edge_target_names(db.conn(), node_id, "routes_to")?;
+
+            let ctx = build_context_string(&NodeContext {
+                node_type: node.node_type,
+                name: node.name,
+                file_path,
+                signature: node.signature,
+                routes,
+                callees,
+                callers,
+                inherits,
+                doc_comment: node.doc_comment,
+            });
+
+            update_context_string(db.conn(), node_id, &ctx)?;
+        }
+    }
+    Ok(())
 }
 
 fn index_files(
@@ -288,6 +352,33 @@ function handleLogin(req: Request) {
         assert_eq!(foo.len(), 0);
         let bar = get_nodes_by_name(db.conn(), "bar").unwrap();
         assert_eq!(bar.len(), 1);
+    }
+
+    #[test]
+    fn test_incremental_propagates_dirty_context() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // Initial: B (in b.ts) calls A (in a.ts)
+        fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
+        fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
+        run_full_index(&db, project_dir.path()).unwrap();
+
+        let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
+        assert_eq!(beta_nodes.len(), 1);
+        let beta_ctx_before = beta_nodes[0].context_string.clone().unwrap_or_default();
+
+        // Change A: rename function (alpha -> alphaRenamed)
+        fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
+        run_incremental_index(&db, project_dir.path()).unwrap();
+
+        // beta's context_string should be updated (calls list changed because
+        // the old alpha node is gone and edge was cascade-deleted)
+        let beta_nodes_after = get_nodes_by_name(db.conn(), "beta").unwrap();
+        assert_eq!(beta_nodes_after.len(), 1);
+        let beta_ctx_after = beta_nodes_after[0].context_string.clone().unwrap_or_default();
+        assert_ne!(beta_ctx_before, beta_ctx_after);
     }
 
     #[test]

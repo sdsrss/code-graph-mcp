@@ -257,6 +257,94 @@ pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// --- Additional node queries ---
+
+pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResult>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string
+         FROM nodes WHERE id = ?1"
+    )?;
+    let mut rows = stmt.query_map([node_id], |row| {
+        Ok(NodeResult {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            node_type: row.get(2)?,
+            name: row.get(3)?,
+            qualified_name: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            code_content: row.get(7)?,
+            signature: row.get(8)?,
+            doc_comment: row.get(9)?,
+            context_string: row.get(10)?,
+        })
+    })?;
+    Ok(rows.next().and_then(|r| r.ok()))
+}
+
+pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<NodeResult>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line,
+                n.code_content, n.signature, n.doc_comment, n.context_string
+         FROM nodes n JOIN files f ON f.id = n.file_id
+         WHERE f.path = ?1
+         ORDER BY n.start_line"
+    )?;
+    let rows = stmt.query_map([file_path], |row| {
+        Ok(NodeResult {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            node_type: row.get(2)?,
+            name: row.get(3)?,
+            qualified_name: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            code_content: row.get(7)?,
+            signature: row.get(8)?,
+            doc_comment: row.get(9)?,
+            context_string: row.get(10)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn get_file_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
+    let mut rows = stmt.query_map([file_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.next().and_then(|r| r.ok()))
+}
+
+/// Find node IDs in other files that have edges pointing to nodes in the given file IDs.
+/// Used for dirty-node propagation during incremental indexing.
+pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result<Vec<i64>> {
+    if changed_file_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let n = changed_file_ids.len();
+    // First set of placeholders for target nodes' file_id
+    let ph1: Vec<String> = (1..=n).map(|i| format!("?{}", i)).collect();
+    // Second set of placeholders for excluding source nodes in changed files
+    let ph2: Vec<String> = (n+1..=2*n).map(|i| format!("?{}", i)).collect();
+    let sql = format!(
+        "SELECT DISTINCT e.source_id FROM edges e
+         JOIN nodes n ON n.id = e.target_id
+         WHERE n.file_id IN ({})
+         AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
+        ph1.join(","), ph2.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for id in changed_file_ids {
+        all_params.push(Box::new(*id));
+    }
+    for id in changed_file_ids {
+        all_params.push(Box::new(*id));
+    }
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
