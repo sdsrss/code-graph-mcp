@@ -1,3 +1,4 @@
+pub mod embedding;
 pub mod indexer;
 pub mod mcp;
 pub mod parser;

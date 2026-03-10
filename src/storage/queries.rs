@@ -203,6 +203,38 @@ pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// --- Graph query helpers ---
+
+pub fn get_all_node_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare("SELECT name, id FROM nodes")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.target_id
+         WHERE e.source_id = ?1 AND e.relation = ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![source_id, relation], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.source_id
+         WHERE e.target_id = ?1 AND e.relation = ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
