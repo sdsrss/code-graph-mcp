@@ -71,14 +71,18 @@ fn walk_for_relations(
             }
         }
 
-        // Import statements (TypeScript/JavaScript)
+        // Import statements
         "import_statement" => {
-            extract_import_names(&node, source, results);
+            if language == "python" {
+                extract_python_import_names(&node, source, results);
+            } else {
+                extract_import_names(&node, source, results);
+            }
         }
 
-        // Python imports
+        // Python: from X import Y
         "import_from_statement" => {
-            extract_import_names(&node, source, results);
+            extract_python_from_import_names(&node, source, results);
         }
 
         // Class inheritance
@@ -210,6 +214,93 @@ fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, result
     }
 }
 
+/// Extract imports from Python `import X` / `import X, Y` statements.
+/// AST: import_statement -> dotted_name ("os") ...
+fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == "dotted_name" || child.kind() == "identifier" {
+                let name = node_text(&child, source).to_string();
+                if !name.is_empty() {
+                    results.push(ParsedRelation {
+                        source_name: "<module>".into(),
+                        target_name: name,
+                        relation: REL_IMPORTS.into(),
+                        metadata: None,
+                    });
+                }
+            } else if child.kind() == "aliased_import" {
+                // import os as operating_system — extract the original module name
+                if let Some(module) = child.named_child(0) {
+                    let name = node_text(&module, source).to_string();
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: name,
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract imports from Python `from X import Y, Z` statements.
+/// AST: import_from_statement -> dotted_name ("collections"), dotted_name ("OrderedDict"), dotted_name ("defaultdict")
+/// The first dotted_name is the module; the rest are imported names.
+fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    let mut is_first_dotted_name = true;
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            match child.kind() {
+                "dotted_name" => {
+                    if is_first_dotted_name {
+                        // First dotted_name is the module name (e.g., "collections") — skip it
+                        is_first_dotted_name = false;
+                    } else {
+                        // Subsequent dotted_names are imported symbols
+                        let name = node_text(&child, source).to_string();
+                        if !name.is_empty() {
+                            results.push(ParsedRelation {
+                                source_name: "<module>".into(),
+                                target_name: name,
+                                relation: REL_IMPORTS.into(),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
+                "aliased_import" => {
+                    // from X import Y as Z — extract Y (the original name)
+                    if let Some(original) = child.named_child(0) {
+                        let name = node_text(&original, source).to_string();
+                        if !name.is_empty() {
+                            results.push(ParsedRelation {
+                                source_name: "<module>".into(),
+                                target_name: name,
+                                relation: REL_IMPORTS.into(),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
+                "wildcard_import" => {
+                    // from X import * — record as wildcard
+                    results.push(ParsedRelation {
+                        source_name: "<module>".into(),
+                        target_name: "*".into(),
+                        relation: REL_IMPORTS.into(),
+                        metadata: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> {
     // Look for "extends" clause / superclass
     for i in 0..node.named_child_count() {
@@ -237,12 +328,23 @@ fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> 
                     }
                 }
             }
-            "superclass" => {
-                // Python: class Foo(Bar) — navigate into child identifier if possible,
-                // otherwise strip parentheses from the raw text.
+            "argument_list" => {
+                // Python: class Dog(Animal) — the parent class list is an argument_list node,
+                // containing identifier or dotted_name children for each superclass.
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
                         if inner.kind() == "identifier" || inner.kind() == "dotted_name" {
+                            return Some(node_text(&inner, source).to_string());
+                        }
+                    }
+                }
+            }
+            "superclass" => {
+                // Java: superclass -> type_identifier
+                // Also check identifier and dotted_name as fallbacks.
+                for k in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(k) {
+                        if inner.kind() == "type_identifier" || inner.kind() == "identifier" || inner.kind() == "dotted_name" {
                             return Some(node_text(&inner, source).to_string());
                         }
                     }
@@ -480,6 +582,57 @@ def get_users():
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(routes.contains(&"get_users"), "got routes: {:?}", routes);
+    }
+
+    // --- Task 2: Java inheritance ---
+
+    #[test]
+    fn test_extract_java_inheritance() {
+        let code = "public class Dog extends Animal {\n    public void bark() {}\n}\n";
+        let relations = extract_relations(code, "java").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"Animal"), "got: {:?}", inherits);
+    }
+
+    // --- Task 3: Python imports ---
+
+    #[test]
+    fn test_extract_python_import() {
+        let code = "import os\n";
+        let relations = extract_relations(code, "python").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"os"), "got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_python_from_import() {
+        let code = "from collections import OrderedDict, defaultdict\n";
+        let relations = extract_relations(code, "python").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"OrderedDict"), "got: {:?}", imports);
+        assert!(imports.contains(&"defaultdict"), "got: {:?}", imports);
+    }
+
+    // --- Task 4: Python class inheritance ---
+
+    #[test]
+    fn test_extract_python_inheritance() {
+        let code = "class Dog(Animal):\n    def bark(self):\n        pass\n";
+        let relations = extract_relations(code, "python").unwrap();
+        let inherits: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(inherits.contains(&"Animal"), "got: {:?}", inherits);
     }
 
     #[test]
