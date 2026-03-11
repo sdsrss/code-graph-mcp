@@ -167,6 +167,19 @@ impl ToolRegistry {
                     "required": ["file_path"]
                 }),
             },
+            ToolDefinition {
+                name: "find_similar_code".into(),
+                description: "Find semantically similar code to a given function or class. Uses vector embeddings to find code with similar purpose even when naming differs. Requires embed-model feature. Use for finding duplicate logic, related implementations, or refactoring candidates.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "node_id": { "type": "number", "description": "Node ID to find similar code for" },
+                        "top_k": { "type": "number", "description": "Number of results (default 5)" },
+                        "max_distance": { "type": "number", "description": "Maximum distance threshold (default 0.5)" }
+                    },
+                    "required": ["node_id"]
+                }),
+            },
         ];
 
         Self { tools }
@@ -199,7 +212,8 @@ mod tests {
         assert!(names.contains(&"impact_analysis"));
         assert!(names.contains(&"module_overview"));
         assert!(names.contains(&"dependency_graph"));
-        assert_eq!(tools.len(), 13);
+        assert!(names.contains(&"find_similar_code"));
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]

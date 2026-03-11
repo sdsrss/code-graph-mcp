@@ -305,6 +305,7 @@ impl McpServer {
             "impact_analysis" => self.tool_impact_analysis(args),
             "module_overview" => self.tool_module_overview(args),
             "dependency_graph" => self.tool_dependency_graph(args),
+            "find_similar_code" => self.tool_find_similar_code(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -938,6 +939,68 @@ impl McpServer {
             "summary": format!("{} depends on {} files, {} files depend on it", file_path, outgoing.len(), incoming.len())
         }))
     }
+
+    fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let node_id = args["node_id"].as_i64()
+            .ok_or_else(|| anyhow!("Missing node_id"))?;
+        let top_k = args.get("top_k")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5) as i64;
+        let max_distance = args.get("max_distance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5);
+
+        // Check if embeddings are available
+        if !self.db.vec_enabled() {
+            return Ok(json!({
+                "error": "Embedding not available. Build with --features embed-model.",
+                "node_id": node_id
+            }));
+        }
+
+        // Get the node's embedding
+        let embedding: Vec<f32> = {
+            let bytes: Vec<u8> = self.db.conn().query_row(
+                "SELECT embedding FROM node_vectors WHERE node_id = ?1",
+                [node_id],
+                |row| row.get(0),
+            ).map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded.", node_id))?;
+            bytemuck::cast_slice(&bytes).to_vec()
+        };
+
+        // Search for similar vectors
+        let results = queries::vector_search(self.db.conn(), &embedding, top_k + 1)?; // +1 to exclude self
+
+        // Filter and format results
+        let similar: Vec<serde_json::Value> = results.iter()
+            .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
+            .take(top_k as usize)
+            .filter_map(|(id, distance)| {
+                queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| {
+                    let file_path = queries::get_file_path(self.db.conn(), node.file_id)
+                        .ok().flatten().unwrap_or_default();
+                    let similarity = 1.0 / (1.0 + distance);
+                    json!({
+                        "node_id": node.id,
+                        "name": node.name,
+                        "type": node.node_type,
+                        "file_path": file_path,
+                        "start_line": node.start_line,
+                        "similarity": format!("{:.2}", similarity),
+                        "distance": format!("{:.4}", distance),
+                    })
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "query_node_id": node_id,
+            "results": similar,
+            "count": similar.len(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -982,7 +1045,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -1576,5 +1639,15 @@ app.post('/api/login', handleLogin);
         } else {
             assert_eq!(result["name"], "bigFunc");
         }
+    }
+
+    #[test]
+    fn test_find_similar_code_no_embeddings() {
+        let server = McpServer::new_test(); // no embedding model, vec not enabled
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_similar_code","arguments":{"node_id":1}}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Should return a result (not error) with an informative message about embedding requirement
+        assert!(parsed["result"].is_object());
     }
 }
