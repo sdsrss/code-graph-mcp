@@ -130,6 +130,19 @@ impl ToolRegistry {
                     "required": ["confirm"]
                 }),
             },
+            ToolDefinition {
+                name: "impact_analysis".into(),
+                description: "Analyze the blast radius of changing a symbol. Returns all affected callers, routes, files, and a risk rating (LOW/MEDIUM/HIGH) in one call. Irreplaceable by Grep — computes transitive impact through the full call graph. Use BEFORE modifying any function to understand consequences.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": { "type": "string", "description": "Symbol name to analyze" },
+                        "change_type": { "type": "string", "enum": ["signature", "behavior", "remove"], "description": "Type of change (default 'behavior')" },
+                        "depth": { "type": "number", "description": "Max caller depth (default 3)" }
+                    },
+                    "required": ["symbol_name"]
+                }),
+            },
         ];
 
         Self { tools }
@@ -159,7 +172,8 @@ mod tests {
         assert!(names.contains(&"get_index_status"));
         assert!(names.contains(&"rebuild_index"));
         assert!(names.contains(&"trace_http_chain"));
-        assert_eq!(tools.len(), 10);
+        assert!(names.contains(&"impact_analysis"));
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]

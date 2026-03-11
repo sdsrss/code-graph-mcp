@@ -302,6 +302,7 @@ impl McpServer {
             "stop_watch" => self.tool_stop_watch(),
             "get_index_status" => self.tool_get_index_status(),
             "rebuild_index" => self.tool_rebuild_index(args),
+            "impact_analysis" => self.tool_impact_analysis(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -801,6 +802,57 @@ impl McpServer {
             "edges_created": result.edges_created,
         }))
     }
+
+    fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let symbol_name = args["symbol_name"].as_str()
+            .ok_or_else(|| anyhow!("Missing symbol_name"))?;
+        let change_type = args.get("change_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("behavior");
+        let depth = args.get("depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3) as i32;
+
+        let callers = queries::get_callers_with_route_info(
+            self.db.conn(), symbol_name, None, depth
+        )?;
+
+        let affected_files: std::collections::HashSet<&str> = callers.iter()
+            .map(|c| c.file_path.as_str()).collect();
+        let affected_routes: Vec<serde_json::Value> = callers.iter()
+            .filter_map(|c| {
+                c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok())
+            }).collect();
+
+        let risk_level = if callers.len() > 10 || affected_routes.len() >= 3 || change_type == "remove" {
+            "HIGH"
+        } else if callers.len() > 3 || !affected_routes.is_empty() {
+            "MEDIUM"
+        } else {
+            "LOW"
+        };
+
+        let direct: Vec<_> = callers.iter().filter(|c| c.depth == 1).collect();
+        let transitive: Vec<_> = callers.iter().filter(|c| c.depth > 1).collect();
+
+        Ok(json!({
+            "symbol": symbol_name,
+            "change_type": change_type,
+            "direct_callers": direct.iter().map(|c| json!({
+                "name": c.name, "file": c.file_path, "depth": c.depth
+            })).collect::<Vec<_>>(),
+            "transitive_callers": transitive.iter().map(|c| json!({
+                "name": c.name, "file": c.file_path, "depth": c.depth
+            })).collect::<Vec<_>>(),
+            "affected_routes": affected_routes,
+            "affected_files": affected_files.len(),
+            "risk_level": risk_level,
+            "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}]",
+                symbol_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -845,7 +897,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]

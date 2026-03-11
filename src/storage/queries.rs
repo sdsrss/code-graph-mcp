@@ -532,6 +532,51 @@ pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) 
     Ok(results)
 }
 
+// --- Caller + route info query ---
+
+#[derive(Debug)]
+pub struct CallerWithRouteInfo {
+    pub node_id: i64,
+    pub name: String,
+    pub node_type: String,
+    pub file_path: String,
+    pub depth: i32,
+    pub route_info: Option<String>, // JSON metadata from routes_to edge
+}
+
+/// Get all callers of a symbol, annotating any that are HTTP route handlers.
+pub fn get_callers_with_route_info(
+    conn: &Connection,
+    symbol_name: &str,
+    file_path: Option<&str>,
+    max_depth: i32,
+) -> Result<Vec<CallerWithRouteInfo>> {
+    use crate::graph::query::get_call_graph;
+    use crate::domain::REL_ROUTES_TO;
+
+    let callers = get_call_graph(conn, symbol_name, "callers", max_depth, file_path)?;
+
+    let mut results = Vec::new();
+    for caller in &callers {
+        // Check if this caller is a route handler (has a routes_to edge as source)
+        let route_meta: Option<String> = conn.query_row(
+            "SELECT e.metadata FROM edges e WHERE e.source_id = ?1 AND e.relation = ?2 LIMIT 1",
+            rusqlite::params![caller.node_id, REL_ROUTES_TO],
+            |row| row.get(0),
+        ).ok();
+
+        results.push(CallerWithRouteInfo {
+            node_id: caller.node_id,
+            name: caller.name.clone(),
+            node_type: caller.node_type.clone(),
+            file_path: caller.file_path.clone(),
+            depth: caller.depth,
+            route_info: route_meta,
+        });
+    }
+    Ok(results)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
@@ -692,6 +737,25 @@ mod tests {
         let results = fts5_search(db.conn(), "authentication token", 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validateToken");
+    }
+
+    #[test]
+    fn test_callers_with_routes() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // Insert test data: file -> handler node -> route edge, caller -> calls -> handler
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'handler', 'handler', 1, 10, 'fn handler()')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'caller', 'caller', 11, 20, 'fn caller()')", []).unwrap();
+        // caller (node 2) calls handler (node 1)
+        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 1, 'calls', NULL)", []).unwrap();
+        // caller (node 2) is also a route handler
+        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 2, 'routes_to', '{\"method\":\"GET\",\"path\":\"/api/test\"}')", []).unwrap();
+
+        let results = get_callers_with_route_info(db.conn(), "handler", None, 3).unwrap();
+        assert!(!results.is_empty());
+        // Verify route info is attached to the caller that is a route handler
+        assert!(results.iter().any(|r| r.route_info.is_some()));
     }
 
     #[test]
