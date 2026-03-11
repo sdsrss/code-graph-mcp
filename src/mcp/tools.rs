@@ -154,6 +154,19 @@ impl ToolRegistry {
                     "required": ["path"]
                 }),
             },
+            ToolDefinition {
+                name: "dependency_graph".into(),
+                description: "Map the import/export dependency tree for any file or module. Shows what it depends on and what depends on it, with recursive depth control. Use when understanding module boundaries, planning refactors, or checking for circular dependencies.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "File path to analyze" },
+                        "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Direction (default 'both')" },
+                        "depth": { "type": "number", "description": "Max depth (default 2)" }
+                    },
+                    "required": ["file_path"]
+                }),
+            },
         ];
 
         Self { tools }
@@ -185,7 +198,8 @@ mod tests {
         assert!(names.contains(&"trace_http_chain"));
         assert!(names.contains(&"impact_analysis"));
         assert!(names.contains(&"module_overview"));
-        assert_eq!(tools.len(), 12);
+        assert!(names.contains(&"dependency_graph"));
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]

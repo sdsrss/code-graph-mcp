@@ -304,6 +304,7 @@ impl McpServer {
             "rebuild_index" => self.tool_rebuild_index(args),
             "impact_analysis" => self.tool_impact_analysis(args),
             "module_overview" => self.tool_module_overview(args),
+            "dependency_graph" => self.tool_dependency_graph(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -897,6 +898,46 @@ impl McpServer {
             "summary": format!("Module '{}': {} exports across {} files", path, exports.len(), files.len())
         }))
     }
+
+    fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let file_path = args["file_path"].as_str()
+            .ok_or_else(|| anyhow!("Missing file_path"))?;
+        let direction = args.get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        let depth = args.get("depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as i32;
+
+        let deps = queries::get_import_tree(self.db.conn(), file_path, direction, depth)?;
+
+        let outgoing: Vec<serde_json::Value> = deps.iter()
+            .filter(|d| d.direction == "outgoing")
+            .map(|d| json!({
+                "file": d.file_path,
+                "symbols": d.symbol_count,
+                "depth": d.depth,
+            }))
+            .collect();
+
+        let incoming: Vec<serde_json::Value> = deps.iter()
+            .filter(|d| d.direction == "incoming")
+            .map(|d| json!({
+                "file": d.file_path,
+                "symbols": d.symbol_count,
+                "depth": d.depth,
+            }))
+            .collect();
+
+        Ok(json!({
+            "file": file_path,
+            "depends_on": outgoing,
+            "depended_by": incoming,
+            "summary": format!("{} depends on {} files, {} files depend on it", file_path, outgoing.len(), incoming.len())
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -941,7 +982,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]

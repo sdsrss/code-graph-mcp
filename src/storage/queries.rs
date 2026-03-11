@@ -615,6 +615,82 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+// --- Import tree queries ---
+
+#[derive(Debug)]
+pub struct FileDependency {
+    pub file_path: String,
+    pub direction: String, // "outgoing" (this file imports) or "incoming" (imports this file)
+    pub symbol_count: i64,
+    pub depth: i32,
+}
+
+/// Get file-level import/export dependency tree.
+/// direction: "outgoing" (what this file depends on), "incoming" (what depends on this file), "both"
+pub fn get_import_tree(
+    conn: &Connection,
+    file_path: &str,
+    direction: &str,
+    _max_depth: i32,
+) -> Result<Vec<FileDependency>> {
+    use crate::domain::REL_IMPORTS;
+    let mut results = Vec::new();
+
+    if direction == "outgoing" || direction == "both" {
+        // Find all files that this file's nodes import from
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT f2.path, COUNT(*) as cnt
+             FROM nodes n1
+             JOIN files f1 ON f1.id = n1.file_id
+             JOIN edges e ON e.source_id = n1.id AND e.relation = ?1
+             JOIN nodes n2 ON n2.id = e.target_id
+             JOIN files f2 ON f2.id = n2.file_id
+             WHERE f1.path = ?2 AND f2.path != ?2
+             GROUP BY f2.path
+             ORDER BY cnt DESC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path], |row| {
+            Ok(FileDependency {
+                file_path: row.get(0)?,
+                direction: "outgoing".into(),
+                symbol_count: row.get(1)?,
+                depth: 1,
+            })
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    if direction == "incoming" || direction == "both" {
+        // Find all files whose nodes import from this file
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT f1.path, COUNT(*) as cnt
+             FROM nodes n2
+             JOIN files f2 ON f2.id = n2.file_id
+             JOIN edges e ON e.target_id = n2.id AND e.relation = ?1
+             JOIN nodes n1 ON n1.id = e.source_id
+             JOIN files f1 ON f1.id = n1.file_id
+             WHERE f2.path = ?2 AND f1.path != ?2
+             GROUP BY f1.path
+             ORDER BY cnt DESC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path], |row| {
+            Ok(FileDependency {
+                file_path: row.get(0)?,
+                direction: "incoming".into(),
+                symbol_count: row.get(1)?,
+                depth: 1,
+            })
+        })?;
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
@@ -809,6 +885,25 @@ mod tests {
         let exports = get_module_exports(conn, "src/auth/").unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "validateUser");
+    }
+
+    #[test]
+    fn test_get_import_tree() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // File A with function that imports from File B
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/b.ts', 'h2', 0, 'typescript', 0)", []).unwrap();
+        // Node in file A
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'funcA', 'funcA', 1, 10, 'fn funcA()')", []).unwrap();
+        // Node in file B
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB', 'funcB', 1, 10, 'fn funcB()')", []).unwrap();
+        // funcA imports funcB
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 2, 'imports')", []).unwrap();
+
+        let tree = get_import_tree(conn, "src/a.ts", "outgoing", 2).unwrap();
+        assert!(!tree.is_empty());
+        assert!(tree.iter().any(|d| d.file_path == "src/b.ts"));
     }
 
     #[test]
