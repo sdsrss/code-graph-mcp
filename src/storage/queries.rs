@@ -591,16 +591,18 @@ pub struct ModuleExport {
 
 /// Get all exported symbols from files under a directory prefix.
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
-    use crate::domain::REL_EXPORTS;
-    let mut stmt = conn.prepare(
+    use crate::domain::{REL_EXPORTS, REL_CALLS};
+    let sql = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = 'calls') as caller_count
+                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = '{}') as caller_count
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
          WHERE f.path LIKE ?2
-         ORDER BY caller_count DESC"
-    )?;
+         ORDER BY caller_count DESC",
+        REL_CALLS
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let prefix_pattern = format!("{}%", dir_prefix);
     let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern], |row| {
         Ok(ModuleExport {
@@ -625,8 +627,10 @@ pub struct FileDependency {
     pub depth: i32,
 }
 
-/// Get file-level import/export dependency tree.
+/// Get file-level import/export dependencies (depth=1).
 /// direction: "outgoing" (what this file depends on), "incoming" (what depends on this file), "both"
+/// Note: currently returns direct dependencies only. The `max_depth` parameter is accepted
+/// for future expansion but only depth=1 is implemented.
 pub fn get_import_tree(
     conn: &Connection,
     file_path: &str,

@@ -156,7 +156,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "dependency_graph".into(),
-                description: "Map the import/export dependency tree for any file or module. Shows what it depends on and what depends on it, with recursive depth control. Use when understanding module boundaries, planning refactors, or checking for circular dependencies.".into(),
+                description: "Map the import/export dependencies for any file. Shows what it depends on (outgoing imports) and what depends on it (incoming imports) at the file level. Use when understanding module boundaries, planning refactors, or checking for circular dependencies.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
