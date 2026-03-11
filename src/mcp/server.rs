@@ -8,7 +8,7 @@ use super::tools::ToolRegistry;
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::pipeline::{run_full_index, run_incremental_index};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
-use crate::search::fusion::rrf_fusion;
+use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
 use crate::storage::queries;
 
@@ -322,7 +322,7 @@ impl McpServer {
             };
 
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
-        let fused = rrf_fusion(&fts_search, &vec_search, 60, fetch_count as usize);
+        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 60, fetch_count as usize, 1.5, 1.0);
 
         // Batch-fetch all candidate nodes with file info (single query instead of N+1)
         let candidate_ids: Vec<i64> = fused.iter().map(|r| r.node_id).collect();

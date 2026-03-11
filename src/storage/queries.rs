@@ -489,7 +489,7 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         return Ok(vec![]);
     }
     let sql = format!(
-        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY bm25(nodes_fts, 10.0, 5.0, 1.0, 3.0, 2.0) LIMIT ?2",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
