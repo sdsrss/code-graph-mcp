@@ -280,43 +280,44 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     Ok(results)
 }
 
-/// Batch-fetch all edge names for a set of node IDs, grouped by (node_id, direction, relation).
-/// Returns: HashMap<i64, Vec<(String, String, String)>> where tuple is (relation, direction, target_name)
+/// Batch-fetch all edge info for a set of node IDs, grouped by (node_id, direction, relation).
+/// Returns: HashMap<i64, Vec<(String, String, String, Option<String>)>>
+/// where tuple is (relation, direction, target_name, metadata)
 /// direction is "out" for outgoing edges (source=node), "in" for incoming edges (target=node)
-pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, Vec<(String, String, String)>>> {
+pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, Vec<(String, String, String, Option<String>)>>> {
     if node_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut result: HashMap<i64, Vec<(String, String, String)>> = HashMap::new();
+    let mut result: HashMap<i64, Vec<(String, String, String, Option<String>)>> = HashMap::new();
 
     // Outgoing edges: node is source
     let placeholders = make_placeholders(1, node_ids.len());
     let sql_out = format!(
-        "SELECT e.source_id, e.relation, n.name FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
+        "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
         placeholders
     );
     let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
     let mut stmt = conn.prepare(&sql_out)?;
     let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
     })?;
     for row in rows {
-        let (source_id, relation, name) = row?;
-        result.entry(source_id).or_default().push((relation, "out".into(), name));
+        let (source_id, relation, name, metadata) = row?;
+        result.entry(source_id).or_default().push((relation, "out".into(), name, metadata));
     }
 
     // Incoming edges: node is target
     let sql_in = format!(
-        "SELECT e.target_id, e.relation, n.name FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
+        "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
         placeholders
     );
     let mut stmt = conn.prepare(&sql_in)?;
     let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
     })?;
     for row in rows {
-        let (target_id, relation, name) = row?;
-        result.entry(target_id).or_default().push((relation, "in".into(), name));
+        let (target_id, relation, name, metadata) = row?;
+        result.entry(target_id).or_default().push((relation, "in".into(), name, metadata));
     }
 
     Ok(result)
@@ -381,25 +382,52 @@ pub fn get_file_language(conn: &Connection, file_id: i64) -> Result<Option<Strin
     }
 }
 
-/// Find node IDs in other files that have edges pointing to nodes in the given file IDs.
+/// Find node IDs in other files that have edges pointing to/from nodes in the given file IDs.
+/// Bidirectional: finds both callers (outgoing edges into changed files) and callees
+/// (incoming edges from changed files) to ensure context strings stay consistent.
 /// Used for dirty-node propagation during incremental indexing.
 pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result<Vec<i64>> {
     if changed_file_ids.is_empty() {
         return Ok(vec![]);
     }
     let n = changed_file_ids.len();
-    let sql = format!(
+    let changed_ph = make_placeholders(1, n);
+    let exclude_ph = make_placeholders(n + 1, n);
+
+    // Nodes in other files that have outgoing edges TO nodes in changed files
+    // (their "calls:" context references changed nodes)
+    let sql_callers = format!(
         "SELECT DISTINCT e.source_id FROM edges e
          JOIN nodes n ON n.id = e.target_id
          WHERE n.file_id IN ({})
          AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-        make_placeholders(1, n), make_placeholders(n + 1, n)
+        changed_ph, exclude_ph
     );
-    let mut stmt = conn.prepare(&sql)?;
+    // Nodes in other files that have incoming edges FROM nodes in changed files
+    // (their "called_by:" context references changed nodes)
+    let sql_callees = format!(
+        "SELECT DISTINCT e.target_id FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         WHERE n.file_id IN ({})
+         AND e.target_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
+        changed_ph, exclude_ph
+    );
+
     let doubled: Vec<i64> = changed_file_ids.iter().chain(changed_file_ids.iter()).copied().collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+
+    let mut results = Vec::new();
+
+    let mut stmt = conn.prepare(&sql_callers)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    for row in rows { results.push(row?); }
+
+    let mut stmt = conn.prepare(&sql_callees)?;
+    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    for row in rows { results.push(row?); }
+
+    results.sort();
+    results.dedup();
     Ok(results)
 }
 
@@ -450,17 +478,23 @@ pub struct RouteMatch {
 }
 
 pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) -> Result<Vec<RouteMatch>> {
+    // Use json_extract for precise path matching instead of LIKE substring.
+    // Match if the route_path is a prefix of the stored path (handles both exact and prefix matches).
     let mut stmt = conn.prepare(
         "SELECT e.source_id, e.metadata, n.name, n.type, f.path, n.start_line, n.end_line
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          JOIN files f ON f.id = n.file_id
-         WHERE e.relation = ?2 AND e.metadata LIKE ?1 ESCAPE '\\'"
+         WHERE e.relation = ?2
+         AND e.metadata IS NOT NULL
+         AND (json_extract(e.metadata, '$.path') = ?1
+              OR json_extract(e.metadata, '$.path') LIKE ?3 ESCAPE '\\')"
     )?;
 
+    // Support both exact match and prefix match (e.g., "/api/users" matches "/api/users/:id")
     let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
-    let pattern = format!("%{}%", escaped);
-    let rows = stmt.query_map(rusqlite::params![pattern, relation], |row| {
+    let prefix_pattern = format!("{}%", escaped);
+    let rows = stmt.query_map(rusqlite::params![route_path, relation, prefix_pattern], |row| {
         Ok(RouteMatch {
             node_id: row.get(0)?,
             metadata: row.get(1)?,

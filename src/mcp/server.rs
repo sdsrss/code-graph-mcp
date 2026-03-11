@@ -452,8 +452,6 @@ impl McpServer {
             self.db.conn(), function_name, direction, depth, file_path,
         )?;
 
-        use crate::graph::query::Direction;
-
         // Build node lists with direction tag for potential compression reuse
         let all_nodes: Vec<serde_json::Value> = results.iter()
             .filter(|n| n.depth > 0)

@@ -3,6 +3,7 @@ pub struct NodeContext {
     pub name: String,
     pub file_path: String,
     pub signature: Option<String>,
+    pub code_content: Option<String>,
     pub routes: Vec<String>,
     pub callees: Vec<String>,
     pub callers: Vec<String>,
@@ -43,6 +44,9 @@ pub fn build_context_string(info: &NodeContext) -> String {
     if let Some(doc) = &info.doc_comment {
         parts.push(format!("doc: {}", doc));
     }
+    if let Some(code) = &info.code_content {
+        parts.push(format!("code: {}", code));
+    }
     parts.join("\n")
 }
 
@@ -57,6 +61,7 @@ mod tests {
             name: "validateToken".into(),
             file_path: "src/auth/middleware.ts".into(),
             signature: Some("(token: string) -> Promise<User | null>".into()),
+            code_content: Some("function validateToken(token: string) { return jwt.verify(token); }".into()),
             routes: vec!["POST /api/login".into(), "GET /api/profile".into()],
             callees: vec!["jwt.verify".into(), "UserRepo.findById".into()],
             callers: vec!["authMiddleware".into(), "handleLogin".into()],
@@ -74,6 +79,7 @@ mod tests {
         assert!(ctx.contains("called_by: authMiddleware, handleLogin"));
         assert!(ctx.contains("routes: POST /api/login, GET /api/profile"));
         assert!(ctx.contains("imports: jwt, UserRepo"));
+        assert!(ctx.contains("code: function validateToken(token: string)"));
     }
 
     #[test]
@@ -83,6 +89,7 @@ mod tests {
             name: "helper".into(),
             file_path: "utils.ts".into(),
             signature: None,
+            code_content: None,
             routes: vec![],
             callees: vec![],
             callers: vec![],

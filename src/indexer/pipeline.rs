@@ -18,6 +18,19 @@ pub struct IndexResult {
     pub edges_created: usize,
 }
 
+/// Extract "METHOD path" from route edge metadata JSON, falling back to the edge name.
+fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
+    if let Some(meta) = metadata {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) {
+            let method = v["method"].as_str().unwrap_or("ALL");
+            if let Some(path) = v["path"].as_str() {
+                return format!("{} {}", method, path);
+            }
+        }
+    }
+    name.to_string()
+}
+
 fn try_embed_and_store(db: &Database, model: Option<&EmbeddingModel>, node_id: i64, ctx: &str) {
     if let Some(m) = model {
         if db.vec_enabled() {
@@ -152,12 +165,14 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
             let mut exports = Vec::new();
 
             if let Some(edge_list) = edges {
-                for (relation, direction, name) in edge_list {
+                for (relation, direction, name, metadata) in edge_list {
                     match (relation.as_str(), direction.as_str()) {
                         (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
                         (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
                         (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
-                        (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
+                        (rel, "out") if rel == REL_ROUTES_TO => {
+                            routes.push(format_route_from_metadata(metadata.as_deref(), name));
+                        }
                         (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
                         (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
                         (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
@@ -171,6 +186,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                 name: node.name.clone(),
                 file_path: file_path.clone(),
                 signature: node.signature.clone(),
+                code_content: Some(node.code_content.clone()),
                 routes,
                 callees,
                 callers,
@@ -392,12 +408,14 @@ fn index_files(
             let mut exports = Vec::new();
 
             if let Some(edge_list) = edges {
-                for (relation, direction, name) in edge_list {
+                for (relation, direction, name, metadata) in edge_list {
                     match (relation.as_str(), direction.as_str()) {
                         (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
                         (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
                         (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
-                        (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
+                        (rel, "out") if rel == REL_ROUTES_TO => {
+                            routes.push(format_route_from_metadata(metadata.as_deref(), name));
+                        }
                         (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
                         (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
                         (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
@@ -413,6 +431,7 @@ fn index_files(
                 name: node_name.clone(),
                 file_path: pf.rel_path.clone(),
                 signature: node_detail.and_then(|n| n.signature.clone()),
+                code_content: node_detail.map(|n| n.code_content.clone()),
                 routes,
                 callees,
                 callers,

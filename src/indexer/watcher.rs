@@ -1,5 +1,5 @@
 use anyhow::Result;
-use notify::{Watcher, RecursiveMode, Event};
+use notify::{Watcher, RecursiveMode, Event, EventKind};
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -16,6 +16,13 @@ impl FileWatcher {
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
+                    // Only react to content-modifying events, not metadata/access
+                    if !matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) {
+                        return;
+                    }
                     let paths: Vec<String> = event.paths.iter()
                         .filter_map(|p| p.to_str().map(String::from))
                         .collect();
@@ -31,7 +38,6 @@ impl FileWatcher {
         watcher.watch(root, RecursiveMode::Recursive)?;
         Ok(Self { _watcher: watcher })
     }
-
 }
 
 #[cfg(test)]
