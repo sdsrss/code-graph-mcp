@@ -6,7 +6,7 @@ use std::sync::{Mutex, mpsc};
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::pipeline::{run_full_index, run_incremental_index};
+use crate::indexer::pipeline::{run_full_index, run_incremental_index_cached};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
@@ -33,6 +33,7 @@ pub struct McpServer {
     indexed: Mutex<bool>,
     watcher: Mutex<Option<WatcherState>>,
     last_incremental_check: Mutex<std::time::Instant>,
+    dir_cache: Mutex<Option<crate::indexer::merkle::DirectoryCache>>,
 }
 
 impl McpServer {
@@ -76,6 +77,7 @@ impl McpServer {
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            dir_cache: Mutex::new(None),
         })
     }
 
@@ -90,6 +92,7 @@ impl McpServer {
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            dir_cache: Mutex::new(None),
         }
     }
 
@@ -106,6 +109,7 @@ impl McpServer {
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            dir_cache: Mutex::new(None),
         }
     }
 
@@ -133,7 +137,11 @@ impl McpServer {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
-                run_incremental_index(&self.db, &project_root, model)?;
+                let cache = self.dir_cache.lock().unwrap().take();
+                let (_result, new_cache) = run_incremental_index_cached(
+                    &self.db, &project_root, model, cache.as_ref()
+                )?;
+                *self.dir_cache.lock().unwrap() = Some(new_cache);
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
                 let has_watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some();
@@ -142,7 +150,11 @@ impl McpServer {
                     let mut last_check = self.last_incremental_check.lock()
                         .unwrap_or_else(|e| e.into_inner());
                     if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
-                        run_incremental_index(&self.db, &project_root, model)?;
+                        let cache = self.dir_cache.lock().unwrap().take();
+                        let (_result, new_cache) = run_incremental_index_cached(
+                            &self.db, &project_root, model, cache.as_ref()
+                        )?;
+                        *self.dir_cache.lock().unwrap() = Some(new_cache);
                         *last_check = std::time::Instant::now();
                     }
                 }

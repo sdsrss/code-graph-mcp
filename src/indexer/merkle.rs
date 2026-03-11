@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
+use std::time::SystemTime;
 use anyhow::Result;
 use ignore::WalkBuilder;
 
@@ -62,6 +63,98 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         }
     }
     Ok(hashes)
+}
+
+/// Cache of directory modification times for skipping unchanged subtrees.
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryCache {
+    dir_mtimes: HashMap<String, SystemTime>,
+}
+
+/// Scan directory with optional mtime cache. Directories whose mtime
+/// hasn't changed since the cached value can skip file hashing.
+pub fn scan_directory_cached(
+    root: &Path,
+    cache: Option<&DirectoryCache>,
+) -> Result<(HashMap<String, String>, DirectoryCache)> {
+    let mut hashes = HashMap::new();
+    let mut new_cache = DirectoryCache::default();
+    let mut changed_dirs: HashSet<String> = HashSet::new();
+
+    // Collect all entries
+    let entries: Vec<_> = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build()
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // Pass 1: identify changed directories
+    for entry in &entries {
+        if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        if let Ok(rel) = entry.path().strip_prefix(root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            if rel_str.starts_with(".git") { continue; }
+
+            if let Ok(meta) = entry.path().metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    new_cache.dir_mtimes.insert(rel_str.clone(), mtime);
+                    let is_changed = match cache {
+                        Some(c) => c.dir_mtimes.get(&rel_str) != Some(&mtime),
+                        None => true,
+                    };
+                    if is_changed {
+                        changed_dirs.insert(rel_str);
+                    }
+                }
+            }
+        }
+    }
+    // Root always considered changed
+    changed_dirs.insert(String::new());
+
+    // Pass 2: hash files in changed directories only.
+    // Files in unchanged dirs are skipped — the pipeline must merge
+    // stored hashes for those files to prevent false "deleted" diffs.
+    for entry in &entries {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
+                continue;
+            }
+            if detect_language(&rel_str).is_none() {
+                continue;
+            }
+
+            let parent_dir = rel.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if !changed_dirs.contains(&parent_dir) {
+                // Directory unchanged — skip hashing, file won't be in diff
+                continue;
+            }
+
+            let hash = match hash_file(path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            hashes.insert(rel_str, hash);
+        }
+    }
+
+    Ok((hashes, new_cache))
 }
 
 pub fn compute_diff(
@@ -143,6 +236,41 @@ mod tests {
 
         let diff = compute_diff(&old, &current);
         assert_eq!(diff.deleted_files.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_directory_cached_skips_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main(){}").unwrap();
+
+        let (hashes1, cache1) = scan_directory_cached(tmp.path(), None).unwrap();
+        assert_eq!(hashes1.len(), 1);
+
+        // Second scan with same cache: should return empty (dirs unchanged → files skipped)
+        let (hashes2, _cache2) = scan_directory_cached(tmp.path(), Some(&cache1)).unwrap();
+        // Files in unchanged dirs are skipped
+        assert_eq!(hashes2.len(), 0);
+    }
+
+    #[test]
+    fn test_scan_directory_cached_detects_new_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main(){}").unwrap();
+
+        let (_hashes1, cache1) = scan_directory_cached(tmp.path(), None).unwrap();
+
+        // Add a new file (changes directory mtime)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn lib(){}").unwrap();
+
+        let (hashes2, _cache2) = scan_directory_cached(tmp.path(), Some(&cache1)).unwrap();
+        // Both files should be hashed since src/ dir changed
+        assert_eq!(hashes2.len(), 2);
+        assert!(hashes2.contains_key("src/lib.rs"));
     }
 
     #[test]

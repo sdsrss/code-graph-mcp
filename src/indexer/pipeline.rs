@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::merkle::{compute_diff, hash_file, scan_directory};
+use crate::indexer::merkle::{compute_diff, hash_file, scan_directory, scan_directory_cached, DirectoryCache};
 use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::storage::db::Database;
@@ -66,6 +66,50 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
     }
 
     Ok(result)
+}
+
+/// Incremental index with directory mtime cache for faster scanning.
+/// Files in unchanged directories are skipped entirely.
+pub fn run_incremental_index_cached(
+    db: &Database,
+    project_root: &Path,
+    model: Option<&EmbeddingModel>,
+    dir_cache: Option<&DirectoryCache>,
+) -> Result<(IndexResult, DirectoryCache)> {
+    let stored_hashes = get_all_file_hashes(db.conn())?;
+    let (mut current_hashes, new_cache) = scan_directory_cached(project_root, dir_cache)?;
+
+    // Merge stored hashes for files in unchanged directories.
+    // scan_directory_cached skips files in unchanged dirs, so we need to
+    // carry forward their stored hashes to prevent false "deleted" diffs.
+    for (path, hash) in &stored_hashes {
+        if !current_hashes.contains_key(path) {
+            // File wasn't scanned (in unchanged dir) — carry forward stored hash
+            // Only if the file still exists on disk
+            if project_root.join(path).exists() {
+                current_hashes.insert(path.clone(), hash.clone());
+            }
+        }
+    }
+
+    let diff = compute_diff(&stored_hashes, &current_hashes);
+
+    let deleted_files = diff.deleted_files;
+    let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
+
+    let dirty_node_ids = if !to_index.is_empty() {
+        collect_dirty_node_ids(db, &to_index)?
+    } else {
+        HashSet::new()
+    };
+
+    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files)?;
+
+    if !dirty_node_ids.is_empty() {
+        regenerate_context_strings(db, &dirty_node_ids, model)?;
+    }
+
+    Ok((result, new_cache))
 }
 
 /// Collect node IDs in OTHER files that have edges pointing to nodes in the changed files.
