@@ -14,6 +14,9 @@ models/
 !.gitignore
 !.npmignore
 !.github/
+!claude-plugin/.mcp.json
+!claude-plugin/.claude-plugin/
+!claude-plugin/.claude-plugin/**
 
 # Documentation (local only)
 docs/

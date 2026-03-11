@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "code-graph": {
+      "command": "code-graph-mcp",
+      "args": ["serve"],
+      "env": {}
+    }
+  }
+}

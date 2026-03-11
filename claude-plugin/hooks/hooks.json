@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "tool == \"Write\" || tool == \"Edit\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "code-graph-mcp incremental-index --quiet",
+            "timeout": 10
+          }
+        ],
+        "description": "Auto-update code graph index after file edits"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "code-graph-mcp health-check --format oneline",
+            "timeout": 5
+          }
+        ],
+        "description": "Verify code graph index freshness at session start"
+      }
+    ]
+  }
+}
