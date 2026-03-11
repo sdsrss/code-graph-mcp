@@ -577,6 +577,44 @@ pub fn get_callers_with_route_info(
     Ok(results)
 }
 
+// --- Module queries ---
+
+#[derive(Debug)]
+pub struct ModuleExport {
+    pub node_id: i64,
+    pub name: String,
+    pub node_type: String,
+    pub signature: Option<String>,
+    pub file_path: String,
+    pub caller_count: i64,
+}
+
+/// Get all exported symbols from files under a directory prefix.
+pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
+    use crate::domain::REL_EXPORTS;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
+                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = 'calls') as caller_count
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         JOIN edges e ON e.target_id = n.id AND e.relation = ?1
+         WHERE f.path LIKE ?2
+         ORDER BY caller_count DESC"
+    )?;
+    let prefix_pattern = format!("{}%", dir_prefix);
+    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern], |row| {
+        Ok(ModuleExport {
+            node_id: row.get(0)?,
+            name: row.get(1)?,
+            node_type: row.get(2)?,
+            signature: row.get(3)?,
+            file_path: row.get(4)?,
+            caller_count: row.get(5)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
@@ -756,6 +794,21 @@ mod tests {
         assert!(!results.is_empty());
         // Verify route info is attached to the caller that is a route handler
         assert!(results.iter().any(|r| r.route_info.is_some()));
+    }
+
+    #[test]
+    fn test_get_module_exports() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/auth/validator.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature) VALUES (1, 'function', 'validateUser', 'validateUser', 1, 10, 'function validateUser() {}', '(token: string) => User')", []).unwrap();
+        // Add an export edge (module-level node exports this function)
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'validator', 'validator', 0, 0, '')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')", []).unwrap();
+
+        let exports = get_module_exports(conn, "src/auth/").unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "validateUser");
     }
 
     #[test]

@@ -303,6 +303,7 @@ impl McpServer {
             "get_index_status" => self.tool_get_index_status(),
             "rebuild_index" => self.tool_rebuild_index(args),
             "impact_analysis" => self.tool_impact_analysis(args),
+            "module_overview" => self.tool_module_overview(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -853,6 +854,49 @@ impl McpServer {
                 symbol_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
         }))
     }
+
+    fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let path = args["path"].as_str()
+            .ok_or_else(|| anyhow!("Missing path"))?;
+
+        let exports = queries::get_module_exports(self.db.conn(), path)?;
+
+        // Get import/dependency info at file level
+        let files: std::collections::HashSet<&str> = exports.iter()
+            .map(|e| e.file_path.as_str()).collect();
+
+        let hot_paths: Vec<serde_json::Value> = exports.iter()
+            .filter(|e| e.caller_count > 0)
+            .take(5)
+            .map(|e| json!({
+                "name": e.name,
+                "type": e.node_type,
+                "file": e.file_path,
+                "caller_count": e.caller_count,
+            }))
+            .collect();
+
+        let all_exports: Vec<serde_json::Value> = exports.iter()
+            .map(|e| json!({
+                "node_id": e.node_id,
+                "name": e.name,
+                "type": e.node_type,
+                "signature": e.signature,
+                "file": e.file_path,
+                "caller_count": e.caller_count,
+            }))
+            .collect();
+
+        Ok(json!({
+            "path": path,
+            "files_count": files.len(),
+            "exports": all_exports,
+            "hot_paths": hot_paths,
+            "summary": format!("Module '{}': {} exports across {} files", path, exports.len(), files.len())
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -897,7 +941,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]

@@ -143,6 +143,17 @@ impl ToolRegistry {
                     "required": ["symbol_name"]
                 }),
             },
+            ToolDefinition {
+                name: "module_overview".into(),
+                description: "Get a structured overview of a module or file: exports, dependencies, caller counts, and hot paths. Returns ~400 tokens of high-density insight vs ~5000 tokens from reading all files in the module. Use INSTEAD OF reading multiple files when you need to understand what a module does and how it connects.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path or directory prefix (e.g. 'src/auth/' or 'src/auth/validator.ts')" }
+                    },
+                    "required": ["path"]
+                }),
+            },
         ];
 
         Self { tools }
@@ -173,7 +184,8 @@ mod tests {
         assert!(names.contains(&"rebuild_index"));
         assert!(names.contains(&"trace_http_chain"));
         assert!(names.contains(&"impact_analysis"));
-        assert_eq!(tools.len(), 11);
+        assert!(names.contains(&"module_overview"));
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
