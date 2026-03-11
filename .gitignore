@@ -18,8 +18,7 @@ models/
 # Documentation (local only)
 docs/
 
-# AI assistant config
-CLAUDE.md
+# AI assistant config (CLAUDE.md is tracked — project instructions for code-graph)
 
 # npm binary (built via scripts/copy-binary.js, not committed)
 bin/code-graph-mcp
