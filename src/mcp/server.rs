@@ -396,7 +396,7 @@ impl McpServer {
 
         // Context Sandbox: compress if results exceed token threshold
         use crate::sandbox::compressor::CompressedOutput;
-        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(self.db.conn(), &node_results, &file_paths, 2000) {
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, 2000) {
             let (mode, compact) = match compressed {
                 CompressedOutput::Nodes(nodes) => {
                     let items: Vec<serde_json::Value> = nodes.iter().map(|c| json!({
@@ -655,7 +655,6 @@ impl McpServer {
         // Clear all data in a single transaction (CASCADE handles nodes→edges)
         self.db.conn().execute_batch("BEGIN")?;
         let cleanup = (|| -> anyhow::Result<()> {
-            self.db.conn().execute("DELETE FROM context_sandbox", [])?;
             self.db.conn().execute("DELETE FROM files", [])?;
             Ok(())
         })();

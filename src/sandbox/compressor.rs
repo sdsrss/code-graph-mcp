@@ -1,5 +1,3 @@
-use anyhow::Result;
-use rusqlite::Connection;
 use std::collections::{BTreeMap, HashSet};
 
 pub struct CompressedResult {
@@ -31,7 +29,7 @@ fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
     total_chars / 3
 }
 
-/// Compress results if needed, with opportunistic sandbox cleanup.
+/// Compress results if needed.
 /// `file_paths` maps each result's index to its file path.
 ///
 /// Returns multi-level compression based on token count:
@@ -40,14 +38,10 @@ fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
 /// - Files (L2): tokens <= threshold * 8 (file groups)
 /// - Directories (L3): tokens > threshold * 8 (directory groups)
 pub fn compress_if_needed(
-    conn: &Connection,
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
     token_threshold: usize,
 ) -> Option<CompressedOutput> {
-    if let Err(e) = cleanup_expired_sandbox(conn) {
-        tracing::warn!("Sandbox cleanup failed: {}", e);
-    }
     let tokens = estimate_tokens(results);
     if tokens <= token_threshold {
         None
@@ -148,15 +142,6 @@ pub fn compress_by_directory(
             }
         })
         .collect()
-}
-
-/// Clean up expired sandbox entries
-pub fn cleanup_expired_sandbox(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "DELETE FROM context_sandbox WHERE expires_at < unixepoch()",
-        [],
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -305,25 +290,4 @@ mod tests {
         assert!(estimate_tokens(&large) > 2000);
     }
 
-    #[test]
-    fn test_sandbox_cleanup_expired() {
-        use crate::storage::db::Database;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let db = Database::open(&tmp.path().join("test.db")).unwrap();
-        // Insert an expired entry (expires_at = 0 which is well in the past)
-        db.conn()
-            .execute(
-                "INSERT INTO context_sandbox (query_hash, summary, pointers, created_at, expires_at) VALUES ('h', 's', '[]', 0, 0)",
-                [],
-            )
-            .unwrap();
-        cleanup_expired_sandbox(db.conn()).unwrap();
-        let count: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM context_sandbox", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-    }
 }

@@ -121,7 +121,7 @@ mod tests {
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"nodes".to_string()));
         assert!(tables.contains(&"edges".to_string()));
-        assert!(tables.contains(&"context_sandbox".to_string()));
+        assert!(!tables.contains(&"context_sandbox".to_string()));
     }
 
     #[test]
