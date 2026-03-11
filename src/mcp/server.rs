@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, MutexGuard, mpsc};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
@@ -10,6 +10,14 @@ use crate::indexer::pipeline::{run_full_index, run_incremental_index_cached};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
+
+/// Lock a Mutex, recovering from poison but logging a warning.
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|e| {
+        tracing::warn!("Recovering poisoned mutex ({}): prior panic in critical section", label);
+        e.into_inner()
+    })
+}
 use crate::storage::queries;
 
 struct WatcherState {
@@ -133,33 +141,32 @@ impl McpServer {
         let model = self.embedding_model.as_ref();
 
         // Read the indexed flag (short lock scope to avoid holding across I/O)
-        let is_indexed = *self.indexed.lock().unwrap_or_else(|e| e.into_inner());
+        let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
         if !is_indexed {
             run_full_index(&self.db, &project_root, model)?;
-            *self.indexed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            *lock_or_recover(&self.indexed, "indexed") = true;
         } else {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
-                let cache = self.dir_cache.lock().unwrap().take();
+                let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
                 let (_result, new_cache) = run_incremental_index_cached(
                     &self.db, &project_root, model, cache.as_ref()
                 )?;
-                *self.dir_cache.lock().unwrap() = Some(new_cache);
+                *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
-                let has_watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
                 if !has_watcher {
                     // No watcher active — debounce to avoid rescanning on every tool call
-                    let mut last_check = self.last_incremental_check.lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut last_check = lock_or_recover(&self.last_incremental_check, "last_incremental_check");
                     if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
-                        let cache = self.dir_cache.lock().unwrap().take();
+                        let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
                         let (_result, new_cache) = run_incremental_index_cached(
                             &self.db, &project_root, model, cache.as_ref()
                         )?;
-                        *self.dir_cache.lock().unwrap() = Some(new_cache);
+                        *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
                         *last_check = std::time::Instant::now();
                     }
                 }
@@ -172,7 +179,7 @@ impl McpServer {
     /// Drain all pending events from the watcher receiver.
     /// Returns true if any file change events were received.
     fn drain_watcher_events(&self) -> bool {
-        let watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        let watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if let Some(ref state) = *watcher_guard {
             let mut has_changes = false;
             while state.receiver.try_recv().is_ok() {
@@ -186,7 +193,7 @@ impl McpServer {
 
     /// Returns whether the file watcher is currently active.
     fn is_watching(&self) -> bool {
-        self.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        lock_or_recover(&self.watcher, "watcher").is_some()
     }
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
@@ -205,9 +212,6 @@ impl McpServer {
 
         let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
-            "notifications/initialized" | "notifications/cancelled" => {
-                return Ok(Some(serde_json::to_string(&JsonRpcResponse::success(req.id, json!({})))?));
-            }
             "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_tools_list(req.id),
             "tools/call" => self.handle_tools_call(req.id, req.params),
@@ -262,7 +266,8 @@ impl McpServer {
 
         match self.handle_tool(tool_name, arguments) {
             Ok(result) => {
-                let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+                let text = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
                 JsonRpcResponse::success(id, json!({
                     "content": [{
                         "type": "text",
@@ -301,7 +306,7 @@ impl McpServer {
     fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let query = args["query"].as_str()
             .ok_or_else(|| anyhow!("query is required"))?;
-        let top_k = args["top_k"].as_u64().unwrap_or(5).min(100) as i64;
+        let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
 
@@ -674,7 +679,7 @@ impl McpServer {
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
 
         let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow!("File record missing for node {}", node_id))?;
 
         // Read source file for context lines if project root available
         let full_snippet = if let Some(ref root) = self.project_root {
@@ -724,7 +729,7 @@ impl McpServer {
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
-        let mut watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if watcher_guard.is_some() {
             return Ok(json!({
                 "status": "already_watching",
@@ -746,7 +751,7 @@ impl McpServer {
     }
 
     fn tool_stop_watch(&self) -> Result<serde_json::Value> {
-        let mut watcher_guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if watcher_guard.is_none() {
             return Ok(json!({
                 "status": "not_watching",
@@ -775,23 +780,16 @@ impl McpServer {
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
         // Clear all data in a single transaction (CASCADE handles nodes→edges)
-        self.db.conn().execute_batch("BEGIN")?;
-        let cleanup = (|| -> anyhow::Result<()> {
+        {
+            let tx = self.db.conn().unchecked_transaction()?;
             self.db.conn().execute("DELETE FROM files", [])?;
-            Ok(())
-        })();
-        match cleanup {
-            Ok(()) => { self.db.conn().execute_batch("COMMIT")?; }
-            Err(e) => {
-                let _ = self.db.conn().execute_batch("ROLLBACK");
-                return Err(e);
-            }
+            tx.commit()?;
         }
 
         let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;
 
         // Reset indexed flag
-        *self.indexed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lock_or_recover(&self.indexed, "indexed") = true;
 
         Ok(json!({
             "status": "rebuilt",

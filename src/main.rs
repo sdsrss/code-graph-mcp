@@ -25,10 +25,11 @@ fn main() -> Result<()> {
             continue;
         }
         if buf.len() > MAX_MESSAGE_SIZE {
-            // Drain remainder of the truncated line to prevent corrupting the next read
+            // Drain remainder of the truncated line to prevent corrupting the next read.
+            // Bound the drain to MAX_MESSAGE_SIZE to prevent OOM from unbounded input.
             if !buf.ends_with('\n') {
                 let mut discard = String::new();
-                let _ = reader.read_line(&mut discard);
+                let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_line(&mut discard);
             }
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",

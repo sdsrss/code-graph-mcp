@@ -3,6 +3,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// Edge info tuple: (relation, direction, target_name, metadata).
+/// Used by batch edge queries and context string builders.
+pub type EdgeInfo = (String, String, String, Option<String>);
+
 // --- Shared helpers ---
 
 const NODE_SELECT: &str =
@@ -66,7 +70,8 @@ pub fn get_index_status(conn: &Connection, is_watching: bool) -> Result<IndexSta
     ).ok().flatten();
     let schema_version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 
-    // For in-memory DBs, page_count * page_size gives size
+    // NOTE: page_count * page_size gives the main DB file size only.
+    // In WAL mode, the -wal file adds additional overhead not reflected here.
     let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
     let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
     let db_size_bytes = page_count * page_size;
@@ -280,15 +285,14 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     Ok(results)
 }
 
-/// Batch-fetch all edge info for a set of node IDs, grouped by (node_id, direction, relation).
-/// Returns: HashMap<i64, Vec<(String, String, String, Option<String>)>>
-/// where tuple is (relation, direction, target_name, metadata)
-/// direction is "out" for outgoing edges (source=node), "in" for incoming edges (target=node)
-pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, Vec<(String, String, String, Option<String>)>>> {
+/// Batch-fetch all edge info for a set of node IDs, grouped by node_id.
+/// Each entry is an [`EdgeInfo`] tuple: (relation, direction, target_name, metadata).
+/// Direction is "out" for outgoing edges (source=node), "in" for incoming edges (target=node).
+pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, Vec<EdgeInfo>>> {
     if node_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut result: HashMap<i64, Vec<(String, String, String, Option<String>)>> = HashMap::new();
+    let mut result: HashMap<i64, Vec<EdgeInfo>> = HashMap::new();
 
     // Outgoing edges: node is source
     let placeholders = make_placeholders(1, node_ids.len());
@@ -491,9 +495,10 @@ pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) 
               OR json_extract(e.metadata, '$.path') LIKE ?3 ESCAPE '\\')"
     )?;
 
-    // Support both exact match and prefix match (e.g., "/api/users" matches "/api/users/:id")
+    // Support both exact match and prefix match with path boundary
+    // (e.g., "/api/users" matches "/api/users/:id" but not "/api/userservices")
     let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
-    let prefix_pattern = format!("{}%", escaped);
+    let prefix_pattern = format!("{}/%", escaped);
     let rows = stmt.query_map(rusqlite::params![route_path, relation, prefix_pattern], |row| {
         Ok(RouteMatch {
             node_id: row.get(0)?,

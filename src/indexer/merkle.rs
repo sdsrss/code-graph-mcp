@@ -65,10 +65,14 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     Ok(hashes)
 }
 
-/// Cache of directory modification times for skipping unchanged subtrees.
+/// Cache of directory and file modification times for skipping unchanged subtrees.
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryCache {
     dir_mtimes: HashMap<String, SystemTime>,
+    /// Per-file mtime cache. Used to detect content modifications in directories
+    /// whose own mtime hasn't changed (dir mtime only changes on file add/remove,
+    /// not on content modification in ext4/btrfs).
+    file_mtimes: HashMap<String, SystemTime>,
 }
 
 /// Scan directory with optional mtime cache. Directories whose mtime
@@ -117,9 +121,9 @@ pub fn scan_directory_cached(
     // Root always considered changed
     changed_dirs.insert(String::new());
 
-    // Pass 2: hash files in changed directories only.
-    // Files in unchanged dirs are skipped — the pipeline must merge
-    // stored hashes for those files to prevent false "deleted" diffs.
+    // Pass 2: hash files in changed directories, and check file mtime in unchanged directories.
+    // Directory mtime only changes on file add/remove (not content edits on ext4/btrfs),
+    // so we also check individual file mtimes to catch content modifications.
     for entry in &entries {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
@@ -138,9 +142,22 @@ pub fn scan_directory_cached(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
+            // Track file mtime in the new cache
+            let file_mtime = path.metadata().ok().and_then(|m| m.modified().ok());
+            if let Some(mtime) = file_mtime {
+                new_cache.file_mtimes.insert(rel_str.clone(), mtime);
+            }
+
             if !changed_dirs.contains(&parent_dir) {
-                // Directory unchanged — skip hashing, file won't be in diff
-                continue;
+                // Directory unchanged — check if individual file mtime changed
+                let file_changed = match (file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str))) {
+                    (Some(current), Some(cached)) => current != *cached,
+                    (Some(_), None) => true, // No cached mtime — treat as changed
+                    _ => false,
+                };
+                if !file_changed {
+                    continue;
+                }
             }
 
             let hash = match hash_file(path) {

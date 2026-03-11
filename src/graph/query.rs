@@ -60,7 +60,7 @@ fn query_direction(
     file_path: Option<&str>,
     direction: Direction,
 ) -> Result<Vec<CallGraphNode>> {
-    let max_depth = max_depth.min(20); // Hard cap to prevent CTE blowup on deep graphs
+    let max_depth = max_depth.min(10); // Hard cap to prevent CTE blowup on highly connected graphs
     // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
     let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
     let file_path_param: Option<&str> = file_path;

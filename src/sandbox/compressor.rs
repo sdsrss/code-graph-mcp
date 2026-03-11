@@ -18,21 +18,25 @@ pub enum CompressedOutput {
     Directories(Vec<GroupedResult>),
 }
 
-/// Estimate token count for results (1 token ~ 3 chars for code)
+/// Estimate token count for results (1 token ~ 3 chars for code).
+/// context_string already includes name, signature, and code_content,
+/// so we use it exclusively when available to avoid double-counting.
 fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
     let total_chars: usize = results.iter().map(|r| {
-        r.code_content.len()
-            + r.name.len()
-            + r.signature.as_ref().map_or(0, |s| s.len())
-            + r.context_string.as_ref().map_or(0, |s| s.len())
+        r.context_string.as_ref().map_or_else(
+            || r.code_content.len() + r.name.len() + r.signature.as_ref().map_or(0, |s| s.len()),
+            |ctx| ctx.len(),
+        )
     }).sum();
     total_chars / 3
 }
 
 /// Estimate token count for a JSON value (1 token ~ 3 chars for code)
 pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
-    let serialized = serde_json::to_string(value).unwrap_or_default();
-    serialized.len() / 3
+    match serde_json::to_string(value) {
+        Ok(s) => s.len() / 3,
+        Err(_) => 1, // conservative non-zero estimate on serialization failure
+    }
 }
 
 /// Compress results if needed.
@@ -65,7 +69,7 @@ pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<CompressedResult> {
-    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
+    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     results
         .iter()
         .enumerate()
@@ -97,7 +101,7 @@ pub fn compress_by_file(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<GroupedResult> {
-    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
+    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (Vec<String>, Vec<i64>)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
@@ -124,7 +128,7 @@ pub fn compress_by_directory(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<GroupedResult> {
-    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
+    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (HashSet<String>, Vec<i64>, usize)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");

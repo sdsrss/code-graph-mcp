@@ -379,12 +379,6 @@ fn index_files(
         }
     }
 
-    // Commit core data (Phases 0-2), then start new transaction for Phase 3.
-    // This releases the write lock so search queries can access fresh node/edge data,
-    // and embedding CPU time doesn't hold a write lock.
-    db.conn().execute_batch("COMMIT")?;
-    db.conn().execute_batch("BEGIN")?;
-
     // Phase 3: Build context strings and update nodes (batch edge fetch)
     let all_node_ids: Vec<i64> = parsed_files.iter().flat_map(|pf| pf.node_ids.iter().copied()).collect();
     let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;

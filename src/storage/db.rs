@@ -18,23 +18,9 @@ static VEC_INIT: Once = Once::new();
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init has the exact C ABI signature expected by
-        // sqlite3_auto_extension: (sqlite3*, char**, sqlite3_api_routines*) -> int.
-        // The transmute converts between equivalent C function pointer types.
-        // NOTE: sqlite3_auto_extension registers globally for ALL future SQLite
-        // connections in this process. We always register it since it's harmless
-        // if vec tables are not created — the extension just adds the vec0 virtual
-        // table type without creating any tables.
+        // sqlite3_auto_extension in rusqlite's FFI bindings. No transmute needed.
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
-                *const (),
-                unsafe extern "C" fn(
-                    *mut rusqlite::ffi::sqlite3,
-                    *mut *mut std::os::raw::c_char,
-                    *const rusqlite::ffi::sqlite3_api_routines,
-                ) -> std::os::raw::c_int,
-            >(
-                sqlite3_vec_init as *const (),
-            )));
+            rusqlite::ffi::sqlite3_auto_extension(Some(sqlite3_vec_init));
         }
     });
 }

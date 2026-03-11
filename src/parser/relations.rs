@@ -91,8 +91,8 @@ fn walk_for_relations(
                 .map(|n| node_text(&n, source).to_string());
 
             if let Some(ref cls) = class_name {
-                // Check for extends/superclass
-                if let Some(parent) = extract_superclass(&node, source) {
+                // Check for extends/superclass (supports multiple inheritance)
+                for parent in extract_superclasses(&node, source) {
                     results.push(ParsedRelation {
                         source_name: cls.clone(),
                         target_name: parent,
@@ -337,6 +337,19 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                         }
                     }
                 }
+                "identifier" => {
+                    // Some tree-sitter versions parse simple import names as bare identifiers
+                    // (e.g., `from os import path` where `path` is an identifier, not dotted_name)
+                    let name = node_text(&child, source).to_string();
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: name,
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
                 "aliased_import" => {
                     // from X import Y as Z — extract Y (the original name)
                     if let Some(original) = child.named_child(0) {
@@ -366,7 +379,8 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
     }
 }
 
-fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> {
+fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+    let mut parents = Vec::new();
     // Look for "extends" clause / superclass
     for i in 0..node.named_child_count() {
         let child = match node.named_child(i) {
@@ -382,45 +396,45 @@ fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> 
                             for k in 0..inner.named_child_count() {
                                 if let Some(type_node) = inner.named_child(k) {
                                     if type_node.kind() == "identifier" || type_node.kind() == "type_identifier" {
-                                        return Some(node_text(&type_node, source).to_string());
+                                        parents.push(node_text(&type_node, source).to_string());
                                     }
                                 }
                             }
                         }
                         if inner.kind() == "identifier" || inner.kind() == "type_identifier" {
-                            return Some(node_text(&inner, source).to_string());
+                            parents.push(node_text(&inner, source).to_string());
                         }
                     }
                 }
             }
             "argument_list" => {
-                // Python: class Dog(Animal) — the parent class list is an argument_list node,
-                // containing identifier or dotted_name children for each superclass.
+                // Python: class Dog(Animal, Pet) — extract all parent classes
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
                         if inner.kind() == "identifier" || inner.kind() == "dotted_name" {
-                            return Some(node_text(&inner, source).to_string());
+                            parents.push(node_text(&inner, source).to_string());
                         }
                     }
                 }
             }
             "superclass" => {
                 // Java: superclass -> type_identifier
-                // Also check identifier and dotted_name as fallbacks.
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
                         if inner.kind() == "type_identifier" || inner.kind() == "identifier" || inner.kind() == "dotted_name" {
-                            return Some(node_text(&inner, source).to_string());
+                            parents.push(node_text(&inner, source).to_string());
                         }
                     }
                 }
-                let text = node_text(&child, source);
-                return Some(text.trim_start_matches('(').trim_end_matches(')').trim().to_string());
+                if parents.is_empty() {
+                    let text = node_text(&child, source);
+                    parents.push(text.trim_start_matches('(').trim_end_matches(')').trim().to_string());
+                }
             }
             _ => {}
         }
     }
-    None
+    parents
 }
 
 fn extract_implements(

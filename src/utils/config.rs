@@ -1,10 +1,8 @@
 pub fn detect_language(path: &str) -> Option<&'static str> {
     let p = std::path::Path::new(path);
-    // Skip dotfiles (e.g., .gitignore) - file_stem is empty for dotfiles
-    let stem = p.file_stem()?.to_str()?;
-    if stem.is_empty() {
-        return None;
-    }
+    // file_stem() returns None for paths without a filename component;
+    // dotfiles like ".gitignore" are filtered by extension() returning None.
+    let _stem = p.file_stem()?.to_str()?;
     let ext = p.extension()?.to_str()?;
     match ext {
         "rs" => Some("rust"),

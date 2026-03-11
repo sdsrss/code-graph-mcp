@@ -13,6 +13,7 @@ pub struct FileWatcher {
 
 impl FileWatcher {
     pub fn start(root: &Path, tx: mpsc::Sender<WatchEvent>) -> Result<Self> {
+        let root_path = root.to_path_buf();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
@@ -23,8 +24,11 @@ impl FileWatcher {
                     ) {
                         return;
                     }
+                    // Convert to relative paths for consistency with the indexer pipeline
                     let paths: Vec<String> = event.paths.iter()
-                        .filter_map(|p| p.to_str().map(String::from))
+                        .filter_map(|p| p.strip_prefix(&root_path).ok()
+                            .or(Some(p.as_path()))
+                            .and_then(|rel| rel.to_str().map(String::from)))
                         .collect();
                     if !paths.is_empty() {
                         let _ = tx.send(WatchEvent::Changed(paths));
