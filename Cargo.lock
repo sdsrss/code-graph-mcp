@@ -261,6 +261,7 @@ dependencies = [
  "candle-transformers",
  "cc",
  "ignore",
+ "libsqlite3-sys",
  "notify",
  "rusqlite",
  "serde",

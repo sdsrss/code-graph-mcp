@@ -11,6 +11,7 @@ embed-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "d
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled-full"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 blake3 = "1"
 ignore = "0.4"
 notify = "6"
