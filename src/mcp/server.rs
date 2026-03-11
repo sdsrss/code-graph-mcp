@@ -220,6 +220,8 @@ impl McpServer {
             "tools/call" => self.handle_tools_call(req.id, req.params),
             "resources/list" => self.handle_resources_list(req.id),
             "resources/read" => self.handle_resources_read(req.id, req.params),
+            "prompts/list" => self.handle_prompts_list(req.id),
+            "prompts/get" => self.handle_prompts_get(req.id, req.params),
             _ => JsonRpcResponse::error(
                 req.id,
                 super::protocol::JSONRPC_METHOD_NOT_FOUND,
@@ -235,7 +237,8 @@ impl McpServer {
             "protocolVersion": "2024-11-05",
             "capabilities": {
                 "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false }
+                "resources": { "subscribe": false, "listChanged": false },
+                "prompts": { "listChanged": false }
             },
             "serverInfo": {
                 "name": "code-graph-mcp",
@@ -343,6 +346,115 @@ impl McpServer {
                 id,
                 super::protocol::JSONRPC_INVALID_PARAMS,
                 format!("Unknown resource URI: {}", uri),
+            ),
+        }
+    }
+
+    fn handle_prompts_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::success(id, json!({
+            "prompts": [
+                {
+                    "name": "impact-analysis",
+                    "description": "Analyze the blast radius of changing a symbol",
+                    "arguments": [
+                        { "name": "symbol_name", "description": "Symbol to analyze", "required": true }
+                    ]
+                },
+                {
+                    "name": "understand-module",
+                    "description": "Deep dive into a module's architecture and relationships",
+                    "arguments": [
+                        { "name": "path", "description": "File or directory path", "required": true }
+                    ]
+                },
+                {
+                    "name": "trace-request",
+                    "description": "Trace an HTTP request from route to data layer",
+                    "arguments": [
+                        { "name": "route", "description": "HTTP route path (e.g. /api/users)", "required": true }
+                    ]
+                }
+            ]
+        }))
+    }
+
+    fn handle_prompts_get(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
+        let name = params.as_ref()
+            .and_then(|p| p["name"].as_str())
+            .unwrap_or("");
+        let arguments = params.as_ref()
+            .and_then(|p| p["arguments"].as_object());
+
+        match name {
+            "impact-analysis" => {
+                let symbol = arguments
+                    .and_then(|a| a.get("symbol_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<symbol>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Analyze the impact of changing the symbol '{}'. \
+                                 Use the impact_analysis tool with symbol_name='{}' to get the blast radius, \
+                                 then use get_call_graph to understand the full caller/callee chain. \
+                                 Present: affected files, affected routes, risk level, and recommendations.",
+                                symbol, symbol
+                            )
+                        }
+                    }]
+                }))
+            }
+            "understand-module" => {
+                let path = arguments
+                    .and_then(|a| a.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<path>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Give me a deep understanding of the module at '{}'. \
+                                 Use module_overview to get exports and hot paths, \
+                                 then use dependency_graph to map what it depends on and what depends on it. \
+                                 For the top 3 most-called exports, use get_call_graph to show their caller chain. \
+                                 Present: purpose, public API, dependencies, dependents, and hot paths.",
+                                path
+                            )
+                        }
+                    }]
+                }))
+            }
+            "trace-request" => {
+                let route = arguments
+                    .and_then(|a| a.get("route"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<route>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Trace the complete HTTP request flow for route '{}'. \
+                                 Use trace_http_chain to get the full chain from route to data layer. \
+                                 For each key node, use read_snippet to show the implementation. \
+                                 Map the flow: route → middleware → validation → business logic → data access → response. \
+                                 Highlight error handling, auth checks, and database operations.",
+                                route
+                            )
+                        }
+                    }]
+                }))
+            }
+            _ => JsonRpcResponse::error(
+                id,
+                super::protocol::JSONRPC_INVALID_PARAMS,
+                format!("Unknown prompt: {}", name),
             ),
         }
     }
@@ -1717,5 +1829,15 @@ app.post('/api/login', handleLogin);
         let resources = parsed["result"]["resources"].as_array().unwrap();
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0]["uri"], "code-graph://project-summary");
+    }
+
+    #[test]
+    fn test_prompts_list() {
+        let server = McpServer::new_test();
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let prompts = parsed["result"]["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 3);
     }
 }
