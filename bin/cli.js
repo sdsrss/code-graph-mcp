@@ -12,8 +12,8 @@ function getBinaryName() {
 function findBinary() {
   const binaryName = getBinaryName();
 
-  // 1. Check platform-specific npm package (@sdsrss/code-graph-mcp-<os>-<arch>)
-  const platformPkg = `@sdsrss/code-graph-mcp-${os.platform()}-${os.arch()}`;
+  // 1. Check platform-specific npm package (code-graph-<os>-<arch>)
+  const platformPkg = `@sdsrs/code-graph-${os.platform()}-${os.arch()}`;
   try {
     const pkgPath = require.resolve(`${platformPkg}/package.json`);
     const pkgDir = path.dirname(pkgPath);

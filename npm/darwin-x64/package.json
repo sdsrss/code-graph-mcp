@@ -1,5 +1,5 @@
 {
-  "name": "@sdsrss/code-graph-mcp-darwin-x64",
+  "name": "@sdsrs/code-graph-darwin-x64",
   "version": "0.1.0",
   "description": "code-graph-mcp binary for macOS x64",
   "license": "MIT",

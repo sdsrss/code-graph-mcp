@@ -1,11 +1,11 @@
 {
-  "name": "@sdsrss/code-graph-mcp",
-  "version": "0.1.0",
+  "name": "@sdsrs/code-graph",
+  "version": "0.1.1",
   "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sdsrss/code-graph-mcp"
+    "url": "git+https://github.com/sdsrss/code-graph-mcp.git"
   },
   "keywords": [
     "mcp",
@@ -18,10 +18,11 @@
     "call-graph"
   ],
   "bin": {
-    "code-graph-mcp": "./bin/cli.js"
+    "code-graph": "bin/cli.js",
+    "code-graph-mcp": "bin/cli.js"
   },
   "files": [
-    "bin/",
+    "bin/cli.js",
     "README.md"
   ],
   "scripts": {
@@ -31,10 +32,10 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@sdsrss/code-graph-mcp-linux-x64": "0.1.0",
-    "@sdsrss/code-graph-mcp-linux-arm64": "0.1.0",
-    "@sdsrss/code-graph-mcp-darwin-x64": "0.1.0",
-    "@sdsrss/code-graph-mcp-darwin-arm64": "0.1.0",
-    "@sdsrss/code-graph-mcp-win32-x64": "0.1.0"
+    "@sdsrs/code-graph-linux-x64": "0.1.0",
+    "@sdsrs/code-graph-linux-arm64": "0.1.0",
+    "@sdsrs/code-graph-darwin-x64": "0.1.0",
+    "@sdsrs/code-graph-darwin-arm64": "0.1.0",
+    "@sdsrs/code-graph-win32-x64": "0.1.0"
   }
 }

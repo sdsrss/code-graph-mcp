@@ -35,7 +35,7 @@ src/
 One-command setup — registers as an MCP server directly in Claude Code:
 
 ```bash
-claude mcp add code-graph-mcp npx @sdsrss/code-graph-mcp
+claude mcp add code-graph-mcp npx @sdsrs/code-graph
 ```
 
 ### Option 2: npx (No Install)
@@ -43,7 +43,7 @@ claude mcp add code-graph-mcp npx @sdsrss/code-graph-mcp
 Run directly without installing:
 
 ```bash
-npx @sdsrss/code-graph-mcp
+npx @sdsrs/code-graph
 ```
 
 ### Option 3: npm (Global Install)
@@ -51,7 +51,7 @@ npx @sdsrss/code-graph-mcp
 Install globally, then run anywhere:
 
 ```bash
-npm install -g @sdsrss/code-graph-mcp
+npm install -g @sdsrs/code-graph
 code-graph-mcp
 ```
 

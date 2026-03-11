@@ -1,5 +1,5 @@
 {
-  "name": "@sdsrss/code-graph-mcp-win32-x64",
+  "name": "@sdsrs/code-graph-win32-x64",
   "version": "0.1.0",
   "description": "code-graph-mcp binary for Windows x64",
   "license": "MIT",
