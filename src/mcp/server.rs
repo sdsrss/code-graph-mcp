@@ -218,6 +218,10 @@ impl McpServer {
             "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_tools_list(req.id),
             "tools/call" => self.handle_tools_call(req.id, req.params),
+            "resources/list" => self.handle_resources_list(req.id),
+            "resources/read" => self.handle_resources_read(req.id, req.params),
+            "prompts/list" => self.handle_prompts_list(req.id),
+            "prompts/get" => self.handle_prompts_get(req.id, req.params),
             _ => JsonRpcResponse::error(
                 req.id,
                 super::protocol::JSONRPC_METHOD_NOT_FOUND,
@@ -232,9 +236,9 @@ impl McpServer {
         JsonRpcResponse::success(id, json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {
-                    "listChanged": false
-                }
+                "tools": { "listChanged": false },
+                "resources": { "subscribe": false, "listChanged": false },
+                "prompts": { "listChanged": false }
             },
             "serverInfo": {
                 "name": "code-graph-mcp",
@@ -290,6 +294,171 @@ impl McpServer {
         }
     }
 
+    fn handle_resources_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::success(id, json!({
+            "resources": [{
+                "uri": "code-graph://project-summary",
+                "name": "Code Graph Project Summary",
+                "description": "Overview of the indexed codebase: file count, node count, edge count, languages, and index health",
+                "mimeType": "application/json",
+                "annotations": {
+                    "audience": ["assistant"]
+                }
+            }]
+        }))
+    }
+
+    fn handle_resources_read(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
+        let uri = params.as_ref()
+            .and_then(|p| p["uri"].as_str())
+            .unwrap_or("");
+
+        match uri {
+            "code-graph://project-summary" => {
+                let status = match queries::get_index_status(self.db.conn(), self.is_watching()) {
+                    Ok(s) => s,
+                    Err(e) => return JsonRpcResponse::error(
+                        id,
+                        super::protocol::JSONRPC_INTERNAL_ERROR,
+                        format!("Failed to get index status: {}", e),
+                    ),
+                };
+
+                let summary = json!({
+                    "files": status.files_count,
+                    "nodes": status.nodes_count,
+                    "edges": status.edges_count,
+                    "schema_version": status.schema_version,
+                    "db_size_bytes": status.db_size_bytes,
+                    "watching": status.is_watching,
+                    "last_indexed_at": status.last_indexed_at,
+                });
+
+                JsonRpcResponse::success(id, json!({
+                    "contents": [{
+                        "uri": "code-graph://project-summary",
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&summary).unwrap_or_default()
+                    }]
+                }))
+            }
+            _ => JsonRpcResponse::error(
+                id,
+                super::protocol::JSONRPC_INVALID_PARAMS,
+                format!("Unknown resource URI: {}", uri),
+            ),
+        }
+    }
+
+    fn handle_prompts_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::success(id, json!({
+            "prompts": [
+                {
+                    "name": "impact-analysis",
+                    "description": "Analyze the blast radius of changing a symbol",
+                    "arguments": [
+                        { "name": "symbol_name", "description": "Symbol to analyze", "required": true }
+                    ]
+                },
+                {
+                    "name": "understand-module",
+                    "description": "Deep dive into a module's architecture and relationships",
+                    "arguments": [
+                        { "name": "path", "description": "File or directory path", "required": true }
+                    ]
+                },
+                {
+                    "name": "trace-request",
+                    "description": "Trace an HTTP request from route to data layer",
+                    "arguments": [
+                        { "name": "route", "description": "HTTP route path (e.g. /api/users)", "required": true }
+                    ]
+                }
+            ]
+        }))
+    }
+
+    fn handle_prompts_get(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
+        let name = params.as_ref()
+            .and_then(|p| p["name"].as_str())
+            .unwrap_or("");
+        let arguments = params.as_ref()
+            .and_then(|p| p["arguments"].as_object());
+
+        match name {
+            "impact-analysis" => {
+                let symbol = arguments
+                    .and_then(|a| a.get("symbol_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<symbol>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Analyze the impact of changing the symbol '{}'. \
+                                 Use the impact_analysis tool with symbol_name='{}' to get the blast radius, \
+                                 then use get_call_graph to understand the full caller/callee chain. \
+                                 Present: affected files, affected routes, risk level, and recommendations.",
+                                symbol, symbol
+                            )
+                        }
+                    }]
+                }))
+            }
+            "understand-module" => {
+                let path = arguments
+                    .and_then(|a| a.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<path>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Give me a deep understanding of the module at '{}'. \
+                                 Use module_overview to get exports and hot paths, \
+                                 then use dependency_graph to map what it depends on and what depends on it. \
+                                 For the top 3 most-called exports, use get_call_graph to show their caller chain. \
+                                 Present: purpose, public API, dependencies, dependents, and hot paths.",
+                                path
+                            )
+                        }
+                    }]
+                }))
+            }
+            "trace-request" => {
+                let route = arguments
+                    .and_then(|a| a.get("route"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<route>");
+                JsonRpcResponse::success(id, json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Trace the complete HTTP request flow for route '{}'. \
+                                 Use trace_http_chain to get the full chain from route to data layer. \
+                                 For each key node, use read_snippet to show the implementation. \
+                                 Map the flow: route → middleware → validation → business logic → data access → response. \
+                                 Highlight error handling, auth checks, and database operations.",
+                                route
+                            )
+                        }
+                    }]
+                }))
+            }
+            _ => JsonRpcResponse::error(
+                id,
+                super::protocol::JSONRPC_INVALID_PARAMS,
+                format!("Unknown prompt: {}", name),
+            ),
+        }
+    }
+
     fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         match name {
             "semantic_code_search" => self.tool_semantic_search(args),
@@ -302,6 +471,10 @@ impl McpServer {
             "stop_watch" => self.tool_stop_watch(),
             "get_index_status" => self.tool_get_index_status(),
             "rebuild_index" => self.tool_rebuild_index(args),
+            "impact_analysis" => self.tool_impact_analysis(args),
+            "module_overview" => self.tool_module_overview(args),
+            "dependency_graph" => self.tool_dependency_graph(args),
+            "find_similar_code" => self.tool_find_similar_code(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -801,6 +974,202 @@ impl McpServer {
             "edges_created": result.edges_created,
         }))
     }
+
+    fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let symbol_name = args["symbol_name"].as_str()
+            .ok_or_else(|| anyhow!("Missing symbol_name"))?;
+        let change_type = args.get("change_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("behavior");
+        let depth = args.get("depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3) as i32;
+
+        let callers = queries::get_callers_with_route_info(
+            self.db.conn(), symbol_name, None, depth
+        )?;
+
+        let affected_files: std::collections::HashSet<&str> = callers.iter()
+            .map(|c| c.file_path.as_str()).collect();
+        let affected_routes: Vec<serde_json::Value> = callers.iter()
+            .filter_map(|c| {
+                c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok())
+            }).collect();
+
+        let risk_level = if callers.len() > 10 || affected_routes.len() >= 3 || change_type == "remove" {
+            "HIGH"
+        } else if callers.len() > 3 || !affected_routes.is_empty() {
+            "MEDIUM"
+        } else {
+            "LOW"
+        };
+
+        let direct: Vec<_> = callers.iter().filter(|c| c.depth == 1).collect();
+        let transitive: Vec<_> = callers.iter().filter(|c| c.depth > 1).collect();
+
+        Ok(json!({
+            "symbol": symbol_name,
+            "change_type": change_type,
+            "direct_callers": direct.iter().map(|c| json!({
+                "name": c.name, "file": c.file_path, "depth": c.depth
+            })).collect::<Vec<_>>(),
+            "transitive_callers": transitive.iter().map(|c| json!({
+                "name": c.name, "file": c.file_path, "depth": c.depth
+            })).collect::<Vec<_>>(),
+            "affected_routes": affected_routes,
+            "affected_files": affected_files.len(),
+            "risk_level": risk_level,
+            "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}]",
+                symbol_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
+        }))
+    }
+
+    fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let path = args["path"].as_str()
+            .ok_or_else(|| anyhow!("Missing path"))?;
+
+        let exports = queries::get_module_exports(self.db.conn(), path)?;
+
+        // Get import/dependency info at file level
+        let files: std::collections::HashSet<&str> = exports.iter()
+            .map(|e| e.file_path.as_str()).collect();
+
+        let hot_paths: Vec<serde_json::Value> = exports.iter()
+            .filter(|e| e.caller_count > 0)
+            .take(5)
+            .map(|e| json!({
+                "name": e.name,
+                "type": e.node_type,
+                "file": e.file_path,
+                "caller_count": e.caller_count,
+            }))
+            .collect();
+
+        let all_exports: Vec<serde_json::Value> = exports.iter()
+            .map(|e| json!({
+                "node_id": e.node_id,
+                "name": e.name,
+                "type": e.node_type,
+                "signature": e.signature,
+                "file": e.file_path,
+                "caller_count": e.caller_count,
+            }))
+            .collect();
+
+        Ok(json!({
+            "path": path,
+            "files_count": files.len(),
+            "exports": all_exports,
+            "hot_paths": hot_paths,
+            "summary": format!("Module '{}': {} exports across {} files", path, exports.len(), files.len())
+        }))
+    }
+
+    fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let file_path = args["file_path"].as_str()
+            .ok_or_else(|| anyhow!("Missing file_path"))?;
+        let direction = args.get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        let depth = args.get("depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as i32;
+
+        let deps = queries::get_import_tree(self.db.conn(), file_path, direction, depth)?;
+
+        let outgoing: Vec<serde_json::Value> = deps.iter()
+            .filter(|d| d.direction == "outgoing")
+            .map(|d| json!({
+                "file": d.file_path,
+                "symbols": d.symbol_count,
+                "depth": d.depth,
+            }))
+            .collect();
+
+        let incoming: Vec<serde_json::Value> = deps.iter()
+            .filter(|d| d.direction == "incoming")
+            .map(|d| json!({
+                "file": d.file_path,
+                "symbols": d.symbol_count,
+                "depth": d.depth,
+            }))
+            .collect();
+
+        Ok(json!({
+            "file": file_path,
+            "depends_on": outgoing,
+            "depended_by": incoming,
+            "summary": format!("{} depends on {} files, {} files depend on it", file_path, outgoing.len(), incoming.len())
+        }))
+    }
+
+    fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let node_id = args["node_id"].as_i64()
+            .ok_or_else(|| anyhow!("Missing node_id"))?;
+        let top_k = args.get("top_k")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5) as i64;
+        let max_distance = args.get("max_distance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5);
+
+        // Check if embeddings are available
+        if !self.db.vec_enabled() {
+            return Ok(json!({
+                "error": "Embedding not available. Build with --features embed-model.",
+                "node_id": node_id
+            }));
+        }
+
+        // Get the node's embedding
+        let embedding: Vec<f32> = {
+            let bytes: Vec<u8> = self.db.conn().query_row(
+                "SELECT embedding FROM node_vectors WHERE node_id = ?1",
+                [node_id],
+                |row| row.get(0),
+            ).map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded.", node_id))?;
+            bytemuck::cast_slice(&bytes).to_vec()
+        };
+
+        // Search for similar vectors
+        let results = queries::vector_search(self.db.conn(), &embedding, top_k + 1)?; // +1 to exclude self
+
+        // Filter and format results
+        let similar: Vec<serde_json::Value> = results.iter()
+            .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
+            .take(top_k as usize)
+            .filter_map(|(id, distance)| {
+                queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| {
+                    let file_path = queries::get_file_path(self.db.conn(), node.file_id)
+                        .ok().flatten().unwrap_or_default();
+                    let similarity = 1.0 / (1.0 + distance);
+                    json!({
+                        "node_id": node.id,
+                        "name": node.name,
+                        "type": node.node_type,
+                        "file_path": file_path,
+                        "start_line": node.start_line,
+                        "similarity": format!("{:.2}", similarity),
+                        "distance": format!("{:.4}", distance),
+                    })
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "query_node_id": node_id,
+            "results": similar,
+            "count": similar.len(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -845,7 +1214,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -1439,5 +1808,36 @@ app.post('/api/login', handleLogin);
         } else {
             assert_eq!(result["name"], "bigFunc");
         }
+    }
+
+    #[test]
+    fn test_find_similar_code_no_embeddings() {
+        let server = McpServer::new_test(); // no embedding model, vec not enabled
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_similar_code","arguments":{"node_id":1}}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Should return a result (not error) with an informative message about embedding requirement
+        assert!(parsed["result"].is_object());
+    }
+
+    #[test]
+    fn test_resources_list() {
+        let server = McpServer::new_test();
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let resources = parsed["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "code-graph://project-summary");
+    }
+
+    #[test]
+    fn test_prompts_list() {
+        let server = McpServer::new_test();
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let prompts = parsed["result"]["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 3);
     }
 }

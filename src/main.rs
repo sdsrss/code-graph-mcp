@@ -1,15 +1,44 @@
 use anyhow::Result;
 use std::io::{self, BufRead, Read, Write};
 
-use code_graph_mcp::mcp::server::McpServer;
-
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let subcommand = args.get(1).map(|s| s.as_str());
+
+    match subcommand {
+        Some("serve") | None => run_serve(),
+        Some("incremental-index") => {
+            let quiet = args.iter().any(|a| a == "--quiet");
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
+        }
+        Some("health-check") => {
+            let format = args
+                .iter()
+                .position(|a| a == "--format")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or("oneline");
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_health_check(&project_root, format)
+        }
+        Some(other) => {
+            eprintln!(
+                "Unknown subcommand: {}. Usage: code-graph-mcp [serve|incremental-index|health-check]",
+                other
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_serve() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .init();
 
     let project_root = std::env::current_dir()?;
-    let server = McpServer::from_project_root(&project_root)?;
+    let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -20,7 +49,9 @@ fn main() -> Result<()> {
     loop {
         buf.clear();
         let n = reader.by_ref().take((MAX_MESSAGE_SIZE + 1) as u64).read_line(&mut buf)?;
-        if n == 0 { break; } // EOF
+        if n == 0 {
+            break; // EOF
+        }
         if buf.trim().is_empty() {
             continue;
         }

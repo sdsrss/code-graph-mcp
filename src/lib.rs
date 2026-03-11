@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod domain;
 pub mod embedding;
 pub mod graph;
