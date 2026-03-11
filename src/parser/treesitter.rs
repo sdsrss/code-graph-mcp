@@ -184,6 +184,9 @@ fn extract_nodes(
         "trait_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name, &node, source));
+                let trait_name = node_text(&node.child_by_field_name("name").unwrap(), source);
+                extract_children(node, source, language, Some(trait_name), results);
+                return;
             }
         }
 

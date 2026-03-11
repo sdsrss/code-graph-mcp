@@ -65,6 +65,7 @@ pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<CompressedResult> {
+    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     results
         .iter()
         .enumerate()
@@ -96,6 +97,7 @@ pub fn compress_by_file(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<GroupedResult> {
+    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (Vec<String>, Vec<i64>)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
@@ -122,6 +124,7 @@ pub fn compress_by_directory(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> Vec<GroupedResult> {
+    debug_assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (HashSet<String>, Vec<i64>, usize)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");

@@ -25,6 +25,11 @@ fn main() -> Result<()> {
             continue;
         }
         if buf.len() > MAX_MESSAGE_SIZE {
+            // Drain remainder of the truncated line to prevent corrupting the next read
+            if !buf.ends_with('\n') {
+                let mut discard = String::new();
+                let _ = reader.read_line(&mut discard);
+            }
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": null,

@@ -112,19 +112,40 @@ fn walk_for_relations(
         }
 
         // Rust: use std::collections::HashMap;
+        // Also handles grouped imports: use std::collections::{HashMap, HashSet};
         "use_declaration" => {
             let text = node_text(&node, source).trim().trim_end_matches(';').to_string();
             if let Some(name) = text.rsplit("::").next() {
                 // Skip glob imports like `use foo::*`
                 if name != "*" && !name.is_empty() {
                     let clean_name = name.trim();
-                    if !clean_name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: active_scope.unwrap_or("<module>").to_string(),
-                            target_name: clean_name.to_string(),
-                            relation: REL_IMPORTS.into(),
-                            metadata: None,
-                        });
+                    // Handle grouped imports: {HashMap, HashSet}
+                    if clean_name.starts_with('{') && clean_name.ends_with('}') {
+                        let inner = &clean_name[1..clean_name.len() - 1];
+                        for item in inner.split(',') {
+                            let item = item.trim();
+                            // Handle aliased imports: HashMap as HM -> extract HashMap
+                            let actual_name = item.split_whitespace().next().unwrap_or("");
+                            if !actual_name.is_empty() && actual_name != "*" {
+                                results.push(ParsedRelation {
+                                    source_name: active_scope.unwrap_or("<module>").to_string(),
+                                    target_name: actual_name.to_string(),
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    } else {
+                        // Handle aliased imports: Read as _ -> extract Read
+                        let actual_name = clean_name.split_whitespace().next().unwrap_or(clean_name);
+                        if !actual_name.is_empty() {
+                            results.push(ParsedRelation {
+                                source_name: active_scope.unwrap_or("<module>").to_string(),
+                                target_name: actual_name.to_string(),
+                                relation: REL_IMPORTS.into(),
+                                metadata: None,
+                            });
+                        }
                     }
                 }
             }
@@ -573,10 +594,12 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
         .trim_matches(|c| c == '\'' || c == '"')
         .to_string();
 
-    // Last named argument is the handler
+    // Last named argument is the handler — only use if it's an identifier
     let handler_count = args.named_child_count();
     if handler_count < 2 { return None; }
     let handler_arg = args.named_child(handler_count - 1)?;
+    // Skip inline functions (arrow_function, function) — they don't resolve to graph nodes
+    if handler_arg.kind() != "identifier" { return None; }
     let handler_name = node_text(&handler_arg, source).to_string();
 
     let metadata = serde_json::json!({"method": http_method, "path": path}).to_string();
@@ -641,8 +664,14 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
     let dec_text = node_text(&dec, source);
 
     // Check for route-like decorator patterns (e.g., @app.route, @app.get, @bp.post)
+    // Only match known framework receiver names to avoid false positives (e.g., @cache.get)
+    let has_known_receiver = ["app.", "bp.", "blueprint.", "router.", "api."]
+        .iter()
+        .any(|prefix| dec_text.contains(prefix));
+    if !has_known_receiver {
+        return None;
+    }
     if !dec_text.contains(".route(")
-        && !dec_text.contains(".route\"")
         && !dec_text.contains(".get(")
         && !dec_text.contains(".post(")
         && !dec_text.contains(".put(")
@@ -853,6 +882,44 @@ func main() {
         let imports: Vec<&ParsedRelation> = relations.iter().filter(|r| r.relation == REL_IMPORTS).collect();
         assert!(imports.iter().any(|r| r.target_name == "fmt"), "should import fmt, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
         assert!(imports.iter().any(|r| r.target_name == "http"), "should import http, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_extract_rust_grouped_use_imports() {
+        let source = r#"
+use std::collections::{HashMap, HashSet, BTreeMap};
+use std::io::Read as _;
+
+fn main() {}
+"#;
+        let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+        let relations = extract_relations_from_tree(&tree, source, "rust");
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"HashMap"), "should import HashMap, got: {:?}", imports);
+        assert!(imports.contains(&"HashSet"), "should import HashSet, got: {:?}", imports);
+        assert!(imports.contains(&"BTreeMap"), "should import BTreeMap, got: {:?}", imports);
+        assert!(imports.contains(&"Read"), "should import Read (not 'Read as _'), got: {:?}", imports);
+        // Should NOT contain braces or 'as _'
+        assert!(!imports.iter().any(|i| i.contains('{')), "should not have brace in import names: {:?}", imports);
+    }
+
+    #[test]
+    fn test_python_route_no_false_positive_on_cache_get() {
+        // @cache.get should NOT be detected as a route (cache is not a known framework receiver)
+        let code = r#"
+@cache.get('/dashboard')
+def get_dashboard():
+    return render_template('dashboard.html')
+"#;
+        let relations = extract_relations(code, "python").unwrap();
+        let routes: Vec<&ParsedRelation> = relations.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .collect();
+        assert!(routes.is_empty(), "should not detect route from @cache.get, got: {:?}",
+            routes.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
     }
 
     #[test]

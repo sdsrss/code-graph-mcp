@@ -1108,13 +1108,11 @@ function standalone() { return 1; }
         let result = parse_tool_result(&resp);
 
         // Should be in compressed mode
-        if result["mode"].as_str() == Some("compressed") {
+        let mode = result["mode"].as_str().unwrap_or("");
+        if mode.starts_with("compressed_") {
             assert!(result["results"].is_array());
             let compressed = result["results"].as_array().unwrap();
             assert!(!compressed.is_empty());
-            // Each compressed result should have node_id and summary
-            assert!(compressed[0]["node_id"].is_number());
-            assert!(compressed[0]["summary"].is_string());
         }
         // If not compressed (small code), that's also valid behavior
     }

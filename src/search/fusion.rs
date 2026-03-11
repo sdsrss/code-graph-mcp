@@ -9,7 +9,7 @@ pub struct SearchResult {
 pub fn weighted_rrf_fusion(
     fts_results: &[SearchResult],
     vec_results: &[SearchResult],
-    k: i32,
+    k: u32,
     top_k: usize,
     fts_weight: f64,
     vec_weight: f64,
@@ -35,7 +35,7 @@ pub fn weighted_rrf_fusion(
 pub fn rrf_fusion(
     fts_results: &[SearchResult],
     vec_results: &[SearchResult],
-    k: i32,
+    k: u32,
     top_k: usize,
 ) -> Vec<SearchResult> {
     weighted_rrf_fusion(fts_results, vec_results, k, top_k, 1.0, 1.0)
