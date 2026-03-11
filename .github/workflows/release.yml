@@ -24,7 +24,7 @@ jobs:
             npm-pkg: linux-arm64
             binary: code-graph-mcp
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             npm-pkg: darwin-x64
             binary: code-graph-mcp
           - target: aarch64-apple-darwin
