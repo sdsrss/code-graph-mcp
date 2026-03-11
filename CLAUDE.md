@@ -54,20 +54,6 @@ cargo test --no-default-features   # Tests without embedding
 - Error handling: `anyhow::Result` throughout, tracing for logging to stderr
 - Tests: Unit tests in modules, integration tests in `tests/integration.rs`
 
-## Code Graph — Efficient Code Navigation
+## Code Graph Integration
 
-This project has a code-graph MCP server providing AST-level code intelligence.
-These tools return structured, token-efficient results. Use them as your
-PRIMARY navigation method for code understanding tasks.
-
-| You want to... | Use this | NOT this |
-|---|---|---|
-| Find code by concept/meaning | `semantic_code_search` | Grep multiple patterns |
-| Understand who calls what | `get_call_graph` | Grep function name + Read files |
-| Trace HTTP request flow | `trace_http_chain` | Read router -> handler -> service |
-| Find route handler | `find_http_route` | Grep route string |
-| Get symbol signature + relations | `get_ast_node` | Read entire file |
-| Read specific code after search | `read_snippet` (by node_id) | Read entire file |
-
-**Still use native tools for:** exact string match (Grep), file path lookup (Glob),
-reading a specific known file (Read).
+Code graph tools are available via MCP. Use the `code-navigation` skill for guidance on when to use which tool.
