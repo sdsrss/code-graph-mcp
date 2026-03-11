@@ -218,6 +218,8 @@ impl McpServer {
             "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_tools_list(req.id),
             "tools/call" => self.handle_tools_call(req.id, req.params),
+            "resources/list" => self.handle_resources_list(req.id),
+            "resources/read" => self.handle_resources_read(req.id, req.params),
             _ => JsonRpcResponse::error(
                 req.id,
                 super::protocol::JSONRPC_METHOD_NOT_FOUND,
@@ -232,9 +234,8 @@ impl McpServer {
         JsonRpcResponse::success(id, json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {
-                    "listChanged": false
-                }
+                "tools": { "listChanged": false },
+                "resources": { "subscribe": false, "listChanged": false }
             },
             "serverInfo": {
                 "name": "code-graph-mcp",
@@ -287,6 +288,62 @@ impl McpServer {
                     "isError": true
                 }))
             }
+        }
+    }
+
+    fn handle_resources_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::success(id, json!({
+            "resources": [{
+                "uri": "code-graph://project-summary",
+                "name": "Code Graph Project Summary",
+                "description": "Overview of the indexed codebase: file count, node count, edge count, languages, and index health",
+                "mimeType": "application/json",
+                "annotations": {
+                    "audience": ["assistant"]
+                }
+            }]
+        }))
+    }
+
+    fn handle_resources_read(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
+        let uri = params.as_ref()
+            .and_then(|p| p["uri"].as_str())
+            .unwrap_or("");
+
+        match uri {
+            "code-graph://project-summary" => {
+                let status = match queries::get_index_status(self.db.conn(), self.is_watching()) {
+                    Ok(s) => s,
+                    Err(e) => return JsonRpcResponse::error(
+                        id,
+                        super::protocol::JSONRPC_INTERNAL_ERROR,
+                        format!("Failed to get index status: {}", e),
+                    ),
+                };
+
+                let summary = json!({
+                    "files": status.files_count,
+                    "nodes": status.nodes_count,
+                    "edges": status.edges_count,
+                    "schema_version": status.schema_version,
+                    "db_size_bytes": status.db_size_bytes,
+                    "watching": status.is_watching,
+                    "last_indexed_at": status.last_indexed_at,
+                });
+
+                JsonRpcResponse::success(id, json!({
+                    "contents": [{
+                        "uri": "code-graph://project-summary",
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&summary).unwrap_or_default()
+                    }]
+                }))
+            }
+            _ => JsonRpcResponse::error(
+                id,
+                super::protocol::JSONRPC_INVALID_PARAMS,
+                format!("Unknown resource URI: {}", uri),
+            ),
         }
     }
 
@@ -1649,5 +1706,16 @@ app.post('/api/login', handleLogin);
         let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
         // Should return a result (not error) with an informative message about embedding requirement
         assert!(parsed["result"].is_object());
+    }
+
+    #[test]
+    fn test_resources_list() {
+        let server = McpServer::new_test();
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}}"#;
+        let response = server.handle_message(msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let resources = parsed["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "code-graph://project-summary");
     }
 }
