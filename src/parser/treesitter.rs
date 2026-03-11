@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use super::languages::get_language;
 use super::node_text;
+use crate::domain::MAX_AST_DEPTH;
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -36,8 +37,6 @@ pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language:
     nodes
 }
 
-const MAX_AST_DEPTH: usize = 64;
-
 fn extract_nodes(
     node: tree_sitter::Node,
     source: &str,
@@ -56,6 +55,14 @@ fn extract_nodes(
                 results.push(parsed);
             }
         }
+        // Python async functions
+        "async_function_definition" => {
+            let nt = if parent_class.is_some() { "method" } else { "function" };
+            if let Some(parsed) = extract_function_node(&node, source, nt, parent_class) {
+                results.push(parsed);
+            }
+        }
+
         "function_definition" => {
             if language == "c" || language == "cpp" {
                 // C/C++: name is in declarator child, not name field
@@ -120,19 +127,36 @@ fn extract_nodes(
             }
         }
 
-        // Interfaces (TS)
+        // Interfaces (TS/Java)
         "interface_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(ParsedNode {
-                    node_type: "interface".into(),
-                    name: name.clone(),
-                    qualified_name: Some(name),
-                    start_line: node.start_position().row as u32 + 1,
-                    end_line: node.end_position().row as u32 + 1,
-                    code_content: node_text(&node, source).into(),
-                    signature: None,
-                    doc_comment: get_preceding_comment(&node, source),
-                });
+                results.push(make_simple_node("interface", name.clone(), &node, source));
+                extract_children(node, source, language, Some(&name), results, depth);
+                return;
+            }
+        }
+
+        // TS type aliases: type Foo = ...
+        "type_alias_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("type", name, &node, source));
+            }
+        }
+
+        // Java enums
+        "enum_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("enum", name, &node, source));
+            }
+        }
+
+        // C++ class/struct
+        "class_specifier" | "struct_specifier" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                let nt = if kind == "class_specifier" { "class" } else { "struct" };
+                results.push(make_simple_node(nt, name.clone(), &node, source));
+                extract_children(node, source, language, Some(&name), results, depth);
+                return;
             }
         }
 
@@ -464,5 +488,46 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"App"), "TSX function with JSX should be parsed, got: {:?}", names);
         assert!(names.contains(&"Container"), "TSX function with complex JSX should be parsed, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_ts_type_alias() {
+        let code = "type UserId = string;\ntype Config = { name: string; port: number };\n";
+        let nodes = parse_code(code, "typescript").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"UserId"), "got: {:?}", names);
+        assert!(names.contains(&"Config"), "got: {:?}", names);
+        assert!(nodes.iter().find(|n| n.name == "UserId").unwrap().node_type == "type");
+    }
+
+    #[test]
+    fn test_parse_java_interface_and_enum() {
+        let code = "public interface Comparable {\n    int compareTo(Object o);\n}\npublic enum Color { RED, GREEN, BLUE }\n";
+        let nodes = parse_code(code, "java").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"Comparable"), "got: {:?}", names);
+        assert!(names.contains(&"Color"), "got: {:?}", names);
+        assert!(nodes.iter().find(|n| n.name == "Comparable").unwrap().node_type == "interface");
+        assert!(nodes.iter().find(|n| n.name == "Color").unwrap().node_type == "enum");
+    }
+
+    #[test]
+    fn test_parse_cpp_class_and_struct() {
+        let code = "class MyClass {\npublic:\n    void doSomething() {}\n};\nstruct Point {\n    int x;\n    int y;\n};\n";
+        let nodes = parse_code(code, "cpp").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"), "got: {:?}", names);
+        assert!(names.contains(&"Point"), "got: {:?}", names);
+        assert!(nodes.iter().find(|n| n.name == "MyClass").unwrap().node_type == "class");
+        assert!(nodes.iter().find(|n| n.name == "Point").unwrap().node_type == "struct");
+    }
+
+    #[test]
+    fn test_parse_python_async_function() {
+        let code = "async def fetch_data(url: str) -> dict:\n    return {}\n\nclass Api:\n    async def get(self, path):\n        pass\n";
+        let nodes = parse_code(code, "python").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"fetch_data"), "got: {:?}", names);
+        assert!(names.contains(&"get"), "got: {:?}", names);
     }
 }

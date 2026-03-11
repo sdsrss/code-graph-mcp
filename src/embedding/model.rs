@@ -1,4 +1,5 @@
-pub const EMBEDDING_DIM: usize = 384;
+// Re-export from domain (canonical source)
+pub use crate::domain::EMBEDDING_DIM;
 
 #[cfg(feature = "embed-model")]
 mod inner {

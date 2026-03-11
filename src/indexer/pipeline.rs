@@ -9,7 +9,7 @@ use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::*;
-use crate::storage::schema::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_FILE_SIZE};
 use crate::utils::config::detect_language;
 
 pub struct IndexResult {
@@ -194,7 +194,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
     for &node_id in dirty_ids {
         if let Some((node, file_path)) = all_nodes.get(&node_id) {
             let edges = all_edges.get(&node_id);
-            let cat = categorize_edges(edges, |meta, name| format_route_from_metadata(meta, name));
+            let cat = categorize_edges(edges, format_route_from_metadata);
 
             let ctx = build_context_string(&NodeContext {
                 node_type: node.node_type.clone(),
@@ -264,7 +264,6 @@ fn index_files(
         };
 
         // Skip files larger than 1MB to avoid OOM on generated/bundled files
-        const MAX_FILE_SIZE: u64 = 1_048_576;
         let file_meta = std::fs::metadata(&abs_path).ok();
         if let Some(ref meta) = file_meta {
             if meta.len() > MAX_FILE_SIZE {
@@ -406,7 +405,7 @@ fn index_files(
         for (idx, &node_id) in pf.node_ids.iter().enumerate() {
             let node_name = &pf.node_names[idx];
             let edges = all_edges.get(&node_id);
-            let cat = categorize_edges(edges, |meta, name| format_route_from_metadata(meta, name));
+            let cat = categorize_edges(edges, format_route_from_metadata);
 
             let node_detail = all_node_details.get(&node_id);
 

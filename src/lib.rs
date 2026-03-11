@@ -1,3 +1,4 @@
+pub mod domain;
 pub mod embedding;
 pub mod graph;
 pub mod indexer;

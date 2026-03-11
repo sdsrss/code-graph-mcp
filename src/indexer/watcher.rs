@@ -24,11 +24,18 @@ impl FileWatcher {
                     ) {
                         return;
                     }
-                    // Convert to relative paths for consistency with the indexer pipeline
+                    // Convert to relative paths for consistency with the indexer pipeline.
+                    // Skip paths that fail strip_prefix (absolute paths never match DB relative paths).
                     let paths: Vec<String> = event.paths.iter()
-                        .filter_map(|p| p.strip_prefix(&root_path).ok()
-                            .or(Some(p.as_path()))
-                            .and_then(|rel| rel.to_str().map(String::from)))
+                        .filter_map(|p| {
+                            match p.strip_prefix(&root_path) {
+                                Ok(rel) => rel.to_str().map(String::from),
+                                Err(_) => {
+                                    tracing::debug!("watcher: dropping out-of-root path {:?}", p);
+                                    None
+                                }
+                            }
+                        })
                         .collect();
                     if !paths.is_empty() {
                         let _ = tx.send(WatchEvent::Changed(paths));

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use super::node_text;
-use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
+use crate::domain::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_RELATION_DEPTH};
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -29,13 +29,13 @@ fn walk_for_relations(
     results: &mut Vec<ParsedRelation>,
     depth: usize,
 ) {
-    if depth > 256 { return; }
+    if depth > MAX_RELATION_DEPTH { return; }
     let kind = node.kind();
 
     // Determine if this node creates a new scope
     let scope_name = match kind {
         "function_declaration" | "function_definition" | "function_item"
-        | "method_definition" | "method_declaration" => {
+        | "method_definition" | "method_declaration" | "async_function_definition" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
         }
@@ -111,6 +111,13 @@ fn walk_for_relations(
         // Export statements (TS/JS)
         "export_statement" => {
             extract_export_names(&node, source, results);
+        }
+
+        // Rust: impl Trait for Type → implements edge
+        "impl_item" => {
+            if let Some(impl_rel) = extract_rust_impl_trait(&node, source) {
+                results.push(impl_rel);
+            }
         }
 
         // Rust: use std::collections::HashMap;
@@ -236,6 +243,24 @@ fn extract_rust_use_imports(
             metadata: None,
         });
     }
+}
+
+/// Extract `impl Trait for Type` → Type implements Trait
+fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
+    // impl_item has "trait" and "type" fields when it's `impl Trait for Type`
+    let trait_node = node.child_by_field_name("trait")?;
+    let type_node = node.child_by_field_name("type")?;
+    let trait_name = node_text(&trait_node, source).to_string();
+    let type_name = node_text(&type_node, source).to_string();
+    if trait_name.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: type_name,
+        target_name: trait_name,
+        relation: REL_IMPLEMENTS.into(),
+        metadata: None,
+    })
 }
 
 fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
@@ -1017,6 +1042,41 @@ def list_items():
             .collect();
         assert!(!routes.is_empty(), "should detect route from @app.get, got no routes");
         assert!(routes[0].target_name == "list_items", "target should be list_items");
+    }
+
+    #[test]
+    fn test_extract_rust_impl_trait() {
+        let source = r#"
+struct MyStruct;
+trait MyTrait { fn do_thing(&self); }
+impl MyTrait for MyStruct {
+    fn do_thing(&self) {}
+}
+"#;
+        let relations = extract_relations(source, "rust").unwrap();
+        let impls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(impls.contains(&("MyStruct", "MyTrait")), "got implements: {:?}", impls);
+    }
+
+    #[test]
+    fn test_bare_impl_no_implements_relation() {
+        // `impl Type { ... }` (no trait) should produce zero REL_IMPLEMENTS relations
+        let source = r#"
+struct MyStruct;
+impl MyStruct {
+    fn new() -> Self { MyStruct }
+    fn do_thing(&self) {}
+}
+"#;
+        let relations = extract_relations(source, "rust").unwrap();
+        let impls: Vec<_> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .collect();
+        assert!(impls.is_empty(), "bare impl should produce no implements relations, got: {:?}",
+            impls.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
     }
 
     #[test]

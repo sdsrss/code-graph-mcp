@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use crate::storage::schema::REL_CALLS;
+use crate::domain::REL_CALLS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
@@ -151,7 +151,7 @@ mod tests {
     use super::*;
     use crate::storage::db::Database;
     use crate::storage::queries::{upsert_file, insert_node, insert_edge, FileRecord, NodeRecord};
-    use crate::storage::schema::REL_CALLS;
+    use crate::domain::REL_CALLS;
     use tempfile::TempDir;
 
     fn test_db() -> (Database, TempDir) {

@@ -1,13 +1,5 @@
 pub const SCHEMA_VERSION: i32 = 1;
 
-// Relation type constants
-pub const REL_CALLS: &str = "calls";
-pub const REL_INHERITS: &str = "inherits";
-pub const REL_IMPORTS: &str = "imports";
-pub const REL_ROUTES_TO: &str = "routes_to";
-pub const REL_IMPLEMENTS: &str = "implements";
-pub const REL_EXPORTS: &str = "exports";
-
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     id          INTEGER PRIMARY KEY,
@@ -84,6 +76,6 @@ pub fn create_vec_tables_sql() -> String {
         CREATE TRIGGER IF NOT EXISTS nodes_vectors_ad AFTER DELETE ON nodes BEGIN
             DELETE FROM node_vectors WHERE node_id = old.id;
         END;",
-        dim = crate::embedding::model::EMBEDDING_DIM,
+        dim = crate::domain::EMBEDDING_DIM,
     )
 }
