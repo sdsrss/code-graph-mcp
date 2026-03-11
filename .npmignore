@@ -1,0 +1,29 @@
+# Rust source and build
+src/
+target/
+vendor/
+Cargo.toml
+Cargo.lock
+build.rs
+tests/
+
+# Development
+.git/
+.gitignore
+.code-graph/
+.tmp/
+.gsd/
+docs/
+models/
+CLAUDE.md
+.claude/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Scripts (only needed for building)
+scripts/

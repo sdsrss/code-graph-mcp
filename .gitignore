@@ -12,9 +12,18 @@ models/
 # Hidden files and directories (IDE, OS, tool configs)
 .*
 !.gitignore
+!.npmignore
 
 # Documentation (local only)
 docs/
 
 # AI assistant config
 CLAUDE.md
+
+# npm binary (built via scripts/copy-binary.js, not committed)
+bin/code-graph-mcp
+bin/code-graph-mcp.exe
+
+# npm artifacts
+node_modules/
+*.tgz

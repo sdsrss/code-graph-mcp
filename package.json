@@ -1,0 +1,43 @@
+{
+  "name": "code-graph-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/petercat-ai/code-graph-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "code-graph",
+    "ast",
+    "knowledge-graph",
+    "semantic-search",
+    "tree-sitter",
+    "code-analysis",
+    "call-graph"
+  ],
+  "bin": {
+    "code-graph-mcp": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "cargo build --release --no-default-features && node scripts/copy-binary.js",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
