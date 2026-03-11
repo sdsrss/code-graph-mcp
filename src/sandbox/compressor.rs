@@ -29,6 +29,12 @@ fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
     total_chars / 3
 }
 
+/// Estimate token count for a JSON value (1 token ~ 3 chars for code)
+pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    serialized.len() / 3
+}
+
 /// Compress results if needed.
 /// `file_paths` maps each result's index to its file path.
 ///

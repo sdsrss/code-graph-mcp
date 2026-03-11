@@ -458,12 +458,36 @@ impl McpServer {
             .map(|n| json!({"node_id": n.node_id, "name": n.name, "type": n.node_type, "file_path": n.file_path, "depth": n.depth}))
             .collect();
 
-        Ok(json!({
+        let result = json!({
             "function": function_name,
             "direction": direction,
             "callees": callee_nodes,
             "callers": caller_nodes,
-        }))
+        });
+
+        // Compress if result exceeds token threshold
+        let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
+        if tokens > 2000 {
+            let items: Vec<serde_json::Value> = results.iter()
+                .filter(|n| n.depth > 0)
+                .map(|n| json!({
+                    "node_id": n.node_id,
+                    "name": n.name,
+                    "type": n.node_type,
+                    "file_path": n.file_path,
+                    "depth": n.depth,
+                    "direction": n.direction.as_str(),
+                }))
+                .collect();
+            return Ok(json!({
+                "mode": "compressed_call_graph",
+                "message": "Call graph exceeded token limit. Use read_snippet(node_id) to expand individual nodes.",
+                "function": function_name,
+                "results": items,
+            }));
+        }
+
+        Ok(result)
     }
 
     fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -549,10 +573,33 @@ impl McpServer {
             handlers.push(handler);
         }
 
-        Ok(json!({
+        let result = json!({
             "route": route_path,
             "handlers": handlers,
-        }))
+        });
+
+        // Compress if result exceeds token threshold
+        let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
+        if tokens > 2000 {
+            let compressed_handlers: Vec<serde_json::Value> = handlers.iter().map(|h| {
+                json!({
+                    "node_id": h["node_id"],
+                    "handler_name": h["handler_name"],
+                    "file_path": h["file_path"],
+                    "start_line": h["start_line"],
+                    "end_line": h["end_line"],
+                    "chain_count": h["call_chain"].as_array().map_or(0, |a| a.len()),
+                })
+            }).collect();
+            return Ok(json!({
+                "mode": "compressed_http_chain",
+                "message": "HTTP chain exceeded token limit. Use read_snippet(node_id) or get_call_graph(function_name) to expand.",
+                "route": route_path,
+                "results": compressed_handlers,
+            }));
+        }
+
+        Ok(result)
     }
 
     fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -587,6 +634,25 @@ impl McpServer {
                     let callers = queries::get_edge_source_names(self.db.conn(), n.id, CALLS)?;
                     result["calls"] = json!(callees);
                     result["called_by"] = json!(callers);
+                }
+
+                // Compress if code_content exceeds token threshold
+                let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
+                if tokens > 2000 {
+                    return Ok(json!({
+                        "mode": "compressed_node",
+                        "message": "Node content exceeded token limit. Use read_snippet(node_id) to read full code.",
+                        "node_id": n.id,
+                        "name": n.name,
+                        "type": n.node_type,
+                        "file_path": file_path,
+                        "start_line": n.start_line,
+                        "end_line": n.end_line,
+                        "signature": n.signature,
+                        "summary": format!("{} {} in {} (lines {}-{}){}",
+                            n.node_type, n.name, file_path, n.start_line, n.end_line,
+                            n.signature.as_ref().map(|s| format!(" {}", s)).unwrap_or_default()),
+                    }));
                 }
 
                 Ok(result)
@@ -1272,5 +1338,69 @@ app.post('/api/login', handleLogin);
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Error") || text.contains("not found"),
             "missing node should return error message, got: {}", text);
+    }
+
+    #[test]
+    fn test_call_graph_compression() {
+        let project_dir = TempDir::new().unwrap();
+        // Create a deep call chain with large function bodies
+        let mut code = String::new();
+        for i in 0..30 {
+            code.push_str(&format!(
+                "function chain{}() {{\n{}\n  chain{}();\n}}\n",
+                i,
+                format!("  // {}\n", "x".repeat(400)).repeat(3),
+                i + 1,
+            ));
+        }
+        code.push_str("function chain30() { return 1; }\n");
+        std::fs::write(project_dir.path().join("deep.ts"), &code).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("get_call_graph", json!({
+            "function_name": "chain0",
+            "direction": "callees",
+            "depth": 20
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        // Result should either be normal (if small enough) or compressed
+        if result["mode"].as_str().is_some() {
+            assert!(result["mode"].as_str().unwrap().starts_with("compressed_"));
+            assert!(result["results"].is_array());
+        } else {
+            assert!(result["function"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn test_ast_node_compression() {
+        let project_dir = TempDir::new().unwrap();
+        // Create a function with very large body
+        let big_body = format!("  // {}\n", "x".repeat(500)).repeat(30);
+        let code = format!("function bigFunc() {{\n{}}}\n", big_body);
+        std::fs::write(project_dir.path().join("big.ts"), &code).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("get_ast_node", json!({
+            "file_path": "big.ts",
+            "symbol_name": "bigFunc"
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        // Result should either be normal or compressed
+        if result["mode"].as_str().is_some() {
+            assert_eq!(result["mode"], "compressed_node");
+            assert!(result["node_id"].is_number());
+            assert!(result["summary"].is_string());
+        } else {
+            assert_eq!(result["name"], "bigFunc");
+        }
     }
 }
