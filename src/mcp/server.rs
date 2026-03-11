@@ -24,6 +24,11 @@ const INCREMENTAL_DEBOUNCE_SECS: u64 = 30;
 #[cfg(test)]
 const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 
+/// Token threshold for auto-compressing tool results.
+/// Results exceeding this estimated token count are returned as summaries
+/// with node_ids for expansion via read_snippet.
+const COMPRESSION_TOKEN_THRESHOLD: usize = 2000;
+
 /// MCP server for code graph operations. Single-threaded (stdio loop).
 pub struct McpServer {
     registry: ToolRegistry,
@@ -397,7 +402,7 @@ impl McpServer {
 
         // Context Sandbox: compress if results exceed token threshold
         use crate::sandbox::compressor::CompressedOutput;
-        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, 2000) {
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, COMPRESSION_TOKEN_THRESHOLD) {
             let (mode, compact) = match compressed {
                 CompressedOutput::Nodes(nodes) => {
                     let items: Vec<serde_json::Value> = nodes.iter().map(|c| json!({
@@ -449,45 +454,44 @@ impl McpServer {
 
         use crate::graph::query::Direction;
 
-        let callee_nodes: Vec<serde_json::Value> = results.iter()
-            .filter(|n| n.direction == Direction::Callees && n.depth > 0)
-            .map(|n| json!({"node_id": n.node_id, "name": n.name, "type": n.node_type, "file_path": n.file_path, "depth": n.depth}))
-            .collect();
-        let caller_nodes: Vec<serde_json::Value> = results.iter()
-            .filter(|n| n.direction == Direction::Callers && n.depth > 0)
-            .map(|n| json!({"node_id": n.node_id, "name": n.name, "type": n.node_type, "file_path": n.file_path, "depth": n.depth}))
+        // Build node lists with direction tag for potential compression reuse
+        let all_nodes: Vec<serde_json::Value> = results.iter()
+            .filter(|n| n.depth > 0)
+            .map(|n| json!({
+                "node_id": n.node_id,
+                "name": n.name,
+                "type": n.node_type,
+                "file_path": n.file_path,
+                "depth": n.depth,
+                "direction": n.direction.as_str(),
+            }))
             .collect();
 
-        let result = json!({
-            "function": function_name,
-            "direction": direction,
-            "callees": callee_nodes,
-            "callers": caller_nodes,
-        });
-
-        // Compress if result exceeds token threshold
-        let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
-        if tokens > 2000 {
-            let items: Vec<serde_json::Value> = results.iter()
-                .filter(|n| n.depth > 0)
-                .map(|n| json!({
-                    "node_id": n.node_id,
-                    "name": n.name,
-                    "type": n.node_type,
-                    "file_path": n.file_path,
-                    "depth": n.depth,
-                    "direction": n.direction.as_str(),
-                }))
-                .collect();
+        // Estimate tokens from the flat list to avoid building full result just to discard it
+        let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
+        if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
             return Ok(json!({
                 "mode": "compressed_call_graph",
                 "message": "Call graph exceeded token limit. Use read_snippet(node_id) to expand individual nodes.",
                 "function": function_name,
-                "results": items,
+                "results": all_nodes,
             }));
         }
 
-        Ok(result)
+        // Normal path: split into callers/callees for structured output
+        let callee_nodes: Vec<&serde_json::Value> = all_nodes.iter()
+            .filter(|n| n["direction"] == "callees")
+            .collect();
+        let caller_nodes: Vec<&serde_json::Value> = all_nodes.iter()
+            .filter(|n| n["direction"] == "callers")
+            .collect();
+
+        Ok(json!({
+            "function": function_name,
+            "direction": direction,
+            "callees": callee_nodes,
+            "callers": caller_nodes,
+        }))
     }
 
     fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -580,7 +584,7 @@ impl McpServer {
 
         // Compress if result exceeds token threshold
         let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
-        if tokens > 2000 {
+        if tokens > COMPRESSION_TOKEN_THRESHOLD {
             let compressed_handlers: Vec<serde_json::Value> = handlers.iter().map(|h| {
                 json!({
                     "node_id": h["node_id"],
@@ -638,7 +642,7 @@ impl McpServer {
 
                 // Compress if code_content exceeds token threshold
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
-                if tokens > 2000 {
+                if tokens > COMPRESSION_TOKEN_THRESHOLD {
                     return Ok(json!({
                         "mode": "compressed_node",
                         "message": "Node content exceeded token limit. Use read_snippet(node_id) to read full code.",
