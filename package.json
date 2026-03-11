@@ -1,5 +1,5 @@
 {
-  "name": "code-graph-mcp",
+  "name": "@sdsrs/code-graph-mcp",
   "version": "0.1.0",
   "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
   "license": "MIT",
