@@ -282,6 +282,7 @@ impl McpServer {
             "semantic_code_search" => self.tool_semantic_search(args),
             "get_call_graph" => self.tool_get_call_graph(args),
             "find_http_route" => self.tool_find_http_route(args),
+            "trace_http_chain" => self.tool_trace_http_chain(args),
             "get_ast_node" => self.tool_get_ast_node(args),
             "read_snippet" => self.tool_read_snippet(args),
             "start_watch" => self.tool_start_watch(),
@@ -491,6 +492,59 @@ impl McpServer {
                 let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
                 handler["downstream_calls"] = json!(downstream);
             }
+
+            handlers.push(handler);
+        }
+
+        Ok(json!({
+            "route": route_path,
+            "handlers": handlers,
+        }))
+    }
+
+    fn tool_trace_http_chain(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let route_path = args["route_path"].as_str()
+            .ok_or_else(|| anyhow!("route_path is required"))?;
+        let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
+        let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
+
+        self.ensure_indexed()?;
+
+        use crate::storage::schema::{REL_CALLS, REL_ROUTES_TO};
+        let rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
+
+        let mut handlers: Vec<serde_json::Value> = Vec::new();
+        for rm in &rows {
+            let mut handler = json!({
+                "node_id": rm.node_id,
+                "metadata": rm.metadata,
+                "handler_name": rm.handler_name,
+                "handler_type": rm.handler_type,
+                "file_path": rm.file_path,
+                "start_line": rm.start_line,
+                "end_line": rm.end_line,
+            });
+
+            if include_middleware {
+                let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
+                handler["downstream_calls"] = json!(downstream);
+            }
+
+            // Recursive call chain via call graph
+            let chain = crate::graph::query::get_call_graph(
+                self.db.conn(), &rm.handler_name, "callees", depth, Some(&rm.file_path),
+            )?;
+            let chain_nodes: Vec<serde_json::Value> = chain.iter()
+                .filter(|n| n.depth > 0) // exclude root (the handler itself)
+                .map(|n| json!({
+                    "node_id": n.node_id,
+                    "name": n.name,
+                    "type": n.node_type,
+                    "file_path": n.file_path,
+                    "depth": n.depth,
+                }))
+                .collect();
+            handler["call_chain"] = json!(chain_nodes);
 
             handlers.push(handler);
         }
@@ -722,7 +776,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
@@ -1163,6 +1217,41 @@ app.post('/api/login', handleLogin);
         // Should succeed (array or compressed mode) — not crash or OOM
         assert!(result.is_array() || result["mode"].as_str() == Some("compressed"),
             "search with huge top_k should return valid results, got: {}", result);
+    }
+
+    #[test]
+    fn test_trace_http_chain() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("server.ts"), r#"
+function validateToken(token: string) { return true; }
+function queryDatabase(userId: string) { return null; }
+
+function handleLogin(req: Request) {
+    validateToken(req.token);
+    return queryDatabase(req.userId);
+}
+
+app.post('/api/login', handleLogin);
+"#).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("trace_http_chain", json!({
+            "route_path": "/api/login",
+            "depth": 3
+        }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        assert_eq!(result["route"], "/api/login");
+        let handlers = result["handlers"].as_array().unwrap();
+        assert!(!handlers.is_empty(), "should find at least one handler");
+
+        // First handler should have a call_chain with recursive callees
+        let handler = &handlers[0];
+        assert!(handler["handler_name"].as_str().is_some());
+        assert!(handler["call_chain"].is_array(), "handler should have call_chain array");
     }
 
     #[test]

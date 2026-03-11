@@ -55,6 +55,19 @@ impl ToolRegistry {
                 }),
             },
             ToolDefinition {
+                name: "trace_http_chain".into(),
+                description: "Trace full call chain from HTTP route to all downstream functions. Combines route lookup with recursive call graph traversal in one step.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "route_path": { "type": "string", "description": "Route path e.g. '/api/users' or 'POST /api/login'" },
+                        "depth": { "type": "number", "description": "Max call chain depth (default 3)" },
+                        "include_middleware": { "type": "boolean", "description": "Include middleware chain (default true)" }
+                    },
+                    "required": ["route_path"]
+                }),
+            },
+            ToolDefinition {
                 name: "get_ast_node".into(),
                 description: "Extract a specific code symbol from a file by name.".into(),
                 input_schema: json!({
@@ -145,7 +158,8 @@ mod tests {
         assert!(names.contains(&"stop_watch"));
         assert!(names.contains(&"get_index_status"));
         assert!(names.contains(&"rebuild_index"));
-        assert_eq!(tools.len(), 9);
+        assert!(names.contains(&"trace_http_chain"));
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
