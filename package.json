@@ -1,11 +1,11 @@
 {
-  "name": "@sdsrs/code-graph-mcp",
+  "name": "@sdsrss/code-graph-mcp",
   "version": "0.1.0",
   "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/petercat-ai/code-graph-mcp"
+    "url": "https://github.com/sdsrss/code-graph-mcp"
   },
   "keywords": [
     "mcp",
@@ -25,19 +25,16 @@
     "README.md"
   ],
   "scripts": {
-    "build": "cargo build --release --no-default-features && node scripts/copy-binary.js",
-    "prepublishOnly": "npm run build"
+    "build": "cargo build --release --no-default-features && node scripts/copy-binary.js"
   },
   "engines": {
     "node": ">=16"
   },
-  "os": [
-    "linux",
-    "darwin",
-    "win32"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ]
+  "optionalDependencies": {
+    "@sdsrss/code-graph-mcp-linux-x64": "0.1.0",
+    "@sdsrss/code-graph-mcp-linux-arm64": "0.1.0",
+    "@sdsrss/code-graph-mcp-darwin-x64": "0.1.0",
+    "@sdsrss/code-graph-mcp-darwin-arm64": "0.1.0",
+    "@sdsrss/code-graph-mcp-win32-x64": "0.1.0"
+  }
 }

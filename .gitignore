@@ -13,6 +13,7 @@ models/
 .*
 !.gitignore
 !.npmignore
+!.github/
 
 # Documentation (local only)
 docs/
@@ -23,6 +24,10 @@ CLAUDE.md
 # npm binary (built via scripts/copy-binary.js, not committed)
 bin/code-graph-mcp
 bin/code-graph-mcp.exe
+
+# Platform-specific npm binaries (built during CI)
+npm/*/code-graph-mcp
+npm/*/code-graph-mcp.exe
 
 # npm artifacts
 node_modules/

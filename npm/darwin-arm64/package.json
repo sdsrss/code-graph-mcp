@@ -1,0 +1,14 @@
+{
+  "name": "@sdsrss/code-graph-mcp-darwin-arm64",
+  "version": "0.1.0",
+  "description": "code-graph-mcp binary for macOS ARM64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sdsrss/code-graph-mcp"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["code-graph-mcp"],
+  "preferUnplugged": true
+}

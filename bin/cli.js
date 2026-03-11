@@ -12,19 +12,32 @@ function getBinaryName() {
 function findBinary() {
   const binaryName = getBinaryName();
 
-  // 1. Check bundled binary in the same directory
+  // 1. Check platform-specific npm package (@sdsrss/code-graph-mcp-<os>-<arch>)
+  const platformPkg = `@sdsrss/code-graph-mcp-${os.platform()}-${os.arch()}`;
+  try {
+    const pkgPath = require.resolve(`${platformPkg}/package.json`);
+    const pkgDir = path.dirname(pkgPath);
+    const platBinary = path.join(pkgDir, binaryName);
+    if (fs.existsSync(platBinary)) {
+      return platBinary;
+    }
+  } catch {
+    // Platform package not installed
+  }
+
+  // 2. Check bundled binary in the same directory
   const bundled = path.join(__dirname, binaryName);
   if (fs.existsSync(bundled)) {
     return bundled;
   }
 
-  // 2. Check cargo build output (for development)
+  // 3. Check cargo build output (for development)
   const cargoRelease = path.join(__dirname, "..", "target", "release", binaryName);
   if (fs.existsSync(cargoRelease)) {
     return cargoRelease;
   }
 
-  // 3. Check if available in PATH
+  // 4. Check if available in PATH
   try {
     const which = os.platform() === "win32" ? "where" : "which";
     const result = execFileSync(which, [binaryName], { encoding: "utf8" }).trim();

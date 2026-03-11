@@ -1,0 +1,14 @@
+{
+  "name": "@sdsrss/code-graph-mcp-linux-x64",
+  "version": "0.1.0",
+  "description": "code-graph-mcp binary for Linux x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sdsrss/code-graph-mcp"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["code-graph-mcp"],
+  "preferUnplugged": true
+}

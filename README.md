@@ -28,7 +28,34 @@ src/
 └── utils/        # Language detection, config
 ```
 
-## Quick Start
+## Installation
+
+### Option 1: Claude Code (Recommended)
+
+One-command setup — registers as an MCP server directly in Claude Code:
+
+```bash
+claude mcp add code-graph-mcp npx @sdsrss/code-graph-mcp
+```
+
+### Option 2: npx (No Install)
+
+Run directly without installing:
+
+```bash
+npx @sdsrss/code-graph-mcp
+```
+
+### Option 3: npm (Global Install)
+
+Install globally, then run anywhere:
+
+```bash
+npm install -g @sdsrss/code-graph-mcp
+code-graph-mcp
+```
+
+## Build from Source
 
 ### Prerequisites
 
@@ -45,18 +72,9 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
-### Run
+### Configure with Claude Code (Manual)
 
-The server communicates via JSON-RPC 2.0 over stdin/stdout:
-
-```bash
-cd /path/to/your/project
-code-graph-mcp
-```
-
-### Configure with Claude Code
-
-Add to your MCP settings:
+If you built from source, add to your MCP settings:
 
 ```json
 {
