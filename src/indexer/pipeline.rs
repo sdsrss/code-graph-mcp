@@ -9,7 +9,7 @@ use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::storage::db::Database;
 use crate::storage::queries::*;
-use crate::storage::schema::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO};
+use crate::storage::schema::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
 use crate::utils::config::detect_language;
 
 pub struct IndexResult {
@@ -104,6 +104,8 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
             let mut inherits = Vec::new();
             let mut routes = Vec::new();
             let mut imports = Vec::new();
+            let mut implements = Vec::new();
+            let mut exports = Vec::new();
 
             if let Some(edge_list) = edges {
                 for (relation, direction, name) in edge_list {
@@ -113,6 +115,8 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                         (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
                         (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
                         (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
+                        (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
+                        (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
                         _ => {}
                     }
                 }
@@ -128,6 +132,8 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                 callers,
                 inherits,
                 imports,
+                implements,
+                exports,
                 doc_comment: node.doc_comment.clone(),
             });
 
@@ -338,6 +344,8 @@ fn index_files(
             let mut inherits = Vec::new();
             let mut routes = Vec::new();
             let mut imports = Vec::new();
+            let mut implements = Vec::new();
+            let mut exports = Vec::new();
 
             if let Some(edge_list) = edges {
                 for (relation, direction, name) in edge_list {
@@ -347,6 +355,8 @@ fn index_files(
                         (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
                         (rel, "out") if rel == REL_ROUTES_TO => routes.push(name.clone()),
                         (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
+                        (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
+                        (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
                         _ => {}
                     }
                 }
@@ -364,6 +374,8 @@ fn index_files(
                 callers,
                 inherits,
                 imports,
+                implements,
+                exports,
                 doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
             });
 

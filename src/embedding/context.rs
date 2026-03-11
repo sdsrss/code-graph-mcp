@@ -8,6 +8,8 @@ pub struct NodeContext {
     pub callers: Vec<String>,
     pub inherits: Vec<String>,
     pub imports: Vec<String>,
+    pub implements: Vec<String>,
+    pub exports: Vec<String>,
     pub doc_comment: Option<String>,
 }
 
@@ -32,6 +34,12 @@ pub fn build_context_string(info: &NodeContext) -> String {
     if !info.imports.is_empty() {
         parts.push(format!("imports: {}", info.imports.join(", ")));
     }
+    if !info.implements.is_empty() {
+        parts.push(format!("implements: {}", info.implements.join(", ")));
+    }
+    if !info.exports.is_empty() {
+        parts.push(format!("exports: {}", info.exports.join(", ")));
+    }
     if let Some(doc) = &info.doc_comment {
         parts.push(format!("doc: {}", doc));
     }
@@ -54,6 +62,8 @@ mod tests {
             callers: vec!["authMiddleware".into(), "handleLogin".into()],
             inherits: vec![],
             imports: vec!["jwt".into(), "UserRepo".into()],
+            implements: vec![],
+            exports: vec![],
             doc_comment: Some("Validates JWT token and returns the associated user".into()),
         };
 
@@ -78,6 +88,8 @@ mod tests {
             callers: vec![],
             inherits: vec![],
             imports: vec![],
+            implements: vec![],
+            exports: vec![],
             doc_comment: None,
         };
 

@@ -5,6 +5,8 @@ pub const REL_CALLS: &str = "calls";
 pub const REL_INHERITS: &str = "inherits";
 pub const REL_IMPORTS: &str = "imports";
 pub const REL_ROUTES_TO: &str = "routes_to";
+pub const REL_IMPLEMENTS: &str = "implements";
+pub const REL_EXPORTS: &str = "exports";
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (

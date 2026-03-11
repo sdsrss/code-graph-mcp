@@ -1,6 +1,6 @@
 use anyhow::Result;
 use super::node_text;
-use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO};
+use crate::storage::schema::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -100,7 +100,15 @@ fn walk_for_relations(
                         metadata: None,
                     });
                 }
+
+                // Check for implements (TS/JS/Java)
+                extract_implements(&node, source, cls, results);
             }
+        }
+
+        // Export statements (TS/JS)
+        "export_statement" => {
+            extract_export_names(&node, source, results);
         }
 
         // Rust: use std::collections::HashMap;
@@ -392,6 +400,138 @@ fn extract_superclass(node: &tree_sitter::Node, source: &str) -> Option<String> 
         }
     }
     None
+}
+
+fn extract_implements(
+    node: &tree_sitter::Node,
+    source: &str,
+    class_name: &str,
+    results: &mut Vec<ParsedRelation>,
+) {
+    for i in 0..node.named_child_count() {
+        let child = match node.named_child(i) {
+            Some(c) => c,
+            None => continue,
+        };
+        match child.kind() {
+            // TS/JS: class_heritage contains implements_clause children
+            "class_heritage" => {
+                for j in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(j) {
+                        if inner.kind() == "implements_clause" {
+                            for k in 0..inner.named_child_count() {
+                                if let Some(type_node) = inner.named_child(k) {
+                                    if type_node.kind() == "type_identifier" || type_node.kind() == "identifier" {
+                                        results.push(ParsedRelation {
+                                            source_name: class_name.to_string(),
+                                            target_name: node_text(&type_node, source).to_string(),
+                                            relation: REL_IMPLEMENTS.into(),
+                                            metadata: None,
+                                        });
+                                    }
+                                    // Handle generic_type: IService<T> -> extract IService
+                                    if type_node.kind() == "generic_type" {
+                                        if let Some(name_node) = type_node.named_child(0) {
+                                            if name_node.kind() == "type_identifier" || name_node.kind() == "identifier" {
+                                                results.push(ParsedRelation {
+                                                    source_name: class_name.to_string(),
+                                                    target_name: node_text(&name_node, source).to_string(),
+                                                    relation: REL_IMPLEMENTS.into(),
+                                                    metadata: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Java: super_interfaces -> type_list -> type_identifier
+            "super_interfaces" | "interfaces" => {
+                for j in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(j) {
+                        if inner.kind() == "type_list" {
+                            for k in 0..inner.named_child_count() {
+                                if let Some(type_node) = inner.named_child(k) {
+                                    if type_node.kind() == "type_identifier" || type_node.kind() == "identifier" {
+                                        results.push(ParsedRelation {
+                                            source_name: class_name.to_string(),
+                                            target_name: node_text(&type_node, source).to_string(),
+                                            relation: REL_IMPLEMENTS.into(),
+                                            metadata: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // Fallback: direct type_identifier child
+                        if inner.kind() == "type_identifier" || inner.kind() == "identifier" {
+                            results.push(ParsedRelation {
+                                source_name: class_name.to_string(),
+                                target_name: node_text(&inner, source).to_string(),
+                                relation: REL_IMPLEMENTS.into(),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_export_names(
+    node: &tree_sitter::Node,
+    source: &str,
+    results: &mut Vec<ParsedRelation>,
+) {
+    // Walk direct children for exported declarations
+    for i in 0..node.named_child_count() {
+        let child = match node.named_child(i) {
+            Some(c) => c,
+            None => continue,
+        };
+        match child.kind() {
+            "function_declaration" | "class_declaration" | "interface_declaration"
+            | "type_alias_declaration" | "enum_declaration" | "abstract_class_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source).to_string();
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: name,
+                            relation: REL_EXPORTS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+            "lexical_declaration" => {
+                // export const foo = ..., export let bar = ...
+                for j in 0..child.named_child_count() {
+                    if let Some(decl) = child.named_child(j) {
+                        if decl.kind() == "variable_declarator" {
+                            if let Some(name_node) = decl.child_by_field_name("name") {
+                                let name = node_text(&name_node, source).to_string();
+                                if !name.is_empty() {
+                                    results.push(ParsedRelation {
+                                        source_name: "<module>".into(),
+                                        target_name: name,
+                                        relation: REL_EXPORTS.into(),
+                                        metadata: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // --- Route extraction functions ---
@@ -758,5 +898,39 @@ func main() {
         let relations = extract_relations(code, "go").unwrap();
         assert!(relations.iter().any(|r| r.relation == REL_ROUTES_TO && r.target_name == "healthCheck"),
             "got relations: {:?}", relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_extract_ts_implements() {
+        let code = "class UserService implements IUserService {\n    getUser() { return null; }\n}\n";
+        let relations = extract_relations(code, "typescript").unwrap();
+        let impls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(impls.contains(&"IUserService"), "got implements: {:?}", impls);
+    }
+
+    #[test]
+    fn test_extract_java_implements() {
+        let code = "public class ArrayList implements List, Serializable {\n}\n";
+        let relations = extract_relations(code, "java").unwrap();
+        let impls: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPLEMENTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(impls.contains(&"List"), "got implements: {:?}", impls);
+    }
+
+    #[test]
+    fn test_extract_ts_exports() {
+        let code = "export function handleLogin(req: Request) {}\nexport class AuthService {}\n";
+        let relations = extract_relations(code, "typescript").unwrap();
+        let exports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_EXPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(exports.contains(&"handleLogin"), "got exports: {:?}", exports);
+        assert!(exports.contains(&"AuthService"), "got exports: {:?}", exports);
     }
 }
