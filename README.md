@@ -13,6 +13,34 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`)
 - **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, and other MCP clients
 
+## Why code-graph-mcp?
+
+Unlike naive full-text search or simple AST dumps, code-graph-mcp builds a **structured knowledge graph** that understands the relationships between symbols across your entire codebase.
+
+### Incremental by Design
+
+BLAKE3 Merkle tree tracks every file's content hash. On re-index, only changed files are re-parsed — unchanged directory subtrees are skipped entirely via mtime cache. When a function signature changes, **dirty propagation** automatically regenerates context for all downstream callers across files.
+
+### Hybrid Search, Not Just Grep
+
+Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-vec) via **Reciprocal Rank Fusion (RRF)** — so searching "handle user login" finds the right function even if it's named `authenticate_session`. Results are auto-compressed to fit LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview).
+
+### Scope-Aware Relation Extraction
+
+The parser doesn't just find function calls — it tracks them within their proper scope context. Extracts calls, imports, inheritance, interface implementations, exports, and HTTP route bindings. Same-file targets are preferred over cross-file matches to minimize false-positive edges.
+
+### HTTP Request Flow Tracing
+
+Unique to code-graph-mcp: trace from `GET /api/users` → route handler → service layer → database call in a single query. Supports Express, Flask/FastAPI, and Go HTTP frameworks.
+
+### Zero External Dependencies at Runtime
+
+Single binary, embedded SQLite, bundled sqlite-vec extension, optional local embedding model via Candle — no database server, no cloud API, no Docker required. Runs entirely on your machine.
+
+### Built for AI Assistants
+
+Every design decision — from token-aware compression to node_id-based snippet expansion — is optimized for LLM context windows. Works out of the box with Claude Code, Cursor, Windsurf, and any MCP-compatible client.
+
 ## Architecture
 
 ```
@@ -35,24 +63,57 @@ src/
 One-command setup — registers as an MCP server directly in Claude Code:
 
 ```bash
-claude mcp add code-graph-mcp npx @sdsrs/code-graph
+claude mcp add code-graph-mcp -- npx -y @sdsrs/code-graph
 ```
 
-### Option 2: npx (No Install)
+### Option 2: Cursor / Windsurf / Other MCP Clients
+
+Add to your MCP settings file (e.g. `~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "code-graph": {
+      "command": "npx",
+      "args": ["-y", "@sdsrs/code-graph"]
+    }
+  }
+}
+```
+
+### Option 3: npx (No Install)
 
 Run directly without installing:
 
 ```bash
-npx @sdsrs/code-graph
+npx -y @sdsrs/code-graph
 ```
 
-### Option 3: npm (Global Install)
+### Option 4: npm (Global Install)
 
 Install globally, then run anywhere:
 
 ```bash
 npm install -g @sdsrs/code-graph
 code-graph-mcp
+```
+
+## Uninstallation
+
+### Claude Code
+
+```bash
+claude mcp remove code-graph-mcp
+```
+
+### Cursor / Windsurf / Other MCP Clients
+
+Remove the `code-graph` entry from your MCP settings file (e.g. `~/.cursor/mcp.json`).
+
+### npm (Global)
+
+```bash
+npm uninstall -g @sdsrs/code-graph
 ```
 
 ## Build from Source
@@ -72,16 +133,15 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
-### Configure with Claude Code (Manual)
+### Configure (from source)
 
-If you built from source, add to your MCP settings:
+Add the compiled binary to your MCP settings:
 
 ```json
 {
   "mcpServers": {
     "code-graph": {
-      "command": "/path/to/code-graph-mcp",
-      "cwd": "/path/to/your/project"
+      "command": "/path/to/target/release/code-graph-mcp"
     }
   }
 }
@@ -94,6 +154,7 @@ If you built from source, add to your MCP settings:
 | `semantic_code_search` | Hybrid BM25 + vector + graph search for AST nodes |
 | `get_call_graph` | Trace upstream/downstream call chains for a function |
 | `find_http_route` | Map route path to backend handler function |
+| `trace_http_chain` | Full request flow: route → handler → downstream call chain |
 | `get_ast_node` | Extract a specific code symbol from a file |
 | `read_snippet` | Read original code snippet by node ID with context |
 | `start_watch` / `stop_watch` | Start/stop file system watcher for incremental indexing |
