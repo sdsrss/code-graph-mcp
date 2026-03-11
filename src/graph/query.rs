@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::storage::schema::REL_CALLS;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Callees,
     Callers,

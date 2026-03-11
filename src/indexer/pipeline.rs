@@ -48,6 +48,45 @@ fn try_embed_and_store(db: &Database, model: Option<&EmbeddingModel>, node_id: i
     }
 }
 
+struct CategorizedEdges {
+    callees: Vec<String>,
+    callers: Vec<String>,
+    inherits: Vec<String>,
+    routes: Vec<String>,
+    imports: Vec<String>,
+    implements: Vec<String>,
+    exports: Vec<String>,
+}
+
+fn categorize_edges(edges: Option<&Vec<EdgeInfo>>, format_route: impl Fn(Option<&str>, &str) -> String) -> CategorizedEdges {
+    let mut result = CategorizedEdges {
+        callees: Vec::new(),
+        callers: Vec::new(),
+        inherits: Vec::new(),
+        routes: Vec::new(),
+        imports: Vec::new(),
+        implements: Vec::new(),
+        exports: Vec::new(),
+    };
+    if let Some(edge_list) = edges {
+        for (relation, direction, name, metadata) in edge_list {
+            match (relation.as_str(), direction.as_str()) {
+                (rel, "out") if rel == REL_CALLS => result.callees.push(name.clone()),
+                (rel, "in") if rel == REL_CALLS => result.callers.push(name.clone()),
+                (rel, "out") if rel == REL_INHERITS => result.inherits.push(name.clone()),
+                (rel, "out") if rel == REL_ROUTES_TO => {
+                    result.routes.push(format_route(metadata.as_deref(), name));
+                }
+                (rel, "out") if rel == REL_IMPORTS => result.imports.push(name.clone()),
+                (rel, "out") if rel == REL_IMPLEMENTS => result.implements.push(name.clone()),
+                (rel, "out") if rel == REL_EXPORTS => result.exports.push(name.clone()),
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
 pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
     let files: Vec<String> = current_hashes.keys().cloned().collect();
@@ -155,31 +194,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
     for &node_id in dirty_ids {
         if let Some((node, file_path)) = all_nodes.get(&node_id) {
             let edges = all_edges.get(&node_id);
-
-            let mut callees = Vec::new();
-            let mut callers = Vec::new();
-            let mut inherits = Vec::new();
-            let mut routes = Vec::new();
-            let mut imports = Vec::new();
-            let mut implements = Vec::new();
-            let mut exports = Vec::new();
-
-            if let Some(edge_list) = edges {
-                for (relation, direction, name, metadata) in edge_list {
-                    match (relation.as_str(), direction.as_str()) {
-                        (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
-                        (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
-                        (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
-                        (rel, "out") if rel == REL_ROUTES_TO => {
-                            routes.push(format_route_from_metadata(metadata.as_deref(), name));
-                        }
-                        (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
-                        (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
-                        (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
-                        _ => {}
-                    }
-                }
-            }
+            let cat = categorize_edges(edges, |meta, name| format_route_from_metadata(meta, name));
 
             let ctx = build_context_string(&NodeContext {
                 node_type: node.node_type.clone(),
@@ -187,13 +202,13 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                 file_path: file_path.clone(),
                 signature: node.signature.clone(),
                 code_content: Some(node.code_content.clone()),
-                routes,
-                callees,
-                callers,
-                inherits,
-                imports,
-                implements,
-                exports,
+                routes: cat.routes,
+                callees: cat.callees,
+                callers: cat.callers,
+                inherits: cat.inherits,
+                imports: cat.imports,
+                implements: cat.implements,
+                exports: cat.exports,
                 doc_comment: node.doc_comment.clone(),
             });
 
@@ -212,9 +227,8 @@ fn index_files(
     model: Option<&EmbeddingModel>,
     delete_paths: &[String],
 ) -> Result<IndexResult> {
-    db.conn().execute_batch("BEGIN")?;
+    let tx = db.conn().unchecked_transaction()?;
 
-    let result = (|| -> Result<IndexResult> {
     // Phase 0: Delete removed files inside transaction
     if !delete_paths.is_empty() {
         delete_files_by_paths(db.conn(), delete_paths)?;
@@ -392,31 +406,7 @@ fn index_files(
         for (idx, &node_id) in pf.node_ids.iter().enumerate() {
             let node_name = &pf.node_names[idx];
             let edges = all_edges.get(&node_id);
-
-            let mut callees = Vec::new();
-            let mut callers = Vec::new();
-            let mut inherits = Vec::new();
-            let mut routes = Vec::new();
-            let mut imports = Vec::new();
-            let mut implements = Vec::new();
-            let mut exports = Vec::new();
-
-            if let Some(edge_list) = edges {
-                for (relation, direction, name, metadata) in edge_list {
-                    match (relation.as_str(), direction.as_str()) {
-                        (rel, "out") if rel == REL_CALLS => callees.push(name.clone()),
-                        (rel, "in") if rel == REL_CALLS => callers.push(name.clone()),
-                        (rel, "out") if rel == REL_INHERITS => inherits.push(name.clone()),
-                        (rel, "out") if rel == REL_ROUTES_TO => {
-                            routes.push(format_route_from_metadata(metadata.as_deref(), name));
-                        }
-                        (rel, "out") if rel == REL_IMPORTS => imports.push(name.clone()),
-                        (rel, "out") if rel == REL_IMPLEMENTS => implements.push(name.clone()),
-                        (rel, "out") if rel == REL_EXPORTS => exports.push(name.clone()),
-                        _ => {}
-                    }
-                }
-            }
+            let cat = categorize_edges(edges, |meta, name| format_route_from_metadata(meta, name));
 
             let node_detail = all_node_details.get(&node_id);
 
@@ -426,13 +416,13 @@ fn index_files(
                 file_path: pf.rel_path.clone(),
                 signature: node_detail.and_then(|n| n.signature.clone()),
                 code_content: node_detail.map(|n| n.code_content.clone()),
-                routes,
-                callees,
-                callers,
-                inherits,
-                imports,
-                implements,
-                exports,
+                routes: cat.routes,
+                callees: cat.callees,
+                callers: cat.callers,
+                inherits: cat.inherits,
+                imports: cat.imports,
+                implements: cat.implements,
+                exports: cat.exports,
                 doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
             });
 
@@ -441,18 +431,13 @@ fn index_files(
         }
     }
 
+    tx.commit()?;
+
     Ok(IndexResult {
         files_indexed: parsed_files.len(),
         nodes_created,
         edges_created,
     })
-    })(); // end of transaction closure
-
-    match &result {
-        Ok(_) => { db.conn().execute_batch("COMMIT")?; }
-        Err(_) => { let _ = db.conn().execute_batch("ROLLBACK"); }
-    }
-    result
 }
 
 #[cfg(test)]

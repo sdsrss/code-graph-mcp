@@ -35,7 +35,7 @@ fn main() -> Result<()> {
                 "jsonrpc": "2.0",
                 "id": null,
                 "error": {
-                    "code": -32600,
+                    "code": code_graph_mcp::mcp::protocol::JSONRPC_INVALID_REQUEST,
                     "message": format!("Message too large: {} bytes (max {})", buf.len(), MAX_MESSAGE_SIZE)
                 }
             });
@@ -53,9 +53,9 @@ fn main() -> Result<()> {
             Err(e) => {
                 tracing::error!("Error handling message: {}", e);
                 let (code, label) = if e.downcast_ref::<serde_json::Error>().is_some() {
-                    (-32700, "Parse error")
+                    (code_graph_mcp::mcp::protocol::JSONRPC_PARSE_ERROR, "Parse error")
                 } else {
-                    (-32603, "Internal error")
+                    (code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR, "Internal error")
                 };
                 let err_resp = serde_json::json!({
                     "jsonrpc": "2.0",

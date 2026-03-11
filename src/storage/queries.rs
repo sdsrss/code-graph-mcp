@@ -3,6 +3,9 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// Maximum number of parameters in a single IN clause to stay within SQLite limits.
+const MAX_IN_PARAMS: usize = 500;
+
 /// Edge info tuple: (relation, direction, target_name, metadata).
 /// Used by batch edge queries and context string builders.
 pub type EdgeInfo = (String, String, String, Option<String>);
@@ -154,10 +157,12 @@ pub fn delete_files_by_paths(conn: &Connection, paths: &[String]) -> Result<()> 
     if paths.is_empty() {
         return Ok(());
     }
-    let sql = format!("DELETE FROM files WHERE path IN ({})", make_placeholders(1, paths.len()));
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        paths.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-    conn.execute(&sql, params.as_slice())?;
+    for chunk in paths.chunks(MAX_IN_PARAMS) {
+        let sql = format!("DELETE FROM files WHERE path IN ({})", make_placeholders(1, chunk.len()));
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        conn.execute(&sql, params.as_slice())?;
+    }
     Ok(())
 }
 
@@ -173,16 +178,18 @@ pub fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>>
 // --- Node CRUD ---
 
 pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
-    conn.execute(
+    let id: i64 = conn.query_row(
         "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         RETURNING id",
         (
             node.file_id, &node.node_type, &node.name, &node.qualified_name,
             node.start_line, node.end_line, &node.code_content,
             &node.signature, &node.doc_comment, &node.context_string,
         ),
+        |row| row.get(0),
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
 pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult>> {
@@ -250,15 +257,20 @@ pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64
     if exclude_file_ids.is_empty() {
         return get_all_node_names(conn);
     }
-    let placeholders = make_placeholders(1, exclude_file_ids.len());
-    let sql = format!("SELECT name, id FROM nodes WHERE file_id NOT IN ({})", placeholders);
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> = exclude_file_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(results)
+    let mut all_results = Vec::new();
+    for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!("SELECT name, id FROM nodes WHERE file_id NOT IN ({})", placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            all_results.push(row?);
+        }
+    }
+    Ok(all_results)
 }
 
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
@@ -294,34 +306,37 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
     }
     let mut result: HashMap<i64, Vec<EdgeInfo>> = HashMap::new();
 
-    // Outgoing edges: node is source
-    let placeholders = make_placeholders(1, node_ids.len());
-    let sql_out = format!(
-        "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
-        placeholders
-    );
-    let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-    let mut stmt = conn.prepare(&sql_out)?;
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
-    })?;
-    for row in rows {
-        let (source_id, relation, name, metadata) = row?;
-        result.entry(source_id).or_default().push((relation, "out".into(), name, metadata));
-    }
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
 
-    // Incoming edges: node is target
-    let sql_in = format!(
-        "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
-        placeholders
-    );
-    let mut stmt = conn.prepare(&sql_in)?;
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
-    })?;
-    for row in rows {
-        let (target_id, relation, name, metadata) = row?;
-        result.entry(target_id).or_default().push((relation, "in".into(), name, metadata));
+        // Outgoing edges: node is source
+        let sql_out = format!(
+            "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql_out)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+        })?;
+        for row in rows {
+            let (source_id, relation, name, metadata) = row?;
+            result.entry(source_id).or_default().push((relation, "out".into(), name, metadata));
+        }
+
+        // Incoming edges: node is target
+        let sql_in = format!(
+            "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql_in)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+        })?;
+        for row in rows {
+            let (target_id, relation, name, metadata) = row?;
+            result.entry(target_id).or_default().push((relation, "in".into(), name, metadata));
+        }
     }
 
     Ok(result)
@@ -394,41 +409,39 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
     if changed_file_ids.is_empty() {
         return Ok(vec![]);
     }
-    let n = changed_file_ids.len();
-    let changed_ph = make_placeholders(1, n);
-    let exclude_ph = make_placeholders(n + 1, n);
-
-    // Nodes in other files that have outgoing edges TO nodes in changed files
-    // (their "calls:" context references changed nodes)
-    let sql_callers = format!(
-        "SELECT DISTINCT e.source_id FROM edges e
-         JOIN nodes n ON n.id = e.target_id
-         WHERE n.file_id IN ({})
-         AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-        changed_ph, exclude_ph
-    );
-    // Nodes in other files that have incoming edges FROM nodes in changed files
-    // (their "called_by:" context references changed nodes)
-    let sql_callees = format!(
-        "SELECT DISTINCT e.target_id FROM edges e
-         JOIN nodes n ON n.id = e.source_id
-         WHERE n.file_id IN ({})
-         AND e.target_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-        changed_ph, exclude_ph
-    );
-
-    let doubled: Vec<i64> = changed_file_ids.iter().chain(changed_file_ids.iter()).copied().collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-
     let mut results = Vec::new();
 
-    let mut stmt = conn.prepare(&sql_callers)?;
-    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    for row in rows { results.push(row?); }
+    for chunk in changed_file_ids.chunks(MAX_IN_PARAMS / 2) {
+        let n = chunk.len();
+        let changed_ph = make_placeholders(1, n);
+        let exclude_ph = make_placeholders(n + 1, n);
 
-    let mut stmt = conn.prepare(&sql_callees)?;
-    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    for row in rows { results.push(row?); }
+        let sql_callers = format!(
+            "SELECT DISTINCT e.source_id FROM edges e
+             JOIN nodes n ON n.id = e.target_id
+             WHERE n.file_id IN ({})
+             AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
+            changed_ph, exclude_ph
+        );
+        let sql_callees = format!(
+            "SELECT DISTINCT e.target_id FROM edges e
+             JOIN nodes n ON n.id = e.source_id
+             WHERE n.file_id IN ({})
+             AND e.target_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
+            changed_ph, exclude_ph
+        );
+
+        let doubled: Vec<i64> = chunk.iter().chain(chunk.iter()).copied().collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+
+        let mut stmt = conn.prepare(&sql_callers)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+        for row in rows { results.push(row?); }
+
+        let mut stmt = conn.prepare(&sql_callees)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+        for row in rows { results.push(row?); }
+    }
 
     results.sort();
     results.dedup();
@@ -450,23 +463,28 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
     if node_ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders = make_placeholders(1, node_ids.len());
-    let sql = format!(
-        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
-        NODE_SELECT_ALIASED, placeholders
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        node_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok(NodeWithFile {
-            node: map_node_row(row)?,
-            file_path: row.get(11)?,
-            language: row.get(12)?,
-        })
-    })?;
-    let results = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(results)
+    let mut all_results = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
+            NODE_SELECT_ALIASED, placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(NodeWithFile {
+                node: map_node_row(row)?,
+                file_path: row.get(11)?,
+                language: row.get(12)?,
+            })
+        })?;
+        for row in rows {
+            all_results.push(row?);
+        }
+    }
+    Ok(all_results)
 }
 
 // --- Route queries ---
@@ -528,7 +546,10 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         return Ok(vec![]);
     }
     let sql = format!(
-        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1 ORDER BY bm25(nodes_fts, 10.0, 5.0, 1.0, 3.0, 2.0) LIMIT ?2",
+        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1
+         -- BM25 field weights: name(10), qualified_name(5), code_content(1), context_string(3), doc_comment(2)
+         -- Higher weight = matches in that field rank higher
+         ORDER BY bm25(nodes_fts, 10.0, 5.0, 1.0, 3.0, 2.0) LIMIT ?2",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;

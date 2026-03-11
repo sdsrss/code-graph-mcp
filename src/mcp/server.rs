@@ -10,6 +10,7 @@ use crate::indexer::pipeline::{run_full_index, run_incremental_index_cached};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
+use crate::storage::queries;
 
 /// Lock a Mutex, recovering from poison but logging a warning.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
@@ -18,7 +19,6 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T>
         e.into_inner()
     })
 }
-use crate::storage::queries;
 
 struct WatcherState {
     _watcher: FileWatcher,
@@ -68,7 +68,10 @@ impl McpServer {
         let gitignore_path = project_root.join(".gitignore");
         {
             let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-            if !content.contains(".code-graph") {
+            if !content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == ".code-graph/" || trimmed == ".code-graph"
+            }) {
                 let mut new_content = content;
                 if !new_content.ends_with('\n') {
                     new_content.push('\n');
@@ -201,7 +204,7 @@ impl McpServer {
 
         // Validate JSON-RPC version
         if let Err(msg) = req.validate() {
-            let resp = JsonRpcResponse::error(req.id, -32600, msg.to_string());
+            let resp = JsonRpcResponse::error(req.id, super::protocol::JSONRPC_INVALID_REQUEST, msg.to_string());
             return Ok(Some(serde_json::to_string(&resp)?));
         }
 
@@ -217,7 +220,7 @@ impl McpServer {
             "tools/call" => self.handle_tools_call(req.id, req.params),
             _ => JsonRpcResponse::error(
                 req.id,
-                -32601,
+                super::protocol::JSONRPC_METHOD_NOT_FOUND,
                 format!("Method not found: {}", req.method),
             ),
         };
@@ -255,12 +258,12 @@ impl McpServer {
     fn handle_tools_call(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
         let params = match params {
             Some(p) => p,
-            None => return JsonRpcResponse::error(id, -32602, "Missing params".into()),
+            None => return JsonRpcResponse::error(id, super::protocol::JSONRPC_INVALID_PARAMS, "Missing params".into()),
         };
 
         let tool_name = match params["name"].as_str() {
             Some(name) => name,
-            None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'name' in tool call params".into()),
+            None => return JsonRpcResponse::error(id, super::protocol::JSONRPC_INVALID_PARAMS, "Missing or invalid 'name' in tool call params".into()),
         };
         let arguments = &params["arguments"];
 
@@ -407,7 +410,7 @@ impl McpServer {
 
         // Context Sandbox: compress if results exceed token threshold
         use crate::sandbox::compressor::CompressedOutput;
-        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, COMPRESSION_TOKEN_THRESHOLD) {
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, COMPRESSION_TOKEN_THRESHOLD)? {
             let (mode, compact) = match compressed {
                 CompressedOutput::Nodes(nodes) => {
                     let items: Vec<serde_json::Value> = nodes.iter().map(|c| json!({
@@ -782,7 +785,7 @@ impl McpServer {
         // Clear all data in a single transaction (CASCADE handles nodes→edges)
         {
             let tx = self.db.conn().unchecked_transaction()?;
-            self.db.conn().execute("DELETE FROM files", [])?;
+            tx.execute("DELETE FROM files", [])?;
             tx.commit()?;
         }
 

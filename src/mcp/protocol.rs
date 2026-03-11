@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+// JSON-RPC 2.0 standard error codes
+pub const JSONRPC_PARSE_ERROR: i32 = -32700;
+pub const JSONRPC_INVALID_REQUEST: i32 = -32600;
+pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+pub const JSONRPC_INVALID_PARAMS: i32 = -32602;
+pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,

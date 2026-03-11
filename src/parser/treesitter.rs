@@ -32,9 +32,11 @@ pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
 /// Extract nodes from a pre-parsed tree (avoids re-parsing).
 pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
-    extract_nodes(tree.root_node(), source, language, None, &mut nodes);
+    extract_nodes(tree.root_node(), source, language, None, &mut nodes, 0);
     nodes
 }
+
+const MAX_AST_DEPTH: usize = 64;
 
 fn extract_nodes(
     node: tree_sitter::Node,
@@ -42,7 +44,9 @@ fn extract_nodes(
     language: &str,
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
+    depth: usize,
 ) {
+    if depth > MAX_AST_DEPTH { return; }
     let kind = node.kind();
 
     match kind {
@@ -104,7 +108,7 @@ fn extract_nodes(
                     signature: None,
                     doc_comment: get_preceding_comment(&node, source),
                 });
-                extract_children(node, source, language, Some(&name), results);
+                extract_children(node, source, language, Some(&name), results, depth);
                 return;
             }
         }
@@ -177,14 +181,14 @@ fn extract_nodes(
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let impl_name = node_text(&type_node, source);
-                extract_children(node, source, language, Some(impl_name), results);
+                extract_children(node, source, language, Some(impl_name), results, depth);
                 return;
             }
         }
         "trait_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source));
-                extract_children(node, source, language, Some(&name), results);
+                extract_children(node, source, language, Some(&name), results, depth);
                 return;
             }
         }
@@ -193,7 +197,7 @@ fn extract_nodes(
     }
 
     // Recurse into children
-    extract_children(node, source, language, parent_class, results);
+    extract_children(node, source, language, parent_class, results, depth);
 }
 
 fn extract_children(
@@ -202,10 +206,11 @@ fn extract_children(
     language: &str,
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
+    depth: usize,
 ) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_nodes(child, source, language, parent_class, results);
+            extract_nodes(child, source, language, parent_class, results, depth + 1);
         }
     }
 }
@@ -304,18 +309,22 @@ fn extract_c_signature(node: &tree_sitter::Node, source: &str) -> Option<String>
 }
 
 fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    extract_declarator_name_inner(node, source, 0)
+}
+
+fn extract_declarator_name_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+    if depth > MAX_AST_DEPTH { return None; }
     // C/C++ function_declarator -> identifier
     if node.kind() == "function_declarator" {
         return get_child_by_field(node, "declarator", source)
             .or_else(|| {
-                // Try first named child as identifier
                 node.named_child(0).map(|c| node_text(&c, source).to_string())
             });
     }
     // Might be a pointer_declarator wrapping a function_declarator
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            if let Some(name) = extract_declarator_name(&child, source) {
+            if let Some(name) = extract_declarator_name_inner(&child, source, depth + 1) {
                 return Some(name);
             }
         }

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use anyhow::ensure;
+
 pub struct CompressedResult {
     pub node_id: i64,
     pub file_path: String,
@@ -51,16 +53,16 @@ pub fn compress_if_needed(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
     token_threshold: usize,
-) -> Option<CompressedOutput> {
+) -> anyhow::Result<Option<CompressedOutput>> {
     let tokens = estimate_tokens(results);
     if tokens <= token_threshold {
-        None
+        Ok(None)
     } else if tokens <= token_threshold * 3 {
-        Some(CompressedOutput::Nodes(compress_results(results, file_paths)))
+        Ok(Some(CompressedOutput::Nodes(compress_results(results, file_paths)?)))
     } else if tokens <= token_threshold * 8 {
-        Some(CompressedOutput::Files(compress_by_file(results, file_paths)))
+        Ok(Some(CompressedOutput::Files(compress_by_file(results, file_paths)?)))
     } else {
-        Some(CompressedOutput::Directories(compress_by_directory(results, file_paths)))
+        Ok(Some(CompressedOutput::Directories(compress_by_directory(results, file_paths)?)))
     }
 }
 
@@ -68,9 +70,9 @@ pub fn compress_if_needed(
 pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
-) -> Vec<CompressedResult> {
-    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
-    results
+) -> anyhow::Result<Vec<CompressedResult>> {
+    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
+    Ok(results
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -93,15 +95,15 @@ pub fn compress_results(
                 summary,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Group results by file path, producing a summary per file.
 pub fn compress_by_file(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
-) -> Vec<GroupedResult> {
-    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
+) -> anyhow::Result<Vec<GroupedResult>> {
+    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (Vec<String>, Vec<i64>)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
@@ -109,7 +111,7 @@ pub fn compress_by_file(
         entry.0.push(format!("{} {}", r.node_type, r.name));
         entry.1.push(r.id);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(file_path, (symbols, node_ids))| {
             let n = symbols.len();
@@ -120,15 +122,15 @@ pub fn compress_by_file(
                 node_ids,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Group results by parent directory, producing a summary per directory.
 pub fn compress_by_directory(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
-) -> Vec<GroupedResult> {
-    assert_eq!(results.len(), file_paths.len(), "results and file_paths must have same length");
+) -> anyhow::Result<Vec<GroupedResult>> {
+    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
     let mut groups: BTreeMap<String, (HashSet<String>, Vec<i64>, usize)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
@@ -141,7 +143,7 @@ pub fn compress_by_directory(
         entry.1.push(r.id);
         entry.2 += 1;
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(dir, (files, node_ids, symbol_count))| {
             let summary = format!("{}: {} files, {} symbols", dir, files.len(), symbol_count);
@@ -151,7 +153,7 @@ pub fn compress_by_directory(
                 node_ids,
             }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -194,7 +196,7 @@ mod tests {
             },
         ];
         let file_paths = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
-        let compressed = compress_results(&results, &file_paths);
+        let compressed = compress_results(&results, &file_paths).unwrap();
         assert_eq!(compressed.len(), 2);
         assert_eq!(compressed[0].node_id, 1);
         assert!(compressed[0].summary.contains("foo"));
@@ -238,7 +240,7 @@ mod tests {
             "src/auth.ts".into(),
             "src/models.ts".into(),
         ];
-        let compressed = compress_by_file(&results, &file_paths);
+        let compressed = compress_by_file(&results, &file_paths).unwrap();
         assert_eq!(compressed.len(), 2);
         let auth_entry = compressed
             .iter()
@@ -274,7 +276,7 @@ mod tests {
             "src/auth/token.ts".into(),
             "src/models/user.ts".into(),
         ];
-        let compressed = compress_by_directory(&results, &file_paths);
+        let compressed = compress_by_directory(&results, &file_paths).unwrap();
         assert_eq!(compressed.len(), 2);
         let auth_dir = compressed
             .iter()
@@ -299,5 +301,4 @@ mod tests {
         }];
         assert!(estimate_tokens(&large) > 2000);
     }
-
 }

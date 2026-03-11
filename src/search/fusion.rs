@@ -6,6 +6,10 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Reciprocal Rank Fusion with configurable weights per search source.
+///
+/// Computes: score(node) = sum( weight_i / (k + rank_i + 1) ) across sources.
+/// Higher `k` values dampen the impact of rank differences (typically k=60).
 pub fn weighted_rrf_fusion(
     fts_results: &[SearchResult],
     vec_results: &[SearchResult],
@@ -32,7 +36,6 @@ pub fn weighted_rrf_fusion(
     results
 }
 
-#[cfg(test)]
 pub fn rrf_fusion(
     fts_results: &[SearchResult],
     vec_results: &[SearchResult],

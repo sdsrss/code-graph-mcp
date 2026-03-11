@@ -17,7 +17,7 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 /// Extract relations from a pre-parsed tree (avoids re-parsing).
 pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
-    walk_for_relations(tree.root_node(), source, language, None, &mut relations);
+    walk_for_relations(tree.root_node(), source, language, None, &mut relations, 0);
     relations
 }
 
@@ -27,7 +27,9 @@ fn walk_for_relations(
     language: &str,
     current_scope: Option<&str>,
     results: &mut Vec<ParsedRelation>,
+    depth: usize,
 ) {
+    if depth > 256 { return; }
     let kind = node.kind();
 
     // Determine if this node creates a new scope
@@ -114,41 +116,7 @@ fn walk_for_relations(
         // Rust: use std::collections::HashMap;
         // Also handles grouped imports: use std::collections::{HashMap, HashSet};
         "use_declaration" => {
-            let text = node_text(&node, source).trim().trim_end_matches(';').to_string();
-            if let Some(name) = text.rsplit("::").next() {
-                // Skip glob imports like `use foo::*`
-                if name != "*" && !name.is_empty() {
-                    let clean_name = name.trim();
-                    // Handle grouped imports: {HashMap, HashSet}
-                    if clean_name.starts_with('{') && clean_name.ends_with('}') {
-                        let inner = &clean_name[1..clean_name.len() - 1];
-                        for item in inner.split(',') {
-                            let item = item.trim();
-                            // Handle aliased imports: HashMap as HM -> extract HashMap
-                            let actual_name = item.split_whitespace().next().unwrap_or("");
-                            if !actual_name.is_empty() && actual_name != "*" {
-                                results.push(ParsedRelation {
-                                    source_name: active_scope.unwrap_or("<module>").to_string(),
-                                    target_name: actual_name.to_string(),
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                });
-                            }
-                        }
-                    } else {
-                        // Handle aliased imports: Read as _ -> extract Read
-                        let actual_name = clean_name.split_whitespace().next().unwrap_or(clean_name);
-                        if !actual_name.is_empty() {
-                            results.push(ParsedRelation {
-                                source_name: active_scope.unwrap_or("<module>").to_string(),
-                                target_name: actual_name.to_string(),
-                                relation: REL_IMPORTS.into(),
-                                metadata: None,
-                            });
-                        }
-                    }
-                }
-            }
+            extract_rust_use_imports(&node, source, active_scope, results);
         }
 
         // Go: import "fmt" or import alias "fmt"
@@ -181,8 +149,92 @@ fn walk_for_relations(
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, active_scope, results);
+            walk_for_relations(child, source, language, active_scope, results, depth + 1);
         }
+    }
+}
+
+/// Extract import names from Rust `use` declarations by walking the tree-sitter AST.
+/// Handles simple (`use foo::Bar`), grouped (`use foo::{Bar, Baz}`),
+/// nested (`use foo::{bar::{A, B}}`), aliased (`use foo::Bar as B`), and glob imports.
+fn extract_rust_use_imports(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+    results: &mut Vec<ParsedRelation>,
+) {
+    fn collect_use_names(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>) {
+        match node.kind() {
+            "use_as_clause" => {
+                // `use foo::Bar as B` — extract the original name (first named child)
+                // The first child may be a scoped_identifier, so recurse to extract leaf name
+                if let Some(child) = node.named_child(0) {
+                    collect_use_names(&child, source, names);
+                }
+            }
+            "use_wildcard" => {
+                // `use foo::*` — skip
+            }
+            "use_list" => {
+                // `{HashMap, HashSet}`
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        collect_use_names(&child, source, names);
+                    }
+                }
+            }
+            "scoped_use_list" => {
+                // `foo::{A, B}` — skip the path (scoped_identifier), only process the use_list
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        if child.kind() != "scoped_identifier" && child.kind() != "identifier" {
+                            collect_use_names(&child, source, names);
+                        }
+                    }
+                }
+            }
+            "scoped_identifier" => {
+                // `foo::Bar` — extract the last segment (the name)
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    if !name.is_empty() && name != "*" && name != "self" {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            "identifier" | "type_identifier" => {
+                let name = node_text(node, source);
+                if !name.is_empty() && name != "self" {
+                    names.push(name.to_string());
+                }
+            }
+            _ => {
+                // Recurse into children for any unhandled wrapper nodes
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        collect_use_names(&child, source, names);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut names = Vec::new();
+    // The use_declaration's first named child is the argument (scoped_identifier, use_list, etc.)
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_use_names(&child, source, &mut names);
+        }
+    }
+
+    let scope_name = scope.unwrap_or("<module>");
+    for name in names {
+        results.push(ParsedRelation {
+            source_name: scope_name.to_string(),
+            target_name: name,
+            relation: REL_IMPORTS.into(),
+            metadata: None,
+        });
     }
 }
 
