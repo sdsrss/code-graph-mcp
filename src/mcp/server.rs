@@ -383,17 +383,37 @@ impl McpServer {
         }
 
         // Context Sandbox: compress if results exceed token threshold
+        use crate::sandbox::compressor::CompressedOutput;
         if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(self.db.conn(), &node_results, &file_paths, 2000) {
-            let compact: Vec<serde_json::Value> = compressed.iter().map(|c| {
-                json!({
-                    "node_id": c.node_id,
-                    "file_path": c.file_path,
-                    "summary": c.summary,
-                })
-            }).collect();
+            let (mode, compact) = match compressed {
+                CompressedOutput::Nodes(nodes) => {
+                    let items: Vec<serde_json::Value> = nodes.iter().map(|c| json!({
+                        "node_id": c.node_id,
+                        "file_path": c.file_path,
+                        "summary": c.summary,
+                    })).collect();
+                    ("compressed_nodes", items)
+                }
+                CompressedOutput::Files(groups) => {
+                    let items: Vec<serde_json::Value> = groups.iter().map(|g| json!({
+                        "file_path": g.file_path,
+                        "summary": g.summary,
+                        "node_ids": g.node_ids,
+                    })).collect();
+                    ("compressed_files", items)
+                }
+                CompressedOutput::Directories(groups) => {
+                    let items: Vec<serde_json::Value> = groups.iter().map(|g| json!({
+                        "file_path": g.file_path,
+                        "summary": g.summary,
+                        "node_ids": g.node_ids,
+                    })).collect();
+                    ("compressed_directories", items)
+                }
+            };
             return Ok(json!({
-                "mode": "compressed",
-                "message": "Results exceeded token limit. Use read_snippet(node_id) to expand.",
+                "mode": mode,
+                "message": "Results exceeded token limit. Use read_snippet(node_id) to expand individual symbols.",
                 "results": compact
             }));
         }
