@@ -94,16 +94,14 @@ pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&Embeddi
 }
 
 pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
+    let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let current_hashes = scan_directory(project_root)?;
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
-    // Index changed + new files (deletion of removed files happens inside index_files transaction)
     let deleted_files = diff.deleted_files;
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 
-    // Dirty-node propagation: identify dirty nodes BEFORE re-indexing
-    // (because cascade delete will remove old edges)
     let dirty_node_ids = if !to_index.is_empty() {
         collect_dirty_node_ids(db, &to_index)?
     } else {
@@ -112,9 +110,17 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
 
     let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files)?;
 
-    // Regenerate context strings (and embeddings) for dirty nodes in other files
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
+    }
+
+    if result.files_indexed > 0 || !deleted_files.is_empty() {
+        tracing::info!(
+            "[incremental] {} files changed, {} deleted, {} nodes, {} edges, {:.1}s",
+            result.files_indexed, deleted_files.len(),
+            result.nodes_created, result.edges_created,
+            start.elapsed().as_secs_f64()
+        );
     }
 
     Ok(result)
@@ -128,6 +134,7 @@ pub fn run_incremental_index_cached(
     model: Option<&EmbeddingModel>,
     dir_cache: Option<&DirectoryCache>,
 ) -> Result<(IndexResult, DirectoryCache)> {
+    let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let (mut current_hashes, new_cache) = scan_directory_cached(project_root, dir_cache)?;
 
@@ -135,12 +142,8 @@ pub fn run_incremental_index_cached(
     // scan_directory_cached skips files in unchanged dirs, so we need to
     // carry forward their stored hashes to prevent false "deleted" diffs.
     for (path, hash) in &stored_hashes {
-        if !current_hashes.contains_key(path) {
-            // File wasn't scanned (in unchanged dir) — carry forward stored hash
-            // Only if the file still exists on disk
-            if project_root.join(path).exists() {
-                current_hashes.insert(path.clone(), hash.clone());
-            }
+        if !current_hashes.contains_key(path) && project_root.join(path).exists() {
+            current_hashes.insert(path.clone(), hash.clone());
         }
     }
 
@@ -159,6 +162,15 @@ pub fn run_incremental_index_cached(
 
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
+    }
+
+    if result.files_indexed > 0 || !deleted_files.is_empty() {
+        tracing::info!(
+            "[incremental] {} files changed, {} deleted, {} nodes, {} edges, {:.1}s",
+            result.files_indexed, deleted_files.len(),
+            result.nodes_created, result.edges_created,
+            start.elapsed().as_secs_f64()
+        );
     }
 
     Ok((result, new_cache))
@@ -431,6 +443,8 @@ fn index_files(
 
         tx.commit()?;
 
+        let batch_file_count = batch_parsed.len();
+
         // Convert to lightweight records — drops Tree and source string
         for pf in batch_parsed {
             all_indexed.push(FileIndexed {
@@ -439,6 +453,14 @@ fn index_files(
                 node_names: pf.node_names,
             });
             // pf.tree and pf.source are dropped here — memory freed
+        }
+
+        if files.len() > BATCH_SIZE {
+            tracing::info!(
+                "[index] batch {}/{}: {} files ({} nodes, {} edges)",
+                all_indexed.len(), files.len(),
+                batch_file_count, total_nodes_created, total_edges_created
+            );
         }
     }
 
@@ -481,6 +503,10 @@ fn index_files(
                 try_embed_and_store(db, model, node_id, &ctx);
             }
         }
+        tracing::info!(
+            "[index] Phase 3: context strings built for {} nodes",
+            all_node_ids.len()
+        );
         tx.commit()?;
     }
 
