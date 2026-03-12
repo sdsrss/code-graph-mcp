@@ -25,5 +25,17 @@ CLAUDE.md
 *.swo
 .DS_Store
 
+# npm binary (built via CI, not committed)
+bin/code-graph-mcp
+bin/code-graph-mcp.exe
+
+# Platform-specific npm binaries
+npm/*/code-graph-mcp
+npm/*/code-graph-mcp.exe
+
+# npm artifacts
+node_modules/
+*.tgz
+
 # Scripts (only needed for building)
 scripts/
