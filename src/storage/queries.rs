@@ -566,24 +566,44 @@ pub fn get_callers_with_route_info(
 
     let callers = get_call_graph(conn, symbol_name, "callers", max_depth, file_path)?;
 
-    let mut results = Vec::new();
-    for caller in &callers {
-        // Check if this caller is a route handler (has a routes_to edge as source)
-        let route_meta: Option<String> = conn.query_row(
-            "SELECT e.metadata FROM edges e WHERE e.source_id = ?1 AND e.relation = ?2 LIMIT 1",
-            rusqlite::params![caller.node_id, REL_ROUTES_TO],
-            |row| row.get(0),
-        ).ok();
+    if callers.is_empty() {
+        return Ok(vec![]);
+    }
 
-        results.push(CallerWithRouteInfo {
+    // Batch fetch route metadata for all callers (avoids N+1 queries)
+    let mut route_map: HashMap<i64, String> = HashMap::new();
+    let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
+    for chunk in caller_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT e.source_id, e.metadata FROM edges e WHERE e.source_id IN ({}) AND e.relation = ?{}",
+            placeholders,
+            chunk.len() + 1
+        );
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rel: &dyn rusqlite::types::ToSql = &REL_ROUTES_TO;
+        params.push(rel);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, meta) = row?;
+            route_map.entry(id).or_insert(meta);
+        }
+    }
+
+    let results = callers
+        .iter()
+        .map(|caller| CallerWithRouteInfo {
             node_id: caller.node_id,
             name: caller.name.clone(),
             node_type: caller.node_type.clone(),
             file_path: caller.file_path.clone(),
             depth: caller.depth,
-            route_info: route_meta,
-        });
-    }
+            route_info: route_map.get(&caller.node_id).cloned(),
+        })
+        .collect();
     Ok(results)
 }
 
