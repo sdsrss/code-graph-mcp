@@ -120,3 +120,65 @@ fn test_stdio_initialize_and_tools_list() {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[test]
+fn test_stdio_full_workflow() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src/auth.ts"), r#"
+function validateToken(token: string): boolean {
+    return token.length > 0;
+}
+
+function handleLogin(req: Request) {
+    if (validateToken(req.token)) {
+        return { ok: true };
+    }
+}
+"#).unwrap();
+
+    let mut child = spawn_server(project.path());
+    let mut stdin = child.stdin.take().unwrap();
+    let rx = spawn_reader(child.stdout.take().unwrap());
+
+    // Initialize
+    send(&mut stdin, &initialize_msg());
+    let _ = read_with_timeout(&rx, TIMEOUT).expect("no response to initialize");
+
+    // semantic_code_search — triggers indexing
+    send(&mut stdin, &tool_call_msg(2, "semantic_code_search", serde_json::json!({
+        "query": "validateToken", "top_k": 5
+    })));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to semantic_code_search");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+    let results: serde_json::Value = serde_json::from_str(text).unwrap();
+    let arr = results.as_array().unwrap();
+    assert!(!arr.is_empty(), "search should return results");
+
+    // get_ast_node
+    send(&mut stdin, &tool_call_msg(3, "get_ast_node", serde_json::json!({
+        "file_path": "src/auth.ts",
+        "symbol_name": "validateToken"
+    })));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to get_ast_node");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+    let node: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(node["name"], "validateToken");
+    let node_id = node["node_id"].as_i64().unwrap();
+
+    // read_snippet
+    send(&mut stdin, &tool_call_msg(4, "read_snippet", serde_json::json!({
+        "node_id": node_id
+    })));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to read_snippet");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+    let snippet: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(snippet["name"], "validateToken");
+    assert!(snippet["code"].as_str().unwrap().contains("token"));
+
+    drop(stdin);
+    let _ = child.wait();
+}
