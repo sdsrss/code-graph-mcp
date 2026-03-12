@@ -202,15 +202,15 @@ impl McpServer {
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
         let req: JsonRpcRequest = serde_json::from_str(line)?;
 
-        // Validate JSON-RPC version
+        // Per JSON-RPC 2.0, notifications (no id) must never receive a response
+        if req.id.is_none() {
+            return Ok(None);
+        }
+
+        // Validate JSON-RPC version (only for requests with id)
         if let Err(msg) = req.validate() {
             let resp = JsonRpcResponse::error(req.id, super::protocol::JSONRPC_INVALID_REQUEST, msg.to_string());
             return Ok(Some(serde_json::to_string(&resp)?));
-        }
-
-        // Per JSON-RPC 2.0, any request without an id is a notification — no response
-        if req.id.is_none() {
-            return Ok(None);
         }
 
         let response = match req.method.as_str() {
@@ -1469,6 +1469,15 @@ function handleLogin(req: Request) {
         let server = McpServer::new_test();
         let result = server.handle_message("not valid json");
         assert!(result.is_err(), "malformed JSON should return Err");
+    }
+
+    #[test]
+    fn test_notification_with_invalid_version_returns_none() {
+        let server = McpServer::new_test();
+        // Notification (no id) with wrong JSON-RPC version — must still return None per spec
+        let req = r#"{"jsonrpc":"1.0","method":"notifications/initialized"}"#;
+        let resp = server.handle_message(req).unwrap();
+        assert!(resp.is_none(), "malformed notifications must never receive a response");
     }
 
     #[test]
