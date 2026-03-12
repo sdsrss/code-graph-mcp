@@ -334,6 +334,260 @@ fn test_e2e_resources_read_unknown_uri() {
 }
 
 #[test]
+fn test_e2e_impact_analysis() {
+    let project = TempDir::new().unwrap();
+
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/utils.ts"), r#"
+export function formatDate(d: Date): string {
+    return d.toISOString();
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/service.ts"), r#"
+import { formatDate } from './utils';
+
+export function createReport(data: any) {
+    return { date: formatDate(new Date()), data };
+}
+
+export function createLog(msg: string) {
+    return formatDate(new Date()) + ': ' + msg;
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/handler.ts"), r#"
+import { createReport } from './service';
+
+export function handleRequest(req: Request, res: Response) {
+    const report = createReport(req.body);
+    res.json(report);
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Trigger indexing
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "formatDate"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // impact_analysis on formatDate — should have callers
+    let msg = tool_call_json("impact_analysis", serde_json::json!({
+        "symbol_name": "formatDate",
+        "change_type": "signature",
+        "depth": 3
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["symbol"], "formatDate");
+    assert_eq!(result["change_type"], "signature");
+    assert!(result["risk_level"].is_string(), "should have risk_level");
+    assert!(result["summary"].as_str().unwrap().contains("formatDate"));
+    assert!(result["direct_callers"].is_array());
+    assert!(result["transitive_callers"].is_array());
+    assert!(result["affected_files"].is_number());
+
+    // Direct callers should include createReport and createLog
+    let direct = result["direct_callers"].as_array().unwrap();
+    let direct_names: Vec<&str> = direct.iter()
+        .filter_map(|c| c["name"].as_str()).collect();
+    assert!(direct_names.contains(&"createReport"), "direct callers should include createReport, got {:?}", direct_names);
+    assert!(direct_names.contains(&"createLog"), "direct callers should include createLog, got {:?}", direct_names);
+
+    // impact_analysis on a leaf function — should have LOW risk
+    let msg = tool_call_json("impact_analysis", serde_json::json!({
+        "symbol_name": "handleRequest"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["symbol"], "handleRequest");
+    assert_eq!(result["risk_level"], "LOW", "leaf function should be LOW risk");
+}
+
+#[test]
+fn test_e2e_module_overview() {
+    let project = TempDir::new().unwrap();
+
+    fs::create_dir_all(project.path().join("src/auth")).unwrap();
+    fs::write(project.path().join("src/auth/validator.ts"), r#"
+export function validateEmail(email: string): boolean {
+    return email.includes('@');
+}
+
+export function validatePassword(pw: string): boolean {
+    return pw.length >= 8;
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/auth/session.ts"), r#"
+import { validateEmail, validatePassword } from './validator';
+
+export function login(email: string, pw: string) {
+    if (validateEmail(email) && validatePassword(pw)) {
+        return { token: 'abc' };
+    }
+    throw new Error('invalid');
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Trigger indexing
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "validate"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // module_overview for a directory prefix
+    let msg = tool_call_json("module_overview", serde_json::json!({
+        "path": "src/auth/"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["path"], "src/auth/");
+    assert!(result["files_count"].as_i64().unwrap() >= 2, "should cover at least 2 files");
+    assert!(result["summary"].as_str().unwrap().contains("src/auth/"));
+
+    let exports = result["exports"].as_array().unwrap();
+    assert!(exports.len() >= 3, "should have at least 3 exports (validateEmail, validatePassword, login), got {}", exports.len());
+    let export_names: Vec<&str> = exports.iter()
+        .filter_map(|e| e["name"].as_str()).collect();
+    assert!(export_names.contains(&"validateEmail"), "exports should contain validateEmail, got {:?}", export_names);
+    assert!(export_names.contains(&"validatePassword"), "exports should contain validatePassword, got {:?}", export_names);
+    assert!(export_names.contains(&"login"), "exports should contain login, got {:?}", export_names);
+
+    // Each export should have expected fields
+    for exp in exports {
+        assert!(exp["node_id"].is_number(), "export should have node_id");
+        assert!(exp["name"].is_string(), "export should have name");
+        assert!(exp["type"].is_string(), "export should have type");
+        assert!(exp["file"].is_string(), "export should have file");
+        assert!(exp["caller_count"].is_number(), "export should have caller_count");
+    }
+
+    // hot_paths should include functions that have callers
+    let hot_paths = result["hot_paths"].as_array().unwrap();
+    let hot_names: Vec<&str> = hot_paths.iter()
+        .filter_map(|h| h["name"].as_str()).collect();
+    assert!(hot_names.contains(&"validateEmail") || hot_names.contains(&"validatePassword"),
+        "hot_paths should include called functions, got {:?}", hot_names);
+
+    // module_overview for a single file
+    let msg = tool_call_json("module_overview", serde_json::json!({
+        "path": "src/auth/validator.ts"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["files_count"], 1);
+    let exports = result["exports"].as_array().unwrap();
+    assert_eq!(exports.len(), 2, "validator.ts should have 2 exports");
+}
+
+#[test]
+fn test_e2e_dependency_graph() {
+    let project = TempDir::new().unwrap();
+
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/db.ts"), r#"
+export function query(sql: string): any[] {
+    return [];
+}
+
+export function connect(): void {}
+"#).unwrap();
+
+    fs::write(project.path().join("src/repo.ts"), r#"
+import { query, connect } from './db';
+
+export function findUser(id: number) {
+    connect();
+    return query('SELECT * FROM users WHERE id = ' + id);
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/api.ts"), r#"
+import { findUser } from './repo';
+
+export function getUser(req: Request, res: Response) {
+    const user = findUser(parseInt(req.params.id));
+    res.json(user);
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Trigger indexing
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "findUser"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // dependency_graph for the middle file (repo.ts) — should have both directions
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/repo.ts",
+        "direction": "both",
+        "depth": 2
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["file"], "src/repo.ts");
+    assert!(result["summary"].as_str().unwrap().contains("src/repo.ts"));
+
+    // repo.ts depends on db.ts (outgoing)
+    let depends_on = result["depends_on"].as_array().unwrap();
+    let outgoing_files: Vec<&str> = depends_on.iter()
+        .filter_map(|d| d["file"].as_str()).collect();
+    assert!(outgoing_files.iter().any(|f| f.contains("db.ts")),
+        "repo.ts should depend on db.ts, got: {:?}", outgoing_files);
+
+    // api.ts depends on repo.ts (incoming)
+    let depended_by = result["depended_by"].as_array().unwrap();
+    let incoming_files: Vec<&str> = depended_by.iter()
+        .filter_map(|d| d["file"].as_str()).collect();
+    assert!(incoming_files.iter().any(|f| f.contains("api.ts")),
+        "api.ts should depend on repo.ts, got: {:?}", incoming_files);
+
+    // Each dependency entry should have expected fields
+    for dep in depends_on.iter().chain(depended_by.iter()) {
+        assert!(dep["file"].is_string(), "dependency should have file");
+        assert!(dep["symbols"].is_number(), "dependency should have symbols count");
+        assert!(dep["depth"].is_number(), "dependency should have depth");
+    }
+
+    // dependency_graph with outgoing-only direction
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/repo.ts",
+        "direction": "outgoing"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(!result["depends_on"].as_array().unwrap().is_empty(),
+        "outgoing direction should return depends_on");
+
+    // dependency_graph with incoming-only direction
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/repo.ts",
+        "direction": "incoming"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(!result["depended_by"].as_array().unwrap().is_empty(),
+        "incoming direction should return depended_by");
+
+    // dependency_graph for leaf file (db.ts) — no outgoing deps
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/db.ts"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["file"], "src/db.ts");
+    let depends_on = result["depends_on"].as_array().unwrap();
+    assert!(depends_on.is_empty(), "db.ts should have no outgoing dependencies");
+}
+
+#[test]
 fn test_e2e_prompts_get_unknown() {
     let project = TempDir::new().unwrap();
     let server = McpServer::from_project_root(project.path()).unwrap();

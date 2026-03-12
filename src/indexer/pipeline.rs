@@ -304,6 +304,23 @@ fn index_files(
         let mut node_ids = Vec::new();
         let mut node_names = Vec::new();
 
+        // Synthetic <module> node — anchor for import/export edges
+        let module_node_id = insert_node(db.conn(), &NodeRecord {
+            file_id,
+            node_type: "module".into(),
+            name: "<module>".into(),
+            qualified_name: Some(rel_path.clone()),
+            start_line: 1,
+            end_line: source.lines().count() as i64,
+            code_content: String::new(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+        })?;
+        node_ids.push(module_node_id);
+        node_names.push("<module>".into());
+        nodes_created += 1;
+
         for pn in &parsed_nodes {
             let node_id = insert_node(db.conn(), &NodeRecord {
                 file_id,
