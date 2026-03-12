@@ -257,20 +257,30 @@ pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64
     if exclude_file_ids.is_empty() {
         return get_all_node_names(conn);
     }
-    let mut all_results = Vec::new();
+
+    // Use a temp table so that the full set of excluded IDs is available in a single query,
+    // avoiding the incorrect chunked NOT IN approach where each chunk only excludes a subset.
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _exclude_file_ids (id INTEGER PRIMARY KEY)")?;
+    conn.execute("DELETE FROM _exclude_file_ids", [])?;
+
     for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
-        let placeholders = make_placeholders(1, chunk.len());
-        let sql = format!("SELECT name, id FROM nodes WHERE file_id NOT IN ({})", placeholders);
-        let mut stmt = conn.prepare(&sql)?;
+        let values = (1..=chunk.len()).map(|i| format!("(?{})", i)).collect::<Vec<_>>().join(",");
+        let sql = format!("INSERT INTO _exclude_file_ids (id) VALUES {}", values);
         let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            all_results.push(row?);
-        }
+        conn.execute(&sql, params.as_slice())?;
     }
-    Ok(all_results)
+
+    let mut stmt = conn.prepare(
+        "SELECT name, id FROM nodes WHERE file_id NOT IN (SELECT id FROM _exclude_file_ids)"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS _exclude_file_ids")?;
+
+    Ok(results)
 }
 
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
@@ -928,5 +938,58 @@ mod tests {
         // Verify FTS5 picks up updated context_string
         let results = fts5_search(db.conn(), "bar baz", 5).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_get_node_names_excluding_files_correctness() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // Create 3 files with 1 node each
+        let fid1 = upsert_file(conn, &FileRecord {
+            path: "a.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let fid2 = upsert_file(conn, &FileRecord {
+            path: "b.ts".into(), blake3_hash: "h2".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let fid3 = upsert_file(conn, &FileRecord {
+            path: "c.ts".into(), blake3_hash: "h3".into(), last_modified: 1, language: None,
+        }).unwrap();
+
+        insert_node(conn, &NodeRecord {
+            file_id: fid1, node_type: "function".into(), name: "alpha".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn alpha(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: fid2, node_type: "function".into(), name: "beta".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn beta(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: fid3, node_type: "function".into(), name: "gamma".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn gamma(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+
+        // Exclude 2 files → only 3rd file's node remains
+        let result = get_node_names_excluding_files(conn, &[fid1, fid2]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "gamma");
+
+        // Exclude all 3 → empty
+        let result = get_node_names_excluding_files(conn, &[fid1, fid2, fid3]).unwrap();
+        assert!(result.is_empty());
+
+        // Exclude none → all 3
+        let result = get_node_names_excluding_files(conn, &[]).unwrap();
+        assert_eq!(result.len(), 3);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
     }
 }
