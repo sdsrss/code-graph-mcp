@@ -257,20 +257,30 @@ pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64
     if exclude_file_ids.is_empty() {
         return get_all_node_names(conn);
     }
-    let mut all_results = Vec::new();
+
+    // Use a temp table so that the full set of excluded IDs is available in a single query,
+    // avoiding the incorrect chunked NOT IN approach where each chunk only excludes a subset.
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _exclude_file_ids (id INTEGER PRIMARY KEY)")?;
+    conn.execute("DELETE FROM _exclude_file_ids", [])?;
+
     for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
-        let placeholders = make_placeholders(1, chunk.len());
-        let sql = format!("SELECT name, id FROM nodes WHERE file_id NOT IN ({})", placeholders);
-        let mut stmt = conn.prepare(&sql)?;
+        let values = (1..=chunk.len()).map(|i| format!("(?{})", i)).collect::<Vec<_>>().join(",");
+        let sql = format!("INSERT INTO _exclude_file_ids (id) VALUES {}", values);
         let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            all_results.push(row?);
-        }
+        conn.execute(&sql, params.as_slice())?;
     }
-    Ok(all_results)
+
+    let mut stmt = conn.prepare(
+        "SELECT name, id FROM nodes WHERE file_id NOT IN (SELECT id FROM _exclude_file_ids)"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS _exclude_file_ids")?;
+
+    Ok(results)
 }
 
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
@@ -556,24 +566,44 @@ pub fn get_callers_with_route_info(
 
     let callers = get_call_graph(conn, symbol_name, "callers", max_depth, file_path)?;
 
-    let mut results = Vec::new();
-    for caller in &callers {
-        // Check if this caller is a route handler (has a routes_to edge as source)
-        let route_meta: Option<String> = conn.query_row(
-            "SELECT e.metadata FROM edges e WHERE e.source_id = ?1 AND e.relation = ?2 LIMIT 1",
-            rusqlite::params![caller.node_id, REL_ROUTES_TO],
-            |row| row.get(0),
-        ).ok();
+    if callers.is_empty() {
+        return Ok(vec![]);
+    }
 
-        results.push(CallerWithRouteInfo {
+    // Batch fetch route metadata for all callers (avoids N+1 queries)
+    let mut route_map: HashMap<i64, String> = HashMap::new();
+    let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
+    for chunk in caller_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT e.source_id, e.metadata FROM edges e WHERE e.source_id IN ({}) AND e.relation = ?{}",
+            placeholders,
+            chunk.len() + 1
+        );
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rel: &dyn rusqlite::types::ToSql = &REL_ROUTES_TO;
+        params.push(rel);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, meta) = row?;
+            route_map.entry(id).or_insert(meta);
+        }
+    }
+
+    let results = callers
+        .iter()
+        .map(|caller| CallerWithRouteInfo {
             node_id: caller.node_id,
             name: caller.name.clone(),
             node_type: caller.node_type.clone(),
             file_path: caller.file_path.clone(),
             depth: caller.depth,
-            route_info: route_meta,
-        });
-    }
+            route_info: route_map.get(&caller.node_id).cloned(),
+        })
+        .collect();
     Ok(results)
 }
 
@@ -592,19 +622,18 @@ pub struct ModuleExport {
 /// Get all exported symbols from files under a directory prefix.
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
     use crate::domain::{REL_EXPORTS, REL_CALLS};
-    let sql = format!(
+    let sql =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = '{}') as caller_count
+                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?3) as caller_count
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
-         WHERE f.path LIKE ?2
-         ORDER BY caller_count DESC",
-        REL_CALLS
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let prefix_pattern = format!("{}%", dir_prefix);
-    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern], |row| {
+         WHERE f.path LIKE ?2 ESCAPE '\\'
+         ORDER BY caller_count DESC";
+    let mut stmt = conn.prepare(sql)?;
+    let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
+    let prefix_pattern = format!("{}%", escaped_prefix);
+    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern, REL_CALLS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
             name: row.get(1)?,
@@ -928,5 +957,58 @@ mod tests {
         // Verify FTS5 picks up updated context_string
         let results = fts5_search(db.conn(), "bar baz", 5).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_get_node_names_excluding_files_correctness() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // Create 3 files with 1 node each
+        let fid1 = upsert_file(conn, &FileRecord {
+            path: "a.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let fid2 = upsert_file(conn, &FileRecord {
+            path: "b.ts".into(), blake3_hash: "h2".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let fid3 = upsert_file(conn, &FileRecord {
+            path: "c.ts".into(), blake3_hash: "h3".into(), last_modified: 1, language: None,
+        }).unwrap();
+
+        insert_node(conn, &NodeRecord {
+            file_id: fid1, node_type: "function".into(), name: "alpha".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn alpha(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: fid2, node_type: "function".into(), name: "beta".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn beta(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: fid3, node_type: "function".into(), name: "gamma".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn gamma(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+        }).unwrap();
+
+        // Exclude 2 files → only 3rd file's node remains
+        let result = get_node_names_excluding_files(conn, &[fid1, fid2]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "gamma");
+
+        // Exclude all 3 → empty
+        let result = get_node_names_excluding_files(conn, &[fid1, fid2, fid3]).unwrap();
+        assert!(result.is_empty());
+
+        // Exclude none → all 3
+        let result = get_node_names_excluding_files(conn, &[]).unwrap();
+        assert_eq!(result.len(), 3);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
     }
 }

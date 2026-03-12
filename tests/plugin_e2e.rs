@@ -108,7 +108,8 @@ fn test_stdio_initialize_and_tools_list() {
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to tools/list");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let tools = parsed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14, "expected 14 tools, got {}", tools.len());
+    assert_eq!(tools.len(), code_graph_mcp::mcp::tools::TOOL_COUNT,
+        "expected {} tools, got {}", code_graph_mcp::mcp::tools::TOOL_COUNT, tools.len());
 
     // Verify each tool has name, description, and inputSchema
     for tool in tools {

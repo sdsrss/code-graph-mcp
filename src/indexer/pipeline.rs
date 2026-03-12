@@ -227,6 +227,13 @@ fn index_files(
     model: Option<&EmbeddingModel>,
     delete_paths: &[String],
 ) -> Result<IndexResult> {
+    // SAFETY: unchecked_transaction is used because rusqlite's Transaction borrows
+    // &mut Connection, preventing other borrows during the transaction. Here we need
+    // both the transaction and read access via db.conn() (which returns &Connection
+    // to the same underlying connection). This is safe because:
+    // (1) db.conn() returns the same Connection the tx was opened on,
+    // (2) we never open nested transactions,
+    // (3) the server is single-threaded.
     let tx = db.conn().unchecked_transaction()?;
 
     // Phase 0: Delete removed files inside transaction

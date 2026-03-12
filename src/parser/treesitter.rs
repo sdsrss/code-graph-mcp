@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use super::languages::get_language;
 use super::node_text;
-use crate::domain::MAX_AST_DEPTH;
+use crate::domain::{MAX_AST_DEPTH, MAX_CODE_CONTENT_LEN};
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -14,15 +16,26 @@ pub struct ParsedNode {
     pub doc_comment: Option<String>,
 }
 
+thread_local! {
+    static PARSER_CACHE: RefCell<HashMap<String, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+}
+
 /// Parse source code into a Tree-sitter tree. Shared by node extraction and relation extraction.
 pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
     let lang = get_language(language)
         .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&lang)?;
-    parser.set_timeout_micros(5_000_000); // 5 second timeout to prevent hangs on pathological input
-    parser.parse(source, None)
-        .ok_or_else(|| anyhow!("parse failed or timed out"))
+
+    PARSER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let parser = cache.entry(language.to_string()).or_insert_with(|| {
+            let mut p = tree_sitter::Parser::new();
+            p.set_timeout_micros(5_000_000);
+            p
+        });
+        parser.set_language(&lang)?;
+        parser.parse(source, None)
+            .ok_or_else(|| anyhow!("parse failed or timed out"))
+    })
 }
 
 pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
@@ -74,7 +87,7 @@ fn extract_nodes(
                             qualified_name: Some(name),
                             start_line: node.start_position().row as u32 + 1,
                             end_line: node.end_position().row as u32 + 1,
-                            code_content: node_text(&node, source).into(),
+                            code_content: truncate_code_content(node_text(&node, source)),
                             signature: extract_c_signature(&node, source),
                             doc_comment: get_preceding_comment(&node, source),
                         });
@@ -111,7 +124,7 @@ fn extract_nodes(
                     qualified_name: Some(name.clone()),
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    code_content: node_text(&node, source).into(),
+                    code_content: truncate_code_content(node_text(&node, source)),
                     signature: None,
                     doc_comment: get_preceding_comment(&node, source),
                 });
@@ -181,7 +194,7 @@ fn extract_nodes(
                                 qualified_name: Some(name),
                                 start_line: child.start_position().row as u32 + 1,
                                 end_line: child.end_position().row as u32 + 1,
-                                code_content: node_text(&child, source).into(),
+                                code_content: truncate_code_content(node_text(&child, source)),
                                 signature: None,
                                 doc_comment: get_preceding_comment(&child, source),
                             });
@@ -239,6 +252,20 @@ fn extract_children(
     }
 }
 
+fn truncate_code_content(content: &str) -> String {
+    if content.len() <= MAX_CODE_CONTENT_LEN {
+        content.to_string()
+    } else {
+        let mut end = MAX_CODE_CONTENT_LEN;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = content[..end].to_string();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
 fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str) -> ParsedNode {
     ParsedNode {
         node_type: node_type.into(),
@@ -246,7 +273,7 @@ fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, sou
         qualified_name: Some(name),
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
-        code_content: node_text(node, source).into(),
+        code_content: truncate_code_content(node_text(node, source)),
         signature: None,
         doc_comment: get_preceding_comment(node, source),
     }
@@ -271,7 +298,7 @@ fn extract_function_node(
         qualified_name,
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
-        code_content: node_text(node, source).into(),
+        code_content: truncate_code_content(node_text(node, source)),
         signature,
         doc_comment: get_preceding_comment(node, source),
     })
@@ -294,7 +321,7 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
                     qualified_name: Some(name),
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    code_content: node_text(node, source).into(),
+                    code_content: truncate_code_content(node_text(node, source)),
                     signature: extract_signature(&value, source),
                     doc_comment: get_preceding_comment(node, source),
                 });

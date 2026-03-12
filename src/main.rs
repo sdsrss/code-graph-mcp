@@ -83,17 +83,12 @@ fn run_serve() -> Result<()> {
             Ok(None) => {}
             Err(e) => {
                 tracing::error!("Error handling message: {}", e);
-                let (code, label) = if e.downcast_ref::<serde_json::Error>().is_some() {
-                    (code_graph_mcp::mcp::protocol::JSONRPC_PARSE_ERROR, "Parse error")
-                } else {
-                    (code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR, "Internal error")
-                };
                 let err_resp = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": null,
                     "error": {
-                        "code": code,
-                        "message": format!("{}: {}", label, e)
+                        "code": code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR,
+                        "message": format!("Internal error: {}", e)
                     }
                 });
                 writeln!(stdout, "{}", err_resp)?;
