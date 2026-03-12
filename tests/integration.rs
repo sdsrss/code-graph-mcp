@@ -267,3 +267,56 @@ function greet(name: string): string {
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(parsed["result"].is_object());
 }
+
+#[test]
+fn test_e2e_resources_read() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("a.ts"), "function a() { return 1; }").unwrap();
+    fs::write(project.path().join("b.ts"), "function b() { return 2; }").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    // Trigger indexing via search
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "function"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Read project summary
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"code-graph://project-summary"}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
+    let summary: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    assert!(summary["files"].as_i64().unwrap() >= 2, "should have at least 2 files indexed");
+    assert!(summary["nodes"].as_i64().unwrap() >= 2, "should have at least 2 nodes");
+    assert!(summary["schema_version"].as_i64().unwrap() >= 1);
+}
+
+#[test]
+fn test_e2e_prompts_get_all() {
+    let project = TempDir::new().unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    let cases = vec![
+        ("impact-analysis", "symbol_name", "handleLogin", "impact_analysis"),
+        ("understand-module", "path", "src/auth/", "module_overview"),
+        ("trace-request", "route", "/api/users", "trace_http_chain"),
+    ];
+
+    for (name, arg_name, arg_val, expected_substr) in cases {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+            "params": { "name": name, "arguments": { arg_name: arg_val } }
+        }).to_string();
+        let resp = server.handle_message(&msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let messages = parsed["result"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let text = messages[0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains(arg_val),
+            "prompt '{}' message should contain argument '{}', got: {}", name, arg_val, text);
+        assert!(text.contains(expected_substr),
+            "prompt '{}' message should reference tool '{}', got: {}", name, expected_substr, text);
+    }
+}
