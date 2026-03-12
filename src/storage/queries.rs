@@ -602,19 +602,18 @@ pub struct ModuleExport {
 /// Get all exported symbols from files under a directory prefix.
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
     use crate::domain::{REL_EXPORTS, REL_CALLS};
-    let sql = format!(
+    let sql =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = '{}') as caller_count
+                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?3) as caller_count
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
-         WHERE f.path LIKE ?2
-         ORDER BY caller_count DESC",
-        REL_CALLS
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let prefix_pattern = format!("{}%", dir_prefix);
-    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern], |row| {
+         WHERE f.path LIKE ?2 ESCAPE '\\'
+         ORDER BY caller_count DESC";
+    let mut stmt = conn.prepare(sql)?;
+    let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
+    let prefix_pattern = format!("{}%", escaped_prefix);
+    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern, REL_CALLS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
             name: row.get(1)?,
