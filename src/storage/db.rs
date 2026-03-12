@@ -145,6 +145,80 @@ mod tests {
     }
 
     #[test]
+    fn test_v1_to_v2_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Create a v1 database manually (without the 3 new columns)
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT
+                );
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT, UNIQUE(source_id, target_id, relation)
+                );
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    content='nodes', content_rowid='id'
+                );"
+            ).unwrap();
+            // Insert test data to verify preservation
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 1, 'typescript', 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'hello', 'hello', 1, 5, 'function hello() {}')",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        // Open with Database::open — should trigger v1→v2 migration
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify schema version updated
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        // Verify new columns exist (can write to them)
+        db.conn().execute(
+            "UPDATE nodes SET name_tokens = 'hello', return_type = 'void', param_types = '()' WHERE id = 1",
+            [],
+        ).unwrap();
+
+        // Verify FTS5 has 8 columns (insert trigger fires on UPDATE with new columns)
+        let fts_count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'hello'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(fts_count >= 1, "FTS5 should find existing data after migration rebuild");
+
+        // Verify existing data preserved
+        let name: String = db.conn().query_row(
+            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(name, "hello");
+    }
+
+    #[test]
     fn test_vec0_extension_loads() {
         let tmp = TempDir::new().unwrap();
         let db = Database::open_with_vec(&tmp.path().join("test.db")).unwrap();

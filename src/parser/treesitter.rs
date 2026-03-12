@@ -16,6 +16,8 @@ pub struct ParsedNode {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub return_type: Option<String>,
+    /// Full parameter text from AST, e.g. "(a: number, b: string)" — includes names and types,
+    /// not just type annotations. Stored as-is for FTS search (users may search by param names).
     pub param_types: Option<String>,
 }
 

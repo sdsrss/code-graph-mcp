@@ -551,6 +551,9 @@ impl McpServer {
             };
 
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
+        // k=30: sharper rank sensitivity than default 60 (top results matter more)
+        // fts=1.0, vec=1.2: slightly favor vector similarity since FTS is now stronger
+        // with name_tokens and type columns in v2 schema
         let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, 1.0, 1.2);
 
         // Batch-fetch all candidate nodes with file info (single query instead of N+1)

@@ -117,6 +117,7 @@ pub struct NodeRecord {
     pub context_string: Option<String>,
     pub name_tokens: Option<String>,
     pub return_type: Option<String>,
+    /// Full parameter text from AST (includes names + types, not just type annotations).
     pub param_types: Option<String>,
 }
 
