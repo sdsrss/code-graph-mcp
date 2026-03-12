@@ -1116,7 +1116,7 @@ impl McpServer {
             .ok_or_else(|| anyhow!("Missing node_id"))?;
         let top_k = args.get("top_k")
             .and_then(|v| v.as_i64())
-            .unwrap_or(5) as i64;
+            .unwrap_or(5);
         let max_distance = args.get("max_distance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.5);
