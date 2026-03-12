@@ -631,3 +631,32 @@ fn test_insert_node_cached_returns_same_as_insert_node() {
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].id, id);
 }
+
+#[test]
+fn test_insert_edge_cached_deduplicates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Database::open(&tmp.path().join("test.db")).unwrap();
+
+    let file_id = upsert_file(db.conn(), &FileRecord {
+        path: "test.ts".into(),
+        blake3_hash: "abc".into(),
+        last_modified: 0,
+        language: Some("typescript".into()),
+    }).unwrap();
+
+    let n1 = insert_node_cached(db.conn(), &NodeRecord {
+        file_id, node_type: "function".into(), name: "a".into(),
+        qualified_name: None, start_line: 1, end_line: 2,
+        code_content: "".into(), signature: None, doc_comment: None, context_string: None,
+    }).unwrap();
+    let n2 = insert_node_cached(db.conn(), &NodeRecord {
+        file_id, node_type: "function".into(), name: "b".into(),
+        qualified_name: None, start_line: 3, end_line: 4,
+        code_content: "".into(), signature: None, doc_comment: None, context_string: None,
+    }).unwrap();
+
+    // First insert should succeed
+    assert!(insert_edge_cached(db.conn(), n1, n2, "calls", None).unwrap());
+    // Duplicate should be ignored
+    assert!(!insert_edge_cached(db.conn(), n1, n2, "calls", None).unwrap());
+}

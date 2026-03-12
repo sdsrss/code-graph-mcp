@@ -245,6 +245,16 @@ pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: 
     Ok(conn.changes() > 0)
 }
 
+/// Insert an edge using a cached prepared statement. Returns true if new row inserted.
+pub fn insert_edge_cached(conn: &Connection, source_id: i64, target_id: i64, relation: &str, metadata: Option<&str>) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+         VALUES (?1, ?2, ?3, ?4)"
+    )?;
+    let rows = stmt.execute((source_id, target_id, relation, metadata))?;
+    Ok(rows > 0)
+}
+
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1"
