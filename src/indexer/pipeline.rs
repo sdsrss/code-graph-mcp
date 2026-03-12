@@ -281,13 +281,19 @@ fn index_files(
 
         let source = match std::fs::read_to_string(&abs_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("Skipping file {}: {}", rel_path, e);
+                continue;
+            }
         };
 
         // Parse once — shared by Phase 1 (nodes) and Phase 2 (relations)
         let tree = match parse_tree(&source, language) {
             Ok(t) => t,
-            Err(_) => continue, // Skip files that fail to parse
+            Err(e) => {
+                tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                continue;
+            }
         };
 
         // Delete old nodes for this file if it was previously indexed

@@ -660,3 +660,28 @@ fn test_insert_edge_cached_deduplicates() {
     // Duplicate should be ignored
     assert!(!insert_edge_cached(db.conn(), n1, n2, "calls", None).unwrap());
 }
+
+#[test]
+fn test_index_skips_unparseable_files_without_crashing() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    // Create a valid TS file
+    fs::write(project_dir.path().join("good.ts"), "function works() {}").unwrap();
+    // Create a file with supported extension but binary content
+    fs::write(project_dir.path().join("bad.ts"), &[0xFF, 0xFE, 0x00, 0x01]).unwrap();
+    // Another valid file
+    fs::write(project_dir.path().join("also_good.ts"), "function alsoWorks() {}").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let result = run_full_index(&db, project_dir.path(), None).unwrap();
+
+    // Bad file skipped, but good files indexed
+    assert!(result.files_indexed >= 2, "Should index at least the 2 good files, got {}", result.files_indexed);
+    let nodes = get_nodes_by_name(db.conn(), "works").unwrap();
+    assert_eq!(nodes.len(), 1);
+    let nodes2 = get_nodes_by_name(db.conn(), "alsoWorks").unwrap();
+    assert_eq!(nodes2.len(), 1);
+}
