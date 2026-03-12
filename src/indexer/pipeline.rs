@@ -19,6 +19,9 @@ pub struct IndexResult {
     pub edges_created: usize,
 }
 
+/// Progress callback: called with (files_done, files_total) after each batch.
+pub type ProgressFn<'a> = &'a dyn Fn(usize, usize);
+
 /// Extract "METHOD path" from route edge metadata JSON, falling back to the edge name.
 fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
     if let Some(meta) = metadata {
@@ -88,13 +91,13 @@ fn categorize_edges(edges: Option<&Vec<EdgeInfo>>, format_route: impl Fn(Option<
     result
 }
 
-pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
+pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
     let files: Vec<String> = current_hashes.keys().cloned().collect();
-    index_files(db, project_root, &files, &current_hashes, model, &[])
+    index_files(db, project_root, &files, &current_hashes, model, &[], progress)
 }
 
-pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<IndexResult> {
+pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
     let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let current_hashes = scan_directory(project_root)?;
@@ -109,7 +112,7 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files)?;
+    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
 
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
@@ -134,6 +137,7 @@ pub fn run_incremental_index_cached(
     project_root: &Path,
     model: Option<&EmbeddingModel>,
     dir_cache: Option<&DirectoryCache>,
+    progress: Option<ProgressFn>,
 ) -> Result<(IndexResult, DirectoryCache)> {
     let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
@@ -159,7 +163,7 @@ pub fn run_incremental_index_cached(
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files)?;
+    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
 
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
@@ -250,6 +254,7 @@ fn index_files(
     hashes: &HashMap<String, String>,
     model: Option<&EmbeddingModel>,
     delete_paths: &[String],
+    progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
     // SAFETY: unchecked_transaction is used because rusqlite's Transaction borrows
     // &mut Connection, preventing other borrows during the transaction. Here we need
@@ -463,6 +468,11 @@ fn index_files(
             // pf.tree and pf.source are dropped here — memory freed
         }
 
+        // Report progress after each batch
+        if let Some(cb) = progress {
+            cb(all_indexed.len(), files.len());
+        }
+
         if files.len() > BATCH_SIZE {
             tracing::info!(
                 "[index] batch {}/{}: {} files ({} nodes, {} edges)",
@@ -550,7 +560,7 @@ function handleLogin(req: Request) {
 "#).unwrap();
 
         let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-        let result = run_full_index(&db, project_dir.path(), None).unwrap();
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
 
         assert!(result.files_indexed > 0);
         assert!(result.nodes_created > 0);
@@ -576,13 +586,13 @@ function handleLogin(req: Request) {
 
         // Initial index
         fs::write(project_dir.path().join("a.ts"), "function foo() {}").unwrap();
-        run_full_index(&db, project_dir.path(), None).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
 
         // Modify file
         fs::write(project_dir.path().join("a.ts"), "function bar() {}").unwrap();
 
         // Incremental index
-        let result = run_incremental_index(&db, project_dir.path(), None).unwrap();
+        let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
         assert_eq!(result.files_indexed, 1);
 
         let foo = get_nodes_by_name(db.conn(), "foo").unwrap();
@@ -600,7 +610,7 @@ function handleLogin(req: Request) {
         // Initial: B (in b.ts) calls A (in a.ts)
         fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
         fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
-        run_full_index(&db, project_dir.path(), None).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
 
         let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
         assert_eq!(beta_nodes.len(), 1);
@@ -608,7 +618,7 @@ function handleLogin(req: Request) {
 
         // Change A: rename function (alpha -> alphaRenamed)
         fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
-        run_incremental_index(&db, project_dir.path(), None).unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
         // beta's context_string should be updated (calls list changed because
         // the old alpha node is gone and edge was cascade-deleted)
@@ -625,10 +635,10 @@ function handleLogin(req: Request) {
         let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
         fs::write(project_dir.path().join("a.ts"), "function foo() {}").unwrap();
-        run_full_index(&db, project_dir.path(), None).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
 
         fs::remove_file(project_dir.path().join("a.ts")).unwrap();
-        run_incremental_index(&db, project_dir.path(), None).unwrap();
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
         let foo = get_nodes_by_name(db.conn(), "foo").unwrap();
         assert_eq!(foo.len(), 0);

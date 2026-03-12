@@ -661,9 +661,15 @@ pub struct ModuleExport {
 }
 
 /// Get all exported symbols from files under a directory prefix.
+/// For JS/TS, uses explicit `exports` edges. For other languages (Rust, Go, Python, etc.),
+/// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
     use crate::domain::{REL_EXPORTS, REL_CALLS};
-    let sql =
+    let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
+    let prefix_pattern = format!("{}%", escaped_prefix);
+
+    // Phase 1: Try explicit exports (JS/TS)
+    let sql_exports =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?3) as caller_count
          FROM nodes n
@@ -671,10 +677,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
          WHERE f.path LIKE ?2 ESCAPE '\\'
          ORDER BY caller_count DESC";
-    let mut stmt = conn.prepare(sql)?;
-    let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
-    let prefix_pattern = format!("{}%", escaped_prefix);
-    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, prefix_pattern, REL_CALLS], |row| {
+    let mut stmt = conn.prepare(sql_exports)?;
+    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, &prefix_pattern, REL_CALLS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
             name: row.get(1)?,
@@ -682,6 +686,72 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             signature: row.get(3)?,
             file_path: row.get(4)?,
             caller_count: row.get(5)?,
+        })
+    })?;
+    let results: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !results.is_empty() {
+        return Ok(results);
+    }
+
+    // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files
+    let sql_fallback =
+        "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
+                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?2) as caller_count
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE f.path LIKE ?1 ESCAPE '\\'
+           AND n.type != 'module'
+           AND n.name != '<module>'
+         ORDER BY caller_count DESC";
+    let mut stmt2 = conn.prepare(sql_fallback)?;
+    let rows2 = stmt2.query_map(rusqlite::params![&prefix_pattern, REL_CALLS], |row| {
+        Ok(ModuleExport {
+            node_id: row.get(0)?,
+            name: row.get(1)?,
+            node_type: row.get(2)?,
+            signature: row.get(3)?,
+            file_path: row.get(4)?,
+            caller_count: row.get(5)?,
+        })
+    })?;
+    rows2.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+// --- Fuzzy name resolution ---
+
+/// Candidate result from fuzzy function name matching.
+#[derive(Debug)]
+pub struct NameCandidate {
+    pub name: String,
+    pub file_path: String,
+    pub node_type: String,
+}
+
+/// Find function/method names that contain the given substring.
+/// Used as a fallback when exact name match returns no results.
+pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Result<Vec<NameCandidate>> {
+    let escaped = partial_name.replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{}%", escaped);
+    let sql =
+        "SELECT DISTINCT n.name, f.path, n.type
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE n.name LIKE ?1 ESCAPE '\\'
+           AND n.type IN ('function', 'method')
+         ORDER BY
+           CASE WHEN n.name = ?2 THEN 0
+                WHEN n.name LIKE ?2 || '%' THEN 1
+                ELSE 2
+           END,
+           LENGTH(n.name)
+         LIMIT 10";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![pattern, partial_name], |row| {
+        Ok(NameCandidate {
+            name: row.get(0)?,
+            file_path: row.get(1)?,
+            node_type: row.get(2)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)

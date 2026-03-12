@@ -40,6 +40,9 @@ fn run_serve() -> Result<()> {
     let project_root = std::env::current_dir()?;
     let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
 
+    // Enable MCP progress/log notifications via stdout
+    server.set_notify_writer(Box::new(io::stdout()));
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = stdin.lock();

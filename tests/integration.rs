@@ -681,7 +681,7 @@ fn test_index_skips_unparseable_files_without_crashing() {
     fs::write(project_dir.path().join("also_good.ts"), "function alsoWorks() {}").unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-    let result = run_full_index(&db, project_dir.path(), None).unwrap();
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Bad file skipped, but good files indexed
     assert!(result.files_indexed >= 2, "Should index at least the 2 good files, got {}", result.files_indexed);
@@ -707,7 +707,7 @@ fn test_batch_indexing_commits_partial_on_many_files() {
     }
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-    let result = run_full_index(&db, project_dir.path(), None).unwrap();
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     assert_eq!(result.files_indexed, 10);
     // Verify all functions exist
@@ -740,7 +740,7 @@ function handleUserLogin(req: Request) {
     ).unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-    run_full_index(&db, project_dir.path(), None).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Searching for "validate" should find "validateAuthToken" via name_tokens splitting
     let results = fts5_search(db.conn(), "validate", 5).unwrap();
@@ -774,7 +774,7 @@ function processOrder(order: Order): OrderResult {
     ).unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
-    run_full_index(&db, project_dir.path(), None).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Search by return type should find functions returning that type
     let results = fts5_search(db.conn(), "OrderResult", 5).unwrap();

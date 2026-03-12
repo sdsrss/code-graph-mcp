@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::json;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, mpsc};
 
@@ -37,6 +38,16 @@ const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 /// with node_ids for expansion via read_snippet.
 const COMPRESSION_TOKEN_THRESHOLD: usize = 2000;
 
+/// Result of fuzzy name resolution.
+enum FuzzyResolution {
+    /// Exactly one candidate matched — use this name.
+    Unique(String),
+    /// Multiple candidates — return suggestions to caller.
+    Ambiguous(Vec<serde_json::Value>),
+    /// No candidates found.
+    NotFound,
+}
+
 /// MCP server for code graph operations. Single-threaded (stdio loop).
 pub struct McpServer {
     registry: ToolRegistry,
@@ -47,6 +58,9 @@ pub struct McpServer {
     watcher: Mutex<Option<WatcherState>>,
     last_incremental_check: Mutex<std::time::Instant>,
     dir_cache: Mutex<Option<crate::indexer::merkle::DirectoryCache>>,
+    /// Writer for sending MCP notifications (progress, logging) to the client.
+    /// Set to stdout in production; None in tests.
+    notify_writer: Mutex<Option<Box<dyn Write + Send>>>,
 }
 
 impl McpServer {
@@ -94,6 +108,7 @@ impl McpServer {
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
+            notify_writer: Mutex::new(None),
         })
     }
 
@@ -109,6 +124,7 @@ impl McpServer {
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
+            notify_writer: Mutex::new(None),
         }
     }
 
@@ -126,11 +142,64 @@ impl McpServer {
             watcher: Mutex::new(None),
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
+            notify_writer: Mutex::new(None),
+        }
+    }
+
+    /// Set the writer for sending MCP notifications to the client.
+    pub fn set_notify_writer(&self, writer: Box<dyn Write + Send>) {
+        *lock_or_recover(&self.notify_writer, "notify_writer") = Some(writer);
+    }
+
+    /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
+    fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
+        let candidates = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?;
+        if candidates.len() == 1 {
+            Ok(FuzzyResolution::Unique(candidates.into_iter().next().unwrap().name))
+        } else if !candidates.is_empty() {
+            let suggestions = candidates.iter().map(|c| json!({
+                "name": c.name, "file_path": c.file_path, "type": c.node_type,
+            })).collect();
+            Ok(FuzzyResolution::Ambiguous(suggestions))
+        } else {
+            Ok(FuzzyResolution::NotFound)
         }
     }
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Send a JSON-RPC notification to the client (non-blocking, best-effort).
+    fn send_notification(&self, method: &str, params: serde_json::Value) {
+        let mut guard = lock_or_recover(&self.notify_writer, "notify_writer");
+        if let Some(ref mut writer) = *guard {
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            });
+            let _ = writeln!(writer, "{}", msg);
+            let _ = writer.flush();
+        }
+    }
+
+    /// Send MCP progress notification.
+    fn send_progress(&self, token: &str, current: usize, total: usize) {
+        self.send_notification("notifications/progress", json!({
+            "progressToken": token,
+            "progress": current,
+            "total": total,
+        }));
+    }
+
+    /// Send MCP log notification.
+    fn send_log(&self, level: &str, message: &str) {
+        self.send_notification("notifications/message", json!({
+            "level": level,
+            "logger": "code-graph",
+            "data": message,
+        }));
     }
 
     /// Ensure index is up-to-date. On first call, runs full index.
@@ -147,7 +216,11 @@ impl McpServer {
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
         if !is_indexed {
-            run_full_index(&self.db, &project_root, model)?;
+            self.send_log("info", "Scanning and indexing project files...");
+            let progress_cb = |current: usize, total: usize| {
+                self.send_progress("indexing", current, total);
+            };
+            run_full_index(&self.db, &project_root, model, Some(&progress_cb))?;
             *lock_or_recover(&self.indexed, "indexed") = true;
         } else {
             // Check if watcher detected changes (locks watcher only)
@@ -178,7 +251,7 @@ impl McpServer {
         let cache = cache_guard.take();
         drop(cache_guard); // Release lock during I/O
 
-        match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref()) {
+        match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref(), None) {
             Ok((_result, new_cache)) => {
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
                 Ok(())
@@ -669,7 +742,39 @@ impl McpServer {
             self.db.conn(), function_name, direction, depth, file_path,
         )?;
 
-        // Build node lists with direction tag for potential compression reuse
+        // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
+        let has_edges = results.iter().any(|n| n.depth > 0);
+        if !has_edges {
+            match self.resolve_fuzzy_name(function_name)? {
+                FuzzyResolution::Unique(resolved) => {
+                    let results2 = crate::graph::query::get_call_graph(
+                        self.db.conn(), &resolved, direction, depth, file_path,
+                    )?;
+                    return self.format_call_graph_response(&resolved, direction, &results2);
+                }
+                FuzzyResolution::Ambiguous(suggestions) => {
+                    return Ok(json!({
+                        "function": function_name,
+                        "direction": direction,
+                        "callees": [],
+                        "callers": [],
+                        "suggestion": format!("No exact match for '{}'. Did you mean one of these?", function_name),
+                        "candidates": suggestions,
+                    }));
+                }
+                FuzzyResolution::NotFound => {}
+            }
+        }
+
+        self.format_call_graph_response(function_name, direction, &results)
+    }
+
+    fn format_call_graph_response(
+        &self,
+        function_name: &str,
+        direction: &str,
+        results: &[crate::graph::query::CallGraphNode],
+    ) -> Result<serde_json::Value> {
         let all_nodes: Vec<serde_json::Value> = results.iter()
             .filter(|n| n.depth > 0)
             .map(|n| json!({
@@ -682,7 +787,6 @@ impl McpServer {
             }))
             .collect();
 
-        // Estimate tokens from the flat list to avoid building full result just to discard it
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
             return Ok(json!({
@@ -693,7 +797,6 @@ impl McpServer {
             }));
         }
 
-        // Normal path: split into callers/callees for structured output
         let callee_nodes: Vec<&serde_json::Value> = all_nodes.iter()
             .filter(|n| n["direction"] == "callees")
             .collect();
@@ -998,7 +1101,11 @@ impl McpServer {
             tx.commit()?;
         }
 
-        let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref())?;
+        self.send_log("info", "Rebuilding index...");
+        let progress_cb = |current: usize, total: usize| {
+            self.send_progress("rebuild-index", current, total);
+        };
+        let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref(), Some(&progress_cb))?;
 
         // Reset indexed flag
         *lock_or_recover(&self.indexed, "indexed") = true;
@@ -1023,9 +1130,36 @@ impl McpServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(3) as i32;
 
-        let callers = queries::get_callers_with_route_info(
+        let mut resolved_name = symbol_name.to_string();
+        let mut callers = queries::get_callers_with_route_info(
             self.db.conn(), symbol_name, None, depth
         )?;
+
+        // Fuzzy fallback: if no callers found, try fuzzy name resolution
+        if callers.is_empty() {
+            match self.resolve_fuzzy_name(symbol_name)? {
+                FuzzyResolution::Unique(resolved) => {
+                    resolved_name = resolved;
+                    callers = queries::get_callers_with_route_info(
+                        self.db.conn(), &resolved_name, None, depth
+                    )?;
+                }
+                FuzzyResolution::Ambiguous(suggestions) => {
+                    return Ok(json!({
+                        "symbol": symbol_name,
+                        "change_type": change_type,
+                        "direct_callers": [],
+                        "transitive_callers": [],
+                        "affected_routes": [],
+                        "affected_files": 0,
+                        "risk_level": "LOW",
+                        "summary": format!("No exact match for '{}'. Did you mean one of these?", symbol_name),
+                        "candidates": suggestions,
+                    }));
+                }
+                FuzzyResolution::NotFound => {}
+            }
+        }
 
         let affected_files: std::collections::HashSet<&str> = callers.iter()
             .map(|c| c.file_path.as_str()).collect();
@@ -1046,7 +1180,7 @@ impl McpServer {
         let transitive: Vec<_> = callers.iter().filter(|c| c.depth > 1).collect();
 
         Ok(json!({
-            "symbol": symbol_name,
+            "symbol": &resolved_name,
             "change_type": change_type,
             "direct_callers": direct.iter().map(|c| json!({
                 "name": c.name, "file": c.file_path, "depth": c.depth
@@ -1058,7 +1192,7 @@ impl McpServer {
             "affected_files": affected_files.len(),
             "risk_level": risk_level,
             "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}]",
-                symbol_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
+                &resolved_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
         }))
     }
 

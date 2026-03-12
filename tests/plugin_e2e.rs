@@ -34,6 +34,23 @@ fn read_with_timeout(rx: &mpsc::Receiver<String>, timeout: Duration) -> Option<S
     rx.recv_timeout(timeout).ok()
 }
 
+/// Read a JSON-RPC response (with "id" field), skipping any notifications.
+/// MCP servers may send `notifications/progress` or `notifications/message`
+/// interleaved with responses; this function filters them out.
+fn read_response(rx: &mpsc::Receiver<String>, timeout: Duration) -> Option<String> {
+    let start = std::time::Instant::now();
+    loop {
+        let remaining = timeout.checked_sub(start.elapsed())?;
+        let line = rx.recv_timeout(remaining).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        // JSON-RPC responses have "id"; notifications don't
+        if parsed.get("id").is_some() {
+            return Some(line);
+        }
+        // else: notification, skip and read next line
+    }
+}
+
 /// Spawn a background reader thread that sends lines to the channel.
 fn spawn_reader(stdout: std::process::ChildStdout) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
@@ -146,11 +163,11 @@ function handleLogin(req: Request) {
     send(&mut stdin, &initialize_msg());
     let _ = read_with_timeout(&rx, TIMEOUT).expect("no response to initialize");
 
-    // semantic_code_search — triggers indexing
+    // semantic_code_search — triggers indexing (may produce progress notifications)
     send(&mut stdin, &tool_call_msg(2, "semantic_code_search", serde_json::json!({
         "query": "validateToken", "top_k": 5
     })));
-    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to semantic_code_search");
+    let resp = read_response(&rx, TIMEOUT).expect("no response to semantic_code_search");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let results: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -162,7 +179,7 @@ function handleLogin(req: Request) {
         "file_path": "src/auth.ts",
         "symbol_name": "validateToken"
     })));
-    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to get_ast_node");
+    let resp = read_response(&rx, TIMEOUT).expect("no response to get_ast_node");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let node: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -173,7 +190,7 @@ function handleLogin(req: Request) {
     send(&mut stdin, &tool_call_msg(4, "read_snippet", serde_json::json!({
         "node_id": node_id
     })));
-    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to read_snippet");
+    let resp = read_response(&rx, TIMEOUT).expect("no response to read_snippet");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let snippet: serde_json::Value = serde_json::from_str(text).unwrap();

@@ -35,7 +35,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
 
     // Use run_incremental_index without a model (no embedding for short-lived CLI)
     use crate::indexer::pipeline::run_incremental_index;
-    let stats = run_incremental_index(&ctx.db, &ctx.project_root, None)?;
+    let stats = run_incremental_index(&ctx.db, &ctx.project_root, None, None)?;
 
     if !quiet {
         eprintln!(
