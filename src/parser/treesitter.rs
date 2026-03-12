@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use super::languages::get_language;
@@ -27,12 +28,13 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
 
     PARSER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let parser = cache.entry(language.to_string()).or_insert_with(|| {
+        if !cache.contains_key(language) {
             let mut p = tree_sitter::Parser::new();
             p.set_timeout_micros(5_000_000);
-            p
-        });
-        parser.set_language(&lang)?;
+            p.set_language(&lang)?;
+            cache.insert(language.to_string(), p);
+        }
+        let parser = cache.get_mut(language).unwrap();
         parser.parse(source, None)
             .ok_or_else(|| anyhow!("parse failed or timed out"))
     })
@@ -87,7 +89,7 @@ fn extract_nodes(
                             qualified_name: Some(name),
                             start_line: node.start_position().row as u32 + 1,
                             end_line: node.end_position().row as u32 + 1,
-                            code_content: truncate_code_content(node_text(&node, source)),
+                            code_content: truncate_code_content(node_text(&node, source)).into_owned(),
                             signature: extract_c_signature(&node, source),
                             doc_comment: get_preceding_comment(&node, source),
                         });
@@ -124,7 +126,7 @@ fn extract_nodes(
                     qualified_name: Some(name.clone()),
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    code_content: truncate_code_content(node_text(&node, source)),
+                    code_content: truncate_code_content(node_text(&node, source)).into_owned(),
                     signature: None,
                     doc_comment: get_preceding_comment(&node, source),
                 });
@@ -194,7 +196,7 @@ fn extract_nodes(
                                 qualified_name: Some(name),
                                 start_line: child.start_position().row as u32 + 1,
                                 end_line: child.end_position().row as u32 + 1,
-                                code_content: truncate_code_content(node_text(&child, source)),
+                                code_content: truncate_code_content(node_text(&child, source)).into_owned(),
                                 signature: None,
                                 doc_comment: get_preceding_comment(&child, source),
                             });
@@ -252,9 +254,9 @@ fn extract_children(
     }
 }
 
-fn truncate_code_content(content: &str) -> String {
+fn truncate_code_content(content: &str) -> Cow<'_, str> {
     if content.len() <= MAX_CODE_CONTENT_LEN {
-        content.to_string()
+        Cow::Borrowed(content)
     } else {
         let mut end = MAX_CODE_CONTENT_LEN;
         while end > 0 && !content.is_char_boundary(end) {
@@ -262,7 +264,7 @@ fn truncate_code_content(content: &str) -> String {
         }
         let mut truncated = content[..end].to_string();
         truncated.push_str("...");
-        truncated
+        Cow::Owned(truncated)
     }
 }
 
@@ -273,7 +275,7 @@ fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, sou
         qualified_name: Some(name),
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
-        code_content: truncate_code_content(node_text(node, source)),
+        code_content: truncate_code_content(node_text(node, source)).into_owned(),
         signature: None,
         doc_comment: get_preceding_comment(node, source),
     }
@@ -298,7 +300,7 @@ fn extract_function_node(
         qualified_name,
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
-        code_content: truncate_code_content(node_text(node, source)),
+        code_content: truncate_code_content(node_text(node, source)).into_owned(),
         signature,
         doc_comment: get_preceding_comment(node, source),
     })
@@ -321,7 +323,7 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
                     qualified_name: Some(name),
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
-                    code_content: truncate_code_content(node_text(node, source)),
+                    code_content: truncate_code_content(node_text(node, source)).into_owned(),
                     signature: extract_signature(&value, source),
                     doc_comment: get_preceding_comment(node, source),
                 });
