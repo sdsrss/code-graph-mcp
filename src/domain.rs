@@ -19,3 +19,4 @@ pub const MAX_RELATION_DEPTH: usize = 256;
 
 // -- Indexing limits --
 pub const MAX_FILE_SIZE: u64 = 1_048_576; // 1 MB
+pub const MAX_CODE_CONTENT_LEN: usize = 4096; // 4KB max stored per node
