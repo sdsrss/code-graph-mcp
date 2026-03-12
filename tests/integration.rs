@@ -685,3 +685,29 @@ fn test_index_skips_unparseable_files_without_crashing() {
     let nodes2 = get_nodes_by_name(db.conn(), "alsoWorks").unwrap();
     assert_eq!(nodes2.len(), 1);
 }
+
+#[test]
+fn test_batch_indexing_commits_partial_on_many_files() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    // Create 10 valid files
+    for i in 0..10 {
+        fs::write(
+            project_dir.path().join(format!("file{}.ts", i)),
+            format!("function func{}() {{}}", i),
+        ).unwrap();
+    }
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let result = run_full_index(&db, project_dir.path(), None).unwrap();
+
+    assert_eq!(result.files_indexed, 10);
+    // Verify all functions exist
+    for i in 0..10 {
+        let nodes = get_nodes_by_name(db.conn(), &format!("func{}", i)).unwrap();
+        assert_eq!(nodes.len(), 1, "func{} should exist", i);
+    }
+}

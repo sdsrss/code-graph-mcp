@@ -219,6 +219,17 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
     Ok(())
 }
 
+/// Batch size for streaming indexing. Each batch processes Phase 1+2
+/// then drops heavyweight data (ASTs, source strings) before the next batch.
+const BATCH_SIZE: usize = 500;
+
+/// Lightweight post-batch record — no Tree or source string.
+struct FileIndexed {
+    rel_path: String,
+    node_ids: Vec<i64>,
+    node_names: Vec<String>,
+}
+
 fn index_files(
     db: &Database,
     root: &Path,
@@ -234,17 +245,19 @@ fn index_files(
     // (1) db.conn() returns the same Connection the tx was opened on,
     // (2) we never open nested transactions,
     // (3) the server is single-threaded.
-    let tx = db.conn().unchecked_transaction()?;
 
-    // Phase 0: Delete removed files inside transaction
+    let mut total_nodes_created = 0usize;
+    let mut total_edges_created = 0usize;
+    let mut all_indexed: Vec<FileIndexed> = Vec::new();
+
+    // Phase 0: Delete removed files in own transaction
     if !delete_paths.is_empty() {
+        let tx = db.conn().unchecked_transaction()?;
         delete_files_by_paths(db.conn(), delete_paths)?;
+        tx.commit()?;
     }
 
-    let mut nodes_created = 0usize;
-    let mut edges_created = 0usize;
-
-    // Collect all parsed data first
+    // Heavyweight per-file data used during Phase 1+2, dropped after each batch
     struct FileParsed {
         rel_path: String,
         source: String,
@@ -255,217 +268,226 @@ fn index_files(
         node_names: Vec<String>,
     }
 
-    let mut parsed_files: Vec<FileParsed> = Vec::new();
+    // Process files in batches — each batch does Phase 1 + Phase 2
+    for batch in files.chunks(BATCH_SIZE) {
+        let tx = db.conn().unchecked_transaction()?;
 
-    // Phase 1: Parse files once, extract nodes, insert into DB
-    for rel_path in files {
-        let abs_path = root.join(rel_path);
-        let language = match detect_language(rel_path) {
-            Some(lang) => lang,
-            None => continue, // Skip unsupported file types
-        };
+        let mut batch_parsed: Vec<FileParsed> = Vec::new();
 
-        let hash = match hashes.get(rel_path.as_str()) {
-            Some(h) => h.clone(),
-            None => hash_file(&abs_path)?,
-        };
-
-        // Skip files larger than 1MB to avoid OOM on generated/bundled files
-        let file_meta = std::fs::metadata(&abs_path).ok();
-        if let Some(ref meta) = file_meta {
-            if meta.len() > MAX_FILE_SIZE {
-                tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
-                continue;
-            }
-        }
-
-        let source = match std::fs::read_to_string(&abs_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Skipping file {}: {}", rel_path, e);
-                continue;
-            }
-        };
-
-        // Parse once — shared by Phase 1 (nodes) and Phase 2 (relations)
-        let tree = match parse_tree(&source, language) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("Parse failed for {}: {}", rel_path, e);
-                continue;
-            }
-        };
-
-        // Delete old nodes for this file if it was previously indexed
-        let last_modified = file_meta
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let file_id = upsert_file(db.conn(), &FileRecord {
-            path: rel_path.clone(),
-            blake3_hash: hash,
-            last_modified,
-            language: Some(language.to_string()),
-        })?;
-
-        // Delete old nodes for this file (they'll be re-created)
-        delete_nodes_by_file(db.conn(), file_id)?;
-
-        let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
-
-        let mut node_ids = Vec::new();
-        let mut node_names = Vec::new();
-
-        // Synthetic <module> node — anchor for import/export edges
-        let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
-            file_id,
-            node_type: "module".into(),
-            name: "<module>".into(),
-            qualified_name: Some(rel_path.clone()),
-            start_line: 1,
-            end_line: source.lines().count() as i64,
-            code_content: String::new(),
-            signature: None,
-            doc_comment: None,
-            context_string: None,
-        })?;
-        node_ids.push(module_node_id);
-        node_names.push("<module>".into());
-        nodes_created += 1;
-
-        for pn in &parsed_nodes {
-            let node_id = insert_node_cached(db.conn(), &NodeRecord {
-                file_id,
-                node_type: pn.node_type.clone(),
-                name: pn.name.clone(),
-                qualified_name: pn.qualified_name.clone(),
-                start_line: pn.start_line as i64,
-                end_line: pn.end_line as i64,
-                code_content: pn.code_content.clone(),
-                signature: pn.signature.clone(),
-                doc_comment: pn.doc_comment.clone(),
-                context_string: None, // Phase 3 will fill this
-            })?;
-            node_ids.push(node_id);
-            node_names.push(pn.name.clone());
-            nodes_created += 1;
-        }
-
-        parsed_files.push(FileParsed {
-            rel_path: rel_path.clone(),
-            source,
-            language: language.to_string(),
-            tree,
-            file_id,
-            node_ids,
-            node_names,
-        });
-    }
-
-    // Phase 2: Extract relations, insert edges
-    // Build a lookup from node name -> node_ids (for cross-file resolution)
-    let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
-    for pf in &parsed_files {
-        for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-            name_to_ids.entry(name.clone()).or_default().push(*id);
-        }
-    }
-    // Also include existing nodes not being re-indexed (exclude files we just re-indexed)
-    let indexed_file_ids: Vec<i64> = parsed_files.iter().map(|pf| pf.file_id).collect();
-    let all_existing = get_node_names_excluding_files(db.conn(), &indexed_file_ids)?;
-    for (name, id) in &all_existing {
-        name_to_ids.entry(name.clone()).or_default().push(*id);
-    }
-    // Deduplicate
-    for ids in name_to_ids.values_mut() {
-        ids.sort();
-        ids.dedup();
-    }
-
-    for pf in &parsed_files {
-        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
-        let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
-
-        for rel in &relations {
-            // Find source node ID
-            let source_ids = pf.node_names.iter()
-                .zip(pf.node_ids.iter())
-                .filter(|(name, _)| *name == &rel.source_name)
-                .map(|(_, id)| *id)
-                .collect::<Vec<_>>();
-
-            let all_target_ids = name_to_ids.get(&rel.target_name)
-                .cloned()
-                .unwrap_or_default();
-
-            // Prefer same-file targets to reduce false-positive cross-file edges
-            let same_file_targets: Vec<i64> = all_target_ids.iter()
-                .filter(|id| local_ids.contains(id))
-                .copied()
-                .collect();
-            let target_ids = if !same_file_targets.is_empty() {
-                same_file_targets
-            } else {
-                all_target_ids
+        // --- Phase 1: Parse + insert nodes ---
+        for rel_path in batch {
+            let abs_path = root.join(rel_path);
+            let language = match detect_language(rel_path) {
+                Some(lang) => lang,
+                None => continue,
             };
 
-            for &src_id in &source_ids {
-                for &tgt_id in &target_ids {
-                    // Allow self-edges for routes (routes_to maps handler to itself with metadata)
-                    if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
-                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
-                        edges_created += 1;
+            let hash = match hashes.get(rel_path.as_str()) {
+                Some(h) => h.clone(),
+                None => hash_file(&abs_path)?,
+            };
+
+            let file_meta = std::fs::metadata(&abs_path).ok();
+            if let Some(ref meta) = file_meta {
+                if meta.len() > MAX_FILE_SIZE {
+                    tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                    continue;
+                }
+            }
+
+            let source = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Skipping file {}: {}", rel_path, e);
+                    continue;
+                }
+            };
+
+            let tree = match parse_tree(&source, language) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                    continue;
+                }
+            };
+
+            let last_modified = file_meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let file_id = upsert_file(db.conn(), &FileRecord {
+                path: rel_path.clone(),
+                blake3_hash: hash,
+                last_modified,
+                language: Some(language.to_string()),
+            })?;
+
+            delete_nodes_by_file(db.conn(), file_id)?;
+
+            let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+
+            let mut node_ids = Vec::new();
+            let mut node_names = Vec::new();
+
+            let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
+                file_id,
+                node_type: "module".into(),
+                name: "<module>".into(),
+                qualified_name: Some(rel_path.clone()),
+                start_line: 1,
+                end_line: source.lines().count() as i64,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+            })?;
+            node_ids.push(module_node_id);
+            node_names.push("<module>".into());
+            total_nodes_created += 1;
+
+            for pn in &parsed_nodes {
+                let node_id = insert_node_cached(db.conn(), &NodeRecord {
+                    file_id,
+                    node_type: pn.node_type.clone(),
+                    name: pn.name.clone(),
+                    qualified_name: pn.qualified_name.clone(),
+                    start_line: pn.start_line as i64,
+                    end_line: pn.end_line as i64,
+                    code_content: pn.code_content.clone(),
+                    signature: pn.signature.clone(),
+                    doc_comment: pn.doc_comment.clone(),
+                    context_string: None,
+                })?;
+                node_ids.push(node_id);
+                node_names.push(pn.name.clone());
+                total_nodes_created += 1;
+            }
+
+            batch_parsed.push(FileParsed {
+                rel_path: rel_path.clone(),
+                source,
+                language: language.to_string(),
+                tree,
+                file_id,
+                node_ids,
+                node_names,
+            });
+        }
+
+        // --- Phase 2: Extract relations + insert edges ---
+        let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+        for pf in &batch_parsed {
+            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+                name_to_ids.entry(name.clone()).or_default().push(*id);
+            }
+        }
+        // Include nodes from prior batches + existing DB (already committed)
+        let indexed_file_ids: Vec<i64> = batch_parsed.iter().map(|pf| pf.file_id).collect();
+        let existing = get_node_names_excluding_files(db.conn(), &indexed_file_ids)?;
+        for (name, id) in &existing {
+            name_to_ids.entry(name.clone()).or_default().push(*id);
+        }
+        for ids in name_to_ids.values_mut() {
+            ids.sort();
+            ids.dedup();
+        }
+
+        for pf in &batch_parsed {
+            let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+            let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+
+            for rel in &relations {
+                let source_ids = pf.node_names.iter()
+                    .zip(pf.node_ids.iter())
+                    .filter(|(name, _)| *name == &rel.source_name)
+                    .map(|(_, id)| *id)
+                    .collect::<Vec<_>>();
+
+                let all_target_ids = name_to_ids.get(&rel.target_name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let same_file_targets: Vec<i64> = all_target_ids.iter()
+                    .filter(|id| local_ids.contains(id))
+                    .copied()
+                    .collect();
+                let target_ids = if !same_file_targets.is_empty() {
+                    same_file_targets
+                } else {
+                    all_target_ids
+                };
+
+                for &src_id in &source_ids {
+                    for &tgt_id in &target_ids {
+                        if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
+                            && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                            total_edges_created += 1;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Phase 3: Build context strings and update nodes (batch edge fetch)
-    let all_node_ids: Vec<i64> = parsed_files.iter().flat_map(|pf| pf.node_ids.iter().copied()).collect();
-    let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
-    // Batch-fetch node details for signature/doc
-    let all_node_details: HashMap<i64, NodeResult> = {
-        let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
-        nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
-    };
+        tx.commit()?;
 
-    for pf in &parsed_files {
-        for (idx, &node_id) in pf.node_ids.iter().enumerate() {
-            let node_name = &pf.node_names[idx];
-            let edges = all_edges.get(&node_id);
-            let cat = categorize_edges(edges, format_route_from_metadata);
-
-            let node_detail = all_node_details.get(&node_id);
-
-            let ctx = build_context_string(&NodeContext {
-                node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
-                name: node_name.clone(),
-                file_path: pf.rel_path.clone(),
-                signature: node_detail.and_then(|n| n.signature.clone()),
-                code_content: node_detail.map(|n| n.code_content.clone()),
-                routes: cat.routes,
-                callees: cat.callees,
-                callers: cat.callers,
-                inherits: cat.inherits,
-                imports: cat.imports,
-                implements: cat.implements,
-                exports: cat.exports,
-                doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
+        // Convert to lightweight records — drops Tree and source string
+        for pf in batch_parsed {
+            all_indexed.push(FileIndexed {
+                rel_path: pf.rel_path,
+                node_ids: pf.node_ids,
+                node_names: pf.node_names,
             });
-
-            update_context_string(db.conn(), node_id, &ctx)?;
-            try_embed_and_store(db, model, node_id, &ctx);
+            // pf.tree and pf.source are dropped here — memory freed
         }
     }
 
-    tx.commit()?;
+    // Phase 3: Build context strings + embeddings (single transaction, lightweight)
+    if !all_indexed.is_empty() {
+        let tx = db.conn().unchecked_transaction()?;
+        let all_node_ids: Vec<i64> = all_indexed.iter()
+            .flat_map(|fi| fi.node_ids.iter().copied()).collect();
+        let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
+        let all_node_details: HashMap<i64, NodeResult> = {
+            let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
+            nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
+        };
+
+        for fi in &all_indexed {
+            for (idx, &node_id) in fi.node_ids.iter().enumerate() {
+                let node_name = &fi.node_names[idx];
+                let edges = all_edges.get(&node_id);
+                let cat = categorize_edges(edges, format_route_from_metadata);
+
+                let node_detail = all_node_details.get(&node_id);
+
+                let ctx = build_context_string(&NodeContext {
+                    node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
+                    name: node_name.clone(),
+                    file_path: fi.rel_path.clone(),
+                    signature: node_detail.and_then(|n| n.signature.clone()),
+                    code_content: node_detail.map(|n| n.code_content.clone()),
+                    routes: cat.routes,
+                    callees: cat.callees,
+                    callers: cat.callers,
+                    inherits: cat.inherits,
+                    imports: cat.imports,
+                    implements: cat.implements,
+                    exports: cat.exports,
+                    doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
+                });
+
+                update_context_string(db.conn(), node_id, &ctx)?;
+                try_embed_and_store(db, model, node_id, &ctx);
+            }
+        }
+        tx.commit()?;
+    }
 
     Ok(IndexResult {
-        files_indexed: parsed_files.len(),
-        nodes_created,
-        edges_created,
+        files_indexed: all_indexed.len(),
+        nodes_created: total_nodes_created,
+        edges_created: total_edges_created,
     })
 }
 
