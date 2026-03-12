@@ -180,3 +180,90 @@ fn test_e2e_incremental_reindex() {
         .collect();
     assert!(names.contains(&"modified"), "should find modified function, got: {:?}", names);
 }
+
+#[test]
+fn test_e2e_full_protocol_lifecycle() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("app.ts"), r#"
+function greet(name: string): string {
+    return "hello " + name;
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    // 1. initialize
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    let resp = server.handle_message(init).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(parsed["result"]["protocolVersion"], "2024-11-05");
+    assert!(parsed["result"]["capabilities"]["tools"].is_object());
+
+    // 2. notifications/initialized — returns None (no response)
+    let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let resp = server.handle_message(notif).unwrap();
+    assert!(resp.is_none());
+
+    // 3. tools/list — 14 tools
+    let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let tools = parsed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 14);
+
+    // 4. resources/list — 1 resource
+    let msg = r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let resources = parsed["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["uri"], "code-graph://project-summary");
+
+    // 5. prompts/list — 3 prompts
+    let msg = r#"{"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let prompts = parsed["result"]["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 3);
+    let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(names.contains(&"impact-analysis"));
+    assert!(names.contains(&"understand-module"));
+    assert!(names.contains(&"trace-request"));
+
+    // 6. prompts/get for each prompt
+    for (name, arg_name, arg_val, expected_text) in [
+        ("impact-analysis", "symbol_name", "greet", "impact_analysis"),
+        ("understand-module", "path", "app.ts", "module_overview"),
+        ("trace-request", "route", "/api/users", "trace_http_chain"),
+    ] {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "prompts/get",
+            "params": { "name": name, "arguments": { arg_name: arg_val } }
+        }).to_string();
+        let resp = server.handle_message(&msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains(expected_text),
+            "prompt '{}' should mention '{}', got: {}", name, expected_text, text);
+    }
+
+    // 7. resources/read
+    let msg = r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"code-graph://project-summary"}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
+    let summary: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(summary["schema_version"].is_number());
+
+    // 8. tool call — triggers indexing
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "greet"}));
+    let resp = server.handle_message(&search).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result.is_array());
+
+    // 9. ping
+    let msg = r#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(parsed["result"].is_object());
+}
