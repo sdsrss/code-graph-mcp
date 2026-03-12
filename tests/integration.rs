@@ -716,3 +716,68 @@ fn test_batch_indexing_commits_partial_on_many_files() {
         assert_eq!(nodes.len(), 1, "func{} should exist", i);
     }
 }
+
+#[test]
+fn test_camelcase_search_finds_split_tokens() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+    use code_graph_mcp::storage::queries::fts5_search;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    fs::write(
+        project_dir.path().join("auth.ts"),
+        r#"
+function validateAuthToken(token: string): boolean {
+    return jwt.verify(token);
+}
+function handleUserLogin(req: Request) {
+    if (validateAuthToken(req.token)) {
+        return createSession(req.userId);
+    }
+}
+"#,
+    ).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None).unwrap();
+
+    // Searching for "validate" should find "validateAuthToken" via name_tokens splitting
+    let results = fts5_search(db.conn(), "validate", 5).unwrap();
+    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"validateAuthToken"), "FTS5 should find validateAuthToken via token 'validate', got: {:?}", names);
+
+    // Searching for "Login" should find "handleUserLogin"
+    let results = fts5_search(db.conn(), "Login", 5).unwrap();
+    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"handleUserLogin"), "FTS5 should find handleUserLogin via token 'Login', got: {:?}", names);
+}
+
+#[test]
+fn test_type_based_search() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+    use code_graph_mcp::storage::queries::fts5_search;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    fs::write(
+        project_dir.path().join("types.ts"),
+        r#"
+function getUser(id: number): Promise<User> {
+    return db.query(id);
+}
+function processOrder(order: Order): OrderResult {
+    return validate(order);
+}
+"#,
+    ).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None).unwrap();
+
+    // Search by return type should find functions returning that type
+    let results = fts5_search(db.conn(), "OrderResult", 5).unwrap();
+    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"processOrder"), "FTS5 should find processOrder via return type 'OrderResult', got: {:?}", names);
+}
