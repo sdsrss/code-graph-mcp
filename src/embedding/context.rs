@@ -15,11 +15,28 @@ pub struct NodeContext {
 }
 
 pub fn build_context_string(info: &NodeContext) -> String {
-    let mut parts = vec![format!("{} {}", info.node_type, info.name)];
-    parts.push(format!("in {}", info.file_path));
+    let mut parts = Vec::new();
+
+    // 1. Signature (always short, high value)
     if let Some(sig) = &info.signature {
         parts.push(format!("signature: {}", sig));
     }
+
+    // 2. Code content (truncated to fit 512-token budget)
+    if let Some(code) = &info.code_content {
+        parts.push(format!("code: {}", code));
+    }
+
+    // 3. Doc comment
+    if let Some(doc) = &info.doc_comment {
+        parts.push(format!("doc: {}", doc));
+    }
+
+    // 4. Identity: type + name + file
+    parts.push(format!("{} {}", info.node_type, info.name));
+    parts.push(format!("in {}", info.file_path));
+
+    // 5. Graph relations (fill remaining space, truncated last)
     if !info.routes.is_empty() {
         parts.push(format!("routes: {}", info.routes.join(", ")));
     }
@@ -40,12 +57,6 @@ pub fn build_context_string(info: &NodeContext) -> String {
     }
     if !info.exports.is_empty() {
         parts.push(format!("exports: {}", info.exports.join(", ")));
-    }
-    if let Some(doc) = &info.doc_comment {
-        parts.push(format!("doc: {}", doc));
-    }
-    if let Some(code) = &info.code_content {
-        parts.push(format!("code: {}", code));
     }
     parts.join("\n")
 }
@@ -80,6 +91,34 @@ mod tests {
         assert!(ctx.contains("routes: POST /api/login, GET /api/profile"));
         assert!(ctx.contains("imports: jwt, UserRepo"));
         assert!(ctx.contains("code: function validateToken(token: string)"));
+    }
+
+    #[test]
+    fn test_context_string_code_before_graph() {
+        let info = NodeContext {
+            node_type: "function".into(),
+            name: "handler".into(),
+            file_path: "api.ts".into(),
+            signature: Some("(req: Request) -> Response".into()),
+            code_content: Some("function handler(req: Request) { return ok(); }".into()),
+            routes: vec![],
+            callees: vec!["ok".into()],
+            callers: vec!["router".into()],
+            inherits: vec![],
+            imports: vec![],
+            implements: vec![],
+            exports: vec![],
+            doc_comment: Some("Handles requests".into()),
+        };
+        let ctx = build_context_string(&info);
+        let sig_pos = ctx.find("signature:").unwrap();
+        let code_pos = ctx.find("code:").unwrap();
+        let identity_pos = ctx.find("function handler").unwrap();
+        let calls_pos = ctx.find("calls:").unwrap();
+        // Per spec 2.3: signature → code → doc → identity → graph relations
+        assert!(sig_pos < code_pos, "signature before code");
+        assert!(code_pos < identity_pos, "code before identity");
+        assert!(identity_pos < calls_pos, "identity before calls");
     }
 
     #[test]
