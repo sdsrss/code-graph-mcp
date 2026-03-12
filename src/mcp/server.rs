@@ -13,6 +13,17 @@ use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
 use crate::storage::queries;
 
+/// Extract a required string argument, trimming whitespace and rejecting empty values.
+fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    let s = args[key].as_str()
+        .ok_or_else(|| anyhow!("{} is required", key))?
+        .trim();
+    if s.is_empty() {
+        return Err(anyhow!("{} must not be empty", key));
+    }
+    Ok(s)
+}
+
 /// Lock a Mutex, recovering from poison but logging a warning.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
@@ -583,8 +594,7 @@ impl McpServer {
     }
 
     fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let query = args["query"].as_str()
-            .ok_or_else(|| anyhow!("query is required"))?;
+        let query = required_str(args, "query")?;
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
@@ -647,6 +657,10 @@ impl McpServer {
             }
             if let Some(nwf) = nwf_map.remove(&r.node_id) {
                 let node = &nwf.node;
+                // Skip module-level container nodes (no useful content for search)
+                if node.node_type == "module" && node.name == "<module>" {
+                    continue;
+                }
                 // Apply node_type filter
                 if let Some(nt) = node_type_filter {
                     if node.node_type != nt {
@@ -730,8 +744,7 @@ impl McpServer {
     }
 
     fn tool_get_call_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let function_name = args["function_name"].as_str()
-            .ok_or_else(|| anyhow!("function_name is required"))?;
+        let function_name = required_str(args, "function_name")?;
         let direction = args["direction"].as_str().unwrap_or("both");
         let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
@@ -762,7 +775,14 @@ impl McpServer {
                         "candidates": suggestions,
                     }));
                 }
-                FuzzyResolution::NotFound => {}
+                FuzzyResolution::NotFound => {
+                    // Check if the function exists at all (seed node with no edges vs truly not found)
+                    let has_seed = results.iter().any(|n| n.depth == 0);
+                    if !has_seed {
+                        return Err(anyhow!("Function '{}' not found in the index", function_name));
+                    }
+                    // Function exists but has no callers/callees — fall through
+                }
             }
         }
 
@@ -927,13 +947,15 @@ impl McpServer {
     fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let file_path = args["file_path"].as_str()
             .ok_or_else(|| anyhow!("file_path is required"))?;
-        let symbol_name = args["symbol_name"].as_str()
-            .ok_or_else(|| anyhow!("symbol_name is required"))?;
+        let symbol_name = required_str(args, "symbol_name")?;
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
 
         self.ensure_indexed()?;
 
         let nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
+        if nodes.is_empty() {
+            return Err(anyhow!("File '{}' not found in index. Check that the path is relative to the project root and the file has been indexed.", file_path));
+        }
         let node = nodes.iter().find(|n| n.name == symbol_name);
 
         match node {
@@ -979,7 +1001,20 @@ impl McpServer {
 
                 Ok(result)
             }
-            None => Err(anyhow!("Symbol '{}' not found in '{}'", symbol_name, file_path)),
+            None => {
+                // List available symbols to help the user
+                let available: Vec<String> = nodes.iter()
+                    .filter(|n| n.name != "<module>")
+                    .take(10)
+                    .map(|n| format!("{} ({})", n.name, n.node_type))
+                    .collect();
+                let hint = if available.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Available symbols: {}", available.join(", "))
+                };
+                Err(anyhow!("Symbol '{}' not found in '{}'{}", symbol_name, file_path, hint))
+            }
         }
     }
 
@@ -1121,11 +1156,13 @@ impl McpServer {
     fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.ensure_indexed()?;
 
-        let symbol_name = args["symbol_name"].as_str()
-            .ok_or_else(|| anyhow!("Missing symbol_name"))?;
+        let symbol_name = required_str(args, "symbol_name")?;
         let change_type = args.get("change_type")
             .and_then(|v| v.as_str())
             .unwrap_or("behavior");
+        if !matches!(change_type, "signature" | "behavior" | "remove") {
+            return Err(anyhow!("change_type must be one of: signature, behavior, remove"));
+        }
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
             .unwrap_or(3) as i32;

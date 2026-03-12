@@ -733,11 +733,17 @@ pub struct NameCandidate {
 pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Result<Vec<NameCandidate>> {
     let escaped = partial_name.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped);
+
+    // Tokenize input for cross-convention matching (camelCase ↔ snake_case).
+    let tokens_only = crate::search::tokenizer::split_identifier_tokens(partial_name);
+    let token_escaped = tokens_only.replace('%', "\\%").replace('_', "\\_");
+    let token_pattern = format!("%{}%", token_escaped);
+
     let sql =
         "SELECT DISTINCT n.name, f.path, n.type
          FROM nodes n
          JOIN files f ON f.id = n.file_id
-         WHERE n.name LIKE ?1 ESCAPE '\\'
+         WHERE (n.name LIKE ?1 ESCAPE '\\' OR n.name_tokens LIKE ?3 ESCAPE '\\')
            AND n.type IN ('function', 'method')
          ORDER BY
            CASE WHEN n.name = ?2 THEN 0
@@ -747,7 +753,7 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
            LENGTH(n.name)
          LIMIT 10";
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![pattern, partial_name], |row| {
+    let rows = stmt.query_map(rusqlite::params![pattern, partial_name, token_pattern], |row| {
         Ok(NameCandidate {
             name: row.get(0)?,
             file_path: row.get(1)?,
@@ -777,23 +783,23 @@ pub fn get_import_tree(
     direction: &str,
     _max_depth: i32,
 ) -> Result<Vec<FileDependency>> {
-    use crate::domain::REL_IMPORTS;
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
     let mut results = Vec::new();
 
     if direction == "outgoing" || direction == "both" {
-        // Find all files that this file's nodes import from
+        // Find all files that this file depends on (via imports OR cross-file calls)
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT f2.path, COUNT(*) as cnt
+            "SELECT f2.path, COUNT(*) as cnt
              FROM nodes n1
              JOIN files f1 ON f1.id = n1.file_id
-             JOIN edges e ON e.source_id = n1.id AND e.relation = ?1
+             JOIN edges e ON e.source_id = n1.id AND e.relation IN (?1, ?3)
              JOIN nodes n2 ON n2.id = e.target_id
              JOIN files f2 ON f2.id = n2.file_id
              WHERE f1.path = ?2 AND f2.path != ?2
              GROUP BY f2.path
              ORDER BY cnt DESC"
         )?;
-        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path], |row| {
+        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path, REL_CALLS], |row| {
             Ok(FileDependency {
                 file_path: row.get(0)?,
                 direction: "outgoing".into(),
@@ -807,19 +813,19 @@ pub fn get_import_tree(
     }
 
     if direction == "incoming" || direction == "both" {
-        // Find all files whose nodes import from this file
+        // Find all files that depend on this file (via imports OR cross-file calls)
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT f1.path, COUNT(*) as cnt
+            "SELECT f1.path, COUNT(*) as cnt
              FROM nodes n2
              JOIN files f2 ON f2.id = n2.file_id
-             JOIN edges e ON e.target_id = n2.id AND e.relation = ?1
+             JOIN edges e ON e.target_id = n2.id AND e.relation IN (?1, ?3)
              JOIN nodes n1 ON n1.id = e.source_id
              JOIN files f1 ON f1.id = n1.file_id
              WHERE f2.path = ?2 AND f1.path != ?2
              GROUP BY f1.path
              ORDER BY cnt DESC"
         )?;
-        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path], |row| {
+        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path, REL_CALLS], |row| {
             Ok(FileDependency {
                 file_path: row.get(0)?,
                 direction: "incoming".into(),

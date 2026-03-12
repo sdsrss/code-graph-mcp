@@ -7,6 +7,14 @@ fn main() -> Result<()> {
 
     match subcommand {
         Some("serve") | None => run_serve(),
+        Some("--help" | "-h" | "help") => {
+            print_help();
+            Ok(())
+        }
+        Some("--version" | "-V") => {
+            print_version();
+            Ok(())
+        }
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
             let project_root = std::env::current_dir()?;
@@ -27,9 +35,30 @@ fn main() -> Result<()> {
                 "Unknown subcommand: {}. Usage: code-graph-mcp [serve|incremental-index|health-check]",
                 other
             );
+            eprintln!("Run 'code-graph-mcp --help' for more information.");
             std::process::exit(1);
         }
     }
+}
+
+fn print_version() {
+    println!("code-graph-mcp {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn print_help() {
+    print_version();
+    println!("AST-based code graph MCP server with semantic search\n");
+    println!("USAGE:");
+    println!("    code-graph-mcp [COMMAND]\n");
+    println!("COMMANDS:");
+    println!("    serve               Start MCP JSON-RPC server on stdio (default)");
+    println!("    incremental-index   Run incremental index update from CLI");
+    println!("        --quiet         Suppress output");
+    println!("    health-check        Query index status and print results");
+    println!("        --format <FMT>  Output format: oneline (default), json\n");
+    println!("OPTIONS:");
+    println!("    -h, --help          Show this help message");
+    println!("    -V, --version       Show version");
 }
 
 fn run_serve() -> Result<()> {

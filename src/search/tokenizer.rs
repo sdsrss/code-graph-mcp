@@ -51,6 +51,20 @@ pub fn split_identifier(name: &str) -> String {
     result
 }
 
+/// Return only the space-separated tokens without the original identifier appended.
+/// "validateToken" → "validate Token"
+/// "get_user_by_id" → "get user by id"
+/// "hello" → "hello" (single-word: returned as-is)
+pub fn split_identifier_tokens(name: &str) -> String {
+    let full = split_identifier(name);
+    if full == name {
+        // Single-word: split_identifier returned unchanged
+        return full;
+    }
+    // strip the trailing " originalName"
+    full[..full.len() - name.len()].trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
