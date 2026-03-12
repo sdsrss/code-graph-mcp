@@ -312,7 +312,7 @@ fn index_files(
         let mut node_names = Vec::new();
 
         // Synthetic <module> node — anchor for import/export edges
-        let module_node_id = insert_node(db.conn(), &NodeRecord {
+        let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
             file_id,
             node_type: "module".into(),
             name: "<module>".into(),
@@ -329,7 +329,7 @@ fn index_files(
         nodes_created += 1;
 
         for pn in &parsed_nodes {
-            let node_id = insert_node(db.conn(), &NodeRecord {
+            let node_id = insert_node_cached(db.conn(), &NodeRecord {
                 file_id,
                 node_type: pn.node_type.clone(),
                 name: pn.name.clone(),
@@ -408,7 +408,7 @@ fn index_files(
                 for &tgt_id in &target_ids {
                     // Allow self-edges for routes (routes_to maps handler to itself with metadata)
                     if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
-                        && insert_edge(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
                         edges_created += 1;
                     }
                 }
