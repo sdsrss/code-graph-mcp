@@ -2,6 +2,8 @@ use std::fs;
 use tempfile::TempDir;
 
 use code_graph_mcp::mcp::server::McpServer;
+use code_graph_mcp::storage::db::Database;
+use code_graph_mcp::storage::queries::*;
 
 fn tool_call_json(tool_name: &str, args: serde_json::Value) -> String {
     serde_json::json!({
@@ -597,4 +599,35 @@ fn test_e2e_prompts_get_unknown() {
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32602);
     assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown prompt"));
+}
+
+#[test]
+fn test_insert_node_cached_returns_same_as_insert_node() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Database::open(&tmp.path().join("test.db")).unwrap();
+
+    let file_id = upsert_file(db.conn(), &FileRecord {
+        path: "test.ts".into(),
+        blake3_hash: "abc123".into(),
+        last_modified: 0,
+        language: Some("typescript".into()),
+    }).unwrap();
+
+    let id = insert_node_cached(db.conn(), &NodeRecord {
+        file_id,
+        node_type: "function".into(),
+        name: "foo".into(),
+        qualified_name: None,
+        start_line: 1,
+        end_line: 5,
+        code_content: "function foo() {}".into(),
+        signature: Some("foo()".into()),
+        doc_comment: None,
+        context_string: None,
+    }).unwrap();
+
+    assert!(id > 0);
+    let nodes = get_nodes_by_name(db.conn(), "foo").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].id, id);
 }

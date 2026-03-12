@@ -192,6 +192,25 @@ pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     Ok(id)
 }
 
+/// Insert a node using a cached prepared statement for better throughput in loops.
+/// Same semantics as insert_node, but avoids re-preparing the SQL on each call.
+pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         RETURNING id"
+    )?;
+    let id: i64 = stmt.query_row(
+        (
+            node.file_id, &node.node_type, &node.name, &node.qualified_name,
+            node.start_line, node.end_line, &node.code_content,
+            &node.signature, &node.doc_comment, &node.context_string,
+        ),
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
 pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult>> {
     let mut stmt = conn.prepare(
         &format!("SELECT {} FROM nodes WHERE name = ?1", NODE_SELECT)
