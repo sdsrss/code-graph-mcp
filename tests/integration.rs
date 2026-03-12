@@ -320,3 +320,27 @@ fn test_e2e_prompts_get_all() {
             "prompt '{}' message should reference tool '{}', got: {}", name, expected_substr, text);
     }
 }
+
+#[test]
+fn test_e2e_resources_read_unknown_uri() {
+    let project = TempDir::new().unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"code-graph://nonexistent"}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(parsed["error"].is_object());
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown resource URI"));
+}
+
+#[test]
+fn test_e2e_prompts_get_unknown() {
+    let project = TempDir::new().unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"nonexistent-prompt"}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(parsed["error"].is_object());
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown prompt"));
+}
