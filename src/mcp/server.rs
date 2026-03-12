@@ -482,7 +482,8 @@ impl McpServer {
     }
 
     fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
-        match name {
+        let start = std::time::Instant::now();
+        let result = match name {
             "semantic_code_search" => self.tool_semantic_search(args),
             "get_call_graph" => self.tool_get_call_graph(args),
             "find_http_route" => self.tool_find_http_route(args),
@@ -498,7 +499,14 @@ impl McpServer {
             "dependency_graph" => self.tool_dependency_graph(args),
             "find_similar_code" => self.tool_find_similar_code(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
+        };
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 100 {
+            tracing::info!("[tool] {} completed in {:.1}s", name, elapsed.as_secs_f64());
+        } else {
+            tracing::debug!("[tool] {} completed in {}ms", name, elapsed.as_millis());
         }
+        result
     }
 
     fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
