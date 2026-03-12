@@ -23,14 +23,12 @@ pub fn split_identifier(name: &str) -> String {
             continue;
         }
 
-        if c.is_uppercase() {
-            if !current.is_empty() && current.chars().last().map_or(false, |lc| lc.is_lowercase()) {
-                parts.push(std::mem::take(&mut current));
-            } else if !current.is_empty()
-                && current.chars().last().map_or(false, |lc| lc.is_uppercase())
+        if c.is_uppercase() && !current.is_empty() {
+            let last_lower = current.chars().last().is_some_and(|lc| lc.is_lowercase());
+            let acronym_end = current.chars().last().is_some_and(|lc| lc.is_uppercase())
                 && i + 1 < len
-                && chars[i + 1].is_lowercase()
-            {
+                && chars[i + 1].is_lowercase();
+            if last_lower || acronym_end {
                 parts.push(std::mem::take(&mut current));
             }
         }

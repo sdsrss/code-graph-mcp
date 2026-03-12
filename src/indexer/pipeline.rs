@@ -7,6 +7,7 @@ use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, hash_file, scan_directory, scan_directory_cached, DirectoryCache};
 use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
+use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::*;
 use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_FILE_SIZE};
@@ -353,12 +354,16 @@ fn index_files(
                 signature: None,
                 doc_comment: None,
                 context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
             })?;
             node_ids.push(module_node_id);
             node_names.push("<module>".into());
             total_nodes_created += 1;
 
             for pn in &parsed_nodes {
+                let name_tokens = split_identifier(&pn.name);
                 let node_id = insert_node_cached(db.conn(), &NodeRecord {
                     file_id,
                     node_type: pn.node_type.clone(),
@@ -370,6 +375,9 @@ fn index_files(
                     signature: pn.signature.clone(),
                     doc_comment: pn.doc_comment.clone(),
                     context_string: None,
+                    name_tokens: Some(name_tokens),
+                    return_type: pn.return_type.clone(),
+                    param_types: pn.param_types.clone(),
                 })?;
                 node_ids.push(node_id);
                 node_names.push(pn.name.clone());

@@ -174,6 +174,9 @@ mod tests {
             signature: None,
             doc_comment: None,
             context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
         }
     }
 

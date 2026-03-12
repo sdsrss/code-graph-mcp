@@ -55,14 +55,24 @@ impl Database {
             PRAGMA busy_timeout = 5000;
         ")?;
 
-        // Check existing schema version before creating/updating tables
+        // Check existing schema version — migrate if needed, bail only on future versions
         let existing_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if existing_version > 0 && existing_version != schema::SCHEMA_VERSION {
+
+        if existing_version > schema::SCHEMA_VERSION {
             anyhow::bail!(
-                "Database schema version mismatch: found v{}, expected v{}. Please rebuild your index.",
+                "Database schema version v{} is newer than supported v{}. Please update code-graph-mcp.",
                 existing_version,
                 schema::SCHEMA_VERSION
             );
+        }
+
+        if existing_version > 0 && existing_version < schema::SCHEMA_VERSION {
+            // Run migrations before CREATE_TABLES (which uses v2 schema)
+            if existing_version < 2 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v1_to_v2(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(schema::CREATE_TABLES)?;
@@ -119,7 +129,7 @@ mod tests {
         let version: i32 = db.conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, schema::SCHEMA_VERSION);
     }
 
     #[test]

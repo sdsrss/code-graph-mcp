@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -21,33 +21,37 @@ CREATE TABLE IF NOT EXISTS nodes (
     code_content TEXT NOT NULL,
     signature   TEXT,
     doc_comment TEXT,
-    context_string TEXT
+    context_string TEXT,
+    name_tokens TEXT,
+    return_type TEXT,
+    param_types TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 
--- FTS5 virtual table
+-- FTS5 virtual table (v2: includes name_tokens, return_type, param_types)
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name, qualified_name, code_content, context_string, doc_comment,
+    name_tokens, return_type, param_types,
     content='nodes', content_rowid='id'
 );
 
--- FTS5 sync triggers
+-- FTS5 sync triggers (v2: include new columns)
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment)
-    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment);
+    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
 END;
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment);
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
 END;
 CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment);
-    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment)
-    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment);
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
 END;
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -65,6 +69,54 @@ CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
 CREATE INDEX IF NOT EXISTS idx_edges_source_rel ON edges(source_id, relation);
 CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
 "#;
+
+/// Migrate from schema v1 to v2. Must be called within a transaction.
+pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v1 → v2: adding name_tokens, return_type, param_types");
+
+    conn.execute_batch(
+        "ALTER TABLE nodes ADD COLUMN name_tokens TEXT;
+         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+         ALTER TABLE nodes ADD COLUMN param_types TEXT;"
+    )?;
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS nodes_ai;
+         DROP TRIGGER IF EXISTS nodes_ad;
+         DROP TRIGGER IF EXISTS nodes_au;
+         DROP TABLE IF EXISTS nodes_fts;"
+    )?;
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+            name, qualified_name, code_content, context_string, doc_comment,
+            name_tokens, return_type, param_types,
+            content='nodes', content_rowid='id'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+        END;"
+    )?;
+
+    conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
+
+    conn.pragma_update(None, "user_version", 2)?;
+
+    tracing::info!("[schema] Migration complete. Re-index recommended for full type extraction.");
+    Ok(())
+}
 
 pub fn create_vec_tables_sql() -> String {
     format!(

@@ -13,11 +13,11 @@ pub type EdgeInfo = (String, String, String, Option<String>);
 // --- Shared helpers ---
 
 const NODE_SELECT: &str =
-    "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string";
+    "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types";
 
 /// NODE_SELECT with `n.` table alias prefix on every column (for JOINs).
 const NODE_SELECT_ALIASED: &str =
-    "n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line, n.code_content, n.signature, n.doc_comment, n.context_string";
+    "n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line, n.code_content, n.signature, n.doc_comment, n.context_string, n.name_tokens, n.return_type, n.param_types";
 
 fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
     Ok(NodeResult {
@@ -32,6 +32,9 @@ fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
         signature: row.get(8)?,
         doc_comment: row.get(9)?,
         context_string: row.get(10)?,
+        name_tokens: row.get(11)?,
+        return_type: row.get(12)?,
+        param_types: row.get(13)?,
     })
 }
 
@@ -112,6 +115,9 @@ pub struct NodeRecord {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub context_string: Option<String>,
+    pub name_tokens: Option<String>,
+    pub return_type: Option<String>,
+    pub param_types: Option<String>,
 }
 
 pub struct NodeResult {
@@ -126,6 +132,9 @@ pub struct NodeResult {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub context_string: Option<String>,
+    pub name_tokens: Option<String>,
+    pub return_type: Option<String>,
+    pub param_types: Option<String>,
 }
 
 // --- Edge records ---
@@ -179,13 +188,14 @@ pub fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>>
 
 pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     let id: i64 = conn.query_row(
-        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          RETURNING id",
         (
             node.file_id, &node.node_type, &node.name, &node.qualified_name,
             node.start_line, node.end_line, &node.code_content,
             &node.signature, &node.doc_comment, &node.context_string,
+            &node.name_tokens, &node.return_type, &node.param_types,
         ),
         |row| row.get(0),
     )?;
@@ -196,8 +206,8 @@ pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
 /// Same semantics as insert_node, but avoids re-preparing the SQL on each call.
 pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          RETURNING id"
     )?;
     let id: i64 = stmt.query_row(
@@ -205,6 +215,7 @@ pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
             node.file_id, &node.node_type, &node.name, &node.qualified_name,
             node.start_line, node.end_line, &node.code_content,
             &node.signature, &node.doc_comment, &node.context_string,
+            &node.name_tokens, &node.return_type, &node.param_types,
         ),
         |row| row.get(0),
     )?;
@@ -515,8 +526,8 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(NodeWithFile {
                 node: map_node_row(row)?,
-                file_path: row.get(11)?,
-                language: row.get(12)?,
+                file_path: row.get(14)?,
+                language: row.get(15)?,
             })
         })?;
         for row in rows {
@@ -768,9 +779,8 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
     }
     let sql = format!(
         "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1
-         -- BM25 field weights: name(10), qualified_name(5), code_content(1), context_string(3), doc_comment(2)
-         -- Higher weight = matches in that field rank higher
-         ORDER BY bm25(nodes_fts, 10.0, 5.0, 1.0, 3.0, 2.0) LIMIT ?2",
+         -- BM25 weights: name(5), qualified_name(3), code_content(2), context_string(2), doc_comment(1), name_tokens(5), return_type(1), param_types(1)
+         ORDER BY bm25(nodes_fts, 5.0, 3.0, 2.0, 2.0, 1.0, 5.0, 1.0, 1.0) LIMIT ?2",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -856,6 +866,9 @@ mod tests {
             signature: Some("(req, res) -> void".into()),
             doc_comment: None,
             context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
         };
         let node_id = insert_node(db.conn(), &node).unwrap();
         assert!(node_id > 0);
@@ -876,12 +889,14 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn a(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
         let n2 = insert_node(db.conn(), &NodeRecord {
             file_id: fid, node_type: "function".into(), name: "b".into(),
             qualified_name: None, start_line: 6, end_line: 10,
             code_content: "fn b(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
 
         insert_edge(db.conn(), n1, n2, "calls", None).unwrap();
@@ -908,6 +923,7 @@ mod tests {
             code_content: "function validateToken(token) { jwt.verify(token); }".into(),
             signature: None, doc_comment: None,
             context_string: Some("validates JWT authentication token".into()),
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
 
         let results = fts5_search(db.conn(), "authentication token", 5).unwrap();
@@ -979,6 +995,7 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn foo(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
 
         update_context_string(db.conn(), nid, "function foo\ncalls: bar, baz").unwrap();
@@ -1009,18 +1026,21 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn alpha(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
         insert_node(conn, &NodeRecord {
             file_id: fid2, node_type: "function".into(), name: "beta".into(),
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn beta(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
         insert_node(conn, &NodeRecord {
             file_id: fid3, node_type: "function".into(), name: "gamma".into(),
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn gamma(){}".into(), signature: None,
             doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None,
         }).unwrap();
 
         // Exclude 2 files → only 3rd file's node remains

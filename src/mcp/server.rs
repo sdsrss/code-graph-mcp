@@ -551,7 +551,7 @@ impl McpServer {
             };
 
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
-        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 60, fetch_count as usize, 1.5, 1.0);
+        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, 1.0, 1.2);
 
         // Batch-fetch all candidate nodes with file info (single query instead of N+1)
         let candidate_ids: Vec<i64> = fused.iter().map(|r| r.node_id).collect();
@@ -606,6 +606,9 @@ impl McpServer {
                     signature: node.signature.clone(),
                     doc_comment: node.doc_comment.clone(),
                     context_string: node.context_string.clone(),
+                    name_tokens: node.name_tokens.clone(),
+                    return_type: node.return_type.clone(),
+                    param_types: node.param_types.clone(),
                 });
                 file_paths.push(nwf.file_path.clone());
             }
@@ -1271,7 +1274,7 @@ mod tests {
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["files_count"], 1);
-        assert_eq!(result["schema_version"], 1);
+        assert_eq!(result["schema_version"], 2);
     }
 
     #[test]
