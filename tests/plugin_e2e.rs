@@ -182,3 +182,125 @@ function handleLogin(req: Request) {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[test]
+fn test_stdio_protocol_endpoints() {
+    let project = TempDir::new().unwrap();
+    let mut child = spawn_server(project.path());
+    let mut stdin = child.stdin.take().unwrap();
+    let rx = spawn_reader(child.stdout.take().unwrap());
+
+    // Initialize
+    send(&mut stdin, &initialize_msg());
+    let _ = read_with_timeout(&rx, TIMEOUT).unwrap();
+
+    // resources/list
+    send(&mut stdin, &jsonrpc_request(2, "resources/list", serde_json::json!({})));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to resources/list");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let resources = parsed["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["uri"], "code-graph://project-summary");
+
+    // resources/read
+    send(&mut stdin, &jsonrpc_request(3, "resources/read",
+        serde_json::json!({"uri": "code-graph://project-summary"})));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to resources/read");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
+    let summary: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(summary["schema_version"].is_number());
+
+    // prompts/list
+    send(&mut stdin, &jsonrpc_request(4, "prompts/list", serde_json::json!({})));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to prompts/list");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let prompts = parsed["result"]["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 3);
+
+    // prompts/get
+    send(&mut stdin, &jsonrpc_request(5, "prompts/get", serde_json::json!({
+        "name": "impact-analysis",
+        "arguments": { "symbol_name": "foo" }
+    })));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to prompts/get");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let text = parsed["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("foo"));
+    assert!(text.contains("impact_analysis"));
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn test_stdio_malformed_input() {
+    let project = TempDir::new().unwrap();
+    let mut child = spawn_server(project.path());
+    let mut stdin = child.stdin.take().unwrap();
+    let rx = spawn_reader(child.stdout.take().unwrap());
+
+    // Send malformed JSON
+    send(&mut stdin, "this is not valid json{{{");
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to malformed input");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert!(parsed["error"].is_object());
+    assert_eq!(parsed["error"]["code"], -32700, "expected parse error code");
+
+    // Verify process still works after error
+    send(&mut stdin, &initialize_msg());
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("process should still respond after parse error");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(parsed["result"]["protocolVersion"], "2024-11-05");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn test_stdio_graceful_eof() {
+    let project = TempDir::new().unwrap();
+    let mut child = spawn_server(project.path());
+
+    // Immediately drop stdin to send EOF
+    drop(child.stdin.take());
+
+    // Wait for process to exit with timeout
+    let (tx, rx) = mpsc::channel();
+    let mut child_for_thread = child;
+    std::thread::spawn(move || {
+        let status = child_for_thread.wait();
+        let _ = tx.send(status);
+    });
+
+    let status = rx.recv_timeout(Duration::from_secs(5))
+        .expect("process should exit within 5 seconds on EOF")
+        .expect("wait should succeed");
+
+    assert!(status.success(), "process should exit cleanly on EOF, got: {:?}", status);
+}
+
+#[test]
+fn test_stdio_unknown_tool() {
+    let project = TempDir::new().unwrap();
+    let mut child = spawn_server(project.path());
+    let mut stdin = child.stdin.take().unwrap();
+    let rx = spawn_reader(child.stdout.take().unwrap());
+
+    send(&mut stdin, &initialize_msg());
+    let _ = read_with_timeout(&rx, TIMEOUT).unwrap();
+
+    // Call nonexistent tool
+    send(&mut stdin, &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})));
+    let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to unknown tool");
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+    // Server wraps unknown tool in MCP content with isError: true
+    assert!(parsed["result"]["isError"].as_bool().unwrap_or(false),
+        "unknown tool should have isError: true");
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Error"), "should contain error message, got: {}", text);
+
+    drop(stdin);
+    let _ = child.wait();
+}
