@@ -15,6 +15,8 @@ pub struct ParsedNode {
     pub code_content: String,
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
+    pub return_type: Option<String>,
+    pub param_types: Option<String>,
 }
 
 thread_local! {
@@ -83,6 +85,7 @@ fn extract_nodes(
                 // C/C++: name is in declarator child, not name field
                 if let Some(declarator) = node.child_by_field_name("declarator") {
                     if let Some(name) = extract_declarator_name(&declarator, source) {
+                        let sig_info = extract_c_signature_info(&node, source);
                         results.push(ParsedNode {
                             node_type: "function".into(),
                             name: name.clone(),
@@ -90,8 +93,10 @@ fn extract_nodes(
                             start_line: node.start_position().row as u32 + 1,
                             end_line: node.end_position().row as u32 + 1,
                             code_content: truncate_code_content(node_text(&node, source)).into_owned(),
-                            signature: extract_c_signature(&node, source),
+                            signature: sig_info.signature,
                             doc_comment: get_preceding_comment(&node, source),
+                            return_type: sig_info.return_type,
+                            param_types: sig_info.param_types,
                         });
                     }
                 }
@@ -129,6 +134,8 @@ fn extract_nodes(
                     code_content: truncate_code_content(node_text(&node, source)).into_owned(),
                     signature: None,
                     doc_comment: get_preceding_comment(&node, source),
+                    return_type: None,
+                    param_types: None,
                 });
                 extract_children(node, source, language, Some(&name), results, depth);
                 return;
@@ -199,6 +206,8 @@ fn extract_nodes(
                                 code_content: truncate_code_content(node_text(&child, source)).into_owned(),
                                 signature: None,
                                 doc_comment: get_preceding_comment(&child, source),
+                                return_type: None,
+                                param_types: None,
                             });
                         }
                     }
@@ -278,6 +287,8 @@ fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, sou
         code_content: truncate_code_content(node_text(node, source)).into_owned(),
         signature: None,
         doc_comment: get_preceding_comment(node, source),
+        return_type: None,
+        param_types: None,
     }
 }
 
@@ -292,7 +303,7 @@ fn extract_function_node(
         Some(cls) => Some(format!("{}.{}", cls, name)),
         None => Some(name.clone()),
     };
-    let signature = extract_signature(node, source);
+    let sig_info = extract_signature_info(node, source);
 
     Some(ParsedNode {
         node_type: node_type.into(),
@@ -301,8 +312,10 @@ fn extract_function_node(
         start_line: node.start_position().row as u32 + 1,
         end_line: node.end_position().row as u32 + 1,
         code_content: truncate_code_content(node_text(node, source)).into_owned(),
-        signature,
+        signature: sig_info.signature,
         doc_comment: get_preceding_comment(node, source),
+        return_type: sig_info.return_type,
+        param_types: sig_info.param_types,
     })
 }
 
@@ -317,6 +330,7 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
             let name = get_child_by_field(&child, "name", source)?;
             let value = child.child_by_field_name("value")?;
             if value.kind() == "arrow_function" {
+                let sig_info = extract_signature_info(&value, source);
                 return Some(ParsedNode {
                     node_type: "function".into(),
                     name: name.clone(),
@@ -324,8 +338,10 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
                     start_line: node.start_position().row as u32 + 1,
                     end_line: node.end_position().row as u32 + 1,
                     code_content: truncate_code_content(node_text(node, source)).into_owned(),
-                    signature: extract_signature(&value, source),
+                    signature: sig_info.signature,
                     doc_comment: get_preceding_comment(node, source),
+                    return_type: sig_info.return_type,
+                    param_types: sig_info.param_types,
                 });
             }
         }
@@ -333,31 +349,52 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
     None
 }
 
-fn extract_signature(node: &tree_sitter::Node, source: &str) -> Option<String> {
+struct SignatureInfo {
+    signature: Option<String>,
+    return_type: Option<String>,
+    param_types: Option<String>,
+}
+
+fn extract_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureInfo {
     let params = node.child_by_field_name("parameters")
         .map(|p| node_text(&p, source).to_string());
     let ret = node.child_by_field_name("return_type")
         .map(|r| node_text(&r, source).to_string());
 
-    match (params, ret) {
+    let signature = match (&params, &ret) {
         (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
-        (Some(p), None) => Some(p),
+        (Some(p), None) => Some(p.clone()),
         _ => None,
+    };
+
+    SignatureInfo {
+        signature,
+        return_type: ret,
+        param_types: params,
     }
 }
 
-fn extract_c_signature(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let declarator = node.child_by_field_name("declarator")?;
+fn extract_c_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureInfo {
+    let declarator = match node.child_by_field_name("declarator") {
+        Some(d) => d,
+        None => return SignatureInfo { signature: None, return_type: None, param_types: None },
+    };
     let params = declarator.child_by_field_name("parameters")
         .map(|p| node_text(&p, source).to_string());
     let ret_type = node.child_by_field_name("type")
         .map(|t| node_text(&t, source).to_string());
 
-    match (ret_type, params) {
+    let signature = match (&ret_type, &params) {
         (Some(t), Some(p)) => Some(format!("{} {}", t, p)),
-        (Some(t), None) => Some(t),
-        (None, Some(p)) => Some(p),
+        (Some(t), None) => Some(t.clone()),
+        (None, Some(p)) => Some(p.clone()),
         _ => None,
+    };
+
+    SignatureInfo {
+        signature,
+        return_type: ret_type,
+        param_types: params,
     }
 }
 
@@ -558,5 +595,32 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"fetch_data"), "got: {:?}", names);
         assert!(names.contains(&"get"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_typescript_return_type_extraction() {
+        let code = r#"
+function greet(name: string): string {
+    return "hello " + name;
+}
+
+function noReturn(x: number) {
+    console.log(x);
+}
+"#;
+        let nodes = parse_code(code, "typescript").unwrap();
+        let greet = nodes.iter().find(|n| n.name == "greet").unwrap();
+        assert_eq!(greet.return_type.as_deref(), Some(": string"));
+
+        let no_ret = nodes.iter().find(|n| n.name == "noReturn").unwrap();
+        assert!(no_ret.return_type.is_none());
+    }
+
+    #[test]
+    fn test_typescript_param_types_extraction() {
+        let code = "function add(a: number, b: number): number { return a + b; }";
+        let nodes = parse_code(code, "typescript").unwrap();
+        let add = nodes.iter().find(|n| n.name == "add").unwrap();
+        assert!(add.param_types.as_ref().unwrap().contains("number"));
     }
 }
