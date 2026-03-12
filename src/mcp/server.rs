@@ -153,11 +153,7 @@ impl McpServer {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
-                let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
-                let (_result, new_cache) = run_incremental_index_cached(
-                    &self.db, &project_root, model, cache.as_ref()
-                )?;
-                *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
+                self.run_incremental_with_cache_restore(&project_root, model)?;
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
                 let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
@@ -165,11 +161,7 @@ impl McpServer {
                     // No watcher active — debounce to avoid rescanning on every tool call
                     let mut last_check = lock_or_recover(&self.last_incremental_check, "last_incremental_check");
                     if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
-                        let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
-                        let (_result, new_cache) = run_incremental_index_cached(
-                            &self.db, &project_root, model, cache.as_ref()
-                        )?;
-                        *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
+                        self.run_incremental_with_cache_restore(&project_root, model)?;
                         *last_check = std::time::Instant::now();
                     }
                 }
@@ -177,6 +169,26 @@ impl McpServer {
             }
         }
         Ok(())
+    }
+
+    /// Run incremental index with cache snapshot/restore on failure.
+    fn run_incremental_with_cache_restore(&self, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<()> {
+        let mut cache_guard = lock_or_recover(&self.dir_cache, "dir_cache");
+        let cache_snapshot = cache_guard.clone();
+        let cache = cache_guard.take();
+        drop(cache_guard); // Release lock during I/O
+
+        match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref()) {
+            Ok((_result, new_cache)) => {
+                *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Incremental index failed, restoring cache: {}", e);
+                *lock_or_recover(&self.dir_cache, "dir_cache") = cache_snapshot;
+                Err(e)
+            }
+        }
     }
 
     /// Drain all pending events from the watcher receiver.
