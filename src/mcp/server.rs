@@ -1224,7 +1224,7 @@ mod tests {
         let resp = server.handle_message(req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tools = parsed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), crate::mcp::tools::TOOL_COUNT);
     }
 
     #[test]

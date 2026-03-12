@@ -204,12 +204,12 @@ function greet(name: string): string {
     let resp = server.handle_message(notif).unwrap();
     assert!(resp.is_none());
 
-    // 3. tools/list — 14 tools
+    // 3. tools/list
     let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
     let resp = server.handle_message(msg).unwrap().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let tools = parsed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), code_graph_mcp::mcp::tools::TOOL_COUNT);
 
     // 4. resources/list — 1 resource
     let msg = r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#;

@@ -1,6 +1,9 @@
 use super::types::ToolDefinition;
 use serde_json::json;
 
+/// Expected tool count — update this when adding/removing tools.
+pub const TOOL_COUNT: usize = 14;
+
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
 }
@@ -213,7 +216,7 @@ mod tests {
         assert!(names.contains(&"module_overview"));
         assert!(names.contains(&"dependency_graph"));
         assert!(names.contains(&"find_similar_code"));
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), TOOL_COUNT);
     }
 
     #[test]
