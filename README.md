@@ -4,14 +4,16 @@ A high-performance code knowledge graph server implementing the [Model Context P
 
 ## Features
 
-- **Multi-language parsing** — Tree-sitter based AST extraction for TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
+- **Multi-language parsing** — Tree-sitter AST extraction for TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
 - **Semantic code search** — Hybrid BM25 full-text + vector semantic search with Reciprocal Rank Fusion (RRF), powered by sqlite-vec
 - **Call graph traversal** — Recursive CTE queries to trace callers/callees with cycle detection
 - **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go)
+- **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
 - **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates
-- **Context compression** — Token-aware snippet extraction for LLM context windows
+- **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview)
 - **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`)
-- **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, and other MCP clients
+- **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, Windsurf, and other MCP clients
+- **Claude Code Plugin** — First-class plugin with slash commands (`/understand`, `/trace`, `/impact`), agents, skills, auto-indexing hooks, StatusLine integration, and self-updating
 
 ## Why code-graph-mcp?
 
@@ -23,7 +25,7 @@ BLAKE3 Merkle tree tracks every file's content hash. On re-index, only changed f
 
 ### Hybrid Search, Not Just Grep
 
-Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-vec) via **Reciprocal Rank Fusion (RRF)** — so searching "handle user login" finds the right function even if it's named `authenticate_session`. Results are auto-compressed to fit LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview).
+Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-vec) via **Reciprocal Rank Fusion (RRF)** — so searching "handle user login" finds the right function even if it's named `authenticate_session`. Results are auto-compressed to fit LLM context windows.
 
 ### Scope-Aware Relation Extraction
 
@@ -58,15 +60,31 @@ src/
 
 ## Installation
 
-### Option 1: Claude Code (Recommended)
+### Option 1: Claude Code Plugin (Recommended)
 
-One-command setup — registers as an MCP server directly in Claude Code:
+Install as a Claude Code plugin for the best experience — includes slash commands, agents, skills, auto-indexing hooks, StatusLine health display, and automatic updates:
+
+```bash
+claude plugin install --url https://raw.githubusercontent.com/sdsrss/code-graph-mcp/main/claude-plugin/marketplace.json
+```
+
+What you get:
+- **MCP Server** — All code-graph tools available to Claude
+- **Slash Commands** — `/understand <module>`, `/trace <route>`, `/impact <symbol>`
+- **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
+- **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
+- **StatusLine** — Real-time health display (nodes, files, watch status) — compatible with other plugins' StatusLine via composite multiplexer
+- **Auto-update** — Checks for new versions every 24h, updates silently
+
+### Option 2: Claude Code MCP Server Only
+
+Register as an MCP server without the plugin features:
 
 ```bash
 claude mcp add code-graph-mcp -- npx -y @sdsrs/code-graph
 ```
 
-### Option 2: Cursor / Windsurf / Other MCP Clients
+### Option 3: Cursor / Windsurf / Other MCP Clients
 
 Add to your MCP settings file (e.g. `~/.cursor/mcp.json`):
 
@@ -81,7 +99,7 @@ Add to your MCP settings file (e.g. `~/.cursor/mcp.json`):
 }
 ```
 
-### Option 3: npx (No Install)
+### Option 4: npx (No Install)
 
 Run directly without installing:
 
@@ -89,7 +107,7 @@ Run directly without installing:
 npx -y @sdsrs/code-graph
 ```
 
-### Option 4: npm (Global Install)
+### Option 5: npm (Global Install)
 
 Install globally, then run anywhere:
 
@@ -100,7 +118,19 @@ code-graph-mcp
 
 ## Uninstallation
 
-### Claude Code
+### Claude Code Plugin
+
+```bash
+claude plugin uninstall code-graph
+```
+
+To also clean up all config and cache data:
+
+```bash
+node ~/.claude/plugins/cache/sdsrss/code-graph/*/scripts/lifecycle.js uninstall
+```
+
+### Claude Code MCP Server
 
 ```bash
 claude mcp remove code-graph-mcp
@@ -115,6 +145,47 @@ Remove the `code-graph` entry from your MCP settings file (e.g. `~/.cursor/mcp.j
 ```bash
 npm uninstall -g @sdsrs/code-graph
 ```
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `semantic_code_search` | Hybrid BM25 + vector + graph search for AST nodes |
+| `get_call_graph` | Trace upstream/downstream call chains for a function |
+| `find_http_route` | Map route path to backend handler function |
+| `trace_http_chain` | Full request flow: route → handler → downstream call chain |
+| `impact_analysis` | Analyze the blast radius of changing a symbol |
+| `module_overview` | High-level overview of a module's structure and exports |
+| `dependency_graph` | Visualize dependency relationships between modules |
+| `find_similar_code` | Find code snippets similar to a given pattern |
+| `get_ast_node` | Extract a specific code symbol from a file |
+| `read_snippet` | Read original code snippet by node ID with context |
+| `start_watch` / `stop_watch` | Start/stop file system watcher for incremental indexing |
+| `get_index_status` | Query index status and health |
+| `rebuild_index` | Force full index rebuild |
+
+## Plugin Slash Commands
+
+Available when installed as a Claude Code plugin:
+
+| Command | Description |
+|---------|-------------|
+| `/understand <module>` | Deep dive into a module or file's architecture and relationships |
+| `/trace <route>` | Trace a full HTTP request flow from route to data layer |
+| `/impact <symbol>` | Analyze the impact scope of changing a symbol before modifying it |
+
+## Supported Languages
+
+TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
+
+## Storage
+
+Uses SQLite with:
+- FTS5 for full-text search
+- sqlite-vec extension for vector similarity search
+- Merkle tree hashes for incremental change detection
+
+Data is stored in `.code-graph/index.db` under the project root (auto-created, gitignored).
 
 ## Build from Source
 
@@ -146,33 +217,6 @@ Add the compiled binary to your MCP settings:
   }
 }
 ```
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `semantic_code_search` | Hybrid BM25 + vector + graph search for AST nodes |
-| `get_call_graph` | Trace upstream/downstream call chains for a function |
-| `find_http_route` | Map route path to backend handler function |
-| `trace_http_chain` | Full request flow: route → handler → downstream call chain |
-| `get_ast_node` | Extract a specific code symbol from a file |
-| `read_snippet` | Read original code snippet by node ID with context |
-| `start_watch` / `stop_watch` | Start/stop file system watcher for incremental indexing |
-| `get_index_status` | Query index status and health |
-| `rebuild_index` | Force full index rebuild |
-
-## Supported Languages
-
-TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
-
-## Storage
-
-Uses SQLite with:
-- FTS5 for full-text search
-- sqlite-vec extension for vector similarity search
-- Merkle tree hashes for incremental change detection
-
-Data is stored in `.code-graph/index.db` under the project root (auto-created, gitignored).
 
 ## Development
 
