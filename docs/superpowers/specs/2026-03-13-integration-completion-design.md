@@ -11,32 +11,36 @@
 ### Current State
 - `claude-plugin/scripts/statusline.js` exists, outputs: `code-graph: ✓ 1247 nodes | 42 files | watching`
 - No auto-registration — user must manually configure `~/.claude/settings.json`
+- GSD plugin currently occupies the global `statusLine` singleton
 
 ### Design
-Add a SessionStart hook script that auto-registers the StatusLine in `~/.claude/settings.json`.
+
+**Approach: Composable StatusLine** — since `statusLine` is a global singleton and GSD already occupies it, we compose code-graph status into the existing statusline rather than competing for the slot.
 
 **New file**: `claude-plugin/scripts/session-init.js`
 
-Behavior:
-1. Read `~/.claude/settings.json`
-2. Check if `statusLine` is absent or already points to code-graph
-3. If absent: write code-graph statusline config
-4. If already set to another plugin: skip (don't overwrite)
-5. Atomic write (temp file + rename)
+Session-init.js responsibilities:
+1. **Health check**: Run `code-graph-mcp health-check --format oneline` and output to stdout (preserves existing SessionStart behavior)
+2. **StatusLine composition**: Check `~/.claude/settings.json`:
+   - If `statusLine` is absent → register code-graph statusline
+   - If `statusLine` already points to code-graph → no-op (idempotent)
+   - If `statusLine` points to another plugin (e.g., GSD) → inject code-graph status into that script by writing a wrapper, OR skip and rely on the health-check output
+3. **One-time registration**: Use a marker file `~/.cache/code-graph/statusline-registered` to avoid re-checking every session. Only attempt registration on first run or when marker is missing.
 
-StatusLine config to write:
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "node \"/path/to/claude-plugin/scripts/statusline.js\""
-  }
-}
+**Practical self-use approach**: Since both GSD and code-graph are self-controlled, the simplest path is to modify `statusline.js` to be callable as a module, then have the GSD statusline script import and append code-graph status. For open-source, fall back to "register if slot is empty, skip if occupied."
+
+**Health check in session-init.js** (explicit):
+```javascript
+const { execSync } = require('child_process');
+try {
+  const output = execSync('code-graph-mcp health-check --format oneline', {
+    timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+  }).toString().trim();
+  process.stdout.write(output);
+} catch { /* silently ignore */ }
 ```
 
-Path resolution: use `__dirname` relative path from session-init.js to statusline.js.
-
-**Modify**: `claude-plugin/hooks/hooks.json` — replace existing SessionStart health-check with session-init.js (which does health-check + statusline registration).
+**Modify**: `claude-plugin/hooks/hooks.json` — replace existing SessionStart health-check with session-init.js.
 
 ```json
 "SessionStart": [
@@ -46,15 +50,17 @@ Path resolution: use `__dirname` relative path from session-init.js to statuslin
       "command": "node /path/to/claude-plugin/scripts/session-init.js",
       "timeout": 5
     }],
-    "description": "Register StatusLine and verify index health at session start"
+    "description": "Health check and StatusLine registration at session start"
   }
 ]
 ```
 
 ### Acceptance Criteria
-- [ ] StatusLine shows `code-graph: ✓ N nodes | M files | watching` after session start
+- [ ] StatusLine shows code-graph status (standalone or composed with GSD)
+- [ ] Health check output appears in session start log
 - [ ] Does not overwrite non-code-graph statusline configs
 - [ ] Idempotent — running twice produces same result
+- [ ] No file corruption risk (one-time registration with marker file, not every-session write)
 
 ---
 
@@ -67,7 +73,8 @@ Path resolution: use `__dirname` relative path from session-init.js to statuslin
 
 ### Design
 1. **Sync all local versions to 0.4.2** (match Cargo.toml as source of truth):
-   - `package.json` → 0.4.2
+   - `Cargo.toml` → 0.4.2 (already correct)
+   - `package.json` → 0.4.2 (version + optionalDependencies)
    - `npm/linux-x64/package.json` → 0.4.2
    - `npm/linux-arm64/package.json` → 0.4.2
    - `npm/darwin-x64/package.json` → 0.4.2
@@ -78,23 +85,47 @@ Path resolution: use `__dirname` relative path from session-init.js to statuslin
 2. **Add version bump helper script** `scripts/bump-version.sh`:
    ```bash
    #!/bin/bash
-   # Usage: ./scripts/bump-version.sh 0.5.0
-   VERSION=$1
+   set -euo pipefail
+   VERSION=${1:?Usage: bump-version.sh <version>}
+
    # Update Cargo.toml
    sed -i "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
-   # Update all package.json files
-   npm version $VERSION --no-git-tag-version --allow-same-version
+
+   # Regenerate Cargo.lock
+   cargo update -p code-graph-mcp
+
+   # Update root package.json version
+   npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+   # Update optionalDependencies in root package.json
+   node -e "
+     const pkg = require('./package.json');
+     for (const key of Object.keys(pkg.optionalDependencies || {})) {
+       pkg.optionalDependencies[key] = '$VERSION';
+     }
+     require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+   "
+
+   # Update platform package.json files (subshell to avoid cd issues)
    for pkg in npm/*/package.json; do
-     cd $(dirname $pkg) && npm version $VERSION --no-git-tag-version --allow-same-version && cd ../..
+     (cd "$(dirname "$pkg")" && npm version "$VERSION" --no-git-tag-version --allow-same-version)
    done
+
    # Update plugin.json
-   node -e "const f='claude-plugin/.claude-plugin/plugin.json';const p=require('./'+f);p.version='$VERSION';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+   node -e "
+     const f = 'claude-plugin/.claude-plugin/plugin.json';
+     const p = JSON.parse(require('fs').readFileSync(f, 'utf8'));
+     p.version = '$VERSION';
+     require('fs').writeFileSync(f, JSON.stringify(p, null, 2) + '\n');
+   "
+
+   echo "All versions updated to $VERSION"
    ```
 
-3. **Release flow**: `./scripts/bump-version.sh 0.5.0 && git commit && git tag v0.5.0 && git push --tags`
+3. **Release flow**: `./scripts/bump-version.sh 0.5.0 && git add -A && git commit -m "chore: bump to 0.5.0" && git tag v0.5.0 && git push && git push --tags`
 
 ### Acceptance Criteria
-- [ ] All version numbers consistent across all files
+- [ ] All version numbers consistent across all 8 files (Cargo.toml, Cargo.lock, package.json, 5x npm/*/package.json, plugin.json)
 - [ ] `git tag v0.4.2 && git push --tags` triggers successful CI release
 - [ ] npm packages published with correct version
 - [ ] GitHub Release created with binaries
@@ -109,7 +140,7 @@ Path resolution: use `__dirname` relative path from session-init.js to statuslin
 - npm distribution exists (`@sdsrs/code-graph`)
 
 ### Design
-Integrate auto-update check into the SessionStart hook (`session-init.js`):
+Integrate auto-update check into `session-init.js`:
 
 1. On session start, check current installed version vs latest GitHub Release
 2. If newer version available, print update notice to stderr (visible but non-blocking)
@@ -117,88 +148,133 @@ Integrate auto-update check into the SessionStart hook (`session-init.js`):
 
 **Implementation in session-init.js**:
 ```javascript
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+
 async function checkUpdate() {
-  const currentVersion = require('../.claude-plugin/plugin.json').version;
-  // Fetch latest release from GitHub API (with 2s timeout)
-  const res = await fetch('https://api.github.com/repos/sdsrss/code-graph-mcp/releases/latest', {
-    signal: AbortSignal.timeout(2000)
-  });
-  const latest = (await res.json()).tag_name.replace('v', '');
-  if (latest !== currentVersion) {
-    process.stderr.write(`[code-graph] Update available: ${currentVersion} → ${latest}. Run: npx @sdsrs/code-graph@latest\n`);
-  }
+  const pluginJson = path.join(__dirname, '..', '.claude-plugin', 'plugin.json');
+  const currentVersion = JSON.parse(fs.readFileSync(pluginJson, 'utf8')).version;
+
+  // Rate limiting: check once per 24h
+  const cacheDir = path.join(os.homedir(), '.cache', 'code-graph');
+  const cacheFile = path.join(cacheDir, 'update-check');
+  try {
+    const stat = fs.statSync(cacheFile);
+    if (Date.now() - stat.mtimeMs < 86400000) return; // < 24h, skip
+  } catch { /* file doesn't exist, proceed */ }
+
+  try {
+    const res = await fetch(
+      'https://api.github.com/repos/sdsrss/code-graph-mcp/releases/latest',
+      { signal: AbortSignal.timeout(2000) }
+    );
+    if (!res.ok) return; // rate-limited or error, silently skip
+    const data = await res.json();
+    if (!data.tag_name) return;
+
+    const latest = data.tag_name.replace(/^v/, '');
+
+    // Semver comparison (X.Y.Z only, no pre-release)
+    const toNum = (v) => v.split('.').map(Number);
+    const [lM, lm, lp] = toNum(latest);
+    const [cM, cm, cp] = toNum(currentVersion);
+    const isNewer = lM > cM || (lM === cM && lm > cm) || (lM === cM && lm === cm && lp > cp);
+
+    if (isNewer) {
+      process.stderr.write(
+        `[code-graph] Update available: ${currentVersion} → ${latest}. ` +
+        `Run: npx @sdsrs/code-graph@latest\n`
+      );
+    }
+
+    // Update cache timestamp
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(cacheFile, new Date().toISOString());
+  } catch { /* network failure, silently ignore */ }
 }
 ```
 
-**Rate limiting**: Cache last check timestamp in `/tmp/code-graph-update-check`. Only check once per 24 hours.
-
 ### Acceptance Criteria
-- [ ] Update notification appears when newer version exists
-- [ ] No notification when up-to-date
-- [ ] Check cached for 24h (no spam)
+- [ ] Update notification appears when newer version exists on GitHub Releases
+- [ ] No notification when up-to-date or when local version is newer (dev mode)
+- [ ] Check cached for 24h in `~/.cache/code-graph/update-check` (no spam)
 - [ ] Network failure silently ignored (no error output)
+- [ ] GitHub API 403/404 silently ignored
 
 ---
 
 ## P2: End-to-End Validation
 
 ### Current State
-- Unit tests exist for individual modules
+- Unit tests exist for individual modules (`cargo test`)
+- Integration tests exist in `tests/integration.rs`
 - No systematic end-to-end validation of the full plugin experience
 
 ### Design
 Dogfood: use code-graph to index itself, then systematically validate all integration points.
 
-**Validation script**: `scripts/e2e-validate.sh`
+### Test Harness Approach
+Use a Node.js script (`scripts/e2e-validate.js`) that:
+1. Spawns `code-graph-mcp serve` as a child process (stdio pipes)
+2. Sends MCP `initialize` request + `initialized` notification
+3. Sends `tools/call` requests for each tool
+4. Validates response structure (has `content`, no `error`)
+5. Kills process on completion
 
-#### Phase 1: Index & Health
+This reuses the same JSON-RPC over stdio protocol that Claude Code uses.
+
+#### Phase 1: CLI Health
 ```bash
 code-graph-mcp health-check --format json  # Should show node/file counts
 code-graph-mcp incremental-index --quiet    # Should complete without error
 ```
 
 #### Phase 2: All 14 Tools via MCP
-Use a test harness that sends JSON-RPC requests to the MCP server on stdio.
-Test each tool with a real query against the code-graph-mcp codebase itself:
+Test each tool against the code-graph-mcp codebase itself:
 
-| Tool | Test Query |
-|------|------------|
-| semantic_code_search | "handle tool call" |
-| get_call_graph | symbol="handle_call_tool", direction="both" |
-| find_http_route | Not applicable (no HTTP routes in Rust MCP) — skip |
-| trace_http_chain | Skip (same reason) |
-| get_ast_node | file_path="src/mcp/server.rs", symbol_name="McpServer" |
-| read_snippet | Use node_id from previous get_ast_node result |
-| impact_analysis | symbol_name="handle_call_tool" |
-| module_overview | path="src/mcp" |
-| dependency_graph | file_path="src/mcp/server.rs" |
-| find_similar_code | symbol_name="compress_if_needed" |
-| start_watch | Start watcher |
-| stop_watch | Stop watcher |
-| get_index_status | Query status |
-| rebuild_index | Force rebuild |
+| Tool | Test Query | Skip? |
+|------|------------|-------|
+| semantic_code_search | "handle tool call" | |
+| get_call_graph | symbol="handle_call_tool", direction="both" | |
+| find_http_route | route="/api/test" | Expected: no result (no HTTP routes in Rust) |
+| trace_http_chain | route="/api/test" | Expected: no result |
+| get_ast_node | file_path="src/mcp/server.rs", symbol_name="McpServer" | |
+| read_snippet | Use node_id from previous result | |
+| impact_analysis | symbol_name="handle_call_tool" | |
+| module_overview | path="src/mcp" | |
+| dependency_graph | file_path="src/mcp/server.rs" | |
+| find_similar_code | symbol_name="compress_if_needed" | |
+| start_watch | Start watcher | |
+| stop_watch | Stop watcher | |
+| get_index_status | Query status | |
+| rebuild_index | Force rebuild | |
 
-#### Phase 3: Hooks Validation
+Note: `find_http_route` and `trace_http_chain` are tested with expected-empty results. Full HTTP tool validation deferred to a separate test with a Go/TS fixture project.
+
+#### Phase 3: Hooks Validation (Manual)
 1. Start a Claude Code session in the project
 2. Edit a file → verify `PostToolUse` hook triggers incremental-index
-3. Verify SessionStart hook runs health-check + statusline registration
+3. Verify SessionStart hook runs health-check
 
-#### Phase 4: Commands Validation
-Test /impact, /trace, /understand commands manually in a Claude Code session.
+#### Phase 4: Commands Validation (Manual)
+Test /impact, /trace, /understand commands in a Claude Code session.
 
 #### Phase 5: Token Efficiency Spot Check
-For 3 representative queries, measure response size in tokens:
-- semantic_code_search result size
-- get_call_graph result size
-- impact_analysis result size
-Compare with equivalent Grep+Read approach (estimated).
+For 3 representative queries, measure JSON response byte size as proxy for token cost (bytes / 4 ≈ tokens):
+- semantic_code_search result
+- get_call_graph result
+- impact_analysis result
+
+Compare with equivalent Grep+Read approach (estimated by grep output byte size).
 
 ### Acceptance Criteria
-- [ ] All non-HTTP tools return valid results on self-indexed codebase
-- [ ] Hooks trigger correctly on file edits
-- [ ] StatusLine displays after session start
-- [ ] Commands produce useful structured output
-- [ ] Token efficiency: tool results < 2000 tokens per call on average
+- [ ] CLI health-check and incremental-index succeed
+- [ ] All 14 tools return valid JSON-RPC responses (no errors)
+- [ ] HTTP tools gracefully handle no-match case
+- [ ] Hooks trigger correctly on file edits (manual verification)
+- [ ] Commands produce useful structured output (manual verification)
+- [ ] Token efficiency: tool results < 2000 tokens per call on average (measured by bytes/4)
 
 ---
 
@@ -220,10 +296,15 @@ Tag & Release is the final step after P2 passes.
 
 | Action | File |
 |--------|------|
-| Create | `claude-plugin/scripts/session-init.js` |
-| Modify | `claude-plugin/hooks/hooks.json` |
-| Modify | `claude-plugin/.claude-plugin/plugin.json` (version) |
-| Modify | `package.json` (version) |
-| Modify | `npm/*/package.json` (version, 5 files) |
+| Create | `claude-plugin/scripts/session-init.js` (health check + statusline registration + update check) |
+| Modify | `claude-plugin/hooks/hooks.json` (SessionStart → session-init.js) |
+| Modify | `claude-plugin/.claude-plugin/plugin.json` (version → 0.4.2) |
+| Modify | `package.json` (version + optionalDependencies → 0.4.2) |
+| Modify | `npm/linux-x64/package.json` (version → 0.4.2) |
+| Modify | `npm/linux-arm64/package.json` (version → 0.4.2) |
+| Modify | `npm/darwin-x64/package.json` (version → 0.4.2) |
+| Modify | `npm/darwin-arm64/package.json` (version → 0.4.2) |
+| Modify | `npm/win32-x64/package.json` (version → 0.4.2) |
+| Modify | `Cargo.lock` (regenerated by cargo update) |
 | Create | `scripts/bump-version.sh` |
-| Create | `scripts/e2e-validate.sh` |
+| Create | `scripts/e2e-validate.js` (Node.js MCP test harness) |
