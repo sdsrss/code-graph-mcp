@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, hash_file, scan_directory, scan_directory_cached, DirectoryCache};
@@ -35,21 +37,19 @@ fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
     name.to_string()
 }
 
-fn try_embed_and_store(db: &Database, model: Option<&EmbeddingModel>, node_id: i64, ctx: &str) {
-    if let Some(m) = model {
-        if db.vec_enabled() {
-            match m.embed(ctx) {
-                Ok(embedding) => {
-                    if let Err(e) = insert_node_vector(db.conn(), node_id, &embedding) {
-                        tracing::warn!("Failed to insert vector for node {}: {}", node_id, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to embed node {}: {}", node_id, e);
-                }
-            }
+/// Embed context strings and batch-insert vectors into the database.
+fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
+    let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+    for (node_id, ctx) in context_updates {
+        match model.embed(ctx) {
+            Ok(embedding) => vectors.push((*node_id, embedding)),
+            Err(e) => tracing::warn!("Failed to embed node {}: {}", node_id, e),
         }
     }
+    if !vectors.is_empty() {
+        insert_node_vectors_batch(db.conn(), &vectors)?;
+    }
+    Ok(())
 }
 
 struct CategorizedEdges {
@@ -208,6 +208,8 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
         nwfs.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path))).collect()
     };
 
+    // Build all context strings first
+    let mut context_updates: Vec<(i64, String)> = Vec::with_capacity(dirty_ids.len());
     for &node_id in dirty_ids {
         if let Some((node, file_path)) = all_nodes.get(&node_id) {
             let edges = all_edges.get(&node_id);
@@ -229,10 +231,20 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
                 doc_comment: node.doc_comment.clone(),
             });
 
-            update_context_string(db.conn(), node_id, &ctx)?;
-            try_embed_and_store(db, model, node_id, &ctx);
+            context_updates.push((node_id, ctx));
         }
     }
+
+    // Batch update context strings
+    update_context_strings_batch(db.conn(), &context_updates)?;
+
+    // Batch embed and store vectors
+    if let Some(m) = model {
+        if db.vec_enabled() {
+            embed_and_store_batch(db, m, &context_updates)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -275,6 +287,17 @@ fn index_files(
         tx.commit()?;
     }
 
+    // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
+    struct FilePreParsed {
+        rel_path: String,
+        source: String,
+        language: String,
+        tree: tree_sitter::Tree,
+        hash: String,
+        last_modified: i64,
+        parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+    }
+
     // Heavyweight per-file data used during Phase 1+2, dropped after each batch
     struct FileParsed {
         rel_path: String,
@@ -290,60 +313,80 @@ fn index_files(
     for batch in files.chunks(BATCH_SIZE) {
         let tx = db.conn().unchecked_transaction()?;
 
+        // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
+        let pre_parsed: Vec<FilePreParsed> = batch
+            .par_iter()
+            .filter_map(|rel_path| {
+                let language = detect_language(rel_path)?;
+                let abs_path = root.join(rel_path);
+
+                let file_meta = std::fs::metadata(&abs_path).ok();
+                if let Some(ref meta) = file_meta {
+                    if meta.len() > MAX_FILE_SIZE {
+                        tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                        return None;
+                    }
+                }
+
+                let source = match std::fs::read_to_string(&abs_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Skipping file {}: {}", rel_path, e);
+                        return None;
+                    }
+                };
+
+                let hash = match hashes.get(rel_path.as_str()) {
+                    Some(h) => h.clone(),
+                    None => match hash_file(&abs_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!("Skipping file (hash error): {}: {}", rel_path, e);
+                            return None;
+                        }
+                    },
+                };
+
+                let tree = match parse_tree(&source, language) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                        return None;
+                    }
+                };
+
+                let last_modified = file_meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+
+                Some(FilePreParsed {
+                    rel_path: rel_path.clone(),
+                    source,
+                    language: language.to_string(),
+                    tree,
+                    hash,
+                    last_modified,
+                    parsed_nodes,
+                })
+            })
+            .collect();
+
         let mut batch_parsed: Vec<FileParsed> = Vec::new();
 
-        // --- Phase 1: Parse + insert nodes ---
-        for rel_path in batch {
-            let abs_path = root.join(rel_path);
-            let language = match detect_language(rel_path) {
-                Some(lang) => lang,
-                None => continue,
-            };
-
-            let hash = match hashes.get(rel_path.as_str()) {
-                Some(h) => h.clone(),
-                None => hash_file(&abs_path)?,
-            };
-
-            let file_meta = std::fs::metadata(&abs_path).ok();
-            if let Some(ref meta) = file_meta {
-                if meta.len() > MAX_FILE_SIZE {
-                    tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
-                    continue;
-                }
-            }
-
-            let source = match std::fs::read_to_string(&abs_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Skipping file {}: {}", rel_path, e);
-                    continue;
-                }
-            };
-
-            let tree = match parse_tree(&source, language) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Parse failed for {}: {}", rel_path, e);
-                    continue;
-                }
-            };
-
-            let last_modified = file_meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+        // --- Phase 1b: Sequential DB inserts ---
+        for pp in pre_parsed {
             let file_id = upsert_file(db.conn(), &FileRecord {
-                path: rel_path.clone(),
-                blake3_hash: hash,
-                last_modified,
-                language: Some(language.to_string()),
+                path: pp.rel_path.clone(),
+                blake3_hash: pp.hash,
+                last_modified: pp.last_modified,
+                language: Some(pp.language.clone()),
             })?;
 
             delete_nodes_by_file(db.conn(), file_id)?;
-
-            let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
 
             let mut node_ids = Vec::new();
             let mut node_names = Vec::new();
@@ -352,9 +395,9 @@ fn index_files(
                 file_id,
                 node_type: "module".into(),
                 name: "<module>".into(),
-                qualified_name: Some(rel_path.clone()),
+                qualified_name: Some(pp.rel_path.clone()),
                 start_line: 1,
-                end_line: source.lines().count() as i64,
+                end_line: pp.source.lines().count() as i64,
                 code_content: String::new(),
                 signature: None,
                 doc_comment: None,
@@ -367,7 +410,7 @@ fn index_files(
             node_names.push("<module>".into());
             total_nodes_created += 1;
 
-            for pn in &parsed_nodes {
+            for pn in &pp.parsed_nodes {
                 let name_tokens = split_identifier(&pn.name);
                 let node_id = insert_node_cached(db.conn(), &NodeRecord {
                     file_id,
@@ -390,10 +433,10 @@ fn index_files(
             }
 
             batch_parsed.push(FileParsed {
-                rel_path: rel_path.clone(),
-                source,
-                language: language.to_string(),
-                tree,
+                rel_path: pp.rel_path,
+                source: pp.source,
+                language: pp.language,
+                tree: pp.tree,
                 file_id,
                 node_ids,
                 node_names,
@@ -493,12 +536,13 @@ fn index_files(
             nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
         };
 
+        // Phase 3a: Build all context strings (CPU-bound, can be parallelized later)
+        let mut context_updates: Vec<(i64, String)> = Vec::with_capacity(all_node_ids.len());
         for fi in &all_indexed {
             for (idx, &node_id) in fi.node_ids.iter().enumerate() {
                 let node_name = &fi.node_names[idx];
                 let edges = all_edges.get(&node_id);
                 let cat = categorize_edges(edges, format_route_from_metadata);
-
                 let node_detail = all_node_details.get(&node_id);
 
                 let ctx = build_context_string(&NodeContext {
@@ -517,15 +561,30 @@ fn index_files(
                     doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
                 });
 
-                update_context_string(db.conn(), node_id, &ctx)?;
-                try_embed_and_store(db, model, node_id, &ctx);
+                context_updates.push((node_id, ctx));
             }
         }
+
+        // Phase 3b: Batch update context strings in DB
+        update_context_strings_batch(db.conn(), &context_updates)?;
+
+        // Phase 3c: Batch embed and store vectors
+        if let Some(m) = model {
+            if db.vec_enabled() {
+                embed_and_store_batch(db, m, &context_updates)?;
+            }
+        }
+
         tracing::info!(
             "[index] Phase 3: context strings built for {} nodes",
             all_node_ids.len()
         );
         tx.commit()?;
+    }
+
+    // Optimize query planner statistics after bulk writes
+    if !all_indexed.is_empty() {
+        let _ = db.run_optimize();
     }
 
     Ok(IndexResult {

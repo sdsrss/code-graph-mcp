@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::SystemTime;
 use anyhow::Result;
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 
 use crate::utils::config::detect_language;
 
@@ -28,7 +29,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
 }
 
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
-    let mut hashes = HashMap::new();
+    // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
         .hidden(true)       // skip hidden files
         .git_ignore(true)   // respect .gitignore
@@ -36,6 +37,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         .git_exclude(true)
         .build();
 
+    let mut file_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -44,25 +46,36 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
-            // Skip .git files and .gitignore
             if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
                 continue;
             }
-            // Only hash files with supported language extensions
+            if rel_str.starts_with("vendor/") || rel_str.starts_with("vendor\\") {
+                continue;
+            }
             if detect_language(&rel_str).is_none() {
                 continue;
             }
-            let hash = match hash_file(path) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
-                    continue;
-                }
-            };
-            hashes.insert(rel_str, hash);
+            file_paths.push((rel_str, path.to_path_buf()));
         }
     }
-    Ok(hashes)
+
+    Ok(hash_files_parallel(&file_paths))
+}
+
+/// Hash a list of (relative_path, absolute_path) pairs in parallel using rayon.
+fn hash_files_parallel(files: &[(String, std::path::PathBuf)]) -> HashMap<String, String> {
+    files
+        .par_iter()
+        .filter_map(|(rel_str, path)| {
+            match hash_file(path) {
+                Ok(h) => Some((rel_str.clone(), h)),
+                Err(e) => {
+                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Cache of directory and file modification times for skipping unchanged subtrees.
@@ -121,9 +134,10 @@ pub fn scan_directory_cached(
     // Root always considered changed
     changed_dirs.insert(String::new());
 
-    // Pass 2: hash files in changed directories, and check file mtime in unchanged directories.
+    // Pass 2: collect files that need hashing, then hash in parallel.
     // Directory mtime only changes on file add/remove (not content edits on ext4/btrfs),
     // so we also check individual file mtimes to catch content modifications.
+    let mut files_to_hash: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in &entries {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
@@ -132,6 +146,9 @@ pub fn scan_directory_cached(
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
             if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
+                continue;
+            }
+            if rel_str.starts_with("vendor/") || rel_str.starts_with("vendor\\") {
                 continue;
             }
             if detect_language(&rel_str).is_none() {
@@ -160,16 +177,12 @@ pub fn scan_directory_cached(
                 }
             }
 
-            let hash = match hash_file(path) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
-                    continue;
-                }
-            };
-            hashes.insert(rel_str, hash);
+            files_to_hash.push((rel_str, path.to_path_buf()));
         }
     }
+
+    // Hash files in parallel
+    hashes.extend(hash_files_parallel(&files_to_hash));
 
     Ok((hashes, new_cache))
 }

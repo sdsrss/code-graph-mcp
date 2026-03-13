@@ -14,6 +14,7 @@ rusqlite = { version = "0.38", features = ["bundled-full"] }
 libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 blake3 = "1"
 ignore = "0.4"
+rayon = "1"
 notify = "6"
 tracing = "0.1"
 tracing-subscriber = "0.3"

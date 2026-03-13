@@ -245,6 +245,17 @@ pub fn update_context_string(conn: &Connection, node_id: i64, context_string: &s
     Ok(())
 }
 
+/// Batch update context strings using a single prepared statement.
+pub fn update_context_strings_batch(conn: &Connection, updates: &[(i64, String)]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE nodes SET context_string = ?1 WHERE id = ?2"
+    )?;
+    for (node_id, ctx) in updates {
+        stmt.execute((ctx.as_str(), node_id))?;
+    }
+    Ok(())
+}
+
 // --- Edge CRUD ---
 
 /// Insert an edge, ignoring duplicates. Returns true if a new row was actually inserted.
@@ -401,6 +412,18 @@ pub fn insert_node_vector(conn: &Connection, node_id: i64, embedding: &[f32]) ->
         "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
         rusqlite::params![node_id, bytes],
     )?;
+    Ok(())
+}
+
+/// Batch insert vectors using a single prepared statement.
+pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES (?1, ?2)"
+    )?;
+    for (node_id, embedding) in vectors {
+        let bytes: &[u8] = bytemuck::cast_slice(embedding);
+        stmt.execute(rusqlite::params![node_id, bytes])?;
+    }
     Ok(())
 }
 
@@ -844,12 +867,14 @@ pub fn get_import_tree(
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
-    // Sanitize FTS5 query: quote each token to prevent FTS5 operator injection
+    // Sanitize FTS5 query: quote each token to prevent FTS5 operator injection.
+    // Use OR semantics so multi-word queries match documents containing ANY term
+    // (BM25 naturally ranks documents matching more terms higher).
     let sanitized: String = query
         .split_whitespace()
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" OR ");
     // Empty/whitespace-only queries would cause FTS5 MATCH error
     if sanitized.is_empty() {
         return Ok(vec![]);

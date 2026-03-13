@@ -278,6 +278,17 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String>
                 Some(node_text(&function, source).to_string())
             }
         }
+        "scoped_identifier" => {
+            // Rust: Self::method(), Module::func(), std::collections::HashMap::new()
+            // Extract the rightmost name component (the actual function being called)
+            function.child_by_field_name("name")
+                .map(|n| node_text(&n, source).to_string())
+        }
+        "selector_expression" => {
+            // Go: receiver.Method(), http.HandleFunc(), etc.
+            function.child_by_field_name("field")
+                .map(|n| node_text(&n, source).to_string())
+        }
         _ => None, // Unknown callee expression — skip to avoid noise in call graph
     }
 }
@@ -685,22 +696,42 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
         .trim_matches(|c| c == '\'' || c == '"')
         .to_string();
 
-    // Last named argument is the handler — only use if it's an identifier
+    // Last named argument is the handler
     let handler_count = args.named_child_count();
     if handler_count < 2 { return None; }
     let handler_arg = args.named_child(handler_count - 1)?;
-    // Skip inline functions (arrow_function, function) — they don't resolve to graph nodes
-    if handler_arg.kind() != "identifier" { return None; }
-    let handler_name = node_text(&handler_arg, source).to_string();
 
-    let metadata = serde_json::json!({"method": http_method, "path": path}).to_string();
-
-    Some(ParsedRelation {
-        source_name: handler_name.clone(),
-        target_name: handler_name,
-        relation: REL_ROUTES_TO.into(),
-        metadata: Some(metadata),
-    })
+    if handler_arg.kind() == "identifier" {
+        // Named handler reference: router.post('/path', handlerFn)
+        let handler_name = node_text(&handler_arg, source).to_string();
+        let metadata = serde_json::json!({"method": http_method, "path": path}).to_string();
+        Some(ParsedRelation {
+            source_name: handler_name.clone(),
+            target_name: handler_name,
+            relation: REL_ROUTES_TO.into(),
+            metadata: Some(metadata),
+        })
+    } else if matches!(handler_arg.kind(), "arrow_function" | "function_expression" | "function") {
+        // Inline handler: router.post('/path', async (req, res) => { ... })
+        // Link to the <module> node so find_http_route can locate the file and handler lines
+        let handler_start = handler_arg.start_position().row + 1;
+        let handler_end = handler_arg.end_position().row + 1;
+        let metadata = serde_json::json!({
+            "method": http_method,
+            "path": path,
+            "inline": true,
+            "handler_start_line": handler_start,
+            "handler_end_line": handler_end,
+        }).to_string();
+        Some(ParsedRelation {
+            source_name: "<module>".into(),
+            target_name: "<module>".into(),
+            relation: REL_ROUTES_TO.into(),
+            metadata: Some(metadata),
+        })
+    } else {
+        None
+    }
 }
 
 fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
@@ -869,6 +900,28 @@ app.get('/api/users/:id', getUser);
             .collect();
         assert!(routes.iter().any(|(meta, target)| meta.contains("/api/login") && *target == "handleLogin"),
             "got routes: {:?}", routes);
+    }
+
+    #[test]
+    fn test_extract_express_inline_arrow_routes() {
+        let code = r#"
+router.post('/api/login', async (req, res) => {
+    const valid = validateCredentials(req.body.email);
+    res.json({ token: 'ok' });
+});
+router.get('/api/users/:id', authMiddleware, async (req, res) => {
+    res.json(user);
+});
+"#;
+        let relations = extract_relations(code, "typescript").unwrap();
+        let routes: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
+            .collect();
+        assert!(routes.iter().any(|(meta, _target)| meta.contains("/api/login") && meta.contains("\"inline\":true")),
+            "should detect inline arrow handler route, got: {:?}", routes);
+        assert!(routes.iter().any(|(meta, _target)| meta.contains("/api/users/:id")),
+            "should detect multi-arg inline route, got: {:?}", routes);
     }
 
     #[test]
@@ -1125,5 +1178,53 @@ func main() {
             .collect();
         assert!(exports.contains(&"handleLogin"), "got exports: {:?}", exports);
         assert!(exports.contains(&"AuthService"), "got exports: {:?}", exports);
+    }
+
+    #[test]
+    fn test_go_selector_call_relations() {
+        // Go receiver.Method() calls should be extracted
+        let code = r#"
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("hello")
+    http.HandleFunc("/", handler)
+}
+"#;
+        let relations = extract_relations(code, "go").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(calls.contains(&("main", "Println")),
+            "fmt.Println() should create call relation, got: {:?}", calls);
+        assert!(calls.contains(&("main", "HandleFunc")),
+            "http.HandleFunc() should create call relation, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_rust_scoped_call_relations() {
+        // Self::method() and Path::func() should be extracted as call relations
+        let code = r#"
+impl Database {
+    fn open() {
+        Self::open_impl(false);
+    }
+    fn open_impl(flag: bool) {
+        HashMap::new();
+    }
+}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(calls.contains(&("open", "open_impl")),
+            "Self::open_impl() should create call relation, got: {:?}", calls);
+        assert!(calls.contains(&("open_impl", "new")),
+            "HashMap::new() should create call relation, got: {:?}", calls);
     }
 }

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -59,10 +59,10 @@ CREATE TABLE IF NOT EXISTS edges (
     source_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     target_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     relation    TEXT NOT NULL,
-    metadata    TEXT,
-    UNIQUE(source_id, target_id, relation)
+    metadata    TEXT
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
@@ -115,6 +115,36 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.pragma_update(None, "user_version", 2)?;
 
     tracing::info!("[schema] Migration complete. Re-index recommended for full type extraction.");
+    Ok(())
+}
+
+/// Migrate from schema v2 to v3. Must be called within a transaction.
+/// Changes edges UNIQUE constraint to include metadata (enables multiple route edges per file).
+pub fn migrate_v2_to_v3(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v2 → v3: updating edges unique constraint to include metadata");
+
+    // SQLite requires recreating the table to change constraints
+    conn.execute_batch(
+        "CREATE TABLE edges_new (
+            id          INTEGER PRIMARY KEY,
+            source_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            target_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            relation    TEXT NOT NULL,
+            metadata    TEXT
+        );
+        INSERT INTO edges_new SELECT * FROM edges;
+        DROP TABLE edges;
+        ALTER TABLE edges_new RENAME TO edges;
+        CREATE UNIQUE INDEX idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
+        CREATE INDEX idx_edges_source ON edges(source_id);
+        CREATE INDEX idx_edges_target ON edges(target_id);
+        CREATE INDEX idx_edges_relation ON edges(relation);
+        CREATE INDEX idx_edges_source_rel ON edges(source_id, relation);
+        CREATE INDEX idx_edges_target_rel ON edges(target_id, relation);"
+    )?;
+
+    conn.pragma_update(None, "user_version", 3)?;
+    tracing::info!("[schema] Migration v2→v3 complete.");
     Ok(())
 }
 

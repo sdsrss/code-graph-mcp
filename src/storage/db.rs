@@ -67,10 +67,15 @@ impl Database {
         }
 
         if existing_version > 0 && existing_version < schema::SCHEMA_VERSION {
-            // Run migrations before CREATE_TABLES (which uses v2 schema)
+            // Run migrations sequentially
             if existing_version < 2 {
                 let tx = conn.unchecked_transaction()?;
                 schema::migrate_v1_to_v2(&conn)?;
+                tx.commit()?;
+            }
+            if existing_version < 3 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v2_to_v3(&conn)?;
                 tx.commit()?;
             }
         }
@@ -92,6 +97,12 @@ impl Database {
 
     pub fn vec_enabled(&self) -> bool {
         self.vec_enabled
+    }
+
+    /// Run PRAGMA optimize to rebuild query planner statistics after bulk writes.
+    pub fn run_optimize(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        Ok(())
     }
 }
 
