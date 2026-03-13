@@ -24,6 +24,54 @@ fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     Ok(s)
 }
 
+/// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
+/// If no method prefix, returns (None, original_path).
+fn parse_route_input(input: &str) -> (Option<String>, &str) {
+    let trimmed = input.trim();
+    if let Some(space_idx) = trimmed.find(' ') {
+        let prefix = &trimmed[..space_idx];
+        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "USE"];
+        if methods.contains(&prefix.to_uppercase().as_str()) {
+            return (Some(prefix.to_uppercase()), trimmed[space_idx..].trim());
+        }
+    }
+    (None, trimmed)
+}
+
+/// Filter route matches by HTTP method from metadata JSON.
+fn filter_routes_by_method(rows: &mut Vec<queries::RouteMatch>, method: &Option<String>) {
+    if let Some(method) = method {
+        rows.retain(|r| {
+            r.metadata.as_ref().map_or(false, |m| {
+                serde_json::from_str::<serde_json::Value>(m).ok()
+                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                    .map_or(false, |rm| rm == *method)
+            })
+        });
+    }
+}
+
+/// For inline handlers, override handler_name and start/end lines from metadata.
+fn apply_inline_handler_metadata(handler: &mut serde_json::Value, metadata: Option<&str>) {
+    if let Some(meta_str) = metadata {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+            if meta.get("inline").and_then(|v| v.as_bool()).unwrap_or(false) {
+                handler["handler_name"] = json!(format!(
+                    "{} {} (inline)",
+                    meta.get("method").and_then(|v| v.as_str()).unwrap_or("?"),
+                    meta.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+                ));
+                if let Some(sl) = meta.get("handler_start_line").and_then(|v| v.as_i64()) {
+                    handler["start_line"] = json!(sl);
+                }
+                if let Some(el) = meta.get("handler_end_line").and_then(|v| v.as_i64()) {
+                    handler["end_line"] = json!(el);
+                }
+            }
+        }
+    }
+}
+
 /// Lock a Mutex, recovering from poison but logging a warning.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
@@ -744,7 +792,10 @@ impl McpServer {
     }
 
     fn tool_get_call_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let function_name = required_str(args, "function_name")?;
+        // Accept both "symbol_name" (canonical) and "function_name" (legacy alias)
+        let function_name = args["symbol_name"].as_str()
+            .or_else(|| args["function_name"].as_str())
+            .ok_or_else(|| anyhow!("symbol_name is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
         let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
@@ -833,14 +884,18 @@ impl McpServer {
     }
 
     fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let route_path = args["route_path"].as_str()
+        let route_path_raw = args["route_path"].as_str()
             .ok_or_else(|| anyhow!("route_path is required"))?;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
 
         self.ensure_indexed()?;
 
+        // Strip HTTP method prefix if present (e.g., "GET /api/users" → "/api/users")
+        let (method_filter, route_path) = parse_route_input(route_path_raw);
+
         use crate::domain::{REL_CALLS, REL_ROUTES_TO};
-        let rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
+        let mut rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
+        filter_routes_by_method(&mut rows, &method_filter);
 
         let mut handlers: Vec<serde_json::Value> = Vec::new();
         for rm in &rows {
@@ -853,6 +908,8 @@ impl McpServer {
                 "start_line": rm.start_line,
                 "end_line": rm.end_line,
             });
+
+            apply_inline_handler_metadata(&mut handler, rm.metadata.as_deref());
 
             if include_middleware {
                 let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
@@ -869,15 +926,18 @@ impl McpServer {
     }
 
     fn tool_trace_http_chain(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let route_path = args["route_path"].as_str()
+        let route_path_raw = args["route_path"].as_str()
             .ok_or_else(|| anyhow!("route_path is required"))?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
 
         self.ensure_indexed()?;
 
+        let (method_filter, route_path) = parse_route_input(route_path_raw);
+
         use crate::domain::{REL_CALLS, REL_ROUTES_TO};
-        let rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
+        let mut rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
+        filter_routes_by_method(&mut rows, &method_filter);
 
         let mut handlers: Vec<serde_json::Value> = Vec::new();
         for rm in &rows {
@@ -890,6 +950,8 @@ impl McpServer {
                 "start_line": rm.start_line,
                 "end_line": rm.end_line,
             });
+
+            apply_inline_handler_metadata(&mut handler, rm.metadata.as_deref());
 
             if include_middleware {
                 let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
@@ -1194,7 +1256,19 @@ impl McpServer {
                         "candidates": suggestions,
                     }));
                 }
-                FuzzyResolution::NotFound => {}
+                FuzzyResolution::NotFound => {
+                    return Ok(json!({
+                        "symbol": symbol_name,
+                        "change_type": change_type,
+                        "direct_callers": [],
+                        "transitive_callers": [],
+                        "affected_routes": [],
+                        "affected_files": 0,
+                        "risk_level": "UNKNOWN",
+                        "warning": format!("Symbol '{}' not found in index. Cannot assess impact.", symbol_name),
+                        "summary": format!("Symbol '{}' not found in the codebase index", symbol_name)
+                    }));
+                }
             }
         }
 
@@ -1236,8 +1310,11 @@ impl McpServer {
     fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.ensure_indexed()?;
 
-        let path = args["path"].as_str()
+        let raw_path = args["path"].as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+        // Normalize: strip leading "./" and treat "." as empty prefix (match all)
+        let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
+        let path = if path == "." { "" } else { path };
 
         let exports = queries::get_module_exports(self.db.conn(), path)?;
 
@@ -1288,6 +1365,18 @@ impl McpServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(2) as i32;
 
+        // Check if file exists in index
+        let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
+        if file_nodes.is_empty() {
+            return Ok(json!({
+                "file": file_path,
+                "depends_on": [],
+                "depended_by": [],
+                "warning": format!("File '{}' not found in index. Check path is relative to project root.", file_path),
+                "summary": format!("File '{}' not found in index", file_path)
+            }));
+        }
+
         let deps = queries::get_import_tree(self.db.conn(), file_path, direction, depth)?;
 
         let outgoing: Vec<serde_json::Value> = deps.iter()
@@ -1319,8 +1408,16 @@ impl McpServer {
     fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.ensure_indexed()?;
 
-        let node_id = args["node_id"].as_i64()
-            .ok_or_else(|| anyhow!("Missing node_id"))?;
+        // Accept node_id directly, or resolve from symbol_name
+        let node_id = if let Some(id) = args["node_id"].as_i64() {
+            id
+        } else if let Some(name) = args["symbol_name"].as_str() {
+            self.db.conn()
+                .query_row("SELECT id FROM nodes WHERE name = ?1 LIMIT 1", [name], |row| row.get(0))
+                .map_err(|_| anyhow!("Symbol '{}' not found in index", name))?
+        } else {
+            return Err(anyhow!("Either node_id or symbol_name is required"));
+        };
         let top_k = args.get("top_k")
             .and_then(|v| v.as_i64())
             .unwrap_or(5);
@@ -1448,7 +1545,7 @@ mod tests {
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["files_count"], 1);
-        assert_eq!(result["schema_version"], 2);
+        assert_eq!(result["schema_version"], crate::storage::schema::SCHEMA_VERSION);
     }
 
     #[test]

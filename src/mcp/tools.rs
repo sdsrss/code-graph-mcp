@@ -37,12 +37,12 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "function_name": { "type": "string", "description": "Function name to trace" },
+                        "symbol_name": { "type": "string", "description": "Function/method name to trace" },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both')" },
                         "depth": { "type": "number", "description": "Max recursion depth (default 2)" },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" }
                     },
-                    "required": ["function_name"]
+                    "required": ["symbol_name"]
                 }),
             },
             ToolDefinition {
@@ -176,11 +176,11 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "node_id": { "type": "number", "description": "Node ID to find similar code for" },
+                        "symbol_name": { "type": "string", "description": "Symbol name to find similar code for (alternative to node_id)" },
+                        "node_id": { "type": "number", "description": "Node ID to find similar code for (alternative to symbol_name)" },
                         "top_k": { "type": "number", "description": "Number of results (default 5)" },
                         "max_distance": { "type": "number", "description": "Maximum distance threshold (default 0.5)" }
-                    },
-                    "required": ["node_id"]
+                    }
                 }),
             },
         ];
