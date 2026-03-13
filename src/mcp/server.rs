@@ -120,6 +120,9 @@ pub struct McpServer {
     /// Writer for sending MCP notifications (progress, logging) to the client.
     /// Set to stdout in production; None in tests.
     notify_writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// Set to true when `notifications/initialized` is received, signaling
+    /// the main loop to run initial indexing and auto-start the file watcher.
+    startup_index_pending: Mutex<bool>,
 }
 
 impl McpServer {
@@ -168,6 +171,7 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
+            startup_index_pending: Mutex::new(false),
         })
     }
 
@@ -184,6 +188,7 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
+            startup_index_pending: Mutex::new(false),
         }
     }
 
@@ -202,12 +207,109 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
+            startup_index_pending: Mutex::new(false),
         }
     }
 
     /// Set the writer for sending MCP notifications to the client.
     pub fn set_notify_writer(&self, writer: Box<dyn Write + Send>) {
         *lock_or_recover(&self.notify_writer, "notify_writer") = Some(writer);
+    }
+
+    /// Run startup tasks if triggered by `notifications/initialized`.
+    /// Called from the main loop after each message. Performs initial indexing
+    /// and auto-starts the file watcher so tools are ready immediately.
+    pub fn run_startup_tasks(&self) {
+        let pending = {
+            let mut guard = lock_or_recover(&self.startup_index_pending, "startup_index_pending");
+            let was_pending = *guard;
+            *guard = false;
+            was_pending
+        };
+        if !pending {
+            return;
+        }
+
+        let project_root = match &self.project_root {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Run initial index with progress notifications
+        let is_indexed = *lock_or_recover(&self.indexed, "indexed");
+        if !is_indexed {
+            let model = self.embedding_model.as_ref();
+            let progress_cb = |current: usize, total: usize| {
+                self.send_progress("indexing", current, total);
+            };
+
+            // Check if DB already has indexed files — use incremental to avoid
+            // re-parsing and re-embedding unchanged files
+            let has_existing_index = queries::get_index_status(self.db.conn(), false)
+                .map(|s| s.files_count > 0)
+                .unwrap_or(false);
+
+            let result = if has_existing_index {
+                self.send_log("info", "Updating index (incremental)...");
+                // Take cache out of mutex before the long operation to avoid deadlock
+                let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
+                let inc_result = run_incremental_index_cached(
+                    &self.db, &project_root, model,
+                    cache.as_ref(),
+                    Some(&progress_cb),
+                );
+                match inc_result {
+                    Ok((result, new_cache)) => {
+                        *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        // Restore cache on failure
+                        *lock_or_recover(&self.dir_cache, "dir_cache") = cache;
+                        Err(e)
+                    }
+                }
+            } else {
+                self.send_log("info", "Building index for the first time...");
+                run_full_index(&self.db, &project_root, model, Some(&progress_cb))
+            };
+
+            match result {
+                Ok(result) => {
+                    *lock_or_recover(&self.indexed, "indexed") = true;
+                    if result.files_indexed > 0 {
+                        self.send_log("info", &format!(
+                            "Indexed {} files ({} nodes, {} edges).",
+                            result.files_indexed, result.nodes_created, result.edges_created
+                        ));
+                    } else {
+                        self.send_log("info", "Index is up to date.");
+                    }
+                }
+                Err(e) => {
+                    self.send_log("error", &format!("Auto-indexing failed: {}", e));
+                    return;
+                }
+            }
+        }
+
+        // Auto-start file watcher
+        let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
+        if watcher_guard.is_none() {
+            let (tx, rx) = mpsc::channel();
+            match FileWatcher::start(&project_root, tx) {
+                Ok(fw) => {
+                    *watcher_guard = Some(WatcherState {
+                        _watcher: fw,
+                        receiver: rx,
+                    });
+                    self.send_log("info", "File watcher started automatically.");
+                }
+                Err(e) => {
+                    self.send_log("warning", &format!("Could not start file watcher: {}", e));
+                }
+            }
+        }
     }
 
     /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
@@ -358,6 +460,9 @@ impl McpServer {
 
         // Per JSON-RPC 2.0, notifications (no id) must never receive a response
         if req.id.is_none() {
+            if req.method == "notifications/initialized" {
+                *lock_or_recover(&self.startup_index_pending, "startup_index_pending") = true;
+            }
             return Ok(None);
         }
 

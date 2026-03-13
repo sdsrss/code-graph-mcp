@@ -417,12 +417,17 @@ pub fn insert_node_vector(conn: &Connection, node_id: i64, embedding: &[f32]) ->
 
 /// Batch insert vectors using a single prepared statement.
 pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)]) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES (?1, ?2)"
+    // vec0 virtual tables do not support INSERT OR REPLACE, so delete first
+    let mut del_stmt = conn.prepare_cached(
+        "DELETE FROM node_vectors WHERE node_id = ?1"
+    )?;
+    let mut ins_stmt = conn.prepare_cached(
+        "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)"
     )?;
     for (node_id, embedding) in vectors {
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
-        stmt.execute(rusqlite::params![node_id, bytes])?;
+        let _ = del_stmt.execute(rusqlite::params![node_id]);
+        ins_stmt.execute(rusqlite::params![node_id, bytes])?;
     }
     Ok(())
 }

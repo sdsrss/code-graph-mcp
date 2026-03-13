@@ -127,6 +127,9 @@ fn run_serve() -> Result<()> {
                 stdout.flush()?;
             }
         }
+
+        // Run startup indexing + auto-watch if triggered by notifications/initialized
+        server.run_startup_tasks();
     }
 
     Ok(())
