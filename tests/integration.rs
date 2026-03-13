@@ -676,7 +676,7 @@ fn test_index_skips_unparseable_files_without_crashing() {
     // Create a valid TS file
     fs::write(project_dir.path().join("good.ts"), "function works() {}").unwrap();
     // Create a file with supported extension but binary content
-    fs::write(project_dir.path().join("bad.ts"), &[0xFF, 0xFE, 0x00, 0x01]).unwrap();
+    fs::write(project_dir.path().join("bad.ts"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
     // Another valid file
     fs::write(project_dir.path().join("also_good.ts"), "function alsoWorks() {}").unwrap();
 

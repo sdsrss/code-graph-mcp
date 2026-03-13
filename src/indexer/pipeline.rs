@@ -38,7 +38,8 @@ fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
 }
 
 /// Embed context strings using batched inference and batch-insert vectors.
-fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
+/// Public so the background embedding thread in server.rs can call it.
+pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
     if context_updates.is_empty() {
         return Ok(());
     }

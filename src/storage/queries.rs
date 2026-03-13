@@ -873,6 +873,21 @@ pub fn get_import_tree(
     Ok(results)
 }
 
+// --- Unembedded nodes ---
+
+/// Get (node_id, context_string) for nodes that have context strings but no vectors.
+pub fn get_unembedded_nodes(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.context_string FROM nodes n
+         LEFT JOIN node_vectors v ON v.node_id = n.id
+         WHERE n.context_string IS NOT NULL AND v.node_id IS NULL"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 // --- FTS5 Search ---
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {

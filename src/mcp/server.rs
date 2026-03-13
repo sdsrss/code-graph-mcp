@@ -2,12 +2,13 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::pipeline::{run_full_index, run_incremental_index_cached};
+use crate::indexer::pipeline::{embed_and_store_batch, run_full_index, run_incremental_index_cached};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
@@ -42,10 +43,10 @@ fn parse_route_input(input: &str) -> (Option<String>, &str) {
 fn filter_routes_by_method(rows: &mut Vec<queries::RouteMatch>, method: &Option<String>) {
     if let Some(method) = method {
         rows.retain(|r| {
-            r.metadata.as_ref().map_or(false, |m| {
+            r.metadata.as_ref().is_some_and(|m| {
                 serde_json::from_str::<serde_json::Value>(m).ok()
                     .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
-                    .map_or(false, |rm| rm == *method)
+                    .is_some_and(|rm| rm == *method)
             })
         });
     }
@@ -123,6 +124,8 @@ pub struct McpServer {
     /// Set to true when `notifications/initialized` is received, signaling
     /// the main loop to run initial indexing and auto-start the file watcher.
     startup_index_pending: Mutex<bool>,
+    /// True while a background embedding thread is running.
+    embedding_in_progress: Arc<AtomicBool>,
 }
 
 impl McpServer {
@@ -172,6 +175,7 @@ impl McpServer {
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
+            embedding_in_progress: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -189,6 +193,7 @@ impl McpServer {
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
+            embedding_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -208,6 +213,7 @@ impl McpServer {
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
+            embedding_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -235,26 +241,26 @@ impl McpServer {
             None => return,
         };
 
-        // Run initial index with progress notifications
+        // Run initial index with progress notifications (skip inline embedding — done in background)
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
         if !is_indexed {
-            let model = self.embedding_model.as_ref();
             let progress_cb = |current: usize, total: usize| {
                 self.send_progress("indexing", current, total);
             };
 
             // Check if DB already has indexed files — use incremental to avoid
-            // re-parsing and re-embedding unchanged files
+            // re-parsing unchanged files
             let has_existing_index = queries::get_index_status(self.db.conn(), false)
                 .map(|s| s.files_count > 0)
                 .unwrap_or(false);
 
+            // Pass model=None for startup index to skip inline embedding (60s+ blocking).
+            // Background thread will embed afterwards.
             let result = if has_existing_index {
                 self.send_log("info", "Updating index (incremental)...");
-                // Take cache out of mutex before the long operation to avoid deadlock
                 let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
                 let inc_result = run_incremental_index_cached(
-                    &self.db, &project_root, model,
+                    &self.db, &project_root, None,
                     cache.as_ref(),
                     Some(&progress_cb),
                 );
@@ -264,14 +270,13 @@ impl McpServer {
                         Ok(result)
                     }
                     Err(e) => {
-                        // Restore cache on failure
                         *lock_or_recover(&self.dir_cache, "dir_cache") = cache;
                         Err(e)
                     }
                 }
             } else {
                 self.send_log("info", "Building index for the first time...");
-                run_full_index(&self.db, &project_root, model, Some(&progress_cb))
+                run_full_index(&self.db, &project_root, None, Some(&progress_cb))
             };
 
             match result {
@@ -285,6 +290,7 @@ impl McpServer {
                     } else {
                         self.send_log("info", "Index is up to date.");
                     }
+                    self.spawn_background_embedding();
                 }
                 Err(e) => {
                     self.send_log("error", &format!("Auto-indexing failed: {}", e));
@@ -310,6 +316,57 @@ impl McpServer {
                 }
             }
         }
+    }
+
+    /// Spawn a background thread to embed nodes that don't yet have vectors.
+    /// The thread opens its own DB connection and model (EmbeddingModel is not Send)
+    /// to avoid blocking the main stdio loop.
+    fn spawn_background_embedding(&self) {
+        // Guard: only spawn if model and vec are available
+        if self.embedding_model.is_none() || !self.db.vec_enabled() {
+            return;
+        }
+
+        let db_path = match &self.project_root {
+            Some(p) => p.join(".code-graph").join("index.db"),
+            None => return,
+        };
+
+        // Acquire flag AFTER precondition checks to avoid permanent flag leak
+        if self.embedding_in_progress.swap(true, Ordering::AcqRel) {
+            return; // already running
+        }
+        let flag = Arc::clone(&self.embedding_in_progress);
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let model = match EmbeddingModel::load()? {
+                    Some(m) => m,
+                    None => return Ok(()),
+                };
+                let db = Database::open_with_vec(&db_path)?;
+                let unembedded = queries::get_unembedded_nodes(db.conn())?;
+                if unembedded.is_empty() {
+                    return Ok(());
+                }
+                tracing::info!("[embed-bg] Embedding {} nodes in background...", unembedded.len());
+                let t0 = std::time::Instant::now();
+
+                // Wrap in transaction for batched fsync (per insert_node_vectors_batch doc)
+                let tx = db.conn().unchecked_transaction()?;
+                embed_and_store_batch(&db, &model, &unembedded)?;
+                tx.commit()?;
+
+                tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
+                    unembedded.len(), t0.elapsed().as_secs_f64());
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                tracing::warn!("[embed-bg] Failed: {}", e);
+            }
+            flag.store(false, Ordering::Release);
+        });
     }
 
     /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
@@ -381,8 +438,10 @@ impl McpServer {
             let progress_cb = |current: usize, total: usize| {
                 self.send_progress("indexing", current, total);
             };
-            run_full_index(&self.db, &project_root, model, Some(&progress_cb))?;
+            // Skip inline embedding for full index (too slow), background thread handles it
+            run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
             *lock_or_recover(&self.indexed, "indexed") = true;
+            self.spawn_background_embedding();
         } else {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
@@ -1307,10 +1366,13 @@ impl McpServer {
         let progress_cb = |current: usize, total: usize| {
             self.send_progress("rebuild-index", current, total);
         };
-        let result = run_full_index(&self.db, project_root, self.embedding_model.as_ref(), Some(&progress_cb))?;
+        // Skip inline embedding, background thread handles it
+        let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
 
         // Reset indexed flag
         *lock_or_recover(&self.indexed, "indexed") = true;
+
+        self.spawn_background_embedding();
 
         Ok(json!({
             "status": "rebuilt",
