@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "code-graph-mcp incremental-index --quiet",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/incremental-index.js\"",
             "timeout": 10
           }
         ],
@@ -15,10 +15,11 @@
     ],
     "SessionStart": [
       {
+        "matcher": "startup",
         "hooks": [
           {
             "type": "command",
-            "command": "node claude-plugin/scripts/session-init.js",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.js\"",
             "timeout": 8
           }
         ],

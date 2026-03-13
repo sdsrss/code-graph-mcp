@@ -1,7 +1,16 @@
 #!/usr/bin/env node
-const { execSync } = require('child_process');
+'use strict';
+const { execFileSync } = require('child_process');
+const { findBinary } = require('./find-binary');
+
+const bin = findBinary();
+if (!bin) {
+  process.stdout.write('code-graph: offline');
+  process.exit(0);
+}
+
 try {
-  const out = execSync('code-graph-mcp health-check --format json', {
+  const out = execFileSync(bin, ['health-check', '--format', 'json'], {
     timeout: 3000,
     stdio: ['pipe', 'pipe', 'pipe']
   }).toString().trim();
