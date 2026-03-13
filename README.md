@@ -65,7 +65,11 @@ src/
 Install as a Claude Code plugin for the best experience — includes slash commands, agents, skills, auto-indexing hooks, StatusLine health display, and automatic updates:
 
 ```bash
-claude plugin install --url https://raw.githubusercontent.com/sdsrss/code-graph-mcp/main/claude-plugin/marketplace.json
+# Step 1: Add the marketplace
+/plugin marketplace add sdsrss/code-graph-mcp
+
+# Step 2: Install the plugin
+/plugin install code-graph@sdsrss-code-graph
 ```
 
 What you get:
@@ -121,12 +125,13 @@ code-graph-mcp
 ### Claude Code Plugin
 
 ```bash
-claude plugin uninstall code-graph
-```
+# Uninstall the plugin
+/plugin uninstall code-graph@sdsrss-code-graph
 
-To also clean up all config and cache data:
+# (Optional) Remove the marketplace
+/plugin marketplace remove sdsrss-code-graph
 
-```bash
+# (Optional) Clean up all config and cache data
 node ~/.claude/plugins/cache/sdsrss/code-graph/*/scripts/lifecycle.js uninstall
 ```
 
