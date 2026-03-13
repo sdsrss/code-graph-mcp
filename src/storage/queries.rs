@@ -416,8 +416,12 @@ pub fn insert_node_vector(conn: &Connection, node_id: i64, embedding: &[f32]) ->
 }
 
 /// Batch insert vectors using a single prepared statement.
+/// For best performance, caller should wrap in a transaction (avoids per-statement fsync).
 pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)]) -> Result<()> {
-    // vec0 virtual tables do not support INSERT OR REPLACE, so delete first
+    if vectors.is_empty() {
+        return Ok(());
+    }
+    // vec0 virtual tables do not support INSERT OR REPLACE, so delete first.
     let mut del_stmt = conn.prepare_cached(
         "DELETE FROM node_vectors WHERE node_id = ?1"
     )?;

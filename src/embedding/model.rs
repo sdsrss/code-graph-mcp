@@ -116,9 +116,86 @@ mod inner {
             Ok(result)
         }
 
-        /// Generate embeddings for multiple texts (sequential, no padding needed).
+        /// Generate embeddings for multiple texts using true batched inference.
+        /// Sorts texts by token length to minimize padding overhead, then batches.
+        const BATCH_CHUNK: usize = 8;
+
         pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            texts.iter().map(|t| self.embed(t)).collect()
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            if texts.len() == 1 {
+                return Ok(vec![self.embed(texts[0])?]);
+            }
+
+            // Pre-tokenize to get lengths, sort by length to minimize padding
+            let encodings: Vec<_> = texts.iter()
+                .map(|t| self.tokenizer.encode(*t, true)
+                    .map_err(|e| anyhow::anyhow!("tokenize error: {}", e)))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Build (original_index, encoding) pairs sorted by token count
+            let mut indexed: Vec<(usize, _)> = encodings.into_iter().enumerate().collect();
+            indexed.sort_by_key(|(_, enc)| enc.get_ids().len());
+
+            // Process sorted chunks — sequences in each chunk have similar lengths
+            let mut results_with_idx: Vec<(usize, Vec<f32>)> = Vec::with_capacity(texts.len());
+            for chunk in indexed.chunks(Self::BATCH_CHUNK) {
+                let chunk_encodings: Vec<&_> = chunk.iter().map(|(_, enc)| enc).collect();
+                let chunk_results = self.embed_batch_chunk_pre_tokenized(&chunk_encodings)?;
+                for (result, &(orig_idx, _)) in chunk_results.into_iter().zip(chunk.iter()) {
+                    results_with_idx.push((orig_idx, result));
+                }
+            }
+
+            // Restore original order
+            results_with_idx.sort_by_key(|(idx, _)| *idx);
+            Ok(results_with_idx.into_iter().map(|(_, v)| v).collect())
+        }
+
+        fn embed_batch_chunk_pre_tokenized(&self, encodings: &[&tokenizers::Encoding]) -> Result<Vec<Vec<f32>>> {
+            let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+            let batch_size = encodings.len();
+
+            // Build padded tensors
+            let mut all_ids = vec![0u32; batch_size * max_len];
+            let mut all_type_ids = vec![0u32; batch_size * max_len];
+            let mut all_attention = vec![0f32; batch_size * max_len];
+
+            for (i, enc) in encodings.iter().enumerate() {
+                let ids = enc.get_ids();
+                let type_ids = enc.get_type_ids();
+                let seq_len = ids.len();
+                let offset = i * max_len;
+                all_ids[offset..offset + seq_len].copy_from_slice(ids);
+                all_type_ids[offset..offset + seq_len].copy_from_slice(type_ids);
+                for j in 0..seq_len {
+                    all_attention[offset + j] = 1.0;
+                }
+            }
+
+            let input_ids = Tensor::from_vec(all_ids, (batch_size, max_len), &self.device)?;
+            let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, max_len), &self.device)?;
+            let attention_mask = Tensor::from_vec(all_attention, (batch_size, max_len), &self.device)?;
+
+            // Single forward pass for entire batch (pass attention mask for correct padding handling)
+            let embeddings = self.model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+
+            // Masked mean pooling per sequence
+            let attention_3d = attention_mask.unsqueeze(2)?; // (batch, seq, 1)
+            let masked = embeddings.broadcast_mul(&attention_3d)?;
+            let summed = masked.sum(1)?; // (batch, hidden)
+            let counts = attention_mask.sum(1)?.unsqueeze(1)?; // (batch, 1)
+            let pooled = summed.broadcast_div(&counts)?;
+
+            // Extract and normalize each vector
+            let mut results = Vec::with_capacity(batch_size);
+            for i in 0..batch_size {
+                let mut vec: Vec<f32> = pooled.get(i)?.to_vec1()?;
+                super::l2_normalize(&mut vec);
+                results.push(vec);
+            }
+            Ok(results)
         }
     }
 }
@@ -140,7 +217,8 @@ impl EmbeddingModel {
         anyhow::bail!("Embedding model not compiled — enable the 'embed-model' feature")
     }
 
-    pub fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    #[allow(unused_variables)]
+    pub fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         anyhow::bail!("Embedding model not compiled — enable the 'embed-model' feature")
     }
 }
@@ -193,6 +271,31 @@ mod tests {
             assert_eq!(embeddings.len(), 3);
             for emb in &embeddings {
                 assert_eq!(emb.len(), EMBEDDING_DIM);
+            }
+        }
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_embed_batch_matches_sequential() {
+        let model = EmbeddingModel::load().unwrap();
+        if let Some(model) = model {
+            let texts = vec![
+                "function validateToken JWT authentication",
+                "short",
+                "function handleLogin with a much longer context string that tests padding behavior in batched inference",
+            ];
+            // Get sequential results
+            let sequential: Vec<Vec<f32>> = texts.iter()
+                .map(|t| model.embed(t).unwrap())
+                .collect();
+            // Get batched results
+            let batched = model.embed_batch(&texts).unwrap();
+
+            assert_eq!(sequential.len(), batched.len());
+            for (i, (seq, bat)) in sequential.iter().zip(batched.iter()).enumerate() {
+                let sim = cosine_sim(seq, bat);
+                assert!(sim > 0.99, "batch vs sequential similarity for text {}: {} (should be >0.99)", i, sim);
             }
         }
     }

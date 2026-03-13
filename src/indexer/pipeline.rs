@@ -37,18 +37,56 @@ fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
     name.to_string()
 }
 
-/// Embed context strings and batch-insert vectors into the database.
+/// Embed context strings using batched inference and batch-insert vectors.
 fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
-    let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
-    for (node_id, ctx) in context_updates {
-        match model.embed(ctx) {
-            Ok(embedding) => vectors.push((*node_id, embedding)),
-            Err(e) => tracing::warn!("Failed to embed node {}: {}", node_id, e),
-        }
+    if context_updates.is_empty() {
+        return Ok(());
     }
+
+    let t0 = std::time::Instant::now();
+    let texts: Vec<&str> = context_updates.iter().map(|(_, ctx)| ctx.as_str()).collect();
+    let ids: Vec<i64> = context_updates.iter().map(|(id, _)| *id).collect();
+
+    let embeddings = match model.embed_batch(&texts) {
+        Ok(embs) => embs,
+        Err(e) => {
+            tracing::warn!("Batch embed failed, falling back to sequential: {}", e);
+            // Fallback: sequential embed
+            let mut embs = Vec::new();
+            for (i, text) in texts.iter().enumerate() {
+                match model.embed(text) {
+                    Ok(emb) => embs.push(Some(emb)),
+                    Err(e2) => {
+                        tracing::warn!("Failed to embed node {}: {}", ids[i], e2);
+                        embs.push(None);
+                    }
+                }
+            }
+            let vectors: Vec<(i64, Vec<f32>)> = ids.iter().zip(embs)
+                .filter_map(|(&id, emb)| emb.map(|e| (id, e)))
+                .collect();
+            if !vectors.is_empty() {
+                insert_node_vectors_batch(db.conn(), &vectors)?;
+            }
+            tracing::info!("[embed] {} nodes (sequential fallback) in {:.1}s",
+                context_updates.len(), t0.elapsed().as_secs_f64());
+            return Ok(());
+        }
+    };
+
+    let vectors: Vec<(i64, Vec<f32>)> = ids.into_iter().zip(embeddings).collect();
+    let t_embed = t0.elapsed();
+
     if !vectors.is_empty() {
         insert_node_vectors_batch(db.conn(), &vectors)?;
     }
+
+    tracing::info!("[embed] {} nodes in {:.1}s (embed {:.1}s, store {:.1}s)",
+        context_updates.len(),
+        t0.elapsed().as_secs_f64(),
+        t_embed.as_secs_f64(),
+        (t0.elapsed() - t_embed).as_secs_f64(),
+    );
     Ok(())
 }
 
@@ -201,6 +239,7 @@ fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<Has
 
 /// Regenerate context strings (and embeddings) for the given set of dirty nodes.
 fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Option<&EmbeddingModel>) -> Result<()> {
+    let tx = db.conn().unchecked_transaction()?;
     let id_vec: Vec<i64> = dirty_ids.iter().copied().collect();
     let all_edges = get_edges_batch(db.conn(), &id_vec)?;
     let all_nodes: HashMap<i64, (NodeResult, String)> = {
@@ -245,6 +284,7 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
         }
     }
 
+    tx.commit()?;
     Ok(())
 }
 
