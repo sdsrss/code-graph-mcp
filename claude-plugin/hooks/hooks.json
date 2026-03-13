@@ -18,11 +18,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "code-graph-mcp health-check --format oneline",
-            "timeout": 5
+            "command": "node claude-plugin/scripts/session-init.js",
+            "timeout": 8
           }
         ],
-        "description": "Verify code graph index freshness at session start"
+        "description": "Health check, StatusLine registration, and update check at session start"
       }
     ]
   }
