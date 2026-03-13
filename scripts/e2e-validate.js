@@ -191,7 +191,7 @@ async function main() {
 
   child.on("exit", (code, signal) => {
     // If child exits unexpectedly during tests, reject all pending
-    for (const [id, entry] of pending) {
+    for (const [, entry] of pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error(`Server exited (code=${code}, signal=${signal})`));
     }
