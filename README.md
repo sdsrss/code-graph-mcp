@@ -80,6 +80,16 @@ What you get:
 - **StatusLine** — Real-time health display (nodes, files, watch status) — compatible with other plugins' StatusLine via composite multiplexer
 - **Auto-update** — Checks for new versions every 24h, updates silently
 
+#### Manual Update
+
+```bash
+npm update -g @sdsrs/code-graph
+```
+
+Then reconnect the MCP server in Claude Code with `/mcp`.
+
+> **Note:** Auto-update is disabled in the source repo directory (dev mode). Use manual update when developing the plugin itself.
+
 ### Option 2: Claude Code MCP Server Only
 
 Register as an MCP server without the plugin features:
