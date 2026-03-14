@@ -1227,4 +1227,32 @@ impl Database {
         assert!(calls.contains(&("open_impl", "new")),
             "HashMap::new() should create call relation, got: {:?}", calls);
     }
+
+    #[test]
+    fn test_rust_method_call_on_object() {
+        // obj.method() should also be extracted as a call relation
+        let code = r#"
+fn test_func() {
+    let server = McpServer::from_project_root(path).unwrap();
+    server.handle_message(init).unwrap();
+    tool_call_json("search", args);
+}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        eprintln!("All relations:");
+        for r in &relations {
+            eprintln!("  {} --[{}]--> {}", r.source_name, r.relation, r.target_name);
+        }
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        eprintln!("Calls: {:?}", calls);
+        assert!(calls.contains(&("test_func", "from_project_root")),
+            "McpServer::from_project_root() should create call, got: {:?}", calls);
+        assert!(calls.contains(&("test_func", "handle_message")),
+            "server.handle_message() should create call, got: {:?}", calls);
+        assert!(calls.contains(&("test_func", "tool_call_json")),
+            "tool_call_json() should create call, got: {:?}", calls);
+    }
 }

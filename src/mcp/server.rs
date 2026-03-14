@@ -975,6 +975,21 @@ impl McpServer {
                         continue;
                     }
                 }
+                // Truncate large code_content to reduce token usage;
+                // users can get full code via get_ast_node(node_id)
+                const MAX_SEARCH_CODE_LEN: usize = 1500;
+                let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
+                    let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
+                        .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
+                    format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
+                        truncated, node.end_line - node.start_line + 1)
+                } else {
+                    node.code_content.clone()
+                };
+                // Normalize RRF score to 0.0–1.0 range for readability
+                let score = if let Some(max_score) = fused.first().map(|f| f.score) {
+                    if max_score > 0.0 { (r.score / max_score * 100.0).round() / 100.0 } else { 0.0 }
+                } else { 0.0 };
                 results.push(json!({
                     "node_id": node.id,
                     "name": node.name,
@@ -982,8 +997,9 @@ impl McpServer {
                     "file_path": nwf.file_path,
                     "start_line": node.start_line,
                     "end_line": node.end_line,
-                    "code_content": node.code_content,
+                    "code_content": code,
                     "signature": node.signature,
+                    "relevance": score,
                 }));
                 matched.push(MatchedNode {
                     node: &nwf.node,
@@ -1343,10 +1359,20 @@ impl McpServer {
                     "file_path": file_path,
                     "start_line": n.start_line,
                     "end_line": n.end_line,
-                    "code_content": n.code_content,
                     "signature": n.signature,
                     "qualified_name": n.qualified_name,
                 });
+
+                // Include source code: prefer context view, fall back to stored code_content
+                if context_lines > 0 {
+                    if let Some(code) = self.read_source_context(file_path, n.start_line, n.end_line, context_lines) {
+                        result["code"] = json!(code);
+                    } else {
+                        result["code_content"] = json!(n.code_content);
+                    }
+                } else {
+                    result["code_content"] = json!(n.code_content);
+                }
 
                 if include_refs {
                     use crate::domain::REL_CALLS as CALLS;
@@ -1354,13 +1380,6 @@ impl McpServer {
                     let callers = queries::get_edge_source_names(self.db.conn(), n.id, CALLS)?;
                     result["calls"] = json!(callees);
                     result["called_by"] = json!(callers);
-                }
-
-                // Add context lines from source file if requested
-                if context_lines > 0 {
-                    if let Some(code) = self.read_source_context(file_path, n.start_line, n.end_line, context_lines) {
-                        result["code"] = json!(code);
-                    }
                 }
 
                 // Compress if code_content exceeds token threshold
@@ -1415,9 +1434,20 @@ impl McpServer {
             "file_path": file_path,
             "start_line": node.start_line,
             "end_line": node.end_line,
-            "code_content": node.code_content,
             "signature": node.signature,
+            "qualified_name": node.qualified_name,
         });
+
+        // Include source code: prefer context view when requested, fall back to stored code_content
+        if context_lines > 0 {
+            if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
+                result["code"] = json!(code);
+            } else {
+                result["code_content"] = json!(node.code_content);
+            }
+        } else {
+            result["code_content"] = json!(node.code_content);
+        }
 
         if include_refs {
             use crate::domain::REL_CALLS as CALLS;
@@ -1425,12 +1455,6 @@ impl McpServer {
             let callers = queries::get_edge_source_names(self.db.conn(), node.id, CALLS)?;
             result["calls"] = json!(callees);
             result["called_by"] = json!(callers);
-        }
-
-        if context_lines > 0 {
-            if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
-                result["code"] = json!(code);
-            }
         }
 
         Ok(result)
@@ -1753,19 +1777,27 @@ impl McpServer {
             .collect();
 
         // Cap exports to avoid bloating context — full project can have 500+ symbols
-        const MAX_EXPORTS: usize = 80;
+        // Active exports (caller_count > 0) get full detail including signature;
+        // inactive ones get compact representation to save tokens.
+        const MAX_EXPORTS: usize = 50;
         let total_exports = exports.len();
         let capped = total_exports > MAX_EXPORTS;
         let all_exports: Vec<serde_json::Value> = exports.iter()
             .take(MAX_EXPORTS)
-            .map(|e| json!({
-                "node_id": e.node_id,
-                "name": e.name,
-                "type": e.node_type,
-                "signature": e.signature,
-                "file": e.file_path,
-                "caller_count": e.caller_count,
-            }))
+            .map(|e| {
+                let mut obj = json!({
+                    "node_id": e.node_id,
+                    "name": e.name,
+                    "type": e.node_type,
+                    "file": e.file_path,
+                    "caller_count": e.caller_count,
+                });
+                // Only include signature for actively-called symbols to save tokens
+                if e.caller_count > 0 {
+                    obj["signature"] = json!(e.signature);
+                }
+                obj
+            })
             .collect();
 
         let mut result = json!({

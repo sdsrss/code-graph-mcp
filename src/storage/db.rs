@@ -93,6 +93,21 @@ impl Database {
 
         conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
 
+        // Check INDEX_VERSION (stored in application_id pragma).
+        // When parser/indexer logic changes, INDEX_VERSION is bumped and
+        // we clear all indexed data so the next ensure_indexed does a full rebuild.
+        let stored_index_version: i32 = conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        if stored_index_version != 0 && stored_index_version != crate::domain::INDEX_VERSION {
+            tracing::info!(
+                "[index] Index version changed ({} → {}), clearing stale data for rebuild",
+                stored_index_version, crate::domain::INDEX_VERSION
+            );
+            conn.execute_batch(
+                "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files;"
+            )?;
+        }
+        conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
+
         Ok(Self { conn, vec_enabled: enable_vec })
     }
 

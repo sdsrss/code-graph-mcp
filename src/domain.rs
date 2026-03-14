@@ -10,6 +10,13 @@ pub const REL_ROUTES_TO: &str = "routes_to";
 pub const REL_IMPLEMENTS: &str = "implements";
 pub const REL_EXPORTS: &str = "exports";
 
+// -- Index version --
+// Bump this when parser/indexer logic changes in a way that produces different
+// nodes or edges for the same source files. The server will detect a mismatch
+// and automatically clear + rebuild the index.
+// This is separate from SCHEMA_VERSION (which tracks table structure changes).
+pub const INDEX_VERSION: i32 = 1;
+
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
 
@@ -34,4 +41,9 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
     "next", "iter", "into_iter",
     "build", "builder",
     "len", "is_empty",
+    "unwrap", "unwrap_or", "unwrap_or_else", "unwrap_or_default",
+    "expect", "ok", "err", "map", "map_err", "and_then",
+    "or_else", "filter", "flatten",
+    "push", "pop", "insert", "remove", "contains", "get",
+    "to_owned", "to_vec", "collect", "join",
 ];
