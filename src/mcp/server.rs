@@ -341,6 +341,15 @@ impl McpServer {
         let flag = Arc::clone(&self.embedding_in_progress);
 
         std::thread::spawn(move || {
+            // Drop guard ensures flag is always cleared, even on panic
+            struct FlagGuard(Arc<AtomicBool>);
+            impl Drop for FlagGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = FlagGuard(flag);
+
             let result = (|| -> Result<()> {
                 let model = match EmbeddingModel::load()? {
                     Some(m) => m,
@@ -351,23 +360,30 @@ impl McpServer {
                 if unembedded.is_empty() {
                     return Ok(());
                 }
-                tracing::info!("[embed-bg] Embedding {} nodes in background...", unembedded.len());
+
+                let total = unembedded.len();
+                tracing::info!("[embed-bg] Embedding {} nodes in background...", total);
                 let t0 = std::time::Instant::now();
 
-                // Wrap in transaction for batched fsync (per insert_node_vectors_batch doc)
-                let tx = db.conn().unchecked_transaction()?;
-                embed_and_store_batch(&db, &model, &unembedded)?;
-                tx.commit()?;
+                const EMBED_PROGRESS_BATCH: usize = 32;
+                for (i, chunk) in unembedded.chunks(EMBED_PROGRESS_BATCH).enumerate() {
+                    let tx = db.conn().unchecked_transaction()?;
+                    embed_and_store_batch(&db, &model, chunk)?;
+                    tx.commit()?;
+
+                    let done = ((i + 1) * EMBED_PROGRESS_BATCH).min(total);
+                    tracing::info!("[embed-bg] Progress: {}/{} nodes", done, total);
+                }
 
                 tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
-                    unembedded.len(), t0.elapsed().as_secs_f64());
+                    total, t0.elapsed().as_secs_f64());
                 Ok(())
             })();
 
             if let Err(e) = result {
                 tracing::warn!("[embed-bg] Failed: {}", e);
             }
-            flag.store(false, Ordering::Release);
+            // FlagGuard::drop() clears the flag automatically
         });
     }
 
