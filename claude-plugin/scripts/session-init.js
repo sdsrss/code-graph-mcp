@@ -8,7 +8,30 @@ const { findBinary } = require('./find-binary');
 const { install, update, readManifest, getPluginVersion, checkScopeConflict } = require('./lifecycle');
 const { checkForUpdate } = require('./auto-update');
 
-const BIN = findBinary();
+let BIN = findBinary();
+
+// --- 0. Auto-install binary if missing ---
+if (!BIN) {
+  const version = getPluginVersion();
+  process.stderr.write(`[code-graph] Binary not found, installing @sdsrs/code-graph@${version}...\n`);
+  try {
+    execFileSync('npm', ['install', '-g', `@sdsrs/code-graph@${version}`], {
+      timeout: 60000, stdio: 'pipe'
+    });
+    // Clear cached path so findBinary picks up the new install
+    try { fs.unlinkSync(path.join(os.homedir(), '.cache', 'code-graph', 'binary-path')); } catch {}
+    BIN = findBinary();
+    if (BIN) {
+      process.stderr.write(`[code-graph] Installed v${version} at ${BIN}\n`);
+    } else {
+      process.stderr.write('[code-graph] Install succeeded but binary not found in PATH. Try: npx @sdsrs/code-graph@latest\n');
+    }
+  } catch {
+    process.stderr.write(
+      `[code-graph] Auto-install failed. Run manually: npm install -g @sdsrs/code-graph@${version}\n`
+    );
+  }
+}
 
 // --- 1. Health check (always runs) ---
 if (BIN) {
