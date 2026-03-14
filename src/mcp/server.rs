@@ -112,7 +112,7 @@ enum FuzzyResolution {
 pub struct McpServer {
     registry: ToolRegistry,
     db: Database,
-    embedding_model: Option<EmbeddingModel>,
+    embedding_model: Mutex<Option<EmbeddingModel>>,
     project_root: Option<PathBuf>,
     indexed: Mutex<bool>,
     watcher: Mutex<Option<WatcherState>>,
@@ -167,7 +167,7 @@ impl McpServer {
         Ok(Self {
             registry: ToolRegistry::new(),
             db,
-            embedding_model,
+            embedding_model: Mutex::new(embedding_model),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -185,7 +185,7 @@ impl McpServer {
         Self {
             registry: ToolRegistry::new(),
             db,
-            embedding_model: None,
+            embedding_model: Mutex::new(None),
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -205,7 +205,7 @@ impl McpServer {
         Self {
             registry: ToolRegistry::new(),
             db,
-            embedding_model: None,
+            embedding_model: Mutex::new(None),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -323,7 +323,7 @@ impl McpServer {
     /// to avoid blocking the main stdio loop.
     fn spawn_background_embedding(&self) {
         // Guard: only spawn if model and vec are available
-        if self.embedding_model.is_none() || !self.db.vec_enabled() {
+        if lock_or_recover(&self.embedding_model, "embedding_model").is_none() || !self.db.vec_enabled() {
             return;
         }
 
@@ -431,8 +431,6 @@ impl McpServer {
             None => return Ok(()),
         };
 
-        let model = self.embedding_model.as_ref();
-
         // Read the indexed flag (short lock scope to avoid holding across I/O)
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
@@ -444,12 +442,17 @@ impl McpServer {
             // Skip inline embedding for full index (too slow), background thread handles it
             run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
             *lock_or_recover(&self.indexed, "indexed") = true;
+            // Note: model lock is NOT held here — spawn_background_embedding locks it internally
             self.spawn_background_embedding();
         } else {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
+                // Lock model briefly to get a ref for incremental indexing
+                let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
+                let model = model_guard.as_ref();
                 self.run_incremental_with_cache_restore(&project_root, model)?;
+                drop(model_guard);
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
                 let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
@@ -457,7 +460,10 @@ impl McpServer {
                     // No watcher active — debounce to avoid rescanning on every tool call
                     let mut last_check = lock_or_recover(&self.last_incremental_check, "last_incremental_check");
                     if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
+                        let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
+                        let model = model_guard.as_ref();
                         self.run_incremental_with_cache_restore(&project_root, model)?;
+                        drop(model_guard);
                         *last_check = std::time::Instant::now();
                     }
                 }
@@ -839,8 +845,9 @@ impl McpServer {
             .collect();
 
         // Vector search (if embedding model available and vec enabled)
+        let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
         let vec_search: Vec<crate::search::fusion::SearchResult> =
-            if let Some(ref model) = self.embedding_model {
+            if let Some(ref model) = *model_guard {
                 if self.db.vec_enabled() {
                     match model.embed(query) {
                         Ok(query_embedding) => {
@@ -859,6 +866,7 @@ impl McpServer {
             } else {
                 vec![]
             };
+        drop(model_guard);
 
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
         // k=30: sharper rank sensitivity than default 60 (top results matter more)
