@@ -20,7 +20,7 @@ This project has a code-graph MCP server. These tools return structured, token-e
 | One symbol's signature+relations | `get_ast_node` | Read entire file | 10x |
 | File import/export dependencies | `dependency_graph` | Grep import statements | 5x |
 | Find similar/duplicate code | `find_similar_code` | Grep partial names | 5x |
-| Read code of a search result | `read_snippet` (by node_id) | Read entire file | 3x |
+| Read code of a search result | `get_ast_node` (by node_id) | Read entire file | 3x |
 
 ## When to use native tools instead
 

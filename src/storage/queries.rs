@@ -1023,7 +1023,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     {
         let sql = format!(
             "SELECT DISTINCT n.name, f.path FROM edges e \
-             JOIN nodes n ON n.id = e.source_id \
+             JOIN nodes n ON n.id = e.target_id \
              JOIN files f ON f.id = n.file_id \
              WHERE e.relation = '{}' AND n.name != '<module>'",
             REL_EXPORTS

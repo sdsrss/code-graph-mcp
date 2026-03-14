@@ -842,7 +842,7 @@ impl McpServer {
                             "text": format!(
                                 "Trace the complete HTTP request flow for route '{}'. \
                                  Use trace_http_chain to get the full chain from route to data layer. \
-                                 For each key node, use read_snippet to show the implementation. \
+                                 For each key node, use get_ast_node(node_id=N, context_lines=5) to show the implementation. \
                                  Map the flow: route → middleware → validation → business logic → data access → response. \
                                  Highlight error handling, auth checks, and database operations.",
                                 route
@@ -1160,47 +1160,7 @@ impl McpServer {
         Ok(result)
     }
 
-    fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let route_path_raw = args["route_path"].as_str()
-            .ok_or_else(|| anyhow!("route_path is required"))?;
-        let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
-
-        self.ensure_indexed()?;
-
-        // Strip HTTP method prefix if present (e.g., "GET /api/users" → "/api/users")
-        let (method_filter, route_path) = parse_route_input(route_path_raw);
-
-        use crate::domain::{REL_CALLS, REL_ROUTES_TO};
-        let mut rows = queries::find_routes_by_path(self.db.conn(), route_path, REL_ROUTES_TO)?;
-        filter_routes_by_method(&mut rows, &method_filter);
-
-        let mut handlers: Vec<serde_json::Value> = Vec::new();
-        for rm in &rows {
-            let mut handler = json!({
-                "node_id": rm.node_id,
-                "metadata": rm.metadata,
-                "handler_name": rm.handler_name,
-                "handler_type": rm.handler_type,
-                "file_path": rm.file_path,
-                "start_line": rm.start_line,
-                "end_line": rm.end_line,
-            });
-
-            apply_inline_handler_metadata(&mut handler, rm.metadata.as_deref());
-
-            if include_middleware {
-                let downstream = queries::get_edge_target_names(self.db.conn(), rm.node_id, REL_CALLS)?;
-                handler["downstream_calls"] = json!(downstream);
-            }
-
-            handlers.push(handler);
-        }
-
-        Ok(json!({
-            "route": route_path,
-            "handlers": handlers,
-        }))
-    }
+    // find_http_route merged into trace_http_chain — old name kept as alias in handle_tool()
 
     fn tool_trace_http_chain(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let route_path_raw = args["route_path"].as_str()
@@ -1425,62 +1385,7 @@ impl McpServer {
         Some(lines[start..end].join("\n"))
     }
 
-    fn tool_read_snippet(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
-
-        let node_id = args["node_id"].as_i64()
-            .ok_or_else(|| anyhow!("node_id is required"))?;
-        let context_lines = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-
-        let node = queries::get_node_by_id(self.db.conn(), node_id)?
-            .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
-
-        let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
-            .ok_or_else(|| anyhow!("File record missing for node {}", node_id))?;
-
-        // Read source file for context lines if project root available
-        let full_snippet = if let Some(ref root) = self.project_root {
-            let abs_path = root.join(&file_path);
-            // Verify path stays within project root to prevent traversal
-            let canonical = match abs_path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    return Ok(json!({
-                        "error": format!("Cannot resolve path: {}", file_path),
-                        "node_id": node_id
-                    }));
-                }
-            };
-            let root_canonical = root.canonicalize()
-                .map_err(|e| anyhow!("Cannot resolve project root: {}", e))?;
-            if !canonical.starts_with(&root_canonical) {
-                return Ok(json!({
-                    "error": "Path traversal detected",
-                    "node_id": node_id
-                }));
-            }
-            if let Ok(source) = std::fs::read_to_string(&canonical) {
-                let lines: Vec<&str> = source.lines().collect();
-                let start = (node.start_line as usize).saturating_sub(1 + context_lines);
-                let end = ((node.end_line as usize) + context_lines).min(lines.len());
-                lines[start..end].join("\n")
-            } else {
-                node.code_content.clone()
-            }
-        } else {
-            node.code_content.clone()
-        };
-
-        Ok(json!({
-            "node_id": node.id,
-            "name": node.name,
-            "type": node.node_type,
-            "file_path": file_path,
-            "start_line": node.start_line,
-            "end_line": node.end_line,
-            "code": full_snippet,
-        }))
-    }
+    // read_snippet merged into get_ast_node — old name kept as alias in handle_tool()
 
     fn tool_start_watch(&self) -> Result<serde_json::Value> {
         let project_root = self.project_root.as_ref()
