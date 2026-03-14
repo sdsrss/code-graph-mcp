@@ -25,6 +25,11 @@ fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     Ok(s)
 }
 
+/// Whether a symbol is a test-only symbol (by name or file path convention).
+fn is_test_symbol(name: &str, file_path: &str) -> bool {
+    name.starts_with("test_") || file_path.starts_with("tests/")
+}
+
 /// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
 /// If no method prefix, returns (None, original_path).
 fn parse_route_input(input: &str) -> (Option<String>, &str) {
@@ -356,27 +361,29 @@ impl McpServer {
                     None => return Ok(()),
                 };
                 let db = Database::open_with_vec(&db_path)?;
-                let unembedded = queries::get_unembedded_nodes(db.conn())?;
-                if unembedded.is_empty() {
-                    return Ok(());
-                }
 
-                let total = unembedded.len();
-                tracing::info!("[embed-bg] Embedding {} nodes in background...", total);
+                const EMBED_BATCH: usize = 32;
+                let mut total_embedded = 0usize;
                 let t0 = std::time::Instant::now();
 
-                const EMBED_PROGRESS_BATCH: usize = 32;
-                for (i, chunk) in unembedded.chunks(EMBED_PROGRESS_BATCH).enumerate() {
+                loop {
+                    let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+
                     let tx = db.conn().unchecked_transaction()?;
-                    embed_and_store_batch(&db, &model, chunk)?;
+                    embed_and_store_batch(&db, &model, &chunk)?;
                     tx.commit()?;
 
-                    let done = ((i + 1) * EMBED_PROGRESS_BATCH).min(total);
-                    tracing::info!("[embed-bg] Progress: {}/{} nodes", done, total);
+                    total_embedded += chunk.len();
+                    tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
                 }
 
-                tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
-                    total, t0.elapsed().as_secs_f64());
+                if total_embedded > 0 {
+                    tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
+                        total_embedded, t0.elapsed().as_secs_f64());
+                }
                 Ok(())
             })();
 
@@ -438,7 +445,7 @@ impl McpServer {
     fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
         let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?
             .into_iter()
-            .filter(|c| !c.name.starts_with("test_") && !c.file_path.starts_with("tests/"))
+            .filter(|c| !is_test_symbol(&c.name, &c.file_path))
             .collect();
         if candidates.len() == 1 {
             Ok(FuzzyResolution::Unique(candidates.into_iter().next().unwrap().name))
@@ -1133,7 +1140,7 @@ impl McpServer {
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
         let has_edges = results.iter().any(|n| n.depth > 0);
         let has_seed = results.iter().any(|n| n.depth == 0);
-        if !has_edges && !(has_seed && file_path.is_some()) {
+        if !(has_edges || has_seed && file_path.is_some()) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
                     let results2 = crate::graph::query::get_call_graph(
@@ -1177,7 +1184,7 @@ impl McpServer {
         results: &[crate::graph::query::CallGraphNode],
     ) -> Result<serde_json::Value> {
         let is_test = |n: &&crate::graph::query::CallGraphNode| {
-            n.name.starts_with("test_") || n.file_path.starts_with("tests/")
+            is_test_symbol(&n.name, &n.file_path)
         };
         let all_nodes: Vec<serde_json::Value> = results.iter()
             .filter(|n| n.depth > 0 && !is_test(n))
@@ -1585,6 +1592,16 @@ impl McpServer {
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
+        // Wait for background embedding to finish before clearing data
+        // to avoid race where embedding thread writes vectors for deleted nodes
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.embedding_in_progress.load(Ordering::Acquire) {
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("Background embedding still in progress. Try again shortly."));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
         // Clear all data in a single transaction (CASCADE handles nodes→edges)
         {
             let tx = self.db.conn().unchecked_transaction()?;
@@ -1685,7 +1702,7 @@ impl McpServer {
 
         // Separate production callers from test callers
         let is_test = |c: &&queries::CallerWithRouteInfo| {
-            c.name.starts_with("test_") || c.file_path.starts_with("tests/")
+            is_test_symbol(&c.name, &c.file_path)
         };
         let prod_callers: Vec<_> = callers.iter().filter(|c| !is_test(c)).collect();
         let test_callers: Vec<_> = callers.iter().filter(|c| is_test(c)).collect();

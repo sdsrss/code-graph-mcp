@@ -36,6 +36,7 @@ pub fn weighted_rrf_fusion(
     results
 }
 
+#[cfg(test)]
 pub fn rrf_fusion(
     fts_results: &[SearchResult],
     vec_results: &[SearchResult],

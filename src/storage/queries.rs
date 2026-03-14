@@ -237,6 +237,7 @@ pub fn delete_nodes_by_file(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn update_context_string(conn: &Connection, node_id: i64, context_string: &str) -> Result<()> {
     conn.execute(
         "UPDATE nodes SET context_string = ?1 WHERE id = ?2",
@@ -882,13 +883,15 @@ pub fn get_import_tree(
 // --- Unembedded nodes ---
 
 /// Get (node_id, context_string) for nodes that have context strings but no vectors.
-pub fn get_unembedded_nodes(conn: &Connection) -> Result<Vec<(i64, String)>> {
+/// Returns at most `limit` rows per call to bound memory usage.
+pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT n.id, n.context_string FROM nodes n
          LEFT JOIN node_vectors v ON v.node_id = n.id
-         WHERE n.context_string IS NOT NULL AND v.node_id IS NULL"
+         WHERE n.context_string IS NOT NULL AND v.node_id IS NULL
+         LIMIT ?1"
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([limit as i64], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1007,7 +1010,8 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.id \
-             ORDER BY cnt DESC";
+             ORDER BY cnt DESC \
+             LIMIT 200";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

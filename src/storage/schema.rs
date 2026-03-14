@@ -71,6 +71,25 @@ CREATE INDEX IF NOT EXISTS idx_edges_source_rel ON edges(source_id, relation);
 CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
 "#;
 
+/// FTS5 sync trigger SQL. Shared by migrations that recreate the FTS5 table,
+/// ensuring trigger definitions stay consistent with CREATE_TABLES.
+fn fts5_triggers_sql() -> &'static str {
+    "CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+        INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+        VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+        VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+    END;
+    CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+        VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+        INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+        VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+    END;"
+}
+
 /// Migrate from schema v1 to v2. Must be called within a transaction.
 pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     tracing::info!("[schema] Migrating v1 → v2: adding name_tokens, return_type, param_types");
@@ -93,23 +112,9 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             name, qualified_name, code_content, context_string, doc_comment,
             name_tokens, return_type, param_types,
             content='nodes', content_rowid='id'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
-        END;
-        CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
-        END;
-        CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
-            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
-        END;"
+        );"
     )?;
+    conn.execute_batch(fts5_triggers_sql())?;
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
@@ -167,23 +172,9 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             name_tokens, return_type, param_types,
             content='nodes', content_rowid='id',
             tokenize='porter unicode61'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
-        END;
-        CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
-        END;
-        CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
-            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
-            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
-        END;"
+        );"
     )?;
+    conn.execute_batch(fts5_triggers_sql())?;
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
