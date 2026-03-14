@@ -864,10 +864,8 @@ impl McpServer {
         let result = match name {
             "semantic_code_search" => self.tool_semantic_search(args),
             "get_call_graph" => self.tool_get_call_graph(args),
-            "find_http_route" => self.tool_find_http_route(args),
-            "trace_http_chain" => self.tool_trace_http_chain(args),
-            "get_ast_node" => self.tool_get_ast_node(args),
-            "read_snippet" => self.tool_read_snippet(args),
+            "find_http_route" | "trace_http_chain" => self.tool_trace_http_chain(args),
+            "get_ast_node" | "read_snippet" => self.tool_get_ast_node(args),
             "start_watch" => self.tool_start_watch(),
             "stop_watch" => self.tool_stop_watch(),
             "get_index_status" => self.tool_get_index_status(),
@@ -1286,12 +1284,22 @@ impl McpServer {
     }
 
     fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let file_path = args["file_path"].as_str()
-            .ok_or_else(|| anyhow!("file_path is required"))?;
-        let symbol_name = required_str(args, "symbol_name")?;
+        self.ensure_indexed()?;
+
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
 
-        self.ensure_indexed()?;
+        // Support lookup by node_id (merged read_snippet) or file_path+symbol_name
+        if let Some(nid) = args["node_id"].as_i64() {
+            // When called with node_id (read_snippet mode), default context_lines=3
+            let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
+            return self.ast_node_by_id(nid, include_refs, ctx);
+        }
+
+        let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
+
+        let file_path = args["file_path"].as_str()
+            .ok_or_else(|| anyhow!("Either node_id or file_path+symbol_name is required"))?;
+        let symbol_name = required_str(args, "symbol_name")?;
 
         let nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
         if nodes.is_empty() {
@@ -1321,12 +1329,19 @@ impl McpServer {
                     result["called_by"] = json!(callers);
                 }
 
+                // Add context lines from source file if requested
+                if context_lines > 0 {
+                    if let Some(code) = self.read_source_context(file_path, n.start_line, n.end_line, context_lines) {
+                        result["code"] = json!(code);
+                    }
+                }
+
                 // Compress if code_content exceeds token threshold
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
                     return Ok(json!({
                         "mode": "compressed_node",
-                        "message": "Node content exceeded token limit. Use read_snippet(node_id) to read full code.",
+                        "message": "Node content exceeded token limit. Retry with context_lines=0 or use get_ast_node(node_id=N) to read specific parts.",
                         "node_id": n.id,
                         "name": n.name,
                         "type": n.node_type,
@@ -1357,6 +1372,57 @@ impl McpServer {
                 Err(anyhow!("Symbol '{}' not found in '{}'{}", symbol_name, file_path, hint))
             }
         }
+    }
+
+    /// Lookup AST node by node_id (merged read_snippet functionality).
+    fn ast_node_by_id(&self, node_id: i64, include_refs: bool, context_lines: usize) -> Result<serde_json::Value> {
+        let node = queries::get_node_by_id(self.db.conn(), node_id)?
+            .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
+        let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
+            .ok_or_else(|| anyhow!("File record missing for node {}", node_id))?;
+
+        let mut result = json!({
+            "node_id": node.id,
+            "name": node.name,
+            "type": node.node_type,
+            "file_path": file_path,
+            "start_line": node.start_line,
+            "end_line": node.end_line,
+            "code_content": node.code_content,
+            "signature": node.signature,
+        });
+
+        if include_refs {
+            use crate::domain::REL_CALLS as CALLS;
+            let callees = queries::get_edge_target_names(self.db.conn(), node.id, CALLS)?;
+            let callers = queries::get_edge_source_names(self.db.conn(), node.id, CALLS)?;
+            result["calls"] = json!(callees);
+            result["called_by"] = json!(callers);
+        }
+
+        if context_lines > 0 {
+            if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
+                result["code"] = json!(code);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read source code with context lines from the project file system.
+    fn read_source_context(&self, file_path: &str, start_line: i64, end_line: i64, context_lines: usize) -> Option<String> {
+        let root = self.project_root.as_ref()?;
+        let abs_path = root.join(file_path);
+        let canonical = abs_path.canonicalize().ok()?;
+        let root_canonical = root.canonicalize().ok()?;
+        if !canonical.starts_with(&root_canonical) {
+            return None; // path traversal
+        }
+        let source = std::fs::read_to_string(&canonical).ok()?;
+        let lines: Vec<&str> = source.lines().collect();
+        let start = (start_line as usize).saturating_sub(1 + context_lines);
+        let end = ((end_line as usize) + context_lines).min(lines.len());
+        Some(lines[start..end].join("\n"))
     }
 
     fn tool_read_snippet(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
