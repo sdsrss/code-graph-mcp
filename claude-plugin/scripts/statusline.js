@@ -1,7 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const { findBinary } = require('./find-binary');
+
+// Only show status in projects that have a code-graph index.
+// The statusLine config is global, so we must exit silently for
+// directories that aren't code-graph projects.
+const cwd = process.cwd();
+if (!fs.existsSync(path.join(cwd, '.code-graph', 'index.db'))) {
+  process.exit(0);
+}
 
 const bin = findBinary();
 if (!bin) {
