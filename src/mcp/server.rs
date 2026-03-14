@@ -977,7 +977,7 @@ impl McpServer {
                 }
                 // Truncate large code_content to reduce token usage;
                 // users can get full code via get_ast_node(node_id)
-                const MAX_SEARCH_CODE_LEN: usize = 1500;
+                const MAX_SEARCH_CODE_LEN: usize = 500;
                 let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
                     let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
                         .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
@@ -1145,7 +1145,14 @@ impl McpServer {
                 }
                 FuzzyResolution::NotFound => {
                     if !has_seed {
-                        return Err(anyhow!("Function '{}' not found in the index", function_name));
+                        return Ok(json!({
+                            "function": function_name,
+                            "direction": direction,
+                            "callers": [],
+                            "callees": [],
+                            "error": format!("Symbol '{}' not found in the index.", function_name),
+                            "hint": "Use semantic_code_search to find the correct symbol name, or check spelling.",
+                        }));
                     }
                     // Function exists but has no callers/callees — fall through
                 }
@@ -1318,7 +1325,10 @@ impl McpServer {
                 .filter(|n| !n.name.starts_with("test_"))
                 .collect();
             return match non_test.len() {
-                0 => Err(anyhow!("Symbol '{}' not found in index", sym)),
+                0 => Ok(json!({
+                    "error": format!("Symbol '{}' not found in index.", sym),
+                    "hint": "Use semantic_code_search to find the correct symbol name, or check spelling.",
+                })),
                 1 => self.ast_node_by_id(non_test[0].id, include_refs, context_lines),
                 _ => {
                     let suggestions: Vec<_> = non_test.iter().map(|n| {
@@ -1346,7 +1356,10 @@ impl McpServer {
 
         let nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
         if nodes.is_empty() {
-            return Err(anyhow!("File '{}' not found in index. Check that the path is relative to the project root and the file has been indexed.", file_path));
+            return Ok(json!({
+                "error": format!("File '{}' not found in index.", file_path),
+                "hint": "Check that the path is relative to the project root and the file has been indexed.",
+            }));
         }
         let node = nodes.iter().find(|n| n.name == symbol_name);
 
@@ -1776,25 +1789,40 @@ impl McpServer {
             }))
             .collect();
 
-        // Cap exports to avoid bloating context — full project can have 500+ symbols
-        // Active exports (caller_count > 0) get full detail including signature;
-        // inactive ones get compact representation to save tokens.
-        const MAX_EXPORTS: usize = 50;
-        let total_exports = exports.len();
-        let capped = total_exports > MAX_EXPORTS;
-        let all_exports: Vec<serde_json::Value> = exports.iter()
-            .take(MAX_EXPORTS)
-            .map(|e| {
+        // Split exports into active (called by others) and inactive to save tokens.
+        // Active exports get full detail; inactive ones are summarized by type.
+        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter()
+            .partition(|e| e.caller_count > 0);
+
+        const MAX_ACTIVE: usize = 30;
+        let active_capped = active.len() > MAX_ACTIVE;
+        let active_exports: Vec<serde_json::Value> = active.iter()
+            .take(MAX_ACTIVE)
+            .map(|e| json!({
+                "node_id": e.node_id,
+                "name": e.name,
+                "type": e.node_type,
+                "file": e.file_path,
+                "caller_count": e.caller_count,
+                "signature": e.signature,
+            }))
+            .collect();
+
+        // Compact summary for inactive symbols — just counts by type
+        let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        for e in &inactive {
+            inactive_by_type.entry(e.node_type.as_str()).or_default().push(e.name.as_str());
+        }
+        let inactive_summary: Vec<serde_json::Value> = inactive_by_type.iter()
+            .map(|(typ, names)| {
+                let display: Vec<&&str> = names.iter().take(8).collect();
                 let mut obj = json!({
-                    "node_id": e.node_id,
-                    "name": e.name,
-                    "type": e.node_type,
-                    "file": e.file_path,
-                    "caller_count": e.caller_count,
+                    "type": typ,
+                    "count": names.len(),
+                    "names": display,
                 });
-                // Only include signature for actively-called symbols to save tokens
-                if e.caller_count > 0 {
-                    obj["signature"] = json!(e.signature);
+                if names.len() > 8 {
+                    obj["more"] = json!(names.len() - 8);
                 }
                 obj
             })
@@ -1803,18 +1831,20 @@ impl McpServer {
         let mut result = json!({
             "path": raw_path,
             "files_count": files.len(),
-            "exports": all_exports,
+            "active_exports": active_exports,
+            "inactive_summary": inactive_summary,
             "hot_paths": hot_paths,
-            "summary": format!("Module '{}': {} exports across {} files", raw_path, total_exports, files.len())
+            "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
+                raw_path, active.len(), inactive.len(), files.len())
         });
         if files.is_empty() {
             result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
         }
-        if capped {
-            result["capped"] = json!(true);
-            result["showing"] = json!(MAX_EXPORTS);
-            result["total"] = json!(total_exports);
-            result["hint"] = json!("Results capped. Use a more specific path (e.g. 'src/mcp/') to see all exports.");
+        if active_capped {
+            result["active_capped"] = json!(true);
+            result["showing"] = json!(MAX_ACTIVE);
+            result["total_active"] = json!(active.len());
+            result["hint"] = json!("Active exports capped. Use a more specific path to see all.");
         }
         Ok(result)
     }
@@ -1892,7 +1922,7 @@ impl McpServer {
         } else if let Some(name) = args["symbol_name"].as_str() {
             self.db.conn()
                 .query_row("SELECT id FROM nodes WHERE name = ?1 LIMIT 1", [name], |row| row.get(0))
-                .map_err(|_| anyhow!("Symbol '{}' not found in index", name))?
+                .map_err(|_| anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct name.", name))?
         } else {
             return Err(anyhow!("Either node_id or symbol_name is required"));
         };

@@ -452,22 +452,32 @@ export function login(email: string, pw: string) {
     assert!(result["files_count"].as_i64().unwrap() >= 2, "should cover at least 2 files");
     assert!(result["summary"].as_str().unwrap().contains("src/auth/"));
 
-    let exports = result["exports"].as_array().unwrap();
-    assert!(exports.len() >= 3, "should have at least 3 exports (validateEmail, validatePassword, login), got {}", exports.len());
-    let export_names: Vec<&str> = exports.iter()
+    // Active exports: symbols with caller_count > 0
+    let active = result["active_exports"].as_array().unwrap();
+    let active_names: Vec<&str> = active.iter()
         .filter_map(|e| e["name"].as_str()).collect();
-    assert!(export_names.contains(&"validateEmail"), "exports should contain validateEmail, got {:?}", export_names);
-    assert!(export_names.contains(&"validatePassword"), "exports should contain validatePassword, got {:?}", export_names);
-    assert!(export_names.contains(&"login"), "exports should contain login, got {:?}", export_names);
+    assert!(active_names.contains(&"validateEmail"), "active_exports should contain validateEmail, got {:?}", active_names);
+    assert!(active_names.contains(&"validatePassword"), "active_exports should contain validatePassword, got {:?}", active_names);
 
-    // Each export should have expected fields
-    for exp in exports {
+    // Each active export should have expected fields
+    for exp in active {
         assert!(exp["node_id"].is_number(), "export should have node_id");
         assert!(exp["name"].is_string(), "export should have name");
         assert!(exp["type"].is_string(), "export should have type");
         assert!(exp["file"].is_string(), "export should have file");
         assert!(exp["caller_count"].is_number(), "export should have caller_count");
+        assert!(exp["signature"].is_string() || exp["signature"].is_null(), "active export should have signature");
     }
+
+    // Inactive summary: symbols with caller_count == 0 grouped by type
+    let inactive = result["inactive_summary"].as_array().unwrap();
+    // login has no callers, should be in inactive summary
+    let empty_arr = vec![];
+    let all_inactive_names: Vec<&str> = inactive.iter()
+        .flat_map(|g| g["names"].as_array().unwrap_or(&empty_arr).iter()
+            .filter_map(|n| n.as_str()))
+        .collect();
+    assert!(all_inactive_names.contains(&"login"), "inactive_summary should contain login, got {:?}", all_inactive_names);
 
     // hot_paths should include functions that have callers
     let hot_paths = result["hot_paths"].as_array().unwrap();
@@ -483,8 +493,9 @@ export function login(email: string, pw: string) {
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["files_count"], 1);
-    let exports = result["exports"].as_array().unwrap();
-    assert_eq!(exports.len(), 2, "validator.ts should have 2 exports");
+    // Both validateEmail and validatePassword have callers → active_exports
+    let active = result["active_exports"].as_array().unwrap();
+    assert_eq!(active.len(), 2, "validator.ts should have 2 active exports");
 }
 
 #[test]
