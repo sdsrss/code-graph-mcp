@@ -315,7 +315,9 @@ fn index_files(
     // to the same underlying connection). This is safe because:
     // (1) db.conn() returns the same Connection the tx was opened on,
     // (2) we never open nested transactions,
-    // (3) the server is single-threaded.
+    // (3) concurrent access (e.g. background embedding thread) uses separate
+    //     DB connections; safety relies on SQLite WAL mode + busy_timeout(5000),
+    //     not single-threadedness.
 
     let mut total_nodes_created = 0usize;
     let mut total_edges_created = 0usize;

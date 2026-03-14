@@ -450,6 +450,12 @@ pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> 
 
 // --- Additional node queries ---
 
+pub fn get_first_node_id_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE name = ?1 LIMIT 1")?;
+    let rows = stmt.query_map([name], |row| row.get::<_, i64>(0))?;
+    Ok(first_row(rows)?)
+}
+
 pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResult>> {
     let mut stmt = conn.prepare(
         &format!("SELECT {} FROM nodes WHERE id = ?1", NODE_SELECT)
@@ -992,21 +998,18 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 2. Key symbols per module (C2: language-agnostic — use most-called functions per module)
     let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
     {
-        let sql = format!(
-            "SELECT n.name, f.path, COUNT(e.id) as cnt \
+        let sql = "SELECT n.name, f.path, COUNT(e.id) as cnt \
              FROM nodes n \
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
-             WHERE e.relation = '{}' AND n.type != 'module' AND n.name != '<module>' \
+             WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-               AND f.path NOT LIKE 'tests/%%' \
-               AND f.path NOT LIKE '%%_test.%%' \
+               AND f.path NOT LIKE 'tests/%' \
+               AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.id \
-             ORDER BY cnt DESC",
-            REL_CALLS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+             ORDER BY cnt DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_CALLS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -1021,15 +1024,12 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
 
     // Also add explicit exports (JS/TS) where available
     {
-        let sql = format!(
-            "SELECT DISTINCT n.name, f.path FROM edges e \
+        let sql = "SELECT DISTINCT n.name, f.path FROM edges e \
              JOIN nodes n ON n.id = e.target_id \
              JOIN files f ON f.id = n.file_id \
-             WHERE e.relation = '{}' AND n.name != '<module>'",
-            REL_EXPORTS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+             WHERE e.relation = ?1 AND n.name != '<module>'";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_EXPORTS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -1059,19 +1059,16 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 3. Cross-module dependencies (C3: use REL_IMPORTS constant)
     let mut dep_map: HashMap<(String, String), usize> = HashMap::new();
     {
-        let sql = format!(
-            "SELECT sf.path, tf.path, COUNT(*) \
+        let sql = "SELECT sf.path, tf.path, COUNT(*) \
              FROM edges e \
              JOIN nodes sn ON sn.id = e.source_id \
              JOIN nodes tn ON tn.id = e.target_id \
              JOIN files sf ON sf.id = sn.file_id \
              JOIN files tf ON tf.id = tn.file_id \
-             WHERE e.relation = '{}' AND sf.path != tf.path \
-             GROUP BY sf.path, tf.path",
-            REL_IMPORTS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+             WHERE e.relation = ?1 AND sf.path != tf.path \
+             GROUP BY sf.path, tf.path";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_IMPORTS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? as usize))
         })?;
         for row in rows {
@@ -1091,18 +1088,15 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 4. HTTP entry points (C3: use REL_ROUTES_TO constant)
     let mut entry_points = Vec::new();
     {
-        let sql = format!(
-            "SELECT tn.name, sf.path, e.metadata \
+        let sql = "SELECT tn.name, sf.path, e.metadata \
              FROM edges e \
              JOIN nodes sn ON sn.id = e.source_id \
              JOIN nodes tn ON tn.id = e.target_id \
              JOIN files sf ON sf.id = sn.file_id \
-             WHERE e.relation = '{}' \
-             LIMIT 20",
-            REL_ROUTES_TO
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+             WHERE e.relation = ?1 \
+             LIMIT 20";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_ROUTES_TO], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
         })?;
         for row in rows {
@@ -1125,22 +1119,19 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 5. Hot functions (C1: filter test code, C3: use REL_CALLS constant)
     let mut hot_functions = Vec::new();
     {
-        let sql = format!(
-            "SELECT n.name, n.type, f.path, COUNT(e.id) as cnt \
+        let sql = "SELECT n.name, n.type, f.path, COUNT(e.id) as cnt \
              FROM nodes n \
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
-             WHERE e.relation = '{}' AND n.type != 'module' AND n.name != '<module>' \
+             WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-               AND f.path NOT LIKE 'tests/%%' \
-               AND f.path NOT LIKE '%%_test.%%' \
+               AND f.path NOT LIKE 'tests/%' \
+               AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.id \
              ORDER BY cnt DESC \
-             LIMIT 15",
-            REL_CALLS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+             LIMIT 15";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_CALLS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)? as usize))
         })?;
         for row in rows {

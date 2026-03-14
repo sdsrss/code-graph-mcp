@@ -452,6 +452,35 @@ impl McpServer {
         }
     }
 
+    /// Check if a symbol name is ambiguous (exists in multiple files).
+    /// Returns Some(suggestions) if ambiguous, None if unambiguous or not found.
+    fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
+        let candidates = queries::get_nodes_by_name(self.db.conn(), name)?;
+        let non_test: Vec<_> = candidates.iter()
+            .filter(|n| !n.name.starts_with("test_"))
+            .collect();
+        if non_test.len() > 1 {
+            let mut seen_files = std::collections::HashSet::new();
+            for n in &non_test {
+                seen_files.insert(n.file_id);
+            }
+            if seen_files.len() > 1 {
+                let suggestions: Vec<_> = non_test.iter().map(|n| {
+                    let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                        .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                    json!({
+                        "name": &n.name,
+                        "file_path": fp,
+                        "type": &n.node_type,
+                        "node_id": n.id,
+                    })
+                }).collect();
+                return Ok(Some(suggestions));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -1087,34 +1116,13 @@ impl McpServer {
 
         // Disambiguate: if no file_path provided, check if symbol matches multiple distinct nodes
         if file_path.is_none() {
-            let candidates = queries::get_nodes_by_name(self.db.conn(), function_name)?;
-            let non_test: Vec<_> = candidates.iter()
-                .filter(|n| !n.name.starts_with("test_"))
-                .collect();
-            // Check if there are matches in multiple distinct files
-            if non_test.len() > 1 {
-                let mut seen_files = std::collections::HashSet::new();
-                for n in &non_test {
-                    seen_files.insert(n.file_id);
-                }
-                if seen_files.len() > 1 {
-                    let suggestions: Vec<_> = non_test.iter().map(|n| {
-                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
-                        json!({
-                            "name": &n.name,
-                            "file_path": fp,
-                            "type": &n.node_type,
-                            "node_id": n.id,
-                        })
-                    }).collect();
-                    return Ok(json!({
-                        "function": function_name,
-                        "direction": direction,
-                        "error": format!("Ambiguous symbol '{}': {} matches in different files. Specify file_path to disambiguate.", function_name, suggestions.len()),
-                        "suggestions": suggestions,
-                    }));
-                }
+            if let Some(suggestions) = self.disambiguate_symbol(function_name)? {
+                return Ok(json!({
+                    "function": function_name,
+                    "direction": direction,
+                    "error": format!("Ambiguous symbol '{}': {} matches in different files. Specify file_path to disambiguate.", function_name, suggestions.len()),
+                    "suggestions": suggestions,
+                }));
             }
         }
 
@@ -1620,35 +1628,13 @@ impl McpServer {
             .clamp(1, 20) as i32;
 
         // Disambiguate: check if symbol matches multiple distinct nodes in different files
-        {
-            let candidates = queries::get_nodes_by_name(self.db.conn(), symbol_name)?;
-            let non_test: Vec<_> = candidates.iter()
-                .filter(|n| !n.name.starts_with("test_"))
-                .collect();
-            if non_test.len() > 1 {
-                let mut seen_files = std::collections::HashSet::new();
-                for n in &non_test {
-                    seen_files.insert(n.file_id);
-                }
-                if seen_files.len() > 1 {
-                    let suggestions: Vec<_> = non_test.iter().map(|n| {
-                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
-                        json!({
-                            "name": &n.name,
-                            "file_path": fp,
-                            "type": &n.node_type,
-                            "node_id": n.id,
-                        })
-                    }).collect();
-                    return Ok(json!({
-                        "symbol": symbol_name,
-                        "change_type": change_type,
-                        "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
-                        "suggestions": suggestions,
-                    }));
-                }
-            }
+        if let Some(suggestions) = self.disambiguate_symbol(symbol_name)? {
+            return Ok(json!({
+                "symbol": symbol_name,
+                "change_type": change_type,
+                "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
+                "suggestions": suggestions,
+            }));
         }
 
         let mut resolved_name = symbol_name.to_string();
@@ -1920,9 +1906,8 @@ impl McpServer {
         let node_id = if let Some(id) = args["node_id"].as_i64() {
             id
         } else if let Some(name) = args["symbol_name"].as_str() {
-            self.db.conn()
-                .query_row("SELECT id FROM nodes WHERE name = ?1 LIMIT 1", [name], |row| row.get(0))
-                .map_err(|_| anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct name.", name))?
+            queries::get_first_node_id_by_name(self.db.conn(), name)?
+                .ok_or_else(|| anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct name.", name))?
         } else {
             return Err(anyhow!("Either node_id or symbol_name is required"));
         };
