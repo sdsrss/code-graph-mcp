@@ -564,7 +564,19 @@ impl McpServer {
             "serverInfo": {
                 "name": "code-graph-mcp",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": concat!(
+                "Code Graph provides AST-level code intelligence. ",
+                "Prefer these tools over Grep+Read:\n",
+                "- Before modifying a function → impact_analysis (check blast radius first)\n",
+                "- Who calls X / what does X call → get_call_graph (not Grep)\n",
+                "- Understand a module/file → module_overview (not Read each file)\n",
+                "- Get one symbol's signature + relations → get_ast_node (not Read whole file)\n",
+                "- HTTP route → handler → downstream → trace_http_chain\n",
+                "- File import/export dependencies → dependency_graph\n",
+                "Still use Grep for: literal strings, constants, regex patterns. ",
+                "Still use Read for: specific files you need to edit."
+            )
         }))
     }
 

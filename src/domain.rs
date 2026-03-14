@@ -20,3 +20,18 @@ pub const MAX_RELATION_DEPTH: usize = 256;
 // -- Indexing limits --
 pub const MAX_FILE_SIZE: u64 = 1_048_576; // 1 MB
 pub const MAX_CODE_CONTENT_LEN: usize = 4096; // 4KB max stored per node
+
+// -- Edge resolution noise filter --
+// Common standard-library method/trait names that produce false-positive call edges
+// when resolved cross-file by name alone (without type context).
+// These are skipped for cross-file `calls` edge creation.
+pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
+    "new", "default", "from", "into", "as_str", "to_string", "clone",
+    "fmt", "display", "drop", "try_from", "try_into",
+    "as_ref", "as_mut", "borrow", "borrow_mut", "deref", "deref_mut",
+    "eq", "ne", "cmp", "partial_cmp", "hash",
+    "serialize", "deserialize",
+    "next", "iter", "into_iter",
+    "build", "builder",
+    "len", "is_empty",
+];

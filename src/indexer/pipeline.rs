@@ -12,7 +12,7 @@ use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::*;
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_FILE_SIZE};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_FILE_SIZE, CROSS_FILE_CALL_NOISE};
 use crate::utils::config::detect_language;
 
 pub struct IndexResult {
@@ -523,6 +523,13 @@ fn index_files(
                     .collect();
                 let target_ids = if !same_file_targets.is_empty() {
                     same_file_targets
+                } else if rel.relation == REL_CALLS
+                    && CROSS_FILE_CALL_NOISE.contains(&rel.target_name.as_str())
+                {
+                    // Skip cross-file edges for common stdlib method names
+                    // (e.g., "new", "default", "from") that produce false positives
+                    // when resolved by name alone without type context.
+                    continue;
                 } else {
                     all_target_ids
                 };

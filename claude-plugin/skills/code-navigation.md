@@ -1,6 +1,6 @@
 ---
 name: code-navigation
-description: Smart code navigation decision tree for code-graph MCP tools. Use when exploring, understanding, or navigating code in a project indexed by code-graph.
+description: Code-graph tool selection guide. Use BEFORE any code exploration, bug fixing, feature implementation, or refactoring task to choose the most token-efficient tool (code-graph vs Grep/Read). Especially important before modifying functions — check impact_analysis first.
 ---
 
 # Code Navigation with Code Graph
