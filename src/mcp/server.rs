@@ -371,7 +371,10 @@ impl McpServer {
 
     /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
     fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
-        let candidates = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?;
+        let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?
+            .into_iter()
+            .filter(|c| !c.name.starts_with("test_") && !c.file_path.starts_with("tests/"))
+            .collect();
         if candidates.len() == 1 {
             Ok(FuzzyResolution::Unique(candidates.into_iter().next().unwrap().name))
         } else if !candidates.is_empty() {
@@ -898,7 +901,6 @@ impl McpServer {
                     "end_line": node.end_line,
                     "code_content": node.code_content,
                     "signature": node.signature,
-                    "context_string": node.context_string,
                 }));
                 matched.push(MatchedNode {
                     node: &nwf.node,
