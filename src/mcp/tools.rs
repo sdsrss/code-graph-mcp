@@ -69,7 +69,7 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "file_path": { "type": "string", "description": "File path (with symbol_name)" },
-                        "symbol_name": { "type": "string", "description": "Symbol name (with file_path)" },
+                        "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve)" },
                         "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0)" }

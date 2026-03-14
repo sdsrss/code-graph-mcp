@@ -1257,9 +1257,41 @@ impl McpServer {
 
         let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
 
-        let file_path = args["file_path"].as_str()
-            .ok_or_else(|| anyhow!("Either node_id or file_path+symbol_name is required"))?;
-        let symbol_name = required_str(args, "symbol_name")?;
+        let symbol_name = args["symbol_name"].as_str();
+        let file_path = args["file_path"].as_str();
+
+        // If only symbol_name provided (no file_path), resolve by name lookup
+        if let (Some(sym), None) = (symbol_name, file_path) {
+            let candidates = queries::get_nodes_by_name(self.db.conn(), sym)?;
+            let non_test: Vec<_> = candidates.iter()
+                .filter(|n| !n.name.starts_with("test_"))
+                .collect();
+            return match non_test.len() {
+                0 => Err(anyhow!("Symbol '{}' not found in index", sym)),
+                1 => self.ast_node_by_id(non_test[0].id, include_refs, context_lines),
+                _ => {
+                    let suggestions: Vec<_> = non_test.iter().map(|n| {
+                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                        json!({
+                            "name": n.name,
+                            "file_path": fp,
+                            "type": n.node_type,
+                            "node_id": n.id,
+                        })
+                    }).collect();
+                    Ok(json!({
+                        "error": format!("Ambiguous symbol '{}': {} matches found. Specify file_path or use node_id.", sym, suggestions.len()),
+                        "suggestions": suggestions,
+                    }))
+                }
+            };
+        }
+
+        let file_path = file_path
+            .ok_or_else(|| anyhow!("Either node_id, symbol_name, or file_path+symbol_name is required"))?;
+        let symbol_name = symbol_name
+            .ok_or_else(|| anyhow!("symbol_name is required when using file_path"))?;
 
         let nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
         if nodes.is_empty() {
@@ -1746,13 +1778,22 @@ impl McpServer {
             }));
         }
 
+        // Check if any embeddings exist at all
+        let (embedded_count, total_nodes) = queries::count_nodes_with_vectors(self.db.conn())?;
+        if embedded_count == 0 {
+            return Ok(json!({
+                "error": format!("No embeddings found ({} nodes indexed, 0 embedded). The embedding model may not be loaded — restart the MCP server with the embed-model feature enabled.", total_nodes),
+                "node_id": node_id
+            }));
+        }
+
         // Get the node's embedding
         let embedding: Vec<f32> = {
             let bytes: Vec<u8> = self.db.conn().query_row(
                 "SELECT embedding FROM node_vectors WHERE node_id = ?1",
                 [node_id],
                 |row| row.get(0),
-            ).map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded.", node_id))?;
+            ).map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded yet ({}/{} nodes embedded).", node_id, embedded_count, total_nodes))?;
             bytemuck::cast_slice(&bytes).to_vec()
         };
 
