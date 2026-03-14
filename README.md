@@ -205,19 +205,15 @@ npm uninstall -g @sdsrs/code-graph
 
 | Tool | Description |
 |------|-------------|
+| `project_map` | Full project architecture: modules, dependencies, entry points, hot functions |
 | `semantic_code_search` | Hybrid BM25 + vector + graph search for AST nodes |
 | `get_call_graph` | Trace upstream/downstream call chains for a function |
-| `find_http_route` | Map route path to backend handler function |
 | `trace_http_chain` | Full request flow: route → handler → downstream call chain |
 | `impact_analysis` | Analyze the blast radius of changing a symbol |
 | `module_overview` | High-level overview of a module's structure and exports |
 | `dependency_graph` | Visualize dependency relationships between modules |
 | `find_similar_code` | Find code snippets similar to a given pattern |
-| `get_ast_node` | Extract a specific code symbol from a file |
-| `read_snippet` | Read original code snippet by node ID with context |
-| `start_watch` / `stop_watch` | Start/stop file system watcher for incremental indexing |
-| `get_index_status` | Query index status and health |
-| `rebuild_index` | Force full index rebuild |
+| `get_ast_node` | Extract a specific code symbol with signature, body, and relations |
 
 ## Plugin Slash Commands
 
@@ -228,6 +224,8 @@ Available when installed as a Claude Code plugin:
 | `/understand <module>` | Deep dive into a module or file's architecture and relationships |
 | `/trace <route>` | Trace a full HTTP request flow from route to data layer |
 | `/impact <symbol>` | Analyze the impact scope of changing a symbol before modifying it |
+| `/status` | Show code-graph index status and embedding progress |
+| `/rebuild` | Force a full code-graph index rebuild |
 
 ## Supported Languages
 
