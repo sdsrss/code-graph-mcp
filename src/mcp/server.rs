@@ -860,8 +860,12 @@ impl McpServer {
             nodes_with_files.iter().map(|nwf| (nwf.node.id, nwf)).collect();
 
         // Collect results with language/node_type filtering
-        let mut node_results: Vec<queries::NodeResult> = Vec::new();
-        let mut file_paths: Vec<String> = Vec::new();
+        // We keep matched (node, file_path) pairs for lazy compression building
+        struct MatchedNode<'a> {
+            node: &'a queries::NodeResult,
+            file_path: &'a str,
+        }
+        let mut matched: Vec<MatchedNode> = Vec::new();
         let mut results = Vec::new();
         for r in &fused {
             if results.len() >= top_k as usize {
@@ -896,7 +900,24 @@ impl McpServer {
                     "signature": node.signature,
                     "context_string": node.context_string,
                 }));
-                node_results.push(queries::NodeResult {
+                matched.push(MatchedNode {
+                    node: &nwf.node,
+                    file_path: &nwf.file_path,
+                });
+            }
+        }
+
+        // Context Sandbox: compress only if results likely exceed token threshold
+        // Estimate tokens: ~1 token per 3 chars of code content
+        use crate::sandbox::compressor::CompressedOutput;
+        let estimated_tokens: usize = matched.iter()
+            .map(|m| m.node.code_content.len() / 3)
+            .sum();
+        if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
+            // Build node_results and file_paths only when compression is needed
+            let node_results: Vec<queries::NodeResult> = matched.iter().map(|m| {
+                let node = m.node;
+                queries::NodeResult {
                     id: node.id,
                     file_id: node.file_id,
                     node_type: node.node_type.clone(),
@@ -911,13 +932,9 @@ impl McpServer {
                     name_tokens: node.name_tokens.clone(),
                     return_type: node.return_type.clone(),
                     param_types: node.param_types.clone(),
-                });
-                file_paths.push(nwf.file_path.clone());
-            }
-        }
-
-        // Context Sandbox: compress if results exceed token threshold
-        use crate::sandbox::compressor::CompressedOutput;
+                }
+            }).collect();
+            let file_paths: Vec<String> = matched.iter().map(|m| m.file_path.to_string()).collect();
         if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, COMPRESSION_TOKEN_THRESHOLD)? {
             let (mode, compact) = match compressed {
                 CompressedOutput::Nodes(nodes) => {
@@ -951,6 +968,7 @@ impl McpServer {
                 "results": compact
             }));
         }
+        } // end estimated_tokens check
 
         Ok(json!(results))
     }
@@ -1394,7 +1412,8 @@ impl McpServer {
         }
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
-            .unwrap_or(3) as i32;
+            .unwrap_or(3)
+            .clamp(1, 20) as i32;
 
         let mut resolved_name = symbol_name.to_string();
         let mut callers = queries::get_callers_with_route_info(

@@ -52,23 +52,45 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     let conn = ctx.db.conn();
     let status = queries::get_index_status(conn, false)?;
 
+    let expected_schema = crate::storage::schema::SCHEMA_VERSION;
+    let schema_ok = status.schema_version == expected_schema;
+    let has_data = status.nodes_count > 0 && status.files_count > 0;
+    let healthy = schema_ok && has_data;
+
     match format {
         "json" => {
-            let json = serde_json::json!({
-                "healthy": true,
+            let mut json = serde_json::json!({
+                "healthy": healthy,
                 "nodes": status.nodes_count,
                 "edges": status.edges_count,
                 "files": status.files_count,
                 "watching": false,
                 "schema_version": status.schema_version,
             });
+            if !schema_ok {
+                json["issue"] = serde_json::json!(format!(
+                    "schema version mismatch: got {}, expected {}",
+                    status.schema_version, expected_schema
+                ));
+            } else if !has_data {
+                json["issue"] = serde_json::json!("index is empty");
+            }
             println!("{}", json);
         }
         _ => {
-            println!(
-                "OK: {} nodes, {} edges, {} files",
-                status.nodes_count, status.edges_count, status.files_count
-            );
+            if healthy {
+                println!(
+                    "OK: {} nodes, {} edges, {} files",
+                    status.nodes_count, status.edges_count, status.files_count
+                );
+            } else if !schema_ok {
+                println!(
+                    "UNHEALTHY: schema version mismatch (got {}, expected {})",
+                    status.schema_version, expected_schema
+                );
+            } else {
+                println!("UNHEALTHY: index is empty");
+            }
         }
     }
     Ok(())

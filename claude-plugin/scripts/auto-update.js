@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -87,6 +87,21 @@ async function fetchLatestRelease() {
   } catch { return null; }
 }
 
+// ── Helpers ────────────────────────────────────────────────
+
+function copyDirSync(src, dst) {
+  fs.mkdirSync(dst, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const srcPath = path.join(src, entry.name);
+    const dstPath = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      copyDirSync(srcPath, dstPath);
+    } else {
+      fs.copyFileSync(srcPath, dstPath);
+    }
+  }
+}
+
 // ── Download & Install ─────────────────────────────────────
 
 async function downloadAndInstall(latest) {
@@ -94,13 +109,20 @@ async function downloadAndInstall(latest) {
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // 1. Download and extract tarball (plugin files)
-    execSync(
-      `curl -sL -H "Accept: application/vnd.github+json" "${latest.tarballUrl}" | tar xz -C "${tmpDir}" --strip-components=1`,
-      { timeout: 30000, stdio: 'pipe' }
-    );
+    // 1. Download tarball (safe: no shell interpolation)
+    const tarballPath = path.join(tmpDir, 'release.tar.gz');
+    execFileSync('curl', [
+      '-sL', '-o', tarballPath,
+      '-H', 'Accept: application/vnd.github+json',
+      latest.tarballUrl,
+    ], { timeout: 30000, stdio: 'pipe' });
 
-    // 2. Copy plugin files to cache
+    // 2. Extract tarball
+    execFileSync('tar', [
+      'xzf', tarballPath, '-C', tmpDir, '--strip-components=1',
+    ], { timeout: 15000, stdio: 'pipe' });
+
+    // 3. Copy plugin files to cache (cross-platform)
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
       os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph', latest.version
@@ -108,11 +130,10 @@ async function downloadAndInstall(latest) {
 
     if (fs.existsSync(pluginSrc)) {
       fs.mkdirSync(pluginDst, { recursive: true });
-      // Copy recursively
-      execSync(`cp -r "${pluginSrc}/." "${pluginDst}/"`, { stdio: 'pipe' });
+      copyDirSync(pluginSrc, pluginDst);
     }
 
-    // 3. Update installed_plugins.json to point to new version
+    // 4. Update installed_plugins.json to point to new version
     const installedPath = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
     try {
       const installed = readJson(installedPath);
@@ -124,7 +145,7 @@ async function downloadAndInstall(latest) {
       }
     } catch { /* installed_plugins update failed — not fatal */ }
 
-    // 4. Update install manifest with tag version
+    // 5. Update install manifest with tag version
     try {
       const manifest = readManifest();
       manifest.version = latest.version;
@@ -132,9 +153,9 @@ async function downloadAndInstall(latest) {
       writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
     } catch { /* manifest update failed — not fatal */ }
 
-    // 5. Update npm binary (non-blocking, best-effort)
+    // 6. Update npm binary (non-blocking, best-effort)
     try {
-      execSync(`npm install -g ${NPM_PACKAGE}@${latest.version}`, {
+      execFileSync('npm', ['install', '-g', `${NPM_PACKAGE}@${latest.version}`], {
         timeout: 60000,
         stdio: 'pipe',
       });
