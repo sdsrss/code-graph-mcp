@@ -631,16 +631,18 @@ impl McpServer {
                 "version": env!("CARGO_PKG_VERSION")
             },
             "instructions": concat!(
-                "Code Graph provides AST-level code intelligence. ",
-                "Prefer these tools over Grep+Read:\n",
-                "- Before modifying a function → impact_analysis (check blast radius first)\n",
-                "- Who calls X / what does X call → get_call_graph (not Grep)\n",
-                "- Understand a module/file → module_overview (not Read each file)\n",
-                "- Get one symbol's signature + relations → get_ast_node (not Read whole file)\n",
-                "- HTTP route → handler → downstream → trace_http_chain\n",
-                "- File import/export dependencies → dependency_graph\n",
-                "Still use Grep for: literal strings, constants, regex patterns. ",
-                "Still use Read for: specific files you need to edit."
+                "Code Graph: AST knowledge graph with semantic search. RULES:\n",
+                "0. START HERE → project_map for full architecture overview (modules, deps, routes, hot paths).\n",
+                "1. Call graph (who calls X / what X calls) → get_call_graph. NOT Grep.\n",
+                "2. Module/file understanding → module_overview. NOT Read multiple files.\n",
+                "3. BEFORE modifying a function → impact_analysis FIRST.\n",
+                "4. Find code by concept/meaning → semantic_code_search. NOT Grep.\n",
+                "5. HTTP request tracing → trace_http_chain. NOT Read router+handler.\n",
+                "6. One symbol's signature+relations → get_ast_node. NOT Read whole file.\n",
+                "7. File dependencies → dependency_graph. NOT Grep imports.\n",
+                "8. Similar/duplicate code → find_similar_code.\n",
+                "Use Grep ONLY for: exact strings, constants, regex patterns.\n",
+                "Use Read ONLY for: files you will edit."
             )
         }))
     }
@@ -874,6 +876,7 @@ impl McpServer {
             "module_overview" => self.tool_module_overview(args),
             "dependency_graph" => self.tool_dependency_graph(args),
             "find_similar_code" => self.tool_find_similar_code(args),
+            "project_map" => self.tool_project_map(),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
         let elapsed = start.elapsed();
@@ -1782,24 +1785,26 @@ impl McpServer {
         // Search for similar vectors
         let results = queries::vector_search(self.db.conn(), &embedding, top_k + 1)?; // +1 to exclude self
 
-        // Filter and format results
+        // Filter and format results (skip self, module nodes, and over-distance)
         let similar: Vec<serde_json::Value> = results.iter()
             .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
-            .take(top_k as usize)
             .filter_map(|(id, distance)| {
-                queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| {
-                    let file_path = queries::get_file_path(self.db.conn(), node.file_id)
-                        .ok().flatten().unwrap_or_default();
-                    let similarity = 1.0 / (1.0 + distance);
-                    json!({
-                        "node_id": node.id,
-                        "name": node.name,
-                        "type": node.node_type,
-                        "file_path": file_path,
-                        "start_line": node.start_line,
-                        "similarity": format!("{:.2}", similarity),
-                        "distance": format!("{:.4}", distance),
-                    })
+                queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| (node, *distance))
+            })
+            .filter(|(node, _)| !(node.node_type == "module" && node.name == "<module>"))
+            .take(top_k as usize)
+            .map(|(node, distance)| {
+                let file_path = queries::get_file_path(self.db.conn(), node.file_id)
+                    .ok().flatten().unwrap_or_default();
+                let similarity = 1.0 / (1.0 + distance);
+                json!({
+                    "node_id": node.id,
+                    "name": node.name,
+                    "type": node.node_type,
+                    "file_path": file_path,
+                    "start_line": node.start_line,
+                    "similarity": format!("{:.2}", similarity),
+                    "distance": format!("{:.4}", distance),
                 })
             })
             .collect();
@@ -1808,6 +1813,63 @@ impl McpServer {
             "query_node_id": node_id,
             "results": similar,
             "count": similar.len(),
+        }))
+    }
+
+    fn tool_project_map(&self) -> Result<serde_json::Value> {
+        self.ensure_indexed()?;
+
+        let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
+
+        let modules_json: Vec<serde_json::Value> = modules.iter().map(|m| {
+            let mut obj = json!({
+                "path": m.path,
+                "files": m.files,
+                "functions": m.functions,
+                "classes": m.classes,
+            });
+            if m.interfaces_traits > 0 {
+                obj["interfaces_traits"] = json!(m.interfaces_traits);
+            }
+            if !m.languages.is_empty() {
+                obj["languages"] = json!(m.languages);
+            }
+            if !m.key_symbols.is_empty() {
+                obj["key_symbols"] = json!(m.key_symbols);
+            }
+            obj
+        }).collect();
+
+        let deps_json: Vec<serde_json::Value> = deps.iter().map(|d| {
+            json!({
+                "from": d.from,
+                "to": d.to,
+                "imports": d.import_count,
+            })
+        }).collect();
+
+        let routes_json: Vec<serde_json::Value> = entry_points.iter().map(|e| {
+            json!({
+                "route": e.route,
+                "handler": e.handler,
+                "file": e.file,
+            })
+        }).collect();
+
+        let hot_json: Vec<serde_json::Value> = hot_functions.iter().map(|h| {
+            json!({
+                "name": h.name,
+                "type": h.node_type,
+                "file": h.file,
+                "caller_count": h.caller_count,
+            })
+        }).collect();
+
+        Ok(json!({
+            "modules": modules_json,
+            "module_dependencies": deps_json,
+            "entry_points": routes_json,
+            "hot_functions": hot_json,
         }))
     }
 }

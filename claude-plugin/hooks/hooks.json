@@ -1,5 +1,29 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "tool == \"Grep\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-search-guide.js\"",
+            "timeout": 2
+          }
+        ],
+        "description": "Suggest code-graph alternatives on first Grep call"
+      },
+      {
+        "matcher": "tool == \"Edit\" || tool == \"Write\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-edit-guide.js\"",
+            "timeout": 2
+          }
+        ],
+        "description": "Remind about impact_analysis before first code modification"
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "tool == \"Write\" || tool == \"Edit\"",

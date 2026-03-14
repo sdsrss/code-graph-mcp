@@ -2,7 +2,9 @@ use super::types::ToolDefinition;
 use serde_json::json;
 
 /// Expected tool count — update this when adding/removing tools.
-pub const TOOL_COUNT: usize = 14;
+/// Management tools (start_watch, stop_watch, get_index_status, rebuild_index)
+/// are still callable via tools/call but hidden from tools/list to save tokens.
+pub const TOOL_COUNT: usize = 11;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -96,43 +98,17 @@ impl ToolRegistry {
                 }),
             },
             ToolDefinition {
-                name: "start_watch".into(),
-                description: "Start file system real-time watcher for incremental indexing.".into(),
+                name: "project_map".into(),
+                description: "Get a birds-eye architecture map of the entire project: modules with function/class counts, cross-module dependency graph, HTTP entry points, and hot functions (most callers). Call FIRST before diving into any task — gives you the full picture in ~500 tokens instead of reading dozens of files. Returns structured data you can reference throughout the session.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {},
                     "required": []
                 }),
             },
-            ToolDefinition {
-                name: "stop_watch".into(),
-                description: "Stop file system real-time watcher.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            },
-            ToolDefinition {
-                name: "get_index_status".into(),
-                description: "Query index status and health information.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            },
-            ToolDefinition {
-                name: "rebuild_index".into(),
-                description: "Force full index rebuild. Deletes and recreates .code-graph/index.db.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "confirm": { "type": "boolean", "description": "Must be true to confirm rebuild" }
-                    },
-                    "required": ["confirm"]
-                }),
-            },
+            // Management tools (start_watch, stop_watch, get_index_status, rebuild_index)
+            // are omitted from the listed registry to reduce per-turn token overhead.
+            // They remain callable via tools/call — see handle_tool() in server.rs.
             ToolDefinition {
                 name: "impact_analysis".into(),
                 description: "Analyze the blast radius of changing a symbol. Returns all affected callers, routes, files, and a risk rating (LOW/MEDIUM/HIGH) in one call. Irreplaceable by Grep — computes transitive impact through the full call graph. Use BEFORE modifying any function to understand consequences.".into(),
@@ -198,25 +174,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tool_registry_lists_all_tools() {
+    fn test_tool_registry_lists_navigation_tools() {
         let registry = ToolRegistry::new();
         let tools = registry.list_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // Navigation tools (listed)
         assert!(names.contains(&"semantic_code_search"));
         assert!(names.contains(&"get_call_graph"));
         assert!(names.contains(&"find_http_route"));
         assert!(names.contains(&"get_ast_node"));
         assert!(names.contains(&"read_snippet"));
-        assert!(names.contains(&"start_watch"));
-        assert!(names.contains(&"stop_watch"));
-        assert!(names.contains(&"get_index_status"));
-        assert!(names.contains(&"rebuild_index"));
         assert!(names.contains(&"trace_http_chain"));
         assert!(names.contains(&"impact_analysis"));
         assert!(names.contains(&"module_overview"));
         assert!(names.contains(&"dependency_graph"));
         assert!(names.contains(&"find_similar_code"));
+        assert!(names.contains(&"project_map"));
         assert_eq!(tools.len(), TOOL_COUNT);
+        // Management tools are unlisted (callable via tools/call but not in tools/list)
+        assert!(!names.contains(&"start_watch"));
+        assert!(!names.contains(&"stop_watch"));
+        assert!(!names.contains(&"get_index_status"));
+        assert!(!names.contains(&"rebuild_index"));
     }
 
     #[test]
