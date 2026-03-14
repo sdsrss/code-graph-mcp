@@ -920,7 +920,7 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
             let split = crate::search::tokenizer::split_identifier(word);
             split.split_whitespace().map(String::from).collect::<Vec<_>>()
         })
-        .collect::<std::collections::HashSet<_>>() // deduplicate
+        .collect::<std::collections::BTreeSet<_>>() // deduplicate (sorted for deterministic queries)
         .into_iter()
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()

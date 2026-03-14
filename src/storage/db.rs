@@ -104,17 +104,6 @@ impl Database {
         self.vec_enabled
     }
 
-    /// Enable sqlite-vec extension and create vector tables if not already enabled.
-    pub fn enable_vec(&mut self) -> anyhow::Result<()> {
-        if self.vec_enabled {
-            return Ok(());
-        }
-        register_sqlite_vec();
-        self.conn.execute_batch(&schema::create_vec_tables_sql())?;
-        self.vec_enabled = true;
-        Ok(())
-    }
-
     /// Run PRAGMA optimize to rebuild query planner statistics after bulk writes.
     pub fn run_optimize(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA optimize;")?;

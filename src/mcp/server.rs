@@ -129,7 +129,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    fn open_db(db_path: &Path, _embedding_model: &Option<EmbeddingModel>) -> Result<Database> {
+    fn open_db(db_path: &Path) -> Result<Database> {
         // Always open with vec support — model may be downloaded later (hot-loading)
         // and the background embedding thread needs vec tables to exist.
         Database::open_with_vec(db_path)
@@ -161,7 +161,7 @@ impl McpServer {
         }
 
         let embedding_model = EmbeddingModel::load()?;
-        let db = Self::open_db(&db_path, &embedding_model)?;
+        let db = Self::open_db(&db_path)?;
         Ok(Self {
             registry: ToolRegistry::new(),
             db,
@@ -513,11 +513,8 @@ impl McpServer {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
             if has_changes {
-                // Lock model briefly to get a ref for incremental indexing
-                let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
-                let model = model_guard.as_ref();
-                self.run_incremental_with_cache_restore(&project_root, model)?;
-                drop(model_guard);
+                // Skip inline embedding — background thread handles it (avoids holding model lock across I/O)
+                self.run_incremental_with_cache_restore(&project_root, None)?;
             } else {
                 // No watcher or no events: still run incremental (cheap if nothing changed)
                 let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
@@ -525,10 +522,7 @@ impl McpServer {
                     // No watcher active — debounce to avoid rescanning on every tool call
                     let mut last_check = lock_or_recover(&self.last_incremental_check, "last_incremental_check");
                     if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
-                        let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
-                        let model = model_guard.as_ref();
-                        self.run_incremental_with_cache_restore(&project_root, model)?;
-                        drop(model_guard);
+                        self.run_incremental_with_cache_restore(&project_root, None)?;
                         *last_check = std::time::Instant::now();
                     }
                 }
@@ -1747,6 +1741,7 @@ impl McpServer {
     }
 
     fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.try_lazy_load_model();
         self.ensure_indexed()?;
 
         // Accept node_id directly, or resolve from symbol_name

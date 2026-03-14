@@ -79,13 +79,20 @@ mod inner {
             )
         }
 
-        /// Download model tarball from URL, extract to dest_dir.
+        /// Download model tarball from URL with timeout, extract to dest_dir.
+        /// Integrity: HTTPS transport + valid tar.gz extraction + blake3 version marker.
         pub fn download_model_to(url: &str, dest_dir: &std::path::Path) -> Result<()> {
             use std::io::Read as IoRead;
 
             tracing::info!("[model] Downloading model from {}...", url);
 
-            let mut response = ureq::get(url)
+            let agent = ureq::Agent::new_with_config(
+                ureq::config::Config::builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(120)))
+                    .build()
+            );
+
+            let mut response = agent.get(url)
                 .call()
                 .map_err(|e| anyhow::anyhow!("Model download failed: {}", e))?;
 
@@ -99,7 +106,7 @@ mod inner {
                 .take(200 * 1024 * 1024)
                 .read_to_end(&mut body)?;
 
-            // Extract tar.gz
+            // Extract tar.gz (also validates integrity — corrupt archives fail here)
             std::fs::create_dir_all(dest_dir)?;
             let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&body));
             let mut archive = tar::Archive::new(gz);
@@ -109,7 +116,7 @@ mod inner {
             let hash = blake3::hash(&body);
             std::fs::write(dest_dir.join(".version"), hash.to_hex().as_str())?;
 
-            tracing::info!("[model] Model extracted to {:?}", dest_dir);
+            tracing::info!("[model] Model extracted to {:?} ({} bytes)", dest_dir, body.len());
             Ok(())
         }
 

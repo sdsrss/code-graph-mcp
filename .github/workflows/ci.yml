@@ -31,5 +31,8 @@ jobs:
       - name: Test (with embedding)
         run: cargo test
 
-      - name: Clippy
+      - name: Clippy (no embedding)
         run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Clippy (with embedding)
+        run: cargo clippy -- -D warnings
