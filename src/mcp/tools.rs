@@ -64,7 +64,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Get a symbol's type, signature, code, and callers/callees. Accepts file_path+symbol_name or node_id. Set context_lines to include surrounding source code.".into(),
+                description: "Get a symbol's type, signature, code, and callers/callees. Accepts file_path+symbol_name, node_id, or symbol_name alone (auto-resolves). Set context_lines to include surrounding source code.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

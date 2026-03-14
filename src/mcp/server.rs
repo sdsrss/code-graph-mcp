@@ -1075,7 +1075,8 @@ impl McpServer {
 
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
         let has_edges = results.iter().any(|n| n.depth > 0);
-        if !has_edges {
+        let has_seed = results.iter().any(|n| n.depth == 0);
+        if !has_edges && !(has_seed && file_path.is_some()) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
                     let results2 = crate::graph::query::get_call_graph(
@@ -1094,8 +1095,6 @@ impl McpServer {
                     }));
                 }
                 FuzzyResolution::NotFound => {
-                    // Check if the function exists at all (seed node with no edges vs truly not found)
-                    let has_seed = results.iter().any(|n| n.depth == 0);
                     if !has_seed {
                         return Err(anyhow!("Function '{}' not found in the index", function_name));
                     }
@@ -1414,6 +1413,9 @@ impl McpServer {
         let lines: Vec<&str> = source.lines().collect();
         let start = (start_line as usize).saturating_sub(1 + context_lines);
         let end = ((end_line as usize) + context_lines).min(lines.len());
+        if start >= end {
+            return None;
+        }
         Some(lines[start..end].join("\n"))
     }
 
@@ -1688,6 +1690,9 @@ impl McpServer {
             "hot_paths": hot_paths,
             "summary": format!("Module '{}': {} exports across {} files", raw_path, total_exports, files.len())
         });
+        if files.is_empty() {
+            result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
+        }
         if capped {
             result["capped"] = json!(true);
             result["showing"] = json!(MAX_EXPORTS);
@@ -1707,7 +1712,8 @@ impl McpServer {
             .unwrap_or("both");
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
+            .unwrap_or(2)
+            .clamp(1, 10) as i32;
 
         // Check if file exists in index
         let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
@@ -1765,7 +1771,8 @@ impl McpServer {
         };
         let top_k = args.get("top_k")
             .and_then(|v| v.as_i64())
-            .unwrap_or(5);
+            .unwrap_or(5)
+            .clamp(1, 100);
         let max_distance = args.get("max_distance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.8);
@@ -1818,7 +1825,7 @@ impl McpServer {
                     "type": node.node_type,
                     "file_path": file_path,
                     "start_line": node.start_line,
-                    "similarity": format!("{:.2}", similarity),
+                    "similarity": format!("{:.4}", similarity),
                     "distance": format!("{:.4}", distance),
                 })
             })
