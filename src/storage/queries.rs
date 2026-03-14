@@ -946,10 +946,10 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Build a project architecture map from the knowledge graph.
+#[allow(clippy::type_complexity)]
 pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<ModuleDep>, Vec<EntryPoint>, Vec<HotFunction>)> {
     // 1. Module map: SQL-level aggregation (C3: use constants, I1: GROUP BY in SQL)
-    let sql = format!(
-        "SELECT f.path, \
+    let sql = "SELECT f.path, \
                 SUM(CASE WHEN n.type = 'function' THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('class', 'struct', 'enum') THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('interface', 'trait') THEN 1 ELSE 0 END), \
@@ -957,7 +957,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
          FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.type != 'module' AND n.name != '<module>' \
          GROUP BY f.path"
-    );
+        .to_string();
     let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut dir_funcs: HashMap<String, usize> = HashMap::new();
     let mut dir_classes: HashMap<String, usize> = HashMap::new();
