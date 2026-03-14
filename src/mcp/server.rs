@@ -1458,23 +1458,31 @@ impl McpServer {
             }
         }
 
-        let affected_files: std::collections::HashSet<&str> = callers.iter()
+        // Separate production callers from test callers
+        let is_test = |c: &&queries::CallerWithRouteInfo| {
+            c.name.starts_with("test_") || c.file_path.starts_with("tests/")
+        };
+        let prod_callers: Vec<_> = callers.iter().filter(|c| !is_test(c)).collect();
+        let test_callers: Vec<_> = callers.iter().filter(|c| is_test(c)).collect();
+
+        let affected_files: std::collections::HashSet<&str> = prod_callers.iter()
             .map(|c| c.file_path.as_str()).collect();
         let affected_routes: Vec<serde_json::Value> = callers.iter()
             .filter_map(|c| {
                 c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok())
             }).collect();
 
-        let risk_level = if callers.len() > 10 || affected_routes.len() >= 3 || change_type == "remove" {
+        // Risk based on production callers, not test callers
+        let risk_level = if prod_callers.len() > 10 || affected_routes.len() >= 3 || change_type == "remove" {
             "HIGH"
-        } else if callers.len() > 3 || !affected_routes.is_empty() {
+        } else if prod_callers.len() > 3 || !affected_routes.is_empty() {
             "MEDIUM"
         } else {
             "LOW"
         };
 
-        let direct: Vec<_> = callers.iter().filter(|c| c.depth == 1).collect();
-        let transitive: Vec<_> = callers.iter().filter(|c| c.depth > 1).collect();
+        let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
+        let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();
 
         Ok(json!({
             "symbol": &resolved_name,
@@ -1488,8 +1496,9 @@ impl McpServer {
             "affected_routes": affected_routes,
             "affected_files": affected_files.len(),
             "risk_level": risk_level,
-            "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}]",
-                &resolved_name, affected_routes.len(), callers.len(), affected_files.len(), risk_level)
+            "tests_affected": test_callers.len(),
+            "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}] ({} tests affected)",
+                &resolved_name, affected_routes.len(), prod_callers.len(), affected_files.len(), risk_level, test_callers.len())
         }))
     }
 
@@ -1503,6 +1512,11 @@ impl McpServer {
         let path = if path == "." { "" } else { path };
 
         let exports = queries::get_module_exports(self.db.conn(), path)?;
+
+        // Filter out test functions — they add noise to module overviews
+        let exports: Vec<_> = exports.into_iter()
+            .filter(|e| !e.name.starts_with("test_"))
+            .collect();
 
         // Get import/dependency info at file level
         let files: std::collections::HashSet<&str> = exports.iter()

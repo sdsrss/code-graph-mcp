@@ -36,15 +36,18 @@ pub fn build_context_string(info: &NodeContext) -> String {
     parts.push(format!("{} {}", info.node_type, info.name));
     parts.push(format!("in {}", info.file_path));
 
-    // 5. Graph relations (fill remaining space, truncated last)
+    // 5. Graph relations (fill remaining space, capped to avoid bloat)
+    const MAX_RELATIONS: usize = 10;
     if !info.routes.is_empty() {
-        parts.push(format!("routes: {}", info.routes.join(", ")));
+        parts.push(format!("routes: {}", info.routes.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", ")));
     }
     if !info.callees.is_empty() {
-        parts.push(format!("calls: {}", info.callees.join(", ")));
+        let suffix = if info.callees.len() > MAX_RELATIONS { format!(" (+{})", info.callees.len() - MAX_RELATIONS) } else { String::new() };
+        parts.push(format!("calls: {}{}", info.callees.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", "), suffix));
     }
     if !info.callers.is_empty() {
-        parts.push(format!("called_by: {}", info.callers.join(", ")));
+        let suffix = if info.callers.len() > MAX_RELATIONS { format!(" (+{})", info.callers.len() - MAX_RELATIONS) } else { String::new() };
+        parts.push(format!("called_by: {}{}", info.callers.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", "), suffix));
     }
     if !info.inherits.is_empty() {
         parts.push(format!("inherits: {}", info.inherits.join(", ")));
