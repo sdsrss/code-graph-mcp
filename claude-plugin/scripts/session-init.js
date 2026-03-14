@@ -2,7 +2,7 @@
 'use strict';
 const { execFileSync } = require('child_process');
 const { findBinary } = require('./find-binary');
-const { install, update, readManifest, getPluginVersion } = require('./lifecycle');
+const { install, update, readManifest, getPluginVersion, checkScopeConflict } = require('./lifecycle');
 const { checkForUpdate } = require('./auto-update');
 
 const BIN = findBinary();
@@ -18,7 +18,16 @@ if (BIN) {
   } catch { /* timeout — silent */ }
 }
 
-// --- 2. Lifecycle: install or update config (idempotent) ---
+// --- 2. Scope conflict warning ---
+const conflict = checkScopeConflict();
+if (conflict) {
+  process.stderr.write(
+    `[code-graph] Warning: conflicting install detected — ${conflict.existingId} (${conflict.scope || 'unknown'} scope). ` +
+    `Use /plugin to remove one to avoid config conflicts.\n`
+  );
+}
+
+// --- 3. Lifecycle: install or update config (idempotent) ---
 const manifest = readManifest();
 const currentVersion = getPluginVersion();
 
@@ -28,7 +37,7 @@ if (!manifest.version) {
   update();
 }
 
-// --- 3. Auto-update (throttled, non-blocking) ---
+// --- 4. Auto-update (throttled, non-blocking) ---
 (async () => {
   const result = await checkForUpdate();
   if (result && result.updated) {

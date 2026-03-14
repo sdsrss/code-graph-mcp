@@ -4,7 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PLUGIN_ID = 'code-graph@sdsrss';
+const PLUGIN_ID = 'code-graph@sdsrss-code-graph';
+const OLD_PLUGIN_ID = 'code-graph@sdsrss'; // Legacy ID — kept for migration cleanup
+const MARKETPLACE_NAME = 'sdsrss-code-graph';
 const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
 const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
@@ -88,6 +90,45 @@ function unregisterStatuslineProvider(id) {
   return true;
 }
 
+// --- Scope Conflict Detection ---
+
+function checkScopeConflict() {
+  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  if (!installed || !installed.plugins) return null;
+  for (const [key, entries] of Object.entries(installed.plugins)) {
+    if (key === PLUGIN_ID) continue;
+    if (key.startsWith('code-graph@')) {
+      return { existingId: key, scope: entries[0] && entries[0].scope, entries };
+    }
+  }
+  return null;
+}
+
+// --- Migration: clean up old PLUGIN_ID remnants ---
+
+function migrateOldPluginId(settings) {
+  let changed = false;
+
+  // Clean old ID from enabledPlugins
+  if (settings.enabledPlugins && OLD_PLUGIN_ID in settings.enabledPlugins) {
+    delete settings.enabledPlugins[OLD_PLUGIN_ID];
+    changed = true;
+  }
+
+  // Clean old ID from installed_plugins.json
+  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  if (installed && installed.plugins && OLD_PLUGIN_ID in installed.plugins) {
+    delete installed.plugins[OLD_PLUGIN_ID];
+    writeJsonAtomic(INSTALLED_PLUGINS_PATH, installed);
+  }
+
+  // Clean old cache path (was using 'sdsrss' instead of 'sdsrss-code-graph')
+  const oldCacheDir = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph');
+  try { fs.rmSync(oldCacheDir, { recursive: true, force: true }); } catch { /* ok */ }
+
+  return changed;
+}
+
 // --- Install (idempotent) ---
 
 function install() {
@@ -95,6 +136,11 @@ function install() {
   const manifest = readManifest();
   const settings = readJson(SETTINGS_PATH) || {};
   let settingsChanged = false;
+
+  // 0. Migrate from old PLUGIN_ID
+  if (migrateOldPluginId(settings)) {
+    settingsChanged = true;
+  }
 
   // 1. StatusLine — composite approach
   //    a. Capture existing statusline as a provider (if not already composite)
@@ -114,20 +160,16 @@ function install() {
   // Register code-graph provider
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 2. enabledPlugins — add if missing
-  if (!settings.enabledPlugins) settings.enabledPlugins = {};
-  if (!(PLUGIN_ID in settings.enabledPlugins)) {
-    settings.enabledPlugins[PLUGIN_ID] = true;
-    settingsChanged = true;
-    manifest.config.enabledPlugins = true;
-  }
+  // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
+  // Do NOT add enabledPlugins entries here — it causes phantom plugin entries
+  // when the ID doesn't match the marketplace name.
 
-  // 3. Write settings atomically if changed
+  // 2. Write settings atomically if changed
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
-  // 4. Write manifest with version
+  // 3. Write manifest with version
   manifest.version = version;
   manifest.installedAt = manifest.installedAt || new Date().toISOString();
   manifest.updatedAt = new Date().toISOString();
@@ -161,10 +203,14 @@ function uninstall() {
       // else: other providers still using composite — leave it
     }
 
-    // 2. Remove from enabledPlugins
-    if (settings.enabledPlugins && PLUGIN_ID in settings.enabledPlugins) {
-      delete settings.enabledPlugins[PLUGIN_ID];
-      settingsChanged = true;
+    // 2. Remove both old and new IDs from enabledPlugins
+    if (settings.enabledPlugins) {
+      for (const id of [PLUGIN_ID, OLD_PLUGIN_ID]) {
+        if (id in settings.enabledPlugins) {
+          delete settings.enabledPlugins[id];
+          settingsChanged = true;
+        }
+      }
     }
 
     // 3. Write settings if changed
@@ -173,19 +219,30 @@ function uninstall() {
     }
   }
 
-  // 4. Remove from installed_plugins.json
+  // 4. Remove both old and new IDs from installed_plugins.json
   const installedPlugins = readJson(INSTALLED_PLUGINS_PATH);
-  if (installedPlugins && installedPlugins.plugins && PLUGIN_ID in installedPlugins.plugins) {
-    delete installedPlugins.plugins[PLUGIN_ID];
-    writeJsonAtomic(INSTALLED_PLUGINS_PATH, installedPlugins);
+  if (installedPlugins && installedPlugins.plugins) {
+    let ipChanged = false;
+    for (const id of [PLUGIN_ID, OLD_PLUGIN_ID]) {
+      if (id in installedPlugins.plugins) {
+        delete installedPlugins.plugins[id];
+        ipChanged = true;
+      }
+    }
+    if (ipChanged) writeJsonAtomic(INSTALLED_PLUGINS_PATH, installedPlugins);
   }
 
   // 5. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
-  // 6. Remove plugin files from cache
-  const pluginCacheDir = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph');
-  try { fs.rmSync(pluginCacheDir, { recursive: true, force: true }); } catch { /* ok */ }
+  // 6. Remove plugin files from cache (both old and new paths)
+  const pluginCacheDirs = [
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'), // legacy
+  ];
+  for (const dir of pluginCacheDirs) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
+  }
 
   return { settingsChanged };
 }
@@ -199,6 +256,11 @@ function update() {
   const settings = readJson(SETTINGS_PATH) || {};
   let settingsChanged = false;
 
+  // 0. Migrate from old PLUGIN_ID
+  if (migrateOldPluginId(settings)) {
+    settingsChanged = true;
+  }
+
   // 1. Update composite command path if version changed
   if (isOurComposite(settings)) {
     const cmd = compositeCommand();
@@ -211,23 +273,18 @@ function update() {
   // 2. Update code-graph provider in registry
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 3. Ensure enabledPlugins entry exists
-  if (!settings.enabledPlugins) settings.enabledPlugins = {};
-  if (!(PLUGIN_ID in settings.enabledPlugins)) {
-    settings.enabledPlugins[PLUGIN_ID] = true;
-    settingsChanged = true;
-  }
+  // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
 
-  // 4. Write settings if changed
+  // 3. Write settings if changed
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
-  // 5. Clear update-check cache (force re-check after update)
+  // 4. Clear update-check cache (force re-check after update)
   const updateCache = path.join(CACHE_DIR, 'update-check');
   try { fs.unlinkSync(updateCache); } catch { /* ok */ }
 
-  // 6. Update manifest
+  // 5. Update manifest
   manifest.version = version;
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
@@ -236,11 +293,11 @@ function update() {
 }
 
 module.exports = {
-  install, uninstall, update,
+  install, uninstall, update, checkScopeConflict,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion,
-  PLUGIN_ID, CACHE_DIR, REGISTRY_FILE,
+  PLUGIN_ID, OLD_PLUGIN_ID, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 
 // CLI: node lifecycle.js <install|uninstall|update>

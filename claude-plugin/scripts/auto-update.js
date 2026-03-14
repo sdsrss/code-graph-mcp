@@ -4,7 +4,7 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { CACHE_DIR, PLUGIN_ID, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
+const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
@@ -103,7 +103,7 @@ async function downloadAndInstall(latest) {
     // 2. Copy plugin files to cache
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
-      os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph', latest.version
+      os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph', latest.version
     );
 
     if (fs.existsSync(pluginSrc)) {
