@@ -131,7 +131,7 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Symbol name (alternative to node_id)" },
                         "node_id": { "type": "number", "description": "Node ID (alternative to symbol_name)" },
                         "top_k": { "type": "number", "description": "Results count (default 5)" },
-                        "max_distance": { "type": "number", "description": "Max distance (default 0.5)" }
+                        "max_distance": { "type": "number", "description": "Max distance (default 0.8)" }
                     }
                 }),
             },

@@ -95,7 +95,7 @@ const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 
 /// Token threshold for auto-compressing tool results.
 /// Results exceeding this estimated token count are returned as summaries
-/// with node_ids for expansion via read_snippet.
+/// with node_ids for expansion via get_ast_node.
 const COMPRESSION_TOKEN_THRESHOLD: usize = 2000;
 
 /// Result of fuzzy name resolution.
@@ -1049,7 +1049,7 @@ impl McpServer {
             };
             return Ok(json!({
                 "mode": mode,
-                "message": "Results exceeded token limit. Use read_snippet(node_id) to expand individual symbols.",
+                "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
                 "results": compact
             }));
         }
@@ -1135,7 +1135,7 @@ impl McpServer {
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
             return Ok(json!({
                 "mode": "compressed_call_graph",
-                "message": "Call graph exceeded token limit. Use read_snippet(node_id) to expand individual nodes.",
+                "message": "Call graph exceeded token limit. Use get_ast_node(node_id) to expand individual nodes.",
                 "function": function_name,
                 "results": all_nodes,
             }));
@@ -1234,7 +1234,7 @@ impl McpServer {
             }).collect();
             return Ok(json!({
                 "mode": "compressed_http_chain",
-                "message": "HTTP chain exceeded token limit. Use read_snippet(node_id) or get_call_graph(function_name) to expand.",
+                "message": "HTTP chain exceeded token limit. Use get_ast_node(node_id) or get_call_graph(symbol_name) to expand.",
                 "route": route_path,
                 "results": compressed_handlers,
             }));
@@ -1248,9 +1248,9 @@ impl McpServer {
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
 
-        // Support lookup by node_id (merged read_snippet) or file_path+symbol_name
+        // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = args["node_id"].as_i64() {
-            // When called with node_id (read_snippet mode), default context_lines=3
+            // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
             return self.ast_node_by_id(nid, include_refs, ctx);
         }
@@ -1334,7 +1334,7 @@ impl McpServer {
         }
     }
 
-    /// Lookup AST node by node_id (merged read_snippet functionality).
+    /// Lookup AST node by node_id.
     fn ast_node_by_id(&self, node_id: i64, include_refs: bool, context_lines: usize) -> Result<serde_json::Value> {
         let node = queries::get_node_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
@@ -1385,7 +1385,7 @@ impl McpServer {
         Some(lines[start..end].join("\n"))
     }
 
-    // read_snippet merged into get_ast_node — old name kept as alias in handle_tool()
+    // read_snippet is a legacy alias for get_ast_node in handle_tool()
 
     fn tool_start_watch(&self) -> Result<serde_json::Value> {
         let project_root = self.project_root.as_ref()
@@ -1736,7 +1736,7 @@ impl McpServer {
             .unwrap_or(5);
         let max_distance = args.get("max_distance")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.5);
+            .unwrap_or(0.8);
 
         // Check if embeddings are available
         if !self.db.vec_enabled() {

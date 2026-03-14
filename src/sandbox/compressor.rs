@@ -66,7 +66,7 @@ pub fn compress_if_needed(
     }
 }
 
-/// Compress results to summaries with node IDs for read_snippet expansion
+/// Compress results to summaries with node IDs for get_ast_node expansion
 pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
