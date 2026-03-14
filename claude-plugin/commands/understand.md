@@ -9,9 +9,9 @@ Understand what a module does, its public API, and how it connects to the rest o
 
 ## Steps
 
-1. Call `get_index_status` to verify the code graph index is current
-2. Call `semantic_code_search` with the module name to find its key symbols
-3. For each important export, call `get_call_graph` to map caller/callee relationships
+1. Call `module_overview(path)` to get exports, hot paths, and file structure in one call
+2. Call `dependency_graph(file_path)` for the main file to map imports and dependents
+3. For key functions that need deeper understanding, call `get_call_graph` to trace call chains
 4. Summarize:
    - **Purpose**: what this module does
    - **Public API**: exported functions/classes with signatures
