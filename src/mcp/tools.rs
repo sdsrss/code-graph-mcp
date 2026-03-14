@@ -19,7 +19,7 @@ impl ToolRegistry {
         let tools = vec![
             ToolDefinition {
                 name: "semantic_code_search".into(),
-                description: "Search code by meaning, not just text matching. Returns structured AST nodes (name, file, signature, type, relations) ranked by semantic relevance. Delivers ~200 tokens of focused results vs ~3000 tokens from multiple Grep+Read calls. Use INSTEAD OF Grep when searching for concepts, patterns, or related code across the codebase.".into(),
+                description: "Search code by meaning, not just text matching. Returns structured AST nodes (name, file, signature, type, relations) ranked by relevance. Delivers ~200 tokens of focused results vs ~3000 tokens from multiple Grep+Read calls. Use INSTEAD OF Grep when searching for concepts, patterns, or related code across the codebase. Tip: use specific terms like function/class names for best results; supports stemming (e.g. 'embedding' matches 'embed').".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

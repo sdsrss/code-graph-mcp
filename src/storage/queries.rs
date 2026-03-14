@@ -890,12 +890,26 @@ pub fn get_unembedded_nodes(conn: &Connection) -> Result<Vec<(i64, String)>> {
 
 // --- FTS5 Search ---
 
+/// Stopwords filtered from FTS5 queries to reduce noise.
+const FTS_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "the", "or", "in", "of", "for", "to", "with",
+    "is", "it", "this", "that", "by", "from", "on", "at", "as", "be",
+    "are", "was", "were", "been", "all", "each", "how", "what", "when",
+];
+
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
-    // Sanitize FTS5 query: quote each token to prevent FTS5 operator injection.
-    // Use OR semantics so multi-word queries match documents containing ANY term
-    // (BM25 naturally ranks documents matching more terms higher).
+    // Preprocess query: filter stopwords, split identifiers (camelCase/snake_case),
+    // then sanitize for FTS5. Porter stemming is handled by the FTS5 tokenizer.
     let sanitized: String = query
         .split_whitespace()
+        .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
+        .flat_map(|word| {
+            // Split camelCase/snake_case identifiers into constituent words
+            let split = crate::search::tokenizer::split_identifier(word);
+            split.split_whitespace().map(String::from).collect::<Vec<_>>()
+        })
+        .collect::<std::collections::HashSet<_>>() // deduplicate
+        .into_iter()
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ");

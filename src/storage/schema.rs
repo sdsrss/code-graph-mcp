@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -31,11 +31,12 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 
--- FTS5 virtual table (v2: includes name_tokens, return_type, param_types)
+-- FTS5 virtual table (v4: porter stemmer for better natural-language search)
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name, qualified_name, code_content, context_string, doc_comment,
     name_tokens, return_type, param_types,
-    content='nodes', content_rowid='id'
+    content='nodes', content_rowid='id',
+    tokenize='porter unicode61'
 );
 
 -- FTS5 sync triggers (v2: include new columns)
@@ -145,6 +146,49 @@ pub fn migrate_v2_to_v3(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 
     conn.pragma_update(None, "user_version", 3)?;
     tracing::info!("[schema] Migration v2→v3 complete.");
+    Ok(())
+}
+
+/// Migrate from schema v3 to v4. Must be called within a transaction.
+/// Rebuilds FTS5 table with `porter unicode61` tokenizer for stemmed search.
+pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v3 → v4: enabling porter stemmer for FTS5");
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS nodes_ai;
+         DROP TRIGGER IF EXISTS nodes_ad;
+         DROP TRIGGER IF EXISTS nodes_au;
+         DROP TABLE IF EXISTS nodes_fts;"
+    )?;
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+            name, qualified_name, code_content, context_string, doc_comment,
+            name_tokens, return_type, param_types,
+            content='nodes', content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+        END;
+        CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+            VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+        END;"
+    )?;
+
+    conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
+
+    conn.pragma_update(None, "user_version", 4)?;
+    tracing::info!("[schema] Migration v3→v4 complete.");
     Ok(())
 }
 
