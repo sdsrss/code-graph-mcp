@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
-// PreToolUse hook: On FIRST Agent(Explore) call per session window, remind Claude
-// that code-graph tools provide faster, structured codebase exploration.
+// PreToolUse hook: On FIRST Agent call per session window, suggest
+// code-graph tools for structural code understanding before spawning agents.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -16,10 +16,9 @@ try {
 
 fs.writeFileSync(flag, '');
 process.stdout.write(
-  '[code-graph] Before spawning an Explore agent, try code-graph tools first:\n' +
-  '  project_map → full architecture overview in one call\n' +
+  '[code-graph] For code structure understanding, try code-graph first (one call vs many):\n' +
+  '  project_map → full architecture overview\n' +
   '  module_overview(path) → module structure, exports, hot paths\n' +
-  '  get_call_graph(symbol) → trace call chains instantly\n' +
-  '  dependency_graph(file) → file-level import/export map\n' +
-  'Explore agents cost many tool calls; code-graph returns structured results in one.\n'
+  '  get_call_graph(symbol) → trace call chains\n' +
+  'Explore agents remain best for: non-code files, runtime behavior, open-ended investigation.\n'
 );

@@ -24,17 +24,6 @@
         "description": "Suggest code-graph alternatives on first Glob call"
       },
       {
-        "matcher": "tool == \"Read\"",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-read-guide.js\"",
-            "timeout": 2
-          }
-        ],
-        "description": "Suggest code-graph alternatives on first Read call"
-      },
-      {
         "matcher": "tool == \"Agent\"",
         "hooks": [
           {

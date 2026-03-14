@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
-// PreToolUse hook: On FIRST Glob call per session window, remind Claude
-// that code-graph tools can find files and modules more efficiently.
+// PreToolUse hook: On FIRST Glob call per session window, suggest
+// code-graph tools when exploring project structure (not finding specific files).
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -16,9 +16,8 @@ try {
 
 fs.writeFileSync(flag, '');
 process.stdout.write(
-  '[code-graph] If searching for files to understand code, prefer code-graph tools:\n' +
-  '  project_map → all modules with their files and key symbols\n' +
-  '  module_overview(path) → file list, exports, and structure of a module\n' +
-  '  semantic_code_search(query) → find code by concept across all files\n' +
-  'Use Glob only for exact file name/extension patterns.\n'
+  '[code-graph] If exploring project structure (not finding specific files):\n' +
+  '  project_map → all modules, their files, key symbols, and dependencies\n' +
+  '  module_overview(path) → files and exports within a module\n' +
+  'Glob remains best for: finding specific files, configs, non-code assets.\n'
 );
