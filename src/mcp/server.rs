@@ -1069,6 +1069,39 @@ impl McpServer {
 
         self.ensure_indexed()?;
 
+        // Disambiguate: if no file_path provided, check if symbol matches multiple distinct nodes
+        if file_path.is_none() {
+            let candidates = queries::get_nodes_by_name(self.db.conn(), function_name)?;
+            let non_test: Vec<_> = candidates.iter()
+                .filter(|n| !n.name.starts_with("test_"))
+                .collect();
+            // Check if there are matches in multiple distinct files
+            if non_test.len() > 1 {
+                let mut seen_files = std::collections::HashSet::new();
+                for n in &non_test {
+                    seen_files.insert(n.file_id);
+                }
+                if seen_files.len() > 1 {
+                    let suggestions: Vec<_> = non_test.iter().map(|n| {
+                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                        json!({
+                            "name": &n.name,
+                            "file_path": fp,
+                            "type": &n.node_type,
+                            "node_id": n.id,
+                        })
+                    }).collect();
+                    return Ok(json!({
+                        "function": function_name,
+                        "direction": direction,
+                        "error": format!("Ambiguous symbol '{}': {} matches in different files. Specify file_path to disambiguate.", function_name, suggestions.len()),
+                        "suggestions": suggestions,
+                    }));
+                }
+            }
+        }
+
         let results = crate::graph::query::get_call_graph(
             self.db.conn(), function_name, direction, depth, file_path,
         )?;
@@ -1213,10 +1246,13 @@ impl McpServer {
             handlers.push(handler);
         }
 
-        let result = json!({
+        let mut result = json!({
             "route": route_path,
             "handlers": handlers,
         });
+        if handlers.is_empty() {
+            result["message"] = json!("No matching routes found. This may mean: (1) the project has no HTTP routes, (2) the route pattern didn't match, or (3) routes use a framework not yet supported. Try a broader pattern or use semantic_code_search to find route handlers.");
+        }
 
         // Compress if result exceeds token threshold
         let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
@@ -1546,6 +1582,38 @@ impl McpServer {
             .unwrap_or(3)
             .clamp(1, 20) as i32;
 
+        // Disambiguate: check if symbol matches multiple distinct nodes in different files
+        {
+            let candidates = queries::get_nodes_by_name(self.db.conn(), symbol_name)?;
+            let non_test: Vec<_> = candidates.iter()
+                .filter(|n| !n.name.starts_with("test_"))
+                .collect();
+            if non_test.len() > 1 {
+                let mut seen_files = std::collections::HashSet::new();
+                for n in &non_test {
+                    seen_files.insert(n.file_id);
+                }
+                if seen_files.len() > 1 {
+                    let suggestions: Vec<_> = non_test.iter().map(|n| {
+                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                        json!({
+                            "name": &n.name,
+                            "file_path": fp,
+                            "type": &n.node_type,
+                            "node_id": n.id,
+                        })
+                    }).collect();
+                    return Ok(json!({
+                        "symbol": symbol_name,
+                        "change_type": change_type,
+                        "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
+                        "suggestions": suggestions,
+                    }));
+                }
+            }
+        }
+
         let mut resolved_name = symbol_name.to_string();
         let mut callers = queries::get_callers_with_route_info(
             self.db.conn(), symbol_name, None, depth
@@ -1618,7 +1686,20 @@ impl McpServer {
         let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
         let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();
 
-        Ok(json!({
+        // For non-function types (struct/class/enum), call graph may miss type-usage references
+        let type_warning = if prod_callers.is_empty() {
+            let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
+            let is_type = nodes.iter().any(|n| matches!(n.node_type.as_str(), "struct" | "class" | "enum" | "interface" | "type_alias"));
+            if is_type {
+                Some("Impact analysis tracks function call chains. This is a type definition — actual usage (field access, type annotations, instantiation) may be broader than shown. Use semantic_code_search to find all references.")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result = json!({
             "symbol": &resolved_name,
             "change_type": change_type,
             "direct_callers": direct.iter().map(|c| json!({
@@ -1633,7 +1714,11 @@ impl McpServer {
             "tests_affected": test_callers.len(),
             "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}] ({} tests affected)",
                 &resolved_name, affected_routes.len(), prod_callers.len(), affected_files.len(), risk_level, test_callers.len())
-        }))
+        });
+        if let Some(warning) = type_warning {
+            result["warning"] = json!(warning);
+        }
+        Ok(result)
     }
 
     fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1718,11 +1803,21 @@ impl McpServer {
         // Check if file exists in index
         let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
         if file_nodes.is_empty() {
+            let hint = if file_path.ends_with('/') || !file_path.contains('.') {
+                // Looks like a directory — suggest using module_overview instead
+                let dir = if file_path.ends_with('/') { file_path.to_string() } else { format!("{}/", file_path) };
+                format!(
+                    "Path '{}' looks like a directory. Use module_overview(path=\"{}\") for directory-level analysis, or specify an exact file (e.g., '{}mod.rs')",
+                    file_path, file_path, dir
+                )
+            } else {
+                format!("File '{}' not found in index. Check path is relative to project root.", file_path)
+            };
             return Ok(json!({
                 "file": file_path,
                 "depends_on": [],
                 "depended_by": [],
-                "warning": format!("File '{}' not found in index. Check path is relative to project root.", file_path),
+                "warning": hint,
                 "summary": format!("File '{}' not found in index", file_path)
             }));
         }

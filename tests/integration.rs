@@ -781,3 +781,76 @@ function processOrder(order: Order): OrderResult {
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
     assert!(names.contains(&"processOrder"), "FTS5 should find processOrder via return type 'OrderResult', got: {:?}", names);
 }
+
+#[test]
+fn test_dependency_graph_directory_hint() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/app.ts"), "export function main() {}").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "main"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Passing a directory path should give a helpful hint
+    let msg = tool_call_json("dependency_graph", serde_json::json!({"file_path": "src/"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let warning = result["warning"].as_str().unwrap();
+    assert!(warning.contains("module_overview"), "directory path should suggest module_overview, got: {}", warning);
+
+    // Path without extension should also trigger directory hint
+    let msg = tool_call_json("dependency_graph", serde_json::json!({"file_path": "src"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let warning = result["warning"].as_str().unwrap();
+    assert!(warning.contains("module_overview"), "extensionless path should suggest module_overview, got: {}", warning);
+}
+
+#[test]
+fn test_impact_analysis_struct_warning() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("models.ts"), r#"
+export class UserModel {
+    id: number;
+    name: string;
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "UserModel"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // impact_analysis on a class with no callers should include a type warning
+    let msg = tool_call_json("impact_analysis", serde_json::json!({"symbol_name": "UserModel", "change_type": "remove"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result["warning"].is_string(), "class with no callers should have type-usage warning");
+    assert!(result["warning"].as_str().unwrap().contains("type definition"),
+        "warning should mention type definition, got: {}", result["warning"]);
+}
+
+#[test]
+fn test_trace_http_chain_no_routes_message() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("app.ts"), "export function main() {}").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "main"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // trace_http_chain with no routes should return a helpful message
+    let msg = tool_call_json("trace_http_chain", serde_json::json!({"route_path": "/api/nothing"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result["handlers"].as_array().unwrap().is_empty());
+    assert!(result["message"].is_string(), "empty handlers should include a message");
+    assert!(result["message"].as_str().unwrap().contains("No matching routes"),
+        "message should explain no routes found, got: {}", result["message"]);
+}
