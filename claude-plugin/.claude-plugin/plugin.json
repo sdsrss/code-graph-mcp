@@ -4,6 +4,6 @@
   "author": {
     "name": "sdsrs"
   },
-  "version": "0.5.5",
+  "version": "0.5.6",
   "keywords": ["code-graph", "ast", "navigation", "mcp", "knowledge-graph"]
 }

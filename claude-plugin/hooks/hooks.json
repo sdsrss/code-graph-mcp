@@ -13,6 +13,39 @@
         "description": "Suggest code-graph alternatives on first Grep call"
       },
       {
+        "matcher": "tool == \"Glob\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-glob-guide.js\"",
+            "timeout": 2
+          }
+        ],
+        "description": "Suggest code-graph alternatives on first Glob call"
+      },
+      {
+        "matcher": "tool == \"Read\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-read-guide.js\"",
+            "timeout": 2
+          }
+        ],
+        "description": "Suggest code-graph alternatives on first Read call"
+      },
+      {
+        "matcher": "tool == \"Agent\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-explore-guide.js\"",
+            "timeout": 2
+          }
+        ],
+        "description": "Suggest code-graph tools before spawning Explore agents"
+      },
+      {
         "matcher": "tool == \"Edit\" || tool == \"Write\"",
         "hooks": [
           {
