@@ -1555,6 +1555,9 @@ impl McpServer {
             }
         }
 
+        // Exclude root node (depth 0) — it's the queried symbol itself, not a caller
+        let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+
         // Separate production callers from test callers
         let is_test = |c: &&queries::CallerWithRouteInfo| {
             c.name.starts_with("test_") || c.file_path.starts_with("tests/")
