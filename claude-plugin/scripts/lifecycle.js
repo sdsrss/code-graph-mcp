@@ -257,10 +257,10 @@ function uninstall() {
   // 5. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
-  // 6. Remove plugin files from cache (all known paths)
+  // 6. Remove plugin files from cache (all known paths, including parent dirs)
   const pluginCacheDirs = [
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph-mcp'),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph', 'code-graph'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph'),
     path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'),
   ];
   for (const dir of pluginCacheDirs) {
