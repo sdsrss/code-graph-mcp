@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { findBinary } = require('./find-binary');
 const { install, update, readManifest, getPluginVersion, checkScopeConflict } = require('./lifecycle');
 const { checkForUpdate } = require('./auto-update');
@@ -24,6 +27,37 @@ if (BIN) {
     '\n[code-graph] TIP: Call project_map first to get a full architecture overview ' +
     '(modules, dependencies, hot functions, entry points) in one call.\n'
   );
+}
+
+// --- 1c. Binary version sync (plugin may update before npm binary) ---
+if (BIN) {
+  try {
+    const binOut = execFileSync(BIN, ['--version'], { timeout: 2000, stdio: 'pipe' }).toString().trim();
+    const binVersion = binOut.replace(/^code-graph-mcp\s+/, '');
+    const pluginVersion = getPluginVersion();
+    if (binVersion && pluginVersion && /^\d+\.\d+\.\d+$/.test(binVersion)) {
+      const bv = binVersion.split('.').map(Number);
+      const pv = pluginVersion.split('.').map(Number);
+      const pluginNewer = (pv[0] > bv[0]) ||
+        (pv[0] === bv[0] && pv[1] > bv[1]) ||
+        (pv[0] === bv[0] && pv[1] === bv[1] && pv[2] > bv[2]);
+      if (pluginNewer) {
+        process.stderr.write(`[code-graph] Binary v${binVersion} < plugin v${pluginVersion}, updating...\n`);
+        try {
+          execFileSync('npm', ['install', '-g', `@sdsrs/code-graph@${pluginVersion}`], {
+            timeout: 30000, stdio: 'pipe'
+          });
+          // Clear cached binary path so next lookup finds the new binary
+          try { fs.unlinkSync(path.join(os.homedir(), '.cache', 'code-graph', 'binary-path')); } catch {}
+          process.stderr.write(`[code-graph] Binary updated to v${pluginVersion}\n`);
+        } catch {
+          process.stderr.write(
+            `[code-graph] Auto-update failed. Run: npm install -g @sdsrs/code-graph@${pluginVersion}\n`
+          );
+        }
+      }
+    }
+  } catch { /* version check failed — not critical */ }
 }
 
 // --- 2. Scope conflict warning ---

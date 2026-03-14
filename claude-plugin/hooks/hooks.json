@@ -44,7 +44,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.js\"",
-            "timeout": 8
+            "timeout": 20
           }
         ],
         "description": "Health check, StatusLine registration, and update check at session start"
