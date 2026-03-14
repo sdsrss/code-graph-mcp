@@ -17,6 +17,7 @@ try {
 fs.writeFileSync(flag, '');
 process.stdout.write(
   '[code-graph] For code understanding, prefer code-graph tools over Grep:\n' +
+  '  project_map → full project architecture overview (call FIRST)\n' +
   '  semantic_code_search → find code by concept (10x fewer tokens)\n' +
   '  get_call_graph → who calls X / what X calls (13x fewer tokens)\n' +
   '  module_overview → understand a module (20x fewer tokens)\n' +

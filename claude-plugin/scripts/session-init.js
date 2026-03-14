@@ -18,6 +18,14 @@ if (BIN) {
   } catch { /* timeout — silent */ }
 }
 
+// --- 1b. Suggest project_map as first action ---
+if (BIN) {
+  process.stdout.write(
+    '\n[code-graph] TIP: Call project_map first to get a full architecture overview ' +
+    '(modules, dependencies, hot functions, entry points) in one call.\n'
+  );
+}
+
 // --- 2. Scope conflict warning ---
 const conflict = checkScopeConflict();
 if (conflict) {
