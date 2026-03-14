@@ -125,7 +125,7 @@ async function downloadAndInstall(latest) {
     // 3. Copy plugin files to cache (cross-platform)
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
-      os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph', latest.version
+      os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph-mcp', latest.version
     );
 
     if (fs.existsSync(pluginSrc)) {

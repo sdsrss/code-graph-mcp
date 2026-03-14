@@ -1,5 +1,5 @@
 {
-  "name": "code-graph",
+  "name": "code-graph-mcp",
   "description": "AST knowledge graph for intelligent code navigation — auto-indexes your codebase and provides semantic search, call graph traversal, HTTP route tracing, and impact analysis via MCP tools",
   "author": {
     "name": "sdsrs"

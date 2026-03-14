@@ -4,9 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PLUGIN_ID = 'code-graph@sdsrss-code-graph';
-const OLD_PLUGIN_ID = 'code-graph@sdsrss'; // Legacy ID — kept for migration cleanup
-const MARKETPLACE_NAME = 'sdsrss-code-graph';
+const PLUGIN_ID = 'code-graph-mcp@code-graph-mcp';
+const OLD_PLUGIN_IDS = [
+  'code-graph@sdsrss',           // v1 legacy ID
+  'code-graph@sdsrss-code-graph', // v2 legacy ID (pre-rename)
+];
+const MARKETPLACE_NAME = 'code-graph-mcp';
 const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
 const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
@@ -97,34 +100,53 @@ function checkScopeConflict() {
   if (!installed || !installed.plugins) return null;
   for (const [key, entries] of Object.entries(installed.plugins)) {
     if (key === PLUGIN_ID) continue;
-    if (key.startsWith('code-graph@')) {
+    // Detect any old code-graph plugin IDs still installed
+    if (key.startsWith('code-graph@') || key.startsWith('code-graph-mcp@')) {
       return { existingId: key, scope: entries[0] && entries[0].scope, entries };
     }
   }
   return null;
 }
 
-// --- Migration: clean up old PLUGIN_ID remnants ---
+// --- Migration: clean up old plugin ID remnants ---
 
-function migrateOldPluginId(settings) {
+function migrateOldPluginIds(settings) {
   let changed = false;
 
-  // Clean old ID from enabledPlugins
-  if (settings.enabledPlugins && OLD_PLUGIN_ID in settings.enabledPlugins) {
-    delete settings.enabledPlugins[OLD_PLUGIN_ID];
-    changed = true;
+  for (const oldId of OLD_PLUGIN_IDS) {
+    // Clean old ID from enabledPlugins
+    if (settings.enabledPlugins && oldId in settings.enabledPlugins) {
+      delete settings.enabledPlugins[oldId];
+      changed = true;
+    }
+
+    // Clean old ID from installed_plugins.json
+    const installed = readJson(INSTALLED_PLUGINS_PATH);
+    if (installed && installed.plugins && oldId in installed.plugins) {
+      delete installed.plugins[oldId];
+      writeJsonAtomic(INSTALLED_PLUGINS_PATH, installed);
+    }
   }
 
-  // Clean old ID from installed_plugins.json
-  const installed = readJson(INSTALLED_PLUGINS_PATH);
-  if (installed && installed.plugins && OLD_PLUGIN_ID in installed.plugins) {
-    delete installed.plugins[OLD_PLUGIN_ID];
-    writeJsonAtomic(INSTALLED_PLUGINS_PATH, installed);
+  // Clean old marketplace names from extraKnownMarketplaces
+  if (settings.extraKnownMarketplaces) {
+    for (const oldName of ['sdsrss-code-graph']) {
+      if (oldName in settings.extraKnownMarketplaces) {
+        delete settings.extraKnownMarketplaces[oldName];
+        changed = true;
+      }
+    }
   }
 
-  // Clean old cache path (was using 'sdsrss' instead of 'sdsrss-code-graph')
-  const oldCacheDir = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph');
-  try { fs.rmSync(oldCacheDir, { recursive: true, force: true }); } catch { /* ok */ }
+  // Clean old cache paths
+  const oldCacheDirs = [
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph', 'code-graph'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph'),
+  ];
+  for (const dir of oldCacheDirs) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
+  }
 
   return changed;
 }
@@ -137,8 +159,8 @@ function install() {
   const settings = readJson(SETTINGS_PATH) || {};
   let settingsChanged = false;
 
-  // 0. Migrate from old PLUGIN_ID
-  if (migrateOldPluginId(settings)) {
+  // 0. Migrate from old plugin IDs
+  if (migrateOldPluginIds(settings)) {
     settingsChanged = true;
   }
 
@@ -203,9 +225,9 @@ function uninstall() {
       // else: other providers still using composite — leave it
     }
 
-    // 2. Remove both old and new IDs from enabledPlugins
+    // 2. Remove all known IDs from enabledPlugins
     if (settings.enabledPlugins) {
-      for (const id of [PLUGIN_ID, OLD_PLUGIN_ID]) {
+      for (const id of [PLUGIN_ID, ...OLD_PLUGIN_IDS]) {
         if (id in settings.enabledPlugins) {
           delete settings.enabledPlugins[id];
           settingsChanged = true;
@@ -219,11 +241,11 @@ function uninstall() {
     }
   }
 
-  // 4. Remove both old and new IDs from installed_plugins.json
+  // 4. Remove all known IDs from installed_plugins.json
   const installedPlugins = readJson(INSTALLED_PLUGINS_PATH);
   if (installedPlugins && installedPlugins.plugins) {
     let ipChanged = false;
-    for (const id of [PLUGIN_ID, OLD_PLUGIN_ID]) {
+    for (const id of [PLUGIN_ID, ...OLD_PLUGIN_IDS]) {
       if (id in installedPlugins.plugins) {
         delete installedPlugins.plugins[id];
         ipChanged = true;
@@ -235,10 +257,11 @@ function uninstall() {
   // 5. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
-  // 6. Remove plugin files from cache (both old and new paths)
+  // 6. Remove plugin files from cache (all known paths)
   const pluginCacheDirs = [
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph'),
-    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'), // legacy
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph-mcp'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph', 'code-graph'),
+    path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'code-graph'),
   ];
   for (const dir of pluginCacheDirs) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
@@ -256,8 +279,8 @@ function update() {
   const settings = readJson(SETTINGS_PATH) || {};
   let settingsChanged = false;
 
-  // 0. Migrate from old PLUGIN_ID
-  if (migrateOldPluginId(settings)) {
+  // 0. Migrate from old plugin IDs
+  if (migrateOldPluginIds(settings)) {
     settingsChanged = true;
   }
 
@@ -297,7 +320,7 @@ module.exports = {
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion,
-  PLUGIN_ID, OLD_PLUGIN_ID, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
+  PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 
 // CLI: node lifecycle.js <install|uninstall|update>

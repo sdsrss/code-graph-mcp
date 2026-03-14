@@ -109,7 +109,7 @@ Install as a Claude Code plugin for the best experience — includes slash comma
 /plugin marketplace add sdsrss/code-graph-mcp
 
 # Step 2: Install the plugin
-/plugin install code-graph@sdsrss-code-graph
+/plugin install code-graph-mcp
 ```
 
 What you get:
@@ -176,13 +176,13 @@ code-graph-mcp
 
 ```bash
 # Uninstall the plugin
-/plugin uninstall code-graph@sdsrss-code-graph
+/plugin uninstall code-graph-mcp
 
 # (Optional) Remove the marketplace
-/plugin marketplace remove sdsrss-code-graph
+/plugin marketplace remove code-graph-mcp
 
 # (Optional) Clean up all config and cache data
-node ~/.claude/plugins/cache/sdsrss/code-graph/*/scripts/lifecycle.js uninstall
+node ~/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/*/scripts/lifecycle.js uninstall
 ```
 
 ### Claude Code MCP Server

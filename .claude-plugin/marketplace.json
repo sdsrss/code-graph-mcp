@@ -1,18 +1,18 @@
 {
-  "name": "sdsrss-code-graph",
+  "name": "code-graph-mcp",
   "owner": {
     "name": "sdsrs"
   },
   "metadata": {
     "description": "AST knowledge graph plugin for Claude Code — semantic search, call graph, HTTP tracing, impact analysis",
-    "version": "0.4.7"
+    "version": "0.5.18"
   },
   "plugins": [
     {
-      "name": "code-graph",
+      "name": "code-graph-mcp",
       "source": "./claude-plugin",
       "description": "AST knowledge graph for intelligent code navigation — auto-indexes your codebase and provides semantic search, call graph traversal, HTTP route tracing, and impact analysis via MCP tools",
-      "version": "0.4.7",
+      "version": "0.5.18",
       "author": {
         "name": "sdsrs"
       },
