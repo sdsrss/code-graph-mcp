@@ -19,11 +19,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check
+      - name: Check (no embedding)
         run: cargo check --no-default-features
 
-      - name: Test
+      - name: Check (with embedding)
+        run: cargo check
+
+      - name: Test (no embedding)
         run: cargo test --no-default-features
+
+      - name: Test (with embedding)
+        run: cargo test
 
       - name: Clippy
         run: cargo clippy --no-default-features -- -D warnings
