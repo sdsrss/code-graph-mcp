@@ -1030,8 +1030,11 @@ impl McpServer {
         direction: &str,
         results: &[crate::graph::query::CallGraphNode],
     ) -> Result<serde_json::Value> {
+        let is_test = |n: &&crate::graph::query::CallGraphNode| {
+            n.name.starts_with("test_") || n.file_path.starts_with("tests/")
+        };
         let all_nodes: Vec<serde_json::Value> = results.iter()
-            .filter(|n| n.depth > 0)
+            .filter(|n| n.depth > 0 && !is_test(n))
             .map(|n| json!({
                 "node_id": n.node_id,
                 "name": n.name,
@@ -1041,6 +1044,9 @@ impl McpServer {
                 "direction": n.direction.as_str(),
             }))
             .collect();
+        let test_callers_count = results.iter()
+            .filter(|n| n.depth > 0 && is_test(n))
+            .count();
 
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
@@ -1059,12 +1065,16 @@ impl McpServer {
             .filter(|n| n["direction"] == "callers")
             .collect();
 
-        Ok(json!({
+        let mut result = json!({
             "function": function_name,
             "direction": direction,
             "callees": callee_nodes,
             "callers": caller_nodes,
-        }))
+        });
+        if test_callers_count > 0 {
+            result["test_callers_filtered"] = json!(test_callers_count);
+        }
+        Ok(result)
     }
 
     fn tool_find_http_route(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1535,7 +1545,12 @@ impl McpServer {
             }))
             .collect();
 
+        // Cap exports to avoid bloating context — full project can have 500+ symbols
+        const MAX_EXPORTS: usize = 80;
+        let total_exports = exports.len();
+        let capped = total_exports > MAX_EXPORTS;
         let all_exports: Vec<serde_json::Value> = exports.iter()
+            .take(MAX_EXPORTS)
             .map(|e| json!({
                 "node_id": e.node_id,
                 "name": e.name,
@@ -1546,13 +1561,20 @@ impl McpServer {
             }))
             .collect();
 
-        Ok(json!({
-            "path": path,
+        let mut result = json!({
+            "path": raw_path,
             "files_count": files.len(),
             "exports": all_exports,
             "hot_paths": hot_paths,
-            "summary": format!("Module '{}': {} exports across {} files", path, exports.len(), files.len())
-        }))
+            "summary": format!("Module '{}': {} exports across {} files", raw_path, total_exports, files.len())
+        });
+        if capped {
+            result["capped"] = json!(true);
+            result["showing"] = json!(MAX_EXPORTS);
+            result["total"] = json!(total_exports);
+            result["hint"] = json!("Results capped. Use a more specific path (e.g. 'src/mcp/') to see all exports.");
+        }
+        Ok(result)
     }
 
     fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
