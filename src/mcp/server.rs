@@ -2498,4 +2498,18 @@ app.post('/api/login', handleLogin);
         let prompts = parsed["result"]["prompts"].as_array().unwrap();
         assert_eq!(prompts.len(), 3);
     }
+
+    #[test]
+    fn test_get_index_status_has_embedding_fields() {
+        let server = McpServer::new_test();
+        let req = tool_call_json("get_index_status", json!({}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert!(result["embedding_status"].is_string(),
+            "should have embedding_status: {:?}", result);
+        assert!(result["embedding_progress"].is_string(),
+            "should have embedding_progress: {:?}", result);
+        assert!(result["model_available"].is_boolean(),
+            "should have model_available: {:?}", result);
+    }
 }
