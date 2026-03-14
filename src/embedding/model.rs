@@ -63,15 +63,65 @@ mod inner {
             ))
         }
 
+        /// Platform-specific cache directory for model files.
+        pub fn cache_models_dir() -> Result<std::path::PathBuf> {
+            let cache = dirs::cache_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine cache directory"))?;
+            Ok(cache.join("code-graph").join("models"))
+        }
+
+        /// URL for model download, based on current binary version.
+        pub fn model_download_url() -> String {
+            let version = env!("CARGO_PKG_VERSION");
+            format!(
+                "https://github.com/sdsrss/code-graph-mcp/releases/download/v{}/models.tar.gz",
+                version
+            )
+        }
+
+        /// Download model tarball from URL, extract to dest_dir.
+        pub fn download_model_to(url: &str, dest_dir: &std::path::Path) -> Result<()> {
+            use std::io::Read as IoRead;
+
+            tracing::info!("[model] Downloading model from {}...", url);
+
+            let mut response = ureq::get(url)
+                .call()
+                .map_err(|e| anyhow::anyhow!("Model download failed: {}", e))?;
+
+            if response.status() != 200 {
+                anyhow::bail!("Model download returned HTTP {}", response.status());
+            }
+
+            // Read body into memory (model is ~30MB compressed, cap at 200MB)
+            let mut body = Vec::new();
+            response.body_mut().as_reader()
+                .take(200 * 1024 * 1024)
+                .read_to_end(&mut body)?;
+
+            // Extract tar.gz
+            std::fs::create_dir_all(dest_dir)?;
+            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&body));
+            let mut archive = tar::Archive::new(gz);
+            archive.unpack(dest_dir)?;
+
+            // Write version marker (blake3 hash of tarball for cache invalidation)
+            let hash = blake3::hash(&body);
+            std::fs::write(dest_dir.join(".version"), hash.to_hex().as_str())?;
+
+            tracing::info!("[model] Model extracted to {:?}", dest_dir);
+            Ok(())
+        }
+
         fn find_models_dir() -> Result<std::path::PathBuf> {
-            // Check relative to current working directory (dev environment)
+            // 1. Check relative to current working directory (dev environment)
             let cwd = std::env::current_dir()?;
             let models = cwd.join("models");
             if models.join("model.safetensors").exists() {
                 return Ok(models);
             }
 
-            // Check relative to executable
+            // 2. Check relative to executable
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(exe_dir) = exe.parent() {
                     let models = exe_dir.join("models");
@@ -81,7 +131,7 @@ mod inner {
                 }
             }
 
-            // Check CARGO_MANIFEST_DIR (for cargo test)
+            // 3. Check CARGO_MANIFEST_DIR (for cargo test)
             if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
                 let models = std::path::PathBuf::from(manifest).join("models");
                 if models.join("model.safetensors").exists() {
@@ -89,7 +139,14 @@ mod inner {
                 }
             }
 
-            anyhow::bail!("Model files not found in models/ directory")
+            // 4. Check platform cache directory
+            if let Ok(cache_dir) = Self::cache_models_dir() {
+                if cache_dir.join("model.safetensors").exists() {
+                    return Ok(cache_dir);
+                }
+            }
+
+            anyhow::bail!("Model files not found. They will be downloaded on first use.")
         }
 
         /// Generate a 384-dim embedding for a single text.
@@ -338,5 +395,36 @@ mod tests {
         let mut v = vec![0.0, 0.0, 0.0];
         l2_normalize(&mut v);
         assert_eq!(v, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_cache_dir_resolves() {
+        let dir = inner::EmbeddingModel::cache_models_dir();
+        assert!(dir.is_ok(), "cache dir should resolve: {:?}", dir);
+        let dir = dir.unwrap();
+        assert!(dir.to_str().unwrap().contains("code-graph"),
+            "cache dir should contain 'code-graph': {:?}", dir);
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_download_model_invalid_url_returns_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = inner::EmbeddingModel::download_model_to(
+            "https://invalid.example.com/nonexistent.tar.gz",
+            tmp.path(),
+        );
+        assert!(result.is_err(), "should fail on invalid URL");
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_model_download_url_contains_version() {
+        let url = inner::EmbeddingModel::model_download_url();
+        assert!(url.contains(env!("CARGO_PKG_VERSION")),
+            "URL should contain package version: {}", url);
+        assert!(url.contains("models.tar.gz"),
+            "URL should point to models.tar.gz: {}", url);
     }
 }
