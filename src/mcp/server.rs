@@ -129,12 +129,10 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    fn open_db(db_path: &Path, embedding_model: &Option<EmbeddingModel>) -> Result<Database> {
-        if embedding_model.is_some() {
-            Database::open_with_vec(db_path)
-        } else {
-            Database::open(db_path)
-        }
+    fn open_db(db_path: &Path, _embedding_model: &Option<EmbeddingModel>) -> Result<Database> {
+        // Always open with vec support — model may be downloaded later (hot-loading)
+        // and the background embedding thread needs vec tables to exist.
+        Database::open_with_vec(db_path)
     }
 
     /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
@@ -316,6 +314,10 @@ impl McpServer {
                 }
             }
         }
+
+        // Background model download if model not available
+        #[cfg(feature = "embed-model")]
+        self.spawn_model_download();
     }
 
     /// Spawn a background thread to embed nodes that don't yet have vectors.
@@ -367,6 +369,53 @@ impl McpServer {
             }
             flag.store(false, Ordering::Release);
         });
+    }
+
+    /// Spawn a background thread to download the embedding model if not available.
+    /// On success, the model files are placed in the cache directory; lazy loading
+    /// in tool_semantic_search will pick them up on the next call.
+    #[cfg(feature = "embed-model")]
+    fn spawn_model_download(&self) {
+        // Only if model is not already loaded
+        if lock_or_recover(&self.embedding_model, "embedding_model").is_some() {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let cache_dir = match EmbeddingModel::cache_models_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("[model-dl] Cannot resolve cache dir: {}", e);
+                    return;
+                }
+            };
+
+            if cache_dir.join("model.safetensors").exists() {
+                return; // Already downloaded
+            }
+
+            let url = EmbeddingModel::model_download_url();
+            match EmbeddingModel::download_model_to(&url, &cache_dir) {
+                Ok(()) => tracing::info!("[model-dl] Model downloaded successfully"),
+                Err(e) => tracing::warn!("[model-dl] Download failed (FTS5-only mode): {}", e),
+            }
+        });
+    }
+
+    /// Try lazy loading: if model was None but cache now has files, load it.
+    /// Called at the start of semantic search / find_similar_code.
+    fn try_lazy_load_model(&self) {
+        let needs_load = lock_or_recover(&self.embedding_model, "embedding_model").is_none();
+        if !needs_load {
+            return;
+        }
+        // Try loading — if files were downloaded in background, this will find them
+        if let Ok(Some(model)) = EmbeddingModel::load() {
+            *lock_or_recover(&self.embedding_model, "embedding_model") = Some(model);
+            tracing::info!("[model] Embedding model hot-loaded from cache");
+            // Trigger background embedding for existing nodes
+            self.spawn_background_embedding();
+        }
     }
 
     /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
@@ -831,6 +880,9 @@ impl McpServer {
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
+
+        // Lazy model loading: pick up model if downloaded in background
+        self.try_lazy_load_model();
 
         // Ensure index is up to date
         self.ensure_indexed()?;
