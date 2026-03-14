@@ -888,6 +888,18 @@ pub fn get_unembedded_nodes(conn: &Connection) -> Result<Vec<(i64, String)>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Count nodes with embeddings vs total embeddable nodes.
+/// Returns (with_vectors, total_embeddable).
+pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL", [], |r| r.get(0)
+    )?;
+    let with_vectors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)
+    ).unwrap_or(0);
+    Ok((with_vectors, total))
+}
+
 // --- FTS5 Search ---
 
 /// Stopwords filtered from FTS5 queries to reduce noise.

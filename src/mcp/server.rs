@@ -1460,8 +1460,37 @@ impl McpServer {
     }
 
     fn tool_get_index_status(&self) -> Result<serde_json::Value> {
-        let status = queries::get_index_status(self.db.conn(), self.is_watching())?;
-        Ok(serde_json::to_value(&status)?)
+        let mut status = serde_json::to_value(
+            queries::get_index_status(self.db.conn(), self.is_watching())?
+        )?;
+
+        // Add embedding status fields
+        let model_available = lock_or_recover(&self.embedding_model, "embedding_model").is_some();
+        let (vectors_done, vectors_total) = if self.db.vec_enabled() {
+            queries::count_nodes_with_vectors(self.db.conn()).unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+
+        let embedding_status = if !model_available {
+            "unavailable"
+        } else if self.embedding_in_progress.load(Ordering::Acquire) {
+            "in_progress"
+        } else if vectors_done >= vectors_total && vectors_total > 0 {
+            "complete"
+        } else if vectors_done > 0 {
+            "partial"
+        } else {
+            "pending"
+        };
+
+        if let Some(obj) = status.as_object_mut() {
+            obj.insert("embedding_status".into(), json!(embedding_status));
+            obj.insert("embedding_progress".into(), json!(format!("{}/{}", vectors_done, vectors_total)));
+            obj.insert("model_available".into(), json!(model_available));
+        }
+
+        Ok(status)
     }
 
     fn tool_rebuild_index(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
