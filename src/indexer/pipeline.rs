@@ -15,14 +15,14 @@ use crate::storage::queries::*;
 use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, max_file_size, CROSS_FILE_CALL_NOISE};
 use crate::utils::config::detect_language;
 
-/// Counters for indexing observability — tracks skipped/truncated items.
+/// Counters for indexing observability — tracks skipped items.
 #[derive(Debug, Clone, Default)]
 pub struct IndexStats {
     pub files_skipped_size: usize,
     pub files_skipped_parse: usize,
     pub files_skipped_read: usize,
     pub files_skipped_hash: usize,
-    pub code_truncations: usize,
+    pub files_skipped_language: usize,
 }
 
 pub struct IndexResult {
@@ -403,6 +403,7 @@ fn index_files(
     let skipped_parse = AtomicUsize::new(0);
     let skipped_read = AtomicUsize::new(0);
     let skipped_hash = AtomicUsize::new(0);
+    let skipped_language = AtomicUsize::new(0);
 
     let mut total_nodes_created = 0usize;
     let mut total_edges_created = 0usize;
@@ -459,7 +460,13 @@ fn index_files(
         let pre_parsed: Vec<FilePreParsed> = batch
             .par_iter()
             .filter_map(|rel_path| {
-                let language = detect_language(rel_path)?;
+                let language = match detect_language(rel_path) {
+                    Some(l) => l,
+                    None => {
+                        skipped_language.fetch_add(1, AtomicOrdering::Relaxed);
+                        return None;
+                    }
+                };
                 let abs_path = root.join(rel_path);
 
                 let file_meta = std::fs::metadata(&abs_path).ok();
@@ -850,7 +857,7 @@ fn index_files(
         files_skipped_parse: skipped_parse.load(AtomicOrdering::Relaxed),
         files_skipped_read: skipped_read.load(AtomicOrdering::Relaxed),
         files_skipped_hash: skipped_hash.load(AtomicOrdering::Relaxed),
-        code_truncations: 0, // Truncation happens inside parser module; tracked separately if needed
+        files_skipped_language: skipped_language.load(AtomicOrdering::Relaxed),
     };
 
     Ok(IndexResult {
@@ -1152,7 +1159,7 @@ function handleLogin(req: Request) {
         assert_eq!(stats.files_skipped_parse, 0);
         assert_eq!(stats.files_skipped_read, 0);
         assert_eq!(stats.files_skipped_hash, 0);
-        assert_eq!(stats.code_truncations, 0);
+        assert_eq!(stats.files_skipped_language, 0);
     }
 
     #[test]

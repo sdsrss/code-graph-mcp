@@ -1188,7 +1188,7 @@ impl McpServer {
             "module_overview" => self.tool_module_overview(args),
             "dependency_graph" => self.tool_dependency_graph(args),
             "find_similar_code" => self.tool_find_similar_code(args),
-            "project_map" => self.tool_project_map(),
+            "project_map" => self.tool_project_map(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
         let elapsed = start.elapsed();
@@ -1916,8 +1916,8 @@ impl McpServer {
                     "hash_error": stats.files_skipped_hash,
                 }));
             }
-            if stats.code_truncations > 0 {
-                obj.insert("code_truncations".into(), json!(stats.code_truncations));
+            if stats.files_skipped_language > 0 {
+                obj.insert("files_skipped_unsupported_language".into(), json!(stats.files_skipped_language));
             }
         }
 
@@ -2361,8 +2361,10 @@ impl McpServer {
         }))
     }
 
-    fn tool_project_map(&self) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
+    fn tool_project_map(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
 
