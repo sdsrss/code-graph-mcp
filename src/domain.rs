@@ -23,11 +23,46 @@ pub const EMBEDDING_DIM: usize = 384;
 // -- Parsing limits --
 pub const MAX_AST_DEPTH: usize = 64;
 pub const MAX_RELATION_DEPTH: usize = 256;
-pub const PARSE_TIMEOUT_MS: u64 = 5000; // 5 seconds max per file parse
 
-// -- Indexing limits --
-pub const MAX_FILE_SIZE: u64 = 1_048_576; // 1 MB
-pub const MAX_CODE_CONTENT_LEN: usize = 4096; // 4KB max stored per node
+// -- Indexing limits (env-var overridable) --
+
+use std::sync::OnceLock;
+
+/// Maximum file size to index. Override: CODE_GRAPH_MAX_FILE_SIZE (bytes).
+/// Default: 1 MB.
+pub fn max_file_size() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("CODE_GRAPH_MAX_FILE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_048_576)
+    })
+}
+
+/// Maximum code content length stored per node. Override: CODE_GRAPH_MAX_CODE_LEN (bytes).
+/// Default: 4 KB.
+pub fn max_code_content_len() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("CODE_GRAPH_MAX_CODE_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096)
+    })
+}
+
+/// Per-file parse timeout in milliseconds. Override: CODE_GRAPH_PARSE_TIMEOUT_MS.
+/// Default: 5000 ms.
+pub fn parse_timeout_ms() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("CODE_GRAPH_PARSE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000)
+    })
+}
 
 // -- Edge resolution noise filter --
 // Common standard-library method/trait names that produce false-positive call edges
@@ -48,3 +83,24 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
     "push", "pop", "insert", "remove", "contains", "get",
     "to_owned", "to_vec", "collect", "join",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_max_file_size_default() {
+        // Without env var set, should return the default 1 MB
+        assert_eq!(max_file_size(), 1_048_576);
+    }
+
+    #[test]
+    fn test_max_code_content_len_default() {
+        assert_eq!(max_code_content_len(), 4096);
+    }
+
+    #[test]
+    fn test_parse_timeout_ms_default() {
+        assert_eq!(parse_timeout_ms(), 5000);
+    }
+}

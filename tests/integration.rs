@@ -1034,11 +1034,12 @@ function main() { return add(1, 2); }
 
 #[test]
 fn test_parse_timeout_does_not_hang() {
-    use code_graph_mcp::domain::PARSE_TIMEOUT_MS;
+    use code_graph_mcp::domain::parse_timeout_ms;
 
-    // Verify the constant exists and is reasonable
-    assert!(PARSE_TIMEOUT_MS > 0 && PARSE_TIMEOUT_MS <= 30_000,
-        "PARSE_TIMEOUT_MS should be between 1 and 30000, got {}", PARSE_TIMEOUT_MS);
+    // Verify the value exists and is reasonable
+    let timeout = parse_timeout_ms();
+    assert!(timeout > 0 && timeout <= 30_000,
+        "parse_timeout_ms should be between 1 and 30000, got {}", timeout);
 
     // Generate deeply nested code that could stress the parser
     let mut code = String::new();

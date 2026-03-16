@@ -12,7 +12,7 @@ use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::*;
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_FILE_SIZE, CROSS_FILE_CALL_NOISE};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, max_file_size, CROSS_FILE_CALL_NOISE};
 use crate::utils::config::detect_language;
 
 /// Counters for indexing observability — tracks skipped/truncated items.
@@ -464,7 +464,7 @@ fn index_files(
 
                 let file_meta = std::fs::metadata(&abs_path).ok();
                 if let Some(ref meta) = file_meta {
-                    if meta.len() > MAX_FILE_SIZE {
+                    if meta.len() > max_file_size() {
                         tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
                         skipped_size.fetch_add(1, AtomicOrdering::Relaxed);
                         return None;

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use super::languages::get_language;
 use super::node_text;
-use crate::domain::{MAX_AST_DEPTH, MAX_CODE_CONTENT_LEN, PARSE_TIMEOUT_MS};
+use crate::domain::{MAX_AST_DEPTH, max_code_content_len, parse_timeout_ms};
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -36,7 +36,7 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(language) {
             let mut p = tree_sitter::Parser::new();
-            p.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+            p.set_timeout_micros(parse_timeout_ms() * 1000);
             p.set_language(&lang)?;
             cache.insert(language.to_string(), p);
         }
@@ -320,10 +320,10 @@ fn extract_children(
 }
 
 fn truncate_code_content(content: &str) -> Cow<'_, str> {
-    if content.len() <= MAX_CODE_CONTENT_LEN {
+    if content.len() <= max_code_content_len() {
         Cow::Borrowed(content)
     } else {
-        let mut end = MAX_CODE_CONTENT_LEN;
+        let mut end = max_code_content_len();
         while end > 0 && !content.is_char_boundary(end) {
             end -= 1;
         }
