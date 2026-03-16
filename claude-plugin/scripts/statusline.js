@@ -4,6 +4,10 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
+const { cleanupDisabledStatusline } = require('./lifecycle');
+
+const disabledCleanup = cleanupDisabledStatusline();
+if (disabledCleanup.cleaned) process.exit(0);
 
 // Only show status in projects that have a code-graph index.
 // The statusLine config is global, so we must exit silently for

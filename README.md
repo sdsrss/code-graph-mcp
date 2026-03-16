@@ -118,7 +118,7 @@ What you get:
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
 - **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
 - **StatusLine** — Real-time health display (nodes, files, watch status) — compatible with other plugins' StatusLine via composite multiplexer
-- **Auto-update** — Checks for new versions every 24h, updates silently
+- **Auto-update** — Checks for new versions every 6h, updates silently
 
 #### Manual Update
 

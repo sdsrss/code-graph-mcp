@@ -1,14 +1,20 @@
 {
   "name": "@sdsrs/code-graph-win32-x64",
-  "version": "0.5.19",
+  "version": "0.5.28",
   "description": "code-graph-mcp binary for Windows x64",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/sdsrss/code-graph-mcp"
   },
-  "os": ["win32"],
-  "cpu": ["x64"],
-  "files": ["code-graph-mcp.exe"],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "code-graph-mcp.exe"
+  ],
   "preferUnplugged": true
 }

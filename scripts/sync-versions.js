@@ -17,6 +17,14 @@ if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
 
 const root = path.resolve(__dirname, '..');
 
+const PLATFORM_PACKAGES = [
+  'npm/linux-x64/package.json',
+  'npm/linux-arm64/package.json',
+  'npm/darwin-x64/package.json',
+  'npm/darwin-arm64/package.json',
+  'npm/win32-x64/package.json',
+];
+
 const updates = [
   {
     file: 'Cargo.toml',
@@ -25,7 +33,16 @@ const updates = [
   {
     file: 'package.json',
     json: true,
-    transform: (obj) => { obj.version = version; return obj; },
+    transform: (obj) => {
+      obj.version = version;
+      // Sync optionalDependencies to same version
+      if (obj.optionalDependencies) {
+        for (const key of Object.keys(obj.optionalDependencies)) {
+          obj.optionalDependencies[key] = version;
+        }
+      }
+      return obj;
+    },
   },
   {
     file: 'claude-plugin/.claude-plugin/plugin.json',
@@ -41,6 +58,12 @@ const updates = [
       return obj;
     },
   },
+  // Platform npm packages
+  ...PLATFORM_PACKAGES.map(file => ({
+    file,
+    json: true,
+    transform: (obj) => { obj.version = version; return obj; },
+  })),
 ];
 
 let changed = 0;

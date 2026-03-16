@@ -95,20 +95,10 @@ jobs:
           cp artifacts/binary-win32-x64/code-graph-mcp.exe npm/win32-x64/
 
       - name: Update versions
-        run: |
-          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            cd npm/$pkg
-            npm version $VERSION --no-git-tag-version --allow-same-version
-            cd ../..
-          done
-          npm version $VERSION --no-git-tag-version --allow-same-version
-          node -e "
-            const pkg = require('./package.json');
-            for (const key of Object.keys(pkg.optionalDependencies || {})) {
-              pkg.optionalDependencies[key] = '$VERSION';
-            }
-            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
+        run: node scripts/sync-versions.js $VERSION
+
+      - name: Release smoke test
+        run: node --test scripts/release-smoke.test.js
 
       - name: Publish platform packages
         run: |

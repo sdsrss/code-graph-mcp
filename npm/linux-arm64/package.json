@@ -1,14 +1,20 @@
 {
   "name": "@sdsrs/code-graph-linux-arm64",
-  "version": "0.5.19",
+  "version": "0.5.28",
   "description": "code-graph-mcp binary for Linux ARM64",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/sdsrss/code-graph-mcp"
   },
-  "os": ["linux"],
-  "cpu": ["arm64"],
-  "files": ["code-graph-mcp"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "code-graph-mcp"
+  ],
   "preferUnplugged": true
 }

@@ -1,62 +1,23 @@
 #!/usr/bin/env node
 
-const { execFileSync, spawn } = require("child_process");
+const { spawn } = require("child_process");
 const path = require("path");
-const fs = require("fs");
-const os = require("os");
 
-function getBinaryName() {
-  return os.platform() === "win32" ? "code-graph-mcp.exe" : "code-graph-mcp";
-}
+// Tell find-binary.js our package root so it can locate bundled binaries
+// and detect dev mode from bin/ → repo root (one level up)
+process.env._FIND_BINARY_ROOT = path.resolve(__dirname, "..");
 
-function findBinary() {
-  const binaryName = getBinaryName();
-
-  // 1. Check platform-specific npm package (code-graph-<os>-<arch>)
-  const platformPkg = `@sdsrs/code-graph-${os.platform()}-${os.arch()}`;
-  try {
-    const pkgPath = require.resolve(`${platformPkg}/package.json`);
-    const pkgDir = path.dirname(pkgPath);
-    const platBinary = path.join(pkgDir, binaryName);
-    if (fs.existsSync(platBinary)) {
-      return platBinary;
-    }
-  } catch {
-    // Platform package not installed
-  }
-
-  // 2. Check bundled binary in the same directory
-  const bundled = path.join(__dirname, binaryName);
-  if (fs.existsSync(bundled)) {
-    return bundled;
-  }
-
-  // 3. Check cargo build output (for development)
-  const cargoRelease = path.join(__dirname, "..", "target", "release", binaryName);
-  if (fs.existsSync(cargoRelease)) {
-    return cargoRelease;
-  }
-
-  // 4. Check if available in PATH
-  try {
-    const which = os.platform() === "win32" ? "where" : "which";
-    const result = execFileSync(which, [binaryName], { encoding: "utf8" }).trim();
-    if (result) return result;
-  } catch {
-    // not in PATH
-  }
-
-  return null;
-}
+const { findBinary } = require("../claude-plugin/scripts/find-binary");
 
 const binary = findBinary();
 
 if (!binary) {
   console.error(
     "Error: code-graph-mcp binary not found.\n\n" +
+    "To install:\n" +
+    "  npm install -g @sdsrs/code-graph\n\n" +
     "To build from source:\n" +
-    "  cargo build --release --no-default-features\n\n" +
-    "Or install the platform-specific binary."
+    "  cargo build --release\n"
   );
   process.exit(1);
 }

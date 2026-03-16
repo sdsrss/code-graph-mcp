@@ -2,18 +2,39 @@
 'use strict';
 const { execFileSync } = require('child_process');
 const fs = require('fs');
+const https = require('https');
 const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
+const { clearCache: clearBinaryCache } = require('./find-binary');
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
-const NPM_PACKAGE = '@sdsrs/code-graph';
 const STATE_FILE = path.join(CACHE_DIR, 'update-state.json');
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h (GitHub allows 60 req/h unauthenticated)
+const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h
 const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
-const POST_UPDATE_INTERVAL_MS = 1 * 60 * 60 * 1000;  // 1h after update (verify success)
 const FETCH_TIMEOUT_MS = 3000;
+const VERSION_OUTPUT_RE = /^code-graph-mcp\s+(\d+\.\d+\.\d+)$/;
+
+function isSilentMode(argv = process.argv.slice(2), env = process.env) {
+  return argv.includes('--silent') || env.CODE_GRAPH_AUTO_UPDATE_SILENT === '1';
+}
+
+// ── Platform → GitHub release asset name mapping ──────────
+function getPlatformAssetName() {
+  const platform = os.platform();
+  const arch = os.arch();
+  const key = `${platform}-${arch}`;
+  const map = {
+    'linux-x64': 'code-graph-mcp-linux-x64',
+    'linux-arm64': 'code-graph-mcp-linux-arm64',
+    'darwin-x64': 'code-graph-mcp-darwin-x64',
+    'darwin-arm64': 'code-graph-mcp-darwin-arm64',
+    'win32-x64': 'code-graph-mcp-win32-x64.exe',
+  };
+  return map[key] || null;
+}
 
 // ── State Persistence ──────────────────────────────────────
 
@@ -43,9 +64,7 @@ function isDevMode() {
 function shouldCheck(state) {
   if (!state.lastCheck) return true;
   const elapsed = Date.now() - new Date(state.lastCheck).getTime();
-  let interval = CHECK_INTERVAL_MS;
-  if (state.rateLimited) interval = RATE_LIMIT_INTERVAL_MS;
-  else if (state.pendingBinaryUpdate) interval = POST_UPDATE_INTERVAL_MS;
+  const interval = state.rateLimited ? RATE_LIMIT_INTERVAL_MS : CHECK_INTERVAL_MS;
   return elapsed >= interval;
 }
 
@@ -63,30 +82,67 @@ function compareVersions(a, b) {
 
 // ── GitHub API ─────────────────────────────────────────────
 
-async function fetchLatestRelease() {
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-  try {
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: 'GET',
       headers: {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'code-graph-auto-update/1.0',
       },
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        if (!res.statusCode) {
+          reject(new Error('missing status code'));
+          return;
+        }
+        resolve({ statusCode: res.statusCode, body });
+      });
     });
 
-    if (res.status === 403) {
-      // Rate limited
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function parseLatestRelease(data, assetName = getPlatformAssetName()) {
+  if (!data || typeof data.tag_name !== 'string' || typeof data.tarball_url !== 'string') {
+    return null;
+  }
+
+  let binaryUrl = null;
+  if (assetName && Array.isArray(data.assets)) {
+    const asset = data.assets.find((entry) => entry && entry.name === assetName);
+    if (asset && typeof asset.browser_download_url === 'string') {
+      binaryUrl = asset.browser_download_url;
+    }
+  }
+
+  return {
+    version: data.tag_name.replace(/^v/, ''),
+    tarballUrl: data.tarball_url,
+    binaryUrl,
+  };
+}
+
+async function fetchLatestRelease(requestJsonFn = requestJson) {
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+  try {
+    const res = await requestJsonFn(url, FETCH_TIMEOUT_MS);
+
+    if (res.statusCode === 403) {
       const state = readState();
       saveState({ ...state, rateLimited: true });
       return null;
     }
-    if (!res.ok) return null;
+    if (res.statusCode < 200 || res.statusCode >= 300) return null;
 
-    const data = await res.json();
-    return {
-      version: data.tag_name.replace(/^v/, ''),
-      tarballUrl: data.tarball_url,
-    };
+    const data = JSON.parse(res.body);
+    return parseLatestRelease(data);
   } catch { return null; }
 }
 
@@ -105,14 +161,60 @@ function copyDirSync(src, dst) {
   }
 }
 
+function getExtractedPluginVersion(pluginSrc) {
+  const manifest = readJson(path.join(pluginSrc, '.claude-plugin', 'plugin.json'));
+  return manifest && typeof manifest.version === 'string' ? manifest.version : null;
+}
+
+function readBinaryVersion(binaryPath) {
+  try {
+    const out = execFileSync(binaryPath, ['--version'], {
+      timeout: 2000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString().trim();
+    const match = out.match(VERSION_OUTPUT_RE);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
+  try {
+    const stat = fs.statSync(binaryTmp);
+    if (stat.size <= 1_000_000) return false;
+
+    const actualVersion = readBinaryVersion(binaryTmp);
+    if (!actualVersion || (expectedVersion && actualVersion !== expectedVersion)) {
+      return false;
+    }
+
+    fs.renameSync(binaryTmp, binaryDst);
+    if (os.platform() !== 'win32') {
+      fs.chmodSync(binaryDst, 0o755);
+    }
+    clearBinaryCache();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      if (fs.existsSync(binaryTmp)) fs.unlinkSync(binaryTmp);
+    } catch { /* ok */ }
+  }
+}
+
 // ── Download & Install ─────────────────────────────────────
 
 async function downloadAndInstall(latest) {
   const tmpDir = path.join(os.tmpdir(), `code-graph-update-${Date.now()}`);
+  let pluginUpdated = false;
+  let binaryUpdated = false;
+
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // 1. Download tarball (safe: no shell interpolation)
+    // ── Step 1: Download and install plugin files from tarball ──
     const tarballPath = path.join(tmpDir, 'release.tar.gz');
     execFileSync('curl', [
       '-sL', '-o', tarballPath,
@@ -120,23 +222,22 @@ async function downloadAndInstall(latest) {
       latest.tarballUrl,
     ], { timeout: 30000, stdio: 'pipe' });
 
-    // 2. Extract tarball
     execFileSync('tar', [
       'xzf', tarballPath, '-C', tmpDir, '--strip-components=1',
     ], { timeout: 15000, stdio: 'pipe' });
 
-    // 3. Copy plugin files to cache (cross-platform)
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
       os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME, 'code-graph-mcp', latest.version
     );
 
-    if (fs.existsSync(pluginSrc)) {
+    if (fs.existsSync(pluginSrc) && getExtractedPluginVersion(pluginSrc) === latest.version) {
       fs.mkdirSync(pluginDst, { recursive: true });
       copyDirSync(pluginSrc, pluginDst);
+      pluginUpdated = true;
     }
 
-    // 4. Update installed_plugins.json to point to new version
+    // Update installed_plugins.json to point to new version
     const installedPath = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
     try {
       const installed = readJson(installedPath);
@@ -146,34 +247,41 @@ async function downloadAndInstall(latest) {
         installed.plugins[PLUGIN_ID][0].lastUpdated = new Date().toISOString();
         writeJsonAtomic(installedPath, installed);
       }
-    } catch { /* installed_plugins update failed — not fatal */ }
+    } catch { /* not fatal */ }
 
-    // 5. Update install manifest with tag version
+    // Update install manifest
     try {
       const manifest = readManifest();
       manifest.version = latest.version;
       manifest.updatedAt = new Date().toISOString();
       writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
-    } catch { /* manifest update failed — not fatal */ }
+    } catch { /* not fatal */ }
 
-    // 6. Update npm binary (non-blocking, best-effort)
-    let binaryUpdated = false;
-    try {
-      execFileSync('npm', ['install', '-g', `${NPM_PACKAGE}@${latest.version}`], {
-        timeout: 60000,
-        stdio: 'pipe',
-      });
-      binaryUpdated = true;
-      // Clear pending flag on success
-      try { const s = readState(); delete s.pendingBinaryUpdate; saveState(s); } catch { /* ok */ }
-    } catch {
-      // npm package may not be published yet (race with CI). Record for retry.
-      try { const s = readState(); s.pendingBinaryUpdate = latest.version; saveState(s); } catch { /* ok */ }
+    // ── Step 2: Download platform binary directly from GitHub release ──
+    if (latest.binaryUrl) {
+      try {
+        const binaryName = os.platform() === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
+        const binaryDst = path.join(BINARY_CACHE_DIR, binaryName);
+        const binaryTmp = binaryDst + '.tmp.' + process.pid;
+
+        fs.mkdirSync(BINARY_CACHE_DIR, { recursive: true });
+        execFileSync('curl', [
+          '-sL', '-o', binaryTmp,
+          latest.binaryUrl,
+        ], { timeout: 60000, stdio: 'pipe' });
+
+        if (promoteVerifiedBinary(binaryTmp, binaryDst, latest.version)) {
+          binaryUpdated = true;
+        }
+      } catch {
+        // Binary download failed — plugin update still counts as success
+      }
     }
 
-    return true;
-  } catch { return false; }
-  finally {
+    return { pluginUpdated, binaryUpdated };
+  } catch {
+    return { pluginUpdated: false, binaryUpdated: false };
+  } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
   }
 }
@@ -189,7 +297,6 @@ async function checkForUpdate() {
 
     // Time-based throttle
     if (!shouldCheck(state)) {
-      // Report pending update from previous check
       if (state.updateAvailable && state.latestVersion) {
         return { updateAvailable: true, from: state.installedVersion, to: state.latestVersion };
       }
@@ -209,8 +316,8 @@ async function checkForUpdate() {
     const hasUpdate = compareVersions(latest.version, currentVersion) > 0;
 
     if (hasUpdate) {
-      // Auto-update
-      const success = await downloadAndInstall(latest);
+      const result = await downloadAndInstall(latest);
+      const success = result.pluginUpdated;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : currentVersion,
@@ -218,12 +325,14 @@ async function checkForUpdate() {
         updateAvailable: !success,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
+        binaryUpdated: result.binaryUpdated,
       };
       saveState(newState);
 
       return {
         updateAvailable: !success,
         updated: success,
+        binaryUpdated: result.binaryUpdated,
         from: currentVersion,
         to: latest.version,
       };
@@ -244,20 +353,27 @@ async function checkForUpdate() {
   }
 }
 
-module.exports = { checkForUpdate, isDevMode, readState };
+module.exports = {
+  checkForUpdate, isDevMode, readState, compareVersions,
+  getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary, isSilentMode,
+  requestJson, parseLatestRelease, fetchLatestRelease,
+};
 
 // CLI: node auto-update.js [check|status]
 if (require.main === module) {
   (async () => {
-    const cmd = process.argv[2] || 'check';
+    const argv = process.argv.slice(2);
+    const cmd = argv.find(arg => !arg.startsWith('--')) || 'check';
+    const silent = isSilentMode(argv);
     if (cmd === 'status') {
       const state = readState();
       console.log(JSON.stringify(state, null, 2));
     } else {
-      console.log('Checking for updates...');
+      if (!silent) console.log('Checking for updates...');
       const result = await checkForUpdate();
+      if (silent) return;
       if (result && result.updated) {
-        console.log(`Updated: v${result.from} → v${result.to}`);
+        console.log(`Updated: v${result.from} → v${result.to} (binary: ${result.binaryUpdated ? 'yes' : 'no'})`);
       } else if (result && result.updateAvailable) {
         console.log(`Update available: v${result.to} (auto-install failed)`);
       } else if (isDevMode()) {

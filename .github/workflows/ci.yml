@@ -15,6 +15,10 @@ jobs:
         with:
           submodules: true
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -30,6 +34,9 @@ jobs:
 
       - name: Test (with embedding)
         run: cargo test
+
+      - name: Plugin lifecycle tests
+        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js scripts/release-smoke.test.js
 
       - name: Clippy (no embedding)
         run: cargo clippy --no-default-features -- -D warnings

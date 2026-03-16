@@ -7,9 +7,12 @@
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
-const { readRegistry } = require('./lifecycle');
+const { cleanupDisabledStatusline, readRegistry } = require('./lifecycle');
 
 const SEPARATOR = ' \x1b[2m|\x1b[0m ';
+
+const disabledCleanup = cleanupDisabledStatusline();
+if (disabledCleanup.cleaned) process.exit(0);
 
 // Collect stdin (Claude Code pipes JSON context)
 let stdinData = '';

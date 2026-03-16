@@ -53,6 +53,15 @@ function codeGraphStatuslineCommand() {
   return `node ${JSON.stringify(path.join(PLUGIN_ROOT, 'scripts', 'statusline.js'))}`;
 }
 
+function hasOwn(obj, key) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function hasInstalledPluginRecord() {
+  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  return !!(installed && installed.plugins && Array.isArray(installed.plugins[PLUGIN_ID]) && installed.plugins[PLUGIN_ID].length > 0);
+}
+
 function isOurComposite(settings) {
   return settings.statusLine &&
     settings.statusLine.command &&
@@ -67,6 +76,10 @@ function readRegistry() {
 }
 
 function writeRegistry(registry) {
+  if (!registry || registry.length === 0) {
+    try { fs.unlinkSync(REGISTRY_FILE); } catch { /* ok */ }
+    return;
+  }
   writeJsonAtomic(REGISTRY_FILE, registry);
 }
 
@@ -91,6 +104,58 @@ function unregisterStatuslineProvider(id) {
   if (filtered.length === registry.length) return false;
   writeRegistry(filtered);
   return true;
+}
+
+function isPluginExplicitlyDisabled(settings = readJson(SETTINGS_PATH) || {}) {
+  return hasOwn(settings.enabledPlugins, PLUGIN_ID) && settings.enabledPlugins[PLUGIN_ID] === false;
+}
+
+function isPluginInactive(settings = readJson(SETTINGS_PATH) || {}) {
+  if (isPluginExplicitlyDisabled(settings)) return true;
+
+  const hasComposite = isOurComposite(settings);
+  const hasCodeGraphRegistry = readRegistry().some((provider) => provider.id === 'code-graph');
+  if (!hasComposite && !hasCodeGraphRegistry) return false;
+
+  const installed = readJson(INSTALLED_PLUGINS_PATH);
+  if (!installed || !installed.plugins) return false;
+  return !hasInstalledPluginRecord();
+}
+
+function detachStatuslineIntegration(settings) {
+  let settingsChanged = false;
+
+  unregisterStatuslineProvider('code-graph');
+  const previous = readRegistry().find(p => p.id === '_previous' && p.command);
+
+  // If our composite is still configured while the plugin is disabled/uninstalled,
+  // prefer restoring the prior statusline (or removing ours entirely) so the plugin
+  // truly stops affecting Claude Code.
+  if (isOurComposite(settings)) {
+    if (previous) {
+      settings.statusLine = { type: 'command', command: previous.command };
+    } else {
+      delete settings.statusLine;
+    }
+    settingsChanged = true;
+  }
+
+  unregisterStatuslineProvider('_previous');
+  return settingsChanged;
+}
+
+function cleanupDisabledStatusline() {
+  const settings = readJson(SETTINGS_PATH);
+  if (!settings || !isPluginInactive(settings)) {
+    return { cleaned: false, settingsChanged: false };
+  }
+
+  const settingsChanged = detachStatuslineIntegration(settings);
+  if (settingsChanged) {
+    writeJsonAtomic(SETTINGS_PATH, settings);
+  }
+
+  return { cleaned: true, settingsChanged };
 }
 
 // --- Scope Conflict Detection ---
@@ -207,22 +272,9 @@ function uninstall() {
   let settingsChanged = false;
 
   if (settings) {
-    // 1. StatusLine: remove code-graph from registry
-    unregisterStatuslineProvider('code-graph');
-    const remaining = readRegistry();
-
-    if (isOurComposite(settings)) {
-      if (remaining.length === 1 && remaining[0].id === '_previous') {
-        // Only the previous provider remains — restore it directly
-        settings.statusLine = { type: 'command', command: remaining[0].command };
-        unregisterStatuslineProvider('_previous');
-        settingsChanged = true;
-      } else if (remaining.length === 0) {
-        // No providers left — remove statusLine entirely
-        delete settings.statusLine;
-        settingsChanged = true;
-      }
-      // else: other providers still using composite — leave it
+    // 1. StatusLine: remove code-graph integration and restore prior statusline.
+    if (detachStatuslineIntegration(settings)) {
+      settingsChanged = true;
     }
 
     // 2. Remove all known IDs from enabledPlugins
@@ -317,6 +369,7 @@ function update() {
 
 module.exports = {
   install, uninstall, update, checkScopeConflict,
+  isPluginExplicitlyDisabled, isPluginInactive, cleanupDisabledStatusline,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion,
