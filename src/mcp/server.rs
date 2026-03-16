@@ -83,6 +83,81 @@ fn should_skip_indexing(args: &serde_json::Value) -> bool {
     args.get("skip_indexing").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Centralized compression for tool results that exceed the token threshold.
+/// Handlers that already produce custom compressed output (with a "mode" key)
+/// are left unchanged. For other results, this truncates large string values
+/// and adds a `_truncated` marker.
+fn centralized_compress(value: serde_json::Value) -> serde_json::Value {
+    use crate::sandbox::compressor::estimate_json_tokens;
+    let tokens = estimate_json_tokens(&value);
+    if tokens <= COMPRESSION_TOKEN_THRESHOLD {
+        return value;
+    }
+    // If the handler already produced a compressed result, leave it alone
+    if value.get("mode").is_some() {
+        return value;
+    }
+    // Truncate large string values to bring result under threshold
+    truncate_large_strings(value, COMPRESSION_TOKEN_THRESHOLD)
+}
+
+/// Recursively truncate string values in a JSON value to stay within a token budget.
+/// Adds a `_truncated` key to the top-level object when truncation occurs.
+fn truncate_large_strings(value: serde_json::Value, token_budget: usize) -> serde_json::Value {
+    // Target: reduce to roughly token_budget * 3 chars total
+    let target_chars = token_budget * 3;
+    let serialized = serde_json::to_string(&value).unwrap_or_default();
+    if serialized.len() <= target_chars {
+        return value;
+    }
+
+    let mut result = truncate_value(value, target_chars);
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("_truncated".to_string(), json!(true));
+        obj.insert("_truncation_hint".to_string(),
+            json!("Result exceeded token limit. Use get_ast_node(node_id) to read specific nodes."));
+    }
+    result
+}
+
+/// Truncate a JSON value's string fields to fit within a char budget.
+fn truncate_value(value: serde_json::Value, budget: usize) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Per-field budget: distribute chars across fields
+            let field_count = map.len().max(1);
+            let per_field = budget / field_count;
+            let truncated: serde_json::Map<String, serde_json::Value> = map.into_iter()
+                .map(|(k, v)| {
+                    let tv = match &v {
+                        serde_json::Value::String(s) if s.len() > per_field => {
+                            let truncated_str = &s[..s.floor_char_boundary(per_field.min(s.len()))];
+                            json!(format!("{}... [truncated, {} chars total]", truncated_str, s.len()))
+                        }
+                        serde_json::Value::Array(arr) if arr.len() > 20 => {
+                            // Keep first 10 and last 5 items, note truncation
+                            let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
+                            kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
+                            kept.extend_from_slice(&arr[arr.len()-5..]);
+                            serde_json::Value::Array(kept)
+                        }
+                        _ => v,
+                    };
+                    (k, tv)
+                })
+                .collect();
+            serde_json::Value::Object(truncated)
+        }
+        serde_json::Value::Array(arr) if arr.len() > 20 => {
+            let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
+            kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
+            kept.extend_from_slice(&arr[arr.len()-5..]);
+            serde_json::Value::Array(kept)
+        }
+        other => other,
+    }
+}
+
 /// Lock a Mutex, recovering from poison but logging a warning.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
@@ -1125,7 +1200,10 @@ impl McpServer {
         } else {
             tracing::debug!("[tool] {} completed in {}ms", name, elapsed.as_millis());
         }
-        result
+        // Centralized compression: safety net for any result exceeding the token threshold.
+        // Handlers with custom compression (semantic_search, call_graph, http_chain, ast_node)
+        // already return results with a "mode" key when compressed — those are left unchanged.
+        result.map(centralized_compress)
     }
 
     fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -3035,5 +3113,33 @@ app.post('/api/login', handleLogin);
             "should have embedding_progress: {:?}", result);
         assert!(result["model_available"].is_boolean(),
             "should have model_available: {:?}", result);
+    }
+
+    #[test]
+    fn test_handle_tool_centralized_compression() {
+        // Verify that estimate_json_tokens works as expected for compression threshold checks
+        let small = json!({"name": "hello", "type": "function"});
+        let small_tokens = crate::sandbox::compressor::estimate_json_tokens(&small);
+        assert!(small_tokens < COMPRESSION_TOKEN_THRESHOLD,
+            "small JSON should be under threshold: {} tokens", small_tokens);
+
+        // Build a large JSON value that exceeds the compression threshold
+        // COMPRESSION_TOKEN_THRESHOLD = 2000, and estimate is len/3
+        // So we need > 6000 chars of JSON
+        let large_content: String = "x".repeat(8000);
+        let large = json!({"code_content": large_content, "name": "big_function"});
+        let large_tokens = crate::sandbox::compressor::estimate_json_tokens(&large);
+        assert!(large_tokens > COMPRESSION_TOKEN_THRESHOLD,
+            "large JSON should exceed threshold: {} tokens vs {} threshold",
+            large_tokens, COMPRESSION_TOKEN_THRESHOLD);
+
+        // Verify the centralized compression produces a truncated result
+        let compressed = centralized_compress(large.clone());
+        assert_ne!(compressed, large, "compressed result should differ from original");
+        assert!(compressed.get("_truncated").is_some(),
+            "centralized compression should add _truncated marker");
+        let compressed_tokens = crate::sandbox::compressor::estimate_json_tokens(&compressed);
+        assert!(compressed_tokens <= COMPRESSION_TOKEN_THRESHOLD * 2,
+            "compressed result should be much smaller: {} tokens", compressed_tokens);
     }
 }
