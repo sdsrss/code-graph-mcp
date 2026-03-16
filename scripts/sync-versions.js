@@ -23,6 +23,11 @@ const updates = [
     transform: (content) => content.replace(/^version = ".*"/m, `version = "${version}"`),
   },
   {
+    file: 'package.json',
+    json: true,
+    transform: (obj) => { obj.version = version; return obj; },
+  },
+  {
     file: 'claude-plugin/.claude-plugin/plugin.json',
     json: true,
     transform: (obj) => { obj.version = version; return obj; },
