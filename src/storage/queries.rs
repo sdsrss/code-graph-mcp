@@ -752,7 +752,38 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             caller_count: row.get(5)?,
         })
     })?;
-    rows2.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    let all: Vec<ModuleExport> = rows2.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Deduplicate by (name, file_path) — keeps highest caller_count.
+    // Handles feature-gated duplicates (e.g. #[cfg(feature)] producing two nodes for same symbol).
+    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut deduped: Vec<ModuleExport> = Vec::with_capacity(all.len());
+    for export in &all {
+        let key = (export.name.as_str(), export.file_path.as_str());
+        if let Some(&prev_idx) = seen.get(&key) {
+            if export.caller_count > deduped[prev_idx].caller_count {
+                deduped[prev_idx] = ModuleExport {
+                    node_id: export.node_id,
+                    name: export.name.clone(),
+                    node_type: export.node_type.clone(),
+                    signature: export.signature.clone(),
+                    file_path: export.file_path.clone(),
+                    caller_count: export.caller_count,
+                };
+            }
+        } else {
+            seen.insert(key, deduped.len());
+            deduped.push(ModuleExport {
+                node_id: export.node_id,
+                name: export.name.clone(),
+                node_type: export.node_type.clone(),
+                signature: export.signature.clone(),
+                file_path: export.file_path.clone(),
+                caller_count: export.caller_count,
+            });
+        }
+    }
+    Ok(deduped)
 }
 
 // --- Fuzzy name resolution ---
@@ -1115,6 +1146,23 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                 "?".into()
             };
             entry_points.push(EntryPoint { route, handler, file });
+        }
+    }
+
+    // 4b. Program entry points: main functions with no callers (Rust/Go/C/Python/Java)
+    if entry_points.is_empty() {
+        let sql = "SELECT n.name, f.path FROM nodes n \
+             JOIN files f ON f.id = n.file_id \
+             WHERE n.name = 'main' AND n.type = 'function' \
+               AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = n.id AND e.relation = ?1) \
+             LIMIT 5";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([REL_CALLS], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, file) = row?;
+            entry_points.push(EntryPoint { route: "main".into(), handler: name, file });
         }
     }
 
