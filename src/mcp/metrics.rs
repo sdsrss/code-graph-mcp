@@ -31,6 +31,10 @@ pub struct SessionMetrics {
     pub nodes_created: u64,
 }
 
+impl Default for SessionMetrics {
+    fn default() -> Self { Self::new() }
+}
+
 impl SessionMetrics {
     /// Create a new empty session.
     pub fn new() -> Self {
