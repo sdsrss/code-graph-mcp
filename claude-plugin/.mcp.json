@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "code-graph": {
-      "command": "code-graph-mcp",
-      "args": ["serve"],
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-launcher.js"],
       "env": {}
     }
   }
