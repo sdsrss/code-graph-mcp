@@ -9,11 +9,29 @@ const { cleanupDisabledStatusline } = require('./lifecycle');
 const disabledCleanup = cleanupDisabledStatusline();
 if (disabledCleanup.cleaned) process.exit(0);
 
-// Only show status in projects that have a code-graph index.
+// Only show status in projects that have a code-graph directory.
 // The statusLine config is global, so we must exit silently for
 // directories that aren't code-graph projects.
 const cwd = process.cwd();
-if (!fs.existsSync(path.join(cwd, '.code-graph', 'index.db'))) {
+const codeGraphDir = path.join(cwd, '.code-graph');
+if (!fs.existsSync(codeGraphDir)) {
+  process.exit(0);
+}
+
+// Check for background indexing progress file first
+const progressFile = path.join(codeGraphDir, 'indexing-status.json');
+try {
+  const raw = fs.readFileSync(progressFile, 'utf8');
+  const p = JSON.parse(raw);
+  if (p.s === 'indexing' && p.t > 0) {
+    const pct = Math.round((p.d / p.t) * 100);
+    process.stdout.write(`code-graph: \u21BB indexing ${p.d}/${p.t} (${pct}%)`);
+    process.exit(0);
+  }
+} catch { /* no progress file or parse error — continue to health check */ }
+
+// No indexing in progress — show normal health status
+if (!fs.existsSync(path.join(codeGraphDir, 'index.db'))) {
   process.exit(0);
 }
 

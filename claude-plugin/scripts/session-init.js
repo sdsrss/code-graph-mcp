@@ -2,9 +2,10 @@
 'use strict';
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
-  cleanupDisabledStatusline, isPluginInactive,
+  cleanupDisabledStatusline, isPluginInactive, readJson,
 } = require('./lifecycle');
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
@@ -32,6 +33,15 @@ function syncLifecycleConfig() {
   if (manifest.version !== currentVersion) {
     update();
     return 'updated';
+  }
+  // Self-heal: version matches but statusLine may have been lost
+  // (e.g. plugin removed and reinstalled without lifecycle uninstall).
+  // install() is idempotent — isOurComposite guard prevents duplicate work.
+  const settings = readJson(path.join(os.homedir(), '.claude', 'settings.json')) || {};
+  if (!settings.statusLine || !settings.statusLine.command ||
+      !settings.statusLine.command.includes('statusline-composite')) {
+    install();
+    return 'self-healed';
   }
   return 'noop';
 }

@@ -31,8 +31,16 @@ function run(stdin) {
     return;
   }
 
+  // Display order: pre-existing statuslines (_previous) first, then our providers.
+  // This ensures plugins installed earlier appear before ours.
+  const sorted = registry.slice().sort((a, b) => {
+    if (a.id === '_previous') return -1;
+    if (b.id === '_previous') return 1;
+    return 0;
+  });
+
   const outputs = [];
-  for (const provider of registry) {
+  for (const provider of sorted) {
     const out = runProvider(provider.command, provider.needsStdin, stdin);
     if (out) outputs.push(out);
   }

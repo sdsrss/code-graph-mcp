@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -113,6 +113,16 @@ enum FuzzyResolution {
     NotFound,
 }
 
+/// Result from background startup indexing, consumed by post-index processing.
+struct StartupIndexResult {
+    files_indexed: usize,
+    nodes_created: usize,
+    edges_created: usize,
+    elapsed_ms: u64,
+    was_full: bool,
+    new_cache: Option<crate::indexer::merkle::DirectoryCache>,
+}
+
 /// MCP server for code graph operations. Single-threaded (stdio loop).
 pub struct McpServer {
     registry: ToolRegistry,
@@ -131,6 +141,12 @@ pub struct McpServer {
     startup_index_pending: Mutex<bool>,
     /// True while a background embedding thread is running.
     embedding_in_progress: Arc<AtomicBool>,
+    /// True while background startup indexing is running.
+    startup_indexing: Arc<AtomicBool>,
+    /// Signaled when background startup indexing completes.
+    startup_indexing_done: Arc<(Mutex<bool>, Condvar)>,
+    /// Pending result from background startup indexing, consumed by post-index processing.
+    startup_index_result: Arc<Mutex<Option<StartupIndexResult>>>,
     /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
     metrics: Mutex<super::metrics::SessionMetrics>,
 }
@@ -181,6 +197,9 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_indexing: Arc::new(AtomicBool::new(false)),
+            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
+            startup_index_result: Arc::new(Mutex::new(None)),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         })
     }
@@ -200,6 +219,9 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_indexing: Arc::new(AtomicBool::new(false)),
+            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
+            startup_index_result: Arc::new(Mutex::new(None)),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
@@ -221,6 +243,9 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_indexing: Arc::new(AtomicBool::new(false)),
+            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
+            startup_index_result: Arc::new(Mutex::new(None)),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
@@ -243,95 +268,205 @@ impl McpServer {
     }
 
     /// Run startup tasks if triggered by `notifications/initialized`.
-    /// Called from the main loop after each message. Performs initial indexing
-    /// and auto-starts the file watcher so tools are ready immediately.
+    /// Called from the main loop after each message. Spawns background indexing
+    /// (non-blocking) and starts watcher/embedding once indexing completes.
     pub fn run_startup_tasks(&self) {
+        // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
             let mut guard = lock_or_recover(&self.startup_index_pending, "startup_index_pending");
             let was_pending = *guard;
             *guard = false;
             was_pending
         };
-        if !pending {
+
+        if pending {
+            let project_root = match &self.project_root {
+                Some(p) => p.clone(),
+                None => return,
+            };
+
+            let is_indexed = *lock_or_recover(&self.indexed, "indexed");
+            if !is_indexed {
+                let has_existing = queries::get_index_status(self.db.conn(), false)
+                    .map(|s| s.files_count > 0)
+                    .unwrap_or(false);
+                // Take dir_cache for background thread (incremental can use it)
+                let dir_cache = if has_existing {
+                    lock_or_recover(&self.dir_cache, "dir_cache").take()
+                } else {
+                    None
+                };
+                self.spawn_startup_indexing(project_root, has_existing, dir_cache);
+                return; // watcher + embedding start after indexing completes
+            }
+
+            // Already indexed — just start watcher + embedding
+            self.start_post_index_services(&project_root);
             return;
         }
 
-        let project_root = match &self.project_root {
-            Some(p) => p.clone(),
-            None => return,
-        };
+        // Phase 2: Check if background indexing completed, do post-index work
+        self.consume_startup_index_result();
+    }
 
-        // Run initial index with progress notifications (skip inline embedding — done in background)
-        let is_indexed = *lock_or_recover(&self.indexed, "indexed");
-        if !is_indexed {
-            let progress_cb = |current: usize, total: usize| {
-                self.send_progress("indexing", current, total);
+    /// Spawn a background thread for startup indexing (non-blocking).
+    /// Writes progress to `.code-graph/indexing-status.json` for statusline.
+    fn spawn_startup_indexing(
+        &self,
+        project_root: PathBuf,
+        has_existing_index: bool,
+        dir_cache: Option<crate::indexer::merkle::DirectoryCache>,
+    ) {
+        if self.startup_indexing.swap(true, Ordering::AcqRel) {
+            return; // already running
+        }
+
+        // Reset condvar done flag for this indexing session
+        *self.startup_indexing_done.0.lock().unwrap() = false;
+
+        if has_existing_index {
+            self.send_log("info", "Updating index in background (incremental)...");
+        } else {
+            self.send_log("info", "Building index in background...");
+        }
+
+        let db_path = project_root.join(".code-graph").join("index.db");
+        let indexing_flag = Arc::clone(&self.startup_indexing);
+        let done_signal = Arc::clone(&self.startup_indexing_done);
+        let result_slot = Arc::clone(&self.startup_index_result);
+        let progress_file = project_root.join(".code-graph").join("indexing-status.json");
+
+        std::thread::spawn(move || {
+            // Guard ensures flags are always cleared, even on panic
+            struct IndexGuard {
+                flag: Arc<AtomicBool>,
+                done: Arc<(Mutex<bool>, Condvar)>,
+                progress_file: PathBuf,
+            }
+            impl Drop for IndexGuard {
+                fn drop(&mut self) {
+                    self.flag.store(false, Ordering::Release);
+                    let _ = std::fs::remove_file(&self.progress_file);
+                    let (lock, cvar) = &*self.done;
+                    if let Ok(mut done) = lock.lock() {
+                        *done = true;
+                    }
+                    cvar.notify_all();
+                }
+            }
+            let _guard = IndexGuard {
+                flag: indexing_flag,
+                done: done_signal,
+                progress_file: progress_file.clone(),
             };
 
-            // Check if DB already has indexed files — use incremental to avoid
-            // re-parsing unchanged files
-            let has_existing_index = queries::get_index_status(self.db.conn(), false)
-                .map(|s| s.files_count > 0)
-                .unwrap_or(false);
+            let db = match Database::open_with_vec(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!("Background indexing: failed to open DB: {}", e);
+                    return;
+                }
+            };
 
-            // Pass model=None for startup index to skip inline embedding (60s+ blocking).
-            // Background thread will embed afterwards.
+            let pf = progress_file.clone();
+            let progress_cb = move |current: usize, total: usize| {
+                let json = format!(r#"{{"s":"indexing","d":{},"t":{}}}"#, current, total);
+                let _ = std::fs::write(&pf, json);
+            };
+
             let index_start = std::time::Instant::now();
             let result = if has_existing_index {
-                self.send_log("info", "Updating index (incremental)...");
-                let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
-                let inc_result = run_incremental_index_cached(
-                    &self.db, &project_root, None,
-                    cache.as_ref(),
+                run_incremental_index_cached(
+                    &db, &project_root, None,
+                    dir_cache.as_ref(),
                     Some(&progress_cb),
-                );
-                match inc_result {
-                    Ok((result, new_cache)) => {
-                        *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
-                        Ok(result)
-                    }
-                    Err(e) => {
-                        *lock_or_recover(&self.dir_cache, "dir_cache") = cache;
-                        Err(e)
-                    }
-                }
+                ).map(|(r, cache)| (r, Some(cache)))
             } else {
-                self.send_log("info", "Building index for the first time...");
-                run_full_index(&self.db, &project_root, None, Some(&progress_cb))
+                run_full_index(&db, &project_root, None, Some(&progress_cb))
+                    .map(|r| (r, None))
             };
 
             match result {
-                Ok(result) => {
-                    let index_elapsed_ms = index_start.elapsed().as_millis() as u64;
-                    *lock_or_recover(&self.indexed, "indexed") = true;
-                    lock_or_recover(&self.metrics, "metrics").record_index(
-                        result.files_indexed as u64,
-                        result.nodes_created as u64,
-                        !has_existing_index,
-                        index_elapsed_ms,
+                Ok((result, new_cache)) => {
+                    let elapsed_ms = index_start.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        "Background indexing complete: {} files, {} nodes in {}ms",
+                        result.files_indexed, result.nodes_created, elapsed_ms
                     );
-                    if result.files_indexed > 0 {
-                        self.send_log("info", &format!(
-                            "Indexed {} files ({} nodes, {} edges).",
-                            result.files_indexed, result.nodes_created, result.edges_created
-                        ));
-                    } else {
-                        self.send_log("info", "Index is up to date.");
+                    match result_slot.lock() {
+                        Ok(mut slot) => {
+                            *slot = Some(StartupIndexResult {
+                                files_indexed: result.files_indexed,
+                                nodes_created: result.nodes_created,
+                                edges_created: result.edges_created,
+                                elapsed_ms,
+                                was_full: !has_existing_index,
+                                new_cache,
+                            });
+                        }
+                        Err(e) => tracing::error!("Background indexing: result slot poisoned: {}", e),
                     }
-                    self.spawn_background_embedding();
                 }
                 Err(e) => {
-                    self.send_log("error", &format!("Auto-indexing failed: {}", e));
-                    return;
+                    tracing::error!("Background indexing failed: {}", e);
                 }
             }
+            // _guard drop: clears flag, removes progress file, signals condvar
+        });
+    }
+
+    /// Check if background startup indexing completed and process the result.
+    /// Called from `run_startup_tasks()` and `ensure_indexed()`.
+    fn consume_startup_index_result(&self) {
+        if self.startup_indexing.load(Ordering::Acquire) {
+            return; // still running
         }
 
+        let result = lock_or_recover(&self.startup_index_result, "startup_result").take();
+        let Some(r) = result else { return };
+
+        *lock_or_recover(&self.indexed, "indexed") = true;
+
+        // Store new dir_cache if available
+        if let Some(cache) = r.new_cache {
+            *lock_or_recover(&self.dir_cache, "dir_cache") = Some(cache);
+        }
+
+        // Record metrics
+        lock_or_recover(&self.metrics, "metrics").record_index(
+            r.files_indexed as u64,
+            r.nodes_created as u64,
+            r.was_full,
+            r.elapsed_ms,
+        );
+
+        if r.files_indexed > 0 {
+            self.send_log("info", &format!(
+                "Indexed {} files ({} nodes, {} edges).",
+                r.files_indexed, r.nodes_created, r.edges_created
+            ));
+        } else {
+            self.send_log("info", "Index is up to date.");
+        }
+
+        // Safety net: ensure progress file is removed (normally done by IndexGuard)
+        if let Some(ref root) = self.project_root {
+            let _ = std::fs::remove_file(root.join(".code-graph").join("indexing-status.json"));
+        }
+
+        // Start watcher + embedding
+        if let Some(ref root) = self.project_root {
+            self.start_post_index_services(root);
+        }
+    }
+
+    /// Start file watcher and background embedding (called after indexing completes).
+    fn start_post_index_services(&self, project_root: &Path) {
         // Auto-start file watcher
         let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if watcher_guard.is_none() {
             let (tx, rx) = mpsc::channel();
-            match FileWatcher::start(&project_root, tx) {
+            match FileWatcher::start(project_root, tx) {
                 Ok(fw) => {
                     *watcher_guard = Some(WatcherState {
                         _watcher: fw,
@@ -344,8 +479,10 @@ impl McpServer {
                 }
             }
         }
+        drop(watcher_guard);
 
-        // Background model download if model not available
+        self.spawn_background_embedding();
+
         #[cfg(feature = "embed-model")]
         self.spawn_model_download();
     }
@@ -550,12 +687,35 @@ impl McpServer {
     }
 
     /// Ensure index is up-to-date. On first call, runs full index.
+    /// If background startup indexing is running, waits for it to complete.
     /// If watcher is active, checks for pending events to decide if incremental needed.
     fn ensure_indexed(&self) -> Result<()> {
         let project_root = match &self.project_root {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
+
+        // Wait for or consume background startup indexing result
+        if self.startup_indexing.load(Ordering::Acquire) {
+            self.send_log("info", "Waiting for background indexing to complete...");
+            let (lock, cvar) = &*self.startup_indexing_done;
+            let mut done = lock_or_recover(lock, "startup_indexing_done");
+            let timeout = std::time::Duration::from_secs(300);
+            while !*done {
+                let (guard, wait_result) = cvar.wait_timeout(done, timeout).unwrap_or_else(|e| {
+                    tracing::warn!("Recovering poisoned condvar (startup_indexing_done)");
+                    let guard = e.into_inner();
+                    (guard.0, guard.1)
+                });
+                done = guard;
+                if wait_result.timed_out() {
+                    tracing::warn!("Background indexing wait timed out ({}s), falling back to synchronous", timeout.as_secs());
+                    break;
+                }
+            }
+        }
+        // Consume result whether we waited or it completed before this call
+        self.consume_startup_index_result();
 
         // Read the indexed flag (short lock scope to avoid holding across I/O)
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
