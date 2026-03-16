@@ -83,6 +83,11 @@ impl Database {
                 schema::migrate_v3_to_v4(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 5 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v4_to_v5(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(schema::CREATE_TABLES)?;

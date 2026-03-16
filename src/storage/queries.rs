@@ -1039,6 +1039,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
              WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
+               AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE '%_test.%' \

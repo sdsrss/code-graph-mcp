@@ -530,6 +530,7 @@ fn index_files(
                 name_tokens: None,
                 return_type: None,
                 param_types: None,
+                is_test: false,
             })?;
             node_ids.push(module_node_id);
             node_names.push("<module>".into());
@@ -551,6 +552,7 @@ fn index_files(
                     name_tokens: Some(name_tokens),
                     return_type: pn.return_type.clone(),
                     param_types: pn.param_types.clone(),
+                    is_test: pn.is_test,
                 })?;
                 node_ids.push(node_id);
                 node_names.push(pn.name.clone());
@@ -716,6 +718,7 @@ fn index_files(
                         name_tokens: None,
                         return_type: None,
                         param_types: None,
+                        is_test: false,
                     })?;
                     ext_node_ids.insert(module_name.clone(), node_id);
                     total_nodes_created += 1;

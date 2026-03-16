@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     context_string TEXT,
     name_tokens TEXT,
     return_type TEXT,
-    param_types TEXT
+    param_types TEXT,
+    is_test     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
@@ -180,6 +181,14 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 
     conn.pragma_update(None, "user_version", 4)?;
     tracing::info!("[schema] Migration v3→v4 complete.");
+    Ok(())
+}
+
+pub fn migrate_v4_to_v5(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v4 → v5: adding is_test column to nodes");
+    conn.execute_batch("ALTER TABLE nodes ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;")?;
+    conn.pragma_update(None, "user_version", 5)?;
+    tracing::info!("[schema] Migration v4→v5 complete.");
     Ok(())
 }
 

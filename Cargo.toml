@@ -1,6 +1,6 @@
 [package]
 name = "code-graph-mcp"
-version = "0.5.25"
+version = "0.5.26"
 edition = "2021"
 
 [features]

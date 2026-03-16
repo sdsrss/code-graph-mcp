@@ -928,6 +928,19 @@ impl McpServer {
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
 
+        // Query quality factor: penalize vague/short queries so relevance scores
+        // reflect actual match quality, not just relative rank position.
+        let meaningful_tokens: Vec<&str> = query.split_whitespace()
+            .filter(|w| w.len() > 1 || w.chars().all(|c| c.is_uppercase()))
+            .collect();
+        let query_quality = match meaningful_tokens.len() {
+            0 => 0.3,
+            1 if meaningful_tokens[0].len() <= 2 => 0.4,
+            1 => 0.7,
+            2 => 0.85,
+            _ => 1.0,
+        };
+
         // Lazy model loading: pick up model if downloaded in background
         self.try_lazy_load_model();
 
@@ -1022,9 +1035,13 @@ impl McpServer {
                 } else {
                     node.code_content.clone()
                 };
-                // Normalize RRF score to 0.0–1.0 range for readability
+                // Normalize RRF score to 0.0–1.0 range, then apply query quality factor
+                // so short/vague queries produce lower relevance scores
                 let score = if let Some(max_score) = fused.first().map(|f| f.score) {
-                    if max_score > 0.0 { (r.score / max_score * 100.0).round() / 100.0 } else { 0.0 }
+                    if max_score > 0.0 {
+                        let normalized = r.score / max_score;
+                        (normalized * query_quality * 100.0).round() / 100.0
+                    } else { 0.0 }
                 } else { 0.0 };
                 results.push(json!({
                     "node_id": node.id,
@@ -1911,7 +1928,11 @@ impl McpServer {
             "file": file_path,
             "depends_on": outgoing,
             "depended_by": incoming,
-            "summary": format!("{} depends on {} files, {} files depend on it", file_path, outgoing.len(), incoming.len())
+            "summary": format!("{} depends on {} file{}, {} file{} depend{} on it",
+                file_path,
+                outgoing.len(), if outgoing.len() == 1 { "" } else { "s" },
+                incoming.len(), if incoming.len() == 1 { "" } else { "s" },
+                if incoming.len() == 1 { "s" } else { "" })
         }))
     }
 

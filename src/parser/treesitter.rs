@@ -19,6 +19,8 @@ pub struct ParsedNode {
     /// Full parameter text from AST, e.g. "(a: number, b: string)" — includes names and types,
     /// not just type annotations. Stored as-is for FTS search (users may search by param names).
     pub param_types: Option<String>,
+    /// True if this node is inside a test context (#[cfg(test)], mod tests, #[test], etc.)
+    pub is_test: bool,
 }
 
 thread_local! {
@@ -53,8 +55,27 @@ pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
 /// Extract nodes from a pre-parsed tree (avoids re-parsing).
 pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
-    extract_nodes(tree.root_node(), source, language, None, &mut nodes, 0);
+    extract_nodes(tree.root_node(), source, language, None, &mut nodes, 0, false);
     nodes
+}
+
+/// Check if a node has a preceding `#[cfg(test)]` or `#[test]` attribute.
+fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" | "inner_attribute_item" => {
+                let text = node_text(&s, source);
+                if text.contains("cfg(test)") || text == "#[test]" {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" | "comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_sibling();
+    }
+    false
 }
 
 fn extract_nodes(
@@ -64,21 +85,45 @@ fn extract_nodes(
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
     depth: usize,
+    in_test_context: bool,
 ) {
     if depth > MAX_AST_DEPTH { return; }
     let kind = node.kind();
 
+    // Detect Rust mod items (e.g., `mod tests { ... }`)
+    if kind == "mod_item" {
+        let mod_name = node.child_by_field_name("name")
+            .map(|n| node_text(&n, source).to_string());
+        let is_test_mod = mod_name.as_deref() == Some("tests")
+            || has_test_attribute(&node, source);
+        // Recurse into the module body with updated test context
+        if let Some(body) = node.child_by_field_name("body") {
+            for i in 0..body.named_child_count() {
+                if let Some(child) = body.named_child(i) {
+                    extract_nodes(child, source, language, parent_class, results, depth + 1,
+                        in_test_context || is_test_mod);
+                }
+            }
+        }
+        return;
+    }
+
+    // Check if this specific node has #[test] or #[cfg(test)]
+    let node_is_test = in_test_context || has_test_attribute(&node, source);
+
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
         "function_declaration" | "function" => {
-            if let Some(parsed) = extract_function_node(&node, source, "function", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+                parsed.is_test = node_is_test;
                 results.push(parsed);
             }
         }
         // Python async functions
         "async_function_definition" => {
             let nt = if parent_class.is_some() { "method" } else { "function" };
-            if let Some(parsed) = extract_function_node(&node, source, nt, parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
+                parsed.is_test = node_is_test;
                 results.push(parsed);
             }
         }
@@ -100,27 +145,31 @@ fn extract_nodes(
                             doc_comment: get_preceding_comment(&node, source),
                             return_type: sig_info.return_type,
                             param_types: sig_info.param_types,
+                            is_test: node_is_test,
                         });
                     }
                 }
             } else {
                 // Python and others: name is in "name" field
                 let nt = if parent_class.is_some() { "method" } else { "function" };
-                if let Some(parsed) = extract_function_node(&node, source, nt, parent_class) {
+                if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
+                    parsed.is_test = node_is_test;
                     results.push(parsed);
                 }
             }
         }
         "function_item" => {
             // Rust functions
-            if let Some(parsed) = extract_function_node(&node, source, "function", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+                parsed.is_test = node_is_test;
                 results.push(parsed);
             }
         }
 
         // Arrow functions (TS/JS): covers const/let (lexical) and var (variable)
         "lexical_declaration" | "variable_declaration" => {
-            if let Some(parsed) = extract_named_arrow(&node, source) {
+            if let Some(mut parsed) = extract_named_arrow(&node, source) {
+                parsed.is_test = node_is_test;
                 results.push(parsed);
             }
         }
@@ -139,15 +188,17 @@ fn extract_nodes(
                     doc_comment: get_preceding_comment(&node, source),
                     return_type: None,
                     param_types: None,
+                    is_test: node_is_test,
                 });
-                extract_children(node, source, language, Some(&name), results, depth);
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
 
         // Methods: TS/JS (method_definition), Go/Java (method_declaration)
         "method_definition" | "method_declaration" => {
-            if let Some(parsed) = extract_function_node(&node, source, "method", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
+                parsed.is_test = node_is_test;
                 results.push(parsed);
             }
         }
@@ -155,8 +206,8 @@ fn extract_nodes(
         // Interfaces (TS/Java)
         "interface_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source));
-                extract_children(node, source, language, Some(&name), results, depth);
+                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -164,14 +215,14 @@ fn extract_nodes(
         // TS type aliases: type Foo = ...
         "type_alias_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("type", name, &node, source));
+                results.push(make_simple_node("type", name, &node, source, node_is_test));
             }
         }
 
         // Java enums
         "enum_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("enum", name, &node, source));
+                results.push(make_simple_node("enum", name, &node, source, node_is_test));
             }
         }
 
@@ -179,8 +230,8 @@ fn extract_nodes(
         "class_specifier" | "struct_specifier" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 let nt = if kind == "class_specifier" { "class" } else { "struct" };
-                results.push(make_simple_node(nt, name.clone(), &node, source));
-                extract_children(node, source, language, Some(&name), results, depth);
+                results.push(make_simple_node(nt, name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -211,6 +262,7 @@ fn extract_nodes(
                                 doc_comment: get_preceding_comment(&child, source),
                                 return_type: None,
                                 param_types: None,
+                                is_test: node_is_test,
                             });
                         }
                     }
@@ -221,25 +273,25 @@ fn extract_nodes(
         // Rust-specific
         "struct_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("struct", name, &node, source));
+                results.push(make_simple_node("struct", name, &node, source, node_is_test));
             }
         }
         "enum_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("enum", name, &node, source));
+                results.push(make_simple_node("enum", name, &node, source, node_is_test));
             }
         }
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let impl_name = node_text(&type_node, source);
-                extract_children(node, source, language, Some(impl_name), results, depth);
+                extract_children(node, source, language, Some(impl_name), results, depth, node_is_test);
                 return;
             }
         }
         "trait_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source));
-                extract_children(node, source, language, Some(&name), results, depth);
+                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -248,7 +300,7 @@ fn extract_nodes(
     }
 
     // Recurse into children
-    extract_children(node, source, language, parent_class, results, depth);
+    extract_children(node, source, language, parent_class, results, depth, node_is_test);
 }
 
 fn extract_children(
@@ -258,10 +310,11 @@ fn extract_children(
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
     depth: usize,
+    in_test_context: bool,
 ) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_nodes(child, source, language, parent_class, results, depth + 1);
+            extract_nodes(child, source, language, parent_class, results, depth + 1, in_test_context);
         }
     }
 }
@@ -280,7 +333,7 @@ fn truncate_code_content(content: &str) -> Cow<'_, str> {
     }
 }
 
-fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str) -> ParsedNode {
+fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str, is_test: bool) -> ParsedNode {
     ParsedNode {
         node_type: node_type.into(),
         name: name.clone(),
@@ -292,6 +345,7 @@ fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, sou
         doc_comment: get_preceding_comment(node, source),
         return_type: None,
         param_types: None,
+        is_test,
     }
 }
 
@@ -319,6 +373,7 @@ fn extract_function_node(
         doc_comment: get_preceding_comment(node, source),
         return_type: sig_info.return_type,
         param_types: sig_info.param_types,
+        is_test: false,
     })
 }
 
@@ -345,6 +400,7 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
                     doc_comment: get_preceding_comment(node, source),
                     return_type: sig_info.return_type,
                     param_types: sig_info.param_types,
+                    is_test: false,
                 });
             }
         }

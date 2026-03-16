@@ -936,7 +936,7 @@ function main() { return add(1, 2); }
 
     let modules = result["modules"].as_array().unwrap();
     assert!(!modules.is_empty(), "project_map should detect modules");
-    let deps = result["module_dependencies"].as_array().unwrap();
+    let _deps = result["module_dependencies"].as_array().unwrap();
     // At least verify the structure is correct, even if import resolution doesn't find cross-module deps
     assert!(result["hot_functions"].is_array(), "hot_functions should be an array");
 }
