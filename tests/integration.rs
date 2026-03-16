@@ -1059,3 +1059,45 @@ fn test_parse_timeout_does_not_hang() {
     // Result can be Ok or Err (timeout) - both are acceptable
     drop(result);
 }
+
+#[test]
+fn test_skip_indexing_flag() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("main.ts"), "export function hello() { return 42; }").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // First call without skip — triggers indexing
+    let msg = tool_call_json("semantic_code_search", serde_json::json!({"query": "hello"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    // semantic_code_search returns a raw array
+    assert!(!result.as_array().unwrap().is_empty(), "should find hello after indexing");
+
+    // Second call with skip_indexing — should still work (index already built)
+    let msg2 = tool_call_json("semantic_code_search", serde_json::json!({
+        "query": "hello",
+        "skip_indexing": true
+    }));
+    let resp2 = server.handle_message(&msg2).unwrap();
+    let result2 = parse_tool_result(&resp2);
+    assert!(!result2.as_array().unwrap().is_empty(), "should find hello with skip_indexing when already indexed");
+
+    // Third call: skip_indexing on a fresh server with no prior indexing should return empty results (not error)
+    let project2 = TempDir::new().unwrap();
+    fs::write(project2.path().join("main.ts"), "export function world() { return 99; }").unwrap();
+    let server2 = McpServer::from_project_root(project2.path()).unwrap();
+    let init2 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server2.handle_message(init2).unwrap();
+
+    let msg3 = tool_call_json("semantic_code_search", serde_json::json!({
+        "query": "world",
+        "skip_indexing": true
+    }));
+    let resp3 = server2.handle_message(&msg3).unwrap();
+    let result3 = parse_tool_result(&resp3);
+    // With skip_indexing and no prior indexing, there should be no results (empty DB)
+    assert!(result3.as_array().unwrap().is_empty(), "should return empty results when skip_indexing with no prior index");
+}

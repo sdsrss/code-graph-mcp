@@ -78,6 +78,11 @@ fn apply_inline_handler_metadata(handler: &mut serde_json::Value, metadata: Opti
     }
 }
 
+/// Check if the caller requested to skip indexing (read-only mode).
+fn should_skip_indexing(args: &serde_json::Value) -> bool {
+    args.get("skip_indexing").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// Lock a Mutex, recovering from poison but logging a warning.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
@@ -1145,8 +1150,10 @@ impl McpServer {
         // Lazy model loading: pick up model if downloaded in background
         self.try_lazy_load_model();
 
-        // Ensure index is up to date
-        self.ensure_indexed()?;
+        // Ensure index is up to date (unless caller requested read-only mode)
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         // FTS5 search (fetch extra to allow for filtering)
         let fetch_count = top_k * 4;
@@ -1341,7 +1348,9 @@ impl McpServer {
         let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
 
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         // Disambiguate: if no file_path provided, check if symbol matches multiple distinct nodes
         if file_path.is_none() {
@@ -1460,7 +1469,9 @@ impl McpServer {
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
 
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let (method_filter, route_path) = parse_route_input(route_path_raw);
 
@@ -1539,7 +1550,9 @@ impl McpServer {
     }
 
     fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
 
@@ -1883,7 +1896,9 @@ impl McpServer {
     }
 
     fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let symbol_name = required_str(args, "symbol_name")?;
         let change_type = args.get("change_type")
@@ -2015,7 +2030,9 @@ impl McpServer {
     }
 
     fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let raw_path = args["path"].as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
@@ -2106,7 +2123,9 @@ impl McpServer {
     }
 
     fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         let file_path = args["file_path"].as_str()
             .ok_or_else(|| anyhow!("Missing file_path"))?;
@@ -2174,7 +2193,9 @@ impl McpServer {
 
     fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.try_lazy_load_model();
-        self.ensure_indexed()?;
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
 
         // Accept node_id directly, or resolve from symbol_name
         let node_id = if let Some(id) = args["node_id"].as_i64() {
