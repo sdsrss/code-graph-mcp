@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::pipeline::{embed_and_store_batch, run_full_index, run_incremental_index_cached};
+use crate::indexer::pipeline::{embed_and_store_batch, run_full_index, run_incremental_index_cached, IndexStats};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
@@ -121,6 +121,7 @@ struct StartupIndexResult {
     elapsed_ms: u64,
     was_full: bool,
     new_cache: Option<crate::indexer::merkle::DirectoryCache>,
+    stats: IndexStats,
 }
 
 /// MCP server for code graph operations. Single-threaded (stdio loop).
@@ -147,6 +148,8 @@ pub struct McpServer {
     startup_indexing_done: Arc<(Mutex<bool>, Condvar)>,
     /// Pending result from background startup indexing, consumed by post-index processing.
     startup_index_result: Arc<Mutex<Option<StartupIndexResult>>>,
+    /// Last indexing stats (skipped files, truncations) for observability.
+    last_index_stats: Mutex<IndexStats>,
     /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
     metrics: Mutex<super::metrics::SessionMetrics>,
 }
@@ -200,6 +203,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         })
     }
@@ -222,6 +226,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
@@ -246,6 +251,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
@@ -402,6 +408,7 @@ impl McpServer {
                                 elapsed_ms,
                                 was_full: !has_existing_index,
                                 new_cache,
+                                stats: result.stats,
                             });
                         }
                         Err(e) => tracing::error!("Background indexing: result slot poisoned: {}", e),
@@ -426,6 +433,9 @@ impl McpServer {
         let Some(r) = result else { return };
 
         *lock_or_recover(&self.indexed, "indexed") = true;
+
+        // Store indexing stats for observability (exposed via get_index_status)
+        *lock_or_recover(&self.last_index_stats, "last_index_stats") = r.stats;
 
         // Store new dir_cache if available
         if let Some(cache) = r.new_cache {
@@ -726,7 +736,8 @@ impl McpServer {
                 self.send_progress("indexing", current, total);
             };
             // Skip inline embedding for full index (too slow), background thread handles it
-            run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
+            let result = run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
+            *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
             // Note: model lock is NOT held here — spawn_background_embedding locks it internally
             self.spawn_background_embedding();
@@ -761,7 +772,8 @@ impl McpServer {
         drop(cache_guard); // Release lock during I/O
 
         match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref(), None) {
-            Ok((_result, new_cache)) => {
+            Ok((result, new_cache)) => {
+                *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
                 Ok(())
             }
@@ -1799,6 +1811,23 @@ impl McpServer {
             } else {
                 "fts_only"
             }));
+
+            // Add indexing observability stats (skipped files, truncations)
+            let stats = lock_or_recover(&self.last_index_stats, "last_index_stats").clone();
+            let skipped_total = stats.files_skipped_size + stats.files_skipped_parse
+                + stats.files_skipped_read + stats.files_skipped_hash;
+            if skipped_total > 0 {
+                obj.insert("skipped_files".into(), json!({
+                    "total": skipped_total,
+                    "too_large": stats.files_skipped_size,
+                    "parse_error": stats.files_skipped_parse,
+                    "read_error": stats.files_skipped_read,
+                    "hash_error": stats.files_skipped_hash,
+                }));
+            }
+            if stats.code_truncations > 0 {
+                obj.insert("code_truncations".into(), json!(stats.code_truncations));
+            }
         }
 
         Ok(status)
@@ -1836,6 +1865,9 @@ impl McpServer {
         };
         // Skip inline embedding, background thread handles it
         let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
+
+        // Save indexing stats for observability
+        *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats.clone();
 
         // Reset indexed flag
         *lock_or_recover(&self.indexed, "indexed") = true;
