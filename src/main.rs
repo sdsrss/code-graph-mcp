@@ -72,6 +72,9 @@ fn run_serve() -> Result<()> {
 
     let project_root = std::env::current_dir()?;
     let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
+    let session_start = std::time::Instant::now();
+
+    tracing::info!("[session] Started v{}, project: {}", env!("CARGO_PKG_VERSION"), project_root.display());
 
     // Enable MCP progress/log notifications via stdout
     server.set_notify_writer(Box::new(io::stdout()));
@@ -135,6 +138,9 @@ fn run_serve() -> Result<()> {
         // Run startup indexing + auto-watch if triggered by notifications/initialized
         server.run_startup_tasks();
     }
+
+    server.flush_metrics();
+    tracing::info!("[session] Ended after {:.0}s", session_start.elapsed().as_secs_f64());
 
     Ok(())
 }

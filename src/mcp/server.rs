@@ -131,6 +131,8 @@ pub struct McpServer {
     startup_index_pending: Mutex<bool>,
     /// True while a background embedding thread is running.
     embedding_in_progress: Arc<AtomicBool>,
+    /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
+    metrics: Mutex<super::metrics::SessionMetrics>,
 }
 
 impl McpServer {
@@ -179,6 +181,7 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         })
     }
 
@@ -197,6 +200,7 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
 
@@ -217,12 +221,25 @@ impl McpServer {
             notify_writer: Mutex::new(None),
             startup_index_pending: Mutex::new(false),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            metrics: Mutex::new(super::metrics::SessionMetrics::new()),
         }
     }
 
     /// Set the writer for sending MCP notifications to the client.
     pub fn set_notify_writer(&self, writer: Box<dyn Write + Send>) {
         *lock_or_recover(&self.notify_writer, "notify_writer") = Some(writer);
+    }
+
+    /// Flush aggregated session metrics to .code-graph/usage.jsonl.
+    /// Called once at server shutdown (EOF). Skips if no tool calls were made.
+    pub fn flush_metrics(&self) {
+        if let Some(ref root) = self.project_root {
+            let metrics = lock_or_recover(&self.metrics, "metrics");
+            if !metrics.is_empty() {
+                let usage_path = root.join(".code-graph").join("usage.jsonl");
+                metrics.flush(&usage_path, env!("CARGO_PKG_VERSION"));
+            }
+        }
     }
 
     /// Run startup tasks if triggered by `notifications/initialized`.
@@ -259,6 +276,7 @@ impl McpServer {
 
             // Pass model=None for startup index to skip inline embedding (60s+ blocking).
             // Background thread will embed afterwards.
+            let index_start = std::time::Instant::now();
             let result = if has_existing_index {
                 self.send_log("info", "Updating index (incremental)...");
                 let cache = lock_or_recover(&self.dir_cache, "dir_cache").take();
@@ -284,7 +302,14 @@ impl McpServer {
 
             match result {
                 Ok(result) => {
+                    let index_elapsed_ms = index_start.elapsed().as_millis() as u64;
                     *lock_or_recover(&self.indexed, "indexed") = true;
+                    lock_or_recover(&self.metrics, "metrics").record_index(
+                        result.files_indexed as u64,
+                        result.nodes_created as u64,
+                        !has_existing_index,
+                        index_elapsed_ms,
+                    );
                     if result.files_indexed > 0 {
                         self.send_log("info", &format!(
                             "Indexed {} files ({} nodes, {} edges).",
@@ -719,6 +744,7 @@ impl McpServer {
                 }))
             }
             Err(e) => {
+                tracing::warn!("[tool-error] {}: {}", tool_name, e);
                 JsonRpcResponse::success(id, json!({
                     "content": [{
                         "type": "text",
@@ -914,6 +940,9 @@ impl McpServer {
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
         let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        lock_or_recover(&self.metrics, "metrics")
+            .record_tool_call(name, elapsed.as_millis() as u64, is_error);
         if elapsed.as_millis() > 100 {
             tracing::info!("[tool] {} completed in {:.1}s", name, elapsed.as_secs_f64());
         } else {
@@ -1060,6 +1089,10 @@ impl McpServer {
                 });
             }
         }
+
+        // Record search metrics (before potential compression return)
+        lock_or_recover(&self.metrics, "metrics")
+            .record_search(results.len(), query_quality, vec_search.is_empty());
 
         // Context Sandbox: compress only if results likely exceed token threshold
         // Estimate tokens: ~1 token per 3 chars of code content
