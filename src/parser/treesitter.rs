@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use super::languages::get_language;
 use super::node_text;
-use crate::domain::{MAX_AST_DEPTH, MAX_CODE_CONTENT_LEN};
+use crate::domain::{MAX_AST_DEPTH, MAX_CODE_CONTENT_LEN, PARSE_TIMEOUT_MS};
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -36,7 +36,7 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(language) {
             let mut p = tree_sitter::Parser::new();
-            p.set_timeout_micros(5_000_000);
+            p.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
             p.set_language(&lang)?;
             cache.insert(language.to_string(), p);
         }

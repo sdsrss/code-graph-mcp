@@ -1031,3 +1031,31 @@ function main() { return add(1, 2); }
     // At least verify the structure is correct, even if import resolution doesn't find cross-module deps
     assert!(result["hot_functions"].is_array(), "hot_functions should be an array");
 }
+
+#[test]
+fn test_parse_timeout_does_not_hang() {
+    use code_graph_mcp::domain::PARSE_TIMEOUT_MS;
+
+    // Verify the constant exists and is reasonable
+    assert!(PARSE_TIMEOUT_MS > 0 && PARSE_TIMEOUT_MS <= 30_000,
+        "PARSE_TIMEOUT_MS should be between 1 and 30000, got {}", PARSE_TIMEOUT_MS);
+
+    // Generate deeply nested code that could stress the parser
+    let mut code = String::new();
+    for _ in 0..1000 {
+        code.push_str("if (true) { ");
+    }
+    for _ in 0..1000 {
+        code.push_str(" }");
+    }
+
+    // Should complete quickly (either parse or timeout), not hang
+    let start = std::time::Instant::now();
+    let result = code_graph_mcp::parser::treesitter::parse_tree(&code, "typescript");
+    let elapsed = start.elapsed();
+
+    // Whether it succeeds or fails, it should not take more than 10 seconds
+    assert!(elapsed.as_secs() < 10, "parse_tree should not hang, took {:?}", elapsed);
+    // Result can be Ok or Err (timeout) - both are acceptable
+    drop(result);
+}

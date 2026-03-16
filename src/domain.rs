@@ -23,6 +23,7 @@ pub const EMBEDDING_DIM: usize = 384;
 // -- Parsing limits --
 pub const MAX_AST_DEPTH: usize = 64;
 pub const MAX_RELATION_DEPTH: usize = 256;
+pub const PARSE_TIMEOUT_MS: u64 = 5000; // 5 seconds max per file parse
 
 // -- Indexing limits --
 pub const MAX_FILE_SIZE: u64 = 1_048_576; // 1 MB
