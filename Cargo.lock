@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "code-graph-mcp"
-version = "0.5.26"
+version = "0.5.27"
 dependencies = [
  "anyhow",
  "blake3",
