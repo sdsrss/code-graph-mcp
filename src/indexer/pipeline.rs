@@ -142,7 +142,10 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
     let current_hashes = scan_directory(project_root)?;
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
-    let deleted_files = diff.deleted_files;
+    // Preserve <external> pseudo-file across incremental indexes
+    let deleted_files: Vec<String> = diff.deleted_files.into_iter()
+        .filter(|p| p != "<external>")
+        .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 
     let dirty_node_ids = if !to_index.is_empty() {
@@ -193,7 +196,10 @@ pub fn run_incremental_index_cached(
 
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
-    let deleted_files = diff.deleted_files;
+    // Preserve <external> pseudo-file across incremental indexes
+    let deleted_files: Vec<String> = diff.deleted_files.into_iter()
+        .filter(|p| p != "<external>")
+        .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 
     let dirty_node_ids = if !to_index.is_empty() {
@@ -298,6 +304,83 @@ struct FileIndexed {
     rel_path: String,
     node_ids: Vec<i64>,
     node_names: Vec<String>,
+}
+
+/// Build mapping from Python dotted module paths to file paths.
+/// Registers both full paths and suffix paths for flexible matching.
+/// e.g., "src/myapp/utils.py" matches "src.myapp.utils", "myapp.utils", and "utils".
+fn build_python_module_map(python_paths: &HashSet<String>) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for path in python_paths {
+        let stripped = if let Some(s) = path.strip_suffix("/__init__.py") {
+            s
+        } else if let Some(s) = path.strip_suffix(".py") {
+            s
+        } else {
+            continue;
+        };
+
+        // Register all suffix module paths for flexible matching
+        // e.g., "src/myapp/utils" -> "src.myapp.utils", "myapp.utils", "utils"
+        let parts: Vec<&str> = stripped.split('/').collect();
+        for i in 0..parts.len() {
+            let dotted = parts[i..].join(".");
+            map.entry(dotted).or_default().push(path.clone());
+        }
+    }
+    // Deduplicate
+    for paths in map.values_mut() {
+        paths.sort();
+        paths.dedup();
+    }
+    map
+}
+
+/// Resolve Python import targets using module path metadata.
+/// For `import X` (is_module_import): finds `<module>` nodes in resolved files.
+/// For `from X import Y`: finds nodes named Y only in resolved files.
+/// Returns None if module can't be resolved (e.g., external package).
+fn resolve_python_module_targets(
+    metadata_str: &str,
+    target_name: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+    node_id_to_path: &HashMap<i64, String>,
+    name_to_ids: &HashMap<String, Vec<i64>>,
+) -> Option<Vec<i64>> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_str).ok()?;
+    let python_module = meta.get("python_module")?.as_str()?;
+    let is_module_import = meta.get("is_module_import")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Resolve module path to file path(s)
+    let module_files = python_module_map.get(python_module)?;
+
+    if is_module_import {
+        // `import X` — link to <module> nodes in the resolved files
+        let module_node_ids = name_to_ids.get("<module>")?;
+        let targets: Vec<i64> = module_node_ids.iter()
+            .filter(|nid| {
+                node_id_to_path.get(nid)
+                    .map(|p| module_files.contains(p))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+        if targets.is_empty() { None } else { Some(targets) }
+    } else {
+        // `from X import Y` — find Y only in the resolved files
+        let all_target_ids = name_to_ids.get(target_name)?;
+        let targets: Vec<i64> = all_target_ids.iter()
+            .filter(|nid| {
+                node_id_to_path.get(nid)
+                    .map(|p| module_files.contains(p))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+        if targets.is_empty() { None } else { Some(targets) }
+    }
 }
 
 fn index_files(
@@ -488,21 +571,52 @@ fn index_files(
 
         // --- Phase 2: Extract relations + insert edges ---
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
         for pf in &batch_parsed {
             for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
                 name_to_ids.entry(name.clone()).or_default().push(*id);
+                node_id_to_path.insert(*id, pf.rel_path.clone());
             }
         }
-        // Include nodes from prior batches + existing DB (already committed)
+        // Include nodes from prior batches (in-memory)
+        for fi in &all_indexed {
+            for &nid in &fi.node_ids {
+                node_id_to_path.insert(nid, fi.rel_path.clone());
+            }
+        }
+        // Include nodes from existing DB (already committed from previous runs)
         let indexed_file_ids: Vec<i64> = batch_parsed.iter().map(|pf| pf.file_id).collect();
-        let existing = get_node_names_excluding_files(db.conn(), &indexed_file_ids)?;
-        for (name, id) in &existing {
+        let existing_with_paths = get_node_names_with_paths_excluding_files(db.conn(), &indexed_file_ids)?;
+        for (name, id, path) in &existing_with_paths {
             name_to_ids.entry(name.clone()).or_default().push(*id);
+            node_id_to_path.insert(*id, path.clone());
         }
         for ids in name_to_ids.values_mut() {
             ids.sort();
             ids.dedup();
         }
+
+        // Build Python module -> file path(s) map for import resolution
+        let mut all_python_paths: HashSet<String> = HashSet::new();
+        for pf in &batch_parsed {
+            if pf.rel_path.ends_with(".py") {
+                all_python_paths.insert(pf.rel_path.clone());
+            }
+        }
+        for fi in &all_indexed {
+            if fi.rel_path.ends_with(".py") {
+                all_python_paths.insert(fi.rel_path.clone());
+            }
+        }
+        for (_, _, path) in &existing_with_paths {
+            if path.ends_with(".py") {
+                all_python_paths.insert(path.clone());
+            }
+        }
+        let python_module_map = build_python_module_map(&all_python_paths);
+
+        // Track unresolved external Python imports: (source_module_node_id, module_name)
+        let mut external_python_imports: Vec<(i64, String)> = Vec::new();
 
         for pf in &batch_parsed {
             let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
@@ -515,6 +629,41 @@ fn index_files(
                     .map(|(_, id)| *id)
                     .collect::<Vec<_>>();
 
+                // Try Python module-constrained resolution for import edges
+                if rel.relation == REL_IMPORTS {
+                    if let Some(ref meta_str) = rel.metadata {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                            if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
+                                if python_module_map.contains_key(python_module) {
+                                    // Internal module — try constrained resolution
+                                    if let Some(module_targets) = resolve_python_module_targets(
+                                        meta_str, &rel.target_name,
+                                        &python_module_map, &node_id_to_path, &name_to_ids,
+                                    ) {
+                                        for &src_id in &source_ids {
+                                            for &tgt_id in &module_targets {
+                                                if src_id != tgt_id
+                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    total_edges_created += 1;
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    // Module found but symbol not found — fall through to default
+                                } else {
+                                    // External module — track for virtual node creation
+                                    if !source_ids.is_empty() {
+                                        external_python_imports.push((source_ids[0], python_module.to_string()));
+                                    }
+                                    continue; // No point in default resolution for external imports
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Default resolution: global name-based lookup
                 let all_target_ids = name_to_ids.get(&rel.target_name)
                     .cloned()
                     .unwrap_or_default();
@@ -542,6 +691,57 @@ fn index_files(
                             && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
                             total_edges_created += 1;
                         }
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: Create virtual nodes for external Python imports
+        if !external_python_imports.is_empty() {
+            let ext_file_id = upsert_file(db.conn(), &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: Some("external".into()),
+            })?;
+
+            // Load existing external module nodes to avoid duplicates
+            let existing_ext_nodes: HashMap<String, i64> =
+                get_nodes_by_file_path(db.conn(), "<external>")?
+                    .into_iter()
+                    .map(|n| (n.name.clone(), n.id))
+                    .collect();
+
+            let unique_modules: HashSet<String> = external_python_imports.iter()
+                .map(|(_, m)| m.clone()).collect();
+
+            let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
+            for module_name in &unique_modules {
+                if !ext_node_ids.contains_key(module_name) {
+                    let node_id = insert_node_cached(db.conn(), &NodeRecord {
+                        file_id: ext_file_id,
+                        node_type: "external_module".into(),
+                        name: module_name.clone(),
+                        qualified_name: Some(format!("<external>/{}", module_name)),
+                        start_line: 0,
+                        end_line: 0,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                    })?;
+                    ext_node_ids.insert(module_name.clone(), node_id);
+                    total_nodes_created += 1;
+                }
+            }
+
+            for (source_id, module_name) in &external_python_imports {
+                if let Some(&ext_id) = ext_node_ids.get(module_name) {
+                    if insert_edge_cached(db.conn(), *source_id, ext_id, REL_IMPORTS, None)? {
+                        total_edges_created += 1;
                     }
                 }
             }
@@ -751,5 +951,141 @@ function handleLogin(req: Request) {
 
         let foo = get_nodes_by_name(db.conn(), "foo").unwrap();
         assert_eq!(foo.len(), 0);
+    }
+
+    #[test]
+    fn test_build_python_module_map() {
+        let mut paths = HashSet::new();
+        paths.insert("myapp/utils.py".into());
+        paths.insert("myapp/__init__.py".into());
+        paths.insert("src/myapp/models.py".into());
+
+        let map = build_python_module_map(&paths);
+
+        // Full dotted path
+        assert!(map.get("myapp.utils").unwrap().contains(&"myapp/utils.py".to_string()));
+        // Suffix path
+        assert!(map.get("utils").unwrap().contains(&"myapp/utils.py".to_string()));
+        // __init__.py maps to package
+        assert!(map.get("myapp").unwrap().contains(&"myapp/__init__.py".to_string()));
+        // Nested with src/ prefix
+        assert!(map.get("myapp.models").unwrap().contains(&"src/myapp/models.py".to_string()));
+    }
+
+    #[test]
+    fn test_python_from_import_resolution() {
+        // Test `from myapp.utils import helper` creates correct cross-file edge
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::create_dir_all(project_dir.path().join("myapp")).unwrap();
+        fs::write(
+            project_dir.path().join("myapp/utils.py"),
+            "def helper():\n    return 42\n",
+        ).unwrap();
+        fs::write(
+            project_dir.path().join("myapp/main.py"),
+            "from myapp.utils import helper\n\ndef main():\n    helper()\n",
+        ).unwrap();
+
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert!(result.edges_created > 0, "should create import edges");
+
+        // Verify dependency: main.py -> utils.py
+        let deps = get_import_tree(db.conn(), "myapp/main.py", "outgoing", 1).unwrap();
+        assert!(
+            deps.iter().any(|d| d.file_path == "myapp/utils.py"),
+            "main.py should depend on utils.py, got: {:?}",
+            deps.iter().map(|d| &d.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_import_module_resolution() {
+        // Test `import myutils` creates correct cross-file edge
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::write(
+            project_dir.path().join("myutils.py"),
+            "def do_something():\n    pass\n",
+        ).unwrap();
+        fs::write(
+            project_dir.path().join("main.py"),
+            "import myutils\n\ndef main():\n    myutils.do_something()\n",
+        ).unwrap();
+
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert!(result.edges_created > 0, "should create import edges");
+
+        // Verify dependency: main.py -> myutils.py
+        let deps = get_import_tree(db.conn(), "main.py", "outgoing", 1).unwrap();
+        assert!(
+            deps.iter().any(|d| d.file_path == "myutils.py"),
+            "main.py should depend on myutils.py, got: {:?}",
+            deps.iter().map(|d| &d.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_external_import_creates_virtual_nodes() {
+        // Test that external imports create virtual nodes in <external> file
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::write(
+            project_dir.path().join("app.py"),
+            "import os\nfrom collections import OrderedDict\nfrom flask import Flask\n\ndef main():\n    pass\n",
+        ).unwrap();
+
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert!(result.files_indexed > 0, "should index the file");
+
+        // Verify <external> file was created with virtual nodes
+        let ext_nodes = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+        let ext_names: Vec<&str> = ext_nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(ext_names.contains(&"os"), "should have virtual node for 'os', got: {:?}", ext_names);
+        assert!(ext_names.contains(&"collections"), "should have virtual node for 'collections', got: {:?}", ext_names);
+        assert!(ext_names.contains(&"flask"), "should have virtual node for 'flask', got: {:?}", ext_names);
+
+        // Verify dependency_graph shows <external> as a dependency
+        let deps = get_import_tree(db.conn(), "app.py", "outgoing", 1).unwrap();
+        assert!(
+            deps.iter().any(|d| d.file_path == "<external>"),
+            "app.py should show <external> dependency, got: {:?}",
+            deps.iter().map(|d| &d.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_mixed_internal_external_imports() {
+        // Test project with both internal and external imports
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::create_dir_all(project_dir.path().join("myapp")).unwrap();
+        fs::write(
+            project_dir.path().join("myapp/utils.py"),
+            "def helper():\n    return 42\n",
+        ).unwrap();
+        fs::write(
+            project_dir.path().join("myapp/main.py"),
+            "import os\nfrom myapp.utils import helper\nfrom flask import Flask\n\ndef main():\n    helper()\n",
+        ).unwrap();
+
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert!(result.edges_created > 0);
+
+        // Should have internal dependency
+        let deps = get_import_tree(db.conn(), "myapp/main.py", "outgoing", 1).unwrap();
+        let dep_files: Vec<&str> = deps.iter().map(|d| d.file_path.as_str()).collect();
+        assert!(dep_files.contains(&"myapp/utils.py"), "should depend on internal utils.py, got: {:?}", dep_files);
+
+        // Should also have external dependency
+        assert!(dep_files.contains(&"<external>"), "should depend on <external>, got: {:?}", dep_files);
     }
 }

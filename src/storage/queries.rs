@@ -336,6 +336,43 @@ pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64
     Ok(results)
 }
 
+/// Like `get_node_names_excluding_files` but also returns the file path for each node.
+/// Used for Python module-constrained import resolution.
+pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file_ids: &[i64]) -> Result<Vec<(String, i64, String)>> {
+    if exclude_file_ids.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _exclude_file_ids (id INTEGER PRIMARY KEY)")?;
+    conn.execute("DELETE FROM _exclude_file_ids", [])?;
+
+    for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
+        let values = (1..=chunk.len()).map(|i| format!("(?{})", i)).collect::<Vec<_>>().join(",");
+        let sql = format!("INSERT INTO _exclude_file_ids (id) VALUES {}", values);
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        conn.execute(&sql, params.as_slice())?;
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.file_id NOT IN (SELECT id FROM _exclude_file_ids)"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS _exclude_file_ids")?;
+
+    Ok(results)
+}
+
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.target_id

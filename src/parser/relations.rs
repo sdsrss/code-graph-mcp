@@ -369,17 +369,22 @@ fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, result
 
 /// Extract imports from Python `import X` / `import X, Y` statements.
 /// AST: import_statement -> dotted_name ("os") ...
+/// Adds metadata `{"python_module": "X", "is_module_import": true}` for module resolution.
 fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             if child.kind() == "dotted_name" || child.kind() == "identifier" {
                 let name = node_text(&child, source).to_string();
                 if !name.is_empty() {
+                    let metadata = serde_json::json!({
+                        "python_module": &name,
+                        "is_module_import": true
+                    }).to_string();
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: name,
                         relation: REL_IMPORTS.into(),
-                        metadata: None,
+                        metadata: Some(metadata),
                     });
                 }
             } else if child.kind() == "aliased_import" {
@@ -387,11 +392,15 @@ fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: 
                 if let Some(module) = child.named_child(0) {
                     let name = node_text(&module, source).to_string();
                     if !name.is_empty() {
+                        let metadata = serde_json::json!({
+                            "python_module": &name,
+                            "is_module_import": true
+                        }).to_string();
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata: Some(metadata),
                         });
                     }
                 }
@@ -403,24 +412,30 @@ fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: 
 /// Extract imports from Python `from X import Y, Z` statements.
 /// AST: import_from_statement -> dotted_name ("collections"), dotted_name ("OrderedDict"), dotted_name ("defaultdict")
 /// The first dotted_name is the module; the rest are imported names.
+/// Adds metadata `{"python_module": "X"}` for module-constrained resolution.
 fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    let mut module_path: Option<String> = None;
     let mut is_first_dotted_name = true;
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             match child.kind() {
                 "dotted_name" => {
                     if is_first_dotted_name {
-                        // First dotted_name is the module name (e.g., "collections") — skip it
+                        // First dotted_name is the module name — capture it for resolution
+                        module_path = Some(node_text(&child, source).to_string());
                         is_first_dotted_name = false;
                     } else {
                         // Subsequent dotted_names are imported symbols
                         let name = node_text(&child, source).to_string();
                         if !name.is_empty() {
+                            let metadata = module_path.as_ref().map(|m| {
+                                serde_json::json!({"python_module": m}).to_string()
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
-                                metadata: None,
+                                metadata,
                             });
                         }
                     }
@@ -430,11 +445,14 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                     // (e.g., `from os import path` where `path` is an identifier, not dotted_name)
                     let name = node_text(&child, source).to_string();
                     if !name.is_empty() {
+                        let metadata = module_path.as_ref().map(|m| {
+                            serde_json::json!({"python_module": m}).to_string()
+                        });
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata,
                         });
                     }
                 }
@@ -443,22 +461,28 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                     if let Some(original) = child.named_child(0) {
                         let name = node_text(&original, source).to_string();
                         if !name.is_empty() {
+                            let metadata = module_path.as_ref().map(|m| {
+                                serde_json::json!({"python_module": m}).to_string()
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
-                                metadata: None,
+                                metadata,
                             });
                         }
                     }
                 }
                 "wildcard_import" => {
                     // from X import * — record as wildcard
+                    let metadata = module_path.as_ref().map(|m| {
+                        serde_json::json!({"python_module": m}).to_string()
+                    });
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: "*".into(),
                         relation: REL_IMPORTS.into(),
-                        metadata: None,
+                        metadata,
                     });
                 }
                 _ => {}
