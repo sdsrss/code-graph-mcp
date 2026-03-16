@@ -5,5 +5,11 @@
     "name": "sdsrs"
   },
   "version": "0.5.26",
-  "keywords": ["code-graph", "ast", "navigation", "mcp", "knowledge-graph"]
+  "keywords": [
+    "code-graph",
+    "ast",
+    "navigation",
+    "mcp",
+    "knowledge-graph"
+  ]
 }

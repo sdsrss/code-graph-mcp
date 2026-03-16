@@ -10,8 +10,9 @@ const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJso
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
 const NPM_PACKAGE = '@sdsrs/code-graph';
 const STATE_FILE = path.join(CACHE_DIR, 'update-state.json');
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;       // 24h
-const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h if rate-limited
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h (GitHub allows 60 req/h unauthenticated)
+const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
+const POST_UPDATE_INTERVAL_MS = 1 * 60 * 60 * 1000;  // 1h after update (verify success)
 const FETCH_TIMEOUT_MS = 3000;
 
 // ── State Persistence ──────────────────────────────────────
@@ -42,7 +43,9 @@ function isDevMode() {
 function shouldCheck(state) {
   if (!state.lastCheck) return true;
   const elapsed = Date.now() - new Date(state.lastCheck).getTime();
-  const interval = state.rateLimited ? RATE_LIMIT_INTERVAL_MS : CHECK_INTERVAL_MS;
+  let interval = CHECK_INTERVAL_MS;
+  if (state.rateLimited) interval = RATE_LIMIT_INTERVAL_MS;
+  else if (state.pendingBinaryUpdate) interval = POST_UPDATE_INTERVAL_MS;
   return elapsed >= interval;
 }
 
@@ -154,14 +157,18 @@ async function downloadAndInstall(latest) {
     } catch { /* manifest update failed — not fatal */ }
 
     // 6. Update npm binary (non-blocking, best-effort)
+    let binaryUpdated = false;
     try {
       execFileSync('npm', ['install', '-g', `${NPM_PACKAGE}@${latest.version}`], {
         timeout: 60000,
         stdio: 'pipe',
       });
+      binaryUpdated = true;
+      // Clear pending flag on success
+      try { const s = readState(); delete s.pendingBinaryUpdate; saveState(s); } catch { /* ok */ }
     } catch {
-      // npm install failed — plugin files still updated
-      // User can manually update binary later
+      // npm package may not be published yet (race with CI). Record for retry.
+      try { const s = readState(); s.pendingBinaryUpdate = latest.version; saveState(s); } catch { /* ok */ }
     }
 
     return true;

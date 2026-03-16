@@ -6,9 +6,30 @@ const path = require('path');
 const os = require('os');
 const { findBinary } = require('./find-binary');
 const { install, update, readManifest, getPluginVersion, checkScopeConflict } = require('./lifecycle');
-const { checkForUpdate } = require('./auto-update');
+const { checkForUpdate, readState: readUpdateState } = require('./auto-update');
 
 let BIN = findBinary();
+
+// --- 0b. Retry pending binary update from previous failed auto-update ---
+{
+  const updateState = readUpdateState();
+  if (updateState.pendingBinaryUpdate) {
+    const pendingVer = updateState.pendingBinaryUpdate;
+    try {
+      execFileSync('npm', ['install', '-g', `@sdsrs/code-graph@${pendingVer}`], {
+        timeout: 30000, stdio: 'pipe'
+      });
+      try { fs.unlinkSync(path.join(os.homedir(), '.cache', 'code-graph', 'binary-path')); } catch {}
+      // Clear pending flag
+      const { writeJsonAtomic, CACHE_DIR } = require('./lifecycle');
+      const s = readUpdateState();
+      delete s.pendingBinaryUpdate;
+      writeJsonAtomic(path.join(CACHE_DIR, 'update-state.json'), s);
+      process.stderr.write(`[code-graph] Binary retry succeeded: v${pendingVer}\n`);
+      BIN = findBinary(); // refresh
+    } catch { /* npm still not available — will retry next session */ }
+  }
+}
 
 // --- 0. Auto-install binary if missing ---
 if (!BIN) {
@@ -66,6 +87,7 @@ if (BIN) {
         (pv[0] === bv[0] && pv[1] === bv[1] && pv[2] > bv[2]);
       if (pluginNewer) {
         process.stderr.write(`[code-graph] Binary v${binVersion} < plugin v${pluginVersion}, updating...\n`);
+        let binarySynced = false;
         try {
           execFileSync('npm', ['install', '-g', `@sdsrs/code-graph@${pluginVersion}`], {
             timeout: 30000, stdio: 'pipe'
@@ -73,9 +95,17 @@ if (BIN) {
           // Clear cached binary path so next lookup finds the new binary
           try { fs.unlinkSync(path.join(os.homedir(), '.cache', 'code-graph', 'binary-path')); } catch {}
           process.stderr.write(`[code-graph] Binary updated to v${pluginVersion}\n`);
+          binarySynced = true;
         } catch {
           process.stderr.write(
             `[code-graph] Auto-update failed. Run: npm install -g @sdsrs/code-graph@${pluginVersion}\n`
+          );
+        }
+        if (binarySynced) {
+          // MCP server is still running old binary — prompt user to reconnect
+          process.stdout.write(
+            `\n\u26A0\uFE0F [code-graph] Binary updated v${binVersion} \u2192 v${pluginVersion}. ` +
+            `Run /mcp to reconnect MCP server with new version.\n`
           );
         }
       }
@@ -107,6 +137,10 @@ if (!manifest.version) {
   const result = await checkForUpdate();
   if (result && result.updated) {
     process.stderr.write(`[code-graph] Updated: v${result.from} \u2192 v${result.to}\n`);
+    process.stdout.write(
+      `\n\uD83D\uDD04 [code-graph] Auto-updated v${result.from} \u2192 v${result.to}. ` +
+      `Run /mcp to use the new version.\n`
+    );
   } else if (result && result.updateAvailable) {
     process.stderr.write(
       `[code-graph] Update available: v${result.from} \u2192 v${result.to}. ` +

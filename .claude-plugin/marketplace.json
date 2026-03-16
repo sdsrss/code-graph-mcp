@@ -19,7 +19,15 @@
       "homepage": "https://github.com/sdsrss/code-graph-mcp",
       "repository": "https://github.com/sdsrss/code-graph-mcp",
       "license": "MIT",
-      "keywords": ["code-graph", "ast", "navigation", "mcp", "knowledge-graph", "semantic-search", "call-graph"]
+      "keywords": [
+        "code-graph",
+        "ast",
+        "navigation",
+        "mcp",
+        "knowledge-graph",
+        "semantic-search",
+        "call-graph"
+      ]
     }
   ]
 }
