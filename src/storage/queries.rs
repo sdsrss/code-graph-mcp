@@ -949,10 +949,13 @@ pub fn get_import_tree(
 /// Get (node_id, context_string) for nodes that have context strings but no vectors.
 /// Returns at most `limit` rows per call to bound memory usage.
 pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
+    // Priority: embed hot-path nodes first (most referenced = highest value for search)
     let mut stmt = conn.prepare(
         "SELECT n.id, n.context_string FROM nodes n
          LEFT JOIN node_vectors v ON v.node_id = n.id
          WHERE n.context_string IS NOT NULL AND v.node_id IS NULL
+         ORDER BY (SELECT COUNT(*) FROM edges e
+                   WHERE e.target_id = n.id) DESC
          LIMIT ?1"
     )?;
     let rows = stmt.query_map([limit as i64], |row| {
@@ -1240,9 +1243,19 @@ const FTS_STOP_WORDS: &[&str] = &[
 ];
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
+    fts5_search_impl(conn, query, limit, true)
+}
+
+/// FTS5 search including test symbols (for test-aware callers).
+#[cfg(test)]
+pub fn fts5_search_with_tests(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
+    fts5_search_impl(conn, query, limit, false)
+}
+
+fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: bool) -> Result<Vec<NodeResult>> {
     // Preprocess query: filter stopwords, split identifiers (camelCase/snake_case),
     // then sanitize for FTS5. Porter stemming is handled by the FTS5 tokenizer.
-    let sanitized: String = query
+    let terms: Vec<String> = query
         .split_whitespace()
         .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
         .flat_map(|word| {
@@ -1253,20 +1266,35 @@ pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Nod
         .collect::<std::collections::BTreeSet<_>>() // deduplicate (sorted for deterministic queries)
         .into_iter()
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+        .collect();
     // Empty/whitespace-only queries would cause FTS5 MATCH error
-    if sanitized.is_empty() {
+    if terms.is_empty() {
         return Ok(vec![]);
     }
+
+    let test_filter = if exclude_tests { " AND n.is_test = 0" } else { "" };
     let sql = format!(
-        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1
+        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1{}
          -- BM25 weights: name(5), qualified_name(3), code_content(2), context_string(2), doc_comment(1), name_tokens(5), return_type(1), param_types(1)
          ORDER BY bm25(nodes_fts, 5.0, 3.0, 2.0, 2.0, 1.0, 5.0, 1.0, 1.0) LIMIT ?2",
-        NODE_SELECT_ALIASED
+        NODE_SELECT_ALIASED, test_filter
     );
+
+    // Strategy: AND-first for multi-term queries (higher precision), fallback to OR
+    if terms.len() > 1 {
+        let and_query = terms.join(" AND ");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![and_query, limit], map_node_row)?;
+        let results: Vec<NodeResult> = rows.collect::<Result<Vec<_>, _>>()?;
+        if results.len() >= (limit as usize / 2).max(1) {
+            return Ok(results);
+        }
+        // Fallback: OR gives broader recall
+    }
+
+    let or_query = terms.join(" OR ");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![sanitized, limit], map_node_row)?;
+    let rows = stmt.query_map(rusqlite::params![or_query, limit], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -1411,6 +1439,69 @@ mod tests {
 
         let results = fts5_search(db.conn(), "authentication token", 5).unwrap();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "validateToken");
+    }
+
+    #[test]
+    fn test_fts5_search_excludes_test_nodes() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        // Production function
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "validateToken".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "function validateToken(token) { jwt.verify(token); }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // Test function (should be excluded by default)
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "test_validateToken".into(),
+            qualified_name: None, start_line: 10, end_line: 15,
+            code_content: "function test_validateToken() { assert(validateToken('x')); }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: true,
+        }).unwrap();
+
+        // Default search excludes test nodes
+        let results = fts5_search(db.conn(), "validateToken", 10).unwrap();
+        assert_eq!(results.len(), 1, "should exclude test node");
+        assert_eq!(results[0].name, "validateToken");
+
+        // With tests included
+        let results_all = fts5_search_with_tests(db.conn(), "validateToken", 10).unwrap();
+        assert_eq!(results_all.len(), 2, "should include test node");
+    }
+
+    #[test]
+    fn test_fts5_and_then_or_strategy() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        // Node with both "validate" and "token" in content
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "validateToken".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "function validateToken(token) { return true; }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // Node with only "validate" (not "token")
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "validateEmail".into(),
+            qualified_name: None, start_line: 10, end_line: 15,
+            code_content: "function validateEmail(email) { return true; }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Multi-term query: AND should match validateToken; if not enough results, OR adds validateEmail
+        let results = fts5_search(db.conn(), "validate token", 10).unwrap();
+        assert!(!results.is_empty(), "should find results");
+        // validateToken matches both terms so should rank first
         assert_eq!(results[0].name, "validateToken");
     }
 

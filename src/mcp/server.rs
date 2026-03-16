@@ -232,6 +232,8 @@ pub struct McpServer {
     last_index_stats: Mutex<IndexStats>,
     /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
     metrics: Mutex<super::metrics::SessionMetrics>,
+    /// Cached project_map result: (timestamp, json_value). Invalidated on re-index.
+    cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
 }
 
 impl McpServer {
@@ -285,6 +287,7 @@ impl McpServer {
             startup_index_result: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
+            cached_project_map: Mutex::new(None),
         })
     }
 
@@ -308,6 +311,7 @@ impl McpServer {
             startup_index_result: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
+            cached_project_map: Mutex::new(None),
         }
     }
 
@@ -333,6 +337,7 @@ impl McpServer {
             startup_index_result: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
+            cached_project_map: Mutex::new(None),
         }
     }
 
@@ -513,6 +518,11 @@ impl McpServer {
         let Some(r) = result else { return };
 
         *lock_or_recover(&self.indexed, "indexed") = true;
+
+        // Invalidate project_map cache after background startup indexing
+        if r.files_indexed > 0 {
+            *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+        }
 
         // Store indexing stats for observability (exposed via get_index_status)
         *lock_or_recover(&self.last_index_stats, "last_index_stats") = r.stats;
@@ -819,6 +829,8 @@ impl McpServer {
             let result = run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
+            // Invalidate project_map cache after re-index
+            *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
             // Note: model lock is NOT held here — spawn_background_embedding locks it internally
             self.spawn_background_embedding();
         } else {
@@ -853,6 +865,10 @@ impl McpServer {
 
         match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref(), None) {
             Ok((result, new_cache)) => {
+                if result.files_indexed > 0 {
+                    // Invalidate project_map cache when files actually changed
+                    *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+                }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
                 Ok(())
@@ -945,17 +961,18 @@ impl McpServer {
             },
             "instructions": concat!(
                 "Code Graph: AST knowledge graph with semantic search. RULES:\n",
-                "0. START HERE → project_map for full architecture overview (modules, deps, routes, hot paths).\n",
-                "1. Call graph (who calls X / what X calls) → get_call_graph. NOT Grep.\n",
-                "2. Module/file understanding → module_overview. NOT Read multiple files.\n",
-                "3. BEFORE modifying a function → impact_analysis FIRST.\n",
-                "4. Find code by concept/meaning → semantic_code_search. NOT Grep.\n",
-                "5. HTTP request tracing → trace_http_chain. NOT Read router+handler.\n",
-                "6. One symbol's signature+relations → get_ast_node. NOT Read whole file.\n",
-                "7. File dependencies → dependency_graph. NOT Grep imports.\n",
-                "8. Similar/duplicate code → find_similar_code.\n",
+                "0. START HERE \u{2192} project_map for full architecture overview (modules, deps, routes, hot paths).\n",
+                "1. Call graph (who calls X / what X calls) \u{2192} get_call_graph. NOT Grep.\n",
+                "2. Module/file understanding \u{2192} module_overview. NOT Read multiple files.\n",
+                "3. BEFORE modifying a function \u{2192} impact_analysis FIRST.\n",
+                "4. Find code by concept/meaning \u{2192} semantic_code_search. NOT Grep.\n",
+                "5. HTTP request tracing \u{2192} trace_http_chain. NOT Read router+handler.\n",
+                "6. One symbol's signature+relations \u{2192} get_ast_node. NOT Read whole file.\n",
+                "7. File dependencies \u{2192} dependency_graph. NOT Grep imports.\n",
+                "8. Similar/duplicate code \u{2192} find_similar_code.\n",
                 "Use Grep ONLY for: exact strings, constants, regex patterns.\n",
-                "Use Read ONLY for: files you will edit."
+                "Use Read ONLY for: files you will edit.\n",
+                "TOKEN SAVING: semantic_code_search(compact=true) for locating; get_ast_node(include_impact=true) to combine lookup+impact in 1 call."
             )
         }))
     }
@@ -1211,6 +1228,7 @@ impl McpServer {
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Query quality factor: penalize vague/short queries so relevance scores
         // reflect actual match quality, not just relative rank position.
@@ -1310,17 +1328,6 @@ impl McpServer {
                         continue;
                     }
                 }
-                // Truncate large code_content to reduce token usage;
-                // users can get full code via get_ast_node(node_id)
-                const MAX_SEARCH_CODE_LEN: usize = 500;
-                let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
-                    let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
-                        .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
-                    format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
-                        truncated, node.end_line - node.start_line + 1)
-                } else {
-                    node.code_content.clone()
-                };
                 // Normalize RRF score to 0.0–1.0 range, then apply query quality factor
                 // so short/vague queries produce lower relevance scores
                 let score = if let Some(max_score) = fused.first().map(|f| f.score) {
@@ -1329,17 +1336,42 @@ impl McpServer {
                         (normalized * query_quality * 100.0).round() / 100.0
                     } else { 0.0 }
                 } else { 0.0 };
-                results.push(json!({
-                    "node_id": node.id,
-                    "name": node.name,
-                    "type": node.node_type,
-                    "file_path": nwf.file_path,
-                    "start_line": node.start_line,
-                    "end_line": node.end_line,
-                    "code_content": code,
-                    "signature": node.signature,
-                    "relevance": score,
-                }));
+
+                // Compact mode: signature + location only (saves ~85% tokens per result)
+                if compact {
+                    results.push(json!({
+                        "node_id": node.id,
+                        "name": node.name,
+                        "type": node.node_type,
+                        "file_path": nwf.file_path,
+                        "line": format!("{}-{}", node.start_line, node.end_line),
+                        "signature": node.signature,
+                        "relevance": score,
+                    }));
+                } else {
+                    // Truncate large code_content to reduce token usage;
+                    // users can get full code via get_ast_node(node_id)
+                    const MAX_SEARCH_CODE_LEN: usize = 500;
+                    let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
+                        let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
+                            .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
+                        format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
+                            truncated, node.end_line - node.start_line + 1)
+                    } else {
+                        node.code_content.clone()
+                    };
+                    results.push(json!({
+                        "node_id": node.id,
+                        "name": node.name,
+                        "type": node.node_type,
+                        "file_path": nwf.file_path,
+                        "start_line": node.start_line,
+                        "end_line": node.end_line,
+                        "code_content": code,
+                        "signature": node.signature,
+                        "relevance": score,
+                    }));
+                }
                 matched.push(MatchedNode {
                     node: &nwf.node,
                     file_path: &nwf.file_path,
@@ -1633,12 +1665,13 @@ impl McpServer {
         }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
+        let include_impact = args["include_impact"].as_bool().unwrap_or(false);
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-            return self.ast_node_by_id(nid, include_refs, ctx);
+            return self.ast_node_by_id(nid, include_refs, include_impact, ctx);
         }
 
         let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
@@ -1657,7 +1690,7 @@ impl McpServer {
                     "error": format!("Symbol '{}' not found in index.", sym),
                     "hint": "Use semantic_code_search to find the correct symbol name, or check spelling.",
                 })),
-                1 => self.ast_node_by_id(non_test[0].id, include_refs, context_lines),
+                1 => self.ast_node_by_id(non_test[0].id, include_refs, include_impact, context_lines),
                 _ => {
                     let suggestions: Vec<_> = non_test.iter().map(|n| {
                         let fp = queries::get_file_path(self.db.conn(), n.file_id)
@@ -1723,6 +1756,10 @@ impl McpServer {
                     result["called_by"] = json!(callers);
                 }
 
+                if include_impact {
+                    self.append_impact_summary(&mut result, &n.name, file_path)?;
+                }
+
                 // Compress if code_content exceeds token threshold
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
@@ -1762,7 +1799,7 @@ impl McpServer {
     }
 
     /// Lookup AST node by node_id.
-    fn ast_node_by_id(&self, node_id: i64, include_refs: bool, context_lines: usize) -> Result<serde_json::Value> {
+    fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_impact: bool, context_lines: usize) -> Result<serde_json::Value> {
         let node = queries::get_node_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
         let file_path = queries::get_file_path(self.db.conn(), node.file_id)?
@@ -1798,7 +1835,45 @@ impl McpServer {
             result["called_by"] = json!(callers);
         }
 
+        if include_impact {
+            self.append_impact_summary(&mut result, &node.name, &file_path)?;
+        }
+
         Ok(result)
+    }
+
+    /// Append a lightweight impact summary to an existing result JSON.
+    /// Reuses the impact_analysis query logic but returns a compact summary object.
+    fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str) -> Result<()> {
+        let callers = queries::get_callers_with_route_info(
+            self.db.conn(), symbol_name, Some(file_path), 3
+        )?;
+        let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+        let prod_callers: Vec<_> = callers.iter()
+            .filter(|c| !is_test_symbol(&c.name, &c.file_path))
+            .collect();
+        let affected_files: std::collections::HashSet<&str> = prod_callers.iter()
+            .map(|c| c.file_path.as_str()).collect();
+        let affected_routes: usize = callers.iter()
+            .filter(|c| c.route_info.is_some())
+            .count();
+
+        let risk = if prod_callers.len() > 10 || affected_routes >= 3 {
+            "HIGH"
+        } else if prod_callers.len() > 3 || affected_routes > 0 {
+            "MEDIUM"
+        } else {
+            "LOW"
+        };
+
+        result["impact"] = json!({
+            "risk_level": risk,
+            "direct_callers": prod_callers.iter().filter(|c| c.depth == 1).count(),
+            "transitive_callers": prod_callers.iter().filter(|c| c.depth > 1).count(),
+            "affected_files": affected_files.len(),
+            "affected_routes": affected_routes,
+        });
+        Ok(())
     }
 
     /// Read source code with context lines from the project file system.
@@ -1960,8 +2035,9 @@ impl McpServer {
         // Save indexing stats for observability
         *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats.clone();
 
-        // Reset indexed flag
+        // Reset indexed flag and invalidate caches
         *lock_or_recover(&self.indexed, "indexed") = true;
+        *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
 
         self.spawn_background_embedding();
 
@@ -2366,6 +2442,16 @@ impl McpServer {
             self.ensure_indexed()?;
         }
 
+        // Return cached result if fresh (< 60s) — project_map is expensive and rarely changes mid-session
+        {
+            let cache = lock_or_recover(&self.cached_project_map, "cached_pmap");
+            if let Some((ts, ref val)) = *cache {
+                if ts.elapsed().as_secs() < 60 {
+                    return Ok(val.clone());
+                }
+            }
+        }
+
         let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
 
         let modules_json: Vec<serde_json::Value> = modules.iter().map(|m| {
@@ -2412,12 +2498,18 @@ impl McpServer {
             })
         }).collect();
 
-        Ok(json!({
+        let result = json!({
             "modules": modules_json,
             "module_dependencies": deps_json,
             "entry_points": routes_json,
             "hot_functions": hot_json,
-        }))
+        });
+
+        // Cache the result
+        *lock_or_recover(&self.cached_project_map, "cached_pmap") =
+            Some((std::time::Instant::now(), result.clone()));
+
+        Ok(result)
     }
 }
 

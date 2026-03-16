@@ -30,7 +30,8 @@ impl ToolRegistry {
                         "query": { "type": "string", "description": "Search query" },
                         "top_k": { "type": "number", "description": "Results count (default 5)" },
                         "language": { "type": "string", "description": "Filter by language" },
-                        "node_type": { "type": "string", "description": "Filter by node type" }
+                        "node_type": { "type": "string", "description": "Filter by node type" },
+                        "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" }
                     },
                     "required": ["query"]
                 }),
@@ -72,6 +73,7 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve)" },
                         "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
+                        "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0)" }
                     },
                     "required": []
