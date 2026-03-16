@@ -45,7 +45,8 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Function/method name" },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both')" },
                         "depth": { "type": "number", "description": "Max depth (default 2)" },
-                        "file_path": { "type": "string", "description": "Disambiguate same-name functions" }
+                        "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" }
                     },
                     "required": ["symbol_name"]
                 }),
@@ -84,7 +85,9 @@ impl ToolRegistry {
                 description: "Full project architecture: modules, cross-module dependencies, HTTP entry points, hot functions. Call first for overview.".into(),
                 input_schema: json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "compact": { "type": "boolean", "description": "Compact mode: module paths+counts only, no symbols/languages (saves tokens)" }
+                    },
                     "required": []
                 }),
             },
@@ -107,7 +110,8 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File or directory path (e.g. 'src/auth/')" }
+                        "path": { "type": "string", "description": "File or directory path (e.g. 'src/auth/')" },
+                        "compact": { "type": "boolean", "description": "Compact mode: name+type+callers only, no signatures (saves tokens)" }
                     },
                     "required": ["path"]
                 }),

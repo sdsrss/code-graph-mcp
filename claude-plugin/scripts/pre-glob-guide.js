@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // PreToolUse hook: On FIRST Glob call per session window, suggest
-// code-graph tools when exploring project structure (not finding specific files).
+// code-graph tools — but only when exploring project structure,
+// NOT finding specific files by name.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -14,10 +15,24 @@ try {
   if (Date.now() - stat.mtimeMs < WINDOW_MS) process.exit(0);
 } catch { /* first time */ }
 
+// Parse tool input to detect intent — skip for specific file lookups
+try {
+  const input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+  const pattern = (input && input.tool_input && input.tool_input.pattern) || '';
+  // Skip suggestion for: specific file patterns (has extension), config files, specific names
+  if (/\.(json|yaml|yml|toml|md|txt|env|lock|config|rc)$/i.test(pattern)) {
+    process.exit(0);
+  }
+  // Skip for patterns with specific filenames (not just wildcards like **/*.ts)
+  if (!pattern.includes('*') && /[\w-]+\.\w{1,5}$/.test(pattern)) {
+    process.exit(0);
+  }
+} catch { /* stdin not available or parse error — show guide anyway */ }
+
 fs.writeFileSync(flag, '');
 process.stdout.write(
   '[code-graph] If exploring project structure (not finding specific files):\n' +
-  '  project_map → all modules, their files, key symbols, and dependencies\n' +
-  '  module_overview(path) → files and exports within a module\n' +
+  '  project_map(compact=true) \u2192 all modules, files, key symbols, dependencies\n' +
+  '  module_overview(path, compact=true) \u2192 files and exports within a module\n' +
   'Glob remains best for: finding specific files, configs, non-code assets.\n'
 );

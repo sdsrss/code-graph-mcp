@@ -17,8 +17,8 @@ try {
 fs.writeFileSync(flag, '');
 process.stdout.write(
   '[code-graph] For code structure understanding, try code-graph first (one call vs many):\n' +
-  '  project_map → full architecture overview\n' +
-  '  module_overview(path) → module structure, exports, hot paths\n' +
-  '  get_call_graph(symbol) → trace call chains\n' +
+  '  project_map(compact=true) \u2192 full architecture overview\n' +
+  '  module_overview(path, compact=true) \u2192 module structure, exports, hot paths\n' +
+  '  get_call_graph(symbol, compact=true) \u2192 trace call chains\n' +
   'Explore agents remain best for: non-code files, runtime behavior, open-ended investigation.\n'
 );

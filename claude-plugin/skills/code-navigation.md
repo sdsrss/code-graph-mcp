@@ -1,30 +1,35 @@
 ---
 name: code-navigation
-description: PROACTIVE code-graph tool selection. Triggers automatically when you need to explore, understand, trace, or modify code. Use BEFORE choosing Grep/Read for code understanding tasks — code-graph tools save 10-40x tokens. Especially critical before modifying functions (impact_analysis first).
+description: PROACTIVE code-graph tool selection. Triggers automatically when you need to explore, understand, trace, or modify code. Use BEFORE choosing Grep/Read for code understanding tasks — code-graph tools save 5-20x tokens. Especially critical before modifying functions (impact_analysis first).
 ---
 
 # Code Navigation Rules
 
-This project has a code-graph MCP server. These tools return structured, token-efficient results.
-**Use them as your PRIMARY navigation method. Fall back to Grep/Read only for exact-match or file editing.**
+This project has a code-graph MCP server. The MCP instructions (injected at session start) are the authoritative decision table.
 
-## Decision Rules
+**Key principle: code-graph tools SUPERSEDE Grep/Agent for code understanding. Use compact=true for browsing, full when you need signatures or will edit.**
 
-| Task | MUST use | NOT this | Token savings |
-|---|---|---|---|
-| Who calls X / what X calls | `get_call_graph` | Grep + Read ×5 | 13x |
-| Understand module/directory | `module_overview` | Read multiple files | 20x |
-| **Before modifying a function** | `impact_analysis` FIRST | Just Edit | prevents breakage |
-| Find code by concept/meaning | `semantic_code_search` | Grep multiple patterns | 10x |
-| Trace HTTP request flow | `trace_http_chain` | Read router→handler→service | 10x |
-| One symbol's signature+relations | `get_ast_node` | Read entire file | 10x |
-| File import/export dependencies | `dependency_graph` | Grep import statements | 5x |
-| Find similar/duplicate code | `find_similar_code` | Grep partial names | 5x |
-| Read code of a search result | `get_ast_node` (by node_id) | Read entire file | 3x |
+## Quick Reference
+
+| Task | Tool | Savings |
+|---|---|---|
+| Architecture overview | `project_map(compact=true)` | 20x vs Read multiple |
+| Who calls X / what X calls | `get_call_graph(symbol, compact=true)` | 13x vs Grep+Read |
+| Understand module/directory | `module_overview(path, compact=true)` | 20x vs Read files |
+| **Before modifying a function** | `impact_analysis(symbol)` FIRST | prevents breakage |
+| Find code by concept | `semantic_code_search(query, compact=true)` | 10x vs Grep |
+| Trace HTTP request flow | `trace_http_chain(route)` | 10x vs Read |
+| Symbol signature+relations | `get_ast_node(node_id)` | 10x vs Read file |
+| File dependencies | `dependency_graph(file)` | 5x vs Grep |
+
+## Workflow Patterns
+
+1. **Quick lookup**: `semantic_code_search(compact=true)` → `get_ast_node(node_id=N)`
+2. **Before edit**: `impact_analysis(symbol)` → Edit
+3. **Understand**: `project_map(compact=true)` → `module_overview(path, compact=true)` → `get_call_graph(symbol)`
 
 ## When to use native tools instead
 
 - **Grep**: exact string match, constants, regex patterns, literal text search
 - **Glob**: find files by name/path pattern
 - **Read**: specific file you already know and need to edit
-- **Write/Edit**: creating or modifying files

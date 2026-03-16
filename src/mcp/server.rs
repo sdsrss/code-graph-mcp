@@ -234,6 +234,8 @@ pub struct McpServer {
     metrics: Mutex<super::metrics::SessionMetrics>,
     /// Cached project_map result: (timestamp, json_value). Invalidated on re-index.
     cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
+    /// Cached module_overview results: path → (timestamp, json_value). Invalidated on re-index.
+    cached_module_overviews: Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
 }
 
 impl McpServer {
@@ -288,6 +290,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
+            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -312,6 +315,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
+            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -338,6 +342,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
+            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -519,9 +524,10 @@ impl McpServer {
 
         *lock_or_recover(&self.indexed, "indexed") = true;
 
-        // Invalidate project_map cache after background startup indexing
+        // Invalidate caches after background startup indexing
         if r.files_indexed > 0 {
             *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
         }
 
         // Store indexing stats for observability (exposed via get_index_status)
@@ -829,8 +835,9 @@ impl McpServer {
             let result = run_full_index(&self.db, &project_root, None, Some(&progress_cb))?;
             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
-            // Invalidate project_map cache after re-index
+            // Invalidate caches after re-index
             *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
             // Note: model lock is NOT held here — spawn_background_embedding locks it internally
             self.spawn_background_embedding();
         } else {
@@ -866,8 +873,9 @@ impl McpServer {
         match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref(), None) {
             Ok((result, new_cache)) => {
                 if result.files_indexed > 0 {
-                    // Invalidate project_map cache when files actually changed
+                    // Invalidate caches when files actually changed
                     *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+                    lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
@@ -961,6 +969,7 @@ impl McpServer {
             },
             "instructions": concat!(
                 "Code Graph: AST knowledge graph with semantic search. RULES:\n",
+                "PRIORITY: When indexed, code-graph tools SUPERSEDE Grep/Agent for code understanding.\n",
                 "0. START HERE \u{2192} project_map for full architecture overview (modules, deps, routes, hot paths).\n",
                 "1. Call graph (who calls X / what X calls) \u{2192} get_call_graph. NOT Grep.\n",
                 "2. Module/file understanding \u{2192} module_overview. NOT Read multiple files.\n",
@@ -972,7 +981,11 @@ impl McpServer {
                 "8. Similar/duplicate code \u{2192} find_similar_code.\n",
                 "Use Grep ONLY for: exact strings, constants, regex patterns.\n",
                 "Use Read ONLY for: files you will edit.\n",
-                "TOKEN SAVING: semantic_code_search(compact=true) for locating; get_ast_node(include_impact=true) to combine lookup+impact in 1 call."
+                "PATTERNS:\n",
+                "  Quick lookup: semantic_code_search(query, compact=true) \u{2192} get_ast_node(node_id=N)\n",
+                "  Before edit: impact_analysis(symbol) \u{2192} Edit\n",
+                "  Understand: project_map(compact=true) \u{2192} module_overview(path, compact=true) \u{2192} get_call_graph(symbol)\n",
+                "TOKEN SAVING: Several tools support compact=true. Use compact for browsing/overview, full when you need signatures or will edit."
             )
         }))
     }
@@ -1457,6 +1470,7 @@ impl McpServer {
         let direction = args["direction"].as_str().unwrap_or("both");
         let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -1487,7 +1501,7 @@ impl McpServer {
                     let results2 = crate::graph::query::get_call_graph(
                         self.db.conn(), &resolved, direction, depth, file_path,
                     )?;
-                    return self.format_call_graph_response(&resolved, direction, &results2);
+                    return self.format_call_graph_response(&resolved, direction, &results2, compact);
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {
                     return Ok(json!({
@@ -1515,7 +1529,7 @@ impl McpServer {
             }
         }
 
-        self.format_call_graph_response(function_name, direction, &results)
+        self.format_call_graph_response(function_name, direction, &results, compact)
     }
 
     fn format_call_graph_response(
@@ -1523,20 +1537,34 @@ impl McpServer {
         function_name: &str,
         direction: &str,
         results: &[crate::graph::query::CallGraphNode],
+        compact: bool,
     ) -> Result<serde_json::Value> {
         let is_test = |n: &&crate::graph::query::CallGraphNode| {
             is_test_symbol(&n.name, &n.file_path)
         };
         let all_nodes: Vec<serde_json::Value> = results.iter()
             .filter(|n| n.depth > 0 && !is_test(n))
-            .map(|n| json!({
-                "node_id": n.node_id,
-                "name": n.name,
-                "type": n.node_type,
-                "file_path": n.file_path,
-                "depth": n.depth,
-                "direction": n.direction.as_str(),
-            }))
+            .map(|n| {
+                if compact {
+                    // Compact: keep node_id for chaining to get_ast_node, drop type (usually "function")
+                    json!({
+                        "node_id": n.node_id,
+                        "name": n.name,
+                        "file_path": n.file_path,
+                        "depth": n.depth,
+                        "direction": n.direction.as_str(),
+                    })
+                } else {
+                    json!({
+                        "node_id": n.node_id,
+                        "name": n.name,
+                        "type": n.node_type,
+                        "file_path": n.file_path,
+                        "depth": n.depth,
+                        "direction": n.direction.as_str(),
+                    })
+                }
+            })
             .collect();
         let test_callers_count = results.iter()
             .filter(|n| n.depth > 0 && is_test(n))
@@ -2038,6 +2066,7 @@ impl McpServer {
         // Reset indexed flag and invalidate caches
         *lock_or_recover(&self.indexed, "indexed") = true;
         *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
+        lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
 
         self.spawn_background_embedding();
 
@@ -2190,9 +2219,26 @@ impl McpServer {
 
         let raw_path = args["path"].as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+        let compact = args["compact"].as_bool().unwrap_or(false);
         // Normalize: strip leading "./" and treat "." as empty prefix (match all)
         let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
         let path = if path == "." { "" } else { path };
+
+        // Return cached result if fresh (< 60s), evict if expired
+        {
+            let mut cache = lock_or_recover(&self.cached_module_overviews, "cached_movw");
+            if let Some((ts, _)) = cache.get(path) {
+                if ts.elapsed().as_secs() < 60 {
+                    let val = cache.get(path).unwrap().1.clone();
+                    if compact {
+                        return self.compact_module_overview(&val);
+                    }
+                    return Ok(val);
+                } else {
+                    cache.remove(path);
+                }
+            }
+        }
 
         let exports = queries::get_module_exports(self.db.conn(), path)?;
 
@@ -2205,6 +2251,10 @@ impl McpServer {
         let files: std::collections::HashSet<&str> = exports.iter()
             .map(|e| e.file_path.as_str()).collect();
 
+        // Split exports into active (called by others) and inactive to save tokens.
+        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter()
+            .partition(|e| e.caller_count > 0);
+
         let hot_paths: Vec<serde_json::Value> = exports.iter()
             .filter(|e| e.caller_count > 0)
             .take(5)
@@ -2216,11 +2266,7 @@ impl McpServer {
             }))
             .collect();
 
-        // Split exports into active (called by others) and inactive to save tokens.
         // Active exports get full detail; inactive ones are summarized by type.
-        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter()
-            .partition(|e| e.caller_count > 0);
-
         const MAX_ACTIVE: usize = 30;
         let active_capped = active.len() > MAX_ACTIVE;
         let active_exports: Vec<serde_json::Value> = active.iter()
@@ -2272,6 +2318,57 @@ impl McpServer {
             result["showing"] = json!(MAX_ACTIVE);
             result["total_active"] = json!(active.len());
             result["hint"] = json!("Active exports capped. Use a more specific path to see all.");
+        }
+
+        // Cache the full result (max 10 entries to bound memory)
+        {
+            let mut cache = lock_or_recover(&self.cached_module_overviews, "cached_movw");
+            if cache.len() >= 10 {
+                // Evict oldest entry
+                if let Some(oldest_key) = cache.iter()
+                    .min_by_key(|(_, (ts, _))| *ts)
+                    .map(|(k, _)| k.to_string())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
+        }
+
+        if compact {
+            return self.compact_module_overview(&result);
+        }
+        Ok(result)
+    }
+
+    fn compact_module_overview(&self, full: &serde_json::Value) -> Result<serde_json::Value> {
+        // Compact: keep node_id for chaining, drop signature
+        let active: Vec<serde_json::Value> = full["active_exports"].as_array()
+            .map(|arr| arr.iter().map(|e| json!({
+                "node_id": e["node_id"],
+                "name": e["name"],
+                "type": e["type"],
+                "file": e["file"],
+                "callers": e["caller_count"],
+            })).collect())
+            .unwrap_or_default();
+
+        let inactive_count: usize = full["inactive_summary"].as_array()
+            .map(|arr| arr.iter()
+                .filter_map(|s| s["count"].as_u64())
+                .sum::<u64>() as usize)
+            .unwrap_or(0);
+
+        let mut result = json!({
+            "path": full["path"],
+            "files": full["files_count"],
+            "active": active,
+            "inactive_count": inactive_count,
+            "hot_paths": full["hot_paths"],
+            "summary": full["summary"],
+        });
+        if full.get("warning").is_some() {
+            result["warning"] = full["warning"].clone();
         }
         Ok(result)
     }
@@ -2441,73 +2538,119 @@ impl McpServer {
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Return cached result if fresh (< 60s) — project_map is expensive and rarely changes mid-session
-        {
+        // Note: cache stores full result; compact is derived from it on the fly
+        let full_result = {
             let cache = lock_or_recover(&self.cached_project_map, "cached_pmap");
             if let Some((ts, ref val)) = *cache {
                 if ts.elapsed().as_secs() < 60 {
-                    return Ok(val.clone());
+                    Some(val.clone())
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        };
 
-        let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
+        let result = if let Some(cached) = full_result {
+            cached
+        } else {
+            let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
 
-        let modules_json: Vec<serde_json::Value> = modules.iter().map(|m| {
-            let mut obj = json!({
-                "path": m.path,
-                "files": m.files,
-                "functions": m.functions,
-                "classes": m.classes,
+            let modules_json: Vec<serde_json::Value> = modules.iter().map(|m| {
+                let mut obj = json!({
+                    "path": m.path,
+                    "files": m.files,
+                    "functions": m.functions,
+                    "classes": m.classes,
+                });
+                if m.interfaces_traits > 0 {
+                    obj["interfaces_traits"] = json!(m.interfaces_traits);
+                }
+                if !m.languages.is_empty() {
+                    obj["languages"] = json!(m.languages);
+                }
+                if !m.key_symbols.is_empty() {
+                    obj["key_symbols"] = json!(m.key_symbols);
+                }
+                obj
+            }).collect();
+
+            let deps_json: Vec<serde_json::Value> = deps.iter().map(|d| {
+                json!({
+                    "from": d.from,
+                    "to": d.to,
+                    "imports": d.import_count,
+                })
+            }).collect();
+
+            let routes_json: Vec<serde_json::Value> = entry_points.iter().map(|e| {
+                json!({
+                    "route": e.route,
+                    "handler": e.handler,
+                    "file": e.file,
+                })
+            }).collect();
+
+            let hot_json: Vec<serde_json::Value> = hot_functions.iter().map(|h| {
+                json!({
+                    "name": h.name,
+                    "type": h.node_type,
+                    "file": h.file,
+                    "caller_count": h.caller_count,
+                })
+            }).collect();
+
+            let r = json!({
+                "modules": modules_json,
+                "module_dependencies": deps_json,
+                "entry_points": routes_json,
+                "hot_functions": hot_json,
             });
-            if m.interfaces_traits > 0 {
-                obj["interfaces_traits"] = json!(m.interfaces_traits);
-            }
-            if !m.languages.is_empty() {
-                obj["languages"] = json!(m.languages);
-            }
-            if !m.key_symbols.is_empty() {
-                obj["key_symbols"] = json!(m.key_symbols);
-            }
-            obj
-        }).collect();
 
-        let deps_json: Vec<serde_json::Value> = deps.iter().map(|d| {
-            json!({
-                "from": d.from,
-                "to": d.to,
-                "imports": d.import_count,
-            })
-        }).collect();
+            // Cache the full result
+            *lock_or_recover(&self.cached_project_map, "cached_pmap") =
+                Some((std::time::Instant::now(), r.clone()));
 
-        let routes_json: Vec<serde_json::Value> = entry_points.iter().map(|e| {
-            json!({
-                "route": e.route,
-                "handler": e.handler,
-                "file": e.file,
-            })
-        }).collect();
+            r
+        };
 
-        let hot_json: Vec<serde_json::Value> = hot_functions.iter().map(|h| {
-            json!({
-                "name": h.name,
-                "type": h.node_type,
-                "file": h.file,
-                "caller_count": h.caller_count,
-            })
-        }).collect();
+        if compact {
+            // Compact mode: drop languages/classes/interfaces, keep key_symbols for discoverability
+            let compact_modules: Vec<serde_json::Value> = result["modules"].as_array()
+                .map(|arr| arr.iter().map(|m| {
+                    let mut obj = json!({
+                        "path": m["path"],
+                        "files": m["files"],
+                        "functions": m["functions"],
+                    });
+                    // Preserve key_symbols — essential for deciding what to explore next
+                    if let Some(ks) = m.get("key_symbols") {
+                        if ks.is_array() && !ks.as_array().unwrap().is_empty() {
+                            obj["key_symbols"] = ks.clone();
+                        }
+                    }
+                    obj
+                }).collect())
+                .unwrap_or_default();
 
-        let result = json!({
-            "modules": modules_json,
-            "module_dependencies": deps_json,
-            "entry_points": routes_json,
-            "hot_functions": hot_json,
-        });
+            let compact_deps: Vec<serde_json::Value> = result["module_dependencies"].as_array()
+                .map(|arr| arr.iter().map(|d| json!({
+                    "from": d["from"],
+                    "to": d["to"],
+                })).collect())
+                .unwrap_or_default();
 
-        // Cache the result
-        *lock_or_recover(&self.cached_project_map, "cached_pmap") =
-            Some((std::time::Instant::now(), result.clone()));
+            return Ok(json!({
+                "modules": compact_modules,
+                "module_dependencies": compact_deps,
+                "entry_points": result["entry_points"],
+                "hot_functions": result["hot_functions"],
+            }));
+        }
 
         Ok(result)
     }
