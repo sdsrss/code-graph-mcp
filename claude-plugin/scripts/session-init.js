@@ -55,6 +55,7 @@ if (!BIN) {
 }
 
 // --- 1. Health check (always runs) ---
+let healthNodes = -1;
 if (BIN) {
   try {
     const out = execFileSync(BIN, ['health-check', '--format', 'oneline'], {
@@ -62,7 +63,36 @@ if (BIN) {
       stdio: ['pipe', 'pipe', 'pipe']
     }).toString().trim();
     if (out) process.stdout.write(out);
+    // Parse node count for empty-index detection
+    const m = out.match(/(\d+)\s*nodes/);
+    if (m) healthNodes = parseInt(m[1], 10);
   } catch { /* timeout — silent */ }
+}
+
+// --- 1a. Auto-index empty databases (fallback if MCP hasn't triggered indexing) ---
+if (BIN && healthNodes === 0) {
+  const dbExists = fs.existsSync(path.join(process.cwd(), '.code-graph', 'index.db'));
+  if (dbExists) {
+    // DB exists but empty — MCP server likely hasn't received notifications/initialized yet.
+    // Trigger CLI indexing as fallback so the index is ready before first tool call.
+    try {
+      process.stderr.write('[code-graph] Empty index detected, running initial indexing...\n');
+      const result = execFileSync(BIN, ['incremental-index', '--quiet'], {
+        timeout: 15000, // 15s max (SessionStart hook has 20s budget)
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).toString().trim();
+      if (result) process.stderr.write(`[code-graph] ${result}\n`);
+      // Re-run health check to update statusline with new counts
+      try {
+        const out2 = execFileSync(BIN, ['health-check', '--format', 'oneline'], {
+          timeout: 2000, stdio: ['pipe', 'pipe', 'pipe']
+        }).toString().trim();
+        if (out2) process.stdout.write(`\n${out2}`);
+      } catch { /* ok */ }
+    } catch (e) {
+      process.stderr.write(`[code-graph] Auto-index failed: ${e.message || e}\n`);
+    }
+  }
 }
 
 // --- 1b. Suggest project_map as first action ---
