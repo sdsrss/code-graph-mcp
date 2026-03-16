@@ -1788,6 +1788,17 @@ impl McpServer {
             obj.insert("embedding_status".into(), json!(embedding_status));
             obj.insert("embedding_progress".into(), json!(format!("{}/{}", vectors_done, vectors_total)));
             obj.insert("model_available".into(), json!(model_available));
+            let coverage_pct = if vectors_total > 0 {
+                (vectors_done as f64 / vectors_total as f64 * 100.0).round() as i64
+            } else {
+                0
+            };
+            obj.insert("embedding_coverage_pct".into(), json!(coverage_pct));
+            obj.insert("search_mode".into(), json!(if model_available && vectors_done > 0 {
+                "hybrid"
+            } else {
+                "fts_only"
+            }));
         }
 
         Ok(status)

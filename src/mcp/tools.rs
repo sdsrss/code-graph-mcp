@@ -37,7 +37,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Caller/callee call chain for a function with depth tracking and file locations.".into(),
+                description: "Caller/callee call chain with depth tracking. Static languages: high accuracy. Dynamic (JS/TS/Python): may have false edges.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -112,7 +112,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "dependency_graph".into(),
-                description: "File-level import/export dependency map with direction and depth.".into(),
+                description: "File-level import/export dependency map with recursive depth. Static languages: high accuracy. Dynamic: may have false edges.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
