@@ -7,7 +7,9 @@
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
-const { cleanupDisabledStatusline, readRegistry } = require('./lifecycle');
+const lifecycle = require('./lifecycle');
+const { readRegistry } = lifecycle;
+const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 const SEPARATOR = ' \x1b[2m|\x1b[0m ';
 

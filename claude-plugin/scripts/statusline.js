@@ -4,7 +4,8 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
-const { cleanupDisabledStatusline } = require('./lifecycle');
+const lifecycle = require('./lifecycle');
+const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 const disabledCleanup = cleanupDisabledStatusline();
 if (disabledCleanup.cleaned) process.exit(0);
