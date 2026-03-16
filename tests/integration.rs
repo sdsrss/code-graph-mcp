@@ -601,6 +601,97 @@ export function getUser(req: Request, res: Response) {
 }
 
 #[test]
+fn test_dependency_graph_multi_depth() {
+    let project = TempDir::new().unwrap();
+
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/db.ts"), r#"
+export function query(sql: string): any[] { return []; }
+export function connect(): void {}
+"#).unwrap();
+
+    fs::write(project.path().join("src/repo.ts"), r#"
+import { query, connect } from './db';
+export function findUser(id: number) {
+    connect();
+    return query('SELECT * FROM users WHERE id = ' + id);
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/api.ts"), r#"
+import { findUser } from './repo';
+export function getUser(req: Request, res: Response) {
+    const user = findUser(parseInt(req.params.id));
+    res.json(user);
+}
+"#).unwrap();
+
+    fs::write(project.path().join("src/main.ts"), r#"
+import { getUser } from './api';
+const app = { get: function(path: string, handler: any) {} };
+app.get('/users/:id', getUser);
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "getUser"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // depth=1: api.ts depends directly on repo.ts only
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/api.ts",
+        "direction": "outgoing",
+        "depth": 1
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let depends_on = result["depends_on"].as_array().unwrap();
+    let depth1_files: Vec<&str> = depends_on.iter()
+        .filter_map(|d| d["file"].as_str()).collect();
+    assert!(depth1_files.iter().any(|f| f.contains("repo.ts")),
+        "depth=1: api.ts should depend on repo.ts, got: {:?}", depth1_files);
+    assert!(!depth1_files.iter().any(|f| f.contains("db.ts")),
+        "depth=1: api.ts should NOT show db.ts, got: {:?}", depth1_files);
+
+    // depth=2: api.ts -> repo.ts -> db.ts (transitive)
+    let msg2 = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/api.ts",
+        "direction": "outgoing",
+        "depth": 2
+    }));
+    let resp2 = server.handle_message(&msg2).unwrap();
+    let result2 = parse_tool_result(&resp2);
+    let depends_on2 = result2["depends_on"].as_array().unwrap();
+    let depth2_files: Vec<&str> = depends_on2.iter()
+        .filter_map(|d| d["file"].as_str()).collect();
+    assert!(depth2_files.iter().any(|f| f.contains("db.ts")),
+        "depth=2: api.ts should transitively depend on db.ts, got: {:?}", depth2_files);
+
+    // Verify depth values
+    let db_dep = depends_on2.iter().find(|d| d["file"].as_str().unwrap().contains("db.ts")).unwrap();
+    assert_eq!(db_dep["depth"].as_i64().unwrap(), 2, "db.ts should be at depth 2");
+
+    let repo_dep = depends_on2.iter().find(|d| d["file"].as_str().unwrap().contains("repo.ts")).unwrap();
+    assert_eq!(repo_dep["depth"].as_i64().unwrap(), 1, "repo.ts should be at depth 1");
+
+    // depth=3 incoming: db.ts <- repo.ts <- api.ts <- main.ts
+    let msg3 = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/db.ts",
+        "direction": "incoming",
+        "depth": 3
+    }));
+    let resp3 = server.handle_message(&msg3).unwrap();
+    let result3 = parse_tool_result(&resp3);
+    let depended_by = result3["depended_by"].as_array().unwrap();
+    let incoming_files: Vec<&str> = depended_by.iter()
+        .filter_map(|d| d["file"].as_str()).collect();
+    assert!(incoming_files.iter().any(|f| f.contains("main.ts")),
+        "depth=3 incoming: db.ts should be transitively depended on by main.ts, got: {:?}", incoming_files);
+}
+
+#[test]
 fn test_e2e_prompts_get_unknown() {
     let project = TempDir::new().unwrap();
     let server = McpServer::from_project_root(project.path()).unwrap();

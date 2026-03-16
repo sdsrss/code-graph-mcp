@@ -845,66 +845,97 @@ pub struct FileDependency {
     pub depth: i32,
 }
 
-/// Get file-level import/export dependencies (depth=1).
+/// Get file-level import/export dependencies with recursive depth traversal.
 /// direction: "outgoing" (what this file depends on), "incoming" (what depends on this file), "both"
-/// Note: currently returns direct dependencies only. The `max_depth` parameter is accepted
-/// for future expansion but only depth=1 is implemented.
 pub fn get_import_tree(
     conn: &Connection,
     file_path: &str,
     direction: &str,
-    _max_depth: i32,
+    max_depth: i32,
 ) -> Result<Vec<FileDependency>> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
+    let max_depth = max_depth.clamp(1, 10);
     let mut results = Vec::new();
 
     if direction == "outgoing" || direction == "both" {
-        // Find all files that this file depends on (via imports OR cross-file calls)
         let mut stmt = conn.prepare(
-            "SELECT f2.path, COUNT(*) as cnt
-             FROM nodes n1
-             JOIN files f1 ON f1.id = n1.file_id
-             JOIN edges e ON e.source_id = n1.id AND e.relation IN (?1, ?3)
-             JOIN nodes n2 ON n2.id = e.target_id
-             JOIN files f2 ON f2.id = n2.file_id
-             WHERE f1.path = ?2 AND f2.path != ?2
-             GROUP BY f2.path
-             ORDER BY cnt DESC"
+            "WITH RECURSIVE dep_tree(file_path, depth, visited) AS (
+                -- Seed: the starting file
+                SELECT ?2, 0, ?2
+
+                UNION ALL
+
+                -- Recurse: find files that the current-depth files depend on
+                SELECT DISTINCT f2.path, dt.depth + 1,
+                       dt.visited || '|' || f2.path
+                FROM dep_tree dt
+                JOIN files f1 ON f1.path = dt.file_path
+                JOIN nodes n1 ON n1.file_id = f1.id
+                JOIN edges e ON e.source_id = n1.id AND e.relation IN (?1, ?3)
+                JOIN nodes n2 ON n2.id = e.target_id
+                JOIN files f2 ON f2.id = n2.file_id
+                WHERE dt.depth < ?4
+                  AND f2.path != ?2
+                  AND ('|' || dt.visited || '|') NOT LIKE '%|' || f2.path || '|%'
+            )
+            SELECT dt.file_path, MIN(dt.depth) as min_depth, COUNT(*) as cnt
+            FROM dep_tree dt
+            WHERE dt.depth > 0
+            GROUP BY dt.file_path
+            ORDER BY min_depth, cnt DESC"
         )?;
-        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path, REL_CALLS], |row| {
-            Ok(FileDependency {
-                file_path: row.get(0)?,
-                direction: "outgoing".into(),
-                symbol_count: row.get(1)?,
-                depth: 1,
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![REL_IMPORTS, file_path, REL_CALLS, max_depth],
+            |row| {
+                Ok(FileDependency {
+                    file_path: row.get(0)?,
+                    direction: "outgoing".into(),
+                    symbol_count: row.get(2)?,
+                    depth: row.get(1)?,
+                })
+            },
+        )?;
         for row in rows {
             results.push(row?);
         }
     }
 
     if direction == "incoming" || direction == "both" {
-        // Find all files that depend on this file (via imports OR cross-file calls)
         let mut stmt = conn.prepare(
-            "SELECT f1.path, COUNT(*) as cnt
-             FROM nodes n2
-             JOIN files f2 ON f2.id = n2.file_id
-             JOIN edges e ON e.target_id = n2.id AND e.relation IN (?1, ?3)
-             JOIN nodes n1 ON n1.id = e.source_id
-             JOIN files f1 ON f1.id = n1.file_id
-             WHERE f2.path = ?2 AND f1.path != ?2
-             GROUP BY f1.path
-             ORDER BY cnt DESC"
+            "WITH RECURSIVE dep_tree(file_path, depth, visited) AS (
+                SELECT ?2, 0, ?2
+
+                UNION ALL
+
+                SELECT DISTINCT f1.path, dt.depth + 1,
+                       dt.visited || '|' || f1.path
+                FROM dep_tree dt
+                JOIN files f2 ON f2.path = dt.file_path
+                JOIN nodes n2 ON n2.file_id = f2.id
+                JOIN edges e ON e.target_id = n2.id AND e.relation IN (?1, ?3)
+                JOIN nodes n1 ON n1.id = e.source_id
+                JOIN files f1 ON f1.id = n1.file_id
+                WHERE dt.depth < ?4
+                  AND f1.path != ?2
+                  AND ('|' || dt.visited || '|') NOT LIKE '%|' || f1.path || '|%'
+            )
+            SELECT dt.file_path, MIN(dt.depth) as min_depth, COUNT(*) as cnt
+            FROM dep_tree dt
+            WHERE dt.depth > 0
+            GROUP BY dt.file_path
+            ORDER BY min_depth, cnt DESC"
         )?;
-        let rows = stmt.query_map(rusqlite::params![REL_IMPORTS, file_path, REL_CALLS], |row| {
-            Ok(FileDependency {
-                file_path: row.get(0)?,
-                direction: "incoming".into(),
-                symbol_count: row.get(1)?,
-                depth: 1,
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![REL_IMPORTS, file_path, REL_CALLS, max_depth],
+            |row| {
+                Ok(FileDependency {
+                    file_path: row.get(0)?,
+                    direction: "incoming".into(),
+                    symbol_count: row.get(2)?,
+                    depth: row.get(1)?,
+                })
+            },
+        )?;
         for row in rows {
             results.push(row?);
         }
