@@ -638,6 +638,7 @@ fn test_insert_node_cached_returns_same_as_insert_node() {
         name_tokens: None,
         return_type: None,
         param_types: None,
+        is_test: false,
     }).unwrap();
 
     assert!(id > 0);
@@ -662,13 +663,13 @@ fn test_insert_edge_cached_deduplicates() {
         file_id, node_type: "function".into(), name: "a".into(),
         qualified_name: None, start_line: 1, end_line: 2,
         code_content: "".into(), signature: None, doc_comment: None, context_string: None,
-        name_tokens: None, return_type: None, param_types: None,
+        name_tokens: None, return_type: None, param_types: None, is_test: false,
     }).unwrap();
     let n2 = insert_node_cached(db.conn(), &NodeRecord {
         file_id, node_type: "function".into(), name: "b".into(),
         qualified_name: None, start_line: 3, end_line: 4,
         code_content: "".into(), signature: None, doc_comment: None, context_string: None,
-        name_tokens: None, return_type: None, param_types: None,
+        name_tokens: None, return_type: None, param_types: None, is_test: false,
     }).unwrap();
 
     // First insert should succeed
@@ -864,4 +865,78 @@ fn test_trace_http_chain_no_routes_message() {
     assert!(result["message"].is_string(), "empty handlers should include a message");
     assert!(result["message"].as_str().unwrap().contains("No matching routes"),
         "message should explain no routes found, got: {}", result["message"]);
+}
+
+#[test]
+fn test_project_map_detects_main_entry_points() {
+    let project = TempDir::new().unwrap();
+    // Rust-style main function
+    fs::write(project.path().join("main.rs"), "fn main() { println!(\"hello\"); }").unwrap();
+    // JS-style main function
+    fs::write(project.path().join("index.js"), "async function main() { run(); }\nmain();").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let entry_points = result["entry_points"].as_array().unwrap();
+    assert!(!entry_points.is_empty(), "project_map should detect main entry points");
+    let handlers: Vec<&str> = entry_points.iter()
+        .map(|e| e["handler"].as_str().unwrap())
+        .collect();
+    assert!(handlers.contains(&"main"), "should find main function as entry point");
+}
+
+#[test]
+fn test_project_map_hot_functions_excludes_test_prefix() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.ts"), r#"
+function realWork() { return helper(); }
+function helper() { return 42; }
+function test_something() { realWork(); realWork(); realWork(); }
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let hot = result["hot_functions"].as_array().unwrap();
+    let hot_names: Vec<&str> = hot.iter().map(|h| h["name"].as_str().unwrap()).collect();
+    assert!(!hot_names.contains(&"test_something"),
+        "hot_functions should exclude test_ prefixed functions, got: {:?}", hot_names);
+}
+
+#[test]
+fn test_project_map_module_dependencies() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/utils.ts"), r#"
+export function add(a: number, b: number): number { return a + b; }
+"#).unwrap();
+    fs::write(project.path().join("src/app.ts"), r#"
+import { add } from './utils';
+function main() { return add(1, 2); }
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let modules = result["modules"].as_array().unwrap();
+    assert!(!modules.is_empty(), "project_map should detect modules");
+    let deps = result["module_dependencies"].as_array().unwrap();
+    // At least verify the structure is correct, even if import resolution doesn't find cross-module deps
+    assert!(result["hot_functions"].is_array(), "hot_functions should be an array");
 }

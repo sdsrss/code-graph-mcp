@@ -175,6 +175,7 @@ mod tests {
             name_tokens: None,
             return_type: None,
             param_types: None,
+            is_test: false,
         }
     }
 

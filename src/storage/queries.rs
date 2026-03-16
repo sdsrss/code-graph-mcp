@@ -119,6 +119,8 @@ pub struct NodeRecord {
     pub return_type: Option<String>,
     /// Full parameter text from AST (includes names + types, not just type annotations).
     pub param_types: Option<String>,
+    /// True if this node is inside a test context (#[cfg(test)], mod tests, etc.)
+    pub is_test: bool,
 }
 
 pub struct NodeResult {
@@ -189,14 +191,15 @@ pub fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>>
 
 pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     let id: i64 = conn.query_row(
-        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types, is_test)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          RETURNING id",
         (
             node.file_id, &node.node_type, &node.name, &node.qualified_name,
             node.start_line, node.end_line, &node.code_content,
             &node.signature, &node.doc_comment, &node.context_string,
             &node.name_tokens, &node.return_type, &node.param_types,
+            node.is_test as i32,
         ),
         |row| row.get(0),
     )?;
@@ -207,8 +210,8 @@ pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
 /// Same semantics as insert_node, but avoids re-preparing the SQL on each call.
 pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types, is_test)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          RETURNING id"
     )?;
     let id: i64 = stmt.query_row(
@@ -217,6 +220,7 @@ pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
             node.start_line, node.end_line, &node.code_content,
             &node.signature, &node.doc_comment, &node.context_string,
             &node.name_tokens, &node.return_type, &node.param_types,
+            node.is_test as i32,
         ),
         |row| row.get(0),
     )?;
@@ -1174,6 +1178,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
              WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
+               AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE '%_test.%' \
@@ -1314,6 +1319,7 @@ mod tests {
             name_tokens: None,
             return_type: None,
             param_types: None,
+            is_test: false,
         };
         let node_id = insert_node(db.conn(), &node).unwrap();
         assert!(node_id > 0);
@@ -1334,14 +1340,14 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn a(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
         let n2 = insert_node(db.conn(), &NodeRecord {
             file_id: fid, node_type: "function".into(), name: "b".into(),
             qualified_name: None, start_line: 6, end_line: 10,
             code_content: "fn b(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
         insert_edge(db.conn(), n1, n2, "calls", None).unwrap();
@@ -1368,7 +1374,7 @@ mod tests {
             code_content: "function validateToken(token) { jwt.verify(token); }".into(),
             signature: None, doc_comment: None,
             context_string: Some("validates JWT authentication token".into()),
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
         let results = fts5_search(db.conn(), "authentication token", 5).unwrap();
@@ -1440,7 +1446,7 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn foo(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
         update_context_string(db.conn(), nid, "function foo\ncalls: bar, baz").unwrap();
@@ -1471,21 +1477,21 @@ mod tests {
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn alpha(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
         insert_node(conn, &NodeRecord {
             file_id: fid2, node_type: "function".into(), name: "beta".into(),
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn beta(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
         insert_node(conn, &NodeRecord {
             file_id: fid3, node_type: "function".into(), name: "gamma".into(),
             qualified_name: None, start_line: 1, end_line: 5,
             code_content: "fn gamma(){}".into(), signature: None,
             doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
         // Exclude 2 files → only 3rd file's node remains
