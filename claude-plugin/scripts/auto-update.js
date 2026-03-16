@@ -8,6 +8,23 @@ const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
 const { clearCache: clearBinaryCache } = require('./find-binary');
 
+// ── Environment Checks ────────────────────────────────────
+
+/**
+ * Check if a command-line tool is available on the system PATH.
+ * @param {string} cmd - Command name (e.g., 'curl', 'tar')
+ * @returns {boolean}
+ */
+function commandExists(cmd) {
+  try {
+    const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+    execFileSync(whichCmd, [cmd], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
 const STATE_FILE = path.join(CACHE_DIR, 'update-state.json');
@@ -207,6 +224,13 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
 // ── Download & Install ─────────────────────────────────────
 
 async function downloadAndInstall(latest) {
+  // Pre-flight: check required CLI tools before attempting any download
+  const missingTools = ['curl', 'tar'].filter(cmd => !commandExists(cmd));
+  if (missingTools.length > 0) {
+    console.error(`[code-graph] Auto-update skipped: missing required tools: ${missingTools.join(', ')}. Install them to enable auto-updates.`);
+    return { pluginUpdated: false, binaryUpdated: false };
+  }
+
   const tmpDir = path.join(os.tmpdir(), `code-graph-update-${Date.now()}`);
   let pluginUpdated = false;
   let binaryUpdated = false;
@@ -273,13 +297,15 @@ async function downloadAndInstall(latest) {
         if (promoteVerifiedBinary(binaryTmp, binaryDst, latest.version)) {
           binaryUpdated = true;
         }
-      } catch {
+      } catch (e) {
         // Binary download failed — plugin update still counts as success
+        console.error(`[code-graph] Binary download failed: ${e.message}`);
       }
     }
 
     return { pluginUpdated, binaryUpdated };
-  } catch {
+  } catch (e) {
+    console.error(`[code-graph] Plugin download/extract failed: ${e.message}`);
     return { pluginUpdated: false, binaryUpdated: false };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
@@ -354,7 +380,7 @@ async function checkForUpdate() {
 }
 
 module.exports = {
-  checkForUpdate, isDevMode, readState, compareVersions,
+  checkForUpdate, commandExists, isDevMode, readState, compareVersions,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary, isSilentMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
 };

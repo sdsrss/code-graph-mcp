@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const {
+  commandExists,
   fetchLatestRelease,
   getExtractedPluginVersion,
   parseLatestRelease,
@@ -78,6 +79,16 @@ test('parseLatestRelease selects the matching platform asset', () => {
     tarballUrl: 'https://example.com/tarball.tgz',
     binaryUrl: 'https://example.com/linux-x64',
   });
+});
+
+// ── commandExists ──────────────────────────────────────────
+
+test('commandExists returns true for a known command (node)', () => {
+  assert.equal(commandExists('node'), true);
+});
+
+test('commandExists returns false for a non-existent command', () => {
+  assert.equal(commandExists('__nonexistent_cmd_xyz_12345__'), false);
 });
 
 test('fetchLatestRelease parses JSON without relying on global fetch', async () => {
