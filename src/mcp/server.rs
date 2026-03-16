@@ -1923,10 +1923,18 @@ impl McpServer {
         let node_id = if let Some(id) = args["node_id"].as_i64() {
             id
         } else if let Some(name) = args["symbol_name"].as_str() {
-            queries::get_first_node_id_by_name(self.db.conn(), name)?
-                .ok_or_else(|| anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct name.", name))?
+            match queries::get_first_node_id_by_name(self.db.conn(), name)? {
+                Some(id) => id,
+                None => return Ok(json!({
+                    "error": format!("Symbol '{}' not found in index.", name),
+                    "hint": "Use semantic_code_search to find the correct symbol name, or check spelling."
+                })),
+            }
         } else {
-            return Err(anyhow!("Either node_id or symbol_name is required"));
+            return Ok(json!({
+                "error": "Either node_id or symbol_name is required.",
+                "hint": "Provide symbol_name (e.g. \"my_function\") or node_id (from other tool results)."
+            }));
         };
         let top_k = args.get("top_k")
             .and_then(|v| v.as_i64())
