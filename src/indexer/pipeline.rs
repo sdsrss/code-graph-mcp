@@ -336,51 +336,36 @@ fn build_python_module_map(python_paths: &HashSet<String>) -> HashMap<String, Ve
     map
 }
 
-/// Resolve Python import targets using module path metadata.
+/// Resolve Python import targets using pre-parsed module metadata.
 /// For `import X` (is_module_import): finds `<module>` nodes in resolved files.
 /// For `from X import Y`: finds nodes named Y only in resolved files.
-/// Returns None if module can't be resolved (e.g., external package).
+/// Returns None if module can't be resolved or no matching nodes found.
 fn resolve_python_module_targets(
-    metadata_str: &str,
+    python_module: &str,
+    is_module_import: bool,
     target_name: &str,
     python_module_map: &HashMap<String, Vec<String>>,
     node_id_to_path: &HashMap<i64, String>,
     name_to_ids: &HashMap<String, Vec<i64>>,
 ) -> Option<Vec<i64>> {
-    let meta: serde_json::Value = serde_json::from_str(metadata_str).ok()?;
-    let python_module = meta.get("python_module")?.as_str()?;
-    let is_module_import = meta.get("is_module_import")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // Resolve module path to file path(s)
+    // Resolve module path to file path(s).
+    // Note: suffix matching in python_module_map means `import utils` may match
+    // multiple files (e.g., "myapp/utils.py" and "other/utils.py"). This is an
+    // inherent ambiguity without sys.path context; over-connecting is safer for
+    // dependency analysis than missing real dependencies.
     let module_files = python_module_map.get(python_module)?;
 
-    if is_module_import {
-        // `import X` — link to <module> nodes in the resolved files
-        let module_node_ids = name_to_ids.get("<module>")?;
-        let targets: Vec<i64> = module_node_ids.iter()
-            .filter(|nid| {
-                node_id_to_path.get(nid)
-                    .map(|p| module_files.contains(p))
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
-        if targets.is_empty() { None } else { Some(targets) }
-    } else {
-        // `from X import Y` — find Y only in the resolved files
-        let all_target_ids = name_to_ids.get(target_name)?;
-        let targets: Vec<i64> = all_target_ids.iter()
-            .filter(|nid| {
-                node_id_to_path.get(nid)
-                    .map(|p| module_files.contains(p))
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
-        if targets.is_empty() { None } else { Some(targets) }
-    }
+    let lookup_name = if is_module_import { "<module>" } else { target_name };
+    let all_ids = name_to_ids.get(lookup_name)?;
+    let targets: Vec<i64> = all_ids.iter()
+        .filter(|nid| {
+            node_id_to_path.get(nid)
+                .map(|p| module_files.contains(p))
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect();
+    if targets.is_empty() { None } else { Some(targets) }
 }
 
 fn index_files(
@@ -423,6 +408,20 @@ fn index_files(
         last_modified: i64,
         parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
     }
+
+    // Pre-build Python module map once (used in all batches for import resolution)
+    let mut all_python_paths: HashSet<String> = files.iter()
+        .filter(|f| f.ends_with(".py"))
+        .cloned()
+        .collect();
+    {
+        let mut stmt = db.conn().prepare("SELECT path FROM files WHERE path LIKE '%.py'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            all_python_paths.insert(row?);
+        }
+    }
+    let python_module_map = build_python_module_map(&all_python_paths);
 
     // Heavyweight per-file data used during Phase 1+2, dropped after each batch
     struct FileParsed {
@@ -596,25 +595,6 @@ fn index_files(
             ids.dedup();
         }
 
-        // Build Python module -> file path(s) map for import resolution
-        let mut all_python_paths: HashSet<String> = HashSet::new();
-        for pf in &batch_parsed {
-            if pf.rel_path.ends_with(".py") {
-                all_python_paths.insert(pf.rel_path.clone());
-            }
-        }
-        for fi in &all_indexed {
-            if fi.rel_path.ends_with(".py") {
-                all_python_paths.insert(fi.rel_path.clone());
-            }
-        }
-        for (_, _, path) in &existing_with_paths {
-            if path.ends_with(".py") {
-                all_python_paths.insert(path.clone());
-            }
-        }
-        let python_module_map = build_python_module_map(&all_python_paths);
-
         // Track unresolved external Python imports: (source_module_node_id, module_name)
         let mut external_python_imports: Vec<(i64, String)> = Vec::new();
 
@@ -634,10 +614,12 @@ fn index_files(
                     if let Some(ref meta_str) = rel.metadata {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
                             if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
+                                let is_module_import = meta.get("is_module_import")
+                                    .and_then(|v| v.as_bool()).unwrap_or(false);
                                 if python_module_map.contains_key(python_module) {
                                     // Internal module — try constrained resolution
                                     if let Some(module_targets) = resolve_python_module_targets(
-                                        meta_str, &rel.target_name,
+                                        python_module, is_module_import, &rel.target_name,
                                         &python_module_map, &node_id_to_path, &name_to_ids,
                                     ) {
                                         for &src_id in &source_ids {
@@ -652,9 +634,11 @@ fn index_files(
                                     }
                                     // Module found but symbol not found — fall through to default
                                 } else {
-                                    // External module — track for virtual node creation
-                                    if !source_ids.is_empty() {
-                                        external_python_imports.push((source_ids[0], python_module.to_string()));
+                                    // External module — track for virtual node creation.
+                                    // For `from X import Y`, we track the module-level dependency (X),
+                                    // not the individual symbol (Y), since we can't index external code.
+                                    for &src_id in &source_ids {
+                                        external_python_imports.push((src_id, python_module.to_string()));
                                     }
                                     continue; // No point in default resolution for external imports
                                 }
@@ -1087,5 +1071,41 @@ function handleLogin(req: Request) {
 
         // Should also have external dependency
         assert!(dep_files.contains(&"<external>"), "should depend on <external>, got: {:?}", dep_files);
+    }
+
+    #[test]
+    fn test_python_external_survives_incremental_index() {
+        // Test that <external> pseudo-file persists across incremental re-indexes
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::write(
+            project_dir.path().join("app.py"),
+            "import os\n\ndef main():\n    pass\n",
+        ).unwrap();
+
+        // Full index → creates <external> with "os" node
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        let ext_before = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+        assert!(!ext_before.is_empty(), "should have external nodes after full index");
+
+        // Modify file slightly
+        fs::write(
+            project_dir.path().join("app.py"),
+            "import os\n\ndef main():\n    return 1\n",
+        ).unwrap();
+
+        // Incremental index → <external> should survive
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+        let ext_after = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+        assert!(!ext_after.is_empty(), "external nodes should survive incremental index");
+
+        // Verify dependency still visible
+        let deps = get_import_tree(db.conn(), "app.py", "outgoing", 1).unwrap();
+        assert!(
+            deps.iter().any(|d| d.file_path == "<external>"),
+            "app.py should still show <external> dependency after incremental index"
+        );
     }
 }

@@ -297,47 +297,8 @@ pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>
 
 // --- Graph query helpers ---
 
-pub fn get_all_node_names(conn: &Connection) -> Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare("SELECT name, id FROM nodes")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(results)
-}
-
-pub fn get_node_names_excluding_files(conn: &Connection, exclude_file_ids: &[i64]) -> Result<Vec<(String, i64)>> {
-    if exclude_file_ids.is_empty() {
-        return get_all_node_names(conn);
-    }
-
-    // Use a temp table so that the full set of excluded IDs is available in a single query,
-    // avoiding the incorrect chunked NOT IN approach where each chunk only excludes a subset.
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _exclude_file_ids (id INTEGER PRIMARY KEY)")?;
-    conn.execute("DELETE FROM _exclude_file_ids", [])?;
-
-    for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
-        let values = (1..=chunk.len()).map(|i| format!("(?{})", i)).collect::<Vec<_>>().join(",");
-        let sql = format!("INSERT INTO _exclude_file_ids (id) VALUES {}", values);
-        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        conn.execute(&sql, params.as_slice())?;
-    }
-
-    let mut stmt = conn.prepare(
-        "SELECT name, id FROM nodes WHERE file_id NOT IN (SELECT id FROM _exclude_file_ids)"
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
-
-    conn.execute_batch("DROP TABLE IF EXISTS _exclude_file_ids")?;
-
-    Ok(results)
-}
-
-/// Like `get_node_names_excluding_files` but also returns the file path for each node.
-/// Used for Python module-constrained import resolution.
+/// Get all node (name, id, file_path) tuples excluding nodes belonging to specified files.
+/// Used for building cross-batch name resolution maps with file path awareness.
 pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file_ids: &[i64]) -> Result<Vec<(String, i64, String)>> {
     if exclude_file_ids.is_empty() {
         let mut stmt = conn.prepare(
@@ -1442,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_node_names_excluding_files_correctness() {
+    fn test_get_node_names_with_paths_excluding_files_correctness() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
@@ -1480,18 +1441,19 @@ mod tests {
         }).unwrap();
 
         // Exclude 2 files → only 3rd file's node remains
-        let result = get_node_names_excluding_files(conn, &[fid1, fid2]).unwrap();
+        let result = get_node_names_with_paths_excluding_files(conn, &[fid1, fid2]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "gamma");
+        assert_eq!(result[0].2, "c.ts"); // also returns file path
 
         // Exclude all 3 → empty
-        let result = get_node_names_excluding_files(conn, &[fid1, fid2, fid3]).unwrap();
+        let result = get_node_names_with_paths_excluding_files(conn, &[fid1, fid2, fid3]).unwrap();
         assert!(result.is_empty());
 
         // Exclude none → all 3
-        let result = get_node_names_excluding_files(conn, &[]).unwrap();
+        let result = get_node_names_with_paths_excluding_files(conn, &[]).unwrap();
         assert_eq!(result.len(), 3);
-        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = result.iter().map(|(n, _, _)| n.as_str()).collect();
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
         assert!(names.contains(&"gamma"));
