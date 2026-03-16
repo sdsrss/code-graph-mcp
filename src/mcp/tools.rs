@@ -74,10 +74,7 @@ impl ToolRegistry {
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0)" }
                     },
-                    "anyOf": [
-                        { "required": ["symbol_name"] },
-                        { "required": ["node_id"] }
-                    ]
+                    "required": []
                 }),
             },
             ToolDefinition {
