@@ -1089,24 +1089,24 @@ impl McpServer {
                 "version": env!("CARGO_PKG_VERSION")
             },
             "instructions": concat!(
-                "Code Graph: AST knowledge graph with semantic search. RULES:\n",
-                "PRIORITY: When indexed, code-graph tools SUPERSEDE Grep/Agent for code understanding.\n",
-                "0. START HERE \u{2192} project_map for full architecture overview (modules, deps, routes, hot paths).\n",
-                "1. Call graph (who calls X / what X calls) \u{2192} get_call_graph. NOT Grep.\n",
-                "2. Module/file understanding \u{2192} module_overview. NOT Read multiple files.\n",
-                "3. BEFORE modifying a function \u{2192} impact_analysis FIRST.\n",
-                "4. Find code by concept/meaning \u{2192} semantic_code_search. NOT Grep.\n",
-                "5. HTTP request tracing \u{2192} trace_http_chain. NOT Read router+handler.\n",
-                "6. One symbol's signature+relations \u{2192} get_ast_node. NOT Read whole file.\n",
-                "7. File dependencies \u{2192} dependency_graph. NOT Grep imports.\n",
-                "8. Similar/duplicate code \u{2192} find_similar_code.\n",
-                "Use Grep ONLY for: exact strings, constants, regex patterns.\n",
-                "Use Read ONLY for: files you will edit.\n",
-                "PATTERNS:\n",
-                "  Quick lookup: semantic_code_search(query, compact=true) \u{2192} get_ast_node(node_id=N)\n",
-                "  Before edit: impact_analysis(symbol) \u{2192} Edit\n",
-                "  Understand: project_map(compact=true) \u{2192} module_overview(path, compact=true) \u{2192} get_call_graph(symbol)\n",
-                "TOKEN SAVING: Several tools support compact=true. Use compact for browsing/overview, full when you need signatures or will edit."
+                "Code Graph CLI \u{2014} this project is indexed. CLI commands (via Bash) complement built-in tools:\n",
+                "\n",
+                "Replace Grep (code understanding):\n",
+                "  code-graph-mcp grep \"pattern\" [path]    \u{2014} grep + AST context (shows containing function/class)\n",
+                "  code-graph-mcp search \"concept\"         \u{2014} semantic search by concept (no exact name needed)\n",
+                "  code-graph-mcp ast-search \"q\" --type fn \u{2014} structural search by type/return/params\n",
+                "\n",
+                "Replace Read multiple files (understand structure):\n",
+                "  code-graph-mcp map                      \u{2014} project architecture (modules, deps, entry points)\n",
+                "  code-graph-mcp overview src/mcp/         \u{2014} module symbols grouped by file and type\n",
+                "  code-graph-mcp callgraph symbol          \u{2014} who calls it / what it calls\n",
+                "\n",
+                "Before modifying code:\n",
+                "  code-graph-mcp impact symbol             \u{2014} blast radius (callers, routes, risk level)\n",
+                "\n",
+                "Still use Grep: exact strings, constants, regex, non-code files.\n",
+                "Still use Read: specific file you will edit.\n",
+                "MCP tools also available for programmatic access with compact=true option."
             )
         }))
     }

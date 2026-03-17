@@ -1,8 +1,5 @@
 ---
-description: Show code-graph index status and embedding progress
+description: Show code-graph index status
 ---
 
-Call the `get_index_status` tool and present the results:
-- files_count, nodes_count, edges_count
-- embedding_status and embedding_progress
-- model_available, is_watching
+!`code-graph-mcp health-check --format json 2>/dev/null || echo '{"error":"No index found"}'`

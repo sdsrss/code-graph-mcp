@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 'use strict';
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, readJson,
@@ -62,12 +63,43 @@ function runSessionInit() {
 
   const lifecycle = syncLifecycleConfig();
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
-  return { inactive: false, lifecycle, autoUpdateLaunched };
+  const mapInjected = injectProjectMap();
+  return { inactive: false, lifecycle, autoUpdateLaunched, mapInjected };
+}
+
+/**
+ * Inject project_map summary into session context if index exists.
+ * Similar to aider's repo-map — gives Claude project structure upfront.
+ */
+function injectProjectMap() {
+  try {
+    const cwd = process.cwd();
+    const dbPath = path.join(cwd, '.code-graph', 'index.db');
+    if (!fs.existsSync(dbPath)) return false;
+
+    const output = execSync('code-graph-mcp map --compact', {
+      cwd,
+      timeout: 5000,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    if (output && output.trim()) {
+      process.stdout.write(
+        '[code-graph] Project map (indexed):\n' + output.trim() + '\n'
+      );
+      return true;
+    }
+  } catch {
+    // Index not ready or binary not found — skip silently
+  }
+  return false;
 }
 
 module.exports = {
   launchBackgroundAutoUpdate,
   syncLifecycleConfig,
+  injectProjectMap,
   runSessionInit,
 };
 

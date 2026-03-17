@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // PreToolUse hook: On FIRST Glob call per session window, suggest
-// code-graph tools — but only when exploring project structure,
+// code-graph CLI commands — but only when exploring project structure,
 // NOT finding specific files by name.
 const fs = require('fs');
 const path = require('path');
@@ -32,7 +32,7 @@ try {
 fs.writeFileSync(flag, '');
 process.stdout.write(
   '[code-graph] If exploring project structure (not finding specific files):\n' +
-  '  project_map(compact=true) \u2192 all modules, files, key symbols, dependencies\n' +
-  '  module_overview(path, compact=true) \u2192 files and exports within a module\n' +
+  '  code-graph-mcp map              \u2190 project architecture (modules, deps, entry points)\n' +
+  '  code-graph-mcp overview src/mcp \u2190 module symbols grouped by file and type\n' +
   'Glob remains best for: finding specific files, configs, non-code assets.\n'
 );

@@ -2,5 +2,6 @@
 description: Force a full code-graph index rebuild
 ---
 
-Call the `rebuild_index` tool with `{"confirm": true}` to rebuild the index from scratch.
-Report the number of files indexed and nodes created.
+Run via Bash: `code-graph-mcp incremental-index`
+This updates the index incrementally (only changed files).
+For a full rebuild, delete `.code-graph/` first, then run the MCP server.

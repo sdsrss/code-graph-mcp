@@ -30,12 +30,37 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_health_check(&project_root, format)
         }
+        Some("grep") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_grep(&project_root, &args)
+        }
+        Some("search") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_search(&project_root, &args)
+        }
+        Some("ast-search") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_ast_search(&project_root, &args)
+        }
+        Some("callgraph") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_callgraph(&project_root, &args)
+        }
+        Some("impact") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_impact(&project_root, &args)
+        }
+        Some("map") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_map(&project_root, &args)
+        }
+        Some("overview") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_overview(&project_root, &args)
+        }
         Some(other) => {
-            eprintln!(
-                "Unknown subcommand: {}. Usage: code-graph-mcp [serve|incremental-index|health-check]",
-                other
-            );
-            eprintln!("Run 'code-graph-mcp --help' for more information.");
+            eprintln!("Unknown subcommand: {}", other);
+            eprintln!("Run 'code-graph-mcp --help' for available commands.");
             std::process::exit(1);
         }
     }
@@ -47,16 +72,30 @@ fn print_version() {
 
 fn print_help() {
     print_version();
-    println!("AST-based code graph MCP server with semantic search\n");
+    println!("AST-based code graph with semantic search\n");
     println!("USAGE:");
     println!("    code-graph-mcp [COMMAND]\n");
     println!("COMMANDS:");
     println!("    serve               Start MCP JSON-RPC server on stdio (default)");
-    println!("    incremental-index   Run incremental index update from CLI");
-    println!("        --quiet         Suppress output");
-    println!("    health-check        Query index status and print results");
-    println!("        --format <FMT>  Output format: oneline (default), json\n");
+    println!("    grep <pattern> [path]");
+    println!("                        AST-context grep (ripgrep + containing function/class)");
+    println!("    search <query>      FTS5 semantic search by concept");
+    println!("    ast-search <query>  Structured search with --type/--returns/--params filters");
+    println!("    callgraph <symbol>  Show call graph (callers/callees)");
+    println!("    impact <symbol>     Impact analysis (callers, routes, risk level)");
+    println!("    map                 Project architecture map (modules, deps, entry points)");
+    println!("    overview <path>     Module overview (symbols grouped by file and type)");
+    println!("    incremental-index   Run incremental index update");
+    println!("    health-check        Query index status\n");
     println!("OPTIONS:");
+    println!("    --json              JSON output (available on all commands)");
+    println!("    --compact           Compact output (map)");
+    println!("    --limit N           Limit results (search, ast-search; default: 20)");
+    println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
+    println!("    --returns <type>    Filter by return type (ast-search)");
+    println!("    --params <text>     Filter by parameter text (ast-search)");
+    println!("    --direction <dir>   callers, callees, or both (callgraph; default: both)");
+    println!("    --depth N           Max traversal depth (callgraph, impact; default: 3)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");
 }

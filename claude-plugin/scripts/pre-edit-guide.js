@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // PreToolUse hook: On FIRST Edit/Write call per session window, remind Claude
-// to check impact_analysis before modifying functions. Fast and non-blocking.
+// to check impact analysis before modifying functions. Fast and non-blocking.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -16,6 +16,6 @@ try {
 
 fs.writeFileSync(flag, '');
 process.stdout.write(
-  '[code-graph] Before modifying functions, consider running impact_analysis(symbol_name) ' +
-  'to check blast radius (callers, affected routes, risk level).\n'
+  '[code-graph] Before modifying functions, consider checking blast radius:\n' +
+  '  code-graph-mcp impact <function_name>\n'
 );

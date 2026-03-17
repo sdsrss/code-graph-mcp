@@ -59,6 +59,19 @@
         "description": "Auto-update code graph index after file edits"
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-context.js\"",
+            "timeout": 4
+          }
+        ],
+        "description": "Inject relevant code-graph context based on user's question"
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup",
@@ -69,7 +82,7 @@
             "timeout": 5
           }
         ],
-        "description": "StatusLine self-heal, lifecycle sync, and background update launch at session start"
+        "description": "StatusLine self-heal, lifecycle sync, project map injection at session start"
       }
     ]
   }

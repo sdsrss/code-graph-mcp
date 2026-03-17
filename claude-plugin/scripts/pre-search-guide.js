@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // PreToolUse hook: On FIRST Grep call per session window, suggest
-// code-graph tools — but only when the pattern looks like code understanding
+// code-graph CLI commands — but only when the pattern looks like code understanding
 // (function names, module patterns), NOT exact string/constant searches.
 const fs = require('fs');
 const path = require('path');
@@ -31,9 +31,9 @@ try {
 
 fs.writeFileSync(flag, '');
 process.stdout.write(
-  '[code-graph] For understanding code relationships, these tools complement Grep:\n' +
-  '  get_call_graph(symbol, compact=true) \u2192 who calls X / what X calls\n' +
-  '  semantic_code_search(query, compact=true) \u2192 find code by concept\n' +
-  '  module_overview(path, compact=true) \u2192 module exports and structure\n' +
-  'Grep remains best for: exact strings, regex, constants, non-code files.\n'
+  '[code-graph] CLI commands for code understanding (via Bash):\n' +
+  '  code-graph-mcp grep "pattern"     \u2190 AST context grep (match + containing function/class)\n' +
+  '  code-graph-mcp search "concept"   \u2190 semantic search (find code by concept, not exact name)\n' +
+  '  code-graph-mcp callgraph symbol   \u2190 call chain tracing\n' +
+  'Grep remains best for: exact strings, constants, regex, non-code files.\n'
 );

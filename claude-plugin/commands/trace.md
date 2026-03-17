@@ -1,15 +1,12 @@
 ---
-description: Trace a full HTTP request flow from route to data layer
-argument-hint: <route_path>
+description: Trace call flow from a handler or route
+argument-hint: <handler_or_route>
 ---
 
-# HTTP Request Flow Tracing
+## Call Graph (callees)
+!`code-graph-mcp callgraph $ARGUMENTS --direction callees --depth 4 2>/dev/null || echo "Symbol not found or no index."`
 
-Trace the complete execution path of an HTTP request.
+## Call Graph (callers)
+!`code-graph-mcp callgraph $ARGUMENTS --direction callers --depth 2 2>/dev/null`
 
-## Steps
-
-1. Call `trace_http_chain(route, depth=5)` to get the full chain
-2. For each key node in the chain, call `get_ast_node` (by node_id, with `context_lines`) to show the implementation
-3. Map the flow: route → middleware → validation → business logic → data access → response
-4. Highlight any error handling, authentication checks, or database operations
+Map the flow and highlight error handling, auth checks, and data access points.
