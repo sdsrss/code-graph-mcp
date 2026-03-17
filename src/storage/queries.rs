@@ -880,7 +880,14 @@ pub fn get_import_tree(
                   AND f2.path != ?2
                   AND ('|' || dt.visited || '|') NOT LIKE '%|' || f2.path || '|%'
             )
-            SELECT dt.file_path, MIN(dt.depth) as min_depth, COUNT(*) as cnt
+            SELECT dt.file_path, MIN(dt.depth) as min_depth,
+                -- Count actual cross-file edges from root to this file
+                (SELECT COUNT(*)
+                 FROM nodes na JOIN files fa ON fa.id = na.file_id
+                 JOIN edges ea ON ea.source_id = na.id AND ea.relation IN (?1, ?3)
+                 JOIN nodes nb ON nb.id = ea.target_id
+                 JOIN files fb ON fb.id = nb.file_id
+                 WHERE fa.path = ?2 AND fb.path = dt.file_path) as cnt
             FROM dep_tree dt
             WHERE dt.depth > 0
             GROUP BY dt.file_path
@@ -921,7 +928,14 @@ pub fn get_import_tree(
                   AND f1.path != ?2
                   AND ('|' || dt.visited || '|') NOT LIKE '%|' || f1.path || '|%'
             )
-            SELECT dt.file_path, MIN(dt.depth) as min_depth, COUNT(*) as cnt
+            SELECT dt.file_path, MIN(dt.depth) as min_depth,
+                -- Count actual cross-file edges from this file to root
+                (SELECT COUNT(*)
+                 FROM nodes na JOIN files fa ON fa.id = na.file_id
+                 JOIN edges ea ON ea.source_id = na.id AND ea.relation IN (?1, ?3)
+                 JOIN nodes nb ON nb.id = ea.target_id
+                 JOIN files fb ON fb.id = nb.file_id
+                 WHERE fa.path = dt.file_path AND fb.path = ?2) as cnt
             FROM dep_tree dt
             WHERE dt.depth > 0
             GROUP BY dt.file_path
@@ -1545,19 +1559,29 @@ mod tests {
     fn test_get_import_tree() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        // File A with function that imports from File B
+        // File A with two functions, File B with two functions
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/b.ts', 'h2', 0, 'typescript', 0)", []).unwrap();
-        // Node in file A
-        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'funcA', 'funcA', 1, 10, 'fn funcA()')", []).unwrap();
-        // Node in file B
-        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB', 'funcB', 1, 10, 'fn funcB()')", []).unwrap();
-        // funcA imports funcB
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 2, 'imports')", []).unwrap();
+        // Nodes in file A
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'funcA1', 'funcA1', 1, 10, 'fn funcA1()')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'funcA2', 'funcA2', 11, 20, 'fn funcA2()')", []).unwrap();
+        // Nodes in file B
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB1', 'funcB1', 1, 10, 'fn funcB1()')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB2', 'funcB2', 11, 20, 'fn funcB2()')", []).unwrap();
+        // funcA1 imports funcB1, funcA2 calls funcB2 — 2 cross-file edges
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 3, 'imports')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 4, 'calls')", []).unwrap();
 
         let tree = get_import_tree(conn, "src/a.ts", "outgoing", 2).unwrap();
         assert!(!tree.is_empty());
-        assert!(tree.iter().any(|d| d.file_path == "src/b.ts"));
+        let b_dep = tree.iter().find(|d| d.file_path == "src/b.ts").unwrap();
+        assert_eq!(b_dep.symbol_count, 2, "symbol_count should reflect actual cross-file edges");
+        assert_eq!(b_dep.depth, 1);
+
+        // Incoming: from B's perspective, A depends on it with 2 symbols
+        let tree_in = get_import_tree(conn, "src/b.ts", "incoming", 2).unwrap();
+        let a_dep = tree_in.iter().find(|d| d.file_path == "src/a.ts").unwrap();
+        assert_eq!(a_dep.symbol_count, 2, "incoming symbol_count should match");
     }
 
     #[test]

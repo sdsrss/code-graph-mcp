@@ -86,7 +86,7 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "compact": { "type": "boolean", "description": "Compact mode: module paths+counts only, no symbols/languages (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" }
                     },
                     "required": []
                 }),

@@ -5,6 +5,80 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Check if a process with the given PID is alive.
+fn pid_is_alive(pid: u32) -> bool {
+    // Linux: fast /proc check
+    #[cfg(target_os = "linux")]
+    { return Path::new(&format!("/proc/{}", pid)).exists(); }
+    // Non-Linux fallback: conservative — assume alive to prevent dual-primary.
+    // Stale locks are reclaimed only on Linux or via manual cleanup.
+    #[cfg(not(target_os = "linux"))]
+    { let _ = pid; return true; }
+}
+
+/// Try to acquire the index lock (`.code-graph/index.lock`).
+/// Returns `true` if this process becomes the primary indexer.
+/// Uses O_CREAT|O_EXCL for atomic creation; stale locks (dead PID) are reclaimed.
+fn try_acquire_index_lock(code_graph_dir: &Path) -> bool {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let lock_path = code_graph_dir.join("index.lock");
+    let my_pid = std::process::id();
+
+    // Try atomic exclusive create first — eliminates TOCTOU race
+    match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        Ok(mut f) => {
+            let _ = f.write_all(my_pid.to_string().as_bytes());
+            return true;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lock file exists — check if holder is alive
+        }
+        Err(e) => {
+            tracing::warn!("Could not write index lock: {} — running in secondary mode", e);
+            return false;
+        }
+    }
+
+    // Lock exists — check if the holding process is alive
+    if let Ok(content) = std::fs::read_to_string(&lock_path) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if pid != my_pid && pid_is_alive(pid) {
+                tracing::info!("Another instance (PID {}) holds the index lock — running in secondary (read-only) mode", pid);
+                return false;
+            }
+            // Stale lock from dead process — reclaim
+            tracing::info!("Reclaiming stale index lock from PID {}", pid);
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+
+    // Re-create atomically after reclaiming stale lock
+    match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        Ok(mut f) => {
+            let _ = f.write_all(my_pid.to_string().as_bytes());
+            true
+        }
+        Err(_) => {
+            // Another process grabbed it between our remove and create — that's fine
+            tracing::info!("Lost lock race during stale reclaim — running in secondary mode");
+            false
+        }
+    }
+}
+
+/// Release the index lock if we are the owner.
+fn release_index_lock(code_graph_dir: &Path) {
+    let lock_path = code_graph_dir.join("index.lock");
+    let my_pid = std::process::id();
+    if let Ok(content) = std::fs::read_to_string(&lock_path) {
+        if content.trim().parse::<u32>().ok() == Some(my_pid) {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+}
+
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::embedding::model::EmbeddingModel;
@@ -236,6 +310,9 @@ pub struct McpServer {
     cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
     /// Cached module_overview results: path → (timestamp, json_value). Invalidated on re-index.
     cached_module_overviews: Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
+    /// True if this instance holds the index lock (primary indexer).
+    /// Secondary instances skip indexing/watching and read the DB in read-only mode.
+    is_primary: bool,
 }
 
 impl McpServer {
@@ -270,6 +347,8 @@ impl McpServer {
             }
         }
 
+        let is_primary = try_acquire_index_lock(&db_dir);
+
         let embedding_model = EmbeddingModel::load()?;
         let db = Self::open_db(&db_path)?;
         Ok(Self {
@@ -291,6 +370,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
             cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
+            is_primary,
         })
     }
 
@@ -316,6 +396,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
             cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
+            is_primary: true,
         }
     }
 
@@ -343,6 +424,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
             cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
+            is_primary: true,
         }
     }
 
@@ -353,6 +435,7 @@ impl McpServer {
 
     /// Flush aggregated session metrics to .code-graph/usage.jsonl.
     /// Called once at server shutdown (EOF). Skips if no tool calls were made.
+    /// Also releases the index lock if this instance is the primary.
     pub fn flush_metrics(&self) {
         if let Some(ref root) = self.project_root {
             let metrics = lock_or_recover(&self.metrics, "metrics");
@@ -360,12 +443,16 @@ impl McpServer {
                 let usage_path = root.join(".code-graph").join("usage.jsonl");
                 metrics.flush(&usage_path, env!("CARGO_PKG_VERSION"));
             }
+            if self.is_primary {
+                release_index_lock(&root.join(".code-graph"));
+            }
         }
     }
 
     /// Run startup tasks if triggered by `notifications/initialized`.
     /// Called from the main loop after each message. Spawns background indexing
     /// (non-blocking) and starts watcher/embedding once indexing completes.
+    /// Secondary instances (no index lock) skip indexing and watcher entirely.
     pub fn run_startup_tasks(&self) {
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
@@ -380,6 +467,22 @@ impl McpServer {
                 Some(p) => p.clone(),
                 None => return,
             };
+
+            // Secondary instances: skip indexing/watcher, but still do embedding
+            if !self.is_primary {
+                let has_data = queries::get_index_status(self.db.conn(), false)
+                    .map(|s| s.files_count > 0)
+                    .unwrap_or(false);
+                if has_data {
+                    *lock_or_recover(&self.indexed, "indexed") = true;
+                    self.send_log("info", "Secondary instance: using existing index (read-only).");
+                    // Embedding uses its own DB connection and is append-only — safe for secondary
+                    self.spawn_background_embedding();
+                } else {
+                    self.send_log("info", "Secondary instance: no index available yet. Queries will work once the primary instance finishes indexing.");
+                }
+                return;
+            }
 
             let is_indexed = *lock_or_recover(&self.indexed, "indexed");
             if !is_indexed {
@@ -804,6 +907,20 @@ impl McpServer {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
+
+        // Secondary instances: read-only — just check if DB has data
+        if !self.is_primary {
+            let is_indexed = *lock_or_recover(&self.indexed, "indexed");
+            if !is_indexed {
+                let has_data = queries::get_index_status(self.db.conn(), false)
+                    .map(|s| s.files_count > 0)
+                    .unwrap_or(false);
+                if has_data {
+                    *lock_or_recover(&self.indexed, "indexed") = true;
+                }
+            }
+            return Ok(());
+        }
 
         // Wait for or consume background startup indexing result
         if self.startup_indexing.load(Ordering::Acquire) {
@@ -1405,17 +1522,21 @@ impl McpServer {
             .record_search(results.len(), query_quality, vec_search.is_empty());
 
         // Context Sandbox: compress only if results likely exceed token threshold
-        // Estimate tokens: ~1 token per 3 chars of code content
+        // Skip compression when compact=true — compact results are already token-efficient
+        // (~85% smaller than full results) and contain fields (relevance, signature)
+        // that would be lost by compression.
         use crate::sandbox::compressor::CompressedOutput;
-        let estimated_tokens: usize = matched.iter()
-            .map(|m| {
-                let node = m.node;
-                node.context_string.as_ref().map_or_else(
-                    || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
-                    |ctx| ctx.len(),
-                ) / 3
-            })
-            .sum();
+        let estimated_tokens: usize = if compact { 0 } else {
+            matched.iter()
+                .map(|m| {
+                    let node = m.node;
+                    node.context_string.as_ref().map_or_else(
+                        || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
+                        |ctx| ctx.len(),
+                    ) / 3
+                })
+                .sum()
+        };
         if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
             // Build node_results and file_paths only when compression is needed
             let node_results: Vec<queries::NodeResult> = matched.iter().map(|m| {
@@ -1948,6 +2069,12 @@ impl McpServer {
     // read_snippet is a legacy alias for get_ast_node in handle_tool()
 
     fn tool_start_watch(&self) -> Result<serde_json::Value> {
+        if !self.is_primary {
+            return Ok(json!({
+                "status": "secondary",
+                "message": "This instance is in secondary (read-only) mode. File watching is handled by the primary instance."
+            }));
+        }
         let project_root = self.project_root.as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
@@ -1973,6 +2100,12 @@ impl McpServer {
     }
 
     fn tool_stop_watch(&self) -> Result<serde_json::Value> {
+        if !self.is_primary {
+            return Ok(json!({
+                "status": "secondary",
+                "message": "This instance is in secondary (read-only) mode. File watching is handled by the primary instance."
+            }));
+        }
         let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if watcher_guard.is_none() {
             return Ok(json!({
@@ -2044,12 +2177,19 @@ impl McpServer {
             if stats.files_skipped_language > 0 {
                 obj.insert("files_skipped_unsupported_language".into(), json!(stats.files_skipped_language));
             }
+            obj.insert("instance_mode".into(), json!(if self.is_primary { "primary" } else { "secondary" }));
         }
 
         Ok(status)
     }
 
     fn tool_rebuild_index(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        if !self.is_primary {
+            return Ok(json!({
+                "status": "secondary",
+                "message": "This instance is in secondary (read-only) mode. Rebuild must be done from the primary instance."
+            }));
+        }
         let confirm = args["confirm"].as_bool().unwrap_or(false);
         if !confirm {
             return Err(anyhow!("Must pass confirm: true to rebuild index"));
@@ -2441,20 +2581,32 @@ impl McpServer {
 
         let outgoing: Vec<serde_json::Value> = deps.iter()
             .filter(|d| d.direction == "outgoing")
-            .map(|d| json!({
-                "file": d.file_path,
-                "symbols": d.symbol_count,
-                "depth": d.depth,
-            }))
+            .map(|d| {
+                let mut obj = json!({
+                    "file": d.file_path,
+                    "depth": d.depth,
+                });
+                // Only show symbols for direct dependencies (depth 1);
+                // deeper entries have 0 direct edges from root which is misleading
+                if d.depth == 1 {
+                    obj["symbols"] = json!(d.symbol_count);
+                }
+                obj
+            })
             .collect();
 
         let incoming: Vec<serde_json::Value> = deps.iter()
             .filter(|d| d.direction == "incoming")
-            .map(|d| json!({
-                "file": d.file_path,
-                "symbols": d.symbol_count,
-                "depth": d.depth,
-            }))
+            .map(|d| {
+                let mut obj = json!({
+                    "file": d.file_path,
+                    "depth": d.depth,
+                });
+                if d.depth == 1 {
+                    obj["symbols"] = json!(d.symbol_count);
+                }
+                obj
+            })
             .collect();
 
         Ok(json!({
@@ -2513,7 +2665,8 @@ impl McpServer {
         if embedded_count == 0 {
             return Ok(json!({
                 "error": format!("No embeddings found ({} nodes indexed, 0 embedded). The embedding model may not be loaded — restart the MCP server with the embed-model feature enabled.", total_nodes),
-                "node_id": node_id
+                "node_id": node_id,
+                "hint": "Alternative: use semantic_code_search with a descriptive query to find similar code by text matching."
             }));
         }
 
@@ -2671,15 +2824,43 @@ impl McpServer {
                 })).collect())
                 .unwrap_or_default();
 
+            // Trim hot_functions: top 10, name+file only
+            let compact_hot: Vec<serde_json::Value> = result["hot_functions"].as_array()
+                .map(|arr| arr.iter().take(10).map(|h| json!({
+                    "name": h["name"],
+                    "file": h["file"],
+                    "caller_count": h["caller_count"],
+                })).collect())
+                .unwrap_or_default();
+
+            // Trim entry_points: file+handler only
+            let compact_entries: Vec<serde_json::Value> = result["entry_points"].as_array()
+                .map(|arr| arr.iter().map(|e| json!({
+                    "file": e["file"],
+                    "handler": e["handler"],
+                })).collect())
+                .unwrap_or_default();
+
             return Ok(json!({
                 "modules": compact_modules,
                 "module_dependencies": compact_deps,
-                "entry_points": result["entry_points"],
-                "hot_functions": result["hot_functions"],
+                "entry_points": compact_entries,
+                "hot_functions": compact_hot,
             }));
         }
 
         Ok(result)
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        // Release the index lock on drop (covers panics, not SIGKILL)
+        if self.is_primary {
+            if let Some(ref root) = self.project_root {
+                release_index_lock(&root.join(".code-graph"));
+            }
+        }
     }
 }
 
