@@ -101,14 +101,7 @@ fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
 
 /// Whether a symbol is a test-only symbol (by name or file path convention).
 fn is_test_symbol(name: &str, file_path: &str) -> bool {
-    name.starts_with("test_")
-        || name.ends_with("Test") || name.ends_with("Tests")
-        || file_path.starts_with("tests/") || file_path.starts_with("test/")
-        || file_path.contains("__tests__/")
-        || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
-        || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
-        || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
-        || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
+    crate::domain::is_test_symbol(name, file_path)
 }
 
 /// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
