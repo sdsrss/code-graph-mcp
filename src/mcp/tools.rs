@@ -75,7 +75,7 @@ impl ToolRegistry {
                         "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
-                        "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0)" }
+                        "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" }
                     },
                     "required": []
                 }),

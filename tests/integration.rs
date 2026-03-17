@@ -105,7 +105,7 @@ export function handleLogin(req: Request, res: Response) {
     let resp = server.handle_message(&snippet).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["name"], "validateToken");
-    assert!(result["code"].as_str().unwrap().contains("verify"));
+    assert!(result["code_content"].as_str().unwrap().contains("verify"));
 
     // Rebuild index
     let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));

@@ -195,7 +195,7 @@ function handleLogin(req: Request) {
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let snippet: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(snippet["name"], "validateToken");
-    assert!(snippet["code"].as_str().unwrap().contains("token"));
+    assert!(snippet["code_content"].as_str().unwrap().contains("token"));
 
     drop(stdin);
     let _ = child.wait();

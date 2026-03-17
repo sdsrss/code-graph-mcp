@@ -1790,7 +1790,7 @@ impl McpServer {
                 // Include source code: prefer context view, fall back to stored code_content
                 if context_lines > 0 {
                     if let Some(code) = self.read_source_context(file_path, n.start_line, n.end_line, context_lines) {
-                        result["code"] = json!(code);
+                        result["code_content"] = json!(code);
                     } else {
                         result["code_content"] = json!(n.code_content);
                     }
@@ -1869,7 +1869,7 @@ impl McpServer {
         // Include source code: prefer context view when requested, fall back to stored code_content
         if context_lines > 0 {
             if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
-                result["code"] = json!(code);
+                result["code_content"] = json!(code);
             } else {
                 result["code_content"] = json!(node.code_content);
             }
@@ -2277,8 +2277,11 @@ impl McpServer {
         let (active, inactive): (Vec<_>, Vec<_>) = exports.iter()
             .partition(|e| e.caller_count > 0);
 
-        let hot_paths: Vec<serde_json::Value> = exports.iter()
+        let mut hot_candidates: Vec<_> = exports.iter()
             .filter(|e| e.caller_count > 0)
+            .collect();
+        hot_candidates.sort_by(|a, b| b.caller_count.cmp(&a.caller_count));
+        let hot_paths: Vec<serde_json::Value> = hot_candidates.iter()
             .take(5)
             .map(|e| json!({
                 "name": e.name,
@@ -2291,7 +2294,9 @@ impl McpServer {
         // Active exports get full detail; inactive ones are summarized by type.
         const MAX_ACTIVE: usize = 30;
         let active_capped = active.len() > MAX_ACTIVE;
-        let active_exports: Vec<serde_json::Value> = active.iter()
+        let mut active_sorted = active.clone();
+        active_sorted.sort_by(|a, b| b.caller_count.cmp(&a.caller_count));
+        let active_exports: Vec<serde_json::Value> = active_sorted.iter()
             .take(MAX_ACTIVE)
             .map(|e| json!({
                 "node_id": e.node_id,
@@ -2855,7 +2860,7 @@ function handleLogin(req: Request) {
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["name"], "foo");
-        assert!(result["code"].as_str().unwrap().contains("return 1"));
+        assert!(result["code_content"].as_str().unwrap().contains("return 1"));
     }
 
     #[test]
