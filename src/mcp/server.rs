@@ -101,7 +101,14 @@ fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
 
 /// Whether a symbol is a test-only symbol (by name or file path convention).
 fn is_test_symbol(name: &str, file_path: &str) -> bool {
-    name.starts_with("test_") || file_path.starts_with("tests/")
+    name.starts_with("test_")
+        || name.ends_with("Test") || name.ends_with("Tests")
+        || file_path.starts_with("tests/") || file_path.starts_with("test/")
+        || file_path.contains("__tests__/")
+        || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
+        || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
+        || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
+        || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
 }
 
 /// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
@@ -279,6 +286,18 @@ struct StartupIndexResult {
 }
 
 /// MCP server for code graph operations. Single-threaded (stdio loop).
+///
+/// Lock ordering (acquire in this order to avoid deadlocks):
+///   1. startup_index_pending
+///   2. indexed
+///   3. dir_cache / last_incremental_check / last_index_stats
+///   4. watcher
+///   5. cached_project_map / cached_module_overviews
+///   6. embedding_model
+///   7. notify_writer / metrics
+///
+/// In practice, only one lock is held at a time due to the single-threaded
+/// stdio loop. This ordering documents the safe sequence if concurrency is added.
 pub struct McpServer {
     registry: ToolRegistry,
     db: Database,
@@ -510,6 +529,12 @@ impl McpServer {
 
     /// Spawn a background thread for startup indexing (non-blocking).
     /// Writes progress to `.code-graph/indexing-status.json` for statusline.
+    ///
+    /// Write-access model: SQLite WAL mode with busy_timeout=5000ms.
+    /// Background threads (indexing, embedding) each open their own connection.
+    /// The startup_indexing flag + condvar prevents concurrent full indexes.
+    /// If SQLITE_BUSY occurs (e.g., embedding vs incremental index), the 5s
+    /// busy_timeout provides automatic retry. No write queue needed at current scale.
     fn spawn_startup_indexing(
         &self,
         project_root: PathBuf,
@@ -833,28 +858,22 @@ impl McpServer {
     /// Check if a symbol name is ambiguous (exists in multiple files).
     /// Returns Some(suggestions) if ambiguous, None if unambiguous or not found.
     fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
-        let candidates = queries::get_nodes_by_name(self.db.conn(), name)?;
+        let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), name)?;
         let non_test: Vec<_> = candidates.iter()
-            .filter(|n| {
-                let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                    .ok().flatten().unwrap_or_default();
-                !is_test_symbol(&n.name, &fp)
-            })
+            .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
             .collect();
         if non_test.len() > 1 {
             let mut seen_files = std::collections::HashSet::new();
-            for n in &non_test {
-                seen_files.insert(n.file_id);
+            for nf in &non_test {
+                seen_files.insert(nf.node.file_id);
             }
             if seen_files.len() > 1 {
-                let suggestions: Vec<_> = non_test.iter().map(|n| {
-                    let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                        .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                let suggestions: Vec<_> = non_test.iter().map(|nf| {
                     json!({
-                        "name": &n.name,
-                        "file_path": fp,
-                        "type": &n.node_type,
-                        "node_id": n.id,
+                        "name": &nf.node.name,
+                        "file_path": &nf.file_path,
+                        "type": &nf.node.node_type,
+                        "node_id": nf.node.id,
                     })
                 }).collect();
                 return Ok(Some(suggestions));
@@ -1902,29 +1921,23 @@ impl McpServer {
 
         // If only symbol_name provided (no file_path), resolve by name lookup
         if let (Some(sym), None) = (symbol_name, file_path) {
-            let candidates = queries::get_nodes_by_name(self.db.conn(), sym)?;
+            let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), sym)?;
             let non_test: Vec<_> = candidates.iter()
-                .filter(|n| {
-                    let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                        .ok().flatten().unwrap_or_default();
-                    !is_test_symbol(&n.name, &fp)
-                })
+                .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
                 .collect();
             return match non_test.len() {
                 0 => Ok(json!({
                     "error": format!("Symbol '{}' not found in index.", sym),
                     "hint": "Use semantic_code_search to find the correct symbol name, or check spelling.",
                 })),
-                1 => self.ast_node_by_id(non_test[0].id, include_refs, include_impact, context_lines),
+                1 => self.ast_node_by_id(non_test[0].node.id, include_refs, include_impact, context_lines),
                 _ => {
-                    let suggestions: Vec<_> = non_test.iter().map(|n| {
-                        let fp = queries::get_file_path(self.db.conn(), n.file_id)
-                            .ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                    let suggestions: Vec<_> = non_test.iter().map(|nf| {
                         json!({
-                            "name": n.name,
-                            "file_path": fp,
-                            "type": n.node_type,
-                            "node_id": n.id,
+                            "name": nf.node.name,
+                            "file_path": &nf.file_path,
+                            "type": nf.node.node_type,
+                            "node_id": nf.node.id,
                         })
                     }).collect();
                     Ok(json!({
@@ -2079,13 +2092,7 @@ impl McpServer {
             .filter(|c| c.route_info.is_some())
             .count();
 
-        let risk = if prod_callers.len() > 10 || affected_routes >= 3 {
-            "HIGH"
-        } else if prod_callers.len() > 3 || affected_routes > 0 {
-            "MEDIUM"
-        } else {
-            "LOW"
-        };
+        let risk = crate::domain::compute_risk_level(prod_callers.len(), affected_routes, false);
 
         result["impact"] = json!({
             "risk_level": risk,
@@ -2098,7 +2105,9 @@ impl McpServer {
     }
 
     /// Read source code with context lines from the project file system.
+    /// Uses BufReader to avoid loading entire file into memory.
     fn read_source_context(&self, file_path: &str, start_line: i64, end_line: i64, context_lines: usize) -> Option<String> {
+        use std::io::BufRead;
         let root = self.project_root.as_ref()?;
         let abs_path = root.join(file_path);
         let canonical = abs_path.canonicalize().ok()?;
@@ -2106,14 +2115,23 @@ impl McpServer {
         if !canonical.starts_with(&root_canonical) {
             return None; // path traversal
         }
-        let source = std::fs::read_to_string(&canonical).ok()?;
-        let lines: Vec<&str> = source.lines().collect();
+        let file = std::fs::File::open(&canonical).ok()?;
+        let reader = std::io::BufReader::new(file);
         let start = (start_line as usize).saturating_sub(1 + context_lines);
-        let end = ((end_line as usize) + context_lines).min(lines.len());
-        if start >= end {
+        let end = (end_line as usize) + context_lines; // 0-indexed end line to collect through
+        let mut collected = Vec::new();
+        for (i, line) in reader.lines().enumerate() {
+            if i >= end {
+                break;
+            }
+            if i >= start {
+                collected.push(line.ok()?);
+            }
+        }
+        if collected.is_empty() {
             return None;
         }
-        Some(lines[start..end].join("\n"))
+        Some(collected.join("\n"))
     }
 
     // read_snippet is a legacy alias for get_ast_node in handle_tool()
@@ -2378,13 +2396,9 @@ impl McpServer {
             }).collect();
 
         // Risk based on production callers, not test callers
-        let risk_level = if prod_callers.len() > 10 || affected_routes.len() >= 3 || change_type == "remove" {
-            "HIGH"
-        } else if prod_callers.len() > 3 || !affected_routes.is_empty() {
-            "MEDIUM"
-        } else {
-            "LOW"
-        };
+        let risk_level = crate::domain::compute_risk_level(
+            prod_callers.len(), affected_routes.len(), change_type == "remove"
+        );
 
         let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
         let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();

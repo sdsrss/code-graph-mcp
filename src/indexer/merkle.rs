@@ -88,6 +88,13 @@ pub struct DirectoryCache {
     file_mtimes: HashMap<String, SystemTime>,
 }
 
+impl DirectoryCache {
+    /// Check if a file was seen during the last directory walk.
+    pub fn file_exists(&self, path: &str) -> bool {
+        self.file_mtimes.contains_key(path)
+    }
+}
+
 /// Scan directory with optional mtime cache. Directories whose mtime
 /// hasn't changed since the cached value can skip file hashing.
 pub fn scan_directory_cached(

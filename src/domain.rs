@@ -64,6 +64,18 @@ pub fn parse_timeout_ms() -> u64 {
     })
 }
 
+// -- Risk level assessment --
+/// Compute impact risk level from caller/route counts.
+pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_removal: bool) -> &'static str {
+    if prod_callers > 10 || affected_routes >= 3 || is_removal {
+        "HIGH"
+    } else if prod_callers > 3 || affected_routes > 0 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
 // -- Edge resolution noise filter --
 // Common standard-library method/trait names that produce false-positive call edges
 // when resolved cross-file by name alone (without type context).

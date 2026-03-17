@@ -11,7 +11,14 @@ use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
 use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
-use crate::storage::queries::*;
+use crate::storage::queries::{
+    delete_files_by_paths, delete_nodes_by_file,
+    get_all_file_hashes, get_dirty_node_ids, get_edges_batch,
+    get_node_names_with_paths_excluding_files, get_nodes_by_file_path,
+    get_nodes_with_files_by_ids, insert_edge_cached, insert_node_cached,
+    insert_node_vectors_batch, update_context_strings_batch, upsert_file,
+    EdgeInfo, FileRecord, NodeRecord, NodeResult,
+};
 use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, max_file_size, CROSS_FILE_CALL_NOISE};
 use crate::utils::config::detect_language;
 
@@ -199,8 +206,10 @@ pub fn run_incremental_index_cached(
     // Merge stored hashes for files in unchanged directories.
     // scan_directory_cached skips files in unchanged dirs, so we need to
     // carry forward their stored hashes to prevent false "deleted" diffs.
+    // Use new_cache.file_mtimes (populated for ALL walked files) to check existence
+    // without per-file stat calls.
     for (path, hash) in &stored_hashes {
-        if !current_hashes.contains_key(path) && project_root.join(path).exists() {
+        if !current_hashes.contains_key(path) && new_cache.file_exists(path) {
             current_hashes.insert(path.clone(), hash.clone());
         }
     }
@@ -871,6 +880,7 @@ fn index_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::queries::{get_nodes_by_name, get_edges_from, get_import_tree};
     use tempfile::TempDir;
     use std::fs;
 

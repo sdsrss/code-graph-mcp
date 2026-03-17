@@ -236,6 +236,25 @@ pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult
     Ok(results)
 }
 
+/// Like `get_nodes_by_name` but JOINs with files to return file_path in one query.
+/// Avoids N+1 `get_file_path` calls when filtering/displaying by file.
+pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeWithFile>> {
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.name = ?1",
+        NODE_SELECT_ALIASED
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([name], |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(14)?,
+            language: row.get(15)?,
+        })
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 pub fn delete_nodes_by_file(conn: &Connection, file_id: i64) -> Result<()> {
     conn.execute("DELETE FROM nodes WHERE file_id = ?1", [file_id])?;
     Ok(())
@@ -1316,7 +1335,15 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         })
         .collect::<std::collections::BTreeSet<_>>() // deduplicate (sorted for deterministic queries)
         .into_iter()
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .map(|word| {
+            // Strip FTS5 metacharacters to prevent query injection
+            // (operators: * ^ : + - ~ ( ) { } " can alter FTS5 semantics)
+            let sanitized: String = word.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            sanitized
+        })
+        .filter(|w| !w.is_empty())
         .collect();
     // Empty/whitespace-only queries would cause FTS5 MATCH error
     if terms.is_empty() {

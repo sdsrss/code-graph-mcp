@@ -692,13 +692,7 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     let routes: Vec<&queries::CallerWithRouteInfo> = callers.iter().filter(|c| c.route_info.is_some()).collect();
     let direct_callers = callers.iter().filter(|c| c.depth == 1).count();
 
-    let risk = if direct_callers > 10 || routes.len() >= 3 {
-        "HIGH"
-    } else if direct_callers > 3 || !routes.is_empty() {
-        "MEDIUM"
-    } else {
-        "LOW"
-    };
+    let risk = crate::domain::compute_risk_level(direct_callers, routes.len(), false);
 
     let mut stdout = std::io::stdout().lock();
 
