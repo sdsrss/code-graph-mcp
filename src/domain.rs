@@ -76,6 +76,20 @@ pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_remova
     }
 }
 
+// -- Test symbol detection --
+/// Check if a symbol is a test function/file based on naming conventions.
+/// Used by both MCP server and CLI to separate test vs production callers.
+pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
+    name.starts_with("test_")
+        || name.ends_with("Test") || name.ends_with("Tests")
+        || file_path.starts_with("tests/") || file_path.starts_with("test/")
+        || file_path.contains("__tests__/")
+        || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
+        || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
+        || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
+        || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
+}
+
 // -- Edge resolution noise filter --
 // Common standard-library method/trait names that produce false-positive call edges
 // when resolved cross-file by name alone (without type context).

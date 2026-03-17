@@ -687,10 +687,19 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
 
     let callers = queries::get_callers_with_route_info(conn, symbol, None, depth)?;
 
-    // Count unique files and routes
-    let files: std::collections::HashSet<&str> = callers.iter().map(|c| c.file_path.as_str()).collect();
-    let routes: Vec<&queries::CallerWithRouteInfo> = callers.iter().filter(|c| c.route_info.is_some()).collect();
-    let direct_callers = callers.iter().filter(|c| c.depth == 1).count();
+    // Exclude root node (depth 0) — it's the queried symbol itself
+    let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+
+    // Separate production callers from test callers
+    let prod_callers: Vec<_> = callers.iter()
+        .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
+        .collect();
+    let test_count = callers.len() - prod_callers.len();
+
+    // Count unique files and routes from production callers only
+    let files: std::collections::HashSet<&str> = prod_callers.iter().map(|c| c.file_path.as_str()).collect();
+    let routes: Vec<&&queries::CallerWithRouteInfo> = prod_callers.iter().filter(|c| c.route_info.is_some()).collect();
+    let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
 
     let risk = crate::domain::compute_risk_level(direct_callers, routes.len(), false);
 
@@ -701,10 +710,11 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
             "symbol": symbol,
             "risk": risk,
             "direct_callers": direct_callers,
-            "total_callers": callers.len(),
+            "total_callers": prod_callers.len(),
+            "tests_affected": test_count,
             "affected_files": files.len(),
             "affected_routes": routes.len(),
-            "callers": callers.iter().map(|c| serde_json::json!({
+            "callers": prod_callers.iter().map(|c| serde_json::json!({
                 "name": c.name,
                 "type": c.node_type,
                 "file": c.file_path,
@@ -719,18 +729,18 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     writeln!(stdout, "Impact: {} — Risk: {}", symbol, risk)?;
     writeln!(
         stdout,
-        "  {} direct callers, {} total, {} files, {} routes",
+        "  {} direct callers, {} total, {} files, {} routes ({} tests affected)",
         direct_callers,
-        callers.len(),
+        prod_callers.len(),
         files.len(),
-        routes.len()
+        routes.len(),
+        test_count
     )?;
 
     if !routes.is_empty() {
         writeln!(stdout, "Routes:")?;
         for r in &routes {
             let route_str = r.route_info.as_deref().unwrap_or("?");
-            // Try to extract method+path from JSON
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(route_str) {
                 let method = v["method"].as_str().unwrap_or("?");
                 let path = v["path"].as_str().unwrap_or("?");
@@ -741,12 +751,9 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
         }
     }
 
-    if !callers.is_empty() {
+    if !prod_callers.is_empty() {
         writeln!(stdout, "Callers:")?;
-        for c in &callers {
-            if c.depth == 0 {
-                continue;
-            }
+        for c in &prod_callers {
             let indent = "  ".repeat(c.depth as usize);
             writeln!(stdout, "{}{}  ({}) {}", indent, c.name, c.node_type, c.file_path)?;
         }
