@@ -314,27 +314,36 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
         return Ok(rows.collect::<Result<Vec<_>, _>>()?);
     }
 
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _exclude_file_ids (id INTEGER PRIMARY KEY)")?;
-    conn.execute("DELETE FROM _exclude_file_ids", [])?;
-
-    for chunk in exclude_file_ids.chunks(MAX_IN_PARAMS) {
-        let values = (1..=chunk.len()).map(|i| format!("(?{})", i)).collect::<Vec<_>>().join(",");
-        let sql = format!("INSERT INTO _exclude_file_ids (id) VALUES {}", values);
-        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        conn.execute(&sql, params.as_slice())?;
+    // Chunked NOT IN — avoids temp table concurrency issues
+    if exclude_file_ids.len() <= MAX_IN_PARAMS {
+        let placeholders = make_placeholders(1, exclude_file_ids.len());
+        let sql = format!(
+            "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE n.file_id NOT IN ({})", placeholders
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = exclude_file_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        return Ok(rows.collect::<Result<Vec<_>, _>>()?);
     }
 
+    // For large exclude sets, filter in Rust with HashSet
+    let exclude_set: std::collections::HashSet<i64> = exclude_file_ids.iter().copied().collect();
     let mut stmt = conn.prepare(
-        "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
-         WHERE n.file_id NOT IN (SELECT id FROM _exclude_file_ids)"
+        "SELECT n.name, n.id, n.file_id, f.path FROM nodes n JOIN files f ON f.id = n.file_id"
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?))
     })?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
-
-    conn.execute_batch("DROP TABLE IF EXISTS _exclude_file_ids")?;
-
+    let mut results = Vec::new();
+    for row in rows {
+        let (name, id, file_id, path) = row?;
+        if !exclude_set.contains(&file_id) {
+            results.push((name, id, path));
+        }
+    }
     Ok(results)
 }
 
@@ -433,7 +442,7 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
     )?;
     for (node_id, embedding) in vectors {
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
-        let _ = del_stmt.execute(rusqlite::params![node_id]);
+        del_stmt.execute(rusqlite::params![node_id])?;
         ins_stmt.execute(rusqlite::params![node_id, bytes])?;
     }
     Ok(())
@@ -449,6 +458,15 @@ pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> 
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+pub fn get_node_embedding(conn: &Connection, node_id: i64) -> Result<Vec<u8>> {
+    let bytes: Vec<u8> = conn.query_row(
+        "SELECT embedding FROM node_vectors WHERE node_id = ?1",
+        [node_id],
+        |row| row.get(0),
+    )?;
+    Ok(bytes)
 }
 
 // --- Additional node queries ---
@@ -691,7 +709,7 @@ pub fn get_callers_with_route_info(
 
 // --- Module queries ---
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModuleExport {
     pub node_id: i64,
     pub name: String,
@@ -760,34 +778,18 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
 
     // Deduplicate by (name, file_path) — keeps highest caller_count.
     // Handles feature-gated duplicates (e.g. #[cfg(feature)] producing two nodes for same symbol).
-    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut deduped: Vec<ModuleExport> = Vec::with_capacity(all.len());
-    for export in &all {
-        let key = (export.name.as_str(), export.file_path.as_str());
-        if let Some(&prev_idx) = seen.get(&key) {
-            if export.caller_count > deduped[prev_idx].caller_count {
-                deduped[prev_idx] = ModuleExport {
-                    node_id: export.node_id,
-                    name: export.name.clone(),
-                    node_type: export.node_type.clone(),
-                    signature: export.signature.clone(),
-                    file_path: export.file_path.clone(),
-                    caller_count: export.caller_count,
-                };
-            }
-        } else {
-            seen.insert(key, deduped.len());
-            deduped.push(ModuleExport {
-                node_id: export.node_id,
-                name: export.name.clone(),
-                node_type: export.node_type.clone(),
-                signature: export.signature.clone(),
-                file_path: export.file_path.clone(),
-                caller_count: export.caller_count,
-            });
-        }
+    let mut best: HashMap<(String, String), ModuleExport> = HashMap::with_capacity(all.len());
+    for export in all {
+        let key = (export.name.clone(), export.file_path.clone());
+        best.entry(key)
+            .and_modify(|existing| {
+                if export.caller_count > existing.caller_count {
+                    *existing = export.clone();
+                }
+            })
+            .or_insert(export);
     }
-    Ok(deduped)
+    Ok(best.into_values().collect())
 }
 
 // --- Fuzzy name resolution ---
@@ -1160,10 +1162,9 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 4. HTTP entry points (C3: use REL_ROUTES_TO constant)
     let mut entry_points = Vec::new();
     {
-        let sql = "SELECT tn.name, sf.path, e.metadata \
+        let sql = "SELECT sn.name, sf.path, e.metadata \
              FROM edges e \
              JOIN nodes sn ON sn.id = e.source_id \
-             JOIN nodes tn ON tn.id = e.target_id \
              JOIN files sf ON sf.id = sn.file_id \
              WHERE e.relation = ?1 \
              LIMIT 20";

@@ -1400,7 +1400,13 @@ impl McpServer {
         // Estimate tokens: ~1 token per 3 chars of code content
         use crate::sandbox::compressor::CompressedOutput;
         let estimated_tokens: usize = matched.iter()
-            .map(|m| m.node.code_content.len() / 3)
+            .map(|m| {
+                let node = m.node;
+                node.context_string.as_ref().map_or_else(
+                    || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
+                    |ctx| ctx.len(),
+                ) / 3
+            })
             .sum();
         if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
             // Build node_results and file_paths only when compression is needed
@@ -1495,7 +1501,7 @@ impl McpServer {
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
         let has_edges = results.iter().any(|n| n.depth > 0);
         let has_seed = results.iter().any(|n| n.depth == 0);
-        if !(has_edges || has_seed && file_path.is_some()) {
+        if !(has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
                     let results2 = crate::graph::query::get_call_graph(
@@ -2492,11 +2498,8 @@ impl McpServer {
 
         // Get the node's embedding
         let embedding: Vec<f32> = {
-            let bytes: Vec<u8> = self.db.conn().query_row(
-                "SELECT embedding FROM node_vectors WHERE node_id = ?1",
-                [node_id],
-                |row| row.get(0),
-            ).map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded yet ({}/{} nodes embedded).", node_id, embedded_count, total_nodes))?;
+            let bytes = queries::get_node_embedding(self.db.conn(), node_id)
+                .map_err(|_| anyhow!("No embedding found for node_id {}. Node may not have been embedded yet ({}/{} nodes embedded).", node_id, embedded_count, total_nodes))?;
             bytemuck::cast_slice(&bytes).to_vec()
         };
 

@@ -414,8 +414,10 @@ fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: 
 /// The first dotted_name is the module; the rest are imported names.
 /// Adds metadata `{"python_module": "X"}` for module-constrained resolution.
 fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
-    let mut module_path: Option<String> = None;
-    let mut is_first_dotted_name = true;
+    // Prefer tree-sitter field name for module (more robust than positional heuristic)
+    let mut module_path: Option<String> = node.child_by_field_name("module_name")
+        .map(|m| node_text(&m, source).to_string());
+    let mut is_first_dotted_name = module_path.is_none();
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             match child.kind() {

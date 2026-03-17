@@ -61,8 +61,11 @@ pub fn split_identifier_tokens(name: &str) -> String {
         // Single-word: split_identifier returned unchanged
         return full;
     }
-    // strip the trailing " originalName"
-    full[..full.len() - name.len()].trim_end().to_string()
+    // split_identifier appends " originalName" at end; strip it safely
+    match full.rfind(name) {
+        Some(pos) => full[..pos].trim_end().to_string(),
+        None => full, // defensive: return full if format changed unexpectedly
+    }
 }
 
 #[cfg(test)]

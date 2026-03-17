@@ -98,8 +98,9 @@ fn run_serve() -> Result<()> {
             // Drain remainder of the truncated line to prevent corrupting the next read.
             // Bound the drain to MAX_MESSAGE_SIZE to prevent OOM from unbounded input.
             if !buf.ends_with('\n') {
-                let mut discard = String::new();
-                let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_line(&mut discard);
+                // Drain until newline (line-aware) without UTF-8 String allocation
+                let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
+                    .read_until(b'\n', &mut Vec::new());
             }
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",
