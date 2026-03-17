@@ -1367,7 +1367,11 @@ impl McpServer {
         // Query quality factor: penalize vague/short queries so relevance scores
         // reflect actual match quality, not just relative rank position.
         let meaningful_tokens: Vec<&str> = query.split_whitespace()
-            .filter(|w| w.len() > 1 || w.chars().all(|c| c.is_uppercase()))
+            .filter(|w| {
+                let has_alnum = w.chars().any(|c| c.is_alphanumeric());
+                let char_count = w.chars().count();
+                has_alnum && (char_count > 1 || w.chars().all(|c| c.is_uppercase()))
+            })
             .collect();
         let query_quality = match meaningful_tokens.len() {
             0 => 0.3,
@@ -1388,10 +1392,11 @@ impl McpServer {
         // FTS5 search (fetch extra to allow for filtering)
         // Use a floor of 20 so small top_k values still have enough candidates after filtering
         let fetch_count = (top_k * 4).max(20);
-        let fts_results = queries::fts5_search(self.db.conn(), query, fetch_count)?;
+        let fts_result = queries::fts5_search(self.db.conn(), query, fetch_count)?;
+        let fts_or_fallback = fts_result.or_fallback;
 
         // Convert to SearchResult for RRF
-        let fts_search: Vec<crate::search::fusion::SearchResult> = fts_results.iter()
+        let fts_search: Vec<crate::search::fusion::SearchResult> = fts_result.nodes.iter()
             .map(|r| crate::search::fusion::SearchResult { node_id: r.id, score: 0.0 })
             .collect();
 
@@ -1419,11 +1424,42 @@ impl McpServer {
             };
         drop(model_guard);
 
+        // Track search source IDs for confidence scoring
+        let fts_node_ids: std::collections::HashSet<i64> = fts_search.iter().map(|r| r.node_id).collect();
+        let vec_node_ids: std::collections::HashSet<i64> = vec_search.iter().map(|r| r.node_id).collect();
+
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
         // k=30: sharper rank sensitivity than default 60 (top results matter more)
         // fts=1.0, vec=1.2: slightly favor vector similarity since FTS is now stronger
         // with name_tokens and type columns in v2 schema
         let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, 1.0, 1.2);
+
+        // Match confidence: penalize when search signals are weak
+        let match_confidence = {
+            let mut c = 1.0_f64;
+            // FTS-empty penalty: no text match → results are purely vector similarity (often noise)
+            if fts_search.is_empty() && !vec_search.is_empty() {
+                c *= 0.35;
+            } else if !fts_search.is_empty() {
+                // OR-fallback penalty: AND mode failed → query terms don't co-occur (weaker match)
+                if fts_or_fallback { c *= 0.6; }
+                // FTS sparsity: fewer results relative to fetch_count → weaker text match
+                let fts_ratio = fts_search.len() as f64 / fetch_count as f64;
+                if fts_ratio < 0.1 { c *= 0.5; }
+                else if fts_ratio < 0.25 { c *= 0.65; }
+                else if fts_ratio < 0.5 { c *= 0.8; }
+            }
+            // Source intersection: when both sources available, low overlap → less confidence
+            if !fts_search.is_empty() && !vec_search.is_empty() {
+                let top_ids: Vec<i64> = fused.iter().take(top_k as usize).map(|r| r.node_id).collect();
+                let in_both = top_ids.iter()
+                    .filter(|id| fts_node_ids.contains(id) && vec_node_ids.contains(id))
+                    .count();
+                let ratio = in_both as f64 / top_ids.len().max(1) as f64;
+                if ratio < 0.2 { c *= 0.75; }
+            }
+            c
+        };
 
         // Batch-fetch all candidate nodes with file info (single query instead of N+1)
         let candidate_ids: Vec<i64> = fused.iter().map(|r| r.node_id).collect();
@@ -1467,12 +1503,13 @@ impl McpServer {
                         continue;
                     }
                 }
-                // Normalize RRF score to 0.0–1.0 range, then apply query quality factor
-                // so short/vague queries produce lower relevance scores
+                // Normalize RRF score to 0.0–1.0 range, then apply quality factors:
+                // - query_quality: penalizes vague/short queries
+                // - match_confidence: penalizes weak FTS matches or low source agreement
                 let score = if let Some(max_score) = fused.first().map(|f| f.score) {
                     if max_score > 0.0 {
                         let normalized = r.score / max_score;
-                        (normalized * query_quality * 100.0).round() / 100.0
+                        (normalized * query_quality * match_confidence * 100.0).round() / 100.0
                     } else { 0.0 }
                 } else { 0.0 };
 

@@ -1286,17 +1286,24 @@ const FTS_STOP_WORDS: &[&str] = &[
     "are", "was", "were", "been", "all", "each", "how", "what", "when",
 ];
 
-pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
+/// FTS5 search result with quality metadata.
+pub struct FtsResult {
+    pub nodes: Vec<NodeResult>,
+    /// True if AND mode failed and OR fallback was used (weaker match).
+    pub or_fallback: bool,
+}
+
+pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<FtsResult> {
     fts5_search_impl(conn, query, limit, true)
 }
 
 /// FTS5 search including test symbols (for test-aware callers).
 #[cfg(test)]
-pub fn fts5_search_with_tests(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NodeResult>> {
+pub fn fts5_search_with_tests(conn: &Connection, query: &str, limit: i64) -> Result<FtsResult> {
     fts5_search_impl(conn, query, limit, false)
 }
 
-fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: bool) -> Result<Vec<NodeResult>> {
+fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: bool) -> Result<FtsResult> {
     // Preprocess query: filter stopwords, split identifiers (camelCase/snake_case),
     // then sanitize for FTS5. Porter stemming is handled by the FTS5 tokenizer.
     let terms: Vec<String> = query
@@ -1313,7 +1320,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         .collect();
     // Empty/whitespace-only queries would cause FTS5 MATCH error
     if terms.is_empty() {
-        return Ok(vec![]);
+        return Ok(FtsResult { nodes: vec![], or_fallback: false });
     }
 
     let test_filter = if exclude_tests { " AND n.is_test = 0" } else { "" };
@@ -1331,7 +1338,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         let rows = stmt.query_map(rusqlite::params![and_query, limit], map_node_row)?;
         let results: Vec<NodeResult> = rows.collect::<Result<Vec<_>, _>>()?;
         if results.len() >= (limit as usize / 2).max(1) {
-            return Ok(results);
+            return Ok(FtsResult { nodes: results, or_fallback: false });
         }
         // Fallback: OR gives broader recall
     }
@@ -1340,7 +1347,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![or_query, limit], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(results)
+    Ok(FtsResult { nodes: results, or_fallback: terms.len() > 1 })
 }
 
 #[cfg(test)]
@@ -1481,7 +1488,7 @@ mod tests {
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
-        let results = fts5_search(db.conn(), "authentication token", 5).unwrap();
+        let results = fts5_search(db.conn(), "authentication token", 5).unwrap().nodes;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validateToken");
     }
@@ -1510,12 +1517,12 @@ mod tests {
         }).unwrap();
 
         // Default search excludes test nodes
-        let results = fts5_search(db.conn(), "validateToken", 10).unwrap();
+        let results = fts5_search(db.conn(), "validateToken", 10).unwrap().nodes;
         assert_eq!(results.len(), 1, "should exclude test node");
         assert_eq!(results[0].name, "validateToken");
 
         // With tests included
-        let results_all = fts5_search_with_tests(db.conn(), "validateToken", 10).unwrap();
+        let results_all = fts5_search_with_tests(db.conn(), "validateToken", 10).unwrap().nodes;
         assert_eq!(results_all.len(), 2, "should include test node");
     }
 
@@ -1543,10 +1550,10 @@ mod tests {
         }).unwrap();
 
         // Multi-term query: AND should match validateToken; if not enough results, OR adds validateEmail
-        let results = fts5_search(db.conn(), "validate token", 10).unwrap();
-        assert!(!results.is_empty(), "should find results");
+        let fts = fts5_search(db.conn(), "validate token", 10).unwrap();
+        assert!(!fts.nodes.is_empty(), "should find results");
         // validateToken matches both terms so should rank first
-        assert_eq!(results[0].name, "validateToken");
+        assert_eq!(fts.nodes[0].name, "validateToken");
     }
 
     #[test]
@@ -1629,7 +1636,7 @@ mod tests {
         update_context_string(db.conn(), nid, "function foo\ncalls: bar, baz").unwrap();
 
         // Verify FTS5 picks up updated context_string
-        let results = fts5_search(db.conn(), "bar baz", 5).unwrap();
+        let results = fts5_search(db.conn(), "bar baz", 5).unwrap().nodes;
         assert_eq!(results.len(), 1);
     }
 

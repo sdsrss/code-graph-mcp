@@ -846,12 +846,12 @@ function handleUserLogin(req: Request) {
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Searching for "validate" should find "validateAuthToken" via name_tokens splitting
-    let results = fts5_search(db.conn(), "validate", 5).unwrap();
+    let results = fts5_search(db.conn(), "validate", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
     assert!(names.contains(&"validateAuthToken"), "FTS5 should find validateAuthToken via token 'validate', got: {:?}", names);
 
     // Searching for "Login" should find "handleUserLogin"
-    let results = fts5_search(db.conn(), "Login", 5).unwrap();
+    let results = fts5_search(db.conn(), "Login", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
     assert!(names.contains(&"handleUserLogin"), "FTS5 should find handleUserLogin via token 'Login', got: {:?}", names);
 }
@@ -880,7 +880,7 @@ function processOrder(order: Order): OrderResult {
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Search by return type should find functions returning that type
-    let results = fts5_search(db.conn(), "OrderResult", 5).unwrap();
+    let results = fts5_search(db.conn(), "OrderResult", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
     assert!(names.contains(&"processOrder"), "FTS5 should find processOrder via return type 'OrderResult', got: {:?}", names);
 }

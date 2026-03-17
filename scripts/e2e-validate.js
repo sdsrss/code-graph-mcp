@@ -4,7 +4,7 @@
  * E2E Validation Script for code-graph-mcp
  *
  * Spawns the MCP server as a child process over stdio and exercises
- * every JSON-RPC method: initialize, tools/list, tools/call (14 tools),
+ * every JSON-RPC method: initialize, tools/list, tools/call (9 visible + 5 hidden tools),
  * resources/list, resources/read, prompts/list, prompts/get.
  *
  * Usage:
@@ -225,7 +225,7 @@ async function main() {
   await new Promise((r) => setTimeout(r, STARTUP_WAIT_MS));
 
   // -----------------------------------------------------------------------
-  // 4. tools/list — verify 14 tools
+  // 4. tools/list — verify 9 visible tools (5 hidden: start_watch, stop_watch, get_index_status, rebuild_index, find_http_route)
   // -----------------------------------------------------------------------
   console.log("\n--- tools/list ---");
 
@@ -234,7 +234,7 @@ async function main() {
     assertNoError(resp);
     const tools = resp.result?.tools;
     if (!Array.isArray(tools)) throw new Error("Expected tools array");
-    if (tools.length !== 14) throw new Error(`Expected 14 tools, got ${tools.length}`);
+    if (tools.length !== 9) throw new Error(`Expected 9 tools, got ${tools.length}`);
     toolNames = tools.map((t) => t.name);
     console.log(`    Tools (${tools.length}): ${toolNames.join(", ")}`);
   });
@@ -242,7 +242,7 @@ async function main() {
   // -----------------------------------------------------------------------
   // 5. Tool calls
   // -----------------------------------------------------------------------
-  console.log("\n--- tools/call (14 tools) ---");
+  console.log("\n--- tools/call (14 tools, 9 visible + 5 hidden) ---");
 
   // 5.1 semantic_code_search
   await testToolCall("semantic_code_search", "semantic_code_search",
