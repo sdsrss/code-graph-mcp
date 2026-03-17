@@ -371,6 +371,34 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
     Ok(results)
 }
 
+/// Like get_edge_target_names but also returns the file path for each target node.
+pub fn get_edge_targets_with_files(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.name, COALESCE(f.path, '') FROM edges e
+         JOIN nodes n ON n.id = e.target_id
+         LEFT JOIN files f ON f.id = n.file_id
+         WHERE e.source_id = ?1 AND e.relation = ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![source_id, relation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Like get_edge_source_names but also returns the file path for each source node.
+pub fn get_edge_sources_with_files(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.name, COALESCE(f.path, '') FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         LEFT JOIN files f ON f.id = n.file_id
+         WHERE e.target_id = ?1 AND e.relation = ?2"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 /// Batch-fetch all edge info for a set of node IDs, grouped by node_id.
 /// Each entry is an [`EdgeInfo`] tuple: (relation, direction, target_name, metadata).
 /// Direction is "out" for outgoing edges (source=node), "in" for incoming edges (target=node).

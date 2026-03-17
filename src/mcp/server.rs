@@ -1386,7 +1386,8 @@ impl McpServer {
         }
 
         // FTS5 search (fetch extra to allow for filtering)
-        let fetch_count = top_k * 4;
+        // Use a floor of 20 so small top_k values still have enough candidates after filtering
+        let fetch_count = (top_k * 4).max(20);
         let fts_results = queries::fts5_search(self.db.conn(), query, fetch_count)?;
 
         // Convert to SearchResult for RRF
@@ -1921,10 +1922,10 @@ impl McpServer {
 
                 if include_refs {
                     use crate::domain::REL_CALLS as CALLS;
-                    let callees = queries::get_edge_target_names(self.db.conn(), n.id, CALLS)?;
-                    let callers = queries::get_edge_source_names(self.db.conn(), n.id, CALLS)?;
-                    result["calls"] = json!(callees);
-                    result["called_by"] = json!(callers);
+                    let callees = queries::get_edge_targets_with_files(self.db.conn(), n.id, CALLS)?;
+                    let callers = queries::get_edge_sources_with_files(self.db.conn(), n.id, CALLS)?;
+                    result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    result["called_by"] = json!(callers.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
                 }
 
                 if include_impact {
@@ -2000,10 +2001,10 @@ impl McpServer {
 
         if include_refs {
             use crate::domain::REL_CALLS as CALLS;
-            let callees = queries::get_edge_target_names(self.db.conn(), node.id, CALLS)?;
-            let callers = queries::get_edge_source_names(self.db.conn(), node.id, CALLS)?;
-            result["calls"] = json!(callees);
-            result["called_by"] = json!(callers);
+            let callees = queries::get_edge_targets_with_files(self.db.conn(), node.id, CALLS)?;
+            let callers = queries::get_edge_sources_with_files(self.db.conn(), node.id, CALLS)?;
+            result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            result["called_by"] = json!(callers.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
         }
 
         if include_impact {
@@ -2700,8 +2701,8 @@ impl McpServer {
                     "type": node.node_type,
                     "file_path": file_path,
                     "start_line": node.start_line,
-                    "similarity": format!("{:.4}", similarity),
-                    "distance": format!("{:.4}", distance),
+                    "similarity": (similarity * 10000.0).round() / 10000.0,
+                    "distance": (distance * 10000.0).round() / 10000.0,
                 }))
             })
             .take(top_k as usize)
