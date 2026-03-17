@@ -1100,5 +1100,9 @@ fn test_skip_indexing_flag() {
     let resp3 = server2.handle_message(&msg3).unwrap();
     let result3 = parse_tool_result(&resp3);
     // With skip_indexing and no prior indexing, there should be no results (empty DB)
-    assert!(result3.as_array().unwrap().is_empty(), "should return empty results when skip_indexing with no prior index");
+    // Empty results return an object with results:[] and a message, not a bare array
+    let empty_results = result3.get("results").and_then(|r| r.as_array())
+        .or_else(|| result3.as_array());
+    assert!(empty_results.map_or(true, |a| a.is_empty()),
+        "should return empty results when skip_indexing with no prior index, got: {}", result3);
 }

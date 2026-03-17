@@ -15,7 +15,7 @@ pub const REL_EXPORTS: &str = "exports";
 // nodes or edges for the same source files. The server will detect a mismatch
 // and automatically clear + rebuild the index.
 // This is separate from SCHEMA_VERSION (which tracks table structure changes).
-pub const INDEX_VERSION: i32 = 2;
+pub const INDEX_VERSION: i32 = 3;
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
@@ -82,6 +82,7 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
     "or_else", "filter", "flatten",
     "push", "pop", "insert", "remove", "contains", "get",
     "to_owned", "to_vec", "collect", "join",
+    "flush", "close", "read", "write",
 ];
 
 #[cfg(test)]

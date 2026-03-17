@@ -1595,6 +1595,14 @@ impl McpServer {
         }
         } // end estimated_tokens check
 
+        if results.is_empty() {
+            return Ok(json!({
+                "results": [],
+                "message": "No matching symbols found.",
+                "hint": "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
+            }));
+        }
+
         Ok(json!(results))
     }
 

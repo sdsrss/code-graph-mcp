@@ -1281,4 +1281,41 @@ fn test_func() {
         assert!(calls.contains(&("test_func", "tool_call_json")),
             "tool_call_json() should create call, got: {:?}", calls);
     }
+
+    #[test]
+    fn test_rust_try_expr_and_match_calls() {
+        // Reproduce actual patterns from main.rs run_serve: try expressions, match scrutinee, method calls
+        let code = r#"
+fn run_serve() {
+    let project_root = std::env::current_dir().unwrap();
+    let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root).unwrap();
+    server.set_notify_writer(Box::new(io::stdout()));
+    match server.handle_message(&buf) {
+        Ok(Some(response)) => {
+            writeln!(stdout, "{}", response).unwrap();
+            stdout.flush().unwrap();
+        }
+        Ok(None) => {}
+        Err(e) => {}
+    }
+    server.run_startup_tasks();
+    server.flush_metrics();
+}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(calls.contains(&("run_serve", "from_project_root")),
+            "McpServer::from_project_root() missing, got: {:?}", calls);
+        assert!(calls.contains(&("run_serve", "set_notify_writer")),
+            "server.set_notify_writer() missing, got: {:?}", calls);
+        assert!(calls.contains(&("run_serve", "handle_message")),
+            "server.handle_message() missing, got: {:?}", calls);
+        assert!(calls.contains(&("run_serve", "run_startup_tasks")),
+            "server.run_startup_tasks() missing, got: {:?}", calls);
+        assert!(calls.contains(&("run_serve", "flush_metrics")),
+            "server.flush_metrics() missing, got: {:?}", calls);
+    }
 }
