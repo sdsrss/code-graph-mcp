@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 fn pid_is_alive(pid: u32) -> bool {
     // Linux: fast /proc check
     #[cfg(target_os = "linux")]
-    { return Path::new(&format!("/proc/{}", pid)).exists(); }
+    { Path::new(&format!("/proc/{}", pid)).exists() }
     // Non-Linux fallback: conservative — assume alive to prevent dual-primary.
     // Stale locks are reclaimed only on Linux or via manual cleanup.
     #[cfg(not(target_os = "linux"))]
-    { let _ = pid; return true; }
+    { let _ = pid; true }
 }
 
 /// Try to acquire the index lock (`.code-graph/index.lock`).
