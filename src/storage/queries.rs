@@ -1034,6 +1034,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                 GROUP_CONCAT(DISTINCT f.language) \
          FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.type != 'module' AND n.name != '<module>' \
+           AND n.is_test = 0 \
          GROUP BY f.path"
         .to_string();
     let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
@@ -1218,7 +1219,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE '%_test.%' \
-             GROUP BY n.id \
+             GROUP BY n.name, n.type, f.path \
              ORDER BY cnt DESC \
              LIMIT 15";
         let mut stmt = conn.prepare(sql)?;

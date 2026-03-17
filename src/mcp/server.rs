@@ -732,7 +732,11 @@ impl McpServer {
     fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
         let candidates = queries::get_nodes_by_name(self.db.conn(), name)?;
         let non_test: Vec<_> = candidates.iter()
-            .filter(|n| !n.name.starts_with("test_"))
+            .filter(|n| {
+                let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                    .ok().flatten().unwrap_or_default();
+                !is_test_symbol(&n.name, &fp)
+            })
             .collect();
         if non_test.len() > 1 {
             let mut seen_files = std::collections::HashSet::new();
@@ -1329,6 +1333,10 @@ impl McpServer {
                 if node.node_type == "module" && node.name == "<module>" {
                     continue;
                 }
+                // Skip test functions (FTS5 filters via is_test=0, but vector search doesn't)
+                if is_test_symbol(&node.name, &nwf.file_path) {
+                    continue;
+                }
                 // Apply node_type filter
                 if let Some(nt) = node_type_filter {
                     if node.node_type != nt {
@@ -1548,8 +1556,11 @@ impl McpServer {
         let is_test = |n: &&crate::graph::query::CallGraphNode| {
             is_test_symbol(&n.name, &n.file_path)
         };
+        let mut seen_nodes = std::collections::HashSet::new();
         let all_nodes: Vec<serde_json::Value> = results.iter()
             .filter(|n| n.depth > 0 && !is_test(n))
+            // Deduplicate cfg-gated functions (same name+file+depth+direction, different node_id)
+            .filter(|n| seen_nodes.insert((&n.name, &n.file_path, n.depth, n.direction.as_str())))
             .map(|n| {
                 if compact {
                     // Compact: keep node_id for chaining to get_ast_node, drop type (usually "function")
@@ -1648,6 +1659,7 @@ impl McpServer {
             )?;
             let chain_nodes: Vec<serde_json::Value> = chain.iter()
                 .filter(|n| n.depth > 0) // exclude root (the handler itself)
+                .filter(|n| !is_test_symbol(&n.name, &n.file_path))
                 .map(|n| json!({
                     "node_id": n.node_id,
                     "name": n.name,
@@ -1717,7 +1729,11 @@ impl McpServer {
         if let (Some(sym), None) = (symbol_name, file_path) {
             let candidates = queries::get_nodes_by_name(self.db.conn(), sym)?;
             let non_test: Vec<_> = candidates.iter()
-                .filter(|n| !n.name.starts_with("test_"))
+                .filter(|n| {
+                    let fp = queries::get_file_path(self.db.conn(), n.file_id)
+                        .ok().flatten().unwrap_or_default();
+                    !is_test_symbol(&n.name, &fp)
+                })
                 .collect();
             return match non_test.len() {
                 0 => Ok(json!({
@@ -2250,7 +2266,7 @@ impl McpServer {
 
         // Filter out test functions — they add noise to module overviews
         let exports: Vec<_> = exports.into_iter()
-            .filter(|e| !e.name.starts_with("test_"))
+            .filter(|e| !is_test_symbol(&e.name, &e.file_path))
             .collect();
 
         // Get import/dependency info at file level
@@ -2513,12 +2529,14 @@ impl McpServer {
                 queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| (node, *distance))
             })
             .filter(|(node, _)| !(node.node_type == "module" && node.name == "<module>"))
-            .take(top_k as usize)
-            .map(|(node, distance)| {
+            .filter_map(|(node, distance)| {
                 let file_path = queries::get_file_path(self.db.conn(), node.file_id)
                     .ok().flatten().unwrap_or_default();
+                if is_test_symbol(&node.name, &file_path) {
+                    return None;
+                }
                 let similarity = 1.0 / (1.0 + distance);
-                json!({
+                Some(json!({
                     "node_id": node.id,
                     "name": node.name,
                     "type": node.node_type,
@@ -2526,8 +2544,9 @@ impl McpServer {
                     "start_line": node.start_line,
                     "similarity": format!("{:.4}", similarity),
                     "distance": format!("{:.4}", distance),
-                })
+                }))
             })
+            .take(top_k as usize)
             .collect();
 
         Ok(json!({
