@@ -1469,90 +1469,98 @@ impl McpServer {
         let mut nwf_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
             nodes_with_files.iter().map(|nwf| (nwf.node.id, nwf)).collect();
 
-        // Collect results with language/node_type filtering
-        // We keep matched (node, file_path) pairs for lazy compression building
+        // Phase 1: Collect all valid candidates with adjusted scores
+        // Name match boost + size dampening counter BM25/vector bias toward large nodes
+        struct Candidate<'a> {
+            node: &'a queries::NodeResult,
+            file_path: &'a str,
+            adjusted_score: f64,
+        }
+        let max_rrf = fused.first().map(|f| f.score).unwrap_or(0.0);
+        let query_terms_lower: Vec<String> = meaningful_tokens.iter()
+            .map(|t| t.to_lowercase())
+            .collect();
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for r in &fused {
+            if let Some(nwf) = nwf_map.remove(&r.node_id) {
+                let node = &nwf.node;
+                if node.node_type == "module" && node.name == "<module>" { continue; }
+                if is_test_symbol(&node.name, &nwf.file_path) { continue; }
+                if let Some(nt) = node_type_filter { if node.node_type != nt { continue; } }
+                if let Some(lang) = language_filter { if nwf.language.as_deref() != Some(lang) { continue; } }
+
+                let base_score = if max_rrf > 0.0 {
+                    (r.score / max_rrf * query_quality * match_confidence * 100.0).round() / 100.0
+                } else { 0.0 };
+
+                // Name match boost: symbols whose name contains query terms are more likely relevant
+                let name_lower = node.name.to_lowercase();
+                let name_match_count = query_terms_lower.iter()
+                    .filter(|t| name_lower.contains(t.as_str()))
+                    .count();
+                let name_boost = (1.0 + name_match_count as f64 * 0.3).min(2.0);
+
+                // Size dampening: counter BM25/vector bias toward very large nodes (>100 lines)
+                let node_lines = (node.end_line.saturating_sub(node.start_line) + 1) as f64;
+                let size_factor = if node_lines > 100.0 {
+                    1.0 / (1.0 + (node_lines / 100.0).ln() * 0.4)
+                } else {
+                    1.0
+                };
+
+                let adjusted = (base_score * name_boost * size_factor * 100.0).round() / 100.0;
+                candidates.push(Candidate { node, file_path: &nwf.file_path, adjusted_score: adjusted });
+            }
+        }
+
+        // Phase 2: Re-rank by adjusted score (name relevance + size normalization)
+        candidates.sort_by(|a, b| b.adjusted_score.total_cmp(&a.adjusted_score));
+        candidates.truncate(top_k as usize);
+
+        // Phase 3: Build results
         struct MatchedNode<'a> {
             node: &'a queries::NodeResult,
             file_path: &'a str,
         }
         let mut matched: Vec<MatchedNode> = Vec::new();
         let mut results = Vec::new();
-        for r in &fused {
-            if results.len() >= top_k as usize {
-                break;
-            }
-            if let Some(nwf) = nwf_map.remove(&r.node_id) {
-                let node = &nwf.node;
-                // Skip module-level container nodes (no useful content for search)
-                if node.node_type == "module" && node.name == "<module>" {
-                    continue;
-                }
-                // Skip test functions (FTS5 filters via is_test=0, but vector search doesn't)
-                if is_test_symbol(&node.name, &nwf.file_path) {
-                    continue;
-                }
-                // Apply node_type filter
-                if let Some(nt) = node_type_filter {
-                    if node.node_type != nt {
-                        continue;
-                    }
-                }
-                // Apply language filter
-                if let Some(lang) = language_filter {
-                    if nwf.language.as_deref() != Some(lang) {
-                        continue;
-                    }
-                }
-                // Normalize RRF score to 0.0–1.0 range, then apply quality factors:
-                // - query_quality: penalizes vague/short queries
-                // - match_confidence: penalizes weak FTS matches or low source agreement
-                let score = if let Some(max_score) = fused.first().map(|f| f.score) {
-                    if max_score > 0.0 {
-                        let normalized = r.score / max_score;
-                        (normalized * query_quality * match_confidence * 100.0).round() / 100.0
-                    } else { 0.0 }
-                } else { 0.0 };
+        for c in &candidates {
+            let node = c.node;
+            let score = c.adjusted_score;
 
-                // Compact mode: signature + location only (saves ~85% tokens per result)
-                if compact {
-                    results.push(json!({
-                        "node_id": node.id,
-                        "name": node.name,
-                        "type": node.node_type,
-                        "file_path": nwf.file_path,
-                        "line": format!("{}-{}", node.start_line, node.end_line),
-                        "signature": node.signature,
-                        "relevance": score,
-                    }));
+            if compact {
+                results.push(json!({
+                    "node_id": node.id,
+                    "name": node.name,
+                    "type": node.node_type,
+                    "file_path": c.file_path,
+                    "line": format!("{}-{}", node.start_line, node.end_line),
+                    "signature": node.signature,
+                    "relevance": score,
+                }));
+            } else {
+                const MAX_SEARCH_CODE_LEN: usize = 500;
+                let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
+                    let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
+                        .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
+                    format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
+                        truncated, node.end_line - node.start_line + 1)
                 } else {
-                    // Truncate large code_content to reduce token usage;
-                    // users can get full code via get_ast_node(node_id)
-                    const MAX_SEARCH_CODE_LEN: usize = 500;
-                    let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
-                        let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
-                            .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
-                        format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
-                            truncated, node.end_line - node.start_line + 1)
-                    } else {
-                        node.code_content.clone()
-                    };
-                    results.push(json!({
-                        "node_id": node.id,
-                        "name": node.name,
-                        "type": node.node_type,
-                        "file_path": nwf.file_path,
-                        "start_line": node.start_line,
-                        "end_line": node.end_line,
-                        "code_content": code,
-                        "signature": node.signature,
-                        "relevance": score,
-                    }));
-                }
-                matched.push(MatchedNode {
-                    node: &nwf.node,
-                    file_path: &nwf.file_path,
-                });
+                    node.code_content.clone()
+                };
+                results.push(json!({
+                    "node_id": node.id,
+                    "name": node.name,
+                    "type": node.node_type,
+                    "file_path": c.file_path,
+                    "start_line": node.start_line,
+                    "end_line": node.end_line,
+                    "code_content": code,
+                    "signature": node.signature,
+                    "relevance": score,
+                }));
             }
+            matched.push(MatchedNode { node, file_path: c.file_path });
         }
 
         // Record search metrics (before potential compression return)
@@ -1977,23 +1985,19 @@ impl McpServer {
                     self.append_impact_summary(&mut result, &n.name, file_path)?;
                 }
 
-                // Compress if code_content exceeds token threshold
+                // Compress if result exceeds token threshold: drop code_content but keep references/impact
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
-                    return Ok(json!({
-                        "mode": "compressed_node",
-                        "message": "Node content exceeded token limit. Retry with context_lines=0 or use get_ast_node(node_id=N) to read specific parts.",
-                        "node_id": n.id,
-                        "name": n.name,
-                        "type": n.node_type,
-                        "file_path": file_path,
-                        "start_line": n.start_line,
-                        "end_line": n.end_line,
-                        "signature": n.signature,
-                        "summary": format!("{} {} in {} (lines {}-{}){}",
-                            n.node_type, n.name, file_path, n.start_line, n.end_line,
-                            n.signature.as_ref().map(|s| format!(" {}", s)).unwrap_or_default()),
-                    }));
+                    result.as_object_mut().map(|obj| obj.remove("code_content"));
+                    result["mode"] = json!("compressed_node");
+                    result["message"] = json!(format!(
+                        "Code content omitted ({} lines, ~{} tokens). Use Read tool on {}:{}-{} to view source.",
+                        n.end_line.saturating_sub(n.start_line) + 1, tokens, file_path, n.start_line, n.end_line
+                    ));
+                    result["summary"] = json!(format!("{} {} in {} (lines {}-{}){}",
+                        n.node_type, n.name, file_path, n.start_line, n.end_line,
+                        n.signature.as_ref().map(|s| format!(" {}", s)).unwrap_or_default()));
+                    return Ok(result);
                 }
 
                 Ok(result)
