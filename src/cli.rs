@@ -1172,7 +1172,7 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
     // Filter by HTTP method if specified (parse metadata JSON for accurate matching)
     if let Some(ref method) = method_filter {
         rows.retain(|r| {
-            r.metadata.as_ref().map_or(false, |m| {
+            r.metadata.as_ref().is_some_and(|m| {
                 serde_json::from_str::<serde_json::Value>(m).ok()
                     .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
                     .is_some_and(|rm| rm.eq_ignore_ascii_case(method))
