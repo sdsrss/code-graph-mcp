@@ -174,11 +174,16 @@ fn test_cli_search_limit() {
 }
 
 // ============================================================
-// grep
+// grep (requires ripgrep `rg` binary)
 // ============================================================
+
+fn has_ripgrep() -> bool {
+    Command::new("rg").arg("--version").output().is_ok()
+}
 
 #[test]
 fn test_cli_grep() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "validateToken"]);
     assert_eq!(code, 0);
@@ -188,6 +193,7 @@ fn test_cli_grep() {
 
 #[test]
 fn test_cli_grep_no_matches() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["grep", "xyznonexistent"]);
     assert_eq!(code, 0);
@@ -196,6 +202,7 @@ fn test_cli_grep_no_matches() {
 
 #[test]
 fn test_cli_grep_with_path() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "validateToken", "src/auth.ts"]);
     assert_eq!(code, 0);
