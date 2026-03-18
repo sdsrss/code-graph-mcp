@@ -44,7 +44,7 @@ impl ToolRegistry {
                     "properties": {
                         "symbol_name": { "type": "string", "description": "Function/method name" },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both')" },
-                        "depth": { "type": "number", "description": "Max depth (default 2)" },
+                        "depth": { "type": "number", "description": "Max depth (default 3)" },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" }
                     },
@@ -98,6 +98,7 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "symbol_name": { "type": "string", "description": "Symbol to analyze" },
+                        "file_path": { "type": "string", "description": "Disambiguate same-name symbols" },
                         "change_type": { "type": "string", "enum": ["signature", "behavior", "remove"], "description": "Change type (default 'behavior')" },
                         "depth": { "type": "number", "description": "Max depth (default 3)" }
                     },

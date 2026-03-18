@@ -1669,7 +1669,7 @@ impl McpServer {
             .or_else(|| args["function_name"].as_str())
             .ok_or_else(|| anyhow!("symbol_name is required"))?;
         let direction = args["direction"].as_str().unwrap_or("both");
-        let depth = args["depth"].as_i64().unwrap_or(2).clamp(1, 20) as i32;
+        let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
 
@@ -2317,20 +2317,23 @@ impl McpServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(3)
             .clamp(1, 20) as i32;
+        let file_path = args.get("file_path").and_then(|v| v.as_str());
 
         // Disambiguate: check if symbol matches multiple distinct nodes in different files
-        if let Some(suggestions) = self.disambiguate_symbol(symbol_name)? {
-            return Ok(json!({
-                "symbol": symbol_name,
-                "change_type": change_type,
-                "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
-                "suggestions": suggestions,
-            }));
+        if file_path.is_none() {
+            if let Some(suggestions) = self.disambiguate_symbol(symbol_name)? {
+                return Ok(json!({
+                    "symbol": symbol_name,
+                    "change_type": change_type,
+                    "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
+                    "suggestions": suggestions,
+                }));
+            }
         }
 
         let mut resolved_name = symbol_name.to_string();
         let mut callers = queries::get_callers_with_route_info(
-            self.db.conn(), symbol_name, None, depth
+            self.db.conn(), symbol_name, file_path, depth
         )?;
 
         // Fuzzy fallback: if no callers found, try fuzzy name resolution
@@ -2339,7 +2342,7 @@ impl McpServer {
                 FuzzyResolution::Unique(resolved) => {
                     resolved_name = resolved;
                     callers = queries::get_callers_with_route_info(
-                        self.db.conn(), &resolved_name, None, depth
+                        self.db.conn(), &resolved_name, file_path, depth
                     )?;
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {

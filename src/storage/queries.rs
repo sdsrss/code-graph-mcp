@@ -543,6 +543,65 @@ pub fn get_nodes_by_file_path(conn: &Connection, file_path: &str) -> Result<Vec<
     Ok(results)
 }
 
+/// List nodes filtered by type/returns/params without FTS5 query.
+/// Used by ast-search when no keyword is given but structural filters are present.
+pub fn get_nodes_with_files_by_filters(
+    conn: &Connection,
+    type_filter: Option<&[&str]>,
+    returns_filter: Option<&str>,
+    params_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NodeWithFile>> {
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut param_idx = 1;
+
+    if let Some(types) = type_filter {
+        let placeholders: Vec<String> = types.iter().enumerate().map(|(i, _)| {
+            format!("?{}", param_idx + i)
+        }).collect();
+        conditions.push(format!("n.type IN ({})", placeholders.join(",")));
+        for t in types {
+            params.push(Box::new(t.to_string()));
+        }
+        param_idx += types.len();
+    }
+    if let Some(rt) = returns_filter {
+        conditions.push(format!("LOWER(n.return_type) LIKE ?{}", param_idx));
+        params.push(Box::new(format!("%{}%", rt.to_lowercase())));
+        param_idx += 1;
+    }
+    if let Some(pt) = params_filter {
+        conditions.push(format!("LOWER(n.param_types) LIKE ?{}", param_idx));
+        params.push(Box::new(format!("%{}%", pt.to_lowercase())));
+        let _ = param_idx; // suppress unused warning
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id{} ORDER BY f.path, n.start_line LIMIT ?{}",
+        NODE_SELECT_ALIASED, where_clause, params.len() + 1
+    );
+    params.push(Box::new(limit as i64));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(14)?,
+            language: row.get(15)?,
+        })
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 pub fn get_file_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
     let mut stmt = conn.prepare("SELECT path FROM files WHERE id = ?1")?;
     let rows = stmt.query_map([file_id], |row| row.get::<_, String>(0))?;

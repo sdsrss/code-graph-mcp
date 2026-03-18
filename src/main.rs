@@ -21,12 +21,16 @@ fn main() -> Result<()> {
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
         Some("health-check") => {
-            let format = args
-                .iter()
-                .position(|a| a == "--format")
-                .and_then(|i| args.get(i + 1))
-                .map(|s| s.as_str())
-                .unwrap_or("oneline");
+            // Support both --format json and --json for consistency with other commands
+            let format = if args.iter().any(|a| a == "--json") {
+                "json"
+            } else {
+                args.iter()
+                    .position(|a| a == "--format")
+                    .and_then(|i| args.get(i + 1))
+                    .map(|s| s.as_str())
+                    .unwrap_or("oneline")
+            };
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_health_check(&project_root, format)
         }
@@ -58,6 +62,22 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_overview(&project_root, &args)
         }
+        Some("show") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_show(&project_root, &args)
+        }
+        Some("trace") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_trace(&project_root, &args)
+        }
+        Some("deps") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_deps(&project_root, &args)
+        }
+        Some("similar") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_similar(&project_root, &args)
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
@@ -80,22 +100,30 @@ fn print_help() {
     println!("    grep <pattern> [path]");
     println!("                        AST-context grep (ripgrep + containing function/class)");
     println!("    search <query>      FTS5 semantic search by concept");
-    println!("    ast-search <query>  Structured search with --type/--returns/--params filters");
+    println!("    ast-search [query]  Structured search with --type/--returns/--params filters");
     println!("    callgraph <symbol>  Show call graph (callers/callees)");
     println!("    impact <symbol>     Impact analysis (callers, routes, risk level)");
+    println!("    show <symbol>       Show symbol details (code, type, signature)");
     println!("    map                 Project architecture map (modules, deps, entry points)");
     println!("    overview <path>     Module overview (symbols grouped by file and type)");
+    println!("    deps <file>         File-level dependency graph");
+    println!("    trace <route>       Trace HTTP route → handler → downstream calls");
+    println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
     println!("    incremental-index   Run incremental index update");
     println!("    health-check        Query index status\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
-    println!("    --compact           Compact output (map)");
+    println!("    --compact           Compact output (search, callgraph, map, overview)");
     println!("    --limit N           Limit results (search, ast-search; default: 20)");
+    println!("    --language <lang>   Filter by language (search)");
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
     println!("    --returns <type>    Filter by return type (ast-search)");
     println!("    --params <text>     Filter by parameter text (ast-search)");
-    println!("    --direction <dir>   callers, callees, or both (callgraph; default: both)");
-    println!("    --depth N           Max traversal depth (callgraph, impact; default: 3)");
+    println!("    --direction <dir>   callers, callees, or both (callgraph, deps; default: both)");
+    println!("    --depth N           Max traversal depth (callgraph, impact, deps; default: 3)");
+    println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show)");
+    println!("    --change-type <t>   signature, behavior, or remove (impact; default: behavior)");
+    println!("    --include-tests     Show test callers in callgraph (hidden by default)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");
 }
