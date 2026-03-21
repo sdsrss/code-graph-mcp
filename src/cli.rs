@@ -1591,7 +1591,7 @@ pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "Benchmark Results")?;
         writeln!(stdout, "=================")?;
-        writeln!(stdout, "")?;
+        writeln!(stdout)?;
         writeln!(stdout, "Full index:          {:>8}ms  ({} files, {} nodes, {} edges)",
             full_index_ms, files_indexed, nodes_created, edges_created)?;
         writeln!(stdout, "Incremental (noop):  {:>8}ms", incr_index_ms)?;

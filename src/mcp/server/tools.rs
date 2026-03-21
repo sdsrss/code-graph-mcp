@@ -1686,7 +1686,7 @@ impl McpServer {
                 || r.code_content.starts_with("pub ")
                 || r.code_content.starts_with("pub(")
                 || (r.file_path.ends_with(".go")
-                    && r.name.chars().next().map_or(false, |c| c.is_uppercase()));
+                    && r.name.chars().next().is_some_and(|c| c.is_uppercase()));
             if is_exported {
                 exported_unused.push(r);
             } else {
