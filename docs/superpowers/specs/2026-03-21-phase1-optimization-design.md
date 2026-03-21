@@ -40,14 +40,14 @@ Competitive analysis identified code-graph-mcp's unique position (Rust + SQLite 
 
 **Core query:**
 ```sql
-SELECT n.id, n.name, n.node_type, n.start_line, n.end_line, f.path
+SELECT n.id, n.name, n.type, n.start_line, n.end_line, f.path
 FROM nodes n
 JOIN files f ON n.file_id = f.id
-WHERE n.is_test = :include_tests_filter
-  AND n.node_type != 'module'
+WHERE n.type != 'module'
   AND n.name != '<module>'
   AND (n.end_line - n.start_line + 1) >= :min_lines
-  AND (:node_type IS NULL OR n.node_type = :node_type)
+  AND (:node_type IS NULL OR n.type = :node_type)
+  -- [dynamic: AND n.is_test = 0 when include_tests=false]
   AND (:path IS NULL OR f.path LIKE :path || '%')
   -- Exclude symbols with incoming usage edges
   AND NOT EXISTS (
@@ -64,9 +64,20 @@ WHERE n.is_test = :include_tests_filter
 ORDER BY (n.end_line - n.start_line) DESC
 ```
 
-**`node_type` parameter mapping:** `fn` → `function`, `const` → `const`, others passed through. When `null`/`all`, query returns all types except `module`.
+**`node_type` parameter mapping:**
 
-**`include_tests` parameter:** When `false` (default), adds `AND n.is_test = 0`. When `true`, removes this clause (matches existing pattern in `fts5_search`).
+| Input | SQL value | Notes |
+|-------|-----------|-------|
+| `fn` | `function` | Also matches `method` (both are callable) |
+| `class` | `class` | Pass-through |
+| `struct` | `struct` | Pass-through |
+| `interface` | `interface` | Pass-through |
+| `enum` | `enum` | Pass-through |
+| `type` | `type` | Pass-through |
+| `const` | `const` | Pass-through |
+| `null`/`all` | omit filter | Returns all types except `module` |
+
+**`include_tests` parameter:** When `false` (default), dynamically appends `AND n.is_test = 0` to the query. When `true`, omits this clause to return all symbols. Follows existing pattern in `fts5_search_impl` (queries.rs:1531).
 
 **`scope=module` + `path`:** When `scope="module"` and `path` is set, adds `AND f.path LIKE :path || '%'` filter.
 
