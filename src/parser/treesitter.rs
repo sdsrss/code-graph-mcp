@@ -179,10 +179,12 @@ fn extract_nodes(
         "class_declaration" | "class" | "class_definition" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 // Kotlin interfaces are class_declaration with first child kind "interface"
-                let node_type_str = if node.child(0).map(|c| c.kind()) == Some("interface") {
-                    "interface"
-                } else {
-                    "class"
+                // Swift reuses class_declaration for class/struct/enum — first child is the keyword
+                let node_type_str = match node.child(0).map(|c| c.kind()) {
+                    Some("interface") => "interface",
+                    Some("struct") => "struct",
+                    Some("enum") => "enum",
+                    _ => "class",
                 };
                 results.push(ParsedNode {
                     node_type: node_type_str.into(),
@@ -222,6 +224,23 @@ fn extract_nodes(
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
                 extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
+            }
+        }
+
+        // Swift protocol → interface
+        "protocol_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                return;
+            }
+        }
+
+        // Swift protocol function declarations (method signatures without body)
+        "protocol_function_declaration" => {
+            if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
             }
         }
 

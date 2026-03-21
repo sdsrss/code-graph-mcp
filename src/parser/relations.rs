@@ -188,6 +188,28 @@ fn walk_for_relations(
             }
         }
 
+        // Swift: import Foundation, import UIKit
+        // AST: import_declaration -> identifier -> simple_identifier
+        "import_declaration" if language == "swift" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "identifier" {
+                        // identifier may contain simple_identifier children (dotted: Foundation.NSObject)
+                        // Use the full text as the import target
+                        let name = node_text(&child, source).to_string();
+                        if !name.is_empty() {
+                            results.push(ParsedRelation {
+                                source_name: "<module>".into(),
+                                target_name: name,
+                                relation: REL_IMPORTS.into(),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Import statements
         "import_statement" => {
             if language == "python" {
@@ -489,7 +511,7 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String>
         .or_else(|| node.named_child(0))?;
 
     match function.kind() {
-        "identifier" => Some(node_text(&function, source).to_string()),
+        "identifier" | "simple_identifier" => Some(node_text(&function, source).to_string()),
         "member_expression" | "field_expression" => {
             // e.g., obj.method — extract "method" or "obj.method"
             if let Some(prop) = function.child_by_field_name("property")
@@ -511,11 +533,18 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String>
                 .map(|n| node_text(&n, source).to_string())
         }
         "navigation_expression" => {
-            // Kotlin: obj.method() — last named child is the method name
+            // Kotlin/Swift: obj.method() — last named child is the method name
+            // Swift wraps it in navigation_suffix → simple_identifier
             let count = function.named_child_count();
             if count > 0 {
-                function.named_child(count - 1)
-                    .map(|n| node_text(&n, source).to_string())
+                let last = function.named_child(count - 1)?;
+                if last.kind() == "navigation_suffix" {
+                    // Swift: navigation_suffix -> simple_identifier
+                    last.named_child(0)
+                        .map(|n| node_text(&n, source).to_string())
+                } else {
+                    Some(node_text(&last, source).to_string())
+                }
             } else {
                 None
             }
@@ -807,6 +836,24 @@ fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
                             if !name.is_empty() {
                                 parents.push(name);
                             }
+                        }
+                    }
+                }
+            }
+            "inheritance_specifier" => {
+                // Swift: class UserService: UserRepository, Codable
+                // inheritance_specifier -> user_type -> type_identifier
+                if let Some(inherits_from) = child.child_by_field_name("inherits_from") {
+                    // Walk into user_type to find type_identifier
+                    let name = if inherits_from.kind() == "user_type" {
+                        inherits_from.named_child(0)
+                            .map(|n| node_text(&n, source).to_string())
+                    } else {
+                        Some(node_text(&inherits_from, source).to_string())
+                    };
+                    if let Some(name) = name {
+                        if !name.is_empty() {
+                            parents.push(name);
                         }
                     }
                 }

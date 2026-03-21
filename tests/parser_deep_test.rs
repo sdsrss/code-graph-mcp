@@ -310,3 +310,53 @@ interface Authenticatable {
         .collect();
     assert!(imports.contains(&"User"), "PHP use import, got: {:?}", imports);
 }
+
+#[test]
+fn test_swift_parsing() {
+    let code = r#"
+import Foundation
+
+protocol UserRepository {
+    func findById(_ id: Int) -> String
+}
+
+class UserService {
+    func findById(_ id: Int) -> String {
+        return String(id)
+    }
+    func listAll() -> [String] {
+        return []
+    }
+}
+
+struct User {
+    let id: Int
+    let name: String
+}
+
+enum UserRole {
+    case admin
+    case viewer
+}
+"#;
+    let nodes = parse_code(code, "swift").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserRepository"), "Swift protocol, got: {:?}", names);
+    assert!(names.contains(&"UserService"), "Swift class, got: {:?}", names);
+    assert!(names.contains(&"User"), "Swift struct, got: {:?}", names);
+
+    // Verify node types
+    let repo = nodes.iter().find(|n| n.name == "UserRepository").unwrap();
+    assert_eq!(repo.node_type, "interface", "Swift protocol should be 'interface', got: {:?}", repo.node_type);
+    let user = nodes.iter().find(|n| n.name == "User").unwrap();
+    assert_eq!(user.node_type, "struct", "Swift struct type, got: {:?}", user.node_type);
+    let role = nodes.iter().find(|n| n.name == "UserRole").unwrap();
+    assert_eq!(role.node_type, "enum", "Swift enum type, got: {:?}", role.node_type);
+
+    let relations = extract_relations(code, "swift").unwrap();
+    let imports: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "imports")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(imports.contains(&"Foundation"), "Swift import, got: {:?}", imports);
+}

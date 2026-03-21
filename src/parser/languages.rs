@@ -17,6 +17,7 @@ pub fn get_language(name: &str) -> Option<Language> {
         "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+        "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         _ => None,
     }
 }

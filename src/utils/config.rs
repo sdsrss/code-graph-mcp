@@ -20,6 +20,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "kt" | "kts" => Some("kotlin"),
         "rb" => Some("ruby"),
         "php" => Some("php"),
+        "swift" => Some("swift"),
         _ => None,
     }
 }
