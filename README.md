@@ -4,10 +4,11 @@ A high-performance code knowledge graph server implementing the [Model Context P
 
 ## Features
 
-- **Multi-language parsing** — Tree-sitter AST extraction for TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
+- **Multi-language parsing** — Tree-sitter AST extraction for 16 languages: TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, C#, Kotlin, Ruby, PHP, Swift, Dart, HTML, CSS
 - **Semantic code search** — Hybrid BM25 full-text + vector semantic search with Reciprocal Rank Fusion (RRF), powered by sqlite-vec
 - **Call graph traversal** — Recursive CTE queries to trace callers/callees with cycle detection
-- **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go)
+- **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go, ASP.NET, Rails, Laravel, Vapor)
+- **Dead code detection** — Find unreferenced symbols with smart Orphan/Exported-Unused classification
 - **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
 - **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates. Smart event filtering skips metadata-only changes (chmod, xattr)
 - **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview). Compact JSON output saves 15-20% tokens
@@ -227,6 +228,9 @@ npm uninstall -g @sdsrs/code-graph
 | `dependency_graph` | Visualize dependency relationships between modules |
 | `find_similar_code` | Find code snippets similar to a given pattern |
 | `get_ast_node` | Extract a specific code symbol with signature, body, and relations |
+| `ast_search` | Search AST nodes by text and/or structural filters (type, return type, params) |
+| `find_references` | Find all references to a symbol (callers, importers, inheritors) |
+| `find_dead_code` | Find unused code — orphan symbols and exported-but-unused public APIs |
 
 ## Plugin Slash Commands
 
@@ -240,9 +244,26 @@ Available when installed as a Claude Code plugin:
 | `/status` | Show code-graph index status and embedding progress |
 | `/rebuild` | Force a full code-graph index rebuild |
 
-## Supported Languages
+## Supported Languages (16)
 
-TypeScript, JavaScript, Go, Python, Rust, Java, C, C++, HTML, CSS
+| Language | Extensions | Relations Extracted |
+|----------|-----------|-------------------|
+| TypeScript | .ts, .tsx | calls, imports, exports, inherits, implements, routes_to |
+| JavaScript | .js, .jsx, .mjs, .cjs | calls, imports, exports, inherits, routes_to |
+| Go | .go | calls, imports, routes_to |
+| Python | .py, .pyi | calls, imports, inherits, routes_to |
+| Rust | .rs | calls, imports, inherits, implements |
+| Java | .java | calls, imports, inherits, implements |
+| C# | .cs | calls, imports, inherits, implements |
+| Kotlin | .kt, .kts | calls, imports, inherits |
+| Ruby | .rb | calls, imports, inherits |
+| PHP | .php | calls, imports, inherits, implements |
+| Swift | .swift | calls, imports, inherits |
+| Dart | .dart | calls, imports, implements |
+| C | .c, .h | calls, imports |
+| C++ | .cpp, .cc, .cxx, .hpp | calls, imports, inherits |
+| HTML | .html, .htm | structural parsing |
+| CSS | .css | structural parsing |
 
 ## Storage
 
