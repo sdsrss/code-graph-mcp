@@ -6,7 +6,7 @@ use serde_json::json;
 /// are still callable via tools/call but hidden from tools/list to save tokens.
 /// Merged tools (find_http_route → trace_http_chain, read_snippet → get_ast_node)
 /// remain callable as aliases for backward compatibility.
-pub const TOOL_COUNT: usize = 9;
+pub const TOOL_COUNT: usize = 11;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -143,6 +143,33 @@ impl ToolRegistry {
                     }
                 }),
             },
+            ToolDefinition {
+                name: "ast_search".into(),
+                description: "Search AST nodes by text and/or structural filters (type, return type, params). For finding functions by signature pattern.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search text (optional if filters provided)" },
+                        "type": { "type": "string", "description": "Node type: fn, class, struct, enum, interface, type, const, var, module" },
+                        "returns": { "type": "string", "description": "Return type substring filter" },
+                        "params": { "type": "string", "description": "Parameter text substring filter" },
+                        "limit": { "type": "number", "description": "Max results (default 20)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "find_references".into(),
+                description: "Find all references to a symbol: callers, importers, inheritors. Shows where a symbol is used across the codebase.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": { "type": "string", "description": "Symbol to find references for" },
+                        "file_path": { "type": "string", "description": "Disambiguate same-name symbols" },
+                        "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "all"], "description": "Relation type filter (default 'all')" }
+                    },
+                    "required": ["symbol_name"]
+                }),
+            },
         ];
 
         Self { tools }
@@ -171,6 +198,7 @@ mod tests {
             "semantic_code_search", "get_call_graph", "trace_http_chain",
             "get_ast_node", "project_map", "impact_analysis",
             "module_overview", "dependency_graph", "find_similar_code",
+            "ast_search", "find_references",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }

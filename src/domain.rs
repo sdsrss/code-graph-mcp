@@ -2,6 +2,9 @@
 // Relation constants, embedding dimensions, and other cross-cutting concerns
 // live here to avoid layer violations (e.g., parser importing from storage).
 
+// -- Data directory --
+pub const CODE_GRAPH_DIR: &str = ".code-graph";
+
 // -- Relation types --
 pub const REL_CALLS: &str = "calls";
 pub const REL_INHERITS: &str = "inherits";
@@ -15,7 +18,7 @@ pub const REL_EXPORTS: &str = "exports";
 // nodes or edges for the same source files. The server will detect a mismatch
 // and automatically clear + rebuild the index.
 // This is separate from SCHEMA_VERSION (which tracks table structure changes).
-pub const INDEX_VERSION: i32 = 3;
+pub const INDEX_VERSION: i32 = 4;
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;

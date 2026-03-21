@@ -270,23 +270,27 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
     let tx = db.conn().unchecked_transaction()?;
     let id_vec: Vec<i64> = dirty_ids.iter().copied().collect();
     let all_edges = get_edges_batch(db.conn(), &id_vec)?;
-    let all_nodes: HashMap<i64, (NodeResult, String)> = {
+    let all_nodes: HashMap<i64, (NodeResult, String, Option<String>)> = {
         let nwfs = get_nodes_with_files_by_ids(db.conn(), &id_vec)?;
-        nwfs.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path))).collect()
+        nwfs.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path, nwf.language))).collect()
     };
 
     // Build all context strings first
     let mut context_updates: Vec<(i64, String)> = Vec::with_capacity(dirty_ids.len());
     for &node_id in dirty_ids {
-        if let Some((node, file_path)) = all_nodes.get(&node_id) {
+        if let Some((node, file_path, language)) = all_nodes.get(&node_id) {
             let edges = all_edges.get(&node_id);
             let cat = categorize_edges(edges, format_route_from_metadata);
 
             let ctx = build_context_string(&NodeContext {
                 node_type: node.node_type.clone(),
                 name: node.name.clone(),
+                qualified_name: node.qualified_name.clone(),
                 file_path: file_path.clone(),
+                language: language.clone(),
                 signature: node.signature.clone(),
+                return_type: node.return_type.clone(),
+                param_types: node.param_types.clone(),
                 code_content: Some(node.code_content.clone()),
                 routes: cat.routes,
                 callees: cat.callees,
@@ -345,8 +349,12 @@ pub fn repair_null_context_strings(
         let ctx = build_context_string(&NodeContext {
             node_type: node.node_type.clone(),
             name: node.name.clone(),
+            qualified_name: node.qualified_name.clone(),
             file_path: nwf.file_path.clone(),
+            language: nwf.language.clone(),
             signature: node.signature.clone(),
+            return_type: node.return_type.clone(),
+            param_types: node.param_types.clone(),
             code_content: Some(node.code_content.clone()),
             routes: cat.routes,
             callees: cat.callees,
@@ -868,9 +876,9 @@ fn index_files(
         let all_node_ids: Vec<i64> = all_indexed.iter()
             .flat_map(|fi| fi.node_ids.iter().copied()).collect();
         let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
-        let all_node_details: HashMap<i64, NodeResult> = {
+        let all_node_details: HashMap<i64, (NodeResult, Option<String>)> = {
             let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
-            nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
+            nodes.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.language))).collect()
         };
 
         // Phase 3a: Build all context strings (CPU-bound, parallelized with rayon)
@@ -890,11 +898,15 @@ fn index_files(
                 let node_detail = all_node_details.get(&node_id);
 
                 let ctx = build_context_string(&NodeContext {
-                    node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
+                    node_type: node_detail.map(|(n, _)| n.node_type.clone()).unwrap_or_default(),
                     name: node_name.to_string(),
+                    qualified_name: node_detail.and_then(|(n, _)| n.qualified_name.clone()),
                     file_path: file_path.to_string(),
-                    signature: node_detail.and_then(|n| n.signature.clone()),
-                    code_content: node_detail.map(|n| n.code_content.clone()),
+                    language: node_detail.and_then(|(_, lang)| lang.clone()),
+                    signature: node_detail.and_then(|(n, _)| n.signature.clone()),
+                    return_type: node_detail.and_then(|(n, _)| n.return_type.clone()),
+                    param_types: node_detail.and_then(|(n, _)| n.param_types.clone()),
+                    code_content: node_detail.map(|(n, _)| n.code_content.clone()),
                     routes: cat.routes,
                     callees: cat.callees,
                     callers: cat.callers,
@@ -902,7 +914,7 @@ fn index_files(
                     imports: cat.imports,
                     implements: cat.implements,
                     exports: cat.exports,
-                    doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
+                    doc_comment: node_detail.and_then(|(n, _)| n.doc_comment.clone()),
                 });
 
                 (node_id, ctx)

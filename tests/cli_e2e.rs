@@ -57,7 +57,7 @@ export class Logger {
 "#).unwrap();
 
     // Index using the library directly
-    let db_dir = project.path().join(".code-graph");
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db_path = db_dir.join("index.db");
     let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();

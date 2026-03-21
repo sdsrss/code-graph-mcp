@@ -1620,15 +1620,9 @@ impl McpServer {
                 .collect()
         } else {
             // Filter-only: direct SQL
-            let normalized: Vec<String>;
-            let type_refs: Option<Vec<&str>> = if let Some(tf) = type_filter {
-                normalized = normalize_type_filter_mcp(tf);
-                Some(normalized.iter().map(|s| s.as_str()).collect())
-            } else {
-                normalized = vec![];
-                let _ = &normalized;
-                None
-            };
+            let normalized = type_filter.map(normalize_type_filter_mcp);
+            let type_refs: Option<Vec<&str>> = normalized.as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             queries::get_nodes_with_files_by_filters(
                 self.db.conn(),
                 type_refs.as_deref(),

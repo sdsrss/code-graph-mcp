@@ -78,6 +78,10 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_similar(&project_root, &args)
         }
+        Some("refs") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_refs(&project_root, &args)
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
@@ -109,6 +113,7 @@ fn print_help() {
     println!("    deps <file>         File-level dependency graph");
     println!("    trace <route>       Trace HTTP route → handler → downstream calls");
     println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
+    println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    incremental-index   Run incremental index update");
     println!("    health-check        Query index status\n");
     println!("OPTIONS:");

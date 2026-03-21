@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::domain::CODE_GRAPH_DIR;
 use crate::storage::db::Database;
 use crate::storage::queries;
 
@@ -15,7 +16,7 @@ pub struct CliContext {
 
 impl CliContext {
     pub fn open(project_root: &Path) -> Result<Self> {
-        let db_path = project_root.join(".code-graph").join("index.db");
+        let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             anyhow::bail!(
                 "No index found at {}. Run the MCP server first to create the index.",
@@ -31,7 +32,7 @@ impl CliContext {
 
     /// Try to open, returning None if no index exists (for grep fallback).
     pub fn try_open(project_root: &Path) -> Option<Self> {
-        let db_path = project_root.join(".code-graph").join("index.db");
+        let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             return None;
         }
@@ -1336,7 +1337,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     let json_mode = has_flag(args, "--json");
 
     // Open with vec support for vector search
-    let db_path = project_root.join(".code-graph").join("index.db");
+    let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     if !db_path.exists() {
         anyhow::bail!("No index found. Run the MCP server first to create the index.");
     }
@@ -1409,6 +1410,83 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
             similarity * 100.0,
             node.node_type, node.qualified_name.as_deref().unwrap_or(&node.name),
             fp, node.start_line, node.end_line)?;
+    }
+
+    Ok(())
+}
+
+pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
+    let symbol = get_positional(args, 0)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Usage: code-graph-mcp refs <symbol> [--file path] [--relation calls|imports|inherits|implements] [--json]"
+        ))?;
+    let file_path = get_flag_value(args, "--file");
+    let relation = get_flag_value(args, "--relation");
+    let json_mode = has_flag(args, "--json");
+
+    let ctx = CliContext::open(project_root)?;
+    let conn = ctx.db.conn();
+
+    // Resolve symbol to node_id(s)
+    let target_ids: Vec<i64> = if let Some(fp) = file_path {
+        let nodes = queries::get_nodes_by_file_path(conn, fp)?;
+        let ids: Vec<i64> = nodes.iter().filter(|n| n.name == symbol).map(|n| n.id).collect();
+        if ids.is_empty() {
+            anyhow::bail!("Symbol '{}' not found in file '{}'.", symbol, fp);
+        }
+        ids
+    } else {
+        let ids = queries::get_node_ids_by_name(conn, symbol)?;
+        if ids.is_empty() {
+            anyhow::bail!("Symbol '{}' not found in index.", symbol);
+        }
+        ids.into_iter().map(|(id, _)| id).collect()
+    };
+
+    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS};
+    let relation_filter = match relation {
+        Some("calls") => Some(REL_CALLS),
+        Some("imports") => Some(REL_IMPORTS),
+        Some("inherits") => Some(REL_INHERITS),
+        Some("implements") => Some(REL_IMPLEMENTS),
+        Some("all") | None => None,
+        Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, all", other),
+    };
+
+    let mut all_refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for target_id in &target_ids {
+        let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
+        for r in refs {
+            let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
+            if seen.insert(key) {
+                all_refs.push(r);
+            }
+        }
+    }
+
+    if json_mode {
+        let items: Vec<serde_json::Value> = all_refs.iter().map(|r| {
+            serde_json::json!({
+                "node_id": r.node_id,
+                "name": r.name,
+                "type": r.node_type,
+                "file_path": r.file_path,
+                "start_line": r.start_line,
+                "relation": r.relation,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        if all_refs.is_empty() {
+            writeln!(stdout, "No references found for '{}'.", symbol)?;
+        } else {
+            writeln!(stdout, "{} references to '{}':", all_refs.len(), symbol)?;
+            for r in &all_refs {
+                writeln!(stdout, "  [{}] {} ({}:{})", r.relation, r.name, r.file_path, r.start_line)?;
+            }
+        }
     }
 
     Ok(())

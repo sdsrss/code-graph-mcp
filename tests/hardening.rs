@@ -179,7 +179,7 @@ fn test_binary_files_dont_crash_indexing() {
     // Binary file with .ts extension
     fs::write(
         project.path().join("broken.ts"),
-        &[0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xFE],
+        [0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xFE],
     )
     .unwrap();
     // Zero-byte file

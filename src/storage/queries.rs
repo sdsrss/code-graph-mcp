@@ -382,6 +382,36 @@ pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) 
     Ok(results)
 }
 
+/// Batch-fetch edge target names for multiple source IDs in one query.
+/// Returns a map from source_id to list of target names.
+pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relation: &str) -> Result<HashMap<i64, Vec<String>>> {
+    let mut result: HashMap<i64, Vec<String>> = HashMap::new();
+    if source_ids.is_empty() {
+        return Ok(result);
+    }
+    for chunk in source_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(2, chunk.len());
+        let sql = format!(
+            "SELECT e.source_id, n.name FROM edges e JOIN nodes n ON n.id = e.target_id
+             WHERE e.source_id IN ({}) AND e.relation = ?1",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&relation as &dyn rusqlite::types::ToSql];
+        for id in chunk {
+            params.push(id as &dyn rusqlite::types::ToSql);
+        }
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (src_id, name) = row?;
+            result.entry(src_id).or_default().push(name);
+        }
+    }
+    Ok(result)
+}
+
 pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.source_id
@@ -420,6 +450,57 @@ pub fn get_edge_sources_with_files(conn: &Connection, target_id: i64, relation: 
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Find all incoming references (source nodes) pointing to a target node, with file paths.
+/// Optionally filter by relation type. Returns structured reference info.
+pub fn get_incoming_references(
+    conn: &Connection,
+    target_id: i64,
+    relation_filter: Option<&str>,
+) -> Result<Vec<IncomingReference>> {
+    let sql = if relation_filter.is_some() {
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation
+         FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         LEFT JOIN files f ON f.id = n.file_id
+         WHERE e.target_id = ?1 AND e.relation = ?2
+         ORDER BY f.path, n.start_line"
+    } else {
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation
+         FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         LEFT JOIN files f ON f.id = n.file_id
+         WHERE e.target_id = ?1
+         ORDER BY e.relation, f.path, n.start_line"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(rel) = relation_filter {
+        stmt.query_map(rusqlite::params![target_id, rel], map_incoming_ref)?
+    } else {
+        stmt.query_map(rusqlite::params![target_id], map_incoming_ref)?
+    };
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub struct IncomingReference {
+    pub node_id: i64,
+    pub name: String,
+    pub node_type: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub relation: String,
+}
+
+fn map_incoming_ref(row: &rusqlite::Row) -> rusqlite::Result<IncomingReference> {
+    Ok(IncomingReference {
+        node_id: row.get(0)?,
+        name: row.get(1)?,
+        node_type: row.get(2)?,
+        file_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        start_line: row.get(4)?,
+        relation: row.get(5)?,
+    })
 }
 
 /// Batch-fetch all edge info for a set of node IDs, grouped by node_id.
@@ -522,6 +603,17 @@ pub fn get_node_embedding(conn: &Connection, node_id: i64) -> Result<Vec<u8>> {
 
 // --- Additional node queries ---
 
+/// Get all node IDs matching an exact name, with file paths for filtering.
+pub fn get_node_ids_by_name(conn: &Connection, name: &str) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, COALESCE(f.path, '') FROM nodes n LEFT JOIN files f ON f.id = n.file_id WHERE n.name = ?1"
+    )?;
+    let rows = stmt.query_map([name], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn get_first_node_id_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT id FROM nodes WHERE name = ?1 LIMIT 1")?;
     let rows = stmt.query_map([name], |row| row.get::<_, i64>(0))?;
@@ -604,6 +696,23 @@ pub fn get_nodes_with_files_by_filters(
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Fetch a single node with its file path/language by node ID (JOIN, single query).
+pub fn get_node_with_file_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeWithFile>> {
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id = ?1",
+        NODE_SELECT_ALIASED
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([node_id], |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(15)?,
+            language: row.get(16)?,
+        })
+    })?;
+    Ok(first_row(rows)?)
 }
 
 pub fn get_file_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
@@ -840,10 +949,12 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // Phase 1: Try explicit exports (JS/TS)
     let sql_exports =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?3) as caller_count
+                COALESCE(cc.cnt, 0) as caller_count
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          JOIN edges e ON e.target_id = n.id AND e.relation = ?1
+         LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?3 GROUP BY target_id) cc
+           ON cc.target_id = n.id
          WHERE f.path LIKE ?2 ESCAPE '\\'
          ORDER BY caller_count DESC";
     let mut stmt = conn.prepare(sql_exports)?;
@@ -866,9 +977,11 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files
     let sql_fallback =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                (SELECT COUNT(*) FROM edges e2 WHERE e2.target_id = n.id AND e2.relation = ?2) as caller_count
+                COALESCE(cc.cnt, 0) as caller_count
          FROM nodes n
          JOIN files f ON f.id = n.file_id
+         LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?2 GROUP BY target_id) cc
+           ON cc.target_id = n.id
          WHERE f.path LIKE ?1 ESCAPE '\\'
            AND n.type != 'module'
            AND n.name != '<module>'

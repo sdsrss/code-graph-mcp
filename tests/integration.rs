@@ -1103,6 +1103,6 @@ fn test_skip_indexing_flag() {
     // Empty results return an object with results:[] and a message, not a bare array
     let empty_results = result3.get("results").and_then(|r| r.as_array())
         .or_else(|| result3.as_array());
-    assert!(empty_results.map_or(true, |a| a.is_empty()),
+    assert!(empty_results.is_none_or(|a| a.is_empty()),
         "should return empty results when skip_indexing with no prior index, got: {}", result3);
 }

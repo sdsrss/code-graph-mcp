@@ -1,8 +1,12 @@
 pub struct NodeContext {
     pub node_type: String,
     pub name: String,
+    pub qualified_name: Option<String>,
     pub file_path: String,
+    pub language: Option<String>,
     pub signature: Option<String>,
+    pub return_type: Option<String>,
+    pub param_types: Option<String>,
     pub code_content: Option<String>,
     pub routes: Vec<String>,
     pub callees: Vec<String>,
@@ -25,11 +29,28 @@ pub fn build_context_string(info: &NodeContext) -> String {
         parts.push(format!("signature: {}", sig));
     }
 
-    // 2. Identity: type + name + file (critical for disambiguation)
-    parts.push(format!("{} {}", info.node_type, info.name));
-    parts.push(format!("in {}", info.file_path));
+    // 2. Type information (high value for structural search)
+    if let Some(rt) = &info.return_type {
+        if !rt.is_empty() {
+            parts.push(format!("returns: {}", rt));
+        }
+    }
+    if let Some(pt) = &info.param_types {
+        if !pt.is_empty() {
+            parts.push(format!("params: {}", pt));
+        }
+    }
 
-    // 3. Graph relations (structural signals that survive truncation)
+    // 3. Identity: type + name + file (critical for disambiguation)
+    let display_name = info.qualified_name.as_deref().unwrap_or(&info.name);
+    parts.push(format!("{} {}", info.node_type, display_name));
+    if let Some(lang) = &info.language {
+        parts.push(format!("{} in {}", lang, info.file_path));
+    } else {
+        parts.push(format!("in {}", info.file_path));
+    }
+
+    // 4. Graph relations (structural signals that survive truncation)
     const MAX_RELATIONS: usize = 10;
     if !info.routes.is_empty() {
         parts.push(format!("routes: {}", info.routes.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", ")));
@@ -55,12 +76,12 @@ pub fn build_context_string(info: &NodeContext) -> String {
         parts.push(format!("exports: {}", info.exports.join(", ")));
     }
 
-    // 4. Doc comment (medium priority — often short enough to survive)
+    // 5. Doc comment (medium priority — often short enough to survive)
     if let Some(doc) = &info.doc_comment {
         parts.push(format!("doc: {}", doc));
     }
 
-    // 5. Code content last (most likely to be truncated at 512 tokens, least loss)
+    // 6. Code content last (most likely to be truncated at 512 tokens, least loss)
     if let Some(code) = &info.code_content {
         parts.push(format!("code: {}", code));
     }
@@ -77,8 +98,12 @@ mod tests {
         let info = NodeContext {
             node_type: "function".into(),
             name: "validateToken".into(),
+            qualified_name: None,
             file_path: "src/auth/middleware.ts".into(),
+            language: Some("typescript".into()),
             signature: Some("(token: string) -> Promise<User | null>".into()),
+            return_type: Some("Promise<User | null>".into()),
+            param_types: Some("(token: string)".into()),
             code_content: Some("function validateToken(token: string) { return jwt.verify(token); }".into()),
             routes: vec!["POST /api/login".into(), "GET /api/profile".into()],
             callees: vec!["jwt.verify".into(), "UserRepo.findById".into()],
@@ -92,7 +117,9 @@ mod tests {
 
         let ctx = build_context_string(&info);
         assert!(ctx.contains("function validateToken"));
-        assert!(ctx.contains("in src/auth/middleware.ts"));
+        assert!(ctx.contains("typescript in src/auth/middleware.ts"));
+        assert!(ctx.contains("returns: Promise<User | null>"));
+        assert!(ctx.contains("params: (token: string)"));
         assert!(ctx.contains("calls: jwt.verify, UserRepo.findById"));
         assert!(ctx.contains("called_by: authMiddleware, handleLogin"));
         assert!(ctx.contains("routes: POST /api/login, GET /api/profile"));
@@ -105,8 +132,12 @@ mod tests {
         let info = NodeContext {
             node_type: "function".into(),
             name: "handler".into(),
+            qualified_name: None,
             file_path: "api.ts".into(),
+            language: None,
             signature: Some("(req: Request) -> Response".into()),
+            return_type: Some("Response".into()),
+            param_types: Some("(req: Request)".into()),
             code_content: Some("function handler(req: Request) { return ok(); }".into()),
             routes: vec![],
             callees: vec!["ok".into()],
@@ -133,8 +164,12 @@ mod tests {
         let info = NodeContext {
             node_type: "function".into(),
             name: "helper".into(),
+            qualified_name: None,
             file_path: "utils.ts".into(),
+            language: None,
             signature: None,
+            return_type: None,
+            param_types: None,
             code_content: None,
             routes: vec![],
             callees: vec![],

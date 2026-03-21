@@ -121,6 +121,16 @@ mod inner {
         }
 
         fn find_models_dir() -> Result<std::path::PathBuf> {
+            // 0. User-configured model directory (highest priority)
+            if let Ok(custom_dir) = std::env::var("CODE_GRAPH_MODEL_DIR") {
+                let custom = std::path::PathBuf::from(&custom_dir);
+                if custom.join("model.safetensors").exists() {
+                    tracing::info!("[model] Using custom model from CODE_GRAPH_MODEL_DIR={}", custom_dir);
+                    return Ok(custom);
+                }
+                tracing::warn!("[model] CODE_GRAPH_MODEL_DIR={} set but model.safetensors not found there", custom_dir);
+            }
+
             // 1. Check relative to current working directory (dev environment)
             let cwd = std::env::current_dir()?;
             let models = cwd.join("models");
