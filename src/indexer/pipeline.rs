@@ -15,7 +15,8 @@ use crate::storage::queries::{
     delete_files_by_paths, delete_nodes_by_file,
     get_all_file_hashes, get_dirty_node_ids, get_edges_batch,
     get_node_names_with_paths_excluding_files, get_nodes_by_file_path,
-    get_nodes_with_files_by_ids, insert_edge_cached, insert_node_cached,
+    get_nodes_missing_context, get_nodes_with_files_by_ids,
+    insert_edge_cached, insert_node_cached,
     insert_node_vectors_batch, update_context_strings_batch, upsert_file,
     EdgeInfo, FileRecord, NodeRecord, NodeResult,
 };
@@ -313,6 +314,68 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
 
     tx.commit()?;
     Ok(())
+}
+
+/// Repair nodes that have NULL context_string (likely from a failed Phase 3).
+/// This is called at startup after index verification.
+pub fn repair_null_context_strings(
+    db: &Database,
+    model: Option<&EmbeddingModel>,
+) -> Result<usize> {
+    let missing_ids = get_nodes_missing_context(db.conn())?;
+    if missing_ids.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::info!("[repair] Found {} nodes with NULL context_string, rebuilding...", missing_ids.len());
+
+    // Load node details with file paths
+    let nodes_with_files = get_nodes_with_files_by_ids(db.conn(), &missing_ids)?;
+
+    // Load edges for all affected nodes in one batch
+    let all_edges = get_edges_batch(db.conn(), &missing_ids)?;
+
+    // Build context strings
+    let mut context_updates: Vec<(i64, String)> = Vec::new();
+    for nwf in &nodes_with_files {
+        let node = &nwf.node;
+        let edges = all_edges.get(&node.id);
+        let cat = categorize_edges(edges, format_route_from_metadata);
+
+        let ctx = build_context_string(&NodeContext {
+            node_type: node.node_type.clone(),
+            name: node.name.clone(),
+            file_path: nwf.file_path.clone(),
+            signature: node.signature.clone(),
+            code_content: Some(node.code_content.clone()),
+            routes: cat.routes,
+            callees: cat.callees,
+            callers: cat.callers,
+            inherits: cat.inherits,
+            imports: cat.imports,
+            implements: cat.implements,
+            exports: cat.exports,
+            doc_comment: node.doc_comment.clone(),
+        });
+
+        context_updates.push((node.id, ctx));
+    }
+
+    // Update in DB
+    if !context_updates.is_empty() {
+        update_context_strings_batch(db.conn(), &context_updates)?;
+
+        // Re-embed if model available
+        if let Some(m) = model {
+            if db.vec_enabled() {
+                embed_and_store_batch(db, m, &context_updates)?;
+            }
+        }
+    }
+
+    let count = context_updates.len();
+    tracing::info!("[repair] Repaired context strings for {} nodes", count);
+    Ok(count)
 }
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
@@ -1206,5 +1269,46 @@ function handleLogin(req: Request) {
             deps.iter().any(|d| d.file_path == "<external>"),
             "app.py should still show <external> dependency after incremental index"
         );
+    }
+
+    #[test]
+    fn test_repair_null_context_strings() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        // Index a file so nodes get context strings
+        fs::write(project_dir.path().join("a.ts"), r#"
+function alpha() { return 1; }
+function beta() { alpha(); }
+"#).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        // Verify context strings exist after index
+        let alpha_nodes = get_nodes_by_name(db.conn(), "alpha").unwrap();
+        assert_eq!(alpha_nodes.len(), 1);
+        assert!(alpha_nodes[0].context_string.is_some(), "alpha should have context_string after index");
+
+        let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
+        assert_eq!(beta_nodes.len(), 1);
+        assert!(beta_nodes[0].context_string.is_some(), "beta should have context_string after index");
+
+        // Simulate Phase 3 failure: NULL out context_strings
+        db.conn().execute("UPDATE nodes SET context_string = NULL", []).unwrap();
+
+        // Verify they are now NULL
+        let alpha_after_null = get_nodes_by_name(db.conn(), "alpha").unwrap();
+        assert!(alpha_after_null[0].context_string.is_none(), "alpha context_string should be NULL after simulated failure");
+
+        // Run repair
+        let repaired = repair_null_context_strings(&db, None).unwrap();
+        assert!(repaired > 0, "should repair at least 1 node");
+
+        // Verify context strings were restored
+        let alpha_repaired = get_nodes_by_name(db.conn(), "alpha").unwrap();
+        assert!(alpha_repaired[0].context_string.is_some(), "alpha should have context_string after repair");
+
+        let beta_repaired = get_nodes_by_name(db.conn(), "beta").unwrap();
+        assert!(beta_repaired[0].context_string.is_some(), "beta should have context_string after repair");
     }
 }

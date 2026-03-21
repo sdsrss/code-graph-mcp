@@ -1436,6 +1436,22 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
     Ok(FtsResult { nodes: results, or_fallback: terms.len() > 1 })
 }
 
+/// Find nodes that are missing context strings (likely from a failed Phase 3).
+/// Excludes external pseudo-nodes which never have context strings.
+pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE n.context_string IS NULL
+         AND f.path != '<external>'
+         LIMIT 10000"
+    )?;
+    let ids: Vec<i64> = stmt.query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1781,5 +1797,50 @@ mod tests {
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
         assert!(names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn test_get_nodes_missing_context() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // Create a normal file and an external pseudo-file
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/app.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: Some("typescript".into()),
+        }).unwrap();
+        let fid_ext = upsert_file(conn, &FileRecord {
+            path: "<external>".into(), blake3_hash: "ext".into(), last_modified: 0, language: None,
+        }).unwrap();
+
+        // Node with context_string set (healthy)
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "healthy".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "function healthy() {}".into(), signature: None,
+            doc_comment: None, context_string: Some("function healthy".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Node with NULL context_string (broken -- should be found)
+        let broken_id = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "broken".into(),
+            qualified_name: None, start_line: 6, end_line: 10,
+            code_content: "function broken() {}".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // External pseudo-node with NULL context_string (should be excluded)
+        insert_node(conn, &NodeRecord {
+            file_id: fid_ext, node_type: "function".into(), name: "ext_func".into(),
+            qualified_name: None, start_line: 0, end_line: 0,
+            code_content: "".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let missing = get_nodes_missing_context(conn).unwrap();
+        assert_eq!(missing.len(), 1, "should find exactly 1 broken node (not external)");
+        assert_eq!(missing[0], broken_id);
     }
 }
