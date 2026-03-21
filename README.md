@@ -44,6 +44,18 @@ Single binary, embedded SQLite, bundled sqlite-vec extension, optional local emb
 
 Every design decision — from token-aware compression to node_id-based snippet expansion — is optimized for LLM context windows. Works out of the box with Claude Code, Cursor, Windsurf, and any MCP-compatible client.
 
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Indexing speed | **300+ files/second** (single-threaded, release build) |
+| Incremental re-index | **<250ms** no-change detection via BLAKE3 Merkle tree |
+| FTS search P50 / P99 | **<300us / <1ms** |
+| Database overhead | **~3.5MB** per 800 nodes |
+| Token savings | **5-20x fewer tokens** per code understanding task vs grep+read |
+
+Run `code-graph-mcp benchmark` on your own project to measure.
+
 ## Efficiency: code-graph vs Traditional Tools
 
 Real-world benchmarks comparing code-graph-mcp tools against traditional approaches (Grep + Read + Glob) on a 33-file Rust project (~537 AST nodes).
