@@ -225,8 +225,17 @@ fn extract_nodes(
             }
         }
 
-        // Interfaces (TS/Java)
+        // Interfaces (TS/Java/PHP)
         "interface_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                return;
+            }
+        }
+
+        // PHP traits — mapped to "interface" type
+        "trait_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
                 extract_children(node, source, language, Some(&name), results, depth, node_is_test);

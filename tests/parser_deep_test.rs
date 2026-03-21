@@ -270,3 +270,43 @@ end
         .collect();
     assert!(inherits.contains(&"ApplicationController"), "Ruby inheritance, got: {:?}", inherits);
 }
+
+#[test]
+fn test_php_parsing() {
+    let code = r#"<?php
+use App\Models\User;
+
+class UserController extends Controller {
+    public function index() {
+        return User::all();
+    }
+    public function show(int $id) {
+        return User::findOrFail($id);
+    }
+}
+
+interface Authenticatable {
+    public function getAuthIdentifier();
+}
+"#;
+    let nodes = parse_code(code, "php").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserController"), "PHP class, got: {:?}", names);
+    assert!(names.contains(&"index"), "PHP method, got: {:?}", names);
+    assert!(names.contains(&"show"), "PHP method, got: {:?}", names);
+    assert!(names.contains(&"Authenticatable"), "PHP interface, got: {:?}", names);
+    assert!(names.contains(&"getAuthIdentifier"), "PHP interface method, got: {:?}", names);
+
+    let relations = extract_relations(code, "php").unwrap();
+    let inherits: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "inherits")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(inherits.contains(&"Controller"), "PHP extends, got: {:?}", inherits);
+
+    let imports: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "imports")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(imports.contains(&"User"), "PHP use import, got: {:?}", imports);
+}

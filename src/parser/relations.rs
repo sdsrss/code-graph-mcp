@@ -106,6 +106,88 @@ fn walk_for_relations(
             }
         }
 
+        // PHP: function_call_expression (doSomething()), member_call_expression ($this->move()),
+        // scoped_call_expression (User::all())
+        "function_call_expression" | "member_call_expression" | "scoped_call_expression"
+            if language == "php" =>
+        {
+            if let Some(scope) = active_scope {
+                // All three PHP call types have a `name` child for the method/function name
+                // For scoped_call_expression, there are multiple `name` children; the second is the method
+                let callee = if kind == "scoped_call_expression" {
+                    // User::all() -> children: name("User"), "::", name("all"), arguments
+                    // The method name is the second `name` child
+                    let mut names = Vec::new();
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if child.kind() == "name" {
+                                names.push(node_text(&child, source).to_string());
+                            }
+                        }
+                    }
+                    names.pop() // Last name is the method
+                } else {
+                    // function_call_expression: name("doSomething"), arguments
+                    // member_call_expression: variable_name("$this"), "->", name("move"), arguments
+                    node.child_by_field_name("name")
+                        .or_else(|| {
+                            // Fallback: find the `name` node among children
+                            (0..node.child_count())
+                                .filter_map(|i| node.child(i))
+                                .find(|c| c.kind() == "name")
+                        })
+                        .map(|n| node_text(&n, source).to_string())
+                };
+                if let Some(name) = callee {
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: name,
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // PHP: use App\Models\User;
+        // namespace_use_declaration -> namespace_use_clause -> qualified_name -> name (last segment)
+        "namespace_use_declaration" if language == "php" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "namespace_use_clause" {
+                        // Get the last `name` segment from the qualified_name
+                        fn find_last_name(n: &tree_sitter::Node, source: &str) -> Option<String> {
+                            let mut result = None;
+                            for i in 0..n.child_count() {
+                                if let Some(child) = n.child(i) {
+                                    if child.kind() == "name" {
+                                        result = Some(node_text(&child, source).to_string());
+                                    } else if child.kind() == "qualified_name" || child.kind() == "namespace_name" {
+                                        if let Some(inner) = find_last_name(&child, source) {
+                                            result = Some(inner);
+                                        }
+                                    }
+                                }
+                            }
+                            result
+                        }
+                        if let Some(name) = find_last_name(&child, source) {
+                            if !name.is_empty() {
+                                results.push(ParsedRelation {
+                                    source_name: "<module>".into(),
+                                    target_name: name,
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Import statements
         "import_statement" => {
             if language == "python" {
@@ -715,6 +797,20 @@ fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
                     }
                 }
             }
+            "base_clause" => {
+                // PHP: class Dog extends Animal
+                // base_clause -> name (the parent class)
+                for k in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(k) {
+                        if inner.kind() == "name" || inner.kind() == "qualified_name" {
+                            let name = node_text(&inner, source).to_string();
+                            if !name.is_empty() {
+                                parents.push(name);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -762,6 +858,25 @@ fn extract_implements(
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            // PHP: class Dog implements Walkable, Swimmable
+            // class_interface_clause -> name children
+            "class_interface_clause" => {
+                for j in 0..child.named_child_count() {
+                    if let Some(inner) = child.named_child(j) {
+                        if inner.kind() == "name" || inner.kind() == "qualified_name" {
+                            let name = node_text(&inner, source).to_string();
+                            if !name.is_empty() {
+                                results.push(ParsedRelation {
+                                    source_name: class_name.to_string(),
+                                    target_name: name,
+                                    relation: REL_IMPLEMENTS.into(),
+                                    metadata: None,
+                                });
                             }
                         }
                     }
