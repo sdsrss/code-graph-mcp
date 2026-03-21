@@ -18,6 +18,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "css" => Some("css"),
         "cs" => Some("csharp"),
         "kt" | "kts" => Some("kotlin"),
+        "rb" => Some("ruby"),
         _ => None,
     }
 }

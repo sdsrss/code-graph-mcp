@@ -36,7 +36,8 @@ fn walk_for_relations(
     let scope_name = match kind {
         "function_declaration" | "function_definition" | "function_item"
         | "method_definition" | "method_declaration" | "constructor_declaration"
-        | "async_function_definition" => {
+        | "async_function_definition"
+        | "method" | "singleton_method" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
         }
@@ -67,6 +68,37 @@ fn walk_for_relations(
                     results.push(ParsedRelation {
                         source_name: scope.to_string(),
                         target_name: callee,
+                        relation: REL_CALLS.into(),
+                        metadata: None,
+                    });
+                }
+            }
+        }
+
+        // Ruby: `call` node kind for method calls (require, require_relative, and regular calls)
+        "call" if language == "ruby" => {
+            // Extract method name from the "method" field
+            if let Some(method_node) = node.child_by_field_name("method") {
+                let method_name = node_text(&method_node, source);
+                // require 'json' / require_relative 'helper'
+                if method_name == "require" || method_name == "require_relative" {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        if let Some(first_arg) = args.named_child(0) {
+                            if let Some(string_val) = extract_string_from_subtree(&first_arg, source) {
+                                results.push(ParsedRelation {
+                                    source_name: active_scope.unwrap_or("<module>").to_string(),
+                                    target_name: string_val,
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(scope) = active_scope {
+                    // Regular method call
+                    results.push(ParsedRelation {
+                        source_name: scope.to_string(),
+                        target_name: method_name.to_string(),
                         relation: REL_CALLS.into(),
                         metadata: None,
                     });
@@ -650,9 +682,11 @@ fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
             }
             "superclass" => {
                 // Java: superclass -> type_identifier
+                // Ruby: superclass -> constant (e.g., `< ApplicationController`)
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
-                        if inner.kind() == "type_identifier" || inner.kind() == "identifier" || inner.kind() == "dotted_name" {
+                        if inner.kind() == "type_identifier" || inner.kind() == "identifier"
+                            || inner.kind() == "dotted_name" || inner.kind() == "constant" || inner.kind() == "scope_resolution" {
                             parents.push(node_text(&inner, source).to_string());
                         }
                     }

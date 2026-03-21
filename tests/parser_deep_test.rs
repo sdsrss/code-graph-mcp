@@ -234,3 +234,39 @@ interface UserRepository {
     assert!(!imports.is_empty(), "Kotlin imports should be extracted, got: {:?}", imports);
     assert!(imports.contains(&"Flow"), "Should import Flow, got: {:?}", imports);
 }
+
+#[test]
+fn test_ruby_parsing() {
+    let code = r#"
+require 'json'
+
+class UserController < ApplicationController
+  def index
+    users = User.all
+    render json: users
+  end
+
+  def show
+    user = User.find(params[:id])
+  end
+end
+
+module Helpers
+  def format_name(user)
+    user.name
+  end
+end
+"#;
+    let nodes = parse_code(code, "ruby").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserController"), "Ruby class, got: {:?}", names);
+    assert!(names.contains(&"index"), "Ruby method, got: {:?}", names);
+    assert!(names.contains(&"Helpers"), "Ruby module, got: {:?}", names);
+
+    let relations = extract_relations(code, "ruby").unwrap();
+    let inherits: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "inherits")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(inherits.contains(&"ApplicationController"), "Ruby inheritance, got: {:?}", inherits);
+}

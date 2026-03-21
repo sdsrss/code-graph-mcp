@@ -202,11 +202,26 @@ fn extract_nodes(
             }
         }
 
-        // Methods: TS/JS (method_definition), Go/Java (method_declaration)
+        // Methods: TS/JS (method_definition), Go/Java (method_declaration), Ruby (method, singleton_method)
         "method_definition" | "method_declaration" => {
             if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
+            }
+        }
+        "method" | "singleton_method" if language == "ruby" => {
+            if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
+            }
+        }
+
+        // Ruby modules — mapped to "interface" type
+        "module" if language == "ruby" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                return;
             }
         }
 

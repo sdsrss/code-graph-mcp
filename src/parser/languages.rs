@@ -15,6 +15,7 @@ pub fn get_language(name: &str) -> Option<Language> {
         "css" => Some(tree_sitter_css::LANGUAGE.into()),
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         _ => None,
     }
 }
