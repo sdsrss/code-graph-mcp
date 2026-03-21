@@ -360,3 +360,41 @@ enum UserRole {
         .collect();
     assert!(imports.contains(&"Foundation"), "Swift import, got: {:?}", imports);
 }
+
+#[test]
+fn test_dart_parsing() {
+    let code = r#"
+import 'dart:async';
+
+abstract class UserRepository {
+  Future<String> findById(int id);
+}
+
+class UserService implements UserRepository {
+  Future<String> findById(int id) async {
+    return id.toString();
+  }
+  List<String> listAll() => [];
+}
+
+class User {
+  final int id;
+  final String name;
+  User(this.id, this.name);
+}
+
+enum UserRole { admin, viewer }
+"#;
+    let nodes = parse_code(code, "dart").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserRepository"), "Dart abstract class, got: {:?}", names);
+    assert!(names.contains(&"UserService"), "Dart class, got: {:?}", names);
+    assert!(names.contains(&"User"), "Dart class, got: {:?}", names);
+
+    let relations = extract_relations(code, "dart").unwrap();
+    let imports: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "imports")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(!imports.is_empty(), "Dart imports should be extracted, got: {:?}", imports);
+}

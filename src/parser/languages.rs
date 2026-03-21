@@ -18,6 +18,7 @@ pub fn get_language(name: &str) -> Option<Language> {
         "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+        "dart" => Some(tree_sitter_dart_orchard::LANGUAGE.into()),
         _ => None,
     }
 }

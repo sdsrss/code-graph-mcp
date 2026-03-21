@@ -218,6 +218,23 @@ fn extract_nodes(
             }
         }
 
+        // Dart: method_signature wraps function_signature/constructor_signature/getter_signature
+        // Extract the function name from the inner signature node
+        "method_signature" if language == "dart" => {
+            if let Some(mut parsed) = extract_dart_method_signature(&node, source, parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
+            }
+        }
+
+        // Dart: top-level declarations can contain function_signature (abstract methods, fields)
+        "declaration" if language == "dart" => {
+            if let Some(mut parsed) = extract_dart_declaration(&node, source, parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
+            }
+        }
+
         // Ruby modules — mapped to "interface" type
         "module" if language == "ruby" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
@@ -579,6 +596,178 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
         comments.reverse();
         Some(comments.join("\n"))
     }
+}
+
+/// Extract a Dart method from a `method_signature` node.
+/// method_signature wraps function_signature, constructor_signature, getter_signature, etc.
+fn extract_dart_method_signature(
+    node: &tree_sitter::Node,
+    source: &str,
+    parent_class: Option<&str>,
+) -> Option<ParsedNode> {
+    // Find the inner function_signature, constructor_signature, getter_signature, or setter_signature
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            match child.kind() {
+                "function_signature" | "getter_signature" | "setter_signature" => {
+                    let name = get_child_by_field(&child, "name", source)?;
+                    let qualified_name = match parent_class {
+                        Some(cls) => Some(format!("{}.{}", cls, name)),
+                        None => Some(name.clone()),
+                    };
+                    let params = child.child_by_field_name("parameters")
+                        .or_else(|| {
+                            // function_signature doesn't use field name for formal_parameter_list
+                            (0..child.named_child_count())
+                                .filter_map(|j| child.named_child(j))
+                                .find(|c| c.kind() == "formal_parameter_list")
+                        })
+                        .map(|p| node_text(&p, source).to_string());
+                    // Return type: first type_identifier, void_type, or function_type child
+                    let ret = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
+                        .map(|r| node_text(&r, source).to_string());
+                    // Include type_arguments (e.g. <String>) with the return type
+                    let ret_with_args = ret.map(|r| {
+                        let type_args = (0..child.named_child_count())
+                            .filter_map(|j| child.named_child(j))
+                            .find(|c| c.kind() == "type_arguments")
+                            .map(|a| node_text(&a, source).to_string());
+                        match type_args {
+                            Some(args) => format!("{}{}", r, args),
+                            None => r,
+                        }
+                    });
+                    let signature = match (&params, &ret_with_args) {
+                        (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
+                        (Some(p), None) => Some(p.clone()),
+                        _ => None,
+                    };
+                    return Some(ParsedNode {
+                        node_type: "method".into(),
+                        name,
+                        qualified_name,
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        code_content: truncate_code_content(node_text(node, source)).into_owned(),
+                        signature,
+                        doc_comment: get_preceding_comment(node, source),
+                        return_type: ret_with_args,
+                        param_types: params,
+                        is_test: false,
+                    });
+                }
+                "constructor_signature" => {
+                    let name = get_child_by_field(&child, "name", source)?;
+                    let qualified_name = match parent_class {
+                        Some(cls) => Some(format!("{}.{}", cls, name)),
+                        None => Some(name.clone()),
+                    };
+                    let params = child.child_by_field_name("parameters")
+                        .map(|p| node_text(&p, source).to_string());
+                    return Some(ParsedNode {
+                        node_type: "function".into(),
+                        name,
+                        qualified_name,
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        code_content: truncate_code_content(node_text(node, source)).into_owned(),
+                        signature: params.clone(),
+                        doc_comment: get_preceding_comment(node, source),
+                        return_type: None,
+                        param_types: params,
+                        is_test: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Extract a Dart function/constructor from a `declaration` node (class-body or top-level).
+/// declaration can contain function_signature, constructor_signature, etc.
+fn extract_dart_declaration(
+    node: &tree_sitter::Node,
+    source: &str,
+    parent_class: Option<&str>,
+) -> Option<ParsedNode> {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            match child.kind() {
+                "function_signature" => {
+                    let name = get_child_by_field(&child, "name", source)?;
+                    let node_type = if parent_class.is_some() { "method" } else { "function" };
+                    let qualified_name = match parent_class {
+                        Some(cls) => Some(format!("{}.{}", cls, name)),
+                        None => Some(name.clone()),
+                    };
+                    let params = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .find(|c| c.kind() == "formal_parameter_list")
+                        .map(|p| node_text(&p, source).to_string());
+                    let ret = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
+                        .map(|r| node_text(&r, source).to_string());
+                    let ret_with_args = ret.map(|r| {
+                        let type_args = (0..child.named_child_count())
+                            .filter_map(|j| child.named_child(j))
+                            .find(|c| c.kind() == "type_arguments")
+                            .map(|a| node_text(&a, source).to_string());
+                        match type_args {
+                            Some(args) => format!("{}{}", r, args),
+                            None => r,
+                        }
+                    });
+                    let signature = match (&params, &ret_with_args) {
+                        (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
+                        (Some(p), None) => Some(p.clone()),
+                        _ => None,
+                    };
+                    return Some(ParsedNode {
+                        node_type: node_type.into(),
+                        name,
+                        qualified_name,
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        code_content: truncate_code_content(node_text(node, source)).into_owned(),
+                        signature,
+                        doc_comment: get_preceding_comment(node, source),
+                        return_type: ret_with_args,
+                        param_types: params,
+                        is_test: false,
+                    });
+                }
+                "constructor_signature" => {
+                    let name = get_child_by_field(&child, "name", source)?;
+                    let qualified_name = match parent_class {
+                        Some(cls) => Some(format!("{}.{}", cls, name)),
+                        None => Some(name.clone()),
+                    };
+                    let params = child.child_by_field_name("parameters")
+                        .map(|p| node_text(&p, source).to_string());
+                    return Some(ParsedNode {
+                        node_type: "function".into(),
+                        name,
+                        qualified_name,
+                        start_line: node.start_position().row as u32 + 1,
+                        end_line: node.end_position().row as u32 + 1,
+                        code_content: truncate_code_content(node_text(node, source)).into_owned(),
+                        signature: params.clone(),
+                        doc_comment: get_preceding_comment(node, source),
+                        return_type: None,
+                        param_types: params,
+                        is_test: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -49,6 +49,20 @@ fn walk_for_relations(
                 .map(|n| node_text(&n, source).to_string())
                 .or_else(|| Some("<anonymous>".to_string()))
         }
+        // Dart: function_body is a sibling of method_signature in class_body
+        // Look at previous sibling to find the method name
+        "function_body" if language == "dart" => {
+            node.prev_sibling()
+                .filter(|s| s.kind() == "method_signature")
+                .and_then(|s| {
+                    // method_signature -> function_signature -> name
+                    (0..s.named_child_count())
+                        .filter_map(|i| s.named_child(i))
+                        .find(|c| matches!(c.kind(), "function_signature" | "constructor_signature" | "getter_signature" | "setter_signature"))
+                        .and_then(|sig| sig.child_by_field_name("name"))
+                        .map(|n| node_text(&n, source).to_string())
+                })
+        }
         _ => None,
     };
 
@@ -208,6 +222,11 @@ fn walk_for_relations(
                     }
                 }
             }
+        }
+
+        // Dart: import 'dart:async'; import 'package:foo/bar.dart';
+        "import_or_export" if language == "dart" => {
+            extract_dart_imports(&node, source, results);
         }
 
         // Import statements
@@ -390,6 +409,14 @@ fn walk_for_relations(
                         }
                     }
                 }
+            }
+        }
+
+        // Dart: expression_statement with identifier + selector(argument_part) = function call
+        // e.g. fetchData() or result.transform() or print(result)
+        "expression_statement" if language == "dart" => {
+            if let Some(scope) = active_scope {
+                extract_dart_calls(&node, source, scope, results);
             }
         }
 
@@ -1193,6 +1220,124 @@ fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option
         }
     }
     None
+}
+
+/// Extract Dart import targets from `import_or_export` nodes.
+/// AST: import_or_export -> library_import -> import_specification -> configurable_uri/uri -> string_literal
+fn extract_dart_imports(
+    node: &tree_sitter::Node,
+    source: &str,
+    results: &mut Vec<ParsedRelation>,
+) {
+    fn find_uri_string(node: &tree_sitter::Node, source: &str) -> Option<String> {
+        if node.kind() == "string_literal" {
+            let text = node_text(node, source);
+            // Strip quotes: 'dart:async' -> dart:async
+            let trimmed = text.trim_matches('\'').trim_matches('"');
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                if let Some(result) = find_uri_string(&child, source) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    if let Some(uri) = find_uri_string(node, source) {
+        // Extract meaningful name: 'dart:async' -> 'async', 'package:foo/bar.dart' -> 'bar'
+        let import_name = if let Some(rest) = uri.strip_prefix("dart:") {
+            rest.to_string()
+        } else if let Some(rest) = uri.strip_prefix("package:") {
+            // package:foo/bar.dart -> last segment without .dart
+            rest.rsplit('/').next()
+                .unwrap_or(rest)
+                .trim_end_matches(".dart")
+                .to_string()
+        } else {
+            // Relative import: 'src/utils.dart' -> 'utils'
+            uri.rsplit('/').next()
+                .unwrap_or(&uri)
+                .trim_end_matches(".dart")
+                .to_string()
+        };
+        if !import_name.is_empty() {
+            results.push(ParsedRelation {
+                source_name: "<module>".into(),
+                target_name: import_name,
+                relation: REL_IMPORTS.into(),
+                metadata: None,
+            });
+        }
+    }
+}
+
+/// Extract Dart function/method calls from expression_statement nodes.
+/// Dart calls: identifier + selector(argument_part) = simple call
+/// identifier + selector(unconditional_assignable_selector(identifier)) + selector(argument_part) = method call
+fn extract_dart_calls(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: &str,
+    results: &mut Vec<ParsedRelation>,
+) {
+    // Walk children to find the pattern: identifier followed by selectors
+    let child_count = node.named_child_count();
+    if child_count < 2 { return; }
+
+    // First named child should be an identifier (the call target or receiver)
+    let first = match node.named_child(0) {
+        Some(c) if c.kind() == "identifier" => c,
+        _ => return,
+    };
+
+    // Check if any selector has an argument_part (making this a call)
+    let mut has_call = false;
+    let mut last_method_name: Option<String> = None;
+
+    for i in 1..child_count {
+        if let Some(sel) = node.named_child(i) {
+            if sel.kind() == "selector" {
+                // Check for argument_part (indicates a function call)
+                for j in 0..sel.named_child_count() {
+                    if let Some(inner) = sel.named_child(j) {
+                        if inner.kind() == "argument_part" {
+                            has_call = true;
+                        }
+                        // unconditional_assignable_selector contains the method name: .transform
+                        if inner.kind() == "unconditional_assignable_selector"
+                            || inner.kind() == "conditional_assignable_selector"
+                        {
+                            for k in 0..inner.named_child_count() {
+                                if let Some(id) = inner.named_child(k) {
+                                    if id.kind() == "identifier" {
+                                        last_method_name = Some(node_text(&id, source).to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if has_call {
+        let callee = last_method_name
+            .unwrap_or_else(|| node_text(&first, source).to_string());
+        if !callee.is_empty() {
+            results.push(ParsedRelation {
+                source_name: scope.to_string(),
+                target_name: callee,
+                relation: REL_CALLS.into(),
+                metadata: None,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
