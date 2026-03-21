@@ -82,6 +82,10 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_refs(&project_root, &args)
         }
+        Some("benchmark") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
@@ -115,7 +119,8 @@ fn print_help() {
     println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    incremental-index   Run incremental index update");
-    println!("    health-check        Query index status\n");
+    println!("    health-check        Query index status");
+    println!("    benchmark           Benchmark index speed, query latency, token savings\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview)");
