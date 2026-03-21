@@ -1254,6 +1254,7 @@ impl McpServer {
             "project_map" => self.tool_project_map(args),
             "ast_search" => self.tool_ast_search(args),
             "find_references" => self.tool_find_references(args),
+            "find_dead_code" => self.tool_find_dead_code(args),
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
         let elapsed = start.elapsed();

@@ -6,7 +6,7 @@ use serde_json::json;
 /// are still callable via tools/call but hidden from tools/list to save tokens.
 /// Merged tools (find_http_route → trace_http_chain, read_snippet → get_ast_node)
 /// remain callable as aliases for backward compatibility.
-pub const TOOL_COUNT: usize = 11;
+pub const TOOL_COUNT: usize = 12;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -170,6 +170,22 @@ impl ToolRegistry {
                     "required": ["symbol_name"]
                 }),
             },
+            ToolDefinition {
+                name: "find_dead_code".into(),
+                description: "Find unused code: Orphan (no references, not exported) or Exported-Unused (exported but never called). Excludes main, modules, route handlers.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": { "type": "string", "description": "Scope: 'project' (default) or 'module'" },
+                        "path": { "type": "string", "description": "Directory/file path filter (e.g. 'src/auth/')" },
+                        "node_type": { "type": "string", "enum": ["fn", "class", "struct", "enum", "interface", "type", "const", "var"], "description": "Filter by node type" },
+                        "include_tests": { "type": "boolean", "description": "Include test symbols (default false)" },
+                        "min_lines": { "type": "integer", "description": "Minimum lines to report (default 3)" },
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+line only, no code (default true)" }
+                    },
+                    "required": []
+                }),
+            },
         ];
 
         Self { tools }
@@ -198,7 +214,7 @@ mod tests {
             "semantic_code_search", "get_call_graph", "trace_http_chain",
             "get_ast_node", "project_map", "impact_analysis",
             "module_overview", "dependency_graph", "find_similar_code",
-            "ast_search", "find_references",
+            "ast_search", "find_references", "find_dead_code",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }

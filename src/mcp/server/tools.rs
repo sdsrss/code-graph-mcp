@@ -1651,6 +1651,98 @@ impl McpServer {
         }))
     }
 
+    pub(super) fn tool_find_dead_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let path = args["path"].as_str();
+        let node_type = args["node_type"].as_str();
+        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
+        let min_lines = args["min_lines"].as_u64().unwrap_or(3) as u32;
+        let compact = args["compact"].as_bool().unwrap_or(true);
+
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+        }
+
+        let results = queries::find_dead_code(
+            self.db.conn(),
+            path,
+            node_type,
+            include_tests,
+            min_lines,
+            200,
+        )?;
+
+        if results.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": "No dead code found with the given filters."}]
+            }));
+        }
+
+        // Classify into orphans and exported-unused
+        let mut orphans: Vec<&queries::DeadCodeResult> = Vec::new();
+        let mut exported_unused: Vec<&queries::DeadCodeResult> = Vec::new();
+
+        for r in &results {
+            let is_exported = r.has_export_edge
+                || r.code_content.starts_with("pub ")
+                || r.code_content.starts_with("pub(")
+                || (r.file_path.ends_with(".go")
+                    && r.name.chars().next().map_or(false, |c| c.is_uppercase()));
+            if is_exported {
+                exported_unused.push(r);
+            } else {
+                orphans.push(r);
+            }
+        }
+
+        let mut output = String::new();
+        output.push_str(&format!("Dead code analysis: {} results ({} orphan, {} exported-unused)\n\n",
+            results.len(), orphans.len(), exported_unused.len()));
+
+        if !orphans.is_empty() {
+            output.push_str(&format!("## ORPHAN ({}) — no references, not exported\n", orphans.len()));
+            for r in &orphans {
+                let lines = r.end_line - r.start_line + 1;
+                output.push_str(&format!("- {} {} `{}` at {}:{} ({} lines)\n",
+                    r.node_type, if r.node_type == "function" || r.node_type == "method" { "fn" } else { "" },
+                    r.name, r.file_path, r.start_line, lines));
+                if !compact {
+                    // Show first 5 lines of code
+                    let code_lines: Vec<&str> = r.code_content.lines().take(5).collect();
+                    for line in &code_lines {
+                        output.push_str(&format!("    {}\n", line));
+                    }
+                    if r.code_content.lines().count() > 5 {
+                        output.push_str("    ...\n");
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        if !exported_unused.is_empty() {
+            output.push_str(&format!("## EXPORTED-UNUSED ({}) — exported/public but never called\n", exported_unused.len()));
+            for r in &exported_unused {
+                let lines = r.end_line - r.start_line + 1;
+                output.push_str(&format!("- {} {} `{}` at {}:{} ({} lines)\n",
+                    r.node_type, if r.node_type == "function" || r.node_type == "method" { "fn" } else { "" },
+                    r.name, r.file_path, r.start_line, lines));
+                if !compact {
+                    let code_lines: Vec<&str> = r.code_content.lines().take(5).collect();
+                    for line in &code_lines {
+                        output.push_str(&format!("    {}\n", line));
+                    }
+                    if r.code_content.lines().count() > 5 {
+                        output.push_str("    ...\n");
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": output.trim_end()}]
+        }))
+    }
+
     pub(super) fn tool_find_references(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let symbol_name = required_str(args, "symbol_name")?;
         let file_path = args["file_path"].as_str();
