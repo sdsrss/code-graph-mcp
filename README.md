@@ -9,9 +9,10 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **Call graph traversal** — Recursive CTE queries to trace callers/callees with cycle detection
 - **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go)
 - **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
-- **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates
-- **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview)
-- **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`)
+- **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates. Smart event filtering skips metadata-only changes (chmod, xattr)
+- **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview). Compact JSON output saves 15-20% tokens
+- **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`). Context reordered to prioritize structural relations over code for better embedding quality
+- **Self-healing** — Automatic SQLite corruption recovery with rebuild. Startup repair for incomplete indexing (Phase 3 failures)
 - **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, Windsurf, and other MCP clients
 - **Claude Code Plugin** — First-class plugin with slash commands (`/understand`, `/trace`, `/impact`), agents, skills, auto-indexing hooks, StatusLine integration, and self-updating
 
@@ -25,7 +26,7 @@ BLAKE3 Merkle tree tracks every file's content hash. On re-index, only changed f
 
 ### Hybrid Search, Not Just Grep
 
-Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-vec) via **Reciprocal Rank Fusion (RRF)** — so searching "handle user login" finds the right function even if it's named `authenticate_session`. Results are auto-compressed to fit LLM context windows.
+Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-vec) via **Reciprocal Rank Fusion (RRF)** with raw score blending — so searching "handle user login" finds the right function even if it's named `authenticate_session`. Results are auto-compressed to fit LLM context windows.
 
 ### Scope-Aware Relation Extraction
 
