@@ -1692,7 +1692,7 @@ impl McpServer {
         } // end estimated_tokens check
 
         if results.is_empty() {
-            let has_non_ascii = query.chars().any(|c| !c.is_ascii());
+            let has_non_ascii = !query.is_ascii();
             let hint = if has_non_ascii {
                 "Try using English keywords — the search index is English-optimized. Also try broader terms or check spelling."
             } else {
