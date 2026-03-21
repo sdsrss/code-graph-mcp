@@ -40,6 +40,27 @@ impl Database {
     }
 
     fn open_impl(path: &Path, enable_vec: bool) -> Result<Self> {
+        match Self::open_impl_inner(path, enable_vec) {
+            Ok(db) => Ok(db),
+            Err(e) if Self::is_corruption_error(&e) && path.exists() => {
+                tracing::warn!(
+                    "[db] Database corrupt ({}), deleting for rebuild: {}",
+                    path.display(), e
+                );
+                // Remove DB + WAL + SHM files — the index is a pure cache
+                std::fs::remove_file(path).ok();
+                let wal_path = path.with_extension("db-wal");
+                let shm_path = path.with_extension("db-shm");
+                if wal_path.exists() { std::fs::remove_file(&wal_path).ok(); }
+                if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
+                // Retry once with a fresh database
+                Self::open_impl_inner(path, enable_vec)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_impl_inner(path: &Path, enable_vec: bool) -> Result<Self> {
         // Always register sqlite-vec extension (it's process-global anyway via auto_extension)
         register_sqlite_vec();
 
@@ -114,6 +135,28 @@ impl Database {
         conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
 
         Ok(Self { conn, vec_enabled: enable_vec })
+    }
+
+    /// Check if an error indicates SQLite database corruption.
+    /// Used to decide whether to auto-delete and rebuild the index cache.
+    fn is_corruption_error(e: &anyhow::Error) -> bool {
+        let msg = e.to_string();
+        if msg.contains("malformed") || msg.contains("corrupt") || msg.contains("not a database") {
+            return true;
+        }
+        if let Some(sqlite_err) = e.downcast_ref::<rusqlite::Error>() {
+            return matches!(
+                sqlite_err,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::DatabaseCorrupt, .. },
+                    _
+                ) | rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::NotADatabase, .. },
+                    _
+                )
+            );
+        }
+        false
     }
 
     pub fn conn(&self) -> &Connection {
@@ -252,6 +295,59 @@ mod tests {
             "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(name, "hello");
+    }
+
+    #[test]
+    fn test_corrupt_db_auto_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        // Write garbage to simulate corruption
+        std::fs::write(&db_path, b"this is not a valid sqlite database").unwrap();
+        // Should auto-delete and recreate instead of crashing
+        let db = Database::open(&db_path).unwrap();
+        // Verify it works — tables were created
+        let tables: Vec<String> = db.conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"files".to_string()), "Expected 'files' table after recovery");
+        assert!(tables.contains(&"nodes".to_string()), "Expected 'nodes' table after recovery");
+    }
+
+    #[test]
+    fn test_corrupt_db_removes_wal_and_shm() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        // Create corrupt DB + stale WAL/SHM files
+        std::fs::write(&db_path, b"not a database").unwrap();
+        std::fs::write(&wal_path, b"stale wal").unwrap();
+        std::fs::write(&shm_path, b"stale shm").unwrap();
+        // Recovery should clean up stale WAL and SHM before recreating
+        let _db = Database::open(&db_path).unwrap();
+        // The new connection creates a fresh WAL (because we use PRAGMA journal_mode=WAL),
+        // but the stale content must be gone — verify the WAL is not our sentinel value
+        if wal_path.exists() {
+            let content = std::fs::read(&wal_path).unwrap();
+            assert_ne!(content, b"stale wal", "Stale WAL content should be replaced");
+        }
+        // SHM may or may not be recreated depending on WAL activity
+        if shm_path.exists() {
+            let content = std::fs::read(&shm_path).unwrap();
+            assert_ne!(content, b"stale shm", "Stale SHM content should be replaced");
+        }
+    }
+
+    #[test]
+    fn test_non_corruption_error_still_propagates() {
+        // Opening a path where the parent dir doesn't exist is not corruption
+        let bad_path = Path::new("/nonexistent_dir_xyz/impossible/index.db");
+        let result = Database::open(bad_path);
+        assert!(result.is_err(), "Non-corruption errors should still propagate");
     }
 
     #[test]
