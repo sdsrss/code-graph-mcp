@@ -298,6 +298,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_corrupt_db_auto_recovery() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("index.db");
@@ -348,6 +349,271 @@ mod tests {
         let bad_path = Path::new("/nonexistent_dir_xyz/impossible/index.db");
         let result = Database::open(bad_path);
         assert!(result.is_err(), "Non-corruption errors should still propagate");
+    }
+
+    #[test]
+    fn test_v2_to_v3_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Create a v2 database manually:
+        // - nodes has name_tokens, return_type, param_types (added in v1->v2)
+        // - edges has UNIQUE(source_id, target_id, relation) -- old constraint without metadata
+        // - FTS5 has 8 columns but NO porter stemmer
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT,
+                    name_tokens TEXT, return_type TEXT, param_types TEXT
+                );
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT,
+                    UNIQUE(source_id, target_id, relation)
+                );
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    name_tokens, return_type, param_types,
+                    content='nodes', content_rowid='id'
+                );"
+            ).unwrap();
+
+            // Insert test data
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 1, 'typescript', 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'hello', 'hello', 1, 5, 'function hello() {}')",
+                [],
+            ).unwrap();
+            // Insert an edge to verify data preservation through table recreation
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (1, 1, 'calls', 'GET /api')",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        // Open with Database::open -- triggers v2->v3 (and v3->v4, v4->v5) migration
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify schema version updated to current
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        // Verify the new UNIQUE index exists on edges (includes metadata via COALESCE)
+        let idx_exists: bool = db.conn().query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_edges_unique'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(idx_exists, "idx_edges_unique should exist after v2->v3 migration");
+
+        // Verify that edges with same (source, target, relation) but different metadata are allowed
+        // (this was the whole point of v3: metadata is part of the unique constraint)
+        db.conn().execute(
+            "INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (1, 1, 'calls', 'POST /api')",
+            [],
+        ).unwrap();
+
+        // Verify existing edge data preserved
+        let edge_meta: String = db.conn().query_row(
+            "SELECT metadata FROM edges WHERE source_id = 1 AND metadata = 'GET /api'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(edge_meta, "GET /api");
+
+        // Verify existing node data preserved
+        let name: String = db.conn().query_row(
+            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(name, "hello");
+    }
+
+    #[test]
+    fn test_v3_to_v4_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Create a v3 database manually:
+        // - nodes has name_tokens, return_type, param_types
+        // - edges has the v3 UNIQUE constraint (includes metadata)
+        // - FTS5 has 8 columns but NO porter stemmer (plain tokenizer)
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT,
+                    name_tokens TEXT, return_type TEXT, param_types TEXT
+                );
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT
+                );
+                CREATE UNIQUE INDEX idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    name_tokens, return_type, param_types,
+                    content='nodes', content_rowid='id'
+                );"
+            ).unwrap();
+
+            // Insert test data with a word that tests porter stemming
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 1, 'typescript', 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'running', 'running', 1, 5, 'function running() {}')",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        // Open with Database::open -- triggers v3->v4 (and v4->v5) migration
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify schema version updated to current
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        // Verify porter stemming works: searching "run" should match "running"
+        let fts_count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'run'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(fts_count >= 1, "Porter stemmer should allow 'run' to match 'running'");
+
+        // Verify existing node data preserved
+        let name: String = db.conn().query_row(
+            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(name, "running");
+    }
+
+    #[test]
+    fn test_v4_to_v5_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Create a v4 database manually:
+        // - nodes has name_tokens, return_type, param_types (but NO is_test column)
+        // - edges has v3 UNIQUE constraint (includes metadata)
+        // - FTS5 has porter stemmer
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT,
+                    name_tokens TEXT, return_type TEXT, param_types TEXT
+                );
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT
+                );
+                CREATE UNIQUE INDEX idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    name_tokens, return_type, param_types,
+                    content='nodes', content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+                CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN
+                    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+                END;
+                CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+                END;
+                CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+                    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+                END;"
+            ).unwrap();
+
+            // Insert test data
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 1, 'typescript', 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'myFunc', 'myFunc', 1, 5, 'function myFunc() {}')",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        // Open with Database::open -- triggers v4->v5 migration
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify schema version updated to current
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        // Verify is_test column exists and defaults to 0 for existing rows
+        let is_test: i32 = db.conn().query_row(
+            "SELECT is_test FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(is_test, 0, "is_test should default to 0 for existing rows");
+
+        // Verify we can set is_test to 1
+        db.conn().execute("UPDATE nodes SET is_test = 1 WHERE id = 1", []).unwrap();
+        let is_test_updated: i32 = db.conn().query_row(
+            "SELECT is_test FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(is_test_updated, 1);
+
+        // Verify existing node data preserved
+        let name: String = db.conn().query_row(
+            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(name, "myFunc");
     }
 
     #[test]
