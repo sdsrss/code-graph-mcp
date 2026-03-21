@@ -322,7 +322,7 @@ struct GrepMatch {
 
 /// Parse ripgrep JSON output into structured matches.
 fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
-    let root_str = project_root.to_str().unwrap_or("");
+    let root_str = project_root.to_string_lossy().into_owned();
     let mut matches = Vec::new();
     for line in stdout.split(|&b| b == b'\n') {
         if line.is_empty() {
@@ -345,7 +345,7 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
 
         // Make path relative to project root
         let relative_path = path_str
-            .strip_prefix(root_str)
+            .strip_prefix(root_str.as_str())
             .unwrap_or(path_str)
             .trim_start_matches('/');
 
@@ -744,10 +744,16 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         writeln!(stdout, "{} ({})", root.name, root.file_path)?;
     }
 
-    // Group by direction
+    // Group by direction, deduplicate same (name, file, direction, depth)
+    // e.g. cfg-gated conditional compilation variants
+    let mut seen = std::collections::HashSet::new();
     for node in &display_nodes {
         if node.depth == 0 {
             continue;
+        }
+        let key = (&node.name, &node.file_path, node.direction.as_str(), node.depth);
+        if !seen.insert(key) {
+            continue; // skip duplicate (e.g. #[cfg] conditional compilation variants)
         }
         let arrow = match node.direction {
             crate::graph::query::Direction::Callers => "←",
@@ -829,7 +835,7 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     let routes: Vec<&&queries::CallerWithRouteInfo> = prod_callers.iter().filter(|c| c.route_info.is_some()).collect();
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
 
-    let risk = crate::domain::compute_risk_level(direct_callers, routes.len(), change_type == "remove");
+    let risk = crate::domain::compute_risk_level(prod_callers.len(), routes.len(), change_type == "remove");
 
     let mut stdout = std::io::stdout().lock();
 
@@ -1251,8 +1257,25 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let outgoing: Vec<&_> = deps.iter().filter(|d| d.direction == "outgoing").collect();
-    let incoming: Vec<&_> = deps.iter().filter(|d| d.direction == "incoming").collect();
+    // Filter out cross-language false edges (name-based resolution artifacts)
+    let root_lang = crate::utils::config::detect_language(file_path);
+    let is_compatible_lang = |dep_path: &str| -> bool {
+        let dep_lang = crate::utils::config::detect_language(dep_path);
+        match (root_lang, dep_lang) {
+            (None, _) | (_, None) => true,
+            (Some(a), Some(b)) if a == b => true,
+            (Some(a), Some(b)) if matches!((a, b),
+                ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx")
+            ) => true,
+            (Some(a), Some(b)) if matches!((a, b),
+                ("c" | "cpp", "c" | "cpp")
+            ) => true,
+            _ => false,
+        }
+    };
+
+    let outgoing: Vec<&_> = deps.iter().filter(|d| d.direction == "outgoing" && is_compatible_lang(&d.file_path)).collect();
+    let incoming: Vec<&_> = deps.iter().filter(|d| d.direction == "incoming" && is_compatible_lang(&d.file_path)).collect();
 
     let mut stdout = std::io::stdout().lock();
 
@@ -1474,6 +1497,7 @@ mod tests {
             name_tokens: None,
             return_type: Some("Result<Value>".into()),
             param_types: Some("name: &str, value: i64".into()),
+            is_test: false,
         };
         let formatted = format_node_compact(&node, "src/lib.rs");
         assert!(formatted.contains("fn MyClass::foo"));

@@ -20,6 +20,11 @@ pub const INDEX_VERSION: i32 = 3;
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
 
+// -- Token estimation --
+/// Approximate characters per token for code content (1 token ≈ 3 chars).
+/// Used for token budget estimation across compression and search.
+pub const CHARS_PER_TOKEN: usize = 3;
+
 // -- Parsing limits --
 pub const MAX_AST_DEPTH: usize = 64;
 pub const MAX_RELATION_DEPTH: usize = 256;

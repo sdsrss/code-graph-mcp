@@ -13,11 +13,11 @@ pub type EdgeInfo = (String, String, String, Option<String>);
 // --- Shared helpers ---
 
 const NODE_SELECT: &str =
-    "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types";
+    "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types, is_test";
 
 /// NODE_SELECT with `n.` table alias prefix on every column (for JOINs).
 const NODE_SELECT_ALIASED: &str =
-    "n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line, n.code_content, n.signature, n.doc_comment, n.context_string, n.name_tokens, n.return_type, n.param_types";
+    "n.id, n.file_id, n.type, n.name, n.qualified_name, n.start_line, n.end_line, n.code_content, n.signature, n.doc_comment, n.context_string, n.name_tokens, n.return_type, n.param_types, n.is_test";
 
 fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
     Ok(NodeResult {
@@ -35,6 +35,7 @@ fn map_node_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeResult> {
         name_tokens: row.get(11)?,
         return_type: row.get(12)?,
         param_types: row.get(13)?,
+        is_test: row.get::<_, i32>(14)? != 0,
     })
 }
 
@@ -138,6 +139,9 @@ pub struct NodeResult {
     pub name_tokens: Option<String>,
     pub return_type: Option<String>,
     pub param_types: Option<String>,
+    /// Whether this node is inside a test context (stored in DB since schema v5).
+    /// Stored as INTEGER in SQLite (0/1).
+    pub is_test: bool,
 }
 
 // --- Edge records ---
@@ -247,8 +251,8 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     let rows = stmt.query_map([name], |row| {
         Ok(NodeWithFile {
             node: map_node_row(row)?,
-            file_path: row.get(14)?,
-            language: row.get(15)?,
+            file_path: row.get(15)?,
+            language: row.get(16)?,
         })
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
@@ -594,8 +598,8 @@ pub fn get_nodes_with_files_by_filters(
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(NodeWithFile {
             node: map_node_row(row)?,
-            file_path: row.get(14)?,
-            language: row.get(15)?,
+            file_path: row.get(15)?,
+            language: row.get(16)?,
         })
     })?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
@@ -692,8 +696,8 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(NodeWithFile {
                 node: map_node_row(row)?,
-                file_path: row.get(14)?,
-                language: row.get(15)?,
+                file_path: row.get(15)?,
+                language: row.get(16)?,
             })
         })?;
         for row in rows {
@@ -1367,6 +1371,8 @@ const FTS_STOP_WORDS: &[&str] = &[
 /// FTS5 search result with quality metadata.
 pub struct FtsResult {
     pub nodes: Vec<NodeResult>,
+    /// Raw BM25 scores (negated so higher = better match), parallel to `nodes`.
+    pub bm25_scores: Vec<f64>,
     /// True if AND mode failed and OR fallback was used (weaker match).
     pub or_fallback: bool,
 }
@@ -1406,34 +1412,45 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         .collect();
     // Empty/whitespace-only queries would cause FTS5 MATCH error
     if terms.is_empty() {
-        return Ok(FtsResult { nodes: vec![], or_fallback: false });
+        return Ok(FtsResult { nodes: vec![], bm25_scores: vec![], or_fallback: false });
     }
 
     let test_filter = if exclude_tests { " AND n.is_test = 0" } else { "" };
+    // Include BM25 score in SELECT for raw score blending in RRF fusion
+    let bm25_expr = "bm25(nodes_fts, 5.0, 3.0, 2.0, 2.0, 1.0, 5.0, 1.0, 1.0)";
     let sql = format!(
-        "SELECT {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1{}
-         -- BM25 weights: name(5), qualified_name(3), code_content(2), context_string(2), doc_comment(1), name_tokens(5), return_type(1), param_types(1)
-         ORDER BY bm25(nodes_fts, 5.0, 3.0, 2.0, 2.0, 1.0, 5.0, 1.0, 1.0) LIMIT ?2",
-        NODE_SELECT_ALIASED, test_filter
+        "SELECT {}, {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1{}
+         ORDER BY {} LIMIT ?2",
+        NODE_SELECT_ALIASED, bm25_expr, test_filter, bm25_expr
     );
+
+    // Row mapper: map_node_row for columns 0..14 (including is_test), BM25 score at column 15
+    let map_row_with_bm25 = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(NodeResult, f64)> {
+        let node = map_node_row(row)?;
+        // BM25 returns negative values (more negative = better); negate for positive scores
+        let bm25: f64 = row.get(15)?;
+        Ok((node, -bm25))
+    };
 
     // Strategy: AND-first for multi-term queries (higher precision), fallback to OR
     if terms.len() > 1 {
         let and_query = terms.join(" AND ");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![and_query, limit], map_node_row)?;
-        let results: Vec<NodeResult> = rows.collect::<Result<Vec<_>, _>>()?;
-        if results.len() >= (limit as usize / 2).max(1) {
-            return Ok(FtsResult { nodes: results, or_fallback: false });
+        let rows = stmt.query_map(rusqlite::params![and_query, limit], map_row_with_bm25)?;
+        let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
+        if pairs.len() >= (limit as usize / 2).max(1) {
+            let (nodes, bm25_scores): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+            return Ok(FtsResult { nodes, bm25_scores, or_fallback: false });
         }
         // Fallback: OR gives broader recall
     }
 
     let or_query = terms.join(" OR ");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![or_query, limit], map_node_row)?;
-    let results = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(FtsResult { nodes: results, or_fallback: terms.len() > 1 })
+    let rows = stmt.query_map(rusqlite::params![or_query, limit], map_row_with_bm25)?;
+    let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
+    let (nodes, bm25_scores): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    Ok(FtsResult { nodes, bm25_scores, or_fallback: terms.len() > 1 })
 }
 
 /// Find nodes that are missing context strings (likely from a failed Phase 3).

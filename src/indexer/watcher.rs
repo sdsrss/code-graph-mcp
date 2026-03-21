@@ -1,7 +1,19 @@
 use anyhow::Result;
 use notify::{Watcher, RecursiveMode, Event, EventKind};
+use notify::event::ModifyKind;
 use std::path::Path;
 use std::sync::mpsc;
+
+/// Check if a file system event kind represents a content change (not just metadata/access).
+fn is_content_event(kind: &EventKind) -> bool {
+    matches!(kind,
+        EventKind::Create(_)
+        | EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Modify(ModifyKind::Any) // catch-all for platforms that don't distinguish
+    )
+}
 
 pub enum WatchEvent {
     Changed(Vec<String>),
@@ -17,11 +29,10 @@ impl FileWatcher {
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    // Only react to content-modifying events, not metadata/access
-                    if !matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) {
+                    // Only react to content-modifying events.
+                    // Skip metadata-only changes (chmod, xattr) and access events
+                    // which would trigger unnecessary incremental index scans.
+                    if !is_content_event(&event.kind) {
                         return;
                     }
                     // Convert to relative paths for consistency with the indexer pipeline.

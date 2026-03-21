@@ -20,7 +20,7 @@ pub enum CompressedOutput {
     Directories(Vec<GroupedResult>),
 }
 
-/// Estimate token count for results (1 token ~ 3 chars for code).
+/// Estimate token count for results using CHARS_PER_TOKEN ratio.
 /// context_string already includes name, signature, and code_content,
 /// so we use it exclusively when available to avoid double-counting.
 fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
@@ -30,13 +30,13 @@ fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
             |ctx| ctx.len(),
         )
     }).sum();
-    total_chars / 3
+    total_chars / crate::domain::CHARS_PER_TOKEN
 }
 
-/// Estimate token count for a JSON value (1 token ~ 3 chars for code)
+/// Estimate token count for a JSON value using CHARS_PER_TOKEN ratio.
 pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
     match serde_json::to_string(value) {
-        Ok(s) => s.len() / 3,
+        Ok(s) => s.len() / crate::domain::CHARS_PER_TOKEN,
         Err(_) => 1, // conservative non-zero estimate on serialization failure
     }
 }
@@ -177,6 +177,7 @@ mod tests {
             name_tokens: None,
             return_type: None,
             param_types: None,
+            is_test: false,
         }
     }
 

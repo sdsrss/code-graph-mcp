@@ -41,7 +41,7 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             cache.insert(language.to_string(), p);
         }
         let parser = cache.get_mut(language)
-            .expect("parser was just inserted");
+            .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
         parser.parse(source, None)
             .ok_or_else(|| anyhow!("parse failed or timed out"))
     })

@@ -873,19 +873,26 @@ fn index_files(
             nodes.into_iter().map(|nwf| (nwf.node.id, nwf.node)).collect()
         };
 
-        // Phase 3a: Build all context strings (CPU-bound, can be parallelized later)
-        let mut context_updates: Vec<(i64, String)> = Vec::with_capacity(all_node_ids.len());
-        for fi in &all_indexed {
-            for (idx, &node_id) in fi.node_ids.iter().enumerate() {
-                let node_name = &fi.node_names[idx];
+        // Phase 3a: Build all context strings (CPU-bound, parallelized with rayon)
+        // Flatten to (node_id, node_name, file_path) tuples for parallel iteration
+        let node_tasks: Vec<(i64, &str, &str)> = all_indexed.iter()
+            .flat_map(|fi| {
+                fi.node_ids.iter().enumerate().map(move |(idx, &node_id)| {
+                    (node_id, fi.node_names[idx].as_str(), fi.rel_path.as_str())
+                })
+            })
+            .collect();
+
+        let context_updates: Vec<(i64, String)> = node_tasks.par_iter()
+            .map(|&(node_id, node_name, file_path)| {
                 let edges = all_edges.get(&node_id);
                 let cat = categorize_edges(edges, format_route_from_metadata);
                 let node_detail = all_node_details.get(&node_id);
 
                 let ctx = build_context_string(&NodeContext {
                     node_type: node_detail.map(|n| n.node_type.clone()).unwrap_or_default(),
-                    name: node_name.clone(),
-                    file_path: fi.rel_path.clone(),
+                    name: node_name.to_string(),
+                    file_path: file_path.to_string(),
                     signature: node_detail.and_then(|n| n.signature.clone()),
                     code_content: node_detail.map(|n| n.code_content.clone()),
                     routes: cat.routes,
@@ -898,9 +905,9 @@ fn index_files(
                     doc_comment: node_detail.and_then(|n| n.doc_comment.clone()),
                 });
 
-                context_updates.push((node_id, ctx));
-            }
-        }
+                (node_id, ctx)
+            })
+            .collect();
 
         // Phase 3b: Batch update context strings in DB
         update_context_strings_batch(db.conn(), &context_updates)?;

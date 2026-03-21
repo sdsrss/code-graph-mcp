@@ -10,9 +10,20 @@ fn pid_is_alive(pid: u32) -> bool {
     // Linux: fast /proc check
     #[cfg(target_os = "linux")]
     { Path::new(&format!("/proc/{}", pid)).exists() }
-    // Non-Linux fallback: conservative — assume alive to prevent dual-primary.
-    // Stale locks are reclaimed only on Linux or via manual cleanup.
-    #[cfg(not(target_os = "linux"))]
+    // macOS/Unix (non-Linux): use `kill -0 <pid>` to check if process exists.
+    // Exit code 0 = process exists, non-zero = no such process.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true) // if command fails, conservatively assume alive
+    }
+    // Windows/other: conservative — assume alive to prevent dual-primary.
+    #[cfg(not(unix))]
     { let _ = pid; true }
 }
 
@@ -178,8 +189,8 @@ fn centralized_compress(value: serde_json::Value) -> serde_json::Value {
 /// Recursively truncate string values in a JSON value to stay within a token budget.
 /// Adds a `_truncated` key to the top-level object when truncation occurs.
 fn truncate_large_strings(value: serde_json::Value, token_budget: usize) -> serde_json::Value {
-    // Target: reduce to roughly token_budget * 3 chars total
-    let target_chars = token_budget * 3;
+    // Target: reduce to roughly token_budget * CHARS_PER_TOKEN chars total
+    let target_chars = token_budget * crate::domain::CHARS_PER_TOKEN;
     let serialized = serde_json::to_string(&value).unwrap_or_default();
     if serialized.len() <= target_chars {
         return value;
@@ -314,6 +325,8 @@ pub struct McpServer {
     startup_indexing_done: Arc<(Mutex<bool>, Condvar)>,
     /// Pending result from background startup indexing, consumed by post-index processing.
     startup_index_result: Arc<Mutex<Option<StartupIndexResult>>>,
+    /// Error message from a failed background startup indexing attempt.
+    startup_index_error: Arc<Mutex<Option<String>>>,
     /// Last indexing stats (skipped files, truncations) for observability.
     last_index_stats: Mutex<IndexStats>,
     /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
@@ -378,6 +391,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            startup_index_error: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
@@ -404,6 +418,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            startup_index_error: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
@@ -432,6 +447,7 @@ impl McpServer {
             startup_indexing: Arc::new(AtomicBool::new(false)),
             startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
             startup_index_result: Arc::new(Mutex::new(None)),
+            startup_index_error: Arc::new(Mutex::new(None)),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             cached_project_map: Mutex::new(None),
@@ -539,7 +555,7 @@ impl McpServer {
         }
 
         // Reset condvar done flag for this indexing session
-        *self.startup_indexing_done.0.lock().unwrap() = false;
+        *lock_or_recover(&self.startup_indexing_done.0, "startup_indexing_done") = false;
 
         if has_existing_index {
             self.send_log("info", "Updating index in background (incremental)...");
@@ -551,6 +567,7 @@ impl McpServer {
         let indexing_flag = Arc::clone(&self.startup_indexing);
         let done_signal = Arc::clone(&self.startup_indexing_done);
         let result_slot = Arc::clone(&self.startup_index_result);
+        let error_slot = Arc::clone(&self.startup_index_error);
         let progress_file = project_root.join(".code-graph").join("indexing-status.json");
 
         std::thread::spawn(move || {
@@ -626,7 +643,11 @@ impl McpServer {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Background indexing failed: {}", e);
+                    let msg = format!("Background indexing failed: {}", e);
+                    tracing::error!("{}", msg);
+                    if let Ok(mut slot) = error_slot.lock() {
+                        *slot = Some(msg);
+                    }
                 }
             }
             // _guard drop: clears flag, removes progress file, signals condvar
@@ -638,6 +659,11 @@ impl McpServer {
     fn consume_startup_index_result(&self) {
         if self.startup_indexing.load(Ordering::Acquire) {
             return; // still running
+        }
+
+        // Check for indexing errors and surface them to the MCP client
+        if let Some(err_msg) = lock_or_recover(&self.startup_index_error, "startup_error").take() {
+            self.send_log("error", &err_msg);
         }
 
         let result = lock_or_recover(&self.startup_index_result, "startup_result").take();
@@ -1118,7 +1144,14 @@ impl McpServer {
                 "\n",
                 "Still use Grep: exact strings, constants, regex, non-code files.\n",
                 "Still use Read: specific file you will edit.\n",
-                "MCP tools also available for programmatic access with compact=true option."
+                "MCP tools also available for programmatic access with compact=true option.\n",
+                "\n",
+                "Workflow tips:\n",
+                "  1. Start with project_map (compact=true) for architecture overview\n",
+                "  2. Use semantic_code_search with compact=true first \u{2014} saves tokens\n",
+                "  3. Expand results: get_ast_node(node_id=N) to read specific symbols\n",
+                "  4. Before changes: impact_analysis to check blast radius\n",
+                "  Prompts available: impact-analysis, understand-module, trace-request"
             )
         }))
     }
@@ -1149,7 +1182,7 @@ impl McpServer {
 
         match self.handle_tool(tool_name, arguments) {
             Ok(result) => {
-                let text = serde_json::to_string_pretty(&result)
+                let text = serde_json::to_string(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
                 JsonRpcResponse::success(id, json!({
                     "content": [{
@@ -1407,9 +1440,13 @@ impl McpServer {
         let fts_result = queries::fts5_search(self.db.conn(), query, fetch_count)?;
         let fts_or_fallback = fts_result.or_fallback;
 
-        // Convert to SearchResult for RRF
+        // Convert to SearchResult for RRF, carrying raw BM25 scores for score blending
         let fts_search: Vec<crate::search::fusion::SearchResult> = fts_result.nodes.iter()
-            .map(|r| crate::search::fusion::SearchResult { node_id: r.id, score: 0.0 })
+            .enumerate()
+            .map(|(i, r)| crate::search::fusion::SearchResult {
+                node_id: r.id,
+                score: fts_result.bm25_scores.get(i).copied().unwrap_or(0.0),
+            })
             .collect();
 
         // Vector search (if embedding model available and vec enabled)
@@ -1421,8 +1458,9 @@ impl McpServer {
                         Ok(query_embedding) => {
                             queries::vector_search(self.db.conn(), &query_embedding, fetch_count)?
                                 .iter()
-                                .map(|(node_id, _distance)| {
-                                    crate::search::fusion::SearchResult { node_id: *node_id, score: 0.0 }
+                                .map(|(node_id, distance)| {
+                                    // Convert distance to similarity: 1.0 - distance (L2-normalized vectors)
+                                    crate::search::fusion::SearchResult { node_id: *node_id, score: 1.0 - distance }
                                 })
                                 .collect()
                         }
@@ -1591,7 +1629,7 @@ impl McpServer {
                     node.context_string.as_ref().map_or_else(
                         || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
                         |ctx| ctx.len(),
-                    ) / 3
+                    ) / crate::domain::CHARS_PER_TOKEN
                 })
                 .sum()
         };
@@ -1614,6 +1652,7 @@ impl McpServer {
                     name_tokens: node.name_tokens.clone(),
                     return_type: node.return_type.clone(),
                     param_types: node.param_types.clone(),
+                    is_test: node.is_test,
                 }
             }).collect();
             let file_paths: Vec<String> = matched.iter().map(|m| m.file_path.to_string()).collect();
@@ -1653,10 +1692,16 @@ impl McpServer {
         } // end estimated_tokens check
 
         if results.is_empty() {
+            let has_non_ascii = query.chars().any(|c| !c.is_ascii());
+            let hint = if has_non_ascii {
+                "Try using English keywords — the search index is English-optimized. Also try broader terms or check spelling."
+            } else {
+                "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
+            };
             return Ok(json!({
                 "results": [],
                 "message": "No matching symbols found.",
-                "hint": "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
+                "hint": hint
             }));
         }
 
@@ -2085,15 +2130,20 @@ impl McpServer {
             .filter(|c| c.route_info.is_some())
             .count();
 
+        let test_callers_count = callers.len() - prod_callers.len();
         let risk = crate::domain::compute_risk_level(prod_callers.len(), affected_routes, false);
 
-        result["impact"] = json!({
+        let mut impact = json!({
             "risk_level": risk,
             "direct_callers": prod_callers.iter().filter(|c| c.depth == 1).count(),
             "transitive_callers": prod_callers.iter().filter(|c| c.depth > 1).count(),
             "affected_files": affected_files.len(),
             "affected_routes": affected_routes,
         });
+        if test_callers_count > 0 {
+            impact["test_callers_filtered"] = json!(test_callers_count);
+        }
+        result["impact"] = impact;
         Ok(())
     }
 
@@ -2639,8 +2689,29 @@ impl McpServer {
 
         let deps = queries::get_import_tree(self.db.conn(), file_path, direction, depth)?;
 
+        // Filter out cross-language false edges (e.g. Rust file "calling" a JS function
+        // due to name-based resolution matching common names like `update`, `read`, etc.)
+        let root_lang = crate::utils::config::detect_language(file_path);
+        let is_compatible_lang = |dep_path: &str| -> bool {
+            let dep_lang = crate::utils::config::detect_language(dep_path);
+            match (root_lang, dep_lang) {
+                (None, _) | (_, None) => true, // unknown language → keep
+                (Some(a), Some(b)) if a == b => true,
+                // JS/TS family can cross-reference
+                (Some(a), Some(b)) if matches!((a, b),
+                    ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx")
+                ) => true,
+                // C/C++ family can cross-reference
+                (Some(a), Some(b)) if matches!((a, b),
+                    ("c" | "cpp", "c" | "cpp")
+                ) => true,
+                _ => false,
+            }
+        };
+
         let outgoing: Vec<serde_json::Value> = deps.iter()
             .filter(|d| d.direction == "outgoing")
+            .filter(|d| is_compatible_lang(&d.file_path))
             .map(|d| {
                 let mut obj = json!({
                     "file": d.file_path,
@@ -2657,6 +2728,7 @@ impl McpServer {
 
         let incoming: Vec<serde_json::Value> = deps.iter()
             .filter(|d| d.direction == "incoming")
+            .filter(|d| is_compatible_lang(&d.file_path))
             .map(|d| {
                 let mut obj = json!({
                     "file": d.file_path,
@@ -2740,26 +2812,32 @@ impl McpServer {
         // Search for similar vectors
         let results = queries::vector_search(self.db.conn(), &embedding, top_k + 1)?; // +1 to exclude self
 
-        // Filter and format results (skip self, module nodes, and over-distance)
-        let similar: Vec<serde_json::Value> = results.iter()
+        // Pre-filter by distance and self, then batch-fetch nodes with file paths
+        let candidates: Vec<(i64, f64)> = results.iter()
             .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
+            .map(|(id, dist)| (*id, *dist))
+            .collect();
+        let candidate_ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+        let nodes_with_files = queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
+        let node_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
+            nodes_with_files.iter().map(|nf| (nf.node.id, nf)).collect();
+
+        let similar: Vec<serde_json::Value> = candidates.iter()
             .filter_map(|(id, distance)| {
-                queries::get_node_by_id(self.db.conn(), *id).ok().flatten().map(|node| (node, *distance))
-            })
-            .filter(|(node, _)| !(node.node_type == "module" && node.name == "<module>"))
-            .filter_map(|(node, distance)| {
-                let file_path = queries::get_file_path(self.db.conn(), node.file_id)
-                    .ok().flatten().unwrap_or_default();
-                if is_test_symbol(&node.name, &file_path) {
+                let nf = node_map.get(id)?;
+                if nf.node.node_type == "module" && nf.node.name == "<module>" {
+                    return None;
+                }
+                if is_test_symbol(&nf.node.name, &nf.file_path) {
                     return None;
                 }
                 let similarity = 1.0 / (1.0 + distance);
                 Some(json!({
-                    "node_id": node.id,
-                    "name": node.name,
-                    "type": node.node_type,
-                    "file_path": file_path,
-                    "start_line": node.start_line,
+                    "node_id": nf.node.id,
+                    "name": nf.node.name,
+                    "type": nf.node.node_type,
+                    "file_path": nf.file_path,
+                    "start_line": nf.node.start_line,
                     "similarity": (similarity * 10000.0).round() / 10000.0,
                     "distance": (distance * 10000.0).round() / 10000.0,
                 }))

@@ -17,26 +17,19 @@ pub struct NodeContext {
 pub fn build_context_string(info: &NodeContext) -> String {
     let mut parts = Vec::new();
 
-    // 1. Signature (always short, high value)
+    // Priority order optimized for embedding models with 512-token limits:
+    // High-value structural signals first, code content last (most likely to be truncated).
+
+    // 1. Signature (always short, high value for search matching)
     if let Some(sig) = &info.signature {
         parts.push(format!("signature: {}", sig));
     }
 
-    // 2. Code content (truncated to fit 512-token budget)
-    if let Some(code) = &info.code_content {
-        parts.push(format!("code: {}", code));
-    }
-
-    // 3. Doc comment
-    if let Some(doc) = &info.doc_comment {
-        parts.push(format!("doc: {}", doc));
-    }
-
-    // 4. Identity: type + name + file
+    // 2. Identity: type + name + file (critical for disambiguation)
     parts.push(format!("{} {}", info.node_type, info.name));
     parts.push(format!("in {}", info.file_path));
 
-    // 5. Graph relations (fill remaining space, capped to avoid bloat)
+    // 3. Graph relations (structural signals that survive truncation)
     const MAX_RELATIONS: usize = 10;
     if !info.routes.is_empty() {
         parts.push(format!("routes: {}", info.routes.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", ")));
@@ -61,6 +54,17 @@ pub fn build_context_string(info: &NodeContext) -> String {
     if !info.exports.is_empty() {
         parts.push(format!("exports: {}", info.exports.join(", ")));
     }
+
+    // 4. Doc comment (medium priority — often short enough to survive)
+    if let Some(doc) = &info.doc_comment {
+        parts.push(format!("doc: {}", doc));
+    }
+
+    // 5. Code content last (most likely to be truncated at 512 tokens, least loss)
+    if let Some(code) = &info.code_content {
+        parts.push(format!("code: {}", code));
+    }
+
     parts.join("\n")
 }
 
@@ -115,13 +119,13 @@ mod tests {
         };
         let ctx = build_context_string(&info);
         let sig_pos = ctx.find("signature:").unwrap();
-        let code_pos = ctx.find("code:").unwrap();
         let identity_pos = ctx.find("function handler").unwrap();
         let calls_pos = ctx.find("calls:").unwrap();
-        // Per spec 2.3: signature → code → doc → identity → graph relations
-        assert!(sig_pos < code_pos, "signature before code");
-        assert!(code_pos < identity_pos, "code before identity");
+        let code_pos = ctx.find("code:").unwrap();
+        // Priority: signature → identity → graph relations → doc → code (code last, truncation-safe)
+        assert!(sig_pos < identity_pos, "signature before identity");
         assert!(identity_pos < calls_pos, "identity before calls");
+        assert!(calls_pos < code_pos, "calls before code (code last for truncation safety)");
     }
 
     #[test]

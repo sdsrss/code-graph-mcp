@@ -298,7 +298,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_corrupt_db_auto_recovery() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("index.db");
