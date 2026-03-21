@@ -16,6 +16,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "cpp" | "cc" | "cxx" | "hpp" => Some("cpp"),
         "html" | "htm" => Some("html"),
         "css" => Some("css"),
+        "cs" => Some("csharp"),
         _ => None,
     }
 }
@@ -37,6 +38,7 @@ mod tests {
         assert_eq!(detect_language("main.cpp"), Some("cpp"));
         assert_eq!(detect_language("index.html"), Some("html"));
         assert_eq!(detect_language("style.css"), Some("css"));
+        assert_eq!(detect_language("Program.cs"), Some("csharp"));
         assert_eq!(detect_language("image.png"), None);
     }
 

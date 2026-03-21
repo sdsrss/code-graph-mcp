@@ -35,7 +35,8 @@ fn walk_for_relations(
     // Determine if this node creates a new scope
     let scope_name = match kind {
         "function_declaration" | "function_definition" | "function_item"
-        | "method_definition" | "method_declaration" | "async_function_definition" => {
+        | "method_definition" | "method_declaration" | "constructor_declaration"
+        | "async_function_definition" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
         }
@@ -147,6 +148,86 @@ fn walk_for_relations(
         "decorated_definition" => {
             if let Some(route_rel) = extract_python_route(&node, source) {
                 results.push(route_rel);
+            }
+        }
+
+        // C# using directives: using System; using System.Collections.Generic;
+        "using_directive" => {
+            if language == "csharp" {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        if child.kind() == "qualified_name" || child.kind() == "identifier" {
+                            let name = node_text(&child, source).to_string();
+                            if !name.is_empty() && name != "using" {
+                                results.push(ParsedRelation {
+                                    source_name: "<module>".into(),
+                                    target_name: name,
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // C# inheritance: class Dog : Animal, IWalkable
+        "base_list" => {
+            if language == "csharp" {
+                // Get the class/struct name from the parent node
+                let owner_name = node.parent()
+                    .and_then(|p| p.child_by_field_name("name"))
+                    .map(|n| node_text(&n, source).to_string());
+                let owner = owner_name.as_deref().or(active_scope).unwrap_or("<module>");
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        let base_name = node_text(&child, source).to_string();
+                        if !base_name.is_empty() {
+                            let rel = if base_name.starts_with('I') && base_name.len() > 1
+                                && base_name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
+                                REL_IMPLEMENTS
+                            } else {
+                                REL_INHERITS
+                            };
+                            results.push(ParsedRelation {
+                                source_name: owner.to_string(),
+                                target_name: base_name,
+                                relation: rel.into(),
+                                metadata: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
+        "invocation_expression" => {
+            if language == "csharp" {
+                if let Some(scope) = active_scope {
+                    if let Some(func) = node.named_child(0) {
+                        let callee = match func.kind() {
+                            "identifier" => Some(node_text(&func, source).to_string()),
+                            "member_access_expression" => {
+                                // e.g. Console.WriteLine — extract "WriteLine"
+                                func.child_by_field_name("name")
+                                    .map(|n| node_text(&n, source).to_string())
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = callee {
+                            if !name.is_empty() {
+                                results.push(ParsedRelation {
+                                    source_name: scope.to_string(),
+                                    target_name: name,
+                                    relation: REL_CALLS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 

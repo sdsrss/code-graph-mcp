@@ -219,10 +219,27 @@ fn extract_nodes(
             }
         }
 
-        // Java enums
+        // Java/C# enums
         "enum_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("enum", name, &node, source, node_is_test));
+            }
+        }
+
+        // C# struct
+        "struct_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("struct", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                return;
+            }
+        }
+
+        // C# constructor
+        "constructor_declaration" => {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
             }
         }
 

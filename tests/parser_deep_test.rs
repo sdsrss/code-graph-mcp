@@ -169,3 +169,33 @@ def process():
     assert!(imports.contains(&"OrderedDict"), "Should extract OrderedDict import, got: {:?}", imports);
     assert!(imports.contains(&"defaultdict"), "Should extract defaultdict import, got: {:?}", imports);
 }
+
+#[test]
+fn test_csharp_parsing() {
+    let code = r#"
+using System;
+
+public class UserService : IUserService {
+    public void GetUser(int id) {
+        Console.WriteLine(id);
+    }
+    private void Helper() {}
+}
+
+public interface IUserService {
+    void GetUser(int id);
+}
+"#;
+    let nodes = parse_code(code, "csharp").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserService"), "C# class should be parsed, got: {:?}", names);
+    assert!(names.contains(&"GetUser"), "C# method should be parsed, got: {:?}", names);
+    assert!(names.contains(&"IUserService"), "C# interface should be parsed, got: {:?}", names);
+
+    let relations = extract_relations(code, "csharp").unwrap();
+    let imports: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "imports")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(!imports.is_empty(), "C# using should create imports, got: {:?}", imports);
+}
