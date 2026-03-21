@@ -83,6 +83,32 @@ fn walk_for_relations(
             }
         }
 
+        // Kotlin: import kotlinx.coroutines.flow.Flow
+        // AST: import -> qualified_identifier -> identifier*
+        // Extract the last identifier segment as the import target
+        "import" if language == "kotlin" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "qualified_identifier" {
+                        let count = child.named_child_count();
+                        if count > 0 {
+                            if let Some(last) = child.named_child(count - 1) {
+                                let name = node_text(&last, source).to_string();
+                                if !name.is_empty() && name != "*" {
+                                    results.push(ParsedRelation {
+                                        source_name: "<module>".into(),
+                                        target_name: name,
+                                        relation: REL_IMPORTS.into(),
+                                        metadata: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Python: from X import Y
         "import_from_statement" => {
             extract_python_from_import_names(&node, source, results);
@@ -370,6 +396,16 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String>
             function.child_by_field_name("field")
                 .map(|n| node_text(&n, source).to_string())
         }
+        "navigation_expression" => {
+            // Kotlin: obj.method() — last named child is the method name
+            let count = function.named_child_count();
+            if count > 0 {
+                function.named_child(count - 1)
+                    .map(|n| node_text(&n, source).to_string())
+            } else {
+                None
+            }
+        }
         _ => None, // Unknown callee expression — skip to avoid noise in call graph
     }
 }
@@ -624,6 +660,25 @@ fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
                 if parents.is_empty() {
                     let text = node_text(&child, source);
                     parents.push(text.trim_start_matches('(').trim_end_matches(')').trim().to_string());
+                }
+            }
+            "delegation_specifiers" => {
+                // Kotlin: class UserService : BaseService, UserRepository
+                // delegation_specifiers -> delegation_specifier -> user_type -> identifier
+                for k in 0..child.named_child_count() {
+                    if let Some(spec) = child.named_child(k) {
+                        if spec.kind() == "delegation_specifier" {
+                            // Walk through user_type to find the identifier
+                            if let Some(user_type) = spec.named_child(0) {
+                                if let Some(ident) = user_type.named_child(0) {
+                                    let name = node_text(&ident, source).to_string();
+                                    if !name.is_empty() {
+                                        parents.push(name);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {}

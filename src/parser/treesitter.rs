@@ -175,10 +175,17 @@ fn extract_nodes(
         }
 
         // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition)
+        // Kotlin: both classes and interfaces use class_declaration — distinguish by first child kind
         "class_declaration" | "class" | "class_definition" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
+                // Kotlin interfaces are class_declaration with first child kind "interface"
+                let node_type_str = if node.child(0).map(|c| c.kind()) == Some("interface") {
+                    "interface"
+                } else {
+                    "class"
+                };
                 results.push(ParsedNode {
-                    node_type: "class".into(),
+                    node_type: node_type_str.into(),
                     name: name.clone(),
                     qualified_name: Some(name.clone()),
                     start_line: node.start_position().row as u32 + 1,
@@ -230,6 +237,15 @@ fn extract_nodes(
         "struct_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("struct", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                return;
+            }
+        }
+
+        // Kotlin object declaration (singleton)
+        "object_declaration" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                results.push(make_simple_node("class", name.clone(), &node, source, node_is_test));
                 extract_children(node, source, language, Some(&name), results, depth, node_is_test);
                 return;
             }

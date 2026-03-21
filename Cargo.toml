@@ -41,6 +41,7 @@ tree-sitter-cpp = "0.23"
 tree-sitter-html = "0.23"
 tree-sitter-css = "0.23"
 tree-sitter-c-sharp = "0.23.1"
+tree-sitter-kotlin-ng = "1.1.0"
 
 [build-dependencies]
 cc = "1"

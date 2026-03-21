@@ -199,3 +199,38 @@ public interface IUserService {
         .collect();
     assert!(!imports.is_empty(), "C# using should create imports, got: {:?}", imports);
 }
+
+#[test]
+fn test_kotlin_parsing() {
+    let code = r#"
+import kotlinx.coroutines.flow.Flow
+
+class UserService {
+    fun findById(id: Long): String {
+        return id.toString()
+    }
+    fun listAll(): List<String> = emptyList()
+}
+
+interface UserRepository {
+    fun findById(id: Long): String
+}
+"#;
+    let nodes = parse_code(code, "kotlin").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"UserService"), "Kotlin class, got: {:?}", names);
+    assert!(names.contains(&"findById"), "Kotlin fun, got: {:?}", names);
+    assert!(names.contains(&"UserRepository"), "Kotlin interface, got: {:?}", names);
+
+    // Verify interface is typed correctly
+    let repo = nodes.iter().find(|n| n.name == "UserRepository").unwrap();
+    assert_eq!(repo.node_type, "interface", "Kotlin interface should have type 'interface', got: {:?}", repo.node_type);
+
+    let relations = extract_relations(code, "kotlin").unwrap();
+    let imports: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == "imports")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(!imports.is_empty(), "Kotlin imports should be extracted, got: {:?}", imports);
+    assert!(imports.contains(&"Flow"), "Should import Flow, got: {:?}", imports);
+}

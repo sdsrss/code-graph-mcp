@@ -17,6 +17,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "html" | "htm" => Some("html"),
         "css" => Some("css"),
         "cs" => Some("csharp"),
+        "kt" | "kts" => Some("kotlin"),
         _ => None,
     }
 }
