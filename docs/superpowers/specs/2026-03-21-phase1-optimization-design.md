@@ -43,22 +43,54 @@ Competitive analysis identified code-graph-mcp's unique position (Rust + SQLite 
 SELECT n.id, n.name, n.node_type, n.start_line, n.end_line, f.path
 FROM nodes n
 JOIN files f ON n.file_id = f.id
-WHERE n.is_test = 0
+WHERE n.is_test = :include_tests_filter
+  AND n.node_type != 'module'
+  AND n.name != '<module>'
   AND (n.end_line - n.start_line + 1) >= :min_lines
+  AND (:node_type IS NULL OR n.node_type = :node_type)
+  AND (:path IS NULL OR f.path LIKE :path || '%')
+  -- Exclude symbols with incoming usage edges
   AND NOT EXISTS (
     SELECT 1 FROM edges e
     WHERE e.target_id = n.id
     AND e.relation IN ('calls', 'imports', 'inherits', 'implements')
   )
+  -- Exclude route handlers (routes_to is a self-edge: source_id = target_id)
+  AND NOT EXISTS (
+    SELECT 1 FROM edges e
+    WHERE e.source_id = n.id
+    AND e.relation = 'routes_to'
+  )
 ORDER BY (n.end_line - n.start_line) DESC
 ```
 
-Orphan vs Exported-Unused classification done in Rust layer by checking for outgoing `exports` edges.
+**`node_type` parameter mapping:** `fn` → `function`, `const` → `const`, others passed through. When `null`/`all`, query returns all types except `module`.
+
+**`include_tests` parameter:** When `false` (default), adds `AND n.is_test = 0`. When `true`, removes this clause (matches existing pattern in `fts5_search`).
+
+**`scope=module` + `path`:** When `scope="module"` and `path` is set, adds `AND f.path LIKE :path || '%'` filter.
+
+**Orphan vs Exported-Unused classification:** Done in Rust layer by checking for **incoming** `exports` edges (`e.target_id = n.id AND e.relation = 'exports'`). The `exports` edge direction is `source=<module>` → `target=exported_symbol`.
+
+**Visibility heuristic (no schema change):** For languages without `exports` edges (Rust, Go, C, etc.), use code_content prefix heuristic:
+- Rust: `code_content` starts with `pub `
+- Go: name starts with uppercase letter
+- Other languages: rely on `exports` edges only (JS/TS)
+Symbols matching visibility heuristic but with zero callers → Exported-Unused. Others → Orphan.
+
+**Test plan:**
+- Function with zero incoming edges, no exports → Orphan
+- Function with incoming `exports` edge but no callers → Exported-Unused
+- `main` function → excluded (entry point)
+- Function with `routes_to` self-edge → excluded (route handler)
+- Trait impl method (has `implements` edge) → excluded
+- Test function with `is_test=1` → excluded by default, included when `include_tests=true`
+- `module` node type → always excluded
 
 **Files modified:**
-- `src/mcp/tools.rs` — Register tool, bump TOOL_COUNT 11→12
-- `src/mcp/server/tools.rs` — Tool implementation (~100 lines)
-- `src/storage/queries.rs` — `find_dead_code()` query function (~40 lines)
+- `src/mcp/tools.rs` — Register tool, bump TOOL_COUNT 11→12, update `test_tool_registry_has_all_tools`
+- `src/mcp/server/tools.rs` — Tool implementation (~120 lines)
+- `src/storage/queries.rs` — `find_dead_code()` query function (~50 lines)
 
 ---
 
@@ -91,8 +123,8 @@ code-graph-mcp benchmark --format json
 - `--format json`: structured JSON for CI/automation
 
 **Files modified:**
-- `src/main.rs` or CLI module — Add `benchmark` subcommand
-- New module `src/benchmark.rs` (~200 lines)
+- `src/cli.rs` — Add `cmd_benchmark()` function following existing `cmd_*` pattern (~200 lines)
+- `src/main.rs` — Wire `"benchmark"` subcommand to `cmd_benchmark()`
 
 ---
 
@@ -160,17 +192,22 @@ Principles:
 - Swift: Vapor `app.get("path") { ... }`
 - Dart: Shelf/Dart Frog (low priority)
 
-**Tree-sitter dependencies:**
+**Tree-sitter dependencies (actual crates.io versions):**
 ```toml
-tree-sitter-c-sharp = "0.23"
-tree-sitter-kotlin = "0.23"
-tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.23"
-tree-sitter-swift = "0.23"
-tree-sitter-dart = "0.23"   # Use latest stable if 0.23 unavailable
+tree-sitter-c-sharp = "0.23.1"   # Follows tree-sitter versioning
+tree-sitter-ruby = "0.23.1"      # Follows tree-sitter versioning
+tree-sitter-php = "0.24.2"       # Latest stable, independent versioning
+tree-sitter-kotlin = "0.3.8"     # Independent versioning scheme
+tree-sitter-swift = "0.7.1"      # Independent versioning scheme
+tree-sitter-dart = "0.1.0"       # Independent versioning, early stage
 ```
 
-**INDEX_VERSION:** Bump 4 → 5 (triggers automatic re-index on existing projects).
+**ABI compatibility note:** Kotlin, Swift, and Dart crates use independent versioning that does not follow the tree-sitter core scheme. These must be validated for ABI compatibility with `tree-sitter = "0.24"` before integration. If incompatible, options:
+1. Use alternative crate (e.g., community fork)
+2. Vendor the grammar C source and build via `build.rs` (like sqlite-vec)
+3. Drop the language from Phase 1 and revisit in Phase 2
+
+**INDEX_VERSION:** Bump 4 → 5 in `src/domain.rs` (triggers automatic re-index on existing projects). Note: `INDEX_VERSION` (domain.rs) and `SCHEMA_VERSION` (schema.rs) are separate constants — only `INDEX_VERSION` needs bumping here since no schema DDL changes.
 
 **Not in scope:**
 - Markup languages (YAML, JSON, Markdown)
@@ -183,11 +220,14 @@ tree-sitter-dart = "0.23"   # Use latest stable if 0.23 unavailable
 
 Minor version bump (new tool + new languages = feature addition).
 
-**8 files requiring version sync** (per project convention):
-- Cargo.toml
-- package.json
-- npm/code-graph/package.json
-- npm/code-graph-{platform}/package.json (5 platform packages)
+**7 files requiring version sync:**
+- `Cargo.toml`
+- `package.json` (root)
+- `npm/linux-x64/package.json`
+- `npm/linux-arm64/package.json`
+- `npm/darwin-x64/package.json`
+- `npm/darwin-arm64/package.json`
+- `npm/win32-x64/package.json`
 
 ---
 
