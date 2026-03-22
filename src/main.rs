@@ -184,9 +184,12 @@ fn run_serve() -> Result<()> {
             continue;
         }
         if buf.len() > MAX_MESSAGE_SIZE {
-            // Drain remainder of the truncated line to prevent corrupting the next read.
-            // Bound the drain to MAX_MESSAGE_SIZE to prevent OOM from unbounded input.
-            if !buf.ends_with('\n') {
+            let oversized_len = buf.len();
+            let needs_drain = !buf.ends_with('\n');
+            // Free the oversized buffer before draining to avoid 2x peak allocation
+            buf.clear();
+            buf.shrink_to(1024);
+            if needs_drain {
                 // Drain until newline (line-aware) without UTF-8 String allocation
                 let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
                     .read_until(b'\n', &mut Vec::new());
@@ -196,7 +199,7 @@ fn run_serve() -> Result<()> {
                 "id": null,
                 "error": {
                     "code": code_graph_mcp::mcp::protocol::JSONRPC_INVALID_REQUEST,
-                    "message": format!("Message too large: {} bytes (max {})", buf.len(), MAX_MESSAGE_SIZE)
+                    "message": format!("Message too large: {} bytes (max {})", oversized_len, MAX_MESSAGE_SIZE)
                 }
             });
             writeln!(stdout, "{}", err_resp)?;

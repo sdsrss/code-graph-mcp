@@ -143,7 +143,7 @@ fn test_e2e_incremental_reindex() {
 
     // Initial file
     fs::write(project.path().join("app.ts"), "function original() {}").unwrap();
-    let server = McpServer::from_project_root(project.path()).unwrap();
+    let server = common::init_server(&project);
 
     // Trigger full index
     let status = tool_call_json("get_index_status", serde_json::json!({}));
@@ -1336,4 +1336,67 @@ fn test_cjk_identifiers_index_and_search() {
         "CJK identifier should be preserved in search results, got names: {:?}",
         names
     );
+}
+
+// --- Protocol error-path tests ---
+
+#[test]
+fn test_malformed_json_returns_parse_error() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    let resp = server.handle_message("not valid json{{{").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert!(parsed["error"].is_object());
+    assert_eq!(parsed["error"]["code"], -32700); // Parse error
+}
+
+#[test]
+fn test_wrong_jsonrpc_version_returns_error() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": 1,
+        "method": "tools/list",
+    });
+    let resp = server.handle_message(&msg.to_string()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert!(parsed["error"].is_object());
+}
+
+#[test]
+fn test_tools_call_missing_name_returns_error() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "arguments": {}
+        }
+    });
+    let resp = server.handle_message(&msg.to_string()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert!(parsed["error"].is_object() || parsed["result"]["isError"] == true,
+        "Missing tool name should error: {:?}", parsed);
+}
+
+#[test]
+fn test_unknown_method_returns_error() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "nonexistent/method",
+    });
+    let resp = server.handle_message(&msg.to_string()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert!(parsed["error"].is_object());
+    assert_eq!(parsed["error"]["code"], -32601); // Method not found
 }

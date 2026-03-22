@@ -78,9 +78,13 @@ mod tests {
 
         // Create a file
         fs::write(tmp.path().join("test.ts"), "function foo() {}").unwrap();
-        thread::sleep(Duration::from_millis(200));
 
-        let events: Vec<WatchEvent> = rx.try_iter().collect();
+        // Wait for at least one event with a generous timeout (avoids flakiness on slow CI)
+        let first = rx.recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for watcher event");
+        let mut events = vec![first];
+        // Drain any additional buffered events
+        events.extend(rx.try_iter());
         assert!(!events.is_empty());
 
         drop(watcher);

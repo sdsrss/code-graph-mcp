@@ -19,6 +19,8 @@ fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init has the exact C ABI signature expected by
         // sqlite3_auto_extension in rusqlite's FFI bindings. No transmute needed.
+        // The Once guard ensures single registration. SQLite is compiled with
+        // SQLITE_THREADSAFE=1 (bundled default), making global extension registration safe.
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(sqlite3_vec_init));
         }

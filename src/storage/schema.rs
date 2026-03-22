@@ -82,20 +82,27 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
 "#)
 }
 
-/// FTS5 sync trigger SQL for use in migrations.
-fn fts5_triggers_sql() -> &'static str {
-    FTS5_TRIGGERS
+/// Check if a column exists on a table (for idempotent migrations).
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("SELECT {} FROM {} LIMIT 0", column, table))
+        .is_ok()
+}
+
+/// Add a column only if it doesn't already exist (idempotent ALTER TABLE).
+fn add_column_if_not_exists(conn: &rusqlite::Connection, table: &str, column: &str, col_type: &str) -> anyhow::Result<()> {
+    if !column_exists(conn, table, column) {
+        conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type))?;
+    }
+    Ok(())
 }
 
 /// Migrate from schema v1 to v2. Must be called within a transaction.
 pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     tracing::info!("[schema] Migrating v1 → v2: adding name_tokens, return_type, param_types");
 
-    conn.execute_batch(
-        "ALTER TABLE nodes ADD COLUMN name_tokens TEXT;
-         ALTER TABLE nodes ADD COLUMN return_type TEXT;
-         ALTER TABLE nodes ADD COLUMN param_types TEXT;"
-    )?;
+    add_column_if_not_exists(conn, "nodes", "name_tokens", "TEXT")?;
+    add_column_if_not_exists(conn, "nodes", "return_type", "TEXT")?;
+    add_column_if_not_exists(conn, "nodes", "param_types", "TEXT")?;
 
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS nodes_ai;
@@ -111,7 +118,7 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             content='nodes', content_rowid='id'
         );"
     )?;
-    conn.execute_batch(fts5_triggers_sql())?;
+    conn.execute_batch(FTS5_TRIGGERS)?;
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
@@ -171,7 +178,7 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             tokenize='porter unicode61'
         );"
     )?;
-    conn.execute_batch(fts5_triggers_sql())?;
+    conn.execute_batch(FTS5_TRIGGERS)?;
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
@@ -182,7 +189,7 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 
 pub fn migrate_v4_to_v5(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     tracing::info!("[schema] Migrating v4 → v5: adding is_test column to nodes");
-    conn.execute_batch("ALTER TABLE nodes ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;")?;
+    add_column_if_not_exists(conn, "nodes", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
     conn.pragma_update(None, "user_version", 5)?;
     tracing::info!("[schema] Migration v4→v5 complete.");
     Ok(())

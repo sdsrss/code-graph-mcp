@@ -11,26 +11,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Check if a process with the given PID is alive (used by non-Unix lock fallback).
+/// On non-Unix platforms, conservatively assumes the process is alive to prevent dual-primary.
 #[cfg(not(unix))]
 fn pid_is_alive(pid: u32) -> bool {
-    // Linux: fast /proc check
-    #[cfg(target_os = "linux")]
-    { Path::new(&format!("/proc/{}", pid)).exists() }
-    // macOS/Unix (non-Linux): use `kill -0 <pid>` to check if process exists.
-    // Exit code 0 = process exists, non-zero = no such process.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true) // if command fails, conservatively assume alive
-    }
-    // Windows/other: conservative — assume alive to prevent dual-primary.
-    #[cfg(not(unix))]
-    { let _ = pid; true }
+    let _ = pid;
+    true
 }
 
 /// Try to acquire the index lock (`.code-graph/index.lock`) using flock().
@@ -976,6 +961,7 @@ impl McpServer {
 
     /// Drain all pending events from the watcher receiver.
     /// Returns true if any file change events were received.
+    /// Note: acquires `watcher` lock briefly; callers must not hold `dir_cache` to avoid deadlock.
     fn drain_watcher_events(&self) -> bool {
         let watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if let Some(ref state) = *watcher_guard {

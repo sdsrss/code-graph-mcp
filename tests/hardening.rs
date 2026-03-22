@@ -40,8 +40,9 @@ fn setup_project(file_count: usize) -> (TempDir, McpServer) {
     (project, server)
 }
 
-/// Concurrent search calls from 10 threads against a shared McpServer.
-/// Validates no deadlocks or panics under interleaved access.
+/// Multi-threaded search calls from 10 threads against a Mutex-wrapped McpServer.
+/// Access is serialized by the mutex (McpServer is Send but not Sync).
+/// Validates no panics or mutex poisoning under multi-threaded scheduling.
 #[test]
 fn test_concurrent_tool_calls() {
     let (_project, server) = setup_project(20);

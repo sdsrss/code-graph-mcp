@@ -195,8 +195,9 @@ impl McpServer {
             } else {
                 const MAX_SEARCH_CODE_LEN: usize = 500;
                 let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
-                    let truncated = &node.code_content[..node.code_content[..MAX_SEARCH_CODE_LEN]
-                        .rfind('\n').unwrap_or(MAX_SEARCH_CODE_LEN)];
+                    let safe_end = node.code_content.floor_char_boundary(MAX_SEARCH_CODE_LEN);
+                    let truncated = &node.code_content[..node.code_content[..safe_end]
+                        .rfind('\n').unwrap_or(safe_end)];
                     format!("{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
                         truncated, node.end_line - node.start_line + 1)
                 } else {

@@ -921,11 +921,13 @@ pub fn get_callers_with_route_info(
         params.push(rel);
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         for row in rows {
             let (id, meta) = row?;
-            route_map.entry(id).or_insert(meta);
+            if let Some(meta) = meta {
+                route_map.entry(id).or_insert(meta);
+            }
         }
     }
 
@@ -1648,16 +1650,22 @@ pub fn find_dead_code(
         conditions.push("n.is_test = 0".to_string());
     }
 
-    if let Some(type_val) = node_type {
-        let normalized = crate::domain::normalize_type_filter(type_val);
-        if normalized.is_empty() {
+    // Track how many type filter placeholders we need
+    let normalized_types: Vec<&str> = node_type
+        .map(|t| crate::domain::normalize_type_filter(t))
+        .unwrap_or_default();
+
+    if node_type.is_some() {
+        if normalized_types.is_empty() {
             // Unknown filter — pass as-is for backward compatibility
             conditions.push("n.type = :node_type".to_string());
-        } else if normalized.len() == 1 {
-            conditions.push(format!("n.type = '{}'", normalized[0]));
+        } else if normalized_types.len() == 1 {
+            conditions.push("n.type = :type_0".to_string());
         } else {
-            let quoted: Vec<String> = normalized.iter().map(|t| format!("'{}'", t)).collect();
-            conditions.push(format!("n.type IN ({})", quoted.join(", ")));
+            let placeholders: Vec<String> = (0..normalized_types.len())
+                .map(|i| format!(":type_{}", i))
+                .collect();
+            conditions.push(format!("n.type IN ({})", placeholders.join(", ")));
         }
     }
 
@@ -1720,10 +1728,17 @@ pub fn find_dead_code(
         (":rel_routes_to", &REL_ROUTES_TO),
     ];
 
+    // Bind type filter placeholders (parameterized to prevent SQL injection)
+    let type_param_names: Vec<String> = (0..normalized_types.len())
+        .map(|i| format!(":type_{}", i))
+        .collect();
+    for (i, name) in type_param_names.iter().enumerate() {
+        params.push((name.as_str(), &normalized_types[i] as &dyn rusqlite::types::ToSql));
+    }
+
     // Only bind :node_type when the value was not recognized by normalize_type_filter
-    // (unknown filter fallback uses `:node_type` placeholder in the SQL).
     let node_type_owned: Option<String> = node_type
-        .filter(|t| crate::domain::normalize_type_filter(t).is_empty())
+        .filter(|_| normalized_types.is_empty())
         .map(|t| t.to_string());
     if let Some(ref t) = node_type_owned {
         params.push((":node_type", t));
