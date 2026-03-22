@@ -753,7 +753,7 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
                 eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
             }
         }
-        return Ok(());
+        std::process::exit(1);
     }
 
     // Filter test callers unless --include-tests is set
@@ -877,7 +877,7 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
                 eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
             }
         }
-        return Ok(());
+        std::process::exit(1);
     }
 
     let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth)?;
@@ -1167,7 +1167,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
             Some(nwf) => vec![(nwf.node, nwf.file_path)],
             None => {
                 eprintln!("[code-graph] Node ID {} not found.", nid);
-                return Ok(());
+                std::process::exit(1);
             }
         }
     } else {
@@ -1194,7 +1194,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
                     eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
                 }
             }
-            return Ok(());
+            std::process::exit(1);
         }
 
         nodes.into_iter().map(|n| {
@@ -1575,7 +1575,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
             Some(id) => id,
             None => {
                 eprintln!("[code-graph] Symbol not found: {}", symbol);
-                return Ok(());
+                std::process::exit(1);
             }
         }
     };
@@ -1584,7 +1584,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     let (embedded_count, total_nodes) = queries::count_nodes_with_vectors(conn)?;
     if embedded_count == 0 {
         eprintln!("[code-graph] No embeddings found ({}/{} nodes embedded). Run MCP server with embed-model feature.", embedded_count, total_nodes);
-        return Ok(());
+        std::process::exit(1);
     }
 
     let embedding: Vec<f32> = {

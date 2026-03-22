@@ -392,6 +392,15 @@ fn extract_nodes(
                 return;
             }
         }
+        "const_item" | "static_item" => {
+            if let Some(name) = get_child_by_field(&node, "name", source) {
+                let type_annotation = node.child_by_field_name("type")
+                    .map(|t| node_text(&t, source).to_string());
+                let mut pn = make_simple_node("constant", name, &node, source, node_is_test);
+                pn.return_type = type_annotation;
+                results.push(pn);
+            }
+        }
 
         _ => {}
     }
@@ -952,5 +961,26 @@ function noReturn(x: number) {
         let nodes = parse_code(code, "typescript").unwrap();
         let add = nodes.iter().find(|n| n.name == "add").unwrap();
         assert!(add.param_types.as_ref().unwrap().contains("number"));
+    }
+
+    #[test]
+    fn test_parse_rust_constants() {
+        let code = r#"
+pub const MAX_SIZE: usize = 1024;
+static DB_PATH: &str = "/tmp/db";
+const NAMES: &[&str] = &["a", "b"];
+"#;
+        let nodes = parse_code(code, "rust").unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"MAX_SIZE"), "should parse const, got: {:?}", names);
+        assert!(names.contains(&"DB_PATH"), "should parse static, got: {:?}", names);
+        assert!(names.contains(&"NAMES"), "should parse const array, got: {:?}", names);
+
+        let max_size = nodes.iter().find(|n| n.name == "MAX_SIZE").unwrap();
+        assert_eq!(max_size.node_type, "constant");
+        assert_eq!(max_size.return_type.as_deref(), Some("usize"), "should capture type annotation");
+
+        let db_path = nodes.iter().find(|n| n.name == "DB_PATH").unwrap();
+        assert_eq!(db_path.node_type, "constant");
     }
 }

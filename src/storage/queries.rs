@@ -1044,13 +1044,14 @@ pub struct NameCandidate {
     pub node_type: String,
 }
 
-/// Find function/method names that contain the given substring.
-/// Used as a fallback when exact name match returns no results.
+/// Find symbol names that match the given input.
+/// Uses substring matching first, then falls back to edit-distance matching.
+/// Matches all node types except modules.
 pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Result<Vec<NameCandidate>> {
+    // Phase 1: LIKE-based substring + token matching (fast path)
     let escaped = partial_name.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped);
 
-    // Tokenize input for cross-convention matching (camelCase ↔ snake_case).
     let tokens_only = crate::search::tokenizer::split_identifier_tokens(partial_name);
     let token_escaped = tokens_only.replace('%', "\\%").replace('_', "\\_");
     let token_pattern = format!("%{}%", token_escaped);
@@ -1060,7 +1061,7 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          WHERE (n.name LIKE ?1 ESCAPE '\\' OR n.name_tokens LIKE ?3 ESCAPE '\\')
-           AND n.type IN ('function', 'method')
+           AND n.type != 'module'
          ORDER BY
            CASE WHEN n.name = ?2 THEN 0
                 WHEN n.name LIKE ?2 || '%' THEN 1
@@ -1076,7 +1077,70 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
             node_type: row.get(2)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    let results: Vec<NameCandidate> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if !results.is_empty() {
+        return Ok(results);
+    }
+
+    // Phase 2: Edit-distance fallback for typos (e.g., "handle_mesage" → "handle_message")
+    let query_lower = partial_name.to_lowercase();
+    let max_dist = match query_lower.len() {
+        0..=3 => 1,
+        4..=7 => 2,
+        _ => 3,
+    };
+
+    let sql2 =
+        "SELECT DISTINCT n.name, f.path, n.type
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE n.type != 'module'";
+    let mut stmt2 = conn.prepare(sql2)?;
+    let rows2 = stmt2.query_map([], |row| {
+        Ok(NameCandidate {
+            name: row.get(0)?,
+            file_path: row.get(1)?,
+            node_type: row.get(2)?,
+        })
+    })?;
+
+    let mut scored: Vec<(usize, NameCandidate)> = Vec::new();
+    for row in rows2 {
+        let candidate = row?;
+        let dist = levenshtein(&query_lower, &candidate.name.to_lowercase());
+        if dist <= max_dist {
+            scored.push((dist, candidate));
+        }
+    }
+    scored.sort_by_key(|(dist, c)| (*dist, c.name.len()));
+    scored.truncate(10);
+    Ok(scored.into_iter().map(|(_, c)| c).collect())
+}
+
+/// Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let (m, n) = (a_chars.len(), b_chars.len());
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    // Single-row optimization: O(min(m,n)) space
+    let mut prev = vec![0usize; n + 1];
+    for j in 0..=n { prev[j] = j; }
+
+    for i in 1..=m {
+        let mut curr = vec![0usize; n + 1];
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        prev = curr;
+    }
+    prev[n]
 }
 
 // --- Import tree queries ---
@@ -2478,5 +2542,17 @@ mod tests {
         let alpha_paths: Vec<&str> = alpha_entries.iter().map(|(_, p)| p.as_str()).collect();
         assert!(alpha_paths.contains(&"src/a.ts"));
         assert!(alpha_paths.contains(&"src/b.ts"));
+    }
+
+    #[test]
+    fn test_levenshtein() {
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("handle_message", "handle_mesage"), 1);
+        assert_eq!(levenshtein("database", "databas"), 1);
+        assert_eq!(levenshtein("foo", "bar"), 3);
     }
 }

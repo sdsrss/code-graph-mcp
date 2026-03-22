@@ -245,7 +245,7 @@ fn test_cli_callgraph_direction() {
 fn test_cli_callgraph_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["callgraph", "nonexistent_fn"]);
-    assert_eq!(code, 0);
+    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
     assert!(stderr.contains("No call graph results"), "should report not found");
 }
 
@@ -275,7 +275,7 @@ fn test_cli_impact() {
 fn test_cli_impact_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["impact", "nonexistent_fn"]);
-    assert_eq!(code, 0);
+    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
     assert!(stderr.contains("Symbol not found"), "should report symbol not found");
 }
 
@@ -323,7 +323,7 @@ fn test_cli_show() {
 fn test_cli_show_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["show", "nonexistent_fn"]);
-    assert_eq!(code, 0);
+    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
     assert!(stderr.contains("Symbol not found"));
 }
 

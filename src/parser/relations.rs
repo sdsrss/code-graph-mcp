@@ -1899,4 +1899,29 @@ function doWork() {
         assert!(calls.iter().any(|(src, tgt)| *src == "doWork" && *tgt == "process"),
             "standalone function scope should remain unqualified, got calls: {:?}", calls);
     }
+
+    #[test]
+    fn test_rust_deeply_nested_scoped_call() {
+        // code_graph_mcp::cli::cmd_show() should extract "cmd_show" as the callee
+        let code = r#"
+fn main() {
+    print_version();
+    code_graph_mcp::cli::cmd_show(&project_root, &args);
+    std::env::current_dir();
+}
+fn print_version() {}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        eprintln!("All calls: {:?}", calls);
+        assert!(calls.contains(&("main", "print_version")),
+            "simple call should work, got: {:?}", calls);
+        assert!(calls.contains(&("main", "cmd_show")),
+            "deeply nested scoped call should extract rightmost name, got: {:?}", calls);
+        assert!(calls.contains(&("main", "current_dir")),
+            "std::env::current_dir() should extract current_dir, got: {:?}", calls);
+    }
 }
