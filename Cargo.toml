@@ -1,6 +1,6 @@
 [package]
 name = "code-graph-mcp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 
 [features]
@@ -20,6 +20,7 @@ notify = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+libc = "0.2"
 bytemuck = "1"
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }

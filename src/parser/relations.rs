@@ -18,7 +18,8 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 /// Extract relations from a pre-parsed tree (avoids re-parsing).
 pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
-    walk_for_relations(tree.root_node(), source, language, None, None, &mut relations, 0);
+    let config = LanguageConfig::for_language(language);
+    walk_for_relations(tree.root_node(), source, language, &config, None, None, &mut relations, 0);
     relations
 }
 
@@ -26,6 +27,7 @@ fn walk_for_relations(
     node: tree_sitter::Node,
     source: &str,
     language: &str,
+    config: &LanguageConfig,
     current_scope: Option<&str>,
     current_class: Option<&str>,
     results: &mut Vec<ParsedRelation>,
@@ -33,7 +35,6 @@ fn walk_for_relations(
 ) {
     if depth > MAX_RELATION_DEPTH { return; }
     let kind = node.kind();
-    let config = LanguageConfig::for_language(language);
 
     // Determine if this node creates a new scope
     let scope_name = match kind {
@@ -194,13 +195,17 @@ fn walk_for_relations(
                     if child.kind() == "namespace_use_clause" {
                         // Get the last `name` segment from the qualified_name
                         fn find_last_name(n: &tree_sitter::Node, source: &str) -> Option<String> {
+                            find_last_name_inner(n, source, 0)
+                        }
+                        fn find_last_name_inner(n: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+                            if depth > MAX_SUBTREE_DEPTH { return None; }
                             let mut result = None;
                             for i in 0..n.child_count() {
                                 if let Some(child) = n.child(i) {
                                     if child.kind() == "name" {
                                         result = Some(node_text(&child, source).to_string());
                                     } else if child.kind() == "qualified_name" || child.kind() == "namespace_name" {
-                                        if let Some(inner) = find_last_name(&child, source) {
+                                        if let Some(inner) = find_last_name_inner(&child, source, depth + 1) {
                                             result = Some(inner);
                                         }
                                     }
@@ -459,7 +464,7 @@ fn walk_for_relations(
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, active_scope, effective_class, results, depth + 1);
+            walk_for_relations(child, source, language, config, active_scope, effective_class, results, depth + 1);
         }
     }
 }
@@ -474,37 +479,34 @@ fn extract_rust_use_imports(
     results: &mut Vec<ParsedRelation>,
 ) {
     fn collect_use_names(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>) {
+        collect_use_names_inner(node, source, names, 0);
+    }
+    fn collect_use_names_inner(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>, depth: usize) {
+        if depth > MAX_SUBTREE_DEPTH { return; }
         match node.kind() {
             "use_as_clause" => {
-                // `use foo::Bar as B` — extract the original name (first named child)
-                // The first child may be a scoped_identifier, so recurse to extract leaf name
                 if let Some(child) = node.named_child(0) {
-                    collect_use_names(&child, source, names);
+                    collect_use_names_inner(&child, source, names, depth + 1);
                 }
             }
-            "use_wildcard" => {
-                // `use foo::*` — skip
-            }
+            "use_wildcard" => {}
             "use_list" => {
-                // `{HashMap, HashSet}`
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
-                        collect_use_names(&child, source, names);
+                        collect_use_names_inner(&child, source, names, depth + 1);
                     }
                 }
             }
             "scoped_use_list" => {
-                // `foo::{A, B}` — skip the path (scoped_identifier), only process the use_list
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
                         if child.kind() != "scoped_identifier" && child.kind() != "identifier" {
-                            collect_use_names(&child, source, names);
+                            collect_use_names_inner(&child, source, names, depth + 1);
                         }
                     }
                 }
             }
             "scoped_identifier" => {
-                // `foo::Bar` — extract the last segment (the name)
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = node_text(&name_node, source);
                     if !name.is_empty() && name != "*" && name != "self" {
@@ -519,10 +521,9 @@ fn extract_rust_use_imports(
                 }
             }
             _ => {
-                // Recurse into children for any unhandled wrapper nodes
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
-                        collect_use_names(&child, source, names);
+                        collect_use_names_inner(&child, source, names, depth + 1);
                     }
                 }
             }
@@ -642,6 +643,11 @@ fn extract_import_names(node: &tree_sitter::Node, source: &str, results: &mut Ve
 }
 
 fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    extract_import_specifiers_inner(node, source, results, 0);
+}
+
+fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, depth: usize) {
+    if depth > MAX_SUBTREE_DEPTH { return; }
     if node.kind() == "import_specifier" {
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = node_text(&name_node, source).to_string();
@@ -656,12 +662,17 @@ fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &m
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_import_specifiers(&child, source, results);
+            extract_import_specifiers_inner(&child, source, results, depth + 1);
         }
     }
 }
 
 fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    extract_import_names_recursive_inner(node, source, results, 0);
+}
+
+fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, depth: usize) {
+    if depth > MAX_SUBTREE_DEPTH { return; }
     if node.kind() == "import_specifier" || node.kind() == "identifier" {
         let name = if node.kind() == "import_specifier" {
             node.child_by_field_name("name")
@@ -682,7 +693,7 @@ fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, result
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_import_names_recursive(&child, source, results);
+            extract_import_names_recursive_inner(&child, source, results, depth + 1);
         }
     }
 }
@@ -1240,14 +1251,21 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
     })
 }
 
+const MAX_SUBTREE_DEPTH: usize = 32;
+
 fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    extract_string_from_subtree_inner(node, source, 0)
+}
+
+fn extract_string_from_subtree_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+    if depth > MAX_SUBTREE_DEPTH { return None; }
     if node.kind() == "string" {
         let text = node_text(node, source);
         return Some(text.trim_matches(|c| c == '\'' || c == '"').to_string());
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
-            if let Some(s) = extract_string_from_subtree(&child, source) {
+            if let Some(s) = extract_string_from_subtree_inner(&child, source, depth + 1) {
                 return Some(s);
             }
         }
@@ -1263,6 +1281,10 @@ fn extract_dart_imports(
     results: &mut Vec<ParsedRelation>,
 ) {
     fn find_uri_string(node: &tree_sitter::Node, source: &str) -> Option<String> {
+        find_uri_string_inner(node, source, 0)
+    }
+    fn find_uri_string_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+        if depth > MAX_SUBTREE_DEPTH { return None; }
         if node.kind() == "string_literal" {
             let text = node_text(node, source);
             // Strip quotes: 'dart:async' -> dart:async
@@ -1273,7 +1295,7 @@ fn extract_dart_imports(
         }
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
-                if let Some(result) = find_uri_string(&child, source) {
+                if let Some(result) = find_uri_string_inner(&child, source, depth + 1) {
                     return Some(result);
                 }
             }

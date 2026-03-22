@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Check if a process with the given PID is alive.
+/// Check if a process with the given PID is alive (used by non-Unix lock fallback).
+#[cfg(not(unix))]
 fn pid_is_alive(pid: u32) -> bool {
     // Linux: fast /proc check
     #[cfg(target_os = "linux")]
@@ -32,67 +33,85 @@ fn pid_is_alive(pid: u32) -> bool {
     { let _ = pid; true }
 }
 
-/// Try to acquire the index lock (`.code-graph/index.lock`).
-/// Returns `true` if this process becomes the primary indexer.
-/// Uses O_CREAT|O_EXCL for atomic creation; stale locks (dead PID) are reclaimed.
-fn try_acquire_index_lock(code_graph_dir: &Path) -> bool {
-    use std::fs::OpenOptions;
+/// Try to acquire the index lock (`.code-graph/index.lock`) using flock().
+/// Returns `Some(File)` holding the advisory lock if this process becomes the primary indexer.
+/// The lock is automatically released when the returned File is dropped.
+#[cfg(unix)]
+fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = code_graph_dir.join("index.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| tracing::warn!("Could not open index lock: {} — running in secondary mode", e))
+        .ok()?;
+
+    // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        tracing::info!("Another instance holds the index lock — running in secondary (read-only) mode");
+        return None;
+    }
+
+    // Write our PID for diagnostics (not used for locking logic)
+    use std::io::Write;
+    let mut f = &file;
+    let _ = f.write_all(std::process::id().to_string().as_bytes());
+
+    Some(file)
+}
+
+/// Non-unix fallback: PID-based lock with create_new atomicity.
+#[cfg(not(unix))]
+fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     use std::io::Write;
 
     let lock_path = code_graph_dir.join("index.lock");
     let my_pid = std::process::id();
 
-    // Try atomic exclusive create first — eliminates TOCTOU race
-    match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
-            return true;
+            return Some(f);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lock file exists — check if holder is alive
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
             tracing::warn!("Could not write index lock: {} — running in secondary mode", e);
-            return false;
+            return None;
         }
     }
 
-    // Lock exists — check if the holding process is alive
+    // Lock exists — check if holder is alive
     if let Ok(content) = std::fs::read_to_string(&lock_path) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid && pid_is_alive(pid) {
                 tracing::info!("Another instance (PID {}) holds the index lock — running in secondary (read-only) mode", pid);
-                return false;
+                return None;
             }
-            // Stale lock from dead process — reclaim
             tracing::info!("Reclaiming stale index lock from PID {}", pid);
             let _ = std::fs::remove_file(&lock_path);
         }
     }
 
-    // Re-create atomically after reclaiming stale lock
-    match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
-            true
+            Some(f)
         }
         Err(_) => {
-            // Another process grabbed it between our remove and create — that's fine
             tracing::info!("Lost lock race during stale reclaim — running in secondary mode");
-            false
+            None
         }
     }
 }
 
-/// Release the index lock if we are the owner.
+/// Remove the index lock file from disk.
+/// On Unix, the flock is released automatically when the `_index_lock` File handle is dropped.
 fn release_index_lock(code_graph_dir: &Path) {
-    let lock_path = code_graph_dir.join("index.lock");
-    let my_pid = std::process::id();
-    if let Ok(content) = std::fs::read_to_string(&lock_path) {
-        if content.trim().parse::<u32>().ok() == Some(my_pid) {
-            let _ = std::fs::remove_file(&lock_path);
-        }
-    }
+    let _ = std::fs::remove_file(code_graph_dir.join("index.lock"));
 }
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -239,6 +258,8 @@ pub struct McpServer {
     /// True if this instance holds the index lock (primary indexer).
     /// Secondary instances skip indexing/watching and read the DB in read-only mode.
     pub(super) is_primary: bool,
+    /// Held lock file handle — on Unix, flock is released when this is dropped.
+    _index_lock: Option<std::fs::File>,
 }
 
 impl McpServer {
@@ -273,7 +294,8 @@ impl McpServer {
             }
         }
 
-        let is_primary = try_acquire_index_lock(&db_dir);
+        let index_lock = try_acquire_index_lock(&db_dir);
+        let is_primary = index_lock.is_some();
 
         let embedding_model = EmbeddingModel::load()?;
         let db = Self::open_db(&db_path)?;
@@ -292,6 +314,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary,
+            _index_lock: index_lock,
         })
     }
 
@@ -313,6 +336,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary: true,
+            _index_lock: None,
         }
     }
 
@@ -336,6 +360,7 @@ impl McpServer {
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary: true,
+            _index_lock: None,
         }
     }
 
@@ -979,7 +1004,7 @@ impl McpServer {
 
         // Per JSON-RPC 2.0, notifications (no id) must never receive a response
         if req.id.is_none() {
-            if req.method == "notifications/initialized" {
+            if req.validate().is_ok() && req.method == "notifications/initialized" {
                 *lock_or_recover(&self.indexing.startup_index_pending, "startup_index_pending") = true;
             }
             return Ok(None);

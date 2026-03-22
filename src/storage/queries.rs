@@ -1552,7 +1552,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
     // Include BM25 score in SELECT for raw score blending in RRF fusion
     let bm25_expr = "bm25(nodes_fts, 5.0, 3.0, 2.0, 2.0, 1.0, 5.0, 1.0, 1.0)";
     let sql = format!(
-        "SELECT {}, {} FROM nodes_fts f JOIN nodes n ON n.id = f.rowid WHERE nodes_fts MATCH ?1{}
+        "SELECT {}, {} FROM nodes_fts fts JOIN nodes n ON n.id = fts.rowid WHERE nodes_fts MATCH ?1{}
          ORDER BY {} LIMIT ?2",
         NODE_SELECT_ALIASED, bm25_expr, test_filter, bm25_expr
     );
@@ -1597,8 +1597,7 @@ pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {
          LIMIT 10000"
     )?;
     let ids: Vec<i64> = stmt.query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ids)
 }
 

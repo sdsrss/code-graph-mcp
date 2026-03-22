@@ -128,7 +128,15 @@ const TRUNCATE_MIN_LEN: usize = 200;
 /// Truncate a JSON value's large string fields to fit within a char budget.
 /// Only strings longer than TRUNCATE_MIN_LEN are eligible for truncation,
 /// preserving short metadata fields (names, types, paths) intact.
+/// Recurses into nested objects/arrays up to MAX_TRUNCATE_DEPTH.
+const MAX_TRUNCATE_DEPTH: usize = 8;
+
 pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_json::Value {
+    truncate_value_inner(value, budget, 0)
+}
+
+fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -> serde_json::Value {
+    if depth > MAX_TRUNCATE_DEPTH { return value; }
     match value {
         serde_json::Value::Object(map) => {
             // Calculate total size of large string fields eligible for truncation
@@ -166,6 +174,9 @@ pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_j
                             kept.extend_from_slice(&arr[arr.len()-5..]);
                             serde_json::Value::Array(kept)
                         }
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            truncate_value_inner(v, budget, depth + 1)
+                        }
                         _ => v,
                     };
                     (k, tv)
@@ -178,6 +189,13 @@ pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_j
             kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
             kept.extend_from_slice(&arr[arr.len()-5..]);
             serde_json::Value::Array(kept)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(
+                arr.into_iter()
+                    .map(|v| truncate_value_inner(v, budget, depth + 1))
+                    .collect()
+            )
         }
         other => other,
     }

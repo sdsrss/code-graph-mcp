@@ -56,7 +56,8 @@ pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
 /// Extract nodes from a pre-parsed tree (avoids re-parsing).
 pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
-    extract_nodes(tree.root_node(), source, language, None, &mut nodes, 0, false);
+    let config = LanguageConfig::for_language(language);
+    extract_nodes(tree.root_node(), source, language, &config, None, &mut nodes, 0, false);
     nodes
 }
 
@@ -83,6 +84,7 @@ fn extract_nodes(
     node: tree_sitter::Node,
     source: &str,
     language: &str,
+    config: &LanguageConfig,
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
     depth: usize,
@@ -90,7 +92,6 @@ fn extract_nodes(
 ) {
     if depth > MAX_AST_DEPTH { return; }
     let kind = node.kind();
-    let config = LanguageConfig::for_language(language);
 
     // Detect Rust mod items (e.g., `mod tests { ... }`)
     if kind == "mod_item" {
@@ -102,7 +103,7 @@ fn extract_nodes(
         if let Some(body) = node.child_by_field_name("body") {
             for i in 0..body.named_child_count() {
                 if let Some(child) = body.named_child(i) {
-                    extract_nodes(child, source, language, parent_class, results, depth + 1,
+                    extract_nodes(child, source, language, config, parent_class, results, depth + 1,
                         in_test_context || is_test_mod);
                 }
             }
@@ -201,7 +202,7 @@ fn extract_nodes(
                     param_types: None,
                     is_test: node_is_test,
                 });
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -241,7 +242,7 @@ fn extract_nodes(
         "module" if config.name == "ruby" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -250,7 +251,7 @@ fn extract_nodes(
         "protocol_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -267,7 +268,7 @@ fn extract_nodes(
         "interface_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -276,7 +277,7 @@ fn extract_nodes(
         "trait_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -299,7 +300,7 @@ fn extract_nodes(
         "struct_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("struct", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -308,7 +309,7 @@ fn extract_nodes(
         "object_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("class", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -326,7 +327,7 @@ fn extract_nodes(
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 let nt = if kind == "class_specifier" { "class" } else { "struct" };
                 results.push(make_simple_node(nt, name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -379,14 +380,14 @@ fn extract_nodes(
         "impl_item" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let impl_name = node_text(&type_node, source);
-                extract_children(node, source, language, Some(impl_name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(impl_name), results, depth, node_is_test);
                 return;
             }
         }
         "trait_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, Some(&name), results, depth, node_is_test);
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
                 return;
             }
         }
@@ -395,13 +396,14 @@ fn extract_nodes(
     }
 
     // Recurse into children
-    extract_children(node, source, language, parent_class, results, depth, node_is_test);
+    extract_children(node, source, language, config, parent_class, results, depth, node_is_test);
 }
 
 fn extract_children(
     node: tree_sitter::Node,
     source: &str,
     language: &str,
+    config: &LanguageConfig,
     parent_class: Option<&str>,
     results: &mut Vec<ParsedNode>,
     depth: usize,
@@ -409,7 +411,7 @@ fn extract_children(
 ) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_nodes(child, source, language, parent_class, results, depth + 1, in_test_context);
+            extract_nodes(child, source, language, config, parent_class, results, depth + 1, in_test_context);
         }
     }
 }

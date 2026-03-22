@@ -49,7 +49,9 @@ impl FileWatcher {
                         })
                         .collect();
                     if !paths.is_empty() {
-                        let _ = tx.send(WatchEvent::Changed(paths));
+                        if let Err(e) = tx.send(WatchEvent::Changed(paths)) {
+                            tracing::debug!("Watcher channel send failed (receiver dropped): {}", e);
+                        }
                     }
                 }
                 Err(e) => {

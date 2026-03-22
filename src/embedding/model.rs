@@ -106,11 +106,20 @@ mod inner {
                 .take(200 * 1024 * 1024)
                 .read_to_end(&mut body)?;
 
-            // Extract tar.gz (also validates integrity — corrupt archives fail here)
+            // Extract tar.gz with path traversal protection
             std::fs::create_dir_all(dest_dir)?;
             let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&body));
             let mut archive = tar::Archive::new(gz);
-            archive.unpack(dest_dir)?;
+            archive.set_overwrite(true);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?;
+                // Reject entries with path traversal components
+                if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    anyhow::bail!("Tar entry contains path traversal: {:?}", path);
+                }
+                entry.unpack_in(dest_dir)?;
+            }
 
             // Write version marker (blake3 hash of tarball for cache invalidation)
             let hash = blake3::hash(&body);
