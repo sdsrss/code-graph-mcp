@@ -145,10 +145,7 @@ impl ToolRegistry {
                         "top_k": { "type": "number", "description": "Results count (default 5)" },
                         "max_distance": { "type": "number", "description": "Max distance (default 0.8)" }
                     },
-                    "anyOf": [
-                        { "required": ["symbol_name"] },
-                        { "required": ["node_id"] }
-                    ]
+                    "required": []
                 }),
             },
             ToolDefinition {
@@ -163,12 +160,7 @@ impl ToolRegistry {
                         "params": { "type": "string", "description": "Parameter text substring filter" },
                         "limit": { "type": "number", "description": "Max results (default 20)" }
                     },
-                    "anyOf": [
-                        { "required": ["query"] },
-                        { "required": ["type"] },
-                        { "required": ["returns"] },
-                        { "required": ["params"] }
-                    ]
+                    "required": []
                 }),
             },
             ToolDefinition {

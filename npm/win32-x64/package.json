@@ -1,6 +1,6 @@
 {
   "name": "@sdsrs/code-graph-win32-x64",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "description": "code-graph-mcp binary for Windows x64",
   "license": "MIT",
   "repository": {
