@@ -369,9 +369,11 @@ pub fn repair_null_context_strings(
         context_updates.push((node.id, ctx));
     }
 
-    // Update in DB
+    // Update in DB within a transaction (avoids per-row fsync under autocommit)
     if !context_updates.is_empty() {
+        let tx = db.conn().unchecked_transaction()?;
         update_context_strings_batch(db.conn(), &context_updates)?;
+        tx.commit()?;
 
         // Re-embed if model available
         if let Some(m) = model {

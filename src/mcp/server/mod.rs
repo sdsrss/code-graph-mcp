@@ -1045,8 +1045,9 @@ impl McpServer {
                 "Workflow tips:\n",
                 "  1. Start with project_map (compact=true) for architecture overview\n",
                 "  2. Use semantic_code_search with compact=true first \u{2014} saves tokens\n",
-                "  3. Expand results: get_ast_node(node_id=N) to read specific symbols\n",
+                "  3. Expand results: get_ast_node(node_id=N, compact=true) for signature, or without compact for full code\n",
                 "  4. Before changes: impact_analysis to check blast radius\n",
+                "  5. If search returns no/unexpected results: call get_index_status to check index health and embedding coverage\n",
                 "  Prompts available: impact-analysis, understand-module, trace-request"
             )
         }))
