@@ -1126,8 +1126,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     if n == 0 { return m; }
 
     // Single-row optimization: O(min(m,n)) space
-    let mut prev = vec![0usize; n + 1];
-    for j in 0..=n { prev[j] = j; }
+    let mut prev: Vec<usize> = (0..=n).collect();
 
     for i in 1..=m {
         let mut curr = vec![0usize; n + 1];
