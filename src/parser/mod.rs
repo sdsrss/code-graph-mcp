@@ -1,3 +1,4 @@
+pub mod lang_config;
 pub mod languages;
 pub mod treesitter;
 pub mod relations;

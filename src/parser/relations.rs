@@ -1,4 +1,5 @@
 use anyhow::Result;
+use super::lang_config::LanguageConfig;
 use super::node_text;
 use crate::domain::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS, MAX_RELATION_DEPTH};
 
@@ -32,6 +33,7 @@ fn walk_for_relations(
 ) {
     if depth > MAX_RELATION_DEPTH { return; }
     let kind = node.kind();
+    let config = LanguageConfig::for_language(language);
 
     // Determine if this node creates a new scope
     let scope_name = match kind {
@@ -64,7 +66,7 @@ fn walk_for_relations(
         }
         // Dart: function_body is a sibling of method_signature in class_body
         // Look at previous sibling to find the method name
-        "function_body" if language == "dart" => {
+        "function_body" if config.function_body_has_methods => {
             node.prev_sibling()
                 .filter(|s| s.kind() == "method_signature")
                 .and_then(|s| {
@@ -109,7 +111,7 @@ fn walk_for_relations(
         }
 
         // Ruby: `call` node kind for method calls (require, require_relative, and regular calls)
-        "call" if language == "ruby" => {
+        "call" if config.name == "ruby" => {
             // Extract method name from the "method" field
             if let Some(method_node) = node.child_by_field_name("method") {
                 let method_name = node_text(&method_node, source);
@@ -142,7 +144,7 @@ fn walk_for_relations(
         // PHP: function_call_expression (doSomething()), member_call_expression ($this->move()),
         // scoped_call_expression (User::all())
         "function_call_expression" | "member_call_expression" | "scoped_call_expression"
-            if language == "php" =>
+            if config.name == "php" =>
         {
             if let Some(scope) = active_scope {
                 // All three PHP call types have a `name` child for the method/function name
@@ -186,7 +188,7 @@ fn walk_for_relations(
 
         // PHP: use App\Models\User;
         // namespace_use_declaration -> namespace_use_clause -> qualified_name -> name (last segment)
-        "namespace_use_declaration" if language == "php" => {
+        "namespace_use_declaration" if config.name == "php" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     if child.kind() == "namespace_use_clause" {
@@ -223,7 +225,7 @@ fn walk_for_relations(
 
         // Swift: import Foundation, import UIKit
         // AST: import_declaration -> identifier -> simple_identifier
-        "import_declaration" if language == "swift" => {
+        "import_declaration" if config.name == "swift" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     if child.kind() == "identifier" {
@@ -244,13 +246,13 @@ fn walk_for_relations(
         }
 
         // Dart: import 'dart:async'; import 'package:foo/bar.dart';
-        "import_or_export" if language == "dart" => {
+        "import_or_export" if config.name == "dart" => {
             extract_dart_imports(&node, source, results);
         }
 
         // Import statements
         "import_statement" => {
-            if language == "python" {
+            if config.name == "python" {
                 extract_python_import_names(&node, source, results);
             } else {
                 extract_import_names(&node, source, results);
@@ -260,7 +262,7 @@ fn walk_for_relations(
         // Kotlin: import kotlinx.coroutines.flow.Flow
         // AST: import -> qualified_identifier -> identifier*
         // Extract the last identifier segment as the import target
-        "import" if language == "kotlin" => {
+        "import" if config.name == "kotlin" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     if child.kind() == "qualified_identifier" {
@@ -353,7 +355,7 @@ fn walk_for_relations(
 
         // C# using directives: using System; using System.Collections.Generic;
         "using_directive" => {
-            if language == "csharp" {
+            if config.name == "csharp" {
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
                         if child.kind() == "qualified_name" || child.kind() == "identifier" {
@@ -374,7 +376,7 @@ fn walk_for_relations(
 
         // C# inheritance: class Dog : Animal, IWalkable
         "base_list" => {
-            if language == "csharp" {
+            if config.name == "csharp" {
                 // Get the class/struct name from the parent node
                 let owner_name = node.parent()
                     .and_then(|p| p.child_by_field_name("name"))
@@ -384,7 +386,8 @@ fn walk_for_relations(
                     if let Some(child) = node.named_child(i) {
                         let base_name = node_text(&child, source).to_string();
                         if !base_name.is_empty() {
-                            let rel = if base_name.starts_with('I') && base_name.len() > 1
+                            let rel = if config.interface_by_prefix
+                                && base_name.starts_with('I') && base_name.len() > 1
                                 && base_name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
                                 REL_IMPLEMENTS
                             } else {
@@ -404,7 +407,7 @@ fn walk_for_relations(
 
         // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
         "invocation_expression" => {
-            if language == "csharp" {
+            if config.name == "csharp" {
                 if let Some(scope) = active_scope {
                     if let Some(func) = node.named_child(0) {
                         let callee = match func.kind() {
@@ -433,7 +436,7 @@ fn walk_for_relations(
 
         // Dart: expression_statement with identifier + selector(argument_part) = function call
         // e.g. fetchData() or result.transform() or print(result)
-        "expression_statement" if language == "dart" => {
+        "expression_statement" if config.name == "dart" => {
             if let Some(scope) = active_scope {
                 extract_dart_calls(&node, source, scope, results);
             }

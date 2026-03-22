@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use super::lang_config::LanguageConfig;
 use super::languages::get_language;
 use super::node_text;
 use crate::domain::{MAX_AST_DEPTH, max_code_content_len, parse_timeout_ms};
@@ -89,6 +90,7 @@ fn extract_nodes(
 ) {
     if depth > MAX_AST_DEPTH { return; }
     let kind = node.kind();
+    let config = LanguageConfig::for_language(language);
 
     // Detect Rust mod items (e.g., `mod tests { ... }`)
     if kind == "mod_item" {
@@ -108,8 +110,8 @@ fn extract_nodes(
         return;
     }
 
-    // Check if this specific node has #[test] or #[cfg(test)] (Rust-only attributes)
-    let node_is_test = in_test_context || (language == "rust" && has_test_attribute(&node, source));
+    // Check if this specific node has #[test] or #[cfg(test)] attributes
+    let node_is_test = in_test_context || (config.has_test_attributes && has_test_attribute(&node, source));
 
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
@@ -129,7 +131,7 @@ fn extract_nodes(
         }
 
         "function_definition" => {
-            if language == "c" || language == "cpp" {
+            if config.name == "c" || config.name == "cpp" {
                 // C/C++: name is in declarator child, not name field
                 if let Some(declarator) = node.child_by_field_name("declarator") {
                     if let Some(name) = extract_declarator_name(&declarator, source) {
@@ -211,7 +213,7 @@ fn extract_nodes(
                 results.push(parsed);
             }
         }
-        "method" | "singleton_method" if language == "ruby" => {
+        "method" | "singleton_method" if config.name == "ruby" => {
             if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
@@ -220,7 +222,7 @@ fn extract_nodes(
 
         // Dart: method_signature wraps function_signature/constructor_signature/getter_signature
         // Extract the function name from the inner signature node
-        "method_signature" if language == "dart" => {
+        "method_signature" if config.method_signature_kind.is_some() => {
             if let Some(mut parsed) = extract_dart_method_signature(&node, source, parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
@@ -228,7 +230,7 @@ fn extract_nodes(
         }
 
         // Dart: top-level declarations can contain function_signature (abstract methods, fields)
-        "declaration" if language == "dart" => {
+        "declaration" if config.name == "dart" => {
             if let Some(mut parsed) = extract_dart_declaration(&node, source, parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
@@ -236,7 +238,7 @@ fn extract_nodes(
         }
 
         // Ruby modules — mapped to "interface" type
-        "module" if language == "ruby" => {
+        "module" if config.name == "ruby" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
                 extract_children(node, source, language, Some(&name), results, depth, node_is_test);
