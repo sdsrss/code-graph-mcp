@@ -156,14 +156,61 @@ pub(super) struct StartupIndexResult {
     pub(super) stats: IndexStats,
 }
 
+/// Background indexing state: tracks startup indexing lifecycle.
+pub(super) struct IndexingState {
+    /// Set to true when `notifications/initialized` is received, signaling
+    /// the main loop to run initial indexing and auto-start the file watcher.
+    pub(super) startup_index_pending: Mutex<bool>,
+    /// True while background startup indexing is running.
+    pub(super) startup_indexing: Arc<AtomicBool>,
+    /// Signaled when background startup indexing completes.
+    pub(super) startup_indexing_done: Arc<(Mutex<bool>, Condvar)>,
+    /// Pending result from background startup indexing, consumed by post-index processing.
+    pub(super) startup_index_result: Arc<Mutex<Option<StartupIndexResult>>>,
+    /// Error message from a failed background startup indexing attempt.
+    pub(super) startup_index_error: Arc<Mutex<Option<String>>>,
+    /// True while a background embedding thread is running.
+    pub(super) embedding_in_progress: Arc<AtomicBool>,
+}
+
+impl IndexingState {
+    fn new() -> Self {
+        Self {
+            startup_index_pending: Mutex::new(false),
+            startup_indexing: Arc::new(AtomicBool::new(false)),
+            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
+            startup_index_result: Arc::new(Mutex::new(None)),
+            startup_index_error: Arc::new(Mutex::new(None)),
+            embedding_in_progress: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Cached query results with TTL-based invalidation.
+pub(super) struct CacheState {
+    /// Cached project_map result: (timestamp, json_value). Invalidated on re-index.
+    pub(super) cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
+    /// Cached module_overview results: path -> (timestamp, json_value). Invalidated on re-index.
+    pub(super) cached_module_overviews: Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
+}
+
+impl CacheState {
+    fn new() -> Self {
+        Self {
+            cached_project_map: Mutex::new(None),
+            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
 /// MCP server for code graph operations. Single-threaded (stdio loop).
 ///
 /// Lock ordering (acquire in this order to avoid deadlocks):
-///   1. startup_index_pending
+///   1. indexing.startup_index_pending
 ///   2. indexed
 ///   3. dir_cache / last_incremental_check / last_index_stats
 ///   4. watcher
-///   5. cached_project_map / cached_module_overviews
+///   5. cache.cached_project_map / cache.cached_module_overviews
 ///   6. embedding_model
 ///   7. notify_writer / metrics
 ///
@@ -181,27 +228,14 @@ pub struct McpServer {
     /// Writer for sending MCP notifications (progress, logging) to the client.
     /// Set to stdout in production; None in tests.
     pub(super) notify_writer: Mutex<Option<Box<dyn Write + Send>>>,
-    /// Set to true when `notifications/initialized` is received, signaling
-    /// the main loop to run initial indexing and auto-start the file watcher.
-    pub(super) startup_index_pending: Mutex<bool>,
-    /// True while a background embedding thread is running.
-    pub(super) embedding_in_progress: Arc<AtomicBool>,
-    /// True while background startup indexing is running.
-    pub(super) startup_indexing: Arc<AtomicBool>,
-    /// Signaled when background startup indexing completes.
-    pub(super) startup_indexing_done: Arc<(Mutex<bool>, Condvar)>,
-    /// Pending result from background startup indexing, consumed by post-index processing.
-    pub(super) startup_index_result: Arc<Mutex<Option<StartupIndexResult>>>,
-    /// Error message from a failed background startup indexing attempt.
-    pub(super) startup_index_error: Arc<Mutex<Option<String>>>,
+    /// Background indexing state (startup indexing lifecycle + embedding flag).
+    pub(super) indexing: IndexingState,
+    /// Cached query results (project_map, module_overviews) with TTL invalidation.
+    pub(super) cache: CacheState,
     /// Last indexing stats (skipped files, truncations) for observability.
     pub(super) last_index_stats: Mutex<IndexStats>,
     /// Aggregated session metrics, flushed to .code-graph/usage.jsonl at shutdown.
     pub(super) metrics: Mutex<super::metrics::SessionMetrics>,
-    /// Cached project_map result: (timestamp, json_value). Invalidated on re-index.
-    pub(super) cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
-    /// Cached module_overview results: path → (timestamp, json_value). Invalidated on re-index.
-    pub(super) cached_module_overviews: Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
     /// True if this instance holds the index lock (primary indexer).
     /// Secondary instances skip indexing/watching and read the DB in read-only mode.
     pub(super) is_primary: bool,
@@ -253,16 +287,10 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
-            startup_index_pending: Mutex::new(false),
-            embedding_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_indexing: Arc::new(AtomicBool::new(false)),
-            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
-            startup_index_result: Arc::new(Mutex::new(None)),
-            startup_index_error: Arc::new(Mutex::new(None)),
+            indexing: IndexingState::new(),
+            cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            cached_project_map: Mutex::new(None),
-            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
             is_primary,
         })
     }
@@ -280,16 +308,10 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
-            startup_index_pending: Mutex::new(false),
-            embedding_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_indexing: Arc::new(AtomicBool::new(false)),
-            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
-            startup_index_result: Arc::new(Mutex::new(None)),
-            startup_index_error: Arc::new(Mutex::new(None)),
+            indexing: IndexingState::new(),
+            cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            cached_project_map: Mutex::new(None),
-            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
             is_primary: true,
         }
     }
@@ -309,16 +331,10 @@ impl McpServer {
             last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
-            startup_index_pending: Mutex::new(false),
-            embedding_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_indexing: Arc::new(AtomicBool::new(false)),
-            startup_indexing_done: Arc::new((Mutex::new(false), Condvar::new())),
-            startup_index_result: Arc::new(Mutex::new(None)),
-            startup_index_error: Arc::new(Mutex::new(None)),
+            indexing: IndexingState::new(),
+            cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            cached_project_map: Mutex::new(None),
-            cached_module_overviews: Mutex::new(std::collections::HashMap::new()),
             is_primary: true,
         }
     }
@@ -351,7 +367,7 @@ impl McpServer {
     pub fn run_startup_tasks(&self) {
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
-            let mut guard = lock_or_recover(&self.startup_index_pending, "startup_index_pending");
+            let mut guard = lock_or_recover(&self.indexing.startup_index_pending, "startup_index_pending");
             let was_pending = *guard;
             *guard = false;
             was_pending
@@ -417,12 +433,12 @@ impl McpServer {
         has_existing_index: bool,
         dir_cache: Option<crate::indexer::merkle::DirectoryCache>,
     ) {
-        if self.startup_indexing.swap(true, Ordering::AcqRel) {
+        if self.indexing.startup_indexing.swap(true, Ordering::AcqRel) {
             return; // already running
         }
 
         // Reset condvar done flag for this indexing session
-        *lock_or_recover(&self.startup_indexing_done.0, "startup_indexing_done") = false;
+        *lock_or_recover(&self.indexing.startup_indexing_done.0, "startup_indexing_done") = false;
 
         if has_existing_index {
             self.send_log("info", "Updating index in background (incremental)...");
@@ -431,10 +447,10 @@ impl McpServer {
         }
 
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
-        let indexing_flag = Arc::clone(&self.startup_indexing);
-        let done_signal = Arc::clone(&self.startup_indexing_done);
-        let result_slot = Arc::clone(&self.startup_index_result);
-        let error_slot = Arc::clone(&self.startup_index_error);
+        let indexing_flag = Arc::clone(&self.indexing.startup_indexing);
+        let done_signal = Arc::clone(&self.indexing.startup_indexing_done);
+        let result_slot = Arc::clone(&self.indexing.startup_index_result);
+        let error_slot = Arc::clone(&self.indexing.startup_index_error);
         let progress_file = project_root.join(CODE_GRAPH_DIR).join("indexing-status.json");
 
         std::thread::spawn(move || {
@@ -524,24 +540,24 @@ impl McpServer {
     /// Check if background startup indexing completed and process the result.
     /// Called from `run_startup_tasks()` and `ensure_indexed()`.
     fn consume_startup_index_result(&self) {
-        if self.startup_indexing.load(Ordering::Acquire) {
+        if self.indexing.startup_indexing.load(Ordering::Acquire) {
             return; // still running
         }
 
         // Check for indexing errors and surface them to the MCP client
-        if let Some(err_msg) = lock_or_recover(&self.startup_index_error, "startup_error").take() {
+        if let Some(err_msg) = lock_or_recover(&self.indexing.startup_index_error, "startup_error").take() {
             self.send_log("error", &err_msg);
         }
 
-        let result = lock_or_recover(&self.startup_index_result, "startup_result").take();
+        let result = lock_or_recover(&self.indexing.startup_index_result, "startup_result").take();
         let Some(r) = result else { return };
 
         *lock_or_recover(&self.indexed, "indexed") = true;
 
         // Invalidate caches after background startup indexing
         if r.files_indexed > 0 {
-            *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
-            lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
+            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
         }
 
         // Store indexing stats for observability (exposed via get_index_status)
@@ -622,10 +638,10 @@ impl McpServer {
         };
 
         // Acquire flag AFTER precondition checks to avoid permanent flag leak
-        if self.embedding_in_progress.swap(true, Ordering::AcqRel) {
+        if self.indexing.embedding_in_progress.swap(true, Ordering::AcqRel) {
             return; // already running
         }
-        let flag = Arc::clone(&self.embedding_in_progress);
+        let flag = Arc::clone(&self.indexing.embedding_in_progress);
 
         std::thread::spawn(move || {
             // Drop guard ensures flag is always cleared, even on panic
@@ -827,22 +843,25 @@ impl McpServer {
             return Ok(());
         }
 
-        // Wait for or consume background startup indexing result
-        if self.startup_indexing.load(Ordering::Acquire) {
-            self.send_log("info", "Waiting for background indexing to complete...");
-            let (lock, cvar) = &*self.startup_indexing_done;
+        // Non-blocking check for background startup indexing with short grace period.
+        // Instead of blocking the stdio loop for up to 300s (which prevents all other
+        // MCP requests), we wait at most 2s then return an error asking the client to retry.
+        if self.indexing.startup_indexing.load(Ordering::Acquire) {
+            let (lock, cvar) = &*self.indexing.startup_indexing_done;
             let mut done = lock_or_recover(lock, "startup_indexing_done");
-            let timeout = std::time::Duration::from_secs(300);
-            while !*done {
-                let (guard, wait_result) = cvar.wait_timeout(done, timeout).unwrap_or_else(|e| {
+            let grace = std::time::Duration::from_secs(2);
+            if !*done {
+                let (guard, wait_result) = cvar.wait_timeout(done, grace).unwrap_or_else(|e| {
                     tracing::warn!("Recovering poisoned condvar (startup_indexing_done)");
                     let guard = e.into_inner();
                     (guard.0, guard.1)
                 });
                 done = guard;
-                if wait_result.timed_out() {
-                    tracing::warn!("Background indexing wait timed out ({}s), falling back to synchronous", timeout.as_secs());
-                    break;
+                if wait_result.timed_out() && !*done {
+                    anyhow::bail!(
+                        "Indexing in progress — results will be available shortly. \
+                         Please retry your request in a few seconds or call get_index_status for details."
+                    );
                 }
             }
         }
@@ -862,8 +881,8 @@ impl McpServer {
             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
             // Invalidate caches after re-index
-            *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
-            lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
+            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
             // Note: model lock is NOT held here — spawn_background_embedding locks it internally
             self.spawn_background_embedding();
         } else {
@@ -896,7 +915,7 @@ impl McpServer {
     /// being deleted and re-inserted by the incremental index. The 30s debounce
     /// (or next tool call in tests) will trigger the re-index once embedding finishes.
     fn run_incremental_with_cache_restore(&self, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<()> {
-        if self.embedding_in_progress.load(Ordering::Acquire) {
+        if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             tracing::info!("Skipping incremental re-index: background embedding in progress");
             return Ok(());
         }
@@ -910,8 +929,8 @@ impl McpServer {
             Ok((result, new_cache)) => {
                 if result.files_indexed > 0 {
                     // Invalidate caches when files actually changed
-                    *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
-                    lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
+                    *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+                    lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
@@ -961,7 +980,7 @@ impl McpServer {
         // Per JSON-RPC 2.0, notifications (no id) must never receive a response
         if req.id.is_none() {
             if req.method == "notifications/initialized" {
-                *lock_or_recover(&self.startup_index_pending, "startup_index_pending") = true;
+                *lock_or_recover(&self.indexing.startup_index_pending, "startup_index_pending") = true;
             }
             return Ok(None);
         }
@@ -2017,5 +2036,31 @@ app.post('/api/login', handleLogin);
         let compressed_tokens = crate::sandbox::compressor::estimate_json_tokens(&compressed);
         assert!(compressed_tokens <= COMPRESSION_TOKEN_THRESHOLD * 2,
             "compressed result should be much smaller: {} tokens", compressed_tokens);
+    }
+
+    #[test]
+    fn test_ensure_indexed_non_blocking_when_indexing_in_progress() {
+        // Setup: create a server with startup_indexing=true and condvar never signaled
+        let project_dir = TempDir::new().unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // Simulate background indexing in progress
+        server.indexing.startup_indexing.store(true, Ordering::SeqCst);
+        *server.indexing.startup_indexing_done.0.lock().unwrap() = false;
+
+        // Call ensure_indexed and verify it returns within 5 seconds
+        let start = std::time::Instant::now();
+        let result = server.ensure_indexed();
+        let elapsed = start.elapsed();
+
+        // Must complete quickly (under 5 seconds), not block for 300 seconds
+        assert!(elapsed.as_secs() < 5,
+            "ensure_indexed should return within 5 seconds, took {}s", elapsed.as_secs());
+
+        // Should return an error indicating indexing is in progress
+        assert!(result.is_err(), "ensure_indexed should return Err when indexing is in progress");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("ndexing in progress") || err_msg.contains("retry"),
+            "error message should mention indexing in progress or retry, got: {}", err_msg);
     }
 }

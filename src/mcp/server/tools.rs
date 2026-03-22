@@ -855,7 +855,7 @@ impl McpServer {
 
         let embedding_status = if !model_available {
             "unavailable"
-        } else if self.embedding_in_progress.load(Ordering::Acquire) {
+        } else if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             "in_progress"
         } else if vectors_done >= vectors_total && vectors_total > 0 {
             "complete"
@@ -921,7 +921,7 @@ impl McpServer {
         // Wait for background embedding to finish before clearing data
         // to avoid race where embedding thread writes vectors for deleted nodes
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while self.embedding_in_progress.load(Ordering::Acquire) {
+        while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             if std::time::Instant::now() > deadline {
                 return Err(anyhow!("Background embedding still in progress. Try again shortly."));
             }
@@ -947,8 +947,8 @@ impl McpServer {
 
         // Reset indexed flag and invalidate caches
         *lock_or_recover(&self.indexed, "indexed") = true;
-        *lock_or_recover(&self.cached_project_map, "cached_pmap") = None;
-        lock_or_recover(&self.cached_module_overviews, "cached_movw").clear();
+        *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+        lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
 
         self.spawn_background_embedding();
 
@@ -1097,7 +1097,7 @@ impl McpServer {
 
         // Return cached result if fresh (< 60s), evict if expired
         {
-            let mut cache = lock_or_recover(&self.cached_module_overviews, "cached_movw");
+            let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
             if let Some((ts, _)) = cache.get(path) {
                 if ts.elapsed().as_secs() < 60 {
                     let val = cache.get(path).unwrap().1.clone();
@@ -1198,7 +1198,7 @@ impl McpServer {
 
         // Cache the full result (max 10 entries to bound memory)
         {
-            let mut cache = lock_or_recover(&self.cached_module_overviews, "cached_movw");
+            let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
             if cache.len() >= 10 {
                 // Evict oldest entry
                 if let Some(oldest_key) = cache.iter()
@@ -1449,7 +1449,7 @@ impl McpServer {
         // Return cached result if fresh (< 60s) — project_map is expensive and rarely changes mid-session
         // Note: cache stores full result; compact is derived from it on the fly
         let full_result = {
-            let cache = lock_or_recover(&self.cached_project_map, "cached_pmap");
+            let cache = lock_or_recover(&self.cache.cached_project_map, "cached_pmap");
             if let Some((ts, ref val)) = *cache {
                 if ts.elapsed().as_secs() < 60 {
                     Some(val.clone())
@@ -1518,7 +1518,7 @@ impl McpServer {
             });
 
             // Cache the full result
-            *lock_or_recover(&self.cached_project_map, "cached_pmap") =
+            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") =
                 Some((std::time::Instant::now(), r.clone()));
 
             r
