@@ -4,35 +4,15 @@
 //! so concurrent tests use Arc<Mutex<McpServer>> to validate that interleaved
 //! access from multiple threads causes no deadlocks or data corruption.
 
+mod common;
+
 use code_graph_mcp::mcp::server::McpServer;
 use serde_json::json;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
-fn tool_call_json(name: &str, args: serde_json::Value) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": { "name": name, "arguments": args }
-    })
-    .to_string()
-}
-
-fn parse_tool_result(resp: &Option<String>) -> serde_json::Value {
-    let resp = resp.as_ref().unwrap();
-    let v: serde_json::Value = serde_json::from_str(resp).unwrap();
-    let text = v["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
-}
-
-fn init_server(project: &TempDir) -> McpServer {
-    let server = McpServer::from_project_root(project.path()).unwrap();
-    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
-    server.handle_message(init).unwrap();
-    server
-}
+use common::{init_server, parse_tool_result, tool_call_json};
 
 fn setup_project(file_count: usize) -> (TempDir, McpServer) {
     let project = TempDir::new().unwrap();

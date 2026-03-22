@@ -398,3 +398,127 @@ enum UserRole { admin, viewer }
         .collect();
     assert!(!imports.is_empty(), "Dart imports should be extracted, got: {:?}", imports);
 }
+
+// ============================================================
+// Unicode identifier tests
+// ============================================================
+
+#[test]
+fn test_unicode_identifiers_python() {
+    // Python supports Unicode identifiers (PEP 3131)
+    let code = format!(
+        "def r{}sum{}(data):\n    return data\n\nclass {}l{}{}(object):\n    pass\n",
+        '\u{00e9}', '\u{00e9}', '\u{00d6}', '\u{00e7}', '\u{00fc}'
+    );
+    let nodes = parse_code(&code, "python").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.contains("sum")),
+        "Python Unicode function name should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with('\u{00d6}')),
+        "Python Unicode class name should be parsed, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_unicode_identifiers_rust() {
+    // Rust supports Unicode identifiers (RFC 2457)
+    let code = format!(
+        "fn caf{}() -> i32 {{ 42 }}\nstruct Stra{}e {{ weg: String }}\n",
+        '\u{00e9}', '\u{00df}'
+    );
+    let nodes = parse_code(&code, "rust").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("caf")),
+        "Rust Unicode function name should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("Stra")),
+        "Rust Unicode struct name should be parsed, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_unicode_identifiers_go() {
+    // Go supports Unicode identifiers
+    let code = format!(
+        "package main\n\nfunc {}{}(x int) int {{\n    return x * 2\n}}\n",
+        '\u{8a08}', '\u{7b97}'
+    );
+    let nodes = parse_code(&code, "go").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let expected = format!("{}{}", '\u{8a08}', '\u{7b97}');
+    assert!(
+        names.contains(&expected.as_str()),
+        "Go CJK function name should be parsed, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_cjk_identifiers_java() {
+    // Java supports Unicode identifiers
+    let class_name = format!(
+        "{}{}{}{}",
+        '\u{30e6}', '\u{30fc}', '\u{30b6}', '\u{30fc}'
+    );
+    let method_name = format!("{}{}", '\u{691c}', '\u{7d22}');
+    let code = format!(
+        "public class {} {{\n    public void {}() {{}}\n}}\n",
+        class_name, method_name
+    );
+    let nodes = parse_code(&code, "java").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.contains(&class_name.as_str()),
+        "Java CJK class name should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&method_name.as_str()),
+        "Java CJK method name should be parsed, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_unicode_does_not_panic_or_truncate() {
+    // Ensure various Unicode scripts don't cause panics or empty names
+    let greek = format!("{}{}{}", '\u{03b1}', '\u{03b2}', '\u{03b3}');
+    let cyrillic = format!("{}{}{}", '\u{0410}', '\u{0411}', '\u{0412}');
+    let korean = format!("{}{}", '\u{c548}', '\u{b155}');
+
+    let cases = vec![
+        ("python", format!("def {}():\n    pass\n", greek), greek.clone()),
+        ("python", format!("def {}():\n    pass\n", cyrillic), cyrillic.clone()),
+        (
+            "go",
+            format!("package main\n\nfunc {}(x int) int {{ return x }}\n", korean),
+            korean.clone(),
+        ),
+    ];
+    for (lang, code, expected_name) in &cases {
+        let nodes = parse_code(code, lang).unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&expected_name.as_str()),
+            "{} identifier '{}' should be parsed without truncation, got: {:?}",
+            lang,
+            expected_name,
+            names
+        );
+        // Verify name length is preserved (not truncated)
+        let node = nodes.iter().find(|n| n.name == *expected_name).unwrap();
+        assert_eq!(
+            node.name, *expected_name,
+            "Name should be exact match (no truncation)"
+        );
+    }
+}

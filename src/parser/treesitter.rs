@@ -108,8 +108,8 @@ fn extract_nodes(
         return;
     }
 
-    // Check if this specific node has #[test] or #[cfg(test)]
-    let node_is_test = in_test_context || has_test_attribute(&node, source);
+    // Check if this specific node has #[test] or #[cfg(test)] (Rust-only attributes)
+    let node_is_test = in_test_context || (language == "rust" && has_test_attribute(&node, source));
 
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)

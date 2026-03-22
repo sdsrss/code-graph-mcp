@@ -17,7 +17,7 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 /// Extract relations from a pre-parsed tree (avoids re-parsing).
 pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
-    walk_for_relations(tree.root_node(), source, language, None, &mut relations, 0);
+    walk_for_relations(tree.root_node(), source, language, None, None, &mut relations, 0);
     relations
 }
 
@@ -26,6 +26,7 @@ fn walk_for_relations(
     source: &str,
     language: &str,
     current_scope: Option<&str>,
+    current_class: Option<&str>,
     results: &mut Vec<ParsedRelation>,
     depth: usize,
 ) {
@@ -39,14 +40,26 @@ fn walk_for_relations(
         | "async_function_definition"
         | "method" | "singleton_method" => {
             node.child_by_field_name("name")
-                .map(|n| node_text(&n, source).to_string())
+                .map(|n| {
+                    let name = node_text(&n, source).to_string();
+                    match current_class {
+                        Some(cls) => format!("{}.{}", cls, name),
+                        None => name,
+                    }
+                })
         }
         "arrow_function" => {
             // Try to get name from parent variable_declarator: const foo = () => {}
             node.parent()
                 .filter(|p| p.kind() == "variable_declarator")
                 .and_then(|p| p.child_by_field_name("name"))
-                .map(|n| node_text(&n, source).to_string())
+                .map(|n| {
+                    let name = node_text(&n, source).to_string();
+                    match current_class {
+                        Some(cls) => format!("{}.{}", cls, name),
+                        None => name,
+                    }
+                })
                 .or_else(|| Some("<anonymous>".to_string()))
         }
         // Dart: function_body is a sibling of method_signature in class_body
@@ -60,7 +73,13 @@ fn walk_for_relations(
                         .filter_map(|i| s.named_child(i))
                         .find(|c| matches!(c.kind(), "function_signature" | "constructor_signature" | "getter_signature" | "setter_signature"))
                         .and_then(|sig| sig.child_by_field_name("name"))
-                        .map(|n| node_text(&n, source).to_string())
+                        .map(|n| {
+                            let name = node_text(&n, source).to_string();
+                            match current_class {
+                                Some(cls) => format!("{}.{}", cls, name),
+                                None => name,
+                            }
+                        })
                 })
         }
         _ => None,
@@ -423,10 +442,21 @@ fn walk_for_relations(
         _ => {}
     }
 
+    // Determine class context for children: when entering a class body,
+    // pass the class name so methods can build qualified scope names.
+    let child_class = match kind {
+        "class_declaration" | "class_definition" | "class" => {
+            node.child_by_field_name("name")
+                .map(|n| node_text(&n, source).to_string())
+        }
+        _ => None,
+    };
+    let effective_class = child_class.as_deref().or(current_class);
+
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, active_scope, results, depth + 1);
+            walk_for_relations(child, source, language, active_scope, effective_class, results, depth + 1);
         }
     }
 }
@@ -1794,5 +1824,48 @@ fn run_serve() {
             "server.run_startup_tasks() missing, got: {:?}", calls);
         assert!(calls.contains(&("run_serve", "flush_metrics")),
             "server.flush_metrics() missing, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_scope_qualification_class_method() {
+        // Methods inside a class should have scope qualified as ClassName.method_name
+        let code = r#"
+class UserService {
+    getUser(id) {
+        return this.db.findById(id);
+    }
+    deleteUser(id) {
+        this.getUser(id);
+        this.db.remove(id);
+    }
+}
+"#;
+        let relations = extract_relations(code, "typescript").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        // The scope for getUser should be "UserService.getUser", not just "getUser"
+        assert!(calls.iter().any(|(src, tgt)| *src == "UserService.getUser" && *tgt == "findById"),
+            "getUser scope should be qualified as UserService.getUser, got calls: {:?}", calls);
+        assert!(calls.iter().any(|(src, tgt)| *src == "UserService.deleteUser" && *tgt == "getUser"),
+            "deleteUser scope should be qualified as UserService.deleteUser, got calls: {:?}", calls);
+    }
+
+    #[test]
+    fn test_scope_standalone_function_not_qualified() {
+        // Standalone functions (not inside a class) should NOT be qualified with a class prefix
+        let code = r#"
+function doWork() {
+    process();
+}
+"#;
+        let relations = extract_relations(code, "typescript").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(calls.iter().any(|(src, tgt)| *src == "doWork" && *tgt == "process"),
+            "standalone function scope should remain unqualified, got calls: {:?}", calls);
     }
 }

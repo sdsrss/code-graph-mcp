@@ -13,8 +13,8 @@ use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::{
     delete_files_by_paths, delete_nodes_by_file,
-    get_all_file_hashes, get_dirty_node_ids, get_edges_batch,
-    get_node_names_with_paths_excluding_files, get_nodes_by_file_path,
+    get_all_file_hashes, get_all_node_names_with_ids, get_dirty_node_ids, get_edges_batch,
+    get_nodes_by_file_path,
     get_nodes_missing_context, get_nodes_with_files_by_ids,
     insert_edge_cached, insert_node_cached,
     insert_node_vectors_batch, update_context_strings_batch, upsert_file,
@@ -521,6 +521,12 @@ fn index_files(
     }
     let python_module_map = build_python_module_map(&all_python_paths);
 
+    // Pre-load global name->[(id, path)] map once before the batch loop.
+    // This avoids a full table scan per batch in Phase 2 relation resolution.
+    // The map is updated incrementally as each batch commits new nodes.
+    let mut global_name_map: HashMap<String, Vec<(i64, String)>> =
+        get_all_node_names_with_ids(db.conn())?;
+
     // Heavyweight per-file data used during Phase 1+2, dropped after each batch
     struct FileParsed {
         rel_path: String,
@@ -679,27 +685,33 @@ fn index_files(
         }
 
         // --- Phase 2: Extract relations + insert edges ---
+        // Build per-batch name_to_ids and node_id_to_path from the pre-loaded global map,
+        // excluding files in the current batch (their old nodes were deleted in Phase 1b).
+        let batch_file_paths: HashSet<&str> = batch_parsed.iter()
+            .map(|pf| pf.rel_path.as_str()).collect();
+
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
+
+        // Add current batch's newly inserted nodes
         for pf in &batch_parsed {
             for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
                 name_to_ids.entry(name.clone()).or_default().push(*id);
                 node_id_to_path.insert(*id, pf.rel_path.clone());
             }
         }
-        // Include nodes from prior batches (in-memory)
-        for fi in &all_indexed {
-            for &nid in &fi.node_ids {
-                node_id_to_path.insert(nid, fi.rel_path.clone());
+
+        // Add nodes from the global map, excluding those in current batch's files
+        // (their old nodes were deleted and replaced by new ones above)
+        for (name, entries) in &global_name_map {
+            for &(id, ref path) in entries {
+                if !batch_file_paths.contains(path.as_str()) {
+                    name_to_ids.entry(name.clone()).or_default().push(id);
+                    node_id_to_path.insert(id, path.clone());
+                }
             }
         }
-        // Include nodes from existing DB (already committed from previous runs)
-        let indexed_file_ids: Vec<i64> = batch_parsed.iter().map(|pf| pf.file_id).collect();
-        let existing_with_paths = get_node_names_with_paths_excluding_files(db.conn(), &indexed_file_ids)?;
-        for (name, id, path) in &existing_with_paths {
-            name_to_ids.entry(name.clone()).or_default().push(*id);
-            node_id_to_path.insert(*id, path.clone());
-        }
+
         for ids in name_to_ids.values_mut() {
             ids.sort();
             ids.dedup();
@@ -846,8 +858,20 @@ fn index_files(
 
         let batch_file_count = batch_parsed.len();
 
+        // Update global_name_map: remove old entries for batch files, add new ones
+        for (_, entries) in global_name_map.iter_mut() {
+            entries.retain(|(_id, path)| !batch_file_paths.contains(path.as_str()));
+        }
+        global_name_map.retain(|_, entries| !entries.is_empty());
+
         // Convert to lightweight records — drops Tree and source string
         for pf in batch_parsed {
+            // Add newly committed nodes to the global map
+            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+                global_name_map.entry(name.clone())
+                    .or_default()
+                    .push((*id, pf.rel_path.clone()));
+            }
             all_indexed.push(FileIndexed {
                 rel_path: pf.rel_path,
                 node_ids: pf.node_ids,
