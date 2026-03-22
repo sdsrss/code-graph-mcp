@@ -2,10 +2,26 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { launchBackgroundAutoUpdate, syncLifecycleConfig } = require('./session-init');
+const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh } = require('./session-init');
 
 test('syncLifecycleConfig is exported as a callable helper', () => {
   assert.equal(typeof syncLifecycleConfig, 'function');
+});
+
+test('ensureIndexFresh is exported as a callable helper', () => {
+  assert.equal(typeof ensureIndexFresh, 'function');
+});
+
+test('ensureIndexFresh returns skipped when no index exists', () => {
+  const origCwd = process.cwd();
+  const tmpDir = require('node:os').tmpdir();
+  process.chdir(tmpDir);
+  try {
+    const result = ensureIndexFresh();
+    assert.equal(result, 'skipped');
+  } finally {
+    process.chdir(origCwd);
+  }
 });
 
 test('launchBackgroundAutoUpdate spawns detached silent updater', () => {

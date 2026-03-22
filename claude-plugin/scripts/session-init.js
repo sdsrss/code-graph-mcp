@@ -47,6 +47,41 @@ function syncLifecycleConfig() {
   return 'noop';
 }
 
+/**
+ * Check if the index is stale by comparing git HEAD timestamp vs index.db mtime.
+ * If stale, spawn background incremental-index to refresh.
+ * Returns 'fresh' | 'refreshing' | 'skipped'.
+ */
+function ensureIndexFresh() {
+  const { findBinary } = require('./find-binary');
+  const bin = findBinary();
+  if (!bin) return 'skipped';
+
+  const cwd = process.cwd();
+  const dbPath = path.join(cwd, '.code-graph', 'index.db');
+  if (!fs.existsSync(dbPath)) return 'skipped';
+
+  try {
+    const dbMtime = fs.statSync(dbPath).mtimeMs;
+    // Compare with git HEAD commit timestamp
+    const gitTs = parseInt(
+      execSync('git log -1 --format=%ct', { cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
+    ) * 1000;
+    if (gitTs <= dbMtime) return 'fresh';
+
+    // Index is stale — run incremental-index in background
+    const child = spawn(bin, ['incremental-index', '--quiet'], {
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+    });
+    if (child && typeof child.unref === 'function') child.unref();
+    return 'refreshing';
+  } catch {
+    return 'skipped';
+  }
+}
+
 function runSessionInit() {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
@@ -63,8 +98,9 @@ function runSessionInit() {
 
   const lifecycle = syncLifecycleConfig();
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
+  const indexFreshness = ensureIndexFresh();
   const mapInjected = injectProjectMap();
-  return { inactive: false, lifecycle, autoUpdateLaunched, mapInjected };
+  return { inactive: false, lifecycle, autoUpdateLaunched, indexFreshness, mapInjected };
 }
 
 /**
@@ -99,6 +135,7 @@ function injectProjectMap() {
 module.exports = {
   launchBackgroundAutoUpdate,
   syncLifecycleConfig,
+  ensureIndexFresh,
   injectProjectMap,
   runSessionInit,
 };

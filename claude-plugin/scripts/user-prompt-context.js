@@ -3,7 +3,7 @@
 // UserPromptSubmit hook: inject relevant code-graph context based on user's question.
 // Only activates when user message references code entities + has understanding intent.
 // This is a CODE INDEX, not a memory store — only inject structural code context.
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -106,7 +106,9 @@ if (result && result.trim()) {
 // --- Helpers ---
 
 function run(cmd) {
-  return execSync(cmd, {
+  const parts = cmd.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+  const args = parts.slice(1).map(a => a.replace(/^"|"$/g, ''));
+  return execFileSync(parts[0], args, {
     cwd,
     timeout: 3000,
     encoding: 'utf8',

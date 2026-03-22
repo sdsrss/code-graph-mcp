@@ -37,19 +37,7 @@ if (!binary) {
       process.stderr.write(`[code-graph] Installed at ${binary}\n`);
     }
   } catch {
-    process.stderr.write('[code-graph] npm install failed. Trying direct download...\n');
-  }
-
-  // Fallback: direct binary download from GitHub release
-  if (!binary) {
-    try {
-      const { downloadBinarySync } = require('./auto-update');
-      if (typeof downloadBinarySync === 'function') {
-        downloadBinarySync(version);
-        clearCache();
-        binary = findBinary();
-      }
-    } catch { /* not available */ }
+    process.stderr.write('[code-graph] npm install failed.\n');
   }
 }
 

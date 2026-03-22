@@ -364,7 +364,45 @@ function update() {
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
+  // 6. Clean up old cached versions (keep latest 3)
+  cleanupOldCacheVersions(3);
+
   return { oldVersion, version, settingsChanged };
+}
+
+/**
+ * Remove old plugin cache versions, keeping the N most recent.
+ * Cache layout: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/
+ */
+function cleanupOldCacheVersions(keep = 3) {
+  const cacheParent = path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME);
+  try {
+    // List all subdirectories under the marketplace cache
+    const entries = fs.readdirSync(cacheParent, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const pluginDir = path.join(cacheParent, entry.name);
+      try {
+        const versions = fs.readdirSync(pluginDir, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => ({
+            name: d.name,
+            path: path.join(pluginDir, d.name),
+            mtime: fs.statSync(path.join(pluginDir, d.name)).mtimeMs,
+          }))
+          .sort((a, b) => b.mtime - a.mtime); // newest first
+
+        if (versions.length <= keep) continue;
+
+        const toRemove = versions.slice(keep);
+        for (const v of toRemove) {
+          try {
+            fs.rmSync(v.path, { recursive: true, force: true });
+          } catch { /* permission error or in-use — skip */ }
+        }
+      } catch { /* can't read plugin dir — skip */ }
+    }
+  } catch { /* cache dir doesn't exist — nothing to clean */ }
 }
 
 module.exports = {
@@ -372,7 +410,7 @@ module.exports = {
   isPluginExplicitlyDisabled, isPluginInactive, cleanupDisabledStatusline,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
-  getPluginVersion,
+  getPluginVersion, cleanupOldCacheVersions,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 

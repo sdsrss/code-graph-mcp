@@ -19,7 +19,7 @@ impl CliContext {
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             anyhow::bail!(
-                "No index found at {}. Run the MCP server first to create the index.",
+                "No index found at {}. Run: code-graph-mcp incremental-index",
                 db_path.display()
             );
         }
@@ -139,23 +139,48 @@ fn format_node_compact(node: &queries::NodeResult, file_path: &str) -> String {
 
 /// Run incremental index update.
 /// If `quiet` is true, suppress non-error output.
+/// Auto-creates the database and runs a full index if no index exists.
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
-    let ctx = CliContext::open(project_root)?;
+    let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+    let is_new = !db_path.exists();
 
-    // Use run_incremental_index without a model (no embedding for short-lived CLI)
-    use crate::indexer::pipeline::run_incremental_index;
-    let stats = run_incremental_index(&ctx.db, &ctx.project_root, None, None)?;
+    if is_new {
+        // Ensure .code-graph/ directory exists
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !quiet {
+            eprintln!("No index found, creating full index...");
+        }
+    }
 
-    if !quiet {
-        eprintln!(
-            "Incremental index: {} files updated, {} nodes created",
-            stats.files_indexed, stats.nodes_created
-        );
+    let db = Database::open(&db_path)?;
+
+    if is_new {
+        // Full index for new databases
+        use crate::indexer::pipeline::run_full_index;
+        let result = run_full_index(&db, project_root, None, None)?;
+        if !quiet {
+            eprintln!(
+                "Full index: {} files, {} nodes, {} edges",
+                result.files_indexed, result.nodes_created, result.edges_created
+            );
+        }
+    } else {
+        // Incremental index for existing databases
+        use crate::indexer::pipeline::run_incremental_index;
+        let stats = run_incremental_index(&db, project_root, None, None)?;
+        if !quiet {
+            eprintln!(
+                "Incremental index: {} files updated, {} nodes created",
+                stats.files_indexed, stats.nodes_created
+            );
+        }
     }
     Ok(())
 }
 
-/// Run health check and print status.
+/// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -165,6 +190,18 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     let schema_ok = status.schema_version == expected_schema;
     let has_data = status.nodes_count > 0 && status.files_count > 0;
     let healthy = schema_ok && has_data;
+
+    // Compute index age from last_indexed_at (unix timestamp in seconds)
+    let age_str = status.last_indexed_at.map(|ts| {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 - ts)
+            .unwrap_or(0);
+        if elapsed < 60 { format!("{}s ago", elapsed) }
+        else if elapsed < 3600 { format!("{}m ago", elapsed / 60) }
+        else if elapsed < 86400 { format!("{}h ago", elapsed / 3600) }
+        else { format!("{}d ago", elapsed / 86400) }
+    });
 
     match format {
         "json" => {
@@ -176,6 +213,12 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "watching": false,
                 "schema_version": status.schema_version,
             });
+            if let Some(ts) = status.last_indexed_at {
+                json["last_indexed_at"] = serde_json::json!(ts);
+            }
+            if let Some(ref age) = age_str {
+                json["index_age"] = serde_json::json!(age);
+            }
             if !schema_ok {
                 json["issue"] = serde_json::json!(format!(
                     "schema version mismatch: got {}, expected {}",
@@ -191,9 +234,10 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         }
         _ => {
             if healthy {
+                let age_info = age_str.map(|a| format!(" (updated {})", a)).unwrap_or_default();
                 println!(
-                    "OK: {} nodes, {} edges, {} files",
-                    status.nodes_count, status.edges_count, status.files_count
+                    "OK: {} nodes, {} edges, {} files{}",
+                    status.nodes_count, status.edges_count, status.files_count, age_info
                 );
             } else if !schema_ok {
                 eprintln!(
