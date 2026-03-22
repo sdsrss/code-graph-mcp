@@ -498,7 +498,7 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
 
     // Normalize node_type filter for matching
     let normalized_node_types: Vec<&'static str> = node_type_filter
-        .map(|t| normalize_type_filter(t))
+        .map(normalize_type_filter)
         .unwrap_or_default();
 
     // Filter by language, node_type, and skip test/module nodes (align with MCP behavior)
@@ -516,10 +516,10 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
                     .unwrap_or(false);
                 if !lang_ok { return false; }
             }
-            if !normalized_node_types.is_empty() {
-                if !normalized_node_types.iter().any(|t| n.node_type == *t) {
-                    return false;
-                }
+            if !normalized_node_types.is_empty()
+                && !normalized_node_types.iter().any(|t| n.node_type == *t)
+            {
+                return false;
             }
             true
         })
