@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use tempfile::TempDir;
 
@@ -5,24 +7,7 @@ use code_graph_mcp::mcp::server::McpServer;
 use code_graph_mcp::storage::db::Database;
 use code_graph_mcp::storage::queries::*;
 
-fn tool_call_json(tool_name: &str, args: serde_json::Value) -> String {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": args
-        }
-    }).to_string()
-}
-
-fn parse_tool_result(response: &Option<String>) -> serde_json::Value {
-    let resp = response.as_ref().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(resp).unwrap();
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
-}
+use common::{parse_tool_result, tool_call_json};
 
 #[test]
 fn test_e2e_index_and_search() {
@@ -1105,4 +1090,229 @@ fn test_skip_indexing_flag() {
         .or_else(|| result3.as_array());
     assert!(empty_results.is_none_or(|a| a.is_empty()),
         "should return empty results when skip_indexing with no prior index, got: {}", result3);
+}
+
+#[test]
+fn test_get_ast_node_compact_mode() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/lib.ts"), r#"
+export function processData(input: string): number {
+    const parsed = JSON.parse(input);
+    return parsed.value * 2;
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "processData"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Non-compact: should have code_content
+    let msg = tool_call_json("get_ast_node", serde_json::json!({
+        "file_path": "src/lib.ts",
+        "symbol_name": "processData"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result["code_content"].is_string(), "non-compact should have code_content");
+
+    // Compact mode: should NOT have code_content
+    let msg = tool_call_json("get_ast_node", serde_json::json!({
+        "file_path": "src/lib.ts",
+        "symbol_name": "processData",
+        "compact": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result["code_content"].is_null(), "compact should strip code_content");
+    assert!(result["name"].is_string(), "compact should keep name");
+    assert!(result["node_id"].is_number(), "compact should keep node_id");
+    assert!(result["type"].is_string(), "compact should keep type");
+    assert!(result["file_path"].is_string(), "compact should keep file_path");
+    assert!(result["start_line"].is_number(), "compact should keep start_line");
+    assert!(result["signature"].is_string() || result["signature"].is_null(), "compact should keep signature");
+
+    // Compact via node_id
+    let node_id = result["node_id"].as_i64().unwrap();
+    let msg = tool_call_json("get_ast_node", serde_json::json!({
+        "node_id": node_id,
+        "compact": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(result["code_content"].is_null(), "compact via node_id should strip code_content");
+    assert_eq!(result["name"], "processData");
+}
+
+#[test]
+fn test_find_references_compact_mode() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/util.ts"), r#"
+export function helper(): number { return 42; }
+"#).unwrap();
+    fs::write(project.path().join("src/main.ts"), r#"
+import { helper } from './util';
+function run() { return helper(); }
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Non-compact: references should have type field
+    let msg = tool_call_json("find_references", serde_json::json!({
+        "symbol_name": "helper"
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    assert!(!refs.is_empty(), "should find references to helper");
+    // Non-compact references include "type" field
+    for r in refs {
+        assert!(r["type"].is_string(), "non-compact should have type field");
+    }
+
+    // Compact mode: references should NOT have type field
+    let msg = tool_call_json("find_references", serde_json::json!({
+        "symbol_name": "helper",
+        "compact": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    assert!(!refs.is_empty(), "compact should still find references");
+    for r in refs {
+        assert!(r["type"].is_null(), "compact should strip type field");
+        assert!(r["name"].is_string(), "compact should keep name");
+        assert!(r["file_path"].is_string(), "compact should keep file_path");
+        assert!(r["relation"].is_string(), "compact should keep relation");
+        assert!(r["node_id"].is_number(), "compact should keep node_id");
+        assert!(r["start_line"].is_number(), "compact should keep start_line");
+    }
+}
+
+#[test]
+fn test_dependency_graph_compact_mode() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/db.ts"), r#"
+export function query(sql: string): any[] { return []; }
+"#).unwrap();
+    fs::write(project.path().join("src/repo.ts"), r#"
+import { query } from './db';
+export function findUser(id: number) { return query('SELECT * FROM users WHERE id=' + id); }
+"#).unwrap();
+    fs::write(project.path().join("src/api.ts"), r#"
+import { findUser } from './repo';
+export function getUser(req: any) { return findUser(req.params.id); }
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "findUser"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Non-compact: should have symbols field for depth-1 deps
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/repo.ts",
+        "direction": "both",
+        "depth": 2
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let depends_on = result["depends_on"].as_array().unwrap();
+    assert!(!depends_on.is_empty(), "should have outgoing deps");
+    // Non-compact depth-1 deps have symbols
+    let depth1 = depends_on.iter().find(|d| d["depth"].as_i64() == Some(1));
+    assert!(depth1.is_some(), "should have depth-1 dep");
+    assert!(depth1.unwrap()["symbols"].is_number(), "non-compact depth-1 should have symbols count");
+
+    // Compact mode: should NOT have symbols field
+    let msg = tool_call_json("dependency_graph", serde_json::json!({
+        "file_path": "src/repo.ts",
+        "direction": "both",
+        "depth": 2,
+        "compact": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let depends_on = result["depends_on"].as_array().unwrap();
+    assert!(!depends_on.is_empty(), "compact should still have outgoing deps");
+    for dep in depends_on {
+        assert!(dep["file"].is_string(), "compact should keep file");
+        assert!(dep["depth"].is_number(), "compact should keep depth");
+        assert!(dep["symbols"].is_null(), "compact should strip symbols");
+    }
+    let depended_by = result["depended_by"].as_array().unwrap();
+    for dep in depended_by {
+        assert!(dep["symbols"].is_null(), "compact should strip symbols from incoming deps too");
+    }
+    assert!(result["file"].is_string(), "compact should keep file");
+    assert!(result["summary"].is_string(), "compact should keep summary");
+}
+
+// ============================================================
+// Unicode identifier tests (FTS5 search integration)
+// ============================================================
+
+#[test]
+fn test_unicode_identifiers_index_and_search() {
+    let project = TempDir::new().unwrap();
+
+    // Python file with Unicode identifiers
+    fs::write(project.path().join("unicodes.py"), r#"
+def r??sum??(data):
+    return data
+
+class ??l????(object):
+    pass
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Search for the Unicode function name
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "r??sum??"}));
+    let resp = server.handle_message(&search).unwrap();
+    let results = parse_tool_result(&resp);
+    let results_arr = results.as_array().unwrap();
+    let names: Vec<&str> = results_arr.iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(names.contains(&"r\u{00e9}sum\u{00e9}"), "FTS5 search should find Unicode identifier, got: {:?}", names);
+}
+
+#[test]
+fn test_cjk_identifiers_index_and_search() {
+    let project = TempDir::new().unwrap();
+
+    // Go file with CJK identifiers
+    fs::write(project.path().join("cjk.go"), r#"package main
+
+func ??????(x int) int {
+    return x * 2
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Trigger indexing and search
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "??????"}));
+    let resp = server.handle_message(&search).unwrap();
+    let results = parse_tool_result(&resp);
+    let results_arr = results.as_array().unwrap();
+    // Verify we get results and the CJK name is preserved
+    let names: Vec<&str> = results_arr.iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(!names.is_empty(), "CJK identifier should be indexed and searchable, got empty results");
 }

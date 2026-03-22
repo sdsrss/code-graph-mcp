@@ -546,12 +546,13 @@ impl McpServer {
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
         let include_impact = args["include_impact"].as_bool().unwrap_or(false);
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-            return self.ast_node_by_id(nid, include_refs, include_impact, ctx);
+            return self.ast_node_by_id(nid, include_refs, include_impact, ctx, compact);
         }
 
         let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
@@ -567,7 +568,7 @@ impl McpServer {
                 .collect();
             return match non_test.len() {
                 0 => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
-                1 => self.ast_node_by_id(non_test[0].node.id, include_refs, include_impact, context_lines),
+                1 => self.ast_node_by_id(non_test[0].node.id, include_refs, include_impact, context_lines, compact),
                 _ => {
                     let suggestions: Vec<_> = non_test.iter().map(|nf| {
                         json!({
@@ -632,6 +633,15 @@ impl McpServer {
                     self.append_impact_summary(&mut result, &n.name, file_path)?;
                 }
 
+                // Compact mode: strip code_content and context_string to save tokens
+                if compact {
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.remove("code_content");
+                        obj.remove("context_string");
+                    }
+                    return Ok(result);
+                }
+
                 // Compress if result exceeds token threshold: drop code_content but keep references/impact
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
@@ -667,7 +677,7 @@ impl McpServer {
     }
 
     /// Lookup AST node by node_id.
-    pub(super) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_impact: bool, context_lines: usize) -> Result<serde_json::Value> {
+    pub(super) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_impact: bool, context_lines: usize, compact: bool) -> Result<serde_json::Value> {
         let nf = queries::get_node_with_file_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
         let node = nf.node;
@@ -684,15 +694,18 @@ impl McpServer {
             "qualified_name": node.qualified_name,
         });
 
-        // Include source code: prefer context view when requested, fall back to stored code_content
-        if context_lines > 0 {
-            if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
-                result["code_content"] = json!(code);
+        // Skip code loading in compact mode — saves tokens
+        if !compact {
+            // Include source code: prefer context view when requested, fall back to stored code_content
+            if context_lines > 0 {
+                if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
+                    result["code_content"] = json!(code);
+                } else {
+                    result["code_content"] = json!(node.code_content);
+                }
             } else {
                 result["code_content"] = json!(node.code_content);
             }
-        } else {
-            result["code_content"] = json!(node.code_content);
         }
 
         if include_refs {
@@ -1250,6 +1263,7 @@ impl McpServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(2)
             .clamp(1, 10) as i32;
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Check if file exists in index
         let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
@@ -1305,7 +1319,8 @@ impl McpServer {
                 });
                 // Only show symbols for direct dependencies (depth 1);
                 // deeper entries have 0 direct edges from root which is misleading
-                if d.depth == 1 {
+                // Skip symbols in compact mode to save tokens
+                if !compact && d.depth == 1 {
                     obj["symbols"] = json!(d.symbol_count);
                 }
                 obj
@@ -1320,7 +1335,7 @@ impl McpServer {
                     "file": d.file_path,
                     "depth": d.depth,
                 });
-                if d.depth == 1 {
+                if !compact && d.depth == 1 {
                     obj["symbols"] = json!(d.symbol_count);
                 }
                 obj
@@ -1747,6 +1762,7 @@ impl McpServer {
         let symbol_name = required_str(args, "symbol_name")?;
         let file_path = args["file_path"].as_str();
         let relation = args["relation"].as_str().unwrap_or("all");
+        let compact = args["compact"].as_bool().unwrap_or(false);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -1809,14 +1825,24 @@ impl McpServer {
                 // Deduplicate by (name, file_path, relation)
                 let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
                 if seen.insert(key) {
-                    all_refs.push(json!({
-                        "name": r.name,
-                        "type": r.node_type,
-                        "file_path": r.file_path,
-                        "start_line": r.start_line,
-                        "relation": r.relation,
-                        "node_id": r.node_id,
-                    }));
+                    if compact {
+                        all_refs.push(json!({
+                            "name": r.name,
+                            "file_path": r.file_path,
+                            "start_line": r.start_line,
+                            "relation": r.relation,
+                            "node_id": r.node_id,
+                        }));
+                    } else {
+                        all_refs.push(json!({
+                            "name": r.name,
+                            "type": r.node_type,
+                            "file_path": r.file_path,
+                            "start_line": r.start_line,
+                            "relation": r.relation,
+                            "node_id": r.node_id,
+                        }));
+                    }
                 }
             }
         }

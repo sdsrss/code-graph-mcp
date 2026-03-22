@@ -75,7 +75,8 @@ impl ToolRegistry {
                         "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
-                        "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" }
+                        "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },
+                        "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
                     },
                     "required": []
                 }),
@@ -125,27 +126,32 @@ impl ToolRegistry {
                     "properties": {
                         "file_path": { "type": "string", "description": "File to analyze" },
                         "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Direction (default 'both')" },
-                        "depth": { "type": "number", "description": "Max depth (default 2)" }
+                        "depth": { "type": "number", "description": "Max depth (default 2)" },
+                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts only, no symbol details (saves tokens)" }
                     },
                     "required": ["file_path"]
                 }),
             },
             ToolDefinition {
                 name: "find_similar_code".into(),
-                description: "Find semantically similar code via embeddings. For duplicate detection and refactoring.".into(),
+                description: "Find semantically similar code via embeddings. For duplicate detection and refactoring. Requires symbol_name OR node_id.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "symbol_name": { "type": "string", "description": "Symbol name (alternative to node_id)" },
-                        "node_id": { "type": "number", "description": "Node ID (alternative to symbol_name)" },
+                        "symbol_name": { "type": "string", "description": "Symbol name (provide this OR node_id)" },
+                        "node_id": { "type": "number", "description": "Node ID (provide this OR symbol_name)" },
                         "top_k": { "type": "number", "description": "Results count (default 5)" },
                         "max_distance": { "type": "number", "description": "Max distance (default 0.8)" }
-                    }
+                    },
+                    "anyOf": [
+                        { "required": ["symbol_name"] },
+                        { "required": ["node_id"] }
+                    ]
                 }),
             },
             ToolDefinition {
                 name: "ast_search".into(),
-                description: "Search AST nodes by text and/or structural filters (type, return type, params). For finding functions by signature pattern.".into(),
+                description: "Search AST nodes by text and/or structural filters (type, return type, params). Requires query OR at least one filter (type/returns/params).".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -154,7 +160,13 @@ impl ToolRegistry {
                         "returns": { "type": "string", "description": "Return type substring filter" },
                         "params": { "type": "string", "description": "Parameter text substring filter" },
                         "limit": { "type": "number", "description": "Max results (default 20)" }
-                    }
+                    },
+                    "anyOf": [
+                        { "required": ["query"] },
+                        { "required": ["type"] },
+                        { "required": ["returns"] },
+                        { "required": ["params"] }
+                    ]
                 }),
             },
             ToolDefinition {
@@ -165,7 +177,8 @@ impl ToolRegistry {
                     "properties": {
                         "symbol_name": { "type": "string", "description": "Symbol to find references for" },
                         "file_path": { "type": "string", "description": "Disambiguate same-name symbols" },
-                        "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "all"], "description": "Relation type filter (default 'all')" }
+                        "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "all"], "description": "Relation type filter (default 'all')" },
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" }
                     },
                     "required": ["symbol_name"]
                 }),
@@ -188,6 +201,9 @@ impl ToolRegistry {
             },
         ];
 
+        debug_assert_eq!(tools.len(), TOOL_COUNT,
+            "TOOL_COUNT ({}) does not match actual tool count ({}). Update TOOL_COUNT in tools.rs.",
+            TOOL_COUNT, tools.len());
         Self { tools }
     }
 
