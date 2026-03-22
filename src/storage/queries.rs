@@ -370,6 +370,23 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
     Ok(results)
 }
 
+/// Load ALL node (name -> [(id, file_path)]) into a HashMap.
+/// Used for building a global name resolution map once before the batch loop.
+pub fn get_all_node_names_with_ids(conn: &Connection) -> Result<HashMap<String, Vec<(i64, String)>>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.id, n.name, f.path FROM nodes n JOIN files f ON n.file_id = f.id"
+    )?;
+    let mut map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (id, name, path) = row?;
+        map.entry(name).or_default().push((id, path));
+    }
+    Ok(map)
+}
+
 pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.target_id
@@ -1189,12 +1206,15 @@ pub fn get_import_tree(
 /// Returns at most `limit` rows per call to bound memory usage.
 pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
     // Priority: embed hot-path nodes first (most referenced = highest value for search)
+    // Uses LEFT JOIN + GROUP BY instead of correlated subquery for better performance
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.context_string FROM nodes n
-         LEFT JOIN node_vectors v ON v.node_id = n.id
-         WHERE n.context_string IS NOT NULL AND v.node_id IS NULL
-         ORDER BY (SELECT COUNT(*) FROM edges e
-                   WHERE e.target_id = n.id) DESC
+        "SELECT n.id, n.context_string
+         FROM nodes n
+         LEFT JOIN node_vectors nv ON n.id = nv.node_id
+         LEFT JOIN edges e ON e.target_id = n.id
+         WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL
+         GROUP BY n.id
+         ORDER BY COUNT(e.target_id) DESC
          LIMIT ?1"
     )?;
     let rows = stmt.query_map([limit as i64], |row| {
@@ -1551,7 +1571,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![and_query, limit], map_row_with_bm25)?;
         let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
-        if pairs.len() >= (limit as usize / 2).max(1) {
+        if pairs.len() >= std::cmp::max(3, limit as usize / 10) {
             let (nodes, bm25_scores): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
             return Ok(FtsResult { nodes, bm25_scores, or_fallback: false });
         }
@@ -2247,5 +2267,176 @@ mod tests {
         let big_names: Vec<&str> = results_big.iter().map(|r| r.name.as_str()).collect();
         assert!(big_names.contains(&"orphan_fn"), "orphan_fn (20 lines) should pass min_lines=18");
         assert!(!big_names.contains(&"exported_unused"), "exported_unused (15 lines) should fail min_lines=18");
+    }
+
+    #[test]
+    fn test_fts5_and_threshold_no_unnecessary_or_fallback() {
+        // Verify that a small number of high-quality AND results don't trigger OR fallback.
+        // With limit=20: new threshold = max(3, 20/10) = 3
+        // So 4 AND results >= 3 means no fallback.
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        // Create 4 nodes that match BOTH "parse" and "json" as separate tokens
+        for i in 0..4 {
+            insert_node(db.conn(), &NodeRecord {
+                file_id: fid, node_type: "function".into(),
+                name: format!("handler{}", i),
+                qualified_name: None, start_line: i * 10 + 1, end_line: i * 10 + 5,
+                code_content: format!("function handler{}() {{ parse json data }}", i),
+                signature: None, doc_comment: None, context_string: None,
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+        }
+        // Create a node that only matches "parse" (not "json")
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "parseXml".into(),
+            qualified_name: None, start_line: 50, end_line: 55,
+            code_content: "function parseXml(xml) { parse xml data }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // With limit=20: old threshold was 20/2=10 (4 < 10 => fallback to OR)
+        // New threshold: max(3, 20/10)=3, so 4 >= 3 => no OR fallback
+        let fts = fts5_search(db.conn(), "parse json", 20).unwrap();
+        assert!(!fts.or_fallback, "4 AND results >= threshold 3, should NOT fall back to OR");
+        // All 4 handler nodes match both terms
+        assert_eq!(fts.nodes.len(), 4);
+    }
+
+    #[test]
+    fn test_get_unembedded_nodes_priority_order() {
+        // Verify that get_unembedded_nodes returns nodes ordered by edge reference count (most referenced first)
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+
+        // Create 3 nodes with context strings
+        let nid1 = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "popular".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "function popular() {}".into(),
+            signature: None, doc_comment: None, context_string: Some("function popular".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let nid2 = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "moderate".into(),
+            qualified_name: None, start_line: 10, end_line: 15,
+            code_content: "function moderate() {}".into(),
+            signature: None, doc_comment: None, context_string: Some("function moderate".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let nid3 = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "lonely".into(),
+            qualified_name: None, start_line: 20, end_line: 25,
+            code_content: "function lonely() {}".into(),
+            signature: None, doc_comment: None, context_string: Some("function lonely".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Create a caller node (no context string so it won't appear in results)
+        let caller = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "caller".into(),
+            qualified_name: None, start_line: 30, end_line: 35,
+            code_content: "function caller() {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // "popular" gets 3 incoming edges, "moderate" gets 1, "lonely" gets 0
+        for _ in 0..3 {
+            // Use different callers for unique edges - but we only have one caller node
+            // Use different relations to make them unique
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation) VALUES (?1, ?2, ?3)",
+                rusqlite::params![caller, nid1, "calls"],
+            ).unwrap();
+        }
+        // Add additional edges with different metadata to make them unique
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (?1, ?2, 'calls', 'a')",
+            rusqlite::params![caller, nid1],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (?1, ?2, 'calls', 'b')",
+            rusqlite::params![caller, nid1],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
+            rusqlite::params![caller, nid2],
+        ).unwrap();
+
+        // Create vec tables for the LEFT JOIN to work
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+
+        let results = get_unembedded_nodes(conn, 10).unwrap();
+        assert_eq!(results.len(), 3, "should return all 3 nodes with context strings");
+
+        // First result should be "popular" (most referenced: 3 edges)
+        assert_eq!(results[0].0, nid1, "most referenced node should be first");
+        // Second should be "moderate" (1 edge)
+        assert_eq!(results[1].0, nid2, "moderately referenced node should be second");
+        // Third should be "lonely" (0 edges)
+        assert_eq!(results[2].0, nid3, "unreferenced node should be last");
+    }
+
+    #[test]
+    fn test_get_all_node_names_with_ids() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // Create 2 files with nodes
+        let fid1 = upsert_file(conn, &FileRecord {
+            path: "src/a.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let fid2 = upsert_file(conn, &FileRecord {
+            path: "src/b.ts".into(), blake3_hash: "h2".into(), last_modified: 1, language: None,
+        }).unwrap();
+
+        let nid1 = insert_node(conn, &NodeRecord {
+            file_id: fid1, node_type: "function".into(), name: "alpha".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn alpha(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let nid2 = insert_node(conn, &NodeRecord {
+            file_id: fid2, node_type: "function".into(), name: "beta".into(),
+            qualified_name: None, start_line: 1, end_line: 5,
+            code_content: "fn beta(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // Same name in different file
+        let nid3 = insert_node(conn, &NodeRecord {
+            file_id: fid2, node_type: "function".into(), name: "alpha".into(),
+            qualified_name: None, start_line: 6, end_line: 10,
+            code_content: "fn alpha(){}".into(), signature: None,
+            doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let map = get_all_node_names_with_ids(conn).unwrap();
+        // "alpha" should have 2 entries (from both files)
+        let alpha_entries = map.get("alpha").unwrap();
+        assert_eq!(alpha_entries.len(), 2, "alpha should have 2 entries");
+        let alpha_ids: Vec<i64> = alpha_entries.iter().map(|(id, _)| *id).collect();
+        assert!(alpha_ids.contains(&nid1));
+        assert!(alpha_ids.contains(&nid3));
+
+        // "beta" should have 1 entry
+        let beta_entries = map.get("beta").unwrap();
+        assert_eq!(beta_entries.len(), 1);
+        assert_eq!(beta_entries[0].0, nid2);
+        assert_eq!(beta_entries[0].1, "src/b.ts");
+
+        // Check paths are correct for alpha entries
+        let alpha_paths: Vec<&str> = alpha_entries.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(alpha_paths.contains(&"src/a.ts"));
+        assert!(alpha_paths.contains(&"src/b.ts"));
     }
 }

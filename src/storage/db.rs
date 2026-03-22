@@ -109,6 +109,11 @@ impl Database {
                 schema::migrate_v4_to_v5(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 6 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v5_to_v6(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(schema::CREATE_TABLES)?;
@@ -613,6 +618,99 @@ mod tests {
             "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(name, "myFunc");
+    }
+
+    #[test]
+    fn test_v5_to_v6_migration() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Create a v5 database manually:
+        // - nodes has is_test column (added in v4->v5)
+        // - NO idx_nodes_qualified_name index
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT,
+                    name_tokens TEXT, return_type TEXT, param_types TEXT,
+                    is_test INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX idx_nodes_file ON nodes(file_id);
+                CREATE INDEX idx_nodes_type ON nodes(type);
+                CREATE INDEX idx_nodes_name ON nodes(name);
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT
+                );
+                CREATE UNIQUE INDEX idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    name_tokens, return_type, param_types,
+                    content='nodes', content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+                CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN
+                    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+                END;
+                CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+                END;
+                CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
+                    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES ('delete', old.id, old.name, old.qualified_name, old.code_content, old.context_string, old.doc_comment, old.name_tokens, old.return_type, old.param_types);
+                    INSERT INTO nodes_fts(rowid, name, qualified_name, code_content, context_string, doc_comment, name_tokens, return_type, param_types)
+                    VALUES (new.id, new.name, new.qualified_name, new.code_content, new.context_string, new.doc_comment, new.name_tokens, new.return_type, new.param_types);
+                END;"
+            ).unwrap();
+
+            // Insert test data
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 1, 'typescript', 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'myFunc', 'MyModule.myFunc', 1, 5, 'function myFunc() {}')",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        // Open with Database::open -- triggers v5->v6 migration
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify schema version updated to current
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        // Verify idx_nodes_qualified_name index exists
+        let idx_exists: bool = db.conn().query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_nodes_qualified_name'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(idx_exists, "idx_nodes_qualified_name should exist after v5->v6 migration");
+
+        // Verify existing node data preserved
+        let qname: String = db.conn().query_row(
+            "SELECT qualified_name FROM nodes WHERE id = 1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(qname, "MyModule.myFunc");
     }
 
     #[test]

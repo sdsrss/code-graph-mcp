@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 pub const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);
 
 -- FTS5 virtual table (v4: porter stemmer for better natural-language search)
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -189,6 +190,16 @@ pub fn migrate_v4_to_v5(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch("ALTER TABLE nodes ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;")?;
     conn.pragma_update(None, "user_version", 5)?;
     tracing::info!("[schema] Migration v4→v5 complete.");
+    Ok(())
+}
+
+pub fn migrate_v5_to_v6(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v5 -> v6: adding index on qualified_name");
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);"
+    )?;
+    conn.pragma_update(None, "user_version", 6)?;
+    tracing::info!("[schema] Migration v5->v6 complete.");
     Ok(())
 }
 
