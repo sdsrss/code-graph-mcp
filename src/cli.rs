@@ -46,7 +46,7 @@ impl CliContext {
 // --- Argument helpers ---
 
 /// Flags that take a value argument (not boolean).
-const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance"];
+const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines"];
 
 fn get_positional(args: &[String], index: usize) -> Option<&str> {
     let mut pos = 0;
@@ -203,6 +203,10 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         else { format!("{}d ago", elapsed / 86400) }
     });
 
+    // Embedding coverage (works without sqlite-vec loaded)
+    let (vectors_done, vectors_total) = queries::count_nodes_with_vectors(conn).unwrap_or((0, 0));
+    let search_mode = if vectors_done > 0 { "hybrid" } else { "fts_only" };
+
     match format {
         "json" => {
             let mut json = serde_json::json!({
@@ -212,6 +216,9 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "files": status.files_count,
                 "watching": false,
                 "schema_version": status.schema_version,
+                "db_size_bytes": status.db_size_bytes,
+                "search_mode": search_mode,
+                "embedding_progress": format!("{}/{}", vectors_done, vectors_total),
             });
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
@@ -457,12 +464,14 @@ fn find_containing_node_in(
 pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     let query = get_positional(args, 0)
         .filter(|q| !q.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp search <query> [--json] [--limit N] [--language <lang>] [--compact]"))?;
+        .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp search <query> [--json] [--limit N] [--top-k N] [--language <lang>] [--compact]"))?;
 
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
     let language_filter = get_flag_value(args, "--language");
+    let node_type_filter = get_flag_value(args, "--node-type");
     let limit: i64 = get_flag_value(args, "--limit")
+        .or_else(|| get_flag_value(args, "--top-k"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
@@ -470,7 +479,8 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     let conn = ctx.db.conn();
 
     // Fetch more results if filtering, to ensure enough after filtering
-    let fetch_limit = if language_filter.is_some() { limit * 4 } else { limit };
+    let has_filter = language_filter.is_some() || node_type_filter.is_some();
+    let fetch_limit = if has_filter { limit * 4 } else { limit };
     let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
     if fts_result.nodes.is_empty() {
         eprintln!("[code-graph] No results for: {}", query);
@@ -486,17 +496,32 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
         .map(|nwf| (nwf.node.id, nwf))
         .collect();
 
-    // Filter by language if requested, preserving FTS rank order
+    // Normalize node_type filter for matching
+    let normalized_node_types: Vec<&'static str> = node_type_filter
+        .map(|t| normalize_type_filter(t))
+        .unwrap_or_default();
+
+    // Filter by language, node_type, and skip test/module nodes (align with MCP behavior)
     let filtered_nodes: Vec<&queries::NodeResult> = fts_result.nodes.iter()
         .filter(|n| {
+            // Skip <module> nodes and test symbols (consistent with MCP semantic_code_search)
+            if n.node_type == "module" && n.name == "<module>" { return false; }
+            if let Some(nwf) = nwf_map.get(&n.id) {
+                if crate::domain::is_test_symbol(&n.name, &nwf.file_path) { return false; }
+            }
             if let Some(lang) = language_filter {
-                nwf_map.get(&n.id)
+                let lang_ok = nwf_map.get(&n.id)
                     .and_then(|nwf| nwf.language.as_deref())
                     .map(|l| l.eq_ignore_ascii_case(lang))
-                    .unwrap_or(false)
-            } else {
-                true
+                    .unwrap_or(false);
+                if !lang_ok { return false; }
             }
+            if !normalized_node_types.is_empty() {
+                if !normalized_node_types.iter().any(|t| n.node_type == *t) {
+                    return false;
+                }
+            }
+            true
         })
         .take(limit as usize)
         .collect();
@@ -520,10 +545,10 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
             .map(|n| {
                 let fp = file_map.get(&n.id).copied().unwrap_or("?");
                 serde_json::json!({
-                    "id": n.id,
+                    "node_id": n.id,
                     "type": n.node_type,
                     "name": n.qualified_name.as_deref().unwrap_or(&n.name),
-                    "file": fp,
+                    "file_path": fp,
                     "start_line": n.start_line,
                     "end_line": n.end_line,
                     "signature": n.signature,
@@ -657,10 +682,10 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
             .map(|nwf| {
                 let n = &nwf.node;
                 serde_json::json!({
-                    "id": n.id,
+                    "node_id": n.id,
                     "type": n.node_type,
                     "name": n.qualified_name.as_deref().unwrap_or(&n.name),
-                    "file": &nwf.file_path,
+                    "file_path": &nwf.file_path,
                     "start_line": n.start_line,
                     "end_line": n.end_line,
                     "return_type": n.return_type,
@@ -680,24 +705,14 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
 
 /// Normalize type filter shorthand: fn → function/method, class → class/struct, etc.
 fn normalize_type_filter(input: &str) -> Vec<&'static str> {
-    match input.to_lowercase().as_str() {
-        "fn" | "func" | "function" | "method" => vec!["function", "method"],
-        "class" => vec!["class"],
-        "struct" => vec!["struct"],
-        "enum" => vec!["enum"],
-        "interface" | "iface" | "trait" => vec!["interface", "trait"],
-        "type" | "type_alias" => vec!["type_alias"],
-        "const" | "constant" => vec!["constant"],
-        "var" | "variable" => vec!["variable"],
-        "module" => vec!["module"],
-        _ => {
-            eprintln!(
-                "[code-graph] Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
-                input
-            );
-            vec![]
-        }
+    let result = crate::domain::normalize_type_filter(input);
+    if result.is_empty() {
+        eprintln!(
+            "[code-graph] Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+            input
+        );
     }
+    result
 }
 
 /// Call graph display.
@@ -767,9 +782,10 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
             .iter()
             .map(|n| {
                 serde_json::json!({
+                    "node_id": n.node_id,
                     "name": n.name,
                     "type": n.node_type,
-                    "file": n.file_path,
+                    "file_path": n.file_path,
                     "depth": n.depth,
                     "direction": n.direction.as_str(),
                 })
@@ -966,11 +982,11 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
                 "files": m.files,
                 "functions": m.functions,
                 "classes": m.classes,
-                "interfaces": m.interfaces_traits,
+                "interfaces_traits": m.interfaces_traits,
                 "languages": m.languages,
                 "key_symbols": m.key_symbols,
             })).collect::<Vec<_>>(),
-            "dependencies": deps.iter().map(|d| serde_json::json!({
+            "module_dependencies": deps.iter().map(|d| serde_json::json!({
                 "from": d.from,
                 "to": d.to,
                 "imports": d.import_count,
@@ -1061,6 +1077,12 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     let conn = ctx.db.conn();
 
     let exports = queries::get_module_exports(conn, path_prefix)?;
+
+    // Filter out test symbols (align with MCP module_overview behavior)
+    let exports: Vec<_> = exports.into_iter()
+        .filter(|e| !crate::domain::is_test_symbol(&e.name, &e.file_path))
+        .collect();
+
     if exports.is_empty() {
         eprintln!("[code-graph] No symbols found under: {}", path_prefix);
         return Ok(());
@@ -1123,74 +1145,191 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
 /// Show symbol details (code, type, signature).
 /// CLI equivalent of MCP `get_ast_node`.
 pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
-    let symbol = get_positional(args, 0)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp show <symbol> [--file <path>] [--json]"
-        ))?;
-
     let json_mode = has_flag(args, "--json");
+    let compact = has_flag(args, "--compact");
+    let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references");
+    let include_impact = has_flag(args, "--include-impact");
     let file_filter = get_flag_value(args, "--file");
+    let context_lines_explicit = get_flag_value(args, "--context-lines")
+        .and_then(|v| v.parse::<usize>().ok());
+    let node_id_arg: Option<i64> = get_flag_value(args, "--node-id")
+        .and_then(|v| v.parse().ok());
+    // Default context_lines=3 when using --node-id (align with MCP behavior), 0 otherwise
+    let context_lines: usize = context_lines_explicit
+        .unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Resolve symbol: prefer file_path+name, fallback to name-only
-    let nodes = if let Some(fp) = file_filter {
-        queries::get_nodes_by_file_path(conn, fp)?
-            .into_iter()
-            .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
-            .collect::<Vec<_>>()
-    } else {
-        queries::get_nodes_by_name(conn, symbol)?
-    };
-
-    if nodes.is_empty() {
-        eprintln!("[code-graph] Symbol not found: {}", symbol);
-        let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
-        if !candidates.is_empty() {
-            eprintln!("[code-graph] Did you mean:");
-            for c in candidates.iter().take(5) {
-                eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
+    // Resolve node(s): by --node-id, or by positional symbol name
+    let nodes_with_paths: Vec<(queries::NodeResult, String)> = if let Some(nid) = node_id_arg {
+        match queries::get_node_with_file_by_id(conn, nid)? {
+            Some(nwf) => vec![(nwf.node, nwf.file_path)],
+            None => {
+                eprintln!("[code-graph] Node ID {} not found.", nid);
+                return Ok(());
             }
         }
-        return Ok(());
-    }
+    } else {
+        let symbol = get_positional(args, 0)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--include-refs] [--include-impact] [--context-lines N] [--compact] [--json]"
+            ))?;
+
+        let nodes = if let Some(fp) = file_filter {
+            queries::get_nodes_by_file_path(conn, fp)?
+                .into_iter()
+                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
+                .collect::<Vec<_>>()
+        } else {
+            queries::get_nodes_by_name(conn, symbol)?
+        };
+
+        if nodes.is_empty() {
+            eprintln!("[code-graph] Symbol not found: {}", symbol);
+            let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
+            if !candidates.is_empty() {
+                eprintln!("[code-graph] Did you mean:");
+                for c in candidates.iter().take(5) {
+                    eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
+                }
+            }
+            return Ok(());
+        }
+
+        nodes.into_iter().map(|n| {
+            let fp = queries::get_file_path(conn, n.file_id)
+                .ok().flatten().unwrap_or_else(|| "?".to_string());
+            (n, fp)
+        }).collect()
+    };
 
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let results: Vec<serde_json::Value> = nodes.iter().map(|node| {
-            let fp = queries::get_file_path(conn, node.file_id)
-                .ok().flatten().unwrap_or_else(|| "?".to_string());
-            serde_json::json!({
-                "id": node.id,
+        let results: Vec<serde_json::Value> = nodes_with_paths.iter().map(|(node, fp)| {
+            let mut obj = serde_json::json!({
+                "node_id": node.id,
                 "type": node.node_type,
                 "name": node.qualified_name.as_deref().unwrap_or(&node.name),
-                "file": fp,
+                "file_path": fp,
                 "start_line": node.start_line,
                 "end_line": node.end_line,
                 "signature": node.signature,
                 "return_type": node.return_type,
                 "param_types": node.param_types,
-                "code": node.code_content,
-            })
+            });
+            if !compact {
+                if context_lines > 0 {
+                    if let Some(code) = read_source_context(project_root, fp, node.start_line, node.end_line, context_lines) {
+                        obj["code_content"] = serde_json::json!(code);
+                    } else {
+                        obj["code_content"] = serde_json::json!(node.code_content);
+                    }
+                } else {
+                    obj["code_content"] = serde_json::json!(node.code_content);
+                }
+            }
+            if include_refs {
+                use crate::domain::REL_CALLS;
+                let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+                let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+                obj["calls"] = serde_json::json!(callees.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
+                obj["called_by"] = serde_json::json!(callers.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
+            }
+            if include_impact {
+                let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3).unwrap_or_default();
+                let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+                let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
+                let routes = callers.iter().filter(|c| c.route_info.is_some()).count();
+                let files: std::collections::HashSet<&str> = prod.iter().map(|c| c.file_path.as_str()).collect();
+                let risk = crate::domain::compute_risk_level(prod.len(), routes, false);
+                obj["impact"] = serde_json::json!({
+                    "risk_level": risk,
+                    "direct_callers": prod.iter().filter(|c| c.depth == 1).count(),
+                    "transitive_callers": prod.iter().filter(|c| c.depth > 1).count(),
+                    "affected_files": files.len(),
+                    "affected_routes": routes,
+                });
+            }
+            obj
         }).collect();
         writeln!(stdout, "{}", serde_json::to_string(&results)?)?;
         return Ok(());
     }
 
-    for node in &nodes {
-        let fp = queries::get_file_path(conn, node.file_id)?
-            .unwrap_or_else(|| "?".to_string());
-        writeln!(stdout, "{}", format_node_compact(node, &fp))?;
-        if !node.code_content.is_empty() {
-            for line in node.code_content.lines() {
-                writeln!(stdout, "  {}", line)?;
+    for (node, fp) in &nodes_with_paths {
+        writeln!(stdout, "{}", format_node_compact(node, fp))?;
+        if !compact {
+            if context_lines > 0 {
+                if let Some(code) = read_source_context(project_root, fp, node.start_line, node.end_line, context_lines) {
+                    for line in code.lines() {
+                        writeln!(stdout, "  {}", line)?;
+                    }
+                } else if !node.code_content.is_empty() {
+                    for line in node.code_content.lines() {
+                        writeln!(stdout, "  {}", line)?;
+                    }
+                }
+            } else if !node.code_content.is_empty() {
+                for line in node.code_content.lines() {
+                    writeln!(stdout, "  {}", line)?;
+                }
             }
+        }
+        if include_refs {
+            use crate::domain::REL_CALLS;
+            let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+            let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+            if !callees.is_empty() {
+                writeln!(stdout, "  Calls:")?;
+                for (name, file) in &callees {
+                    writeln!(stdout, "    → {} ({})", name, file)?;
+                }
+            }
+            if !callers.is_empty() {
+                writeln!(stdout, "  Called by:")?;
+                for (name, file) in &callers {
+                    writeln!(stdout, "    ← {} ({})", name, file)?;
+                }
+            }
+        }
+        if include_impact {
+            let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3).unwrap_or_default();
+            let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+            let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
+            let routes = callers.iter().filter(|c| c.route_info.is_some()).count();
+            let files: std::collections::HashSet<&str> = prod.iter().map(|c| c.file_path.as_str()).collect();
+            let risk = crate::domain::compute_risk_level(prod.len(), routes, false);
+            writeln!(stdout, "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
+                risk, prod.iter().filter(|c| c.depth == 1).count(),
+                prod.iter().filter(|c| c.depth > 1).count(), files.len(), routes)?;
         }
     }
 
     Ok(())
+}
+
+/// Read source code with context lines from the project file system.
+fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, end_line: i64, context_lines: usize) -> Option<String> {
+    use std::io::BufRead;
+    let abs_path = project_root.join(file_path);
+    let canonical = abs_path.canonicalize().ok()?;
+    let root_canonical = project_root.canonicalize().ok()?;
+    if !canonical.starts_with(&root_canonical) {
+        return None;
+    }
+    let file = std::fs::File::open(&canonical).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let start = (start_line as usize).saturating_sub(1 + context_lines);
+    let end = (end_line as usize) + context_lines;
+    let mut collected = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        if i >= end { break; }
+        if i >= start { collected.push(line.ok()?); }
+    }
+    if collected.is_empty() { return None; }
+    Some(collected.join("\n"))
 }
 
 /// Trace HTTP route → handler → downstream calls.
@@ -1198,7 +1337,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
 pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
     let route_path = get_positional(args, 0)
         .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp trace <route> [--depth N] [--json]"
+            "Usage: code-graph-mcp trace <route> [--depth N] [--include-middleware] [--json]"
         ))?;
 
     let depth: i32 = get_flag_value(args, "--depth")
@@ -1206,6 +1345,7 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
         .unwrap_or(3)
         .clamp(1, 20);
     let json_mode = has_flag(args, "--json");
+    let include_middleware = !has_flag(args, "--no-middleware");
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -1238,6 +1378,15 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
 
     let mut stdout = std::io::stdout().lock();
 
+    // Batch-fetch downstream calls if middleware included
+    use crate::domain::REL_CALLS;
+    let downstream_map = if include_middleware {
+        let node_ids: Vec<i64> = rows.iter().map(|rm| rm.node_id).collect();
+        queries::get_edge_target_names_batch(conn, &node_ids, REL_CALLS)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     for rm in &rows {
         if json_mode {
             let chain = crate::graph::query::get_call_graph(
@@ -1246,19 +1395,34 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
             let chain_nodes: Vec<serde_json::Value> = chain.iter()
                 .filter(|n| n.depth > 0)
                 .map(|n| serde_json::json!({
-                    "name": n.name, "file": n.file_path, "depth": n.depth,
+                    "name": n.name, "file_path": n.file_path, "depth": n.depth,
                 }))
                 .collect();
-            writeln!(stdout, "{}", serde_json::to_string(&serde_json::json!({
+            let mut entry = serde_json::json!({
                 "route": path,
                 "handler": rm.handler_name,
-                "file": rm.file_path,
+                "file_path": rm.file_path,
                 "call_chain": chain_nodes,
-            }))?)?;
+            });
+            if include_middleware {
+                let downstream = downstream_map.get(&rm.node_id)
+                    .cloned()
+                    .unwrap_or_default();
+                entry["downstream_calls"] = serde_json::json!(downstream);
+            }
+            writeln!(stdout, "{}", serde_json::to_string(&entry)?)?;
         } else {
             writeln!(stdout, "{} → {} ({}:{})",
                 rm.metadata.as_deref().unwrap_or(path),
                 rm.handler_name, rm.file_path, rm.start_line)?;
+
+            if include_middleware {
+                if let Some(downstream) = downstream_map.get(&rm.node_id) {
+                    if !downstream.is_empty() {
+                        writeln!(stdout, "  downstream: {}", downstream.join(", "))?;
+                    }
+                }
+            }
 
             // Show call chain
             let chain = crate::graph::query::get_call_graph(
@@ -1292,6 +1456,7 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
         .unwrap_or(2)
         .clamp(1, 10);
     let json_mode = has_flag(args, "--json");
+    let compact = has_flag(args, "--compact");
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -1327,12 +1492,16 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     if json_mode {
         let result = serde_json::json!({
             "file": file_path,
-            "depends_on": outgoing.iter().map(|d| serde_json::json!({
-                "file": d.file_path, "depth": d.depth, "symbols": d.symbol_count,
-            })).collect::<Vec<_>>(),
-            "depended_by": incoming.iter().map(|d| serde_json::json!({
-                "file": d.file_path, "depth": d.depth, "symbols": d.symbol_count,
-            })).collect::<Vec<_>>(),
+            "depends_on": outgoing.iter().map(|d| {
+                let mut obj = serde_json::json!({"file": d.file_path, "depth": d.depth});
+                if !compact && d.depth == 1 { obj["symbols"] = serde_json::json!(d.symbol_count); }
+                obj
+            }).collect::<Vec<_>>(),
+            "depended_by": incoming.iter().map(|d| {
+                let mut obj = serde_json::json!({"file": d.file_path, "depth": d.depth});
+                if !compact && d.depth == 1 { obj["symbols"] = serde_json::json!(d.symbol_count); }
+                obj
+            }).collect::<Vec<_>>(),
         });
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
@@ -1342,7 +1511,9 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     if !outgoing.is_empty() {
         writeln!(stdout, "  Depends on:")?;
         for d in &outgoing {
-            if d.depth == 1 {
+            if compact {
+                writeln!(stdout, "    {}", d.file_path)?;
+            } else if d.depth == 1 {
                 writeln!(stdout, "    {} ({} symbols)", d.file_path, d.symbol_count)?;
             } else {
                 writeln!(stdout, "    {} (depth {})", d.file_path, d.depth)?;
@@ -1352,7 +1523,9 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     if !incoming.is_empty() {
         writeln!(stdout, "  Depended by:")?;
         for d in &incoming {
-            if d.depth == 1 {
+            if compact {
+                writeln!(stdout, "    {}", d.file_path)?;
+            } else if d.depth == 1 {
                 writeln!(stdout, "    {} ({} symbols)", d.file_path, d.symbol_count)?;
             } else {
                 writeln!(stdout, "    {} (depth {})", d.file_path, d.depth)?;
@@ -1366,11 +1539,6 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
 pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
-    let symbol = get_positional(args, 0)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp similar <symbol> [--top-k N] [--max-distance N] [--json]"
-        ))?;
-
     let top_k: i64 = get_flag_value(args, "--top-k")
         .and_then(|v| v.parse().ok())
         .unwrap_or(5)
@@ -1379,6 +1547,8 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.8);
     let json_mode = has_flag(args, "--json");
+    let node_id_arg: Option<i64> = get_flag_value(args, "--node-id")
+        .and_then(|v| v.parse().ok());
 
     // Open with vec support for vector search
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
@@ -1393,12 +1563,20 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve symbol to node_id
-    let node_id = match queries::get_first_node_id_by_name(conn, symbol)? {
-        Some(id) => id,
-        None => {
-            eprintln!("[code-graph] Symbol not found: {}", symbol);
-            return Ok(());
+    // Resolve to node_id: by --node-id or by positional symbol name
+    let node_id = if let Some(nid) = node_id_arg {
+        nid
+    } else {
+        let symbol = get_positional(args, 0)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
+            ))?;
+        match queries::get_first_node_id_by_name(conn, symbol)? {
+            Some(id) => id,
+            None => {
+                eprintln!("[code-graph] Symbol not found: {}", symbol);
+                return Ok(());
+            }
         }
     };
 
@@ -1430,7 +1608,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     }
 
     if similar.is_empty() {
-        eprintln!("[code-graph] No similar code found for: {}", symbol);
+        eprintln!("[code-graph] No similar code found for node_id: {}", node_id);
         return Ok(());
     }
 
@@ -1440,8 +1618,9 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         let json_results: Vec<serde_json::Value> = similar.iter().map(|(node, fp, distance)| {
             let similarity = 1.0 / (1.0 + distance);
             serde_json::json!({
-                "name": node.name, "type": node.node_type, "file": fp,
+                "node_id": node.id, "name": node.name, "type": node.node_type, "file_path": fp,
                 "start_line": node.start_line, "similarity": (similarity * 10000.0).round() / 10000.0,
+                "distance": (distance * 10000.0).round() / 10000.0,
             })
         }).collect();
         writeln!(stdout, "{}", serde_json::to_string(&json_results)?)?;
@@ -1462,11 +1641,12 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
 pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     let symbol = get_positional(args, 0)
         .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp refs <symbol> [--file path] [--relation calls|imports|inherits|implements] [--json]"
+            "Usage: code-graph-mcp refs <symbol> [--file path] [--relation calls|imports|inherits|implements] [--compact] [--json]"
         ))?;
     let file_path = get_flag_value(args, "--file");
     let relation = get_flag_value(args, "--relation");
     let json_mode = has_flag(args, "--json");
+    let compact = has_flag(args, "--compact");
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -1511,14 +1691,24 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
 
     if json_mode {
         let items: Vec<serde_json::Value> = all_refs.iter().map(|r| {
-            serde_json::json!({
-                "node_id": r.node_id,
-                "name": r.name,
-                "type": r.node_type,
-                "file": r.file_path,
-                "start_line": r.start_line,
-                "relation": r.relation,
-            })
+            if compact {
+                serde_json::json!({
+                    "name": r.name,
+                    "file_path": r.file_path,
+                    "start_line": r.start_line,
+                    "relation": r.relation,
+                    "node_id": r.node_id,
+                })
+            } else {
+                serde_json::json!({
+                    "node_id": r.node_id,
+                    "name": r.name,
+                    "type": r.node_type,
+                    "file_path": r.file_path,
+                    "start_line": r.start_line,
+                    "relation": r.relation,
+                })
+            }
         }).collect();
         println!("{}", serde_json::to_string_pretty(&items)?);
     } else {
@@ -1528,7 +1718,116 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
         } else {
             writeln!(stdout, "{} references to '{}':", all_refs.len(), symbol)?;
             for r in &all_refs {
-                writeln!(stdout, "  [{}] {} ({}:{})", r.relation, r.name, r.file_path, r.start_line)?;
+                if compact {
+                    writeln!(stdout, "  [{}] {} {}", r.relation, r.name, r.file_path)?;
+                } else {
+                    writeln!(stdout, "  [{}] {} ({}:{})", r.relation, r.name, r.file_path, r.start_line)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Find dead code: orphans and exported-unused symbols.
+/// CLI equivalent of MCP `find_dead_code`.
+pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
+    let path_filter = get_positional(args, 0);
+    let type_filter = get_flag_value(args, "--type");
+    let include_tests = has_flag(args, "--include-tests");
+    let min_lines: u32 = get_flag_value(args, "--min-lines")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let compact = !has_flag(args, "--no-compact");
+    let json_mode = has_flag(args, "--json");
+
+    let ctx = CliContext::open(project_root)?;
+    let conn = ctx.db.conn();
+
+    let results = queries::find_dead_code(conn, path_filter, type_filter, include_tests, min_lines, 200)?;
+
+    if results.is_empty() {
+        eprintln!("[code-graph] No dead code found.");
+        return Ok(());
+    }
+
+    // Classify into orphans and exported-unused
+    let mut orphans: Vec<&queries::DeadCodeResult> = Vec::new();
+    let mut exported_unused: Vec<&queries::DeadCodeResult> = Vec::new();
+
+    for r in &results {
+        let is_exported = r.has_export_edge
+            || r.code_content.starts_with("pub ")
+            || r.code_content.starts_with("pub(")
+            || (r.file_path.ends_with(".go")
+                && r.name.chars().next().is_some_and(|c| c.is_uppercase()));
+        if is_exported {
+            exported_unused.push(r);
+        } else {
+            orphans.push(r);
+        }
+    }
+
+    let mut stdout = std::io::stdout().lock();
+
+    if json_mode {
+        let items: Vec<serde_json::Value> = results.iter().map(|r| {
+            let is_exported = r.has_export_edge
+                || r.code_content.starts_with("pub ")
+                || r.code_content.starts_with("pub(");
+            let mut obj = serde_json::json!({
+                "name": r.name,
+                "type": r.node_type,
+                "file_path": r.file_path,
+                "start_line": r.start_line,
+                "end_line": r.end_line,
+                "category": if is_exported { "exported_unused" } else { "orphan" },
+                "lines": r.end_line - r.start_line + 1,
+            });
+            if !compact {
+                obj["code"] = serde_json::json!(r.code_content);
+            }
+            obj
+        }).collect();
+        writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "Dead code: {} results ({} orphan, {} exported-unused)\n",
+        results.len(), orphans.len(), exported_unused.len())?;
+
+    if !orphans.is_empty() {
+        writeln!(stdout, "ORPHAN ({}) — no references, not exported", orphans.len())?;
+        for r in &orphans {
+            let lines = r.end_line - r.start_line + 1;
+            writeln!(stdout, "  {} {} {}:{} ({} lines)",
+                r.node_type, r.name, r.file_path, r.start_line, lines)?;
+            if !compact {
+                for line in r.code_content.lines().take(5) {
+                    writeln!(stdout, "    {}", line)?;
+                }
+                if r.code_content.lines().count() > 5 {
+                    writeln!(stdout, "    ...")?;
+                }
+            }
+        }
+    }
+
+    if !exported_unused.is_empty() {
+        if !orphans.is_empty() { writeln!(stdout)?; }
+        writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public but never called", exported_unused.len())?;
+        for r in &exported_unused {
+            let lines = r.end_line - r.start_line + 1;
+            writeln!(stdout, "  {} {} {}:{} ({} lines)",
+                r.node_type, r.name, r.file_path, r.start_line, lines)?;
+            if !compact {
+                for line in r.code_content.lines().take(5) {
+                    writeln!(stdout, "    {}", line)?;
+                }
+                if r.code_content.lines().count() > 5 {
+                    writeln!(stdout, "    ...")?;
+                }
             }
         }
     }

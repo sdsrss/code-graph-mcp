@@ -1649,10 +1649,15 @@ pub fn find_dead_code(
     }
 
     if let Some(type_val) = node_type {
-        if type_val == "fn" {
-            conditions.push("n.type IN ('function', 'method')".to_string());
-        } else {
+        let normalized = crate::domain::normalize_type_filter(type_val);
+        if normalized.is_empty() {
+            // Unknown filter — pass as-is for backward compatibility
             conditions.push("n.type = :node_type".to_string());
+        } else if normalized.len() == 1 {
+            conditions.push(format!("n.type = '{}'", normalized[0]));
+        } else {
+            let quoted: Vec<String> = normalized.iter().map(|t| format!("'{}'", t)).collect();
+            conditions.push(format!("n.type IN ({})", quoted.join(", ")));
         }
     }
 
@@ -1715,9 +1720,11 @@ pub fn find_dead_code(
         (":rel_routes_to", &REL_ROUTES_TO),
     ];
 
-    // Only bind :node_type if it's used in the query AND not "fn" (which uses IN clause).
-    // Store as String so the borrow lives long enough for query_map.
-    let node_type_owned: Option<String> = node_type.filter(|t| *t != "fn").map(|t| t.to_string());
+    // Only bind :node_type when the value was not recognized by normalize_type_filter
+    // (unknown filter fallback uses `:node_type` placeholder in the SQL).
+    let node_type_owned: Option<String> = node_type
+        .filter(|t| crate::domain::normalize_type_filter(t).is_empty())
+        .map(|t| t.to_string());
     if let Some(ref t) = node_type_owned {
         params.push((":node_type", t));
     }

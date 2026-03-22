@@ -3,7 +3,9 @@ use super::*;
 impl McpServer {
     pub(super) fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let query = required_str(args, "query")?;
-        let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 100) as i64;
+        let top_k = args["top_k"].as_u64()
+            .or_else(|| args["limit"].as_u64())
+            .unwrap_or(20).clamp(1, 100) as i64;
         let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
@@ -135,7 +137,10 @@ impl McpServer {
                 let node = &nwf.node;
                 if node.node_type == "module" && node.name == "<module>" { continue; }
                 if is_test_symbol(&node.name, &nwf.file_path) { continue; }
-                if let Some(nt) = node_type_filter { if node.node_type != nt { continue; } }
+                if let Some(nt) = node_type_filter {
+                    let normalized = normalize_type_filter_mcp(nt);
+                    if !normalized.iter().any(|t| t == &node.node_type) { continue; }
+                }
                 if let Some(lang) = language_filter { if nwf.language.as_deref() != Some(lang) { continue; } }
 
                 let base_score = if max_rrf > 0.0 {
@@ -316,6 +321,7 @@ impl McpServer {
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let file_path = args["file_path"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
+        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -346,7 +352,7 @@ impl McpServer {
                     let results2 = crate::graph::query::get_call_graph(
                         self.db.conn(), &resolved, direction, depth, file_path,
                     )?;
-                    return self.format_call_graph_response(&resolved, direction, &results2, compact);
+                    return self.format_call_graph_response(&resolved, direction, &results2, compact, include_tests);
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {
                     return Ok(json!({
@@ -367,7 +373,7 @@ impl McpServer {
             }
         }
 
-        self.format_call_graph_response(function_name, direction, &results, compact)
+        self.format_call_graph_response(function_name, direction, &results, compact, include_tests)
     }
 
     pub(super) fn format_call_graph_response(
@@ -376,13 +382,14 @@ impl McpServer {
         direction: &str,
         results: &[crate::graph::query::CallGraphNode],
         compact: bool,
+        include_tests: bool,
     ) -> Result<serde_json::Value> {
         let is_test = |n: &&crate::graph::query::CallGraphNode| {
             is_test_symbol(&n.name, &n.file_path)
         };
         let mut seen_nodes = std::collections::HashSet::new();
         let all_nodes: Vec<serde_json::Value> = results.iter()
-            .filter(|n| n.depth > 0 && !is_test(n))
+            .filter(|n| n.depth > 0 && (include_tests || !is_test(n)))
             // Deduplicate cfg-gated functions (same name+file+depth+direction, different node_id)
             .filter(|n| seen_nodes.insert((&n.name, &n.file_path, n.depth, n.direction.as_str())))
             .map(|n| {
@@ -407,9 +414,13 @@ impl McpServer {
                 }
             })
             .collect();
-        let test_callers_count = results.iter()
-            .filter(|n| n.depth > 0 && is_test(n))
-            .count();
+        let test_callers_count = if include_tests {
+            0
+        } else {
+            results.iter()
+                .filter(|n| n.depth > 0 && is_test(n))
+                .count()
+        };
 
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
@@ -898,6 +909,29 @@ impl McpServer {
                 obj.insert("files_skipped_unsupported_language".into(), json!(stats.files_skipped_language));
             }
             obj.insert("instance_mode".into(), json!(if self.is_primary { "primary" } else { "secondary" }));
+
+            // Health and age fields (consistent with CLI health-check)
+            let expected_schema = crate::storage::schema::SCHEMA_VERSION;
+            let schema_ok = obj.get("schema_version")
+                .and_then(|v| v.as_i64())
+                .map(|v| v == expected_schema as i64)
+                .unwrap_or(false);
+            let has_data = obj.get("nodes_count")
+                .and_then(|v| v.as_i64())
+                .map(|v| v > 0)
+                .unwrap_or(false);
+            obj.insert("healthy".into(), json!(schema_ok && has_data));
+            if let Some(ts) = obj.get("last_indexed_at").and_then(|v| v.as_i64()) {
+                let elapsed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64 - ts)
+                    .unwrap_or(0);
+                let age = if elapsed < 60 { format!("{}s ago", elapsed) }
+                    else if elapsed < 3600 { format!("{}m ago", elapsed / 60) }
+                    else if elapsed < 86400 { format!("{}h ago", elapsed / 3600) }
+                    else { format!("{}d ago", elapsed / 86400) };
+                obj.insert("index_age".into(), json!(age));
+            }
         }
 
         Ok(status)
@@ -1688,13 +1722,16 @@ impl McpServer {
 
         if results.is_empty() {
             return Ok(json!({
-                "content": [{"type": "text", "text": "No dead code found with the given filters."}]
+                "results": [],
+                "orphan_count": 0,
+                "exported_unused_count": 0,
+                "summary": "No dead code found with the given filters."
             }));
         }
 
         // Classify into orphans and exported-unused
-        let mut orphans: Vec<&queries::DeadCodeResult> = Vec::new();
-        let mut exported_unused: Vec<&queries::DeadCodeResult> = Vec::new();
+        let mut orphan_items: Vec<serde_json::Value> = Vec::new();
+        let mut exported_items: Vec<serde_json::Value> = Vec::new();
 
         for r in &results {
             let is_exported = r.has_export_edge
@@ -1702,59 +1739,35 @@ impl McpServer {
                 || r.code_content.starts_with("pub(")
                 || (r.file_path.ends_with(".go")
                     && r.name.chars().next().is_some_and(|c| c.is_uppercase()));
+            let lines = r.end_line - r.start_line + 1;
+            let mut item = json!({
+                "name": r.name,
+                "type": r.node_type,
+                "file_path": r.file_path,
+                "start_line": r.start_line,
+                "end_line": r.end_line,
+                "lines": lines,
+                "category": if is_exported { "exported_unused" } else { "orphan" },
+            });
+            if !compact {
+                item["code"] = json!(r.code_content);
+            }
             if is_exported {
-                exported_unused.push(r);
+                exported_items.push(item);
             } else {
-                orphans.push(r);
+                orphan_items.push(item);
             }
         }
 
-        let mut output = String::new();
-        output.push_str(&format!("Dead code analysis: {} results ({} orphan, {} exported-unused)\n\n",
-            results.len(), orphans.len(), exported_unused.len()));
-
-        if !orphans.is_empty() {
-            output.push_str(&format!("## ORPHAN ({}) — no references, not exported\n", orphans.len()));
-            for r in &orphans {
-                let lines = r.end_line - r.start_line + 1;
-                output.push_str(&format!("- {} {} `{}` at {}:{} ({} lines)\n",
-                    r.node_type, if r.node_type == "function" || r.node_type == "method" { "fn" } else { "" },
-                    r.name, r.file_path, r.start_line, lines));
-                if !compact {
-                    // Show first 5 lines of code
-                    let code_lines: Vec<&str> = r.code_content.lines().take(5).collect();
-                    for line in &code_lines {
-                        output.push_str(&format!("    {}\n", line));
-                    }
-                    if r.code_content.lines().count() > 5 {
-                        output.push_str("    ...\n");
-                    }
-                }
-            }
-            output.push('\n');
-        }
-
-        if !exported_unused.is_empty() {
-            output.push_str(&format!("## EXPORTED-UNUSED ({}) — exported/public but never called\n", exported_unused.len()));
-            for r in &exported_unused {
-                let lines = r.end_line - r.start_line + 1;
-                output.push_str(&format!("- {} {} `{}` at {}:{} ({} lines)\n",
-                    r.node_type, if r.node_type == "function" || r.node_type == "method" { "fn" } else { "" },
-                    r.name, r.file_path, r.start_line, lines));
-                if !compact {
-                    let code_lines: Vec<&str> = r.code_content.lines().take(5).collect();
-                    for line in &code_lines {
-                        output.push_str(&format!("    {}\n", line));
-                    }
-                    if r.code_content.lines().count() > 5 {
-                        output.push_str("    ...\n");
-                    }
-                }
-            }
-        }
+        let mut all_items = orphan_items.clone();
+        all_items.extend(exported_items.iter().cloned());
 
         Ok(json!({
-            "content": [{"type": "text", "text": output.trim_end()}]
+            "results": all_items,
+            "orphan_count": orphan_items.len(),
+            "exported_unused_count": exported_items.len(),
+            "summary": format!("Dead code: {} results ({} orphan, {} exported-unused)",
+                all_items.len(), orphan_items.len(), exported_items.len())
         }))
     }
 

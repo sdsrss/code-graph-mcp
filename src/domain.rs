@@ -98,6 +98,24 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
 }
 
+// -- Node type normalization --
+/// Normalize shorthand type filter into canonical AST node types.
+/// Shared by CLI and MCP tool implementations.
+pub fn normalize_type_filter(input: &str) -> Vec<&'static str> {
+    match input.to_lowercase().as_str() {
+        "fn" | "func" | "function" | "method" => vec!["function", "method"],
+        "class" => vec!["class"],
+        "struct" => vec!["struct"],
+        "enum" => vec!["enum"],
+        "interface" | "iface" | "trait" => vec!["interface", "trait"],
+        "type" | "type_alias" => vec!["type_alias"],
+        "const" | "constant" => vec!["constant"],
+        "var" | "variable" => vec!["variable"],
+        "module" => vec!["module"],
+        _ => vec![],
+    }
+}
+
 // -- Edge resolution noise filter --
 // Common standard-library method/trait names that produce false-positive call edges
 // when resolved cross-file by name alone (without type context).

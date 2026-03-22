@@ -82,6 +82,10 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_refs(&project_root, &args)
         }
+        Some("dead-code") => {
+            let project_root = std::env::current_dir()?;
+            code_graph_mcp::cli::cmd_dead_code(&project_root, &args)
+        }
         Some("benchmark") => {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
@@ -118,22 +122,30 @@ fn print_help() {
     println!("    trace <route>       Trace HTTP route → handler → downstream calls");
     println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
+    println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    incremental-index   Run incremental index update");
     println!("    health-check        Query index status");
     println!("    benchmark           Benchmark index speed, query latency, token savings\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
-    println!("    --compact           Compact output (search, callgraph, map, overview)");
+    println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
     println!("    --limit N           Limit results (search, ast-search; default: 20)");
     println!("    --language <lang>   Filter by language (search)");
+    println!("    --node-type <type>  Filter by node type (search)");
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
     println!("    --returns <type>    Filter by return type (ast-search)");
     println!("    --params <text>     Filter by parameter text (ast-search)");
     println!("    --direction <dir>   callers, callees, or both (callgraph, deps; default: both)");
     println!("    --depth N           Max traversal depth (callgraph, impact, deps; default: 3)");
-    println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show)");
+    println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)");
+    println!("    --node-id N         Lookup by node ID (show, similar)");
     println!("    --change-type <t>   signature, behavior, or remove (impact; default: behavior)");
-    println!("    --include-tests     Show test callers in callgraph (hidden by default)");
+    println!("    --include-tests     Show test callers (callgraph; hidden by default)");
+    println!("    --include-refs      Show callers/callees (show)");
+    println!("    --include-impact    Show impact summary (show)");
+    println!("    --context-lines N   Surrounding source lines (show; default: 0)");
+    println!("    --min-lines N       Min lines to report (dead-code; default: 3)");
+    println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");
 }

@@ -28,7 +28,8 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
-                        "top_k": { "type": "number", "description": "Results count (default 5)" },
+                        "top_k": { "type": "number", "description": "Results count (default 20). Alias: limit" },
+                        "limit": { "type": "number", "description": "Alias for top_k" },
                         "language": { "type": "string", "description": "Filter by language" },
                         "node_type": { "type": "string", "description": "Filter by node type" },
                         "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" }
@@ -46,7 +47,8 @@ impl ToolRegistry {
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both')" },
                         "depth": { "type": "number", "description": "Max depth (default 3)" },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
-                        "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
+                        "include_tests": { "type": "boolean", "description": "Include test callers (default false)" }
                     },
                     "required": ["symbol_name"]
                 }),
@@ -189,7 +191,6 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "scope": { "type": "string", "description": "Scope: 'project' (default) or 'module'" },
                         "path": { "type": "string", "description": "Directory/file path filter (e.g. 'src/auth/')" },
                         "node_type": { "type": "string", "enum": ["fn", "class", "struct", "enum", "interface", "type", "const", "var"], "description": "Filter by node type" },
                         "include_tests": { "type": "boolean", "description": "Include test symbols (default false)" },

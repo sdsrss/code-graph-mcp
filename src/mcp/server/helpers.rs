@@ -70,19 +70,13 @@ pub(super) fn should_skip_indexing(args: &serde_json::Value) -> bool {
 }
 
 /// Normalize user-facing type filter aliases to internal AST node types.
+/// Delegates to shared domain implementation, logging a warning for unknown inputs.
 pub(super) fn normalize_type_filter_mcp(input: &str) -> Vec<String> {
-    match input.to_lowercase().as_str() {
-        "fn" | "func" | "function" | "method" => vec!["function".into(), "method".into()],
-        "class" => vec!["class".into()],
-        "struct" => vec!["struct".into()],
-        "enum" => vec!["enum".into()],
-        "interface" | "iface" | "trait" => vec!["interface".into(), "trait".into()],
-        "type" | "type_alias" => vec!["type_alias".into()],
-        "const" | "constant" => vec!["constant".into()],
-        "var" | "variable" => vec!["variable".into()],
-        "module" => vec!["module".into()],
-        _ => vec![input.to_lowercase()],
+    let result = crate::domain::normalize_type_filter(input);
+    if result.is_empty() {
+        tracing::warn!("Unknown node type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var, module", input);
     }
+    result.into_iter().map(String::from).collect()
 }
 
 /// Centralized compression for tool results that exceed the token threshold.

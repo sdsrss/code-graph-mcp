@@ -234,6 +234,31 @@ npm uninstall -g @sdsrs/code-graph
 | `find_references` | Find all references to a symbol (callers, importers, inheritors). Supports `compact` mode |
 | `find_dead_code` | Find unused code — orphan symbols and exported-but-unused public APIs |
 
+## CLI Commands
+
+All tools are also available as CLI subcommands for shell scripts, hooks, and terminal workflows:
+
+| Command | MCP Equivalent | Description |
+|---------|---------------|-------------|
+| `search <query>` | `semantic_code_search` | FTS5 search by concept |
+| `ast-search [query]` | `ast_search` | Structural search with `--type`/`--returns`/`--params` filters |
+| `callgraph <symbol>` | `get_call_graph` | Show call graph (callers/callees) |
+| `impact <symbol>` | `impact_analysis` | Impact analysis (callers, routes, risk level) |
+| `show <symbol>` | `get_ast_node` | Show symbol details (code, type, signature) |
+| `map` | `project_map` | Project architecture map |
+| `overview <path>` | `module_overview` | Module symbols grouped by file and type |
+| `deps <file>` | `dependency_graph` | File-level dependency graph |
+| `trace <route>` | `trace_http_chain` | Trace HTTP route → handler → downstream calls |
+| `similar <symbol>` | `find_similar_code` | Find semantically similar code (requires embeddings) |
+| `refs <symbol>` | `find_references` | Find all references to a symbol |
+| `dead-code [path]` | `find_dead_code` | Find unused code (orphans and exported-unused) |
+| `grep <pattern>` | — | AST-context grep (ripgrep + containing function/class) |
+| `incremental-index` | — | Run incremental index update (auto-creates DB if needed) |
+| `health-check` | `get_index_status` | Query index status and freshness |
+| `benchmark` | — | Benchmark index speed, query latency, token savings |
+
+Common options: `--json` (JSON output), `--compact` (compact output), `--limit N`, `--depth N`, `--file <path>`.
+
 ## Plugin Slash Commands
 
 Available when installed as a Claude Code plugin:

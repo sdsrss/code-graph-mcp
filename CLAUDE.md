@@ -61,13 +61,14 @@ Code graph tools are available via MCP. The MCP server injects `instructions` at
 
 <claude-mem-context>
 ### Last Session
-Request: 合并清理分支   提交代码并push,发布新版本包括release版本，检查github上有没有错误。
+Request: 按建议修复优先级开始修复
+Completed: Error: cli_e2e.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de…; Modified cli.rs, domain.rs
 
 ### Key Context
-- [discovery] Reviewed 2 files: tools.rs, mod.rs (#4422)
-- [bugfix] cargo check --no-default-features 2>&1 → Checking code-graph-mcp v0.5.47 (/mnt/… (#4421)
-- [bugfix] Error: server.rs: in_progress		fix(clippy): use str::is_ascii() ins… (#4371)
-- [bugfix] Error: watcher.rs: Compiling code-graph-mcp v0.5.46 (/mnt/data_ssd/d… (#4363)
-- [discovery] code-graph-mcp build failures with --no-default-features flag (#4361)
+- [bugfix] Error: cli_e2e.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4912)
+- [bugfix] Error: cli.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4905)
+- [bugfix] Error: cli.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4872)
+- [bugfix] Error: session-init.test.js, session-init.test.js: TAP version 13 # Subtest: sy… (#4846)
+- [bugfix] Error: mod.rs: diff --git a/src/indexer/pipeline.rs b/src/indexe… (#4839)
 
 </claude-mem-context>

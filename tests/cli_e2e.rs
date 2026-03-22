@@ -336,7 +336,7 @@ fn test_cli_show_json() {
     assert!(v.is_array(), "JSON output should be array");
     let arr = v.as_array().unwrap();
     assert!(!arr.is_empty());
-    assert!(arr[0]["code"].is_string(), "should include code field");
+    assert!(arr[0]["code_content"].is_string(), "should include code_content field");
 }
 
 // ============================================================

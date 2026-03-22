@@ -935,14 +935,19 @@ impl McpServer {
 
     /// Run incremental index with cache snapshot/restore on failure.
     ///
-    /// If background embedding is in progress, skips the re-index to avoid a race
-    /// condition where the embedding thread inserts vectors for node IDs that are
-    /// being deleted and re-inserted by the incremental index. The 30s debounce
-    /// (or next tool call in tests) will trigger the re-index once embedding finishes.
+    /// If background embedding is in progress, waits briefly for it to finish
+    /// to avoid a race condition where the embedding thread inserts vectors for
+    /// node IDs that are being deleted and re-inserted by the incremental index.
     fn run_incremental_with_cache_restore(&self, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<()> {
         if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
-            tracing::info!("Skipping incremental re-index: background embedding in progress");
-            return Ok(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    tracing::info!("Skipping incremental re-index: background embedding still in progress");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
 
         let mut cache_guard = lock_or_recover(&self.dir_cache, "dir_cache");
