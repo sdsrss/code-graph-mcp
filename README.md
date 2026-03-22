@@ -101,13 +101,15 @@ Real-world benchmarks comparing code-graph-mcp tools against traditional approac
 
 ```
 src/
+├── domain.rs     # Shared constants, relation types, env-var config
 ├── mcp/          # MCP protocol layer (JSON-RPC, tool registry, server)
-├── parser/       # Tree-sitter parsing, relation extraction, language support
+│   └── server/   # McpServer with IndexingState + CacheState sub-structs
+├── parser/       # Tree-sitter parsing, relation extraction, LanguageConfig dispatch
 ├── indexer/      # 3-phase pipeline, Merkle tree, file watcher
-├── storage/      # SQLite schema, CRUD, FTS5 full-text search
+├── storage/      # SQLite schema (v6), CRUD, FTS5, migrations
 ├── graph/        # Recursive CTE call graph queries
 ├── search/       # RRF fusion search combining BM25 + vector
-├── embedding/    # Candle embedding model (optional)
+├── embedding/    # Candle embedding model (optional, masked mean pooling)
 ├── sandbox/      # Context compressor with token estimation
 └── utils/        # Language detection, config
 ```
@@ -225,11 +227,11 @@ npm uninstall -g @sdsrs/code-graph
 | `trace_http_chain` | Full request flow: route → handler → downstream call chain |
 | `impact_analysis` | Analyze the blast radius of changing a symbol |
 | `module_overview` | High-level overview of a module's structure and exports |
-| `dependency_graph` | Visualize dependency relationships between modules |
-| `find_similar_code` | Find code snippets similar to a given pattern |
-| `get_ast_node` | Extract a specific code symbol with signature, body, and relations |
+| `dependency_graph` | Visualize dependency relationships between modules. Supports `compact` mode |
+| `find_similar_code` | Find semantically similar code via embeddings. Requires `symbol_name` or `node_id` |
+| `get_ast_node` | Extract a specific code symbol with signature, body, and relations. Supports `compact` mode |
 | `ast_search` | Search AST nodes by text and/or structural filters (type, return type, params) |
-| `find_references` | Find all references to a symbol (callers, importers, inheritors) |
+| `find_references` | Find all references to a symbol (callers, importers, inheritors). Supports `compact` mode |
 | `find_dead_code` | Find unused code — orphan symbols and exported-but-unused public APIs |
 
 ## Plugin Slash Commands
@@ -316,6 +318,9 @@ cargo test --no-default-features
 
 # Check compilation
 cargo check
+
+# Run performance benchmarks (indexing, search, call graph)
+cargo bench --no-default-features
 ```
 
 ## License
