@@ -1096,6 +1096,9 @@ pub fn get_import_tree(
     max_depth: i32,
 ) -> Result<Vec<FileDependency>> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
+    if !matches!(direction, "outgoing" | "incoming" | "both") {
+        anyhow::bail!("invalid direction '{}': expected outgoing, incoming, or both", direction);
+    }
     let max_depth = max_depth.clamp(1, 10);
     let mut results = Vec::new();
 
@@ -1229,6 +1232,7 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL", [], |r| r.get(0)
     )?;
+    // node_vectors table may not exist when embed-model feature is disabled; return 0 in that case
     let with_vectors: i64 = conn.query_row(
         "SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)
     ).unwrap_or(0);

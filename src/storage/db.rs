@@ -116,7 +116,7 @@ impl Database {
             }
         }
 
-        conn.execute_batch(schema::CREATE_TABLES)?;
+        conn.execute_batch(&schema::create_tables_sql())?;
 
         if enable_vec {
             conn.execute_batch(&schema::create_vec_tables_sql())?;
