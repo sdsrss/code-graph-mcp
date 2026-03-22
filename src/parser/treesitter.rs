@@ -80,6 +80,7 @@ fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_nodes(
     node: tree_sitter::Node,
     source: &str,
@@ -399,6 +400,7 @@ fn extract_nodes(
     extract_children(node, source, language, config, parent_class, results, depth, node_is_test);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_children(
     node: tree_sitter::Node,
     source: &str,

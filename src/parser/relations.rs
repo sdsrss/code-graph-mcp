@@ -23,6 +23,7 @@ pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, langu
     relations
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_for_relations(
     node: tree_sitter::Node,
     source: &str,
