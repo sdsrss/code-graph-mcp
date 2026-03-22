@@ -253,10 +253,8 @@ fn suggest_subcommand(input: &str) -> Option<&'static str> {
     for &cmd in SUBCOMMANDS {
         let d = levenshtein_small(&input_lower, cmd);
         let threshold = if cmd.len() <= 4 { 1 } else { 2 };
-        if d <= threshold {
-            if best.is_none() || d < best.unwrap().1 {
-                best = Some((cmd, d));
-            }
+        if d <= threshold && (best.is_none() || d < best.unwrap().1) {
+            best = Some((cmd, d));
         }
     }
     best.map(|(cmd, _)| cmd)

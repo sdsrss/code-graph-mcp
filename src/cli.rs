@@ -1642,7 +1642,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     } else {
         let symbol = get_positional(args, 0)
             .filter(|s| !s.is_empty())
-            .map(|s| strip_qualified_prefix(s))
+            .map(strip_qualified_prefix)
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
