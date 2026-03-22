@@ -12,6 +12,7 @@ embed-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled-full"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled"] }  # direct dep needed for DEP_SQLITE3_INCLUDE in build.rs
 blake3 = "1"
 ignore = "0.4"
 rayon = "1"

@@ -353,6 +353,7 @@ dependencies = [
  "flate2",
  "ignore",
  "libc",
+ "libsqlite3-sys",
  "notify",
  "rayon",
  "rusqlite",
