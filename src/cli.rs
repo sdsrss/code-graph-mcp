@@ -81,6 +81,65 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// Get a flag value that represents a file path, normalizing `./` prefix.
+fn get_path_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    get_flag_value(args, flag).map(|p| p.strip_prefix("./").unwrap_or(p))
+}
+
+/// Parse a numeric flag value, printing a warning on invalid input and falling back to default.
+fn parse_flag_or<T: std::str::FromStr + std::fmt::Display>(args: &[String], flag: &str, default: T) -> T {
+    match get_flag_value(args, flag) {
+        Some(v) => match v.parse::<T>() {
+            Ok(val) => val,
+            Err(_) => {
+                eprintln!("[code-graph] Warning: invalid value '{}' for {}, using default {}", v, flag, default);
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Strip qualified name prefix (e.g. "McpServer.handle_message" -> "handle_message")
+/// so users can copy-paste names from output and use them in lookups.
+fn strip_qualified_prefix(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Resolve a possibly-qualified symbol name (e.g. "Database.open") to a base name
+/// and optional file path for disambiguation. When the user passes a qualified name,
+/// we find the matching node and use its file_path as a filter so that downstream
+/// queries (callgraph, impact, refs) pick the right symbol.
+/// Returns (base_name, resolved_file_filter) where resolved_file_filter is Some only
+/// if the qualified name resolved uniquely and no explicit --file was given.
+fn resolve_qualified_symbol<'a>(
+    conn: &rusqlite::Connection,
+    raw_symbol: &'a str,
+    explicit_file: Option<&'a str>,
+) -> (&'a str, Option<String>) {
+    // If user already provided --file, just strip the prefix and use their filter
+    if explicit_file.is_some() {
+        return (strip_qualified_prefix(raw_symbol), None);
+    }
+    // If the symbol contains '.', try qualified name resolution
+    if raw_symbol.contains('.') {
+        let base = strip_qualified_prefix(raw_symbol);
+        if let Ok(nodes) = queries::get_nodes_by_name(conn, base) {
+            let matched: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.qualified_name.as_deref() == Some(raw_symbol))
+                .collect();
+            if matched.len() == 1 {
+                if let Ok(Some(fp)) = queries::get_file_path(conn, matched[0].file_id) {
+                    return (base, Some(fp));
+                }
+            }
+        }
+        return (base, None);
+    }
+    (raw_symbol, None)
+}
+
 // --- Output formatting ---
 
 /// Format a node as a compact single line: `type QualifiedName  file:start-end  (params) -> return`
@@ -470,10 +529,11 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     let compact = has_flag(args, "--compact");
     let language_filter = get_flag_value(args, "--language");
     let node_type_filter = get_flag_value(args, "--node-type");
-    let limit: i64 = get_flag_value(args, "--limit")
-        .or_else(|| get_flag_value(args, "--top-k"))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+    let limit: i64 = if get_flag_value(args, "--limit").is_some() {
+        parse_flag_or(args, "--limit", 20_i64)
+    } else {
+        parse_flag_or(args, "--top-k", 20_i64)
+    }.max(1);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -588,9 +648,7 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
     let returns_filter = get_flag_value(args, "--returns");
     let params_filter = get_flag_value(args, "--params");
     let json_mode = has_flag(args, "--json");
-    let limit: usize = get_flag_value(args, "--limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+    let limit: usize = parse_flag_or(args, "--limit", 20_usize).max(1);
 
     // Require either a query or at least one structural filter
     let has_filters = type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();
@@ -724,23 +782,24 @@ fn normalize_type_filter(input: &str) -> Vec<&'static str> {
 ///   → calls: tool_semantic_search (src/mcp/server.rs:1360)
 /// ```
 pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
-    let symbol = get_positional(args, 0)
+    let raw_symbol = get_positional(args, 0)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]"
         ))?;
 
     let direction = get_flag_value(args, "--direction").unwrap_or("both");
-    let depth: i32 = get_flag_value(args, "--depth")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3)
-        .clamp(1, 20);
+    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
     let include_tests = has_flag(args, "--include-tests");
-    let file_filter = get_flag_value(args, "--file");
+    let explicit_file = get_path_flag(args, "--file");
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+
+    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let file_filter = explicit_file.or(resolved_file.as_deref());
 
     let nodes = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
     if nodes.is_empty() {
@@ -847,17 +906,15 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
 ///
 /// Shows callers with route info and risk level.
 pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
-    let symbol = get_positional(args, 0)
+    let raw_symbol = get_positional(args, 0)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp impact <symbol> [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]"
         ))?;
 
-    let depth: i32 = get_flag_value(args, "--depth")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3)
-        .clamp(1, 20);
+    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
     let json_mode = has_flag(args, "--json");
-    let file_filter = get_flag_value(args, "--file");
+    let explicit_file = get_path_flag(args, "--file");
     let change_type = get_flag_value(args, "--change-type").unwrap_or("behavior");
     if !matches!(change_type, "signature" | "behavior" | "remove") {
         anyhow::bail!("--change-type must be one of: signature, behavior, remove");
@@ -865,6 +922,9 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+
+    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let file_filter = explicit_file.or(resolved_file.as_deref());
 
     // Verify symbol exists before running impact analysis
     let symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
@@ -1067,8 +1127,9 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
 
 /// Module overview: all symbols in files under a path prefix.
 pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
-    let path_prefix = get_positional(args, 0)
+    let raw_path = get_positional(args, 0)
         .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp overview <path> [--json] [--compact]"))?;
+    let path_prefix = raw_path.strip_prefix("./").unwrap_or(raw_path);
 
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
@@ -1149,11 +1210,17 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
     let compact = has_flag(args, "--compact");
     let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references");
     let include_impact = has_flag(args, "--include-impact");
-    let file_filter = get_flag_value(args, "--file");
-    let context_lines_explicit = get_flag_value(args, "--context-lines")
-        .and_then(|v| v.parse::<usize>().ok());
-    let node_id_arg: Option<i64> = get_flag_value(args, "--node-id")
-        .and_then(|v| v.parse().ok());
+    let file_filter = get_path_flag(args, "--file");
+    let context_lines_explicit: Option<usize> = if get_flag_value(args, "--context-lines").is_some() {
+        Some(parse_flag_or(args, "--context-lines", 0_usize))
+    } else {
+        None
+    };
+    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
+        Some(parse_flag_or(args, "--node-id", 0_i64))
+    } else {
+        None
+    };
     // Default context_lines=3 when using --node-id (align with MCP behavior), 0 otherwise
     let context_lines: usize = context_lines_explicit
         .unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
@@ -1172,6 +1239,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         }
     } else {
         let symbol = get_positional(args, 0)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--include-refs] [--include-impact] [--context-lines N] [--compact] [--json]"
             ))?;
@@ -1182,7 +1250,17 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
                 .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .collect::<Vec<_>>()
         } else {
-            queries::get_nodes_by_name(conn, symbol)?
+            let mut found = queries::get_nodes_by_name(conn, symbol)?;
+            // Fallback: try as qualified name (e.g. "McpServer.handle_message")
+            if found.is_empty() && symbol.contains('.') {
+                if let Some(base_name) = symbol.rsplit('.').next() {
+                    found = queries::get_nodes_by_name(conn, base_name)?
+                        .into_iter()
+                        .filter(|n| n.qualified_name.as_deref() == Some(symbol))
+                        .collect();
+                }
+            }
+            found
         };
 
         if nodes.is_empty() {
@@ -1336,14 +1414,12 @@ fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, en
 /// CLI equivalent of MCP `trace_http_chain`.
 pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
     let route_path = get_positional(args, 0)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp trace <route> [--depth N] [--include-middleware] [--json]"
         ))?;
 
-    let depth: i32 = get_flag_value(args, "--depth")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3)
-        .clamp(1, 20);
+    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
     let json_mode = has_flag(args, "--json");
     let include_middleware = !has_flag(args, "--no-middleware");
 
@@ -1442,19 +1518,18 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
 /// File-level dependency graph.
 /// CLI equivalent of MCP `dependency_graph`.
 pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
-    let file_path = get_positional(args, 0)
+    let raw_file_path = get_positional(args, 0)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp deps <file> [--direction outgoing|incoming|both] [--depth N] [--json]"
         ))?;
+    let file_path = raw_file_path.strip_prefix("./").unwrap_or(raw_file_path);
 
     let direction = get_flag_value(args, "--direction").unwrap_or("both");
     if !matches!(direction, "outgoing" | "incoming" | "both") {
         anyhow::bail!("--direction must be one of: outgoing, incoming, both");
     }
-    let depth: i32 = get_flag_value(args, "--depth")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
-        .clamp(1, 10);
+    let depth: i32 = parse_flag_or(args, "--depth", 2_i32).clamp(1, 10);
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
 
@@ -1539,16 +1614,14 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
 pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
-    let top_k: i64 = get_flag_value(args, "--top-k")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5)
-        .clamp(1, 100);
-    let max_distance: f64 = get_flag_value(args, "--max-distance")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.8);
+    let top_k: i64 = parse_flag_or(args, "--top-k", 5_i64).clamp(1, 100);
+    let max_distance: f64 = parse_flag_or(args, "--max-distance", 0.8_f64);
     let json_mode = has_flag(args, "--json");
-    let node_id_arg: Option<i64> = get_flag_value(args, "--node-id")
-        .and_then(|v| v.parse().ok());
+    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
+        Some(parse_flag_or(args, "--node-id", 0_i64))
+    } else {
+        None
+    };
 
     // Open with vec support for vector search
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
@@ -1568,6 +1641,8 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         nid
     } else {
         let symbol = get_positional(args, 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| strip_qualified_prefix(s))
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
@@ -1639,17 +1714,21 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
 }
 
 pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
-    let symbol = get_positional(args, 0)
+    let raw_symbol = get_positional(args, 0)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
             "Usage: code-graph-mcp refs <symbol> [--file path] [--relation calls|imports|inherits|implements] [--compact] [--json]"
         ))?;
-    let file_path = get_flag_value(args, "--file");
+    let explicit_file = get_path_flag(args, "--file");
     let relation = get_flag_value(args, "--relation");
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+
+    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let file_path = explicit_file.or(resolved_file.as_deref());
 
     // Resolve symbol to node_id(s)
     let target_ids: Vec<i64> = if let Some(fp) = file_path {
@@ -1662,7 +1741,15 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     } else {
         let ids = queries::get_node_ids_by_name(conn, symbol)?;
         if ids.is_empty() {
-            anyhow::bail!("Symbol '{}' not found in index.", symbol);
+            eprintln!("[code-graph] Symbol not found: {}", symbol);
+            let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
+            if !candidates.is_empty() {
+                eprintln!("[code-graph] Did you mean:");
+                for c in candidates.iter().take(5) {
+                    eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
+                }
+            }
+            std::process::exit(1);
         }
         ids.into_iter().map(|(id, _)| id).collect()
     };
@@ -1733,12 +1820,10 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
 /// Find dead code: orphans and exported-unused symbols.
 /// CLI equivalent of MCP `find_dead_code`.
 pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
-    let path_filter = get_positional(args, 0);
+    let path_filter = get_positional(args, 0).map(|p| p.strip_prefix("./").unwrap_or(p));
     let type_filter = get_flag_value(args, "--type");
     let include_tests = has_flag(args, "--include-tests");
-    let min_lines: u32 = get_flag_value(args, "--min-lines")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    let min_lines: u32 = parse_flag_or(args, "--min-lines", 3_u32);
     let compact = !has_flag(args, "--no-compact");
     let json_mode = has_flag(args, "--json");
 

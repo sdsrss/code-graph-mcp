@@ -92,6 +92,9 @@ fn main() -> Result<()> {
         }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
+            if let Some(suggestion) = suggest_subcommand(other) {
+                eprintln!("Did you mean '{}'?", suggestion);
+            }
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
             std::process::exit(1);
         }
@@ -135,7 +138,7 @@ fn print_help() {
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
     println!("    --returns <type>    Filter by return type (ast-search)");
     println!("    --params <text>     Filter by parameter text (ast-search)");
-    println!("    --direction <dir>   callers, callees, or both (callgraph, deps; default: both)");
+    println!("    --direction <dir>   callers|callees|both (callgraph), outgoing|incoming|both (deps)");
     println!("    --depth N           Max traversal depth (callgraph, impact, deps; default: 3)");
     println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)");
     println!("    --node-id N         Lookup by node ID (show, similar)");
@@ -236,4 +239,42 @@ fn run_serve() -> Result<()> {
     tracing::info!("[session] Ended after {:.0}s", session_start.elapsed().as_secs_f64());
 
     Ok(())
+}
+
+const SUBCOMMANDS: &[&str] = &[
+    "serve", "grep", "search", "ast-search", "callgraph", "impact",
+    "show", "map", "overview", "deps", "trace", "similar", "refs",
+    "dead-code", "incremental-index", "health-check", "benchmark",
+];
+
+fn suggest_subcommand(input: &str) -> Option<&'static str> {
+    let input_lower = input.to_lowercase();
+    let mut best: Option<(&str, usize)> = None;
+    for &cmd in SUBCOMMANDS {
+        let d = levenshtein_small(&input_lower, cmd);
+        let threshold = if cmd.len() <= 4 { 1 } else { 2 };
+        if d <= threshold {
+            if best.is_none() || d < best.unwrap().1 {
+                best = Some((cmd, d));
+            }
+        }
+    }
+    best.map(|(cmd, _)| cmd)
+}
+
+fn levenshtein_small(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }

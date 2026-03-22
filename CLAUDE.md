@@ -61,14 +61,16 @@ Code graph tools are available via MCP. The MCP server injects `instructions` at
 
 <claude-mem-context>
 ### Last Session
-Request: 按建议修复优先级开始修复
-Completed: Error: cli_e2e.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de…; Modified cli.rs, domain.rs
+Request: Debug and fix code-graph-mcp CLI command errors related to symbol lookup and callgraph functionality
+Completed: Identified two distinct error categories in cli.rs: (1) Symbol not found error in cmd_refs function, (2) Usage/callgrap…
+Remaining: Fix cmd_refs symbol resolution in cli.rs; Fix callgraph error handling for empty/invalid queries; Verify both commands …
+Next: Review cmd_refs implementation for symbol lookup logic; Add empty query validation before callgraph execution; Run inte…
 
 ### Key Context
-- [bugfix] Error: cli_e2e.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4912)
-- [bugfix] Error: cli.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4905)
-- [bugfix] Error: cli.rs: Compiling code-graph-mcp v0.7.4 (/mnt/data_ssd/de… (#4872)
-- [bugfix] Error: session-init.test.js, session-init.test.js: TAP version 13 # Subtest: sy… (#4846)
-- [bugfix] Error: mod.rs: diff --git a/src/indexer/pipeline.rs b/src/indexe… (#4839)
+- [bugfix] Error: cli.rs: code-graph Symbol not found:  --- code-graph No r… (#5079)
+- [bugfix] Error: cli.rs: Error: Usage: code-graph-mcp search <query> --jso… (#5077)
+- [refactor] Test and refine code-graph-mcp CLI argument validation (#5045)
+- [bugfix] Error: cli.rs: Error: Symbol 'run_ful' not found in index. EXIT:1 (#5044)
+- [bugfix] Error: queries.rs: in_progress		fix(clippy): replace needless range … (#5011)
 
 </claude-mem-context>
