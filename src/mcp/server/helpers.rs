@@ -122,22 +122,45 @@ pub(super) fn truncate_large_strings(value: serde_json::Value, token_budget: usi
     result
 }
 
-/// Truncate a JSON value's string fields to fit within a char budget.
+/// Minimum string length to consider for truncation — short metadata fields are never truncated.
+const TRUNCATE_MIN_LEN: usize = 200;
+
+/// Truncate a JSON value's large string fields to fit within a char budget.
+/// Only strings longer than TRUNCATE_MIN_LEN are eligible for truncation,
+/// preserving short metadata fields (names, types, paths) intact.
 pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            // Per-field budget: distribute chars across fields
-            let field_count = map.len().max(1);
-            let per_field = budget / field_count;
+            // Calculate total size of large string fields eligible for truncation
+            let large_fields: usize = map.values()
+                .filter_map(|v| v.as_str().filter(|s| s.len() > TRUNCATE_MIN_LEN).map(|s| s.len()))
+                .sum();
+            let small_fields_size: usize = map.iter()
+                .map(|(k, v)| k.len() + match v {
+                    serde_json::Value::String(s) if s.len() <= TRUNCATE_MIN_LEN => s.len(),
+                    serde_json::Value::String(_) => 0,
+                    _ => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
+                })
+                .sum();
+            let large_budget = budget.saturating_sub(small_fields_size);
+
             let truncated: serde_json::Map<String, serde_json::Value> = map.into_iter()
                 .map(|(k, v)| {
                     let tv = match &v {
-                        serde_json::Value::String(s) if s.len() > per_field => {
-                            let truncated_str = &s[..s.floor_char_boundary(per_field.min(s.len()))];
-                            json!(format!("{}... [truncated, {} chars total]", truncated_str, s.len()))
+                        serde_json::Value::String(s) if s.len() > TRUNCATE_MIN_LEN => {
+                            let field_budget = if large_fields > 0 {
+                                (large_budget as f64 * s.len() as f64 / large_fields as f64) as usize
+                            } else {
+                                large_budget
+                            };
+                            if s.len() > field_budget {
+                                let trunc = &s[..s.floor_char_boundary(field_budget.min(s.len()))];
+                                json!(format!("{}... [truncated, {} chars total]", trunc, s.len()))
+                            } else {
+                                v
+                            }
                         }
                         serde_json::Value::Array(arr) if arr.len() > 20 => {
-                            // Keep first 10 and last 5 items, note truncation
                             let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
                             kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
                             kept.extend_from_slice(&arr[arr.len()-5..]);

@@ -528,6 +528,7 @@ fn index_files(
         get_all_node_names_with_ids(db.conn())?;
 
     // Heavyweight per-file data used during Phase 1+2, dropped after each batch
+    #[allow(dead_code)]
     struct FileParsed {
         rel_path: String,
         source: String,

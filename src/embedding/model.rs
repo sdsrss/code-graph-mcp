@@ -167,21 +167,30 @@ mod inner {
         }
 
         /// Generate a 384-dim embedding for a single text.
+        /// Uses masked mean pooling (consistent with embed_batch) to avoid
+        /// diluting signal with padding zeros for texts shorter than 512 tokens.
         pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
             let encoding = self.tokenizer.encode(text, true)
                 .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))?;
 
             let ids = encoding.get_ids();
             let type_ids = encoding.get_type_ids();
+            let seq_len = ids.len();
 
             let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
             let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
+            // Build attention mask: 1.0 for real tokens
+            let attention_vec: Vec<f32> = vec![1.0; seq_len];
+            let attention_mask = Tensor::from_vec(attention_vec, (1, seq_len), &self.device)?;
 
-            let embeddings = self.model.forward(&input_ids, &token_type_ids, None)?;
+            let embeddings = self.model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
-            // Mean pooling: average across token dimension
-            let (_batch, n_tokens, _hidden) = embeddings.dims3()?;
-            let pooled = (embeddings.sum(1)? / (n_tokens as f64))?;
+            // Masked mean pooling: only average over real tokens
+            let attention_3d = attention_mask.unsqueeze(2)?;
+            let masked = embeddings.broadcast_mul(&attention_3d)?;
+            let summed = masked.sum(1)?;
+            let count = attention_mask.sum(1)?.unsqueeze(1)?;
+            let pooled = summed.broadcast_div(&count)?;
             let pooled = pooled.squeeze(0)?;
 
             let mut result: Vec<f32> = pooled.to_vec1()?;
