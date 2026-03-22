@@ -1168,11 +1168,9 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
     let function = node.child_by_field_name("function")?;
     if function.kind() != "selector_expression" { return None; }
 
-    let operand = function.child_by_field_name("operand")?;
     let field = function.child_by_field_name("field")?;
-
-    if node_text(&operand, source) != "http" { return None; }
     let func_name = node_text(&field, source);
+    // Match HandleFunc/Handle on any receiver: http.HandleFunc, mux.HandleFunc, router.Handle, etc.
     if !matches!(func_name, "HandleFunc" | "Handle") { return None; }
 
     let args = node.child_by_field_name("arguments")?;
@@ -1180,7 +1178,14 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
     let path = node_text(&path_arg, source).trim_matches('"').to_string();
 
     let handler_arg = args.named_child(1)?;
-    let handler = node_text(&handler_arg, source).to_string();
+    // For selector expressions like handler.GetUser, extract just the method name
+    let handler = if handler_arg.kind() == "selector_expression" {
+        handler_arg.child_by_field_name("field")
+            .map(|f| node_text(&f, source).to_string())
+            .unwrap_or_else(|| node_text(&handler_arg, source).to_string())
+    } else {
+        node_text(&handler_arg, source).to_string()
+    };
 
     let metadata = serde_json::json!({"method": "ALL", "path": path}).to_string();
 

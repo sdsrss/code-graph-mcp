@@ -1471,7 +1471,7 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
                 "node_id": r.node_id,
                 "name": r.name,
                 "type": r.node_type,
-                "file_path": r.file_path,
+                "file": r.file_path,
                 "start_line": r.start_line,
                 "relation": r.relation,
             })

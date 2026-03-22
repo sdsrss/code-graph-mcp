@@ -1,6 +1,6 @@
 {
   "name": "@sdsrs/code-graph-linux-x64",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "code-graph-mcp binary for Linux x64",
   "license": "MIT",
   "repository": {

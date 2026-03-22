@@ -1674,6 +1674,21 @@ pub fn find_dead_code(
                WHERE source_id = n.id AND target_id = n.id
                  AND relation = :rel_routes_to
            )
+           -- For non-callable types (struct/enum/type/const/interface), also check
+           -- if the name appears in any function's code in the same file.
+           -- This catches struct instantiation, type usage, etc. that the parser
+           -- doesn't track as graph edges.
+           AND (
+               n.type IN ('function', 'method')
+               OR length(n.name) < 3
+               OR NOT EXISTS (
+                   SELECT 1 FROM nodes n2
+                   WHERE n2.file_id = n.file_id
+                     AND n2.id != n.id
+                     AND n2.type IN ('function', 'method')
+                     AND instr(n2.code_content, n.name) > 0
+               )
+           )
          ORDER BY (n.end_line - n.start_line + 1) DESC
          LIMIT :limit"
     );
