@@ -1652,7 +1652,7 @@ pub fn find_dead_code(
 
     // Track how many type filter placeholders we need
     let normalized_types: Vec<&str> = node_type
-        .map(|t| crate::domain::normalize_type_filter(t))
+        .map(crate::domain::normalize_type_filter)
         .unwrap_or_default();
 
     if node_type.is_some() {
