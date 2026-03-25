@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
-// UserPromptSubmit hook: inject relevant code-graph context based on user's question.
-// Only activates when user message references code entities + has understanding intent.
-// This is a CODE INDEX, not a memory store — only inject structural code context.
+// UserPromptSubmit hook: inject relevant code-graph RESULTS based on user's intent.
+// Strategy: PUSH structural context (not suggestions) that Grep/Read cannot provide.
+// This is a CODE INDEX — only inject structural code context (impact, overview, callgraph).
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -31,13 +31,27 @@ if (!fs.existsSync(MANIFEST_PATH)) {
   process.exit(0);
 }
 
-// --- Rate limiting ---
-const flag = path.join(os.tmpdir(), '.code-graph-prompt-ctx');
-const COOLDOWN_MS = 60 * 1000; // 1 minute between injections
-try {
-  const stat = fs.statSync(flag);
-  if (Date.now() - stat.mtimeMs < COOLDOWN_MS) process.exit(0);
-} catch { /* first time */ }
+// --- Per-type rate limiting (replaces single global cooldown) ---
+const COOLDOWNS = {
+  impact:    30 * 1000,     // 30s — impact context changes during rapid edits
+  overview:  5 * 60 * 1000, // 5min — module structure rarely changes mid-session
+  callgraph: 60 * 1000,     // 1min
+  search:    60 * 1000,     // 1min
+};
+
+function isCoolingDown(type) {
+  try {
+    const flag = path.join(os.tmpdir(), `.code-graph-ctx-${type}`);
+    const stat = fs.statSync(flag);
+    return Date.now() - stat.mtimeMs < (COOLDOWNS[type] || 60000);
+  } catch { return false; }
+}
+
+function markCooldown(type) {
+  try {
+    fs.writeFileSync(path.join(os.tmpdir(), `.code-graph-ctx-${type}`), '');
+  } catch { /* ok */ }
+}
 
 // --- Read user message ---
 let message;
@@ -87,51 +101,75 @@ const symbolCandidates = (message.match(/\b(?:[A-Z]\w*(?:::\w+)+|[a-z]\w*(?:_\w+
   .filter(s => !STOP_WORDS.has(s.toLowerCase()))
   .slice(0, 3);
 
+// Fallback: plain lowercase words (8+ chars) likely to be function/type names.
+// Only when strict patterns found nothing — avoids false positives from English prose.
+// Minimum 8 chars filters most common English words while keeping technical terms
+// (authenticate, serialize, initialize, dispatch, resolver, etc.)
+if (symbolCandidates.length === 0) {
+  const plain = (message.match(/\b[a-z][a-z]{7,}\b/g) || [])
+    .filter(s => !STOP_WORDS.has(s))
+    .filter(s => !/^(possible|together|actually|something|different|important|following|available|necessary|currently|implement|operation|otherwise|beginning|knowledge|attention|according|certainly|sometimes|direction|recommend|structure|describe|question|complete|generate|anything|continue|consider|response|approach|happened|recently|probably|expected|previous|original|specific|directly|received|required|supposed|separate|designed|finished|provided|included|prepared|combined|properly|remember|whatever|although|document|handling|existing|everyone|standard|research|personal|relative|absolute|practice|language|thousand|national|evidence)$/.test(s));
+  symbolCandidates.push(...plain.slice(0, 2));
+}
+
 // Detect intent keywords (EN + ZH, derived from user's actual prompt history)
 const intentImpact = /(?:impact|影响|修改前|改之前|blast radius|before (?:edit|chang|modif)|risk|风险|改动范围|波及|问题在|bug|干扰|冲突|卡)/i.test(message);
+const intentModify = /(?:改(?!变)|修改|重构|\brefactor\b|\bchange\b|\brename\b|移动|\bmove\b|删(?!除文件)|\bremove\b|替换|\breplace\b|\bupdate\b|升级|\bmigrate\b|迁移|拆分|\bsplit\b|合并|\bmerge\b|提取|\bextract\b|改成|改为|换成|转为|异步|同步)/i.test(message);
 const intentUnderstand = /(?:how does|怎么工作|怎么实现|怎么做|什么|理解|看看|看一下|了解|分析|explain|understand|架构|architecture|structure|overview|模块|概览|干什么|做什么|工作原理|逻辑|机制|流程|功能|结合度|效率|评估|调研|是什么|有什么|能用不|高效不|达标|起作用|科学|深入思考|源码)/i.test(message);
 const intentCallgraph = /(?:who calls|what calls|调用|call(?:graph|er|ee)|trace|链路|追踪|谁调|被谁调|调了谁|上下游|依赖关系|触发|路径|覆盖|介入)/i.test(message);
 const intentSearch = /(?:where is|在哪|find|search|搜索|找|locate|哪里用|哪里定义|定义在|实现在|处理没|在源码|加不加)/i.test(message);
 
 // Need entities AND intent, or strong entity signal (qualified names like Foo::bar)
 const hasQualifiedSymbol = symbolCandidates.some(s => s.includes('::'));
-const hasIntent = intentImpact || intentUnderstand || intentCallgraph || intentSearch;
+const hasIntent = intentImpact || intentModify || intentUnderstand || intentCallgraph || intentSearch;
 if (!hasIntent && !hasQualifiedSymbol && filePaths.length === 0) {
   process.exit(0);
 }
 
-// --- Run ONE targeted CLI query ---
+// --- Semantic output prefixes ---
+const PREFIXES = {
+  impact:    '[code-graph:impact] Blast radius — review before editing:',
+  overview:  '[code-graph:structure] Module structure:',
+  callgraph: '[code-graph:callgraph] Call relationships:',
+  search:    '[code-graph:search] Relevant code:',
+};
+
+// --- Run ONE targeted CLI query (per-type cooldown allows different types to fire) ---
+let queryType = null;
 let result = '';
 try {
-  if (intentImpact && symbolCandidates.length > 0) {
-    result = run(`code-graph-mcp impact "${symbolCandidates[0]}"`);
-  } else if (filePaths.length > 0 && intentUnderstand) {
-    // Overview of the mentioned file's directory
+  // Priority: impact/modify > callgraph > understand/overview > search
+  // intentModify + symbol → inject impact so Claude knows blast radius before editing
+  if ((intentImpact || intentModify) && symbolCandidates.length > 0 && !isCoolingDown('impact')) {
+    queryType = 'impact';
+    result = run('code-graph-mcp', ['impact', symbolCandidates[0]]);
+  } else if (intentCallgraph && symbolCandidates.length > 0 && !isCoolingDown('callgraph')) {
+    queryType = 'callgraph';
+    result = run('code-graph-mcp', ['callgraph', symbolCandidates[0], '--depth', '2']);
+  } else if (filePaths.length > 0 && (intentUnderstand || !hasIntent) && !isCoolingDown('overview')) {
+    queryType = 'overview';
     const dir = filePaths[0].replace(/\/[^/]+$/, '/');
-    result = run(`code-graph-mcp overview "${dir}"`);
-  } else if (intentCallgraph && symbolCandidates.length > 0) {
-    result = run(`code-graph-mcp callgraph "${symbolCandidates[0]}" --depth 2`);
-  } else if ((intentSearch || hasQualifiedSymbol) && symbolCandidates.length > 0) {
-    result = run(`code-graph-mcp search "${symbolCandidates[0]}" --limit 8`);
-  } else if (filePaths.length > 0) {
-    const dir = filePaths[0].replace(/\/[^/]+$/, '/');
-    result = run(`code-graph-mcp overview "${dir}"`);
+    result = run('code-graph-mcp', ['overview', dir]);
+  } else if ((intentSearch || hasQualifiedSymbol) && symbolCandidates.length > 0 && !isCoolingDown('search')) {
+    queryType = 'search';
+    result = run('code-graph-mcp', ['search', symbolCandidates[0], '--limit', '8']);
+  } else if (intentUnderstand && symbolCandidates.length > 0 && !isCoolingDown('search')) {
+    queryType = 'search';
+    result = run('code-graph-mcp', ['search', symbolCandidates[0], '--limit', '8']);
   }
 } catch {
   process.exit(0);
 }
 
-if (result && result.trim()) {
-  fs.writeFileSync(flag, ''); // update cooldown
-  process.stdout.write(result.trim() + '\n');
+if (result && result.trim() && queryType) {
+  markCooldown(queryType);
+  process.stdout.write(`${PREFIXES[queryType]}\n${result.trim()}\n`);
 }
 
 // --- Helpers ---
 
-function run(cmd) {
-  const parts = cmd.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
-  const args = parts.slice(1).map(a => a.replace(/^"|"$/g, ''));
-  return execFileSync(parts[0], args, {
+function run(cmd, args) {
+  return execFileSync(cmd, args, {
     cwd,
     timeout: 3000,
     encoding: 'utf8',

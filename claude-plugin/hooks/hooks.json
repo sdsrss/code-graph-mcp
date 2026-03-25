@@ -2,48 +2,15 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "tool == \"Grep\"",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-search-guide.js\"",
-            "timeout": 2
-          }
-        ],
-        "description": "Suggest code-graph alternatives on first Grep call"
-      },
-      {
-        "matcher": "tool == \"Glob\"",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-glob-guide.js\"",
-            "timeout": 2
-          }
-        ],
-        "description": "Suggest code-graph alternatives on first Glob call"
-      },
-      {
-        "matcher": "tool == \"Agent\"",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-explore-guide.js\"",
-            "timeout": 2
-          }
-        ],
-        "description": "Suggest code-graph tools before spawning Explore agents"
-      },
-      {
-        "matcher": "tool == \"Edit\" || tool == \"Write\"",
+        "matcher": "tool == \"Edit\"",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-edit-guide.js\"",
-            "timeout": 2
+            "timeout": 4
           }
         ],
-        "description": "Remind about impact_analysis before first code modification"
+        "description": "Auto-inject impact analysis when editing function definitions with 2+ callers"
       }
     ],
     "PostToolUse": [
@@ -66,10 +33,10 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-context.js\"",
-            "timeout": 4
+            "timeout": 5
           }
         ],
-        "description": "Inject relevant code-graph context based on user's question"
+        "description": "Inject code-graph structural context (impact, overview, callgraph) based on user intent"
       }
     ],
     "SessionStart": [

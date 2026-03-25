@@ -61,16 +61,13 @@ Code graph tools are available via MCP. The MCP server injects `instructions` at
 
 <claude-mem-context>
 ### Last Session
-Request: Debug and fix code-graph-mcp CLI command errors related to symbol lookup and callgraph functionality
-Completed: Identified two distinct error categories in cli.rs: (1) Symbol not found error in cmd_refs function, (2) Usage/callgrap…
-Remaining: Fix cmd_refs symbol resolution in cli.rs; Fix callgraph error handling for empty/invalid queries; Verify both commands …
-Next: Review cmd_refs implementation for symbol lookup logic; Add empty query validation before callgraph execution; Run inte…
+Request: 提交并push代码，发布新版本，包括release版本，查看github上有没有错误。
 
 ### Key Context
+- [bugfix] Error: session-init.test.js: TAP version 13 # Subtest: syncLifecycleConfig is … (#5202)
+- [bugfix] Error: user-prompt-context.js, session-init.js, mcp-launcher.js: TAP version 13… (#5200)
+- [bugfix] Error: cli.rs: struct Database  src/storage/db.rs:30-33 fn McpSe… (#5096)
 - [bugfix] Error: cli.rs: code-graph Symbol not found:  --- code-graph No r… (#5079)
 - [bugfix] Error: cli.rs: Error: Usage: code-graph-mcp search <query> --jso… (#5077)
-- [refactor] Test and refine code-graph-mcp CLI argument validation (#5045)
-- [bugfix] Error: cli.rs: Error: Symbol 'run_ful' not found in index. EXIT:1 (#5044)
-- [bugfix] Error: queries.rs: in_progress		fix(clippy): replace needless range … (#5011)
 
 </claude-mem-context>
