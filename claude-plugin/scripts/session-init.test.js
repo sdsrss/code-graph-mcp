@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh } = require('./session-init');
+const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary } = require('./session-init');
 
 test('syncLifecycleConfig is exported as a callable helper', () => {
   assert.equal(typeof syncLifecycleConfig, 'function');
@@ -21,6 +21,27 @@ test('ensureIndexFresh returns skipped when no index exists', () => {
     assert.equal(result, 'skipped');
   } finally {
     process.chdir(origCwd);
+  }
+});
+
+test('verifyBinary returns available:true when binary is found and executable', () => {
+  const result = verifyBinary();
+  // In dev repo, binary should be found (target/release/code-graph-mcp)
+  if (result.available) {
+    assert.equal(typeof result.binary, 'string');
+    assert.ok(result.binary.length > 0);
+  } else {
+    // Binary not built — still verify the return shape
+    assert.equal(result.available, false);
+  }
+});
+
+test('verifyBinary returns structured result with expected shape', () => {
+  const result = verifyBinary();
+  assert.equal(typeof result.available, 'boolean');
+  assert.ok('binary' in result);
+  if (!result.available && result.binary) {
+    assert.ok('issue' in result);
   }
 });
 

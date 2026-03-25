@@ -49,6 +49,23 @@ if (!binary) {
   process.exit(1);
 }
 
+// Pre-spawn: verify binary is executable (catches macOS quarantine, permission issues)
+try {
+  fs.accessSync(binary, fs.constants.X_OK);
+} catch {
+  process.stderr.write(`[code-graph] Binary not executable: ${binary}\n`);
+  if (process.platform === 'darwin') {
+    process.stderr.write(
+      'macOS may be quarantining the downloaded binary. Fix with:\n' +
+      `  xattr -d com.apple.quarantine "${binary}"\n` +
+      `  chmod +x "${binary}"\n`
+    );
+  } else {
+    process.stderr.write(`Fix: chmod +x "${binary}"\n`);
+  }
+  process.exit(1);
+}
+
 // Spawn binary with stdio inheritance for MCP JSON-RPC
 const child = spawn(binary, ['serve'], {
   stdio: 'inherit',
@@ -57,6 +74,12 @@ const child = spawn(binary, ['serve'], {
 
 child.on('error', (err) => {
   process.stderr.write(`[code-graph] Failed to start: ${err.message}\n`);
+  if (process.platform === 'darwin' && (err.code === 'EACCES' || err.code === 'EPERM')) {
+    process.stderr.write(
+      'macOS may be blocking this binary. Try:\n' +
+      `  xattr -d com.apple.quarantine "${binary}"\n`
+    );
+  }
   process.exit(1);
 });
 

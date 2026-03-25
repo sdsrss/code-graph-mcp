@@ -8,6 +8,29 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// --- Mid-session install detection ---
+// If hooks are running but lifecycle install() hasn't executed yet (no manifest),
+// the plugin was installed mid-session and the MCP server isn't connected.
+// Claude Code only starts MCP servers at session startup; /mcp reconnect cannot
+// start servers that were never initialized.
+const MANIFEST_PATH = path.join(os.homedir(), '.cache', 'code-graph', 'install-manifest.json');
+if (!fs.existsSync(MANIFEST_PATH)) {
+  const noticeFile = path.join(os.tmpdir(), '.code-graph-mcp-restart-notice');
+  try {
+    // Show once per hour to avoid spam
+    if (Date.now() - fs.statSync(noticeFile).mtimeMs < 3600000) process.exit(0);
+  } catch { /* first notice */ }
+  try { fs.writeFileSync(noticeFile, ''); } catch { /* ok */ }
+  process.stdout.write(
+    '[code-graph] Plugin installed — MCP server requires a session restart to connect.\n' +
+    'MCP servers are only initialized at session startup. To activate:\n' +
+    '  1. Press Ctrl+C to exit the current session\n' +
+    '  2. Re-run `claude` to start a new session\n' +
+    'Meanwhile, CLI tools work directly: code-graph-mcp search <query>, code-graph-mcp map, etc.\n'
+  );
+  process.exit(0);
+}
+
 // --- Rate limiting ---
 const flag = path.join(os.tmpdir(), '.code-graph-prompt-ctx');
 const COOLDOWN_MS = 60 * 1000; // 1 minute between injections

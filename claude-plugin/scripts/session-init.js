@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFileSync } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -82,6 +82,63 @@ function ensureIndexFresh() {
   }
 }
 
+/**
+ * Verify binary is available and executable.
+ * On macOS, detect Gatekeeper quarantine (common after npm/GitHub download).
+ * Returns { available, binary, issue? }.
+ */
+function verifyBinary() {
+  const { findBinary } = require('./find-binary');
+  const binary = findBinary();
+  if (!binary) {
+    process.stderr.write(
+      '[code-graph] Binary not found — MCP server cannot start.\n' +
+      'Install: npm install -g @sdsrs/code-graph\n'
+    );
+    return { available: false, binary: null };
+  }
+
+  // Check executable permission
+  try {
+    fs.accessSync(binary, fs.constants.X_OK);
+  } catch {
+    process.stderr.write(
+      `[code-graph] Binary not executable: ${binary}\n` +
+      `Fix: chmod +x "${binary}"\n`
+    );
+    if (process.platform === 'darwin') {
+      process.stderr.write(`Also try: xattr -d com.apple.quarantine "${binary}"\n`);
+    }
+    return { available: false, binary, issue: 'not-executable' };
+  }
+
+  // On macOS, verify the binary can actually run (Gatekeeper may block it)
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync(binary, ['--version'], { timeout: 3000, stdio: 'pipe' });
+    } catch (err) {
+      const msg = (err.message || '') + (err.stderr ? err.stderr.toString() : '');
+      if (msg.includes('quarantine') || msg.includes('not permitted') ||
+          msg.includes('killed') || err.status === 137 || err.signal === 'SIGKILL') {
+        process.stderr.write(
+          `[code-graph] macOS Gatekeeper is blocking the binary: ${binary}\n` +
+          `Fix: xattr -d com.apple.quarantine "${binary}"\n` +
+          `Then restart Claude Code to reconnect the MCP server.\n`
+        );
+        return { available: false, binary, issue: 'quarantine' };
+      }
+      // Other errors (e.g., missing libs) — still report
+      process.stderr.write(
+        `[code-graph] Binary found but failed to run: ${binary}\n` +
+        `Error: ${msg.slice(0, 200)}\n`
+      );
+      return { available: false, binary, issue: 'runtime-error' };
+    }
+  }
+
+  return { available: true, binary };
+}
+
 function runSessionInit() {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
@@ -97,10 +154,14 @@ function runSessionInit() {
   }
 
   const lifecycle = syncLifecycleConfig();
+
+  // Verify binary availability — catch issues early with actionable diagnostics
+  const binaryCheck = verifyBinary();
+
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
-  const indexFreshness = ensureIndexFresh();
-  const mapInjected = injectProjectMap();
-  return { inactive: false, lifecycle, autoUpdateLaunched, indexFreshness, mapInjected };
+  const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
+  const mapInjected = binaryCheck.available ? injectProjectMap() : false;
+  return { inactive: false, lifecycle, autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck };
 }
 
 /**
@@ -137,6 +198,7 @@ module.exports = {
   syncLifecycleConfig,
   ensureIndexFresh,
   injectProjectMap,
+  verifyBinary,
   runSessionInit,
 };
 
