@@ -61,13 +61,17 @@ Code graph tools are available via MCP. The MCP server injects `instructions` at
 
 <claude-mem-context>
 ### Last Session
-Request: 提交并push代码，发布新版本，包括release版本，查看github上有没有错误。
+Request: 配置提交代码时的git pre-commit hook检查和代码审核工具，避免下次github上再出现错误。     Pre-commit hook (scripts/pre-commit.sh):    ┌──────────┬────…
+Completed: Modified package.json, .gitignore; Modified pre-commit.sh
+
+### File Lessons
+- cli.rs: Embedding availability must be validated before semantic search to prevent runtime errors; distingu… (#5321)
 
 ### Key Context
+- [bugfix] Error: queries.rs: Error: Usage: code-graph-mcp search <query> --jso… (#5267)
 - [bugfix] Error: session-init.test.js: TAP version 13 # Subtest: syncLifecycleConfig is … (#5202)
 - [bugfix] Error: user-prompt-context.js, session-init.js, mcp-launcher.js: TAP version 13… (#5200)
 - [bugfix] Error: cli.rs: struct Database  src/storage/db.rs:30-33 fn McpSe… (#5096)
 - [bugfix] Error: cli.rs: code-graph Symbol not found:  --- code-graph No r… (#5079)
-- [bugfix] Error: cli.rs: Error: Usage: code-graph-mcp search <query> --jso… (#5077)
 
 </claude-mem-context>

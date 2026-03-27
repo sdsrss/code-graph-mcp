@@ -680,9 +680,8 @@ impl McpServer {
                         break;
                     }
 
-                    let tx = db.conn().unchecked_transaction()?;
+                    // embed_and_store_batch manages its own transaction internally
                     embed_and_store_batch(&db, &model, &chunk)?;
-                    tx.commit()?;
 
                     total_embedded += chunk.len();
                     tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);

@@ -1199,20 +1199,34 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
 
 fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
     // Look for decorator that matches @app.route(...) or @app.get(...) etc.
-    let mut decorator = None;
+    // Iterate all decorators and match the first route-like one (not the last),
+    // since route decorators may appear before auth/middleware decorators.
+    let mut matched_decorator = None;
     let mut func_def = None;
+
+    let known_receivers = ["app.", "bp.", "blueprint.", "router.", "api."];
+    let route_methods = [".route(", ".get(", ".post(", ".put(", ".delete(", ".patch("];
 
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             match child.kind() {
-                "decorator" => decorator = Some(child),
+                "decorator" => {
+                    if matched_decorator.is_none() {
+                        let dec_text = node_text(&child, source);
+                        let has_receiver = known_receivers.iter().any(|p| dec_text.contains(p));
+                        let has_method = route_methods.iter().any(|m| dec_text.contains(m));
+                        if has_receiver && has_method {
+                            matched_decorator = Some(child);
+                        }
+                    }
+                }
                 "function_definition" => func_def = Some(child),
                 _ => {}
             }
         }
     }
 
-    let dec = decorator?;
+    let dec = matched_decorator?;
     let func = func_def?;
     let func_name_node = func.child_by_field_name("name")?;
     let func_name = node_text(&func_name_node, source);
@@ -1222,20 +1236,7 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
 
     // Check for route-like decorator patterns (e.g., @app.route, @app.get, @bp.post)
     // Only match known framework receiver names to avoid false positives (e.g., @cache.get)
-    let has_known_receiver = ["app.", "bp.", "blueprint.", "router.", "api."]
-        .iter()
-        .any(|prefix| dec_text.contains(prefix));
-    if !has_known_receiver {
-        return None;
-    }
-    if !dec_text.contains(".route(")
-        && !dec_text.contains(".get(")
-        && !dec_text.contains(".post(")
-        && !dec_text.contains(".put(")
-        && !dec_text.contains(".delete(")
-        && !dec_text.contains(".patch(") {
-        return None;
-    }
+    // Route validation already done during decorator selection above
 
     // Extract path from decorator arguments
     let path = extract_string_from_subtree(&dec, source)?;

@@ -1169,24 +1169,24 @@ pub fn get_import_tree(
 
     if direction == "outgoing" || direction == "both" {
         let mut stmt = conn.prepare(
-            "WITH RECURSIVE dep_tree(file_path, depth, visited) AS (
-                -- Seed: the starting file
-                SELECT ?2, 0, ?2
+            "WITH RECURSIVE dep_tree(file_id, file_path, depth, visited_ids) AS (
+                -- Seed: the starting file (use file ID for cycle detection to avoid LIKE metacharacter issues)
+                SELECT f0.id, f0.path, 0, CAST(f0.id AS TEXT)
+                FROM files f0 WHERE f0.path = ?2
 
                 UNION ALL
 
                 -- Recurse: find files that the current-depth files depend on
-                SELECT DISTINCT f2.path, dt.depth + 1,
-                       dt.visited || '|' || f2.path
+                SELECT DISTINCT f2.id, f2.path, dt.depth + 1,
+                       dt.visited_ids || '|' || CAST(f2.id AS TEXT)
                 FROM dep_tree dt
-                JOIN files f1 ON f1.path = dt.file_path
-                JOIN nodes n1 ON n1.file_id = f1.id
+                JOIN nodes n1 ON n1.file_id = dt.file_id
                 JOIN edges e ON e.source_id = n1.id AND e.relation IN (?1, ?3)
                 JOIN nodes n2 ON n2.id = e.target_id
                 JOIN files f2 ON f2.id = n2.file_id
                 WHERE dt.depth < ?4
                   AND f2.path != ?2
-                  AND ('|' || dt.visited || '|') NOT LIKE '%|' || f2.path || '|%'
+                  AND ('|' || dt.visited_ids || '|') NOT LIKE '%|' || CAST(f2.id AS TEXT) || '|%'
             )
             SELECT dt.file_path, MIN(dt.depth) as min_depth,
                 -- Count actual cross-file edges from root to this file
@@ -1219,22 +1219,22 @@ pub fn get_import_tree(
 
     if direction == "incoming" || direction == "both" {
         let mut stmt = conn.prepare(
-            "WITH RECURSIVE dep_tree(file_path, depth, visited) AS (
-                SELECT ?2, 0, ?2
+            "WITH RECURSIVE dep_tree(file_id, file_path, depth, visited_ids) AS (
+                SELECT f0.id, f0.path, 0, CAST(f0.id AS TEXT)
+                FROM files f0 WHERE f0.path = ?2
 
                 UNION ALL
 
-                SELECT DISTINCT f1.path, dt.depth + 1,
-                       dt.visited || '|' || f1.path
+                SELECT DISTINCT f1.id, f1.path, dt.depth + 1,
+                       dt.visited_ids || '|' || CAST(f1.id AS TEXT)
                 FROM dep_tree dt
-                JOIN files f2 ON f2.path = dt.file_path
-                JOIN nodes n2 ON n2.file_id = f2.id
+                JOIN nodes n2 ON n2.file_id = dt.file_id
                 JOIN edges e ON e.target_id = n2.id AND e.relation IN (?1, ?3)
                 JOIN nodes n1 ON n1.id = e.source_id
                 JOIN files f1 ON f1.id = n1.file_id
                 WHERE dt.depth < ?4
                   AND f1.path != ?2
-                  AND ('|' || dt.visited || '|') NOT LIKE '%|' || f1.path || '|%'
+                  AND ('|' || dt.visited_ids || '|') NOT LIKE '%|' || CAST(f1.id AS TEXT) || '|%'
             )
             SELECT dt.file_path, MIN(dt.depth) as min_depth,
                 -- Count actual cross-file edges from this file to root
@@ -1693,8 +1693,8 @@ pub struct DeadCodeResult {
     pub id: i64,
     pub name: String,
     pub node_type: String,
-    pub start_line: u32,
-    pub end_line: u32,
+    pub start_line: i64,
+    pub end_line: i64,
     pub file_path: String,
     pub code_content: String,
     /// True if the node has an incoming `exports` edge (exported but never called).

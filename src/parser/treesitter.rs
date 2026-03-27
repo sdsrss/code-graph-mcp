@@ -171,8 +171,9 @@ fn extract_nodes(
         }
 
         // Arrow functions (TS/JS): covers const/let (lexical) and var (variable)
+        // A single declaration may contain multiple arrow functions.
         "lexical_declaration" | "variable_declaration" => {
-            if let Some(mut parsed) = extract_named_arrow(&node, source) {
+            for mut parsed in extract_named_arrows(&node, source) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
             }
@@ -485,25 +486,33 @@ fn extract_function_node(
     })
 }
 
-fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedNode> {
+fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNode> {
     // lexical_declaration -> variable_declarator -> arrow_function
+    // A single declaration may contain multiple arrow functions: const a = () => {}, b = () => {};
+    let mut out = Vec::new();
     for i in 0..node.named_child_count() {
         let child = match node.named_child(i) {
             Some(c) => c,
             None => continue,
         };
         if child.kind() == "variable_declarator" {
-            let name = get_child_by_field(&child, "name", source)?;
-            let value = child.child_by_field_name("value")?;
+            let name = match get_child_by_field(&child, "name", source) {
+                Some(n) => n,
+                None => continue,
+            };
+            let value = match child.child_by_field_name("value") {
+                Some(v) => v,
+                None => continue,
+            };
             if value.kind() == "arrow_function" {
                 let sig_info = extract_signature_info(&value, source);
-                return Some(ParsedNode {
+                out.push(ParsedNode {
                     node_type: "function".into(),
                     name: name.clone(),
                     qualified_name: Some(name),
-                    start_line: node.start_position().row as u32 + 1,
-                    end_line: node.end_position().row as u32 + 1,
-                    code_content: truncate_code_content(node_text(node, source)).into_owned(),
+                    start_line: child.start_position().row as u32 + 1,
+                    end_line: child.end_position().row as u32 + 1,
+                    code_content: truncate_code_content(node_text(&child, source)).into_owned(),
                     signature: sig_info.signature,
                     doc_comment: get_preceding_comment(node, source),
                     return_type: sig_info.return_type,
@@ -513,7 +522,7 @@ fn extract_named_arrow(node: &tree_sitter::Node, source: &str) -> Option<ParsedN
             }
         }
     }
-    None
+    out
 }
 
 struct SignatureInfo {

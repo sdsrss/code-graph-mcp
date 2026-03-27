@@ -344,7 +344,14 @@ pub fn cmd_grep(project_root: &Path, args: &[String]) -> Result<()> {
         .arg(pattern);
 
     if let Some(path) = search_path {
-        rg_cmd.arg(path);
+        // Validate search_path is within project root to prevent path traversal
+        let resolved = project_root.join(path);
+        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        let root_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+        if !canonical.starts_with(&root_canonical) {
+            anyhow::bail!("search path must be within project root");
+        }
+        rg_cmd.arg(canonical);
     } else {
         rg_cmd.arg(project_root);
     }

@@ -58,6 +58,7 @@ fn format_route_from_metadata(metadata: Option<&str>, name: &str) -> String {
 
 /// Embed context strings using batched inference and batch-insert vectors.
 /// Public so the background embedding thread in server.rs can call it.
+/// Wraps vector inserts in a transaction for atomicity and performance.
 pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
     if context_updates.is_empty() {
         return Ok(());
@@ -86,7 +87,9 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
                 .filter_map(|(&id, emb)| emb.map(|e| (id, e)))
                 .collect();
             if !vectors.is_empty() {
+                let tx = db.conn().unchecked_transaction()?;
                 insert_node_vectors_batch(db.conn(), &vectors)?;
+                tx.commit()?;
             }
             tracing::info!("[embed] {} nodes (sequential fallback) in {:.1}s",
                 context_updates.len(), t0.elapsed().as_secs_f64());
@@ -98,7 +101,9 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     let t_embed = t0.elapsed();
 
     if !vectors.is_empty() {
+        let tx = db.conn().unchecked_transaction()?;
         insert_node_vectors_batch(db.conn(), &vectors)?;
+        tx.commit()?;
     }
 
     tracing::info!("[embed] {} nodes in {:.1}s (embed {:.1}s, store {:.1}s)",
@@ -308,15 +313,14 @@ fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Op
 
     // Batch update context strings
     update_context_strings_batch(db.conn(), &context_updates)?;
+    tx.commit()?;
 
-    // Batch embed and store vectors
+    // Embed outside the committed tx — recoverable on failure
     if let Some(m) = model {
         if db.vec_enabled() {
             embed_and_store_batch(db, m, &context_updates)?;
         }
     }
-
-    tx.commit()?;
     Ok(())
 }
 
@@ -950,19 +954,19 @@ fn index_files(
 
         // Phase 3b: Batch update context strings in DB
         update_context_strings_batch(db.conn(), &context_updates)?;
-
-        // Phase 3c: Batch embed and store vectors
-        if let Some(m) = model {
-            if db.vec_enabled() {
-                embed_and_store_batch(db, m, &context_updates)?;
-            }
-        }
+        tx.commit()?;
 
         tracing::info!(
             "[index] Phase 3: context strings built for {} nodes",
             all_node_ids.len()
         );
-        tx.commit()?;
+
+        // Phase 3c: Embed outside the committed tx — recoverable on failure via repair_null_context_strings
+        if let Some(m) = model {
+            if db.vec_enabled() {
+                embed_and_store_batch(db, m, &context_updates)?;
+            }
+        }
     }
 
     // Optimize query planner statistics after bulk writes

@@ -150,7 +150,8 @@ function cleanupDisabledStatusline() {
     return { cleaned: false, settingsChanged: false };
   }
 
-  const settingsChanged = detachStatuslineIntegration(settings);
+  let settingsChanged = detachStatuslineIntegration(settings);
+  if (removeHooksFromSettings(settings)) settingsChanged = true;
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
@@ -216,6 +217,91 @@ function migrateOldPluginIds(settings) {
   return changed;
 }
 
+// --- Hook Registration ---
+// Plugin system's hooks.json auto-loading is unreliable (observed across GSD,
+// superpowers, code-graph-mcp). Write hooks directly to settings.json instead.
+// Same strategy as claude-mem-lite. hooks.json is kept empty to prevent double-firing.
+
+const OUR_HOOK_SCRIPTS = ['session-init.js', 'incremental-index.js', 'user-prompt-context.js', 'pre-edit-guide.js'];
+
+function isOurHookEntry(entry) {
+  if (!entry || !entry.hooks) return false;
+  return entry.hooks.some(h =>
+    h.command && OUR_HOOK_SCRIPTS.some(s => h.command.includes(s)) &&
+    h.command.includes('code-graph')
+  );
+}
+
+function hookCommand(scriptName) {
+  return `node ${JSON.stringify(path.join(PLUGIN_ROOT, 'scripts', scriptName))}`;
+}
+
+function getHookDefinitions() {
+  return {
+    SessionStart: [{
+      matcher: 'startup|clear|compact',
+      hooks: [{ type: 'command', command: hookCommand('session-init.js'), timeout: 5 }],
+      description: 'StatusLine self-heal, lifecycle sync, project map injection',
+    }],
+    PreToolUse: [{
+      matcher: 'tool == "Edit"',
+      hooks: [{ type: 'command', command: hookCommand('pre-edit-guide.js'), timeout: 4 }],
+      description: 'Auto-inject impact analysis when editing functions with 2+ callers',
+    }],
+    PostToolUse: [{
+      matcher: 'tool == "Write" || tool == "Edit"',
+      hooks: [{ type: 'command', command: hookCommand('incremental-index.js'), timeout: 10 }],
+      description: 'Auto-update code graph index after file edits',
+    }],
+    UserPromptSubmit: [{
+      matcher: '',
+      hooks: [{ type: 'command', command: hookCommand('user-prompt-context.js'), timeout: 5 }],
+      description: 'Inject code-graph structural context based on user intent',
+    }],
+  };
+}
+
+function registerHooksToSettings(settings) {
+  if (!settings.hooks) settings.hooks = {};
+  const defs = getHookDefinitions();
+  let changed = false;
+
+  for (const [event, newEntries] of Object.entries(defs)) {
+    if (!settings.hooks[event]) settings.hooks[event] = [];
+
+    for (const newEntry of newEntries) {
+      const existingIdx = settings.hooks[event].findIndex(e => isOurHookEntry(e));
+      if (existingIdx >= 0) {
+        if (JSON.stringify(settings.hooks[event][existingIdx]) !== JSON.stringify(newEntry)) {
+          settings.hooks[event][existingIdx] = newEntry;
+          changed = true;
+        }
+      } else {
+        settings.hooks[event].push(newEntry);
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
+}
+
+function removeHooksFromSettings(settings) {
+  if (!settings.hooks) return false;
+  let changed = false;
+
+  for (const event of Object.keys(settings.hooks)) {
+    if (!Array.isArray(settings.hooks[event])) continue;
+    const before = settings.hooks[event].length;
+    settings.hooks[event] = settings.hooks[event].filter(e => !isOurHookEntry(e));
+    if (settings.hooks[event].length !== before) changed = true;
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+
+  return changed;
+}
+
 // --- Install (idempotent) ---
 
 function install() {
@@ -247,16 +333,21 @@ function install() {
   // Register code-graph provider
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
+  // 2. Hooks — register to settings.json (hooks.json auto-loading unreliable)
+  if (registerHooksToSettings(settings)) {
+    settingsChanged = true;
+  }
+
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
   // Do NOT add enabledPlugins entries here — it causes phantom plugin entries
   // when the ID doesn't match the marketplace name.
 
-  // 2. Write settings atomically if changed
+  // 3. Write settings atomically if changed
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
-  // 3. Write manifest with version
+  // 4. Write manifest with version
   manifest.version = version;
   manifest.installedAt = manifest.installedAt || new Date().toISOString();
   manifest.updatedAt = new Date().toISOString();
@@ -277,7 +368,12 @@ function uninstall() {
       settingsChanged = true;
     }
 
-    // 2. Remove all known IDs from enabledPlugins
+    // 2. Hooks: remove from settings.json
+    if (removeHooksFromSettings(settings)) {
+      settingsChanged = true;
+    }
+
+    // 3. Remove all known IDs from enabledPlugins
     if (settings.enabledPlugins) {
       for (const id of [PLUGIN_ID, ...OLD_PLUGIN_IDS]) {
         if (id in settings.enabledPlugins) {
@@ -287,13 +383,13 @@ function uninstall() {
       }
     }
 
-    // 3. Write settings if changed
+    // 4. Write settings if changed
     if (settingsChanged) {
       writeJsonAtomic(SETTINGS_PATH, settings);
     }
   }
 
-  // 4. Remove all known IDs from installed_plugins.json
+  // 5. Remove all known IDs from installed_plugins.json
   const installedPlugins = readJson(INSTALLED_PLUGINS_PATH);
   if (installedPlugins && installedPlugins.plugins) {
     let ipChanged = false;
@@ -306,10 +402,10 @@ function uninstall() {
     if (ipChanged) writeJsonAtomic(INSTALLED_PLUGINS_PATH, installedPlugins);
   }
 
-  // 5. Remove cache directory
+  // 6. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
-  // 6. Remove plugin files from cache (all known paths, including parent dirs)
+  // 7. Remove plugin files from cache (all known paths, including parent dirs)
   const pluginCacheDirs = [
     path.join(os.homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_NAME),
     path.join(os.homedir(), '.claude', 'plugins', 'cache', 'sdsrss-code-graph'),
@@ -348,23 +444,28 @@ function update() {
   // 2. Update code-graph provider in registry
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
+  // 3. Hooks — update command paths
+  if (registerHooksToSettings(settings)) {
+    settingsChanged = true;
+  }
+
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
 
-  // 3. Write settings if changed
+  // 4. Write settings if changed
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
-  // 4. Clear update-check cache (force re-check after update)
+  // 5. Clear update-check cache (force re-check after update)
   const updateCache = path.join(CACHE_DIR, 'update-check');
   try { fs.unlinkSync(updateCache); } catch { /* ok */ }
 
-  // 5. Update manifest
+  // 6. Update manifest
   manifest.version = version;
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  // 6. Clean up old cached versions (keep latest 3)
+  // 7. Clean up old cached versions (keep latest 3)
   cleanupOldCacheVersions(3);
 
   return { oldVersion, version, settingsChanged };
@@ -411,6 +512,7 @@ module.exports = {
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
+  registerHooksToSettings, removeHooksFromSettings, getHookDefinitions,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 

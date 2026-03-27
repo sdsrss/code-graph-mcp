@@ -82,10 +82,24 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
 "#)
 }
 
-/// Check if a column exists on a table (for idempotent migrations).
+/// Check if a column exists on a table using PRAGMA table_info (safe from SQL injection).
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
-    conn.prepare(&format!("SELECT {} FROM {} LIMIT 0", column, table))
-        .is_ok()
+    // Validate table name against allowlist to prevent injection via PRAGMA
+    const ALLOWED_TABLES: &[&str] = &["files", "nodes", "edges"];
+    if !ALLOWED_TABLES.contains(&table) {
+        tracing::warn!("column_exists: table '{}' not in allowlist, add it to ALLOWED_TABLES", table);
+        return false;
+    }
+    let sql = format!("PRAGMA table_info({})", table);
+    match conn.prepare(&sql) {
+        Ok(mut stmt) => {
+            let found = stmt.query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
+                .unwrap_or(false);
+            found
+        }
+        Err(_) => false,
+    }
 }
 
 /// Add a column only if it doesn't already exist (idempotent ALTER TABLE).

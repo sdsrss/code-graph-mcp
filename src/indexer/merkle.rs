@@ -138,8 +138,10 @@ pub fn scan_directory_cached(
             }
         }
     }
-    // Root always considered changed
-    changed_dirs.insert(String::new());
+    // Root considered changed only when there is no prior cache (first scan)
+    if cache.is_none() {
+        changed_dirs.insert(String::new());
+    }
 
     // Pass 2: collect files that need hashing, then hash in parallel.
     // Directory mtime only changes on file add/remove (not content edits on ext4/btrfs),
@@ -308,6 +310,27 @@ mod tests {
         // Both files should be hashed since src/ dir changed
         assert_eq!(hashes2.len(), 2);
         assert!(hashes2.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_scan_directory_cached_detects_root_file_content_change() {
+        // Verifies that editing a file directly in the project root is detected
+        // on a cached scan, even though root is no longer unconditionally marked changed.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        // File directly in root (parent_dir = "")
+        fs::write(tmp.path().join("main.rs"), "fn main(){}").unwrap();
+
+        let (_hashes1, cache1) = scan_directory_cached(tmp.path(), None).unwrap();
+
+        // Modify content of root-level file (dir mtime does NOT change)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(tmp.path().join("main.rs"), "fn main(){ println!(\"changed\"); }").unwrap();
+
+        let (hashes2, _cache2) = scan_directory_cached(tmp.path(), Some(&cache1)).unwrap();
+        // The file mtime check (Pass 2) should detect the content change
+        assert_eq!(hashes2.len(), 1);
+        assert!(hashes2.contains_key("main.rs"));
     }
 
     #[test]
