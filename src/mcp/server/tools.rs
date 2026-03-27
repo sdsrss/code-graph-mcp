@@ -297,8 +297,11 @@ impl McpServer {
         } // end estimated_tokens check
 
         if results.is_empty() {
+            let has_code_syntax = query.contains('(') || query.contains(')') || query.contains("->") || query.contains("::") || query.contains('<');
             let has_non_ascii = !query.is_ascii();
-            let hint = if has_non_ascii {
+            let hint = if has_code_syntax {
+                "Query looks like code syntax. For structural queries, use ast_search with type/returns/params filters instead of text search."
+            } else if has_non_ascii {
                 "Try using English keywords — the search index is English-optimized. Also try broader terms or check spelling."
             } else {
                 "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
@@ -1537,12 +1540,16 @@ impl McpServer {
             }).collect();
 
             let hot_json: Vec<serde_json::Value> = hot_functions.iter().map(|h| {
-                json!({
+                let mut obj = json!({
                     "name": h.name,
                     "type": h.node_type,
                     "file": h.file,
                     "caller_count": h.caller_count,
-                })
+                });
+                if h.test_caller_count > 0 {
+                    obj["test_caller_count"] = json!(h.test_caller_count);
+                }
+                obj
             }).collect();
 
             let r = json!({
@@ -1585,13 +1592,19 @@ impl McpServer {
                 })).collect())
                 .unwrap_or_default();
 
-            // Trim hot_functions: top 10, name+file only
+            // Trim hot_functions: top 10, name+file+counts only
             let compact_hot: Vec<serde_json::Value> = result["hot_functions"].as_array()
-                .map(|arr| arr.iter().take(10).map(|h| json!({
-                    "name": h["name"],
-                    "file": h["file"],
-                    "caller_count": h["caller_count"],
-                })).collect())
+                .map(|arr| arr.iter().take(10).map(|h| {
+                    let mut obj = json!({
+                        "name": h["name"],
+                        "file": h["file"],
+                        "caller_count": h["caller_count"],
+                    });
+                    if h.get("test_caller_count").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+                        obj["test_caller_count"] = h["test_caller_count"].clone();
+                    }
+                    obj
+                }).collect())
                 .unwrap_or_default();
 
             // Trim entry_points: file+handler only
