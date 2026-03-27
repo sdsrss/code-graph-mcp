@@ -1339,6 +1339,7 @@ pub struct HotFunction {
     pub node_type: String,
     pub file: String,
     pub caller_count: usize,
+    pub test_caller_count: usize,
 }
 
 /// Get the directory part of a file path (everything before the last '/').
@@ -1533,28 +1534,42 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
         }
     }
 
-    // 5. Hot functions (C1: filter test code, C3: use REL_CALLS constant)
+    // 5. Hot functions (C1: filter test code, split prod/test caller counts, C3: use REL_CALLS constant)
     let mut hot_functions = Vec::new();
     {
-        let sql = "SELECT n.name, n.type, f.path, COUNT(e.id) as cnt \
+        let sql = "SELECT n.name, n.type, f.path, \
+               COUNT(CASE WHEN src.is_test = 0 \
+                          AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
+                          AND sf.path NOT LIKE 'tests/%' \
+                          AND sf.path NOT LIKE '%_test.%' \
+                     THEN e.id END) as prod_cnt, \
+               COUNT(CASE WHEN src.is_test = 1 \
+                          OR src.name LIKE 'test\\_%' ESCAPE '\\' \
+                          OR sf.path LIKE 'tests/%' \
+                          OR sf.path LIKE '%_test.%' \
+                     THEN e.id END) as test_cnt \
              FROM nodes n \
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
+             JOIN nodes src ON src.id = e.source_id \
+             JOIN files sf ON sf.id = src.file_id \
              WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
                AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.name, n.type, f.path \
-             ORDER BY cnt DESC \
+             HAVING prod_cnt > 0 \
+             ORDER BY prod_cnt DESC \
              LIMIT 15";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)? as usize))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as usize, row.get::<_, i64>(4)? as usize))
         })?;
         for row in rows {
-            let (name, node_type, file, count) = row?;
-            hot_functions.push(HotFunction { name, node_type, file, caller_count: count });
+            let (name, node_type, file, count, test_count) = row?;
+            hot_functions.push(HotFunction { name, node_type, file, caller_count: count, test_caller_count: test_count });
         }
     }
 

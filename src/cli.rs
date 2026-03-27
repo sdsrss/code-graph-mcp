@@ -544,6 +544,18 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
     if fts_result.nodes.is_empty() {
         eprintln!("[code-graph] No results for: {}", query);
+        // Hint: if query looks like code syntax, suggest ast-search
+        if query.contains('(') || query.contains(')') || query.contains("->") || query.contains("::") || query.contains('<') {
+            // Replace non-word chars with spaces, collapse multiple spaces, extract clean keywords
+            let clean: String = query.chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+                .collect();
+            let keywords: Vec<&str> = clean.split_whitespace().collect();
+            if !keywords.is_empty() {
+                eprintln!("  Tip: For structural queries, try: code-graph-mcp ast-search --type fn --returns \"{}\"",
+                    keywords.join(" "));
+            }
+        }
         return Ok(());
     }
 
@@ -1056,12 +1068,18 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
                 "handler": e.handler,
                 "file": e.file,
             })).collect::<Vec<_>>(),
-            "hot_functions": hot_functions.iter().map(|h| serde_json::json!({
-                "name": h.name,
-                "type": h.node_type,
-                "file": h.file,
-                "callers": h.caller_count,
-            })).collect::<Vec<_>>(),
+            "hot_functions": hot_functions.iter().map(|h| {
+                let mut obj = serde_json::json!({
+                    "name": h.name,
+                    "type": h.node_type,
+                    "file": h.file,
+                    "callers": h.caller_count,
+                });
+                if h.test_caller_count > 0 {
+                    obj["test_callers"] = serde_json::json!(h.test_caller_count);
+                }
+                obj
+            }).collect::<Vec<_>>(),
         });
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
@@ -1114,11 +1132,19 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
         writeln!(stdout, "Hot Functions:")?;
         let max_hot = if compact { 5 } else { hot_functions.len() };
         for h in hot_functions.iter().take(max_hot) {
-            writeln!(
-                stdout,
-                "  {} ({}) — {} callers ({})",
-                h.name, h.node_type, h.caller_count, h.file
-            )?;
+            if h.test_caller_count > 0 {
+                writeln!(
+                    stdout,
+                    "  {} ({}) — {} callers + {} test ({})",
+                    h.name, h.node_type, h.caller_count, h.test_caller_count, h.file
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "  {} ({}) — {} callers ({})",
+                    h.name, h.node_type, h.caller_count, h.file
+                )?;
+            }
         }
     }
 
@@ -1632,7 +1658,9 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     let conn = db.conn();
 
     if !db.vec_enabled() {
-        eprintln!("[code-graph] Embedding not available. Build with --features embed-model.");
+        eprintln!("[code-graph] Vector search not available (sqlite-vec extension not loaded).");
+        eprintln!("  To enable: build with `cargo build --release --features embed-model`.");
+        eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
         return Ok(());
     }
 
@@ -1658,7 +1686,10 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     // Check embedding exists
     let (embedded_count, total_nodes) = queries::count_nodes_with_vectors(conn)?;
     if embedded_count == 0 {
-        eprintln!("[code-graph] No embeddings found ({}/{} nodes embedded). Run MCP server with embed-model feature.", embedded_count, total_nodes);
+        eprintln!("[code-graph] No embeddings found ({}/{} nodes embedded).", embedded_count, total_nodes);
+        eprintln!("  To enable: build with `cargo build --release --features embed-model`,");
+        eprintln!("  then restart the MCP server to generate embeddings.");
+        eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
         std::process::exit(1);
     }
 
