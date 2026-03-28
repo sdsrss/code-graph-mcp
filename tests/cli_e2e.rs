@@ -550,6 +550,7 @@ fn test_cli_json_empty_search() {
 
 #[test]
 fn test_cli_json_empty_grep() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "--json"]);
     assert_eq!(code, 0);
