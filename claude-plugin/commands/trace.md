@@ -1,5 +1,5 @@
 ---
-description: Trace call flow from a handler or route
+description: Trace call flow from a handler or route. Use when debugging API behavior, understanding request processing flow, or asked how an endpoint works.
 argument-hint: <handler_or_route>
 ---
 

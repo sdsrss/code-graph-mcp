@@ -95,11 +95,19 @@ if (/^(修复|优化|实施|执行|开始|按|实测|帮我|进入|用|重新)/.
 const filePaths = (message.match(/(?:src|lib|test|pkg|cmd|internal|app|components?)\/[\w/.-]+/g) || [])
   .slice(0, 2);
 
-// Extract potential symbol names (camelCase, snake_case, PascalCase, qualified like Foo::bar)
-const symbolCandidates = (message.match(/\b(?:[A-Z]\w*(?:::\w+)+|[a-z]\w*(?:_\w+){1,}|[a-z]\w*(?:[A-Z]\w*)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g) || [])
+// Extract potential symbol names (camelCase, snake_case, PascalCase, qualified like Foo::bar, Foo.bar, Foo::bar::baz)
+const symbolCandidates = (message.match(/\b(?:[A-Z]\w*(?:(?:::|\.)\w+)+|[a-z]\w*(?:_\w+){1,}|[a-z]\w*(?:[A-Z]\w*)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g) || [])
   .filter(s => s.length > 4)
   .filter(s => !STOP_WORDS.has(s.toLowerCase()))
   .slice(0, 3);
+
+// Fallback: extract backtick-quoted symbols (common in mixed Chinese+code: "修改 `parse_code` 函数")
+if (symbolCandidates.length === 0) {
+  const backtickSymbols = (message.match(/`([a-zA-Z_]\w{2,})`/g) || [])
+    .map(s => s.replace(/`/g, ''))
+    .filter(s => s.length >= 3 && !STOP_WORDS.has(s.toLowerCase()));
+  symbolCandidates.push(...backtickSymbols.slice(0, 3));
+}
 
 // Fallback: plain lowercase words (8+ chars) likely to be function/type names.
 // Only when strict patterns found nothing — avoids false positives from English prose.

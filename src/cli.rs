@@ -368,6 +368,9 @@ pub fn cmd_grep(project_root: &Path, args: &[String]) -> Result<()> {
     // Parse rg JSON output into matches
     let matches = parse_rg_json(&rg_output.stdout, project_root);
     if matches.is_empty() {
+        if json_mode {
+            println!("[]");
+        }
         // Surface ripgrep errors (e.g., path not found) instead of silent exit
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
@@ -550,6 +553,9 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     let fetch_limit = if has_filter { limit * 4 } else { limit };
     let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
     if fts_result.nodes.is_empty() {
+        if json_mode {
+            println!("[]");
+        }
         eprintln!("[code-graph] No results for: {}", query);
         // Hint: if query looks like code syntax, suggest ast-search
         if query.contains('(') || query.contains(')') || query.contains("->") || query.contains("::") || query.contains('<') {
@@ -606,6 +612,9 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
         .collect();
 
     if filtered_nodes.is_empty() {
+        if json_mode {
+            println!("[]");
+        }
         eprintln!("[code-graph] No results for: {} (language: {})", query, language_filter.unwrap_or("any"));
         return Ok(());
     }
@@ -686,6 +695,7 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
         // FTS5 search then filter in Rust
         let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
         if fts_result.nodes.is_empty() {
+            if json_mode { println!("[]"); }
             eprintln!("[code-graph] No results for: {}", query);
             return Ok(());
         }
@@ -822,6 +832,9 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
 
     let nodes = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
     if nodes.is_empty() {
+        if json_mode {
+            println!("{{\"results\":[]}}");
+        }
         eprintln!("[code-graph] No call graph results for: {}", symbol);
         // Try fuzzy match
         let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
@@ -948,6 +961,9 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     // Verify symbol exists before running impact analysis
     let symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
     if symbol_nodes.is_empty() {
+        if json_mode {
+            println!("{}", serde_json::json!({"error": "Symbol not found", "symbol": symbol}));
+        }
         eprintln!("[code-graph] Symbol not found: {}", symbol);
         let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
         if !candidates.is_empty() {
@@ -964,11 +980,15 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     // Exclude root node (depth 0) — it's the queried symbol itself
     let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
 
-    // Separate production callers from test callers
+    // Separate production callers from test callers, deduplicate by (name, file, depth)
+    let mut seen = std::collections::HashSet::new();
     let prod_callers: Vec<_> = callers.iter()
         .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
+        .filter(|c| seen.insert((&c.name, &c.file_path, c.depth)))
         .collect();
-    let test_count = callers.len() - prod_callers.len();
+    let test_count = callers.iter()
+        .filter(|c| crate::domain::is_test_symbol(&c.name, &c.file_path))
+        .count();
 
     // Count unique files and routes from production callers only
     let files: std::collections::HashSet<&str> = prod_callers.iter().map(|c| c.file_path.as_str()).collect();
@@ -1178,8 +1198,8 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
         .collect();
 
     if exports.is_empty() {
-        eprintln!("[code-graph] No symbols found under: {}", path_prefix);
-        return Ok(());
+        if json_mode { println!("[]"); }
+        anyhow::bail!("[code-graph] No symbols found under: {}", path_prefix);
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -1241,8 +1261,8 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
 pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
-    let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references");
-    let include_impact = has_flag(args, "--include-impact");
+    let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references") || has_flag(args, "--refs");
+    let include_impact = has_flag(args, "--include-impact") || has_flag(args, "--impact");
     let file_filter = get_path_flag(args, "--file");
     let context_lines_explicit: Option<usize> = if get_flag_value(args, "--context-lines").is_some() {
         Some(parse_flag_or(args, "--context-lines", 0_usize))
@@ -1274,7 +1294,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         let symbol = get_positional(args, 0)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
-                "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--include-refs] [--include-impact] [--context-lines N] [--compact] [--json]"
+                "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--refs] [--impact] [--context-lines N] [--compact] [--json]"
             ))?;
 
         let nodes = if let Some(fp) = file_filter {
@@ -1297,6 +1317,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         };
 
         if nodes.is_empty() {
+            if json_mode { println!("[]"); }
             eprintln!("[code-graph] Symbol not found: {}", symbol);
             let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
             if !candidates.is_empty() {
@@ -1343,10 +1364,22 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
             }
             if include_refs {
                 use crate::domain::REL_CALLS;
+                let include_tests = has_flag(args, "--include-tests");
                 let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
                 let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
                 obj["calls"] = serde_json::json!(callees.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
-                obj["called_by"] = serde_json::json!(callers.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
+                let filtered_callers: Vec<_> = if include_tests {
+                    callers.iter().collect()
+                } else {
+                    callers.iter().filter(|(n, f)| !crate::domain::is_test_symbol(n, f)).collect()
+                };
+                obj["called_by"] = serde_json::json!(filtered_callers.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
+                if !include_tests {
+                    let test_count = callers.len() - filtered_callers.len();
+                    if test_count > 0 {
+                        obj["test_callers_hidden"] = serde_json::json!(test_count);
+                    }
+                }
             }
             if include_impact {
                 let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3).unwrap_or_default();
@@ -1390,6 +1423,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         }
         if include_refs {
             use crate::domain::REL_CALLS;
+            let include_tests = has_flag(args, "--include-tests");
             let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
             let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
             if !callees.is_empty() {
@@ -1399,9 +1433,17 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
                 }
             }
             if !callers.is_empty() {
+                let mut test_count = 0usize;
                 writeln!(stdout, "  Called by:")?;
                 for (name, file) in &callers {
-                    writeln!(stdout, "    ← {} ({})", name, file)?;
+                    if !include_tests && crate::domain::is_test_symbol(name, file) {
+                        test_count += 1;
+                    } else {
+                        writeln!(stdout, "    ← {} ({})", name, file)?;
+                    }
+                }
+                if test_count > 0 {
+                    writeln!(stdout, "    ({} test callers hidden, use --include-tests to show)", test_count)?;
                 }
             }
         }
@@ -1481,8 +1523,10 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
     }
 
     if rows.is_empty() {
-        eprintln!("[code-graph] No routes matching: {}", route_path);
-        return Ok(());
+        if json_mode {
+            println!("{}", serde_json::json!({"handlers": [], "message": format!("No routes matching: {}", route_path)}));
+        }
+        anyhow::bail!("[code-graph] No routes matching: {}", route_path);
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -1571,8 +1615,7 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
 
     let deps = queries::get_import_tree(conn, file_path, direction, depth)?;
     if deps.is_empty() {
-        eprintln!("[code-graph] No dependencies found for: {}", file_path);
-        return Ok(());
+        anyhow::bail!("[code-graph] No dependencies found for: {}", file_path);
     }
 
     // Filter out cross-language false edges (name-based resolution artifacts)
@@ -1684,6 +1727,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         match queries::get_first_node_id_by_name(conn, symbol)? {
             Some(id) => id,
             None => {
+                if json_mode { println!("[]"); }
                 eprintln!("[code-graph] Symbol not found: {}", symbol);
                 std::process::exit(1);
             }
@@ -1779,6 +1823,7 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     } else {
         let ids = queries::get_node_ids_by_name(conn, symbol)?;
         if ids.is_empty() {
+            if json_mode { println!("[]"); }
             eprintln!("[code-graph] Symbol not found: {}", symbol);
             let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
             if !candidates.is_empty() {

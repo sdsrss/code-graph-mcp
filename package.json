@@ -1,6 +1,6 @@
 {
   "name": "@sdsrs/code-graph",
-  "version": "0.7.13",
+  "version": "0.7.14",
   "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
   "license": "MIT",
   "repository": {
@@ -34,10 +34,10 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@sdsrs/code-graph-linux-x64": "0.7.13",
-    "@sdsrs/code-graph-linux-arm64": "0.7.13",
-    "@sdsrs/code-graph-darwin-x64": "0.7.13",
-    "@sdsrs/code-graph-darwin-arm64": "0.7.13",
-    "@sdsrs/code-graph-win32-x64": "0.7.13"
+    "@sdsrs/code-graph-linux-x64": "0.7.14",
+    "@sdsrs/code-graph-linux-arm64": "0.7.14",
+    "@sdsrs/code-graph-darwin-x64": "0.7.14",
+    "@sdsrs/code-graph-darwin-arm64": "0.7.14",
+    "@sdsrs/code-graph-win32-x64": "0.7.14"
   }
 }

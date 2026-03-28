@@ -143,9 +143,9 @@ fn print_help() {
     println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)");
     println!("    --node-id N         Lookup by node ID (show, similar)");
     println!("    --change-type <t>   signature, behavior, or remove (impact; default: behavior)");
-    println!("    --include-tests     Show test callers (callgraph; hidden by default)");
-    println!("    --include-refs      Show callers/callees (show)");
-    println!("    --include-impact    Show impact summary (show)");
+    println!("    --include-tests     Show test callers (callgraph, show; hidden by default)");
+    println!("    --refs              Show callers/callees (show; alias: --include-refs)");
+    println!("    --impact            Show impact summary (show; alias: --include-impact)");
     println!("    --context-lines N   Surrounding source lines (show; default: 0)");
     println!("    --min-lines N       Min lines to report (dead-code; default: 3)");
     println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");

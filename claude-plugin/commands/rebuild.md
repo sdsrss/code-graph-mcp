@@ -1,5 +1,5 @@
 ---
-description: Force a full code-graph index rebuild
+description: Force code-graph index rebuild. Use when search results seem stale or wrong, after major codebase restructuring, or when index health check reports issues.
 ---
 
 Run via Bash: `code-graph-mcp incremental-index`

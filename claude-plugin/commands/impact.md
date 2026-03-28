@@ -1,5 +1,5 @@
 ---
-description: Analyze impact scope before modifying a symbol
+description: Analyze blast radius before modifying a symbol. Use when about to edit/rename/remove a function, or asked about change risk and affected callers.
 argument-hint: <symbol_name>
 ---
 

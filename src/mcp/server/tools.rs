@@ -560,6 +560,7 @@ impl McpServer {
         }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
+        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         let include_impact = args["include_impact"].as_bool().unwrap_or(false);
         let compact = args["compact"].as_bool().unwrap_or(false);
 
@@ -567,7 +568,7 @@ impl McpServer {
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-            return self.ast_node_by_id(nid, include_refs, include_impact, ctx, compact);
+            return self.ast_node_by_id(nid, include_refs, include_tests, include_impact, ctx, compact);
         }
 
         let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
@@ -583,7 +584,7 @@ impl McpServer {
                 .collect();
             return match non_test.len() {
                 0 => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
-                1 => self.ast_node_by_id(non_test[0].node.id, include_refs, include_impact, context_lines, compact),
+                1 => self.ast_node_by_id(non_test[0].node.id, include_refs, include_tests, include_impact, context_lines, compact),
                 _ => {
                     let suggestions: Vec<_> = non_test.iter().map(|nf| {
                         json!({
@@ -641,7 +642,20 @@ impl McpServer {
                     let callees = queries::get_edge_targets_with_files(self.db.conn(), n.id, CALLS)?;
                     let callers = queries::get_edge_sources_with_files(self.db.conn(), n.id, CALLS)?;
                     result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
-                    result["called_by"] = json!(callers.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    let (filtered, test_count) = if include_tests {
+                        (callers, 0)
+                    } else {
+                        let total = callers.len();
+                        let prod: Vec<_> = callers.into_iter()
+                            .filter(|(n, f)| !is_test_symbol(n, f))
+                            .collect();
+                        let tc = total - prod.len();
+                        (prod, tc)
+                    };
+                    result["called_by"] = json!(filtered.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    if test_count > 0 {
+                        result["test_callers_hidden"] = json!(test_count);
+                    }
                 }
 
                 if include_impact {
@@ -692,7 +706,7 @@ impl McpServer {
     }
 
     /// Lookup AST node by node_id.
-    pub(super) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_impact: bool, context_lines: usize, compact: bool) -> Result<serde_json::Value> {
+    pub(super) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_tests: bool, include_impact: bool, context_lines: usize, compact: bool) -> Result<serde_json::Value> {
         let nf = queries::get_node_with_file_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
         let node = nf.node;
@@ -728,7 +742,20 @@ impl McpServer {
             let callees = queries::get_edge_targets_with_files(self.db.conn(), node.id, CALLS)?;
             let callers = queries::get_edge_sources_with_files(self.db.conn(), node.id, CALLS)?;
             result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
-            result["called_by"] = json!(callers.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            let (filtered, test_count) = if include_tests {
+                (callers, 0)
+            } else {
+                let total = callers.len();
+                let prod: Vec<_> = callers.into_iter()
+                    .filter(|(n, f)| !is_test_symbol(n, f))
+                    .collect();
+                let tc = total - prod.len();
+                (prod, tc)
+            };
+            result["called_by"] = json!(filtered.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            if test_count > 0 {
+                result["test_callers_hidden"] = json!(test_count);
+            }
         }
 
         if include_impact {

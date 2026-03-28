@@ -47,6 +47,45 @@ for (const pat of fnPatterns) {
   }
 }
 
+// Fallback: if old_string is inside a function body (not a definition),
+// extract a unique identifier from the code and grep for it to find the containing function
+if (!symbol || symbol.length < 3) {
+  const filePath = (input.tool_input && input.tool_input.file_path) || '';
+  if (filePath && oldStr.length >= 10) {
+    try {
+      // Extract identifiers from old_string, try the most specific one first
+      const identifiers = (oldStr.match(/\b([a-z]\w*(?:_\w+)+|[a-z]\w*(?:[A-Z]\w*)+|[A-Z]\w+\.\w+|[A-Z]\w+::\w+)\b/g) || [])
+        .filter(id => id.length >= 6);
+      const skipWords = new Set(['return', 'function', 'default', 'require', 'module', 'exports', 'import', 'console']);
+      // Sort by length descending (longer = more specific = fewer matches)
+      const candidates = [...new Set(identifiers)]
+        .filter(id => !skipWords.has(id.toLowerCase()))
+        .sort((a, b) => b.length - a.length);
+      for (const candidate of candidates.slice(0, 5)) {
+        try {
+          const raw = execFileSync('code-graph-mcp', ['grep', candidate, filePath, '--json'], {
+            cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+          });
+          const grepResult = JSON.parse(raw);
+          // Pick this candidate if it has few matches (precise location)
+          const withContainer = (grepResult || []).filter(m => m.container && m.container.name);
+          if (withContainer.length > 0 && withContainer.length <= 5) {
+            // If multiple containers, vote for the most common one
+            const votes = {};
+            for (const m of withContainer) {
+              const cn = m.container.name;
+              votes[cn] = (votes[cn] || 0) + 1;
+            }
+            const best = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
+            symbol = best.includes('.') ? best.split('.').pop() : best.includes('::') ? best.split('::').pop() : best;
+            break;
+          }
+        } catch { /* try next candidate */ }
+      }
+    } catch { /* grep failed or no match — fall through */ }
+  }
+}
+
 if (!symbol || symbol.length < 3) process.exit(0);
 
 // Skip common patterns that aren't real function names

@@ -1063,7 +1063,16 @@ impl McpServer {
                 "  3. Expand results: get_ast_node(node_id=N, compact=true) for signature, or without compact for full code\n",
                 "  4. Before changes: impact_analysis to check blast radius\n",
                 "  5. If search returns no/unexpected results: call get_index_status to check index health and embedding coverage\n",
-                "  Prompts available: impact-analysis, understand-module, trace-request"
+                "  Prompts available: impact-analysis, understand-module, trace-request\n",
+                "\n",
+                "Decision rules (use INSTEAD OF multi-step Grep/Read):\n",
+                "  \u{2022} \"who calls X?\" / \"what does X call?\" \u{2192} get_call_graph (NOT grep for function name)\n",
+                "  \u{2022} \"what will break if I change X?\" \u{2192} impact_analysis (BEFORE editing)\n",
+                "  \u{2022} \"how is module Y structured?\" \u{2192} module_overview (NOT reading files one by one)\n",
+                "  \u{2022} \"find code that does Z\" (concept) \u{2192} semantic_code_search (NOT grep)\n",
+                "  \u{2022} \"find all functions returning T\" \u{2192} ast_search with --returns filter\n",
+                "  \u{2022} \"is this function used anywhere?\" \u{2192} find_references\n",
+                "  \u{2022} modifying a function signature \u{2192} impact_analysis FIRST, then find all call sites"
             )
         }))
     }

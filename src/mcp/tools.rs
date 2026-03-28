@@ -23,7 +23,7 @@ impl ToolRegistry {
         let tools = vec![
             ToolDefinition {
                 name: "semantic_code_search".into(),
-                description: "Search code by meaning. Returns structured AST nodes (name, file, signature, type) ranked by relevance. Supports stemming.".into(),
+                description: "Search code by concept, not exact text. Use when: you know what code does but not its name, or grep returns noise. Returns AST nodes ranked by relevance.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -39,7 +39,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Caller/callee call chain with depth tracking. Static languages: high accuracy. Dynamic (JS/TS/Python): may have false edges.".into(),
+                description: "Call chain for a function. Use when: tracing who calls it / what it calls, understanding flow before modifying. Recursive with depth tracking.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -55,7 +55,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "trace_http_chain".into(),
-                description: "Trace HTTP route → handler → downstream calls. Also works as route finder (depth=1 for handler only).".into(),
+                description: "Trace HTTP route to handler and downstream calls. Use when: debugging API endpoints or finding which handler serves a route. depth=1 for handler only.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -68,7 +68,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Get a symbol's type, signature, code, and callers/callees. Accepts file_path+symbol_name, node_id, or symbol_name alone (auto-resolves). Set context_lines to include surrounding source code.".into(),
+                description: "Get symbol details: type, signature, code, references, impact. Use when: inspecting a function/class before editing it. Accepts symbol_name, node_id, or file_path+symbol_name.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -76,6 +76,7 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve)" },
                         "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
+                        "include_tests": { "type": "boolean", "description": "Include test callers in references (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },
                         "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
@@ -85,7 +86,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "project_map".into(),
-                description: "Full project architecture: modules, cross-module dependencies, HTTP entry points, hot functions. Call first for overview.".into(),
+                description: "Project architecture map. Use when: starting work on unfamiliar code, finding which module owns functionality, or needing cross-module dependency overview.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -96,7 +97,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "impact_analysis".into(),
-                description: "Blast radius of changing a symbol: affected callers, routes, files, and risk level. Call before modifying functions.".into(),
+                description: "Blast radius before modifying code. Use when: about to change/rename/remove a function — shows risk level, affected callers, routes, and files.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -110,7 +111,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "module_overview".into(),
-                description: "Module/file structure: exports, hot paths, file list, dependency summary.".into(),
+                description: "Module structure and symbols. Use when: exploring a directory/module you haven't seen, or finding the right file to edit. Shows exports, hot paths, files.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -122,7 +123,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "dependency_graph".into(),
-                description: "File-level import/export dependency map with recursive depth. Static languages: high accuracy. Dynamic: may have false edges.".into(),
+                description: "File-level import/dependency map. Use when: understanding dependencies before splitting/moving files, checking import chains, or finding circular deps.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -136,7 +137,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_similar_code".into(),
-                description: "Find semantically similar code via embeddings. For duplicate detection and refactoring. Requires symbol_name OR node_id.".into(),
+                description: "Find semantically similar functions. Use when: looking for duplicate logic to extract, consistent refactoring, or related patterns. Requires embeddings.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -150,7 +151,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "ast_search".into(),
-                description: "Search AST nodes by text and/or structural filters (type, return type, params). Requires query OR at least one filter (type/returns/params).".into(),
+                description: "Structural code search by type/return/params. Use when: finding all functions returning a type, or querying code structure that grep can't express.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -165,7 +166,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Find all references to a symbol: callers, importers, inheritors. Shows where a symbol is used across the codebase.".into(),
+                description: "All references to a symbol. Use when: checking if safe to rename/remove, or finding all usage points before refactoring. Shows callers, importers, inheritors.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -179,7 +180,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_dead_code".into(),
-                description: "Find unused code: Orphan (no references, not exported) or Exported-Unused (exported but never called). Excludes main, modules, route handlers.".into(),
+                description: "Find unused code (orphans, exported-unused). Use when: cleaning up codebase, finding safe-to-delete functions, or reviewing for unused exports.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

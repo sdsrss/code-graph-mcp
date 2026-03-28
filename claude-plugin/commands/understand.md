@@ -1,5 +1,5 @@
 ---
-description: Deep dive into a module or file's architecture
+description: Deep dive into a module's architecture. Use when starting work in an unfamiliar area, asked to explain how code works, or before implementing changes in a module.
 argument-hint: <file_or_dir_path>
 ---
 

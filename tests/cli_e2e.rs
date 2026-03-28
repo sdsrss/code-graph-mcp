@@ -396,7 +396,7 @@ fn test_cli_overview_compact() {
 fn test_cli_overview_nonexistent_path() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["overview", "nonexistent/"]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 1);
     assert!(stderr.contains("No symbols found"));
 }
 
@@ -469,7 +469,7 @@ fn test_cli_ast_search_class_filter() {
 fn test_cli_trace_no_routes() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["trace", "/api/login"]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 1);
     assert!(stderr.contains("No routes matching"), "should report no routes found");
 }
 
@@ -533,4 +533,61 @@ fn test_cli_depth_clamping() {
     let (stdout, _, code) = run_cli(&project, &["callgraph", "validateToken", "--depth", "-5"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"), "should still work with clamped depth");
+}
+
+// ============================================================
+// JSON empty results — must output valid JSON, not plain text
+// ============================================================
+
+#[test]
+fn test_cli_json_empty_search() {
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &["search", "xyznonexistent", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]", "JSON search with no results should output []");
+    assert!(stderr.contains("No results"), "stderr should still show hint");
+}
+
+#[test]
+fn test_cli_json_empty_grep() {
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]", "JSON grep with no results should output []");
+    assert!(stderr.contains("No matches"), "stderr should still show hint");
+}
+
+#[test]
+fn test_cli_json_empty_callgraph() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "xyznonexistent", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(v.is_object(), "JSON callgraph error should output JSON object");
+}
+
+#[test]
+fn test_cli_json_empty_show() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["show", "xyznonexistent", "--json"]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout.trim(), "[]", "JSON show with no results should output []");
+}
+
+#[test]
+fn test_cli_json_empty_trace() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["trace", "/api/nonexistent", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("trace --json must output valid JSON even on no-match");
+    assert!(v.is_object(), "JSON trace error should output JSON object");
+}
+
+#[test]
+fn test_cli_json_empty_overview() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["overview", "nonexistent/", "--json"]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout.trim(), "[]", "JSON overview with no results should output []");
 }
