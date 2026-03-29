@@ -248,6 +248,10 @@ mod inner {
         fn embed_batch_chunk_pre_tokenized(&self, encodings: &[&tokenizers::Encoding]) -> Result<Vec<Vec<f32>>> {
             let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
             let batch_size = encodings.len();
+            if max_len == 0 {
+                // All encodings are empty — return zero vectors
+                return Ok(vec![vec![0f32; super::EMBEDDING_DIM]; batch_size]);
+            }
 
             // Build padded tensors
             let mut all_ids = vec![0u32; batch_size * max_len];

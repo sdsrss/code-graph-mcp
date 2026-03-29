@@ -104,6 +104,16 @@ fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool
 
 /// Add a column only if it doesn't already exist (idempotent ALTER TABLE).
 fn add_column_if_not_exists(conn: &rusqlite::Connection, table: &str, column: &str, col_type: &str) -> anyhow::Result<()> {
+    // Validate identifiers to prevent SQL injection
+    fn is_valid_ident(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    fn is_valid_col_type(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+    }
+    if !is_valid_ident(table) || !is_valid_ident(column) || !is_valid_col_type(col_type) {
+        anyhow::bail!("Invalid identifier in ALTER TABLE: table={}, column={}, type={}", table, column, col_type);
+    }
     if !column_exists(conn, table, column) {
         conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type))?;
     }
@@ -136,8 +146,6 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
-    conn.pragma_update(None, "user_version", 2)?;
-
     tracing::info!("[schema] Migration complete. Re-index recommended for full type extraction.");
     Ok(())
 }
@@ -167,7 +175,6 @@ pub fn migrate_v2_to_v3(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         CREATE INDEX idx_edges_target_rel ON edges(target_id, relation);"
     )?;
 
-    conn.pragma_update(None, "user_version", 3)?;
     tracing::info!("[schema] Migration v2→v3 complete.");
     Ok(())
 }
@@ -196,7 +203,6 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 
     conn.execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');")?;
 
-    conn.pragma_update(None, "user_version", 4)?;
     tracing::info!("[schema] Migration v3→v4 complete.");
     Ok(())
 }
@@ -204,7 +210,6 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 pub fn migrate_v4_to_v5(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     tracing::info!("[schema] Migrating v4 → v5: adding is_test column to nodes");
     add_column_if_not_exists(conn, "nodes", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
-    conn.pragma_update(None, "user_version", 5)?;
     tracing::info!("[schema] Migration v4→v5 complete.");
     Ok(())
 }
@@ -214,7 +219,6 @@ pub fn migrate_v5_to_v6(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);"
     )?;
-    conn.pragma_update(None, "user_version", 6)?;
     tracing::info!("[schema] Migration v5->v6 complete.");
     Ok(())
 }

@@ -259,6 +259,29 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     Ok(results)
 }
 
+/// Collect cross-file inbound edges before deleting a file's nodes.
+/// Returns (source_id, target_name, relation, metadata) for edges where:
+/// - target is in the given file (will be deleted)
+/// - source is NOT in the given file (would lose edge on cascade delete)
+pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<Vec<(i64, String, String, Option<String>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.source_id, nt.name, e.relation, e.metadata
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         WHERE nt.file_id = ?1 AND ns.file_id != ?1"
+    )?;
+    let rows = stmt.query_map([file_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn delete_nodes_by_file(conn: &Connection, file_id: i64) -> Result<()> {
     conn.execute("DELETE FROM nodes WHERE file_id = ?1", [file_id])?;
     Ok(())
@@ -1094,7 +1117,8 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
         "SELECT DISTINCT n.name, f.path, n.type
          FROM nodes n
          JOIN files f ON f.id = n.file_id
-         WHERE n.type != 'module'";
+         WHERE n.type != 'module'
+         LIMIT 5000";
     let mut stmt2 = conn.prepare(sql2)?;
     let rows2 = stmt2.query_map([], |row| {
         Ok(NameCandidate {
@@ -1625,7 +1649,7 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
                 .collect();
             sanitized
         })
-        .filter(|w| !w.is_empty())
+        .filter(|w| w.len() >= 2)
         .collect();
     // Empty/whitespace-only queries would cause FTS5 MATCH error
     if terms.is_empty() {

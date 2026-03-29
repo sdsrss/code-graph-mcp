@@ -172,11 +172,6 @@ impl McpServer {
         candidates.truncate(top_k as usize);
 
         // Phase 3: Build results
-        struct MatchedNode<'a> {
-            node: &'a queries::NodeResult,
-            file_path: &'a str,
-        }
-        let mut matched: Vec<MatchedNode> = Vec::new();
         let mut results = Vec::new();
         for c in &candidates {
             let node = c.node;
@@ -215,7 +210,6 @@ impl McpServer {
                     "relevance": score,
                 }));
             }
-            matched.push(MatchedNode { node, file_path: c.file_path });
         }
 
         // Record search metrics (before potential compression return)
@@ -228,9 +222,9 @@ impl McpServer {
         // that would be lost by compression.
         use crate::sandbox::compressor::CompressedOutput;
         let estimated_tokens: usize = if compact { 0 } else {
-            matched.iter()
-                .map(|m| {
-                    let node = m.node;
+            candidates.iter()
+                .map(|c| {
+                    let node = c.node;
                     node.context_string.as_ref().map_or_else(
                         || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
                         |ctx| ctx.len(),
@@ -240,8 +234,8 @@ impl McpServer {
         };
         if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
             // Build node_results and file_paths only when compression is needed
-            let node_results: Vec<queries::NodeResult> = matched.iter().map(|m| {
-                let node = m.node;
+            let node_results: Vec<queries::NodeResult> = candidates.iter().map(|c| {
+                let node = c.node;
                 queries::NodeResult {
                     id: node.id,
                     file_id: node.file_id,
@@ -260,7 +254,7 @@ impl McpServer {
                     is_test: node.is_test,
                 }
             }).collect();
-            let file_paths: Vec<String> = matched.iter().map(|m| m.file_path.to_string()).collect();
+            let file_paths: Vec<String> = candidates.iter().map(|c| c.file_path.to_string()).collect();
         if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(&node_results, &file_paths, COMPRESSION_TOKEN_THRESHOLD)? {
             let (mode, compact) = match compressed {
                 CompressedOutput::Nodes(nodes) => {

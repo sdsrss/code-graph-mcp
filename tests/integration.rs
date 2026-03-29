@@ -55,7 +55,7 @@ export function handleLogin(req: Request, res: Response) {
 
     // Get call graph for handleLogin
     let graph = tool_call_json("get_call_graph", serde_json::json!({
-        "function_name": "handleLogin",
+        "symbol_name": "handleLogin",
         "direction": "callees",
         "depth": 2
     }));
@@ -158,7 +158,11 @@ fn test_e2e_incremental_reindex() {
     // Modify file
     fs::write(project.path().join("app.ts"), "function modified() {}").unwrap();
 
-    // Search again (triggers incremental index)
+    // Explicit rebuild to sync before search (avoids timing-dependent incremental detection)
+    let rebuild = tool_call_json("rebuild_index", serde_json::json!({"confirm": true}));
+    let _ = server.handle_message(&rebuild).unwrap();
+
+    // Search again
     let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "modified"}));
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);

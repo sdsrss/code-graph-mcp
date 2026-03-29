@@ -22,7 +22,7 @@ pub(super) fn parse_route_input(input: &str) -> (Option<String>, &str) {
     let trimmed = input.trim();
     if let Some(space_idx) = trimmed.find(' ') {
         let prefix = &trimmed[..space_idx];
-        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "USE"];
+        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
         if methods.contains(&prefix.to_uppercase().as_str()) {
             return (Some(prefix.to_uppercase()), trimmed[space_idx..].trim());
         }

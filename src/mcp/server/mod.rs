@@ -225,6 +225,8 @@ pub struct McpServer {
     pub(super) db: Database,
     pub(super) embedding_model: Mutex<Option<EmbeddingModel>>,
     pub(super) project_root: Option<PathBuf>,
+    /// Pre-computed canonical project root to avoid repeated `canonicalize()` syscalls.
+    pub(super) project_root_canonical: Option<PathBuf>,
     pub(super) indexed: Mutex<bool>,
     pub(super) watcher: Mutex<Option<WatcherState>>,
     pub(super) last_incremental_check: Mutex<std::time::Instant>,
@@ -260,7 +262,7 @@ impl McpServer {
         std::fs::create_dir_all(&db_dir)?;
         let db_path = db_dir.join("index.db");
 
-        // Ensure .code-graph/ is in .gitignore
+        // Ensure .code-graph/ is in .gitignore (atomic append to avoid read-modify-write race)
         let gitignore_path = project_root.join(".gitignore");
         {
             let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
@@ -268,12 +270,18 @@ impl McpServer {
                 let trimmed = line.trim();
                 trimmed.trim_end_matches('/') == CODE_GRAPH_DIR
             }) {
-                let mut new_content = content;
-                if !new_content.ends_with('\n') {
-                    new_content.push('\n');
-                }
-                new_content.push_str(&format!("{}/\n", CODE_GRAPH_DIR));
-                if let Err(e) = std::fs::write(&gitignore_path, new_content) {
+                use std::io::Write as _;
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&gitignore_path);
+                if let Ok(mut f) = f {
+                    // Add newline separator if the file doesn't end with one
+                    if !content.ends_with('\n') && !content.is_empty() {
+                        let _ = f.write_all(b"\n");
+                    }
+                    let _ = f.write_all(format!("{}/\n", CODE_GRAPH_DIR).as_bytes());
+                } else if let Err(e) = f {
                     tracing::warn!("Could not update .gitignore: {}", e);
                 }
             }
@@ -284,10 +292,12 @@ impl McpServer {
 
         let embedding_model = EmbeddingModel::load()?;
         let db = Self::open_db(&db_path)?;
+        let root_canonical = project_root.canonicalize().ok();
         Ok(Self {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(embedding_model),
+            project_root_canonical: root_canonical,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -310,6 +320,7 @@ impl McpServer {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(None),
+            project_root_canonical: None,
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -334,6 +345,7 @@ impl McpServer {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(None),
+            project_root_canonical: project_root.canonicalize().ok(),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),

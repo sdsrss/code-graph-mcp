@@ -14,6 +14,7 @@ use crate::storage::db::Database;
 use crate::storage::queries::{
     delete_files_by_paths, delete_nodes_by_file,
     get_all_file_hashes, get_all_node_names_with_ids, get_dirty_node_ids, get_edges_batch,
+    get_inbound_cross_file_edges,
     get_nodes_by_file_path,
     get_nodes_missing_context, get_nodes_with_files_by_ids,
     insert_edge_cached, insert_node_cached,
@@ -622,6 +623,8 @@ fn index_files(
             .collect();
 
         let mut batch_parsed: Vec<FileParsed> = Vec::new();
+        // Saved inbound edges from other files → batch files (to restore after cascade delete)
+        let mut saved_inbound_edges: Vec<(i64, String, String, Option<String>)> = Vec::new();
 
         // --- Phase 1b: Sequential DB inserts ---
         for pp in pre_parsed {
@@ -631,6 +634,9 @@ fn index_files(
                 last_modified: pp.last_modified,
                 language: Some(pp.language.clone()),
             })?;
+
+            // Save cross-file inbound edges before cascade delete destroys them
+            saved_inbound_edges.extend(get_inbound_cross_file_edges(db.conn(), file_id)?);
 
             delete_nodes_by_file(db.conn(), file_id)?;
 
@@ -858,6 +864,35 @@ fn index_files(
                         total_edges_created += 1;
                     }
                 }
+            }
+        }
+
+        // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
+        // When a file is re-indexed, its old nodes are deleted (cascade-deleting edges).
+        // Edges from OTHER files into the re-indexed file must be rebuilt using new node IDs.
+        if !saved_inbound_edges.is_empty() {
+            // Build name → new_node_id map for batch files only
+            let mut batch_name_to_ids: HashMap<&str, Vec<i64>> = HashMap::new();
+            for pf in &batch_parsed {
+                for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+                    batch_name_to_ids.entry(name.as_str()).or_default().push(*id);
+                }
+            }
+
+            let mut restored = 0usize;
+            for (source_id, target_name, relation, metadata) in &saved_inbound_edges {
+                if let Some(new_target_ids) = batch_name_to_ids.get(target_name.as_str()) {
+                    for &new_tgt_id in new_target_ids {
+                        if *source_id != new_tgt_id
+                            && insert_edge_cached(db.conn(), *source_id, new_tgt_id, relation, metadata.as_deref())? {
+                            total_edges_created += 1;
+                            restored += 1;
+                        }
+                    }
+                }
+            }
+            if restored > 0 {
+                tracing::debug!("[index] Restored {} cross-file inbound edges", restored);
             }
         }
 
