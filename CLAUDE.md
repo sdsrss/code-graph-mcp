@@ -61,17 +61,18 @@ Code graph tools are available via MCP. The MCP server injects `instructions` at
 
 <claude-mem-context>
 ### Last Session
-Request: 配置提交代码时的git pre-commit hook检查和代码审核工具，避免下次github上再出现错误。     Pre-commit hook (scripts/pre-commit.sh):    ┌──────────┬────…
-Completed: Modified package.json, .gitignore; Modified pre-commit.sh
-
-### File Lessons
-- cli.rs: Embedding availability must be validated before semantic search to prevent runtime errors; distingu… (#5321)
+Request: Simulate user-level testing of all code-graph-mcp functions and UX, fix discovered problems, evaluate programming effic…
+Completed: Fixed tools.rs compilation (Phase 3 result-building); Modified pipeline.rs (default resolution logic); Created SKILL.md…
+Remaining: Comprehensive UX testing not executed; Loop plugin 3-iteration execution not performed; Functional testing of all code-…
+Next: 1) Execute user-level functional testing workflow via loop plugin (3× as specified); 2) Document UX findings and issues…
+Lessons: Phase 3 result struct initialization in tools.rs requires explicit type handling; Multi-file code pattern searches needed to identify incomplete reference mapping implementations
+Decisions: Prioritized compilation correctness (tools.rs, pipeline.rs) before comprehensive UX testing; Created SKILL.md to improve project discoverability and functionality documentation
 
 ### Key Context
-- [bugfix] Error: queries.rs: Error: Usage: code-graph-mcp search <query> --jso… (#5267)
-- [bugfix] Error: session-init.test.js: TAP version 13 # Subtest: syncLifecycleConfig is … (#5202)
-- [bugfix] Error: user-prompt-context.js, session-init.js, mcp-launcher.js: TAP version 13… (#5200)
-- [bugfix] Error: cli.rs: struct Database  src/storage/db.rs:30-33 fn McpSe… (#5096)
-- [bugfix] Error: cli.rs: code-graph Symbol not found:  --- code-graph No r… (#5079)
+- [discovery] Reviewed 2 files: treesitter.rs, relations.rs (#5740)
+- [refactor] Remove unused thread import from watcher.rs (#5714)
+- [bugfix] Error: tools.rs: Compiling code-graph-mcp v0.7.14 (/mnt/data_ssd/d… (#5701)
+- [bugfix] Error: tools.rs: error: Your local changes to the following files … (#5697)
+- [change] Add idempotent column insertion checks to schema.rs (#5696)
 
 </claude-mem-context>

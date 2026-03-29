@@ -43,8 +43,13 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
         }
         let parser = cache.get_mut(language)
             .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
-        parser.parse(source, None)
-            .ok_or_else(|| anyhow!("parse failed or timed out"))
+        match parser.parse(source, None) {
+            Some(tree) => Ok(tree),
+            None => {
+                parser.reset();
+                Err(anyhow!("parse failed or timed out"))
+            }
+        }
     })
 }
 
@@ -68,7 +73,7 @@ fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
         match s.kind() {
             "attribute_item" | "inner_attribute_item" => {
                 let text = node_text(&s, source);
-                if text.contains("cfg(test)") || text == "#[test]" {
+                if text.contains("cfg(test)") || text == "#[test]" || text.contains("::test]") {
                     return true;
                 }
             }

@@ -98,6 +98,11 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
 }
 
+/// Enhanced test detection: combines naming heuristic with AST-level is_test flag.
+pub fn is_test_symbol_or_annotated(name: &str, file_path: &str, is_test_from_ast: bool) -> bool {
+    is_test_from_ast || is_test_symbol(name, file_path)
+}
+
 // -- Node type normalization --
 /// Normalize shorthand type filter into canonical AST node types.
 /// Shared by CLI and MCP tool implementations.

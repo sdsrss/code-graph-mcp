@@ -136,7 +136,7 @@ impl Database {
                 stored_index_version, crate::domain::INDEX_VERSION
             );
             conn.execute_batch(
-                "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files;"
+                "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
             )?;
         }
         conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;

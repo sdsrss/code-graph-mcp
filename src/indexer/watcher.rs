@@ -68,7 +68,7 @@ impl FileWatcher {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use std::{fs, time::Duration, thread};
+    use std::{fs, time::Duration};
 
     #[test]
     fn test_watcher_detects_file_changes() {

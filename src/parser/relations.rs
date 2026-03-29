@@ -876,7 +876,13 @@ fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
                 }
                 if parents.is_empty() {
                     let text = node_text(&child, source);
-                    parents.push(text.trim_start_matches('(').trim_end_matches(')').trim().to_string());
+                    let cleaned = text
+                        .trim_start_matches(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                        .trim_end_matches(|c: char| c == ')' || c.is_whitespace())
+                        .to_string();
+                    if !cleaned.is_empty() {
+                        parents.push(cleaned);
+                    }
                 }
             }
             "delegation_specifiers" => {
@@ -1268,6 +1274,7 @@ fn extract_string_from_subtree_inner(node: &tree_sitter::Node, source: &str, dep
     if depth > MAX_SUBTREE_DEPTH { return None; }
     if node.kind() == "string" {
         let text = node_text(node, source);
+        let text = text.trim_start_matches(['f', 'r', 'b', 'u', 'F', 'R', 'B', 'U']);
         return Some(text.trim_matches(|c| c == '\'' || c == '"').to_string());
     }
     for i in 0..node.child_count() {
@@ -1924,5 +1931,90 @@ fn print_version() {}
             "deeply nested scoped call should extract rightmost name, got: {:?}", calls);
         assert!(calls.contains(&("main", "current_dir")),
             "std::env::current_dir() should extract current_dir, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_rust_match_arm_dispatch_calls() {
+        // Calls inside match arms should be detected — this is the pattern used by
+        // handle_tool (self.tool_*) and main (code_graph_mcp::cli::cmd_*)
+        let code = r#"
+impl Server {
+    fn handle_tool(&self, name: &str) -> i32 {
+        let result = match name {
+            "search" => self.tool_search(),
+            "map" => self.tool_map(),
+            _ => 0,
+        };
+        self.log_result();
+        result
+    }
+}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        eprintln!("Match arm calls: {:?}", calls);
+        // Note: Rust `impl` blocks don't set class context (unlike class {} in TS/JS),
+        // so scope is just "handle_tool" not "Server.handle_tool"
+        assert!(calls.contains(&("handle_tool", "tool_search")),
+            "self.tool_search() in match arm should be detected, got: {:?}", calls);
+        assert!(calls.contains(&("handle_tool", "tool_map")),
+            "self.tool_map() in match arm should be detected, got: {:?}", calls);
+        assert!(calls.contains(&("handle_tool", "log_result")),
+            "self.log_result() outside match should be detected, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_real_handle_tool_dispatch_pattern() {
+        // Reproduce the exact pattern from McpServer::handle_tool in mod.rs
+        let code = r#"
+impl McpServer {
+    fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let result = match name {
+            "semantic_code_search" => self.tool_semantic_search(args),
+            "get_call_graph" => self.tool_get_call_graph(args),
+            "find_http_route" | "trace_http_chain" => self.tool_trace_http_chain(args),
+            "get_ast_node" | "read_snippet" => self.tool_get_ast_node(args),
+            "start_watch" => self.tool_start_watch(),
+            "stop_watch" => self.tool_stop_watch(),
+            "get_index_status" => self.tool_get_index_status(),
+            "rebuild_index" => self.tool_rebuild_index(args),
+            "impact_analysis" => self.tool_impact_analysis(args),
+            "module_overview" => self.tool_module_overview(args),
+            "dependency_graph" => self.tool_dependency_graph(args),
+            "find_similar_code" => self.tool_find_similar_code(args),
+            "project_map" => self.tool_project_map(args),
+            "ast_search" => self.tool_ast_search(args),
+            "find_references" => self.tool_find_references(args),
+            "find_dead_code" => self.tool_find_dead_code(args),
+            _ => Err(anyhow!("Unknown tool")),
+        };
+        let elapsed = start.elapsed();
+        lock_or_recover(&self.metrics, "metrics")
+            .record_tool_call(name, elapsed.as_millis() as u64, false);
+        result
+    }
+}
+"#;
+        let relations = extract_relations(code, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        eprintln!("All calls from handle_tool ({}):", calls.len());
+        for (src, tgt) in &calls {
+            eprintln!("  {} -> {}", src, tgt);
+        }
+        assert!(calls.iter().any(|(_, t)| *t == "tool_semantic_search"),
+            "tool_semantic_search not found in: {:?}", calls);
+        assert!(calls.iter().any(|(_, t)| *t == "tool_find_dead_code"),
+            "tool_find_dead_code not found in: {:?}", calls);
+        assert!(calls.iter().any(|(_, t)| *t == "lock_or_recover"),
+            "lock_or_recover not found in: {:?}", calls);
+        assert!(calls.iter().any(|(_, t)| *t == "record_tool_call"),
+            "record_tool_call not found in: {:?}", calls);
     }
 }

@@ -26,10 +26,13 @@ pub fn tool_call_json(tool_name: &str, args: serde_json::Value) -> String {
 /// Assumes the response wraps the tool output as a JSON string inside
 /// `result.content[0].text`.
 pub fn parse_tool_result(response: &Option<String>) -> serde_json::Value {
-    let resp = response.as_ref().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(resp).unwrap();
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
+    let resp = response.as_ref().expect("parse_tool_result: response was None");
+    let parsed: serde_json::Value = serde_json::from_str(resp)
+        .unwrap_or_else(|e| panic!("parse_tool_result: invalid JSON: {e}\nraw: {resp}"));
+    let text = parsed["result"]["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("parse_tool_result: unexpected response shape: {parsed}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("parse_tool_result: inner text not JSON: {e}\ntext: {text}"))
 }
 
 /// Create an McpServer from a TempDir project root and send the `initialize` handshake.

@@ -102,7 +102,8 @@ fn query_direction(
         JOIN nodes n ON n.id = cg.node_id
         JOIN files f ON f.id = n.file_id
         GROUP BY cg.node_id
-        ORDER BY depth"
+        ORDER BY depth
+        LIMIT 200"
     );
 
     let mut stmt = conn.prepare(&sql)?;

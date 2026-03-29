@@ -61,6 +61,11 @@ fn get_positional(args: &[String], index: usize) -> Option<&str> {
             }
             continue;
         }
+        // Skip single-dash flags (e.g., -h, -V)
+        if args[i].starts_with('-') && args[i].len() > 1 {
+            i += 1;
+            continue;
+        }
         if pos == index {
             return Some(&args[i]);
         }
@@ -465,8 +470,10 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         let text = data["lines"]["text"].as_str().unwrap_or("").to_string();
 
         // Make path relative to project root
+        let root_prefix = root_str.trim_end_matches('/');
         let relative_path = path_str
-            .strip_prefix(root_str.as_str())
+            .strip_prefix(root_prefix)
+            .or_else(|| path_str.strip_prefix(&root_str))
             .unwrap_or(path_str)
             .trim_start_matches('/');
 
@@ -2006,7 +2013,7 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
 /// Run benchmark: full index, incremental index, query latency, DB size, token savings.
 pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
     use crate::domain::CODE_GRAPH_DIR;
-    use crate::indexer::pipeline::run_full_index;
+    use crate::indexer::pipeline::{run_full_index, run_incremental_index};
     use std::time::Instant;
 
     let json_mode = has_flag(args, "--json");
@@ -2036,7 +2043,7 @@ pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
 
     // 2. Incremental index (no-change detection — should be fast)
     let t_incr = Instant::now();
-    let _ = run_full_index(&bench_db, project_root, None, None)?;
+    let _ = run_incremental_index(&bench_db, project_root, None, None)?;
     let incr_index_ms = t_incr.elapsed().as_millis() as u64;
 
     eprintln!("[benchmark] Incremental (no-change): {}ms", incr_index_ms);

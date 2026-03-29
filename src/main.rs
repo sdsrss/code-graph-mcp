@@ -1,5 +1,19 @@
 use anyhow::Result;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::{Arc, Mutex};
+
+/// Newtype wrapper around `Arc<Mutex<io::Stdout>>` so both the main loop
+/// and `McpServer::send_notification` share a single, mutex-protected handle.
+struct SharedStdout(Arc<Mutex<io::Stdout>>);
+
+impl Write for SharedStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -168,25 +182,28 @@ fn run_serve() -> Result<()> {
 
     tracing::info!("[session] Started v{}, project: {}", env!("CARGO_PKG_VERSION"), project_root.display());
 
-    // Enable MCP progress/log notifications via stdout
-    server.set_notify_writer(Box::new(io::stdout()));
+    // Shared stdout handle: prevents interleaved JSON when background threads
+    // send notifications concurrently with the main loop writing responses.
+    let stdout_shared = Arc::new(Mutex::new(io::stdout()));
+
+    // Enable MCP progress/log notifications via the same shared handle
+    server.set_notify_writer(Box::new(SharedStdout(Arc::clone(&stdout_shared))));
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
     let mut reader = stdin.lock();
     let mut buf = String::new();
     const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
     loop {
         buf.clear();
-        let n = reader.by_ref().take((MAX_MESSAGE_SIZE + 1) as u64).read_line(&mut buf)?;
+        let n = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_line(&mut buf)?;
         if n == 0 {
             break; // EOF
         }
         if buf.trim().is_empty() {
             continue;
         }
-        if buf.len() > MAX_MESSAGE_SIZE {
+        if buf.len() >= MAX_MESSAGE_SIZE && !buf.ends_with('\n') {
             let oversized_len = buf.len();
             let needs_drain = !buf.ends_with('\n');
             // Free the oversized buffer before draining to avoid 2x peak allocation
@@ -205,15 +222,19 @@ fn run_serve() -> Result<()> {
                     "message": format!("Message too large: {} bytes (max {})", oversized_len, MAX_MESSAGE_SIZE)
                 }
             });
-            writeln!(stdout, "{}", err_resp)?;
-            stdout.flush()?;
+            {
+                let mut out = stdout_shared.lock().unwrap();
+                writeln!(out, "{}", err_resp)?;
+                out.flush()?;
+            }
             continue;
         }
 
         match server.handle_message(&buf) {
             Ok(Some(response)) => {
-                writeln!(stdout, "{}", response)?;
-                stdout.flush()?;
+                let mut out = stdout_shared.lock().unwrap();
+                writeln!(out, "{}", response)?;
+                out.flush()?;
             }
             Ok(None) => {}
             Err(e) => {
@@ -226,8 +247,9 @@ fn run_serve() -> Result<()> {
                         "message": format!("Internal error: {}", e)
                     }
                 });
-                writeln!(stdout, "{}", err_resp)?;
-                stdout.flush()?;
+                let mut out = stdout_shared.lock().unwrap();
+                writeln!(out, "{}", err_resp)?;
+                out.flush()?;
             }
         }
 

@@ -89,8 +89,12 @@ if (!symbol || symbol.length < 3) {
 if (!symbol || symbol.length < 3) process.exit(0);
 
 // Skip common patterns that aren't real function names
-if (/^(if|for|while|switch|catch|else|return|new|get|set|try)$/i.test(symbol)) {
+if (isCommonKeyword(symbol)) {
   process.exit(0);
+}
+
+function isCommonKeyword(s) {
+  return /^(if|for|while|switch|catch|else|return|new|get|set|try)$/i.test(s);
 }
 
 // --- Per-symbol cooldown: 2 minutes ---
