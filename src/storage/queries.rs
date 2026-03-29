@@ -263,6 +263,7 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
 /// Returns (source_id, target_name, relation, metadata) for edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
+#[allow(clippy::type_complexity)]
 pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<Vec<(i64, String, String, Option<String>)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT e.source_id, nt.name, e.relation, e.metadata

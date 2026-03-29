@@ -226,6 +226,7 @@ pub struct McpServer {
     pub(super) embedding_model: Mutex<Option<EmbeddingModel>>,
     pub(super) project_root: Option<PathBuf>,
     /// Pre-computed canonical project root to avoid repeated `canonicalize()` syscalls.
+    #[allow(dead_code)]
     pub(super) project_root_canonical: Option<PathBuf>,
     pub(super) indexed: Mutex<bool>,
     pub(super) watcher: Mutex<Option<WatcherState>>,
