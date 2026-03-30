@@ -609,8 +609,13 @@ if (require.main === module) {
         console.log(`  ${issue.type}: ${issue.path || issue.id}`);
       }
     }
+  } else if (cmd === 'doctor') {
+    const { runDoctor } = require('./doctor');
+    const checkOnly = process.argv.includes('--check-only');
+    const { issueCount } = runDoctor({ checkOnly });
+    process.exit(issueCount > 0 ? 1 : 0);
   } else {
-    console.error('Usage: lifecycle.js <install|uninstall|update|health>');
+    console.error('Usage: lifecycle.js <install|uninstall|update|health|doctor>');
     process.exit(1);
   }
 }

@@ -104,6 +104,35 @@ fn main() -> Result<()> {
             let project_root = std::env::current_dir()?;
             code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
         }
+        Some("doctor") => {
+            // Delegate to plugin's doctor.js
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+            let doctor_candidates = [
+                // Dev mode: binary is in target/release/, doctor.js is in claude-plugin/scripts/
+                exe_dir.join("../../claude-plugin/scripts/doctor.js"),
+                // Installed via npm: doctor.js is alongside the binary's package
+                exe_dir.join("../claude-plugin/scripts/doctor.js"),
+            ];
+
+            for candidate in &doctor_candidates {
+                if candidate.exists() {
+                    let mut cmd = std::process::Command::new("node");
+                    cmd.arg(candidate);
+                    if args.iter().any(|a| a == "--check-only") {
+                        cmd.arg("--check-only");
+                    }
+                    let status = cmd.status()?;
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
+
+            eprintln!("doctor.js not found. Run directly: node claude-plugin/scripts/doctor.js");
+            std::process::exit(1);
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             if let Some(suggestion) = suggest_subcommand(other) {
@@ -142,6 +171,7 @@ fn print_help() {
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    incremental-index   Run incremental index update");
     println!("    health-check        Query index status");
+    println!("    doctor              Diagnose and repair environment issues");
     println!("    benchmark           Benchmark index speed, query latency, token savings\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
@@ -266,7 +296,7 @@ fn run_serve() -> Result<()> {
 const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
-    "dead-code", "incremental-index", "health-check", "benchmark",
+    "dead-code", "incremental-index", "health-check", "doctor", "benchmark",
 ];
 
 fn suggest_subcommand(input: &str) -> Option<&'static str> {
