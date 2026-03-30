@@ -45,7 +45,7 @@ cargo test --no-default-features   # Tests without embedding
 - **Database**: SQLite with sqlite-vec compiled from `vendor/sqlite-vec/sqlite-vec.c` via `build.rs`
 - **Relation constants**: Defined in `src/domain.rs` (re-exported from `storage/schema.rs`) — use constants (e.g., `REL_CALLS`) instead of hardcoded strings
 - **Schema**: Defined in `src/storage/schema.rs` — parameterized queries in `src/storage/queries.rs`
-- **MCP tools**: Registered in `src/mcp/tools.rs`, handled in `src/mcp/server.rs`
+- **MCP tools**: Registered in `src/mcp/tools.rs`, handled in `src/mcp/server/tools.rs`
 - **Data directory**: `.code-graph/` under project root, auto-created and gitignored
 
 ## Conventions
@@ -56,23 +56,22 @@ cargo test --no-default-features   # Tests without embedding
 
 ## Code Graph Integration
 
-Code graph tools are available via MCP. The MCP server injects `instructions` at session start to guide tool selection. Use the `code-navigation` skill for the full decision tree.
+Code graph tools are available via MCP. The MCP server injects `instructions` at session start with decision rules for tool selection (e.g., "who calls X?" → `get_call_graph`). CLI commands (`code-graph-mcp <cmd>`) complement MCP tools for Bash workflows.
 
 
 <claude-mem-context>
 ### Last Session
-Request: Simulate user-level testing of all code-graph-mcp functions and UX, fix discovered problems, evaluate programming effic…
-Completed: Fixed tools.rs compilation (Phase 3 result-building); Modified pipeline.rs (default resolution logic); Created SKILL.md…
-Remaining: Comprehensive UX testing not executed; Loop plugin 3-iteration execution not performed; Functional testing of all code-…
-Next: 1) Execute user-level functional testing workflow via loop plugin (3× as specified); 2) Document UX findings and issues…
-Lessons: Phase 3 result struct initialization in tools.rs requires explicit type handling; Multi-file code pattern searches needed to identify incomplete reference mapping implementations
-Decisions: Prioritized compilation correctness (tools.rs, pipeline.rs) before comprehensive UX testing; Created SKILL.md to improve project discoverability and functionality documentation
+Request: 要实现
+
+### File Lessons
+- user-prompt-context.js: Node.js --test runner TAP reporter may fail on certain test structures; spec reporter is more relia… (#5755)
+- user-prompt-context.js: Prompt filtering requires distinguishing between action-only prompts (lacking code context) and cod… (#5754)
 
 ### Key Context
-- [discovery] Reviewed 2 files: treesitter.rs, relations.rs (#5740)
-- [refactor] Remove unused thread import from watcher.rs (#5714)
-- [bugfix] Error: tools.rs: Compiling code-graph-mcp v0.7.14 (/mnt/data_ssd/d… (#5701)
-- [bugfix] Error: tools.rs: error: Your local changes to the following files … (#5697)
-- [change] Add idempotent column insertion checks to schema.rs (#5696)
+- [bugfix] Dead code false positive elimination: trait impl, struct expr, callback patterns (#5800)
+- [discovery] Reviewed 0 files: (#5797)
+- [discovery] Reviewed 1 files: db.rs (#5794)
+- [discovery] code-graph-mcp lacks external module handling in schema (#5791)
+- [discovery] Worked on schema.rs (#5787)
 
 </claude-mem-context>
