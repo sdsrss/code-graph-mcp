@@ -1,6 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary } = require('./session-init');
 
@@ -68,5 +70,36 @@ test('launchBackgroundAutoUpdate spawns detached silent updater', () => {
   assert.equal(calls[0].options.stdio, 'ignore');
   assert.equal(calls[0].options.env.CODE_GRAPH_AUTO_UPDATE_SILENT, '1');
   assert.equal(calls[0].unrefCalled, true);
+});
+
+const { consistencyCheck } = require('./session-init');
+
+test('consistencyCheck is exported as a function', () => {
+  assert.equal(typeof consistencyCheck, 'function');
+});
+
+test('consistencyCheck returns empty array when binary version matches plugin', () => {
+  const result = consistencyCheck('/tmp/nonexistent-binary');
+  assert.ok(Array.isArray(result));
+});
+
+test('consistencyCheck returns version-mismatch when versions differ', () => {
+  const os = require('os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-'));
+  const bin = path.join(dir, 'code-graph-mcp');
+  fs.writeFileSync(bin, [
+    '#!/usr/bin/env bash',
+    'if [ "$1" = "--version" ]; then',
+    '  echo "code-graph-mcp 0.0.1"',
+    '  exit 0',
+    'fi',
+    'exit 0',
+  ].join('\n'));
+  fs.chmodSync(bin, 0o755);
+
+  const issues = consistencyCheck(bin);
+  const versionIssue = issues.find(i => i.id === 'version-mismatch');
+  assert.ok(versionIssue, 'should detect version mismatch');
+  assert.ok(versionIssue.msg.includes('0.0.1'));
 });
 

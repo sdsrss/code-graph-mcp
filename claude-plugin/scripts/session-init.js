@@ -8,6 +8,7 @@ const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, readJson,
 } = require('./lifecycle');
+const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
   try {
@@ -161,6 +162,72 @@ function verifyBinary() {
   return { available: true, binary };
 }
 
+/**
+ * Lightweight consistency checks — called from runSessionInit().
+ * Returns an array of issue objects: { id, msg, fix }.
+ * Empty array = all consistent (silent).
+ */
+function consistencyCheck(binary) {
+  const issues = [];
+
+  // Check 1: Binary version vs plugin version
+  try {
+    const pluginVersion = getPluginVersion();
+    const binaryVersion = readBinaryVersion(binary);
+    if (binaryVersion && binaryVersion !== pluginVersion) {
+      issues.push({
+        id: 'version-mismatch',
+        msg: `Binary v${binaryVersion}, plugin expects v${pluginVersion}`,
+        fix: isDevMode() ? 'cargo build --release' : 'code-graph-mcp doctor',
+      });
+    }
+  } catch { /* skip check on error */ }
+
+  // Check 2: Source freshness (dev mode only)
+  try {
+    if (isDevMode()) {
+      const srcDir = path.resolve(__dirname, '..', '..', 'src');
+      const binaryMtime = fs.statSync(binary).mtimeMs;
+      const latestSrcMtime = getNewestMtime(srcDir, '.rs');
+      if (latestSrcMtime > binaryMtime) {
+        const deltaMin = Math.round((latestSrcMtime - binaryMtime) / 60000);
+        issues.push({
+          id: 'binary-stale',
+          msg: `src/ modified ${deltaMin}min after last build`,
+          fix: 'cargo build --release',
+        });
+      }
+    }
+  } catch { /* skip check on error */ }
+
+  // Check 3: Auto-update incomplete
+  try {
+    const statePath = path.join(
+      os.homedir(), '.cache', 'code-graph', 'update-state.json'
+    );
+    const state = readJson(statePath);
+    if (state && state.updateAvailable && state.binaryUpdated === false) {
+      issues.push({
+        id: 'update-incomplete',
+        msg: `Plugin updated to v${state.latestVersion}, binary not updated`,
+        fix: 'code-graph-mcp doctor',
+      });
+    }
+  } catch { /* skip check on error */ }
+
+  // Output warnings to stderr
+  if (issues.length > 0) {
+    const lines = [`[code-graph] ${issues.length} consistency issue(s):`];
+    issues.forEach((issue, i) => {
+      lines.push(`  ${i + 1}. ${issue.msg}`);
+      lines.push(`     → ${issue.fix}`);
+    });
+    process.stderr.write(lines.join('\n') + '\n');
+  }
+
+  return issues;
+}
+
 function runSessionInit() {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
@@ -183,7 +250,10 @@ function runSessionInit() {
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
   const mapInjected = binaryCheck.available ? injectProjectMap() : false;
-  return { inactive: false, lifecycle, autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck };
+  const consistencyIssues = binaryCheck.available
+    ? consistencyCheck(binaryCheck.binary)
+    : [];
+  return { inactive: false, lifecycle, autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues };
 }
 
 /**
@@ -221,6 +291,7 @@ module.exports = {
   ensureIndexFresh,
   injectProjectMap,
   verifyBinary,
+  consistencyCheck,
   runSessionInit,
 };
 
