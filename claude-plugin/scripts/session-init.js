@@ -6,7 +6,7 @@ const os = require('os');
 const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
-  cleanupDisabledStatusline, isPluginInactive, readJson,
+  cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 
@@ -202,9 +202,7 @@ function consistencyCheck(binary) {
 
   // Check 3: Auto-update incomplete
   try {
-    const statePath = path.join(
-      os.homedir(), '.cache', 'code-graph', 'update-state.json'
-    );
+    const statePath = path.join(CACHE_DIR, 'update-state.json');
     const state = readJson(statePath);
     if (state && state.updateAvailable && state.binaryUpdated === false) {
       issues.push({

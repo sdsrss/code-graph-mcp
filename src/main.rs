@@ -125,7 +125,13 @@ fn main() -> Result<()> {
                     if args.iter().any(|a| a == "--check-only") {
                         cmd.arg("--check-only");
                     }
-                    let status = cmd.status()?;
+                    let status = cmd.status().map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            anyhow::anyhow!("Node.js not found. Install Node.js to use 'code-graph-mcp doctor'.")
+                        } else {
+                            e.into()
+                        }
+                    })?;
                     std::process::exit(status.code().unwrap_or(1));
                 }
             }

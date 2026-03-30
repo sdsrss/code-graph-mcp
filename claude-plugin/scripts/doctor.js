@@ -205,18 +205,17 @@ function runRepairs(results) {
       case 'binary-stale':
       case 'version-mismatch': {
         if (!isDevMode()) {
-          console.log('\n  Downloading binary...');
+          console.log('\n  Triggering binary update...');
           try {
-            const { checkForUpdate } = require('./auto-update');
-            checkForUpdate().then(() => {
-              console.log('  \u2705 Binary download triggered (runs in background)');
-            }).catch(() => {
-              console.log('  \u274c Binary download failed — install manually');
+            execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], {
+              timeout: 60000,
+              stdio: 'inherit',
             });
+            console.log('  \u2705 Update check complete');
+            fixed++;
           } catch {
-            console.log('  \u274c Could not trigger auto-update');
+            console.log('  \u274c Update check failed — install manually');
           }
-          fixed++;
           break;
         }
         console.log('\n  Building binary...');
@@ -301,15 +300,14 @@ function runRepairs(results) {
       case 'update-incomplete': {
         console.log('\n  Completing auto-update...');
         try {
-          const { checkForUpdate } = require('./auto-update');
-          checkForUpdate().then(() => {
-            console.log('  \u2705 Update check triggered');
-          }).catch(() => {
-            console.log('  \u274c Update check failed');
+          execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], {
+            timeout: 60000,
+            stdio: 'inherit',
           });
+          console.log('  \u2705 Update check complete');
           fixed++;
         } catch {
-          console.log('  \u274c Could not trigger update');
+          console.log('  \u274c Update check failed');
         }
         break;
       }
