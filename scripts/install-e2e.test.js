@@ -87,7 +87,7 @@ test('§1.4 plugin install registers all 4 hook events to settings.json', () => 
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -126,7 +126,7 @@ test('§1.5 plugin install creates install manifest with version', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -152,7 +152,7 @@ test('§1.6 plugin install sets up composite statusline', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -196,7 +196,7 @@ test('§1.7 plugin update refreshes hook paths and clears update cache', () => {
   fs.writeFileSync(updateCache, '{}');
 
   execFileSync(process.execPath, [LIFECYCLE, 'update'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -224,7 +224,7 @@ test('§1.8 plugin uninstall removes all traces', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -233,7 +233,7 @@ test('§1.8 plugin uninstall removes all traces', () => {
 
   // Then uninstall
   execFileSync(process.execPath, [LIFECYCLE, 'uninstall'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -273,7 +273,7 @@ test('§1.9 plugin install migrates old plugin IDs', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
 
@@ -299,7 +299,7 @@ test('§1.10 plugin install is idempotent', () => {
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
 
-  const env = { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT };
+  const env = { ...process.env, HOME: homeDir };
 
   // Install twice
   execFileSync(process.execPath, [LIFECYCLE, 'install'], { env, stdio: 'pipe' });
@@ -640,9 +640,9 @@ test('§4.2 binary serve responds to MCP initialize', async () => {
 });
 
 test('§4.3 mcp-launcher.js resolves binary in dev mode', () => {
-  // Test that mcp-launcher can at least find the binary
+  // Test that find-binary can locate binary without CLAUDE_PLUGIN_ROOT
+  // (mcp-launcher.js now derives _FIND_BINARY_ROOT from __dirname)
   const result = execFileSync(process.execPath, ['-e', `
-    process.env.CLAUDE_PLUGIN_ROOT = ${JSON.stringify(PLUGIN_ROOT)};
     process.env._FIND_BINARY_ROOT = ${JSON.stringify(PLUGIN_ROOT)};
     const { findBinary } = require(${JSON.stringify(path.join(PLUGIN_ROOT, 'scripts', 'find-binary.js'))});
     const bin = findBinary();
@@ -652,7 +652,7 @@ test('§4.3 mcp-launcher.js resolves binary in dev mode', () => {
       process.stdout.write('NOTFOUND');
     }
   `], {
-    env: { ...process.env, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+    env: { ...process.env },
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString();
 
@@ -714,7 +714,7 @@ test('§6.1 full lifecycle: fresh install → use → update → uninstall', () 
   const cacheDir = path.join(homeDir, '.cache', 'code-graph');
   const manifestPath = path.join(cacheDir, 'install-manifest.json');
   const registryPath = path.join(cacheDir, 'statusline-registry.json');
-  const env = { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT };
+  const env = { ...process.env, HOME: homeDir };
 
   // Phase 1: Fresh install (no prior settings)
   writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });

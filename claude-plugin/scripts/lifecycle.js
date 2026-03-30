@@ -11,7 +11,10 @@ const OLD_PLUGIN_IDS = [
 ];
 const MARKETPLACE_NAME = 'code-graph-mcp';
 const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
-const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
+// Always derive from __dirname — CLAUDE_PLUGIN_ROOT env var can leak from other
+// plugins when hooks run in shared process context (e.g. claude-mem-lite sets it
+// to its own marketplace path, polluting all subsequent settings.json hook processes).
+const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
@@ -223,9 +226,18 @@ function migrateOldPluginIds(settings) {
 // Same strategy as claude-mem-lite. hooks.json is kept empty to prevent double-firing.
 
 const OUR_HOOK_SCRIPTS = ['session-init.js', 'incremental-index.js', 'user-prompt-context.js', 'pre-edit-guide.js'];
+const OUR_DESCRIPTIONS = [
+  'StatusLine self-heal, lifecycle sync, project map injection',
+  'Auto-inject impact analysis when editing functions with 2+ callers',
+  'Auto-update code graph index after file edits',
+  'Inject code-graph structural context based on user intent',
+];
 
 function isOurHookEntry(entry) {
   if (!entry || !entry.hooks) return false;
+  // Primary: match by description (immune to path pollution)
+  if (entry.description && OUR_DESCRIPTIONS.includes(entry.description)) return true;
+  // Fallback: match by script name + 'code-graph' in path
   return entry.hooks.some(h =>
     h.command && OUR_HOOK_SCRIPTS.some(s => h.command.includes(s)) &&
     h.command.includes('code-graph')
@@ -269,17 +281,17 @@ function registerHooksToSettings(settings) {
   for (const [event, newEntries] of Object.entries(defs)) {
     if (!settings.hooks[event]) settings.hooks[event] = [];
 
+    // First, remove ALL existing entries that match ours (cleans up duplicates
+    // from prior PLUGIN_ROOT pollution where isOurHookEntry couldn't match,
+    // causing infinite re-adds each session).
+    const beforeLen = settings.hooks[event].length;
+    settings.hooks[event] = settings.hooks[event].filter(e => !isOurHookEntry(e));
+    if (settings.hooks[event].length !== beforeLen) changed = true;
+
+    // Then add our entries fresh with correct paths
     for (const newEntry of newEntries) {
-      const existingIdx = settings.hooks[event].findIndex(e => isOurHookEntry(e));
-      if (existingIdx >= 0) {
-        if (JSON.stringify(settings.hooks[event][existingIdx]) !== JSON.stringify(newEntry)) {
-          settings.hooks[event][existingIdx] = newEntry;
-          changed = true;
-        }
-      } else {
-        settings.hooks[event].push(newEntry);
-        changed = true;
-      }
+      settings.hooks[event].push(newEntry);
+      changed = true;
     }
   }
 
@@ -328,6 +340,13 @@ function install() {
     settings.statusLine = { type: 'command', command: compositeCommand() };
     settingsChanged = true;
     manifest.config.statusLine = true;
+  } else {
+    // Composite exists — ensure path is correct (may have been polluted by env leak)
+    const cmd = compositeCommand();
+    if (settings.statusLine.command !== cmd) {
+      settings.statusLine.command = cmd;
+      settingsChanged = true;
+    }
   }
 
   // Register code-graph provider
@@ -506,8 +525,60 @@ function cleanupOldCacheVersions(keep = 3) {
   } catch { /* cache dir doesn't exist — nothing to clean */ }
 }
 
+// --- Health Check ---
+// Validates all registered paths in settings.json point to existing scripts.
+// Returns { healthy, issues, repaired }.
+
+function healthCheck() {
+  const settings = readJson(SETTINGS_PATH) || {};
+  const issues = [];
+
+  // Check statusLine path
+  if (isOurComposite(settings)) {
+    const m = settings.statusLine.command.match(/node\s+"([^"]+)"/);
+    if (m && m[1] && !fs.existsSync(m[1])) {
+      issues.push({ type: 'statusLine', path: m[1] });
+    }
+  }
+
+  // Check hook paths
+  if (settings.hooks) {
+    for (const [event, entries] of Object.entries(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (!isOurHookEntry(entry) || !entry.hooks) continue;
+        for (const h of entry.hooks) {
+          const m = h.command && h.command.match(/node\s+"([^"]+)"/);
+          if (m && m[1] && !fs.existsSync(m[1])) {
+            issues.push({ type: 'hook', event, path: m[1] });
+          }
+        }
+      }
+    }
+  }
+
+  // Check registry paths
+  const registry = readRegistry();
+  for (const provider of registry) {
+    if (provider.id === '_previous') continue;
+    const m = provider.command && provider.command.match(/node\s+"([^"]+)"/);
+    if (m && m[1] && !fs.existsSync(m[1])) {
+      issues.push({ type: 'registry', id: provider.id, path: m[1] });
+    }
+  }
+
+  // Auto-repair if issues found
+  let repaired = false;
+  if (issues.length > 0) {
+    install();
+    repaired = true;
+  }
+
+  return { healthy: issues.length === 0, issues, repaired };
+}
+
 module.exports = {
-  install, uninstall, update, checkScopeConflict,
+  install, uninstall, update, healthCheck, checkScopeConflict,
   isPluginExplicitlyDisabled, isPluginInactive, cleanupDisabledStatusline,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
@@ -516,7 +587,7 @@ module.exports = {
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 
-// CLI: node lifecycle.js <install|uninstall|update>
+// CLI: node lifecycle.js <install|uninstall|update|health>
 if (require.main === module) {
   const cmd = process.argv[2];
   if (cmd === 'install') {
@@ -528,8 +599,18 @@ if (require.main === module) {
   } else if (cmd === 'update') {
     const r = update();
     console.log(`Updated ${r.oldVersion} → ${r.version} | settings=${r.settingsChanged}`);
+  } else if (cmd === 'health') {
+    const r = healthCheck();
+    if (r.healthy) {
+      console.log('Health: OK — all paths valid');
+    } else {
+      console.log(`Health: ${r.issues.length} issue(s) found${r.repaired ? ' — repaired' : ''}`);
+      for (const issue of r.issues) {
+        console.log(`  ${issue.type}: ${issue.path || issue.id}`);
+      }
+    }
   } else {
-    console.error('Usage: lifecycle.js <install|uninstall|update>');
+    console.error('Usage: lifecycle.js <install|uninstall|update|health>');
     process.exit(1);
   }
 }

@@ -82,8 +82,8 @@ function parseCommand(cmd) {
 }
 
 function codeGraphCommand() {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
-  return `node "${path.join(pluginRoot, 'scripts', 'statusline.js')}"`;
+  // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
+  return `node "${path.join(__dirname, 'statusline.js')}"`;
 }
 
 module.exports = { run };

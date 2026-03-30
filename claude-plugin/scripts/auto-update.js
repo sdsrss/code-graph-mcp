@@ -68,7 +68,8 @@ function saveState(state) {
 // ── Dev Mode Detection ─────────────────────────────────────
 
 function isDevMode() {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
+  // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
+  const pluginRoot = path.resolve(__dirname, '..');
   // Dev mode: running from source repo (has Cargo.toml nearby)
   if (fs.existsSync(path.join(pluginRoot, '..', 'Cargo.toml'))) return true;
   // Dev mode: plugin root is a symlink
@@ -280,6 +281,20 @@ async function downloadAndInstall(latest) {
       manifest.updatedAt = new Date().toISOString();
       writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
     } catch { /* not fatal */ }
+
+    // Run the NEW lifecycle.js to update settings.json hooks with new paths.
+    // Without this, settings.json hooks still point to the old version directory
+    // until the next session's self-heal corrects them.
+    if (pluginUpdated) {
+      try {
+        const newLifecycle = path.join(pluginDst, 'scripts', 'lifecycle.js');
+        if (fs.existsSync(newLifecycle)) {
+          execFileSync(process.execPath, [newLifecycle, 'update'], {
+            timeout: 5000, stdio: 'pipe',
+          });
+        }
+      } catch { /* not fatal — syncLifecycleConfig will self-heal on next session */ }
+    }
 
     // ── Step 2: Download platform binary directly from GitHub release ──
     if (latest.binaryUrl) {

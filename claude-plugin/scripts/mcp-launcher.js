@@ -12,7 +12,8 @@ const path = require('path');
 const fs = require('fs');
 
 // Set plugin root so find-binary.js can locate bundled/dev binaries
-process.env._FIND_BINARY_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
+// Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
+process.env._FIND_BINARY_ROOT = path.resolve(__dirname, '..');
 
 const { findBinary, clearCache } = require('./find-binary');
 

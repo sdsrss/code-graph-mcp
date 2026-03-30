@@ -1,4 +1,16 @@
 {
-  "_note": "Hooks registered to settings.json by lifecycle.js — hooks.json auto-loading is unreliable",
-  "hooks": {}
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
 }

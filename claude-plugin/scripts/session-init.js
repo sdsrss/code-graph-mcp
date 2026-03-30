@@ -35,14 +35,36 @@ function syncLifecycleConfig() {
     update();
     return 'updated';
   }
-  // Self-heal: version matches but statusLine may have been lost
-  // (e.g. plugin removed and reinstalled without lifecycle uninstall).
+  // Self-heal: version matches but statusLine may have been lost or path corrupted
+  // (e.g. plugin removed and reinstalled, or CLAUDE_PLUGIN_ROOT leaked from another plugin).
   // install() is idempotent — isOurComposite guard prevents duplicate work.
   const settings = readJson(path.join(os.homedir(), '.claude', 'settings.json')) || {};
   if (!settings.statusLine || !settings.statusLine.command ||
       !settings.statusLine.command.includes('statusline-composite')) {
     install();
     return 'self-healed';
+  }
+  // Also self-heal if composite path points to a non-existent script (path pollution)
+  const scriptMatch = settings.statusLine.command.match(/node\s+"([^"]+)"/);
+  if (scriptMatch && scriptMatch[1] && !fs.existsSync(scriptMatch[1])) {
+    install();
+    return 'self-healed-bad-path';
+  }
+  // Self-heal if any hook command points to a non-existent script (path pollution)
+  if (settings.hooks) {
+    for (const entries of Object.values(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (!entry.hooks) continue;
+        for (const h of entry.hooks) {
+          const m = h.command && h.command.match(/node\s+"([^"]+)"/);
+          if (m && m[1] && m[1].includes('code-graph') && !fs.existsSync(m[1])) {
+            install();
+            return 'self-healed-bad-hook';
+          }
+        }
+      }
+    }
   }
   return 'noop';
 }

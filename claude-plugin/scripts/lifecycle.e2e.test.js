@@ -26,9 +26,13 @@ function readJson(filePath) {
 }
 
 function runScript(homeDir, scriptPath, args = [], options = {}) {
+  const env = { ...process.env, HOME: homeDir };
+  // Do NOT set CLAUDE_PLUGIN_ROOT — lifecycle.js derives PLUGIN_ROOT from __dirname
+  // to avoid env var leakage from other plugins in shared hook execution context.
+  delete env.CLAUDE_PLUGIN_ROOT;
   return execFileSync(process.execPath, [scriptPath, ...args], {
     cwd: options.cwd || repoRoot,
-    env: { ...process.env, HOME: homeDir, CLAUDE_PLUGIN_ROOT: pluginRoot },
+    env,
     input: options.input,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString();
