@@ -119,7 +119,7 @@ fn walk_for_relations(
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let struct_name = node_text(&name_node, source);
                     // Strip path prefix: path::MyStruct → MyStruct
-                    let short_name = struct_name.rsplit("::").next().unwrap_or(&struct_name);
+                    let short_name = struct_name.rsplit("::").next().unwrap_or(struct_name);
                     if !short_name.is_empty() {
                         results.push(ParsedRelation {
                             source_name: scope.to_string(),
