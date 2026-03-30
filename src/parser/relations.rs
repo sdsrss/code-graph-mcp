@@ -112,6 +112,26 @@ fn walk_for_relations(
             }
         }
 
+        // Rust/Go: struct instantiation → calls edge (enables cross-file dead code tracking)
+        // e.g., `MyStruct { field: value }` or `MyStruct::new()` (calls already handled above)
+        "struct_expression" => {
+            if let Some(scope) = active_scope {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let struct_name = node_text(&name_node, source);
+                    // Strip path prefix: path::MyStruct → MyStruct
+                    let short_name = struct_name.rsplit("::").next().unwrap_or(&struct_name);
+                    if !short_name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: short_name.to_string(),
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // Ruby: `call` node kind for method calls (require, require_relative, and regular calls)
         "call" if config.name == "ruby" => {
             // Extract method name from the "method" field
@@ -322,10 +342,33 @@ fn walk_for_relations(
             extract_export_names(&node, source, results);
         }
 
-        // Rust: impl Trait for Type → implements edge
+        // Rust: impl Trait for Type → implements edge (type-level + method-level)
         "impl_item" => {
             if let Some(impl_rel) = extract_rust_impl_trait(&node, source) {
+                let type_name = impl_rel.source_name.clone();
                 results.push(impl_rel);
+                // For each method in the trait impl block, emit a method-level
+                // implements edge: TypeName → method_name. This ensures dead code
+                // detection sees incoming implements edges on trait methods.
+                if let Some(body) = node.child_by_field_name("body") {
+                    for i in 0..body.named_child_count() {
+                        if let Some(child) = body.named_child(i) {
+                            if child.kind() == "function_item" {
+                                if let Some(name_node) = child.child_by_field_name("name") {
+                                    let method_name = node_text(&name_node, source);
+                                    if !method_name.is_empty() {
+                                        results.push(ParsedRelation {
+                                            source_name: type_name.clone(),
+                                            target_name: method_name.to_string(),
+                                            relation: REL_IMPLEMENTS.into(),
+                                            metadata: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1673,9 +1716,10 @@ def list_items():
     fn test_extract_rust_impl_trait() {
         let source = r#"
 struct MyStruct;
-trait MyTrait { fn do_thing(&self); }
+trait MyTrait { fn do_thing(&self); fn other(&self); }
 impl MyTrait for MyStruct {
     fn do_thing(&self) {}
+    fn other(&self) {}
 }
 "#;
         let relations = extract_relations(source, "rust").unwrap();
@@ -1683,7 +1727,12 @@ impl MyTrait for MyStruct {
             .filter(|r| r.relation == REL_IMPLEMENTS)
             .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
             .collect();
+        // Type-level: MyStruct implements MyTrait
         assert!(impls.contains(&("MyStruct", "MyTrait")), "got implements: {:?}", impls);
+        // Method-level: MyStruct → do_thing, MyStruct → other
+        assert!(impls.contains(&("MyStruct", "do_thing")), "method-level edge missing for do_thing: {:?}", impls);
+        assert!(impls.contains(&("MyStruct", "other")), "method-level edge missing for other: {:?}", impls);
+        assert_eq!(impls.len(), 3, "expected 3 implements edges (1 type + 2 methods), got: {:?}", impls);
     }
 
     #[test]
@@ -1702,6 +1751,41 @@ impl MyStruct {
             .collect();
         assert!(impls.is_empty(), "bare impl should produce no implements relations, got: {:?}",
             impls.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_rust_struct_instantiation_creates_calls_edge() {
+        let source = r#"
+struct Config { verbose: bool, path: String }
+
+fn build_config() -> Config {
+    Config { verbose: true, path: "/tmp".into() }
+}
+"#;
+        let relations = extract_relations(source, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        assert!(calls.contains(&("build_config", "Config")),
+            "struct instantiation should create calls edge, got: {:?}", calls);
+    }
+
+    #[test]
+    fn test_rust_scoped_struct_instantiation() {
+        let source = r#"
+fn create() {
+    let node = crate::parser::NodeRecord { name: "foo".into() };
+}
+"#;
+        let relations = extract_relations(source, "rust").unwrap();
+        let calls: Vec<(&str, &str)> = relations.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect();
+        // Should strip path prefix, keeping just "NodeRecord"
+        assert!(calls.contains(&("create", "NodeRecord")),
+            "scoped struct should strip path, got: {:?}", calls);
     }
 
     #[test]

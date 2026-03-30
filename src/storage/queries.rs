@@ -264,9 +264,9 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
-pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<Vec<(i64, String, String, Option<String>)>> {
+pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT e.source_id, nt.name, e.relation, e.metadata
+        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata
          FROM edges e
          JOIN nodes nt ON nt.id = e.target_id
          JOIN nodes ns ON ns.id = e.source_id
@@ -275,9 +275,10 @@ pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<V
     let rows = stmt.query_map([file_id], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1746,6 +1747,7 @@ pub fn find_dead_code(
         "n.type != 'module'".to_string(),
         "n.name != '<module>'".to_string(),
         "n.name != 'main'".to_string(),
+        "f.path != '<external>'".to_string(),
         "(n.end_line - n.start_line + 1) >= :min_lines".to_string(),
     ];
 
@@ -1794,19 +1796,33 @@ pub fn find_dead_code(
                WHERE source_id = n.id AND target_id = n.id
                  AND relation = :rel_routes_to
            )
-           -- For non-callable types (struct/enum/type/const/interface), also check
-           -- if the name appears in any function's code in the same file.
-           -- This catches struct instantiation, type usage, etc. that the parser
-           -- doesn't track as graph edges.
+           -- Check if the name appears as a standalone identifier in another
+           -- function's code in the same file. Uses delimiter-aware matching
+           -- to avoid false matches where the name is a prefix of a longer
+           -- identifier (e.g., `get_x` matching inside `get_x_batch`).
+           -- This catches references the parser doesn't track as edges:
+           --   1. Struct instantiation, type usage
+           --   2. Function pointers/callbacks (e.g., `query_map(params, map_fn)`)
            AND (
-               n.type IN ('function', 'method')
-               OR length(n.name) < 3
+               length(n.name) < 3
                OR NOT EXISTS (
                    SELECT 1 FROM nodes n2
                    WHERE n2.file_id = n.file_id
                      AND n2.id != n.id
                      AND n2.type IN ('function', 'method')
-                     AND instr(n2.code_content, n.name) > 0
+                     AND (
+                         instr(n2.code_content, n.name || '(') > 0
+                         OR instr(n2.code_content, n.name || ')') > 0
+                         OR instr(n2.code_content, n.name || ',') > 0
+                         OR instr(n2.code_content, n.name || ' ') > 0
+                         OR instr(n2.code_content, n.name || ';') > 0
+                         OR instr(n2.code_content, n.name || char(10)) > 0
+                         OR instr(n2.code_content, n.name || ':') > 0
+                         OR instr(n2.code_content, n.name || '<') > 0
+                         OR instr(n2.code_content, n.name || '.') > 0
+                         OR instr(n2.code_content, n.name || '{{') > 0
+                         OR instr(n2.code_content, n.name || '}}') > 0
+                     )
                )
            )
          ORDER BY (n.end_line - n.start_line + 1) DESC
@@ -2335,13 +2351,23 @@ mod tests {
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
+        // 8. callback_fn — no call edge, but name appears in another function's code
+        //    (function pointer passed as argument) → should NOT be dead code
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "callback_fn".into(),
+            qualified_name: None, start_line: 91, end_line: 105,
+            code_content: "fn callback_fn(row: &Row) -> Result<Item> { Ok(row.get(0)?) }".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
         // --- Create edges ---
-        // Someone calls used_fn
+        // Someone calls used_fn and passes callback_fn as a function pointer
         let caller_id = insert_node(conn, &NodeRecord {
             file_id: fid, node_type: "function".into(), name: "caller".into(),
             qualified_name: None, start_line: 86, end_line: 90,
-            code_content: "function caller() { used_fn(); }".into(), signature: None,
-            doc_comment: None, context_string: None,
+            code_content: "fn caller() { used_fn(); stmt.query_map(params, callback_fn).unwrap(); }".into(),
+            signature: None, doc_comment: None, context_string: None,
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
         insert_edge(conn, caller_id, used_fn_id, REL_CALLS, None).unwrap();
@@ -2374,6 +2400,7 @@ mod tests {
         assert!(!names.contains(&"test_something"), "test node should be excluded by default");
         assert!(!names.contains(&"handle_login"), "route handler should be excluded");
         assert!(!names.contains(&"<module>"), "<module> should be excluded");
+        assert!(!names.contains(&"callback_fn"), "callback_fn should be excluded (referenced as function pointer in caller's code)");
 
         // Verify has_export_edge classification
         let orphan = results.iter().find(|r| r.name == "orphan_fn").unwrap();

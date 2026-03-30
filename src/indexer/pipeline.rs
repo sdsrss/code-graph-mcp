@@ -624,7 +624,10 @@ fn index_files(
 
         let mut batch_parsed: Vec<FileParsed> = Vec::new();
         // Saved inbound edges from other files → batch files (to restore after cascade delete)
-        let mut saved_inbound_edges: Vec<(i64, String, String, Option<String>)> = Vec::new();
+        // Tuple: (source_id, source_file_id, target_name, relation, metadata)
+        let mut saved_inbound_edges: Vec<(i64, i64, String, String, Option<String>)> = Vec::new();
+        // Track file_ids in this batch to filter intra-batch edges in Phase 2c
+        let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
         // --- Phase 1b: Sequential DB inserts ---
         for pp in pre_parsed {
@@ -637,6 +640,7 @@ fn index_files(
 
             // Save cross-file inbound edges before cascade delete destroys them
             saved_inbound_edges.extend(get_inbound_cross_file_edges(db.conn(), file_id)?);
+            batch_file_ids.insert(file_id);
 
             delete_nodes_by_file(db.conn(), file_id)?;
 
@@ -732,6 +736,9 @@ fn index_files(
 
         // Track unresolved external Python imports: (source_module_node_id, module_name)
         let mut external_python_imports: Vec<(i64, String)> = Vec::new();
+        // Track unresolved external symbols for sentinel node creation:
+        // (source_id, target_name, relation) — e.g., implements edges to external traits
+        let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
 
         for pf in &batch_parsed {
             let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
@@ -804,11 +811,19 @@ fn index_files(
                     all_target_ids
                 };
 
-                for &src_id in &source_ids {
-                    for &tgt_id in &target_ids {
-                        if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
-                            && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
-                            total_edges_created += 1;
+                if target_ids.is_empty() && rel.relation == REL_IMPLEMENTS {
+                    // Unresolved implements target (e.g., external trait like Write, Default)
+                    // Collect for sentinel node creation in Phase 2b
+                    for &src_id in &source_ids {
+                        unresolved_externals.push((src_id, rel.target_name.clone(), rel.relation.clone()));
+                    }
+                } else {
+                    for &src_id in &source_ids {
+                        for &tgt_id in &target_ids {
+                            if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
+                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                total_edges_created += 1;
+                            }
                         }
                     }
                 }
@@ -867,6 +882,64 @@ fn index_files(
             }
         }
 
+        // Phase 2b-ext: Create sentinel nodes for unresolved external symbols
+        // (e.g., Rust `impl Write for SharedStdout` where Write is from std::io)
+        if !unresolved_externals.is_empty() {
+            let ext_file_id = upsert_file(db.conn(), &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: Some("external".into()),
+            })?;
+
+            let existing_ext_nodes: HashMap<String, i64> =
+                get_nodes_by_file_path(db.conn(), "<external>")?
+                    .into_iter()
+                    .map(|n| (n.name.clone(), n.id))
+                    .collect();
+
+            let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
+
+            // Collect unique targets with inferred type
+            let unique_targets: HashMap<&str, &str> = unresolved_externals.iter()
+                .map(|(_, name, rel)| {
+                    let node_type = if rel == REL_IMPLEMENTS { "trait" } else { "module" };
+                    (name.as_str(), node_type)
+                })
+                .collect();
+
+            for (&name, &node_type) in &unique_targets {
+                if !ext_node_ids.contains_key(name) {
+                    let node_id = insert_node_cached(db.conn(), &NodeRecord {
+                        file_id: ext_file_id,
+                        node_type: node_type.into(),
+                        name: name.into(),
+                        qualified_name: Some(format!("<external>/{}", name)),
+                        start_line: 0,
+                        end_line: 0,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    })?;
+                    ext_node_ids.insert(name.into(), node_id);
+                    total_nodes_created += 1;
+                }
+            }
+
+            for (source_id, target_name, relation) in &unresolved_externals {
+                if let Some(&ext_id) = ext_node_ids.get(target_name.as_str()) {
+                    if insert_edge_cached(db.conn(), *source_id, ext_id, relation, None)? {
+                        total_edges_created += 1;
+                    }
+                }
+            }
+        }
+
         // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
         // When a file is re-indexed, its old nodes are deleted (cascade-deleting edges).
         // Edges from OTHER files into the re-indexed file must be rebuilt using new node IDs.
@@ -880,7 +953,14 @@ fn index_files(
             }
 
             let mut restored = 0usize;
-            for (source_id, target_name, relation, metadata) in &saved_inbound_edges {
+            let mut skipped_intra_batch = 0usize;
+            for (source_id, source_file_id, target_name, relation, metadata) in &saved_inbound_edges {
+                // Source file is also in this batch — source_id is stale (deleted + re-created).
+                // Phase 2 already resolves cross-file edges for intra-batch files.
+                if batch_file_ids.contains(source_file_id) {
+                    skipped_intra_batch += 1;
+                    continue;
+                }
                 if let Some(new_target_ids) = batch_name_to_ids.get(target_name.as_str()) {
                     for &new_tgt_id in new_target_ids {
                         if *source_id != new_tgt_id
@@ -891,8 +971,8 @@ fn index_files(
                     }
                 }
             }
-            if restored > 0 {
-                tracing::debug!("[index] Restored {} cross-file inbound edges", restored);
+            if restored > 0 || skipped_intra_batch > 0 {
+                tracing::debug!("[index] Restored {} cross-file inbound edges, skipped {} intra-batch", restored, skipped_intra_batch);
             }
         }
 
@@ -1395,5 +1475,60 @@ function beta() { alpha(); }
 
         let beta_repaired = get_nodes_by_name(db.conn(), "beta").unwrap();
         assert!(beta_repaired[0].context_string.is_some(), "beta should have context_string after repair");
+    }
+
+    #[test]
+    fn test_rust_implements_creates_sentinel_for_external_trait() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+        fs::write(project_dir.path().join("main.rs"), r#"
+use std::io::{self, Write};
+use std::fmt;
+
+struct MyWriter;
+
+impl Write for MyWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { Ok(buf.len()) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+impl fmt::Display for MyWriter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "MyWriter")
+    }
+}
+"#).unwrap();
+
+        let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        assert!(result.files_indexed > 0);
+
+        // Verify sentinel nodes created for external traits
+        let ext_nodes = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+        let ext_names: Vec<&str> = ext_nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(ext_names.contains(&"Write"), "should have sentinel for Write, got: {:?}", ext_names);
+        // fmt::Display keeps path prefix (as parsed by tree-sitter)
+        assert!(ext_names.contains(&"fmt::Display"), "should have sentinel for fmt::Display, got: {:?}", ext_names);
+
+        // Verify sentinel type is "trait"
+        let write_node = ext_nodes.iter().find(|n| n.name == "Write").unwrap();
+        assert_eq!(write_node.node_type, "trait", "sentinel should be type 'trait'");
+
+        // Verify implements edges exist: MyWriter → Write, MyWriter → Display
+        let edges: Vec<(String, String)> = db.conn().prepare(
+            "SELECT ns.name, nt.name FROM edges e
+             JOIN nodes ns ON ns.id = e.source_id
+             JOIN nodes nt ON nt.id = e.target_id
+             WHERE e.relation = 'implements'"
+        ).unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert!(edges.contains(&("MyWriter".into(), "Write".into())),
+            "should have MyWriter→Write implements edge, got: {:?}", edges);
+        assert!(edges.contains(&("MyWriter".into(), "fmt::Display".into())),
+            "should have MyWriter→fmt::Display implements edge, got: {:?}", edges);
     }
 }

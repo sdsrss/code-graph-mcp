@@ -218,7 +218,8 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
         }
     }
 
-    let db = Database::open(&db_path)?;
+    // Open with vec support so embeddings can be stored
+    let db = Database::open_with_vec(&db_path)?;
 
     if is_new {
         // Full index for new databases
@@ -241,6 +242,26 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
             );
         }
     }
+
+    // Embed any nodes missing vectors (runs synchronously, unlike server background thread)
+    if db.vec_enabled() {
+        use crate::embedding::model::EmbeddingModel;
+        use crate::indexer::pipeline::embed_and_store_batch;
+        if let Some(model) = EmbeddingModel::load()? {
+            let mut total = 0usize;
+            loop {
+                let chunk = queries::get_unembedded_nodes(db.conn(), 64)?;
+                if chunk.is_empty() { break; }
+                embed_and_store_batch(&db, &model, &chunk)?;
+                total += chunk.len();
+            }
+            if total > 0 && !quiet {
+                let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())?;
+                eprintln!("Embedded {} nodes ({}/{})", total, embedded, embeddable);
+            }
+        }
+    }
+
     Ok(())
 }
 

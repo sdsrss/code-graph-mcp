@@ -882,7 +882,7 @@ impl McpServer {
                 if wait_result.timed_out() && !*done {
                     anyhow::bail!(
                         "Indexing in progress — results will be available shortly. \
-                         Please retry your request in a few seconds or call get_index_status for details."
+                         Please retry your request in a few seconds or run `code-graph-mcp health-check` for details."
                     );
                 }
             }
@@ -964,9 +964,41 @@ impl McpServer {
                 Ok(())
             }
             Err(e) => {
-                tracing::error!("Incremental index failed, restoring cache: {}", e);
-                *lock_or_recover(&self.dir_cache, "dir_cache") = cache_snapshot;
-                Err(e)
+                let err_msg = e.to_string();
+                if err_msg.contains("FOREIGN KEY constraint failed") {
+                    // DB state is inconsistent with in-memory caches (e.g., DB replaced
+                    // externally, or stale node IDs from a previous session).
+                    // Recovery: clear all caches and fall back to full re-index.
+                    tracing::warn!(
+                        "Incremental index hit FK constraint — DB state may be stale. \
+                         Falling back to full re-index."
+                    );
+                    *lock_or_recover(&self.dir_cache, "dir_cache") = None;
+                    *lock_or_recover(&self.indexed, "indexed") = false;
+                    *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+                    lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
+
+                    let progress_cb = |current: usize, total: usize| {
+                        self.send_progress("indexing", current, total);
+                    };
+                    match run_full_index(&self.db, project_root, model, Some(&progress_cb)) {
+                        Ok(result) => {
+                            *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
+                            *lock_or_recover(&self.indexed, "indexed") = true;
+                            self.spawn_background_embedding();
+                            tracing::info!("Full re-index recovery successful");
+                            Ok(())
+                        }
+                        Err(e2) => {
+                            tracing::error!("Full re-index recovery also failed: {}", e2);
+                            Err(e2)
+                        }
+                    }
+                } else {
+                    tracing::error!("Incremental index failed, restoring cache: {}", e);
+                    *lock_or_recover(&self.dir_cache, "dir_cache") = cache_snapshot;
+                    Err(e)
+                }
             }
         }
     }
@@ -1075,7 +1107,7 @@ impl McpServer {
                 "  2. Use semantic_code_search with compact=true first \u{2014} saves tokens\n",
                 "  3. Expand results: get_ast_node(node_id=N, compact=true) for signature, or without compact for full code\n",
                 "  4. Before changes: impact_analysis to check blast radius\n",
-                "  5. If search returns no/unexpected results: call get_index_status to check index health and embedding coverage\n",
+                "  5. If search returns no/unexpected results: run `code-graph-mcp health-check` to check index health and embedding coverage\n",
                 "  Prompts available: impact-analysis, understand-module, trace-request\n",
                 "\n",
                 "Decision rules (use INSTEAD OF multi-step Grep/Read):\n",
@@ -1085,7 +1117,11 @@ impl McpServer {
                 "  \u{2022} \"find code that does Z\" (concept) \u{2192} semantic_code_search (NOT grep)\n",
                 "  \u{2022} \"find all functions returning T\" \u{2192} ast_search with --returns filter\n",
                 "  \u{2022} \"is this function used anywhere?\" \u{2192} find_references\n",
-                "  \u{2022} modifying a function signature \u{2192} impact_analysis FIRST, then find all call sites"
+                "  \u{2022} modifying a function signature \u{2192} impact_analysis FIRST, then find all call sites\n",
+                "  \u{2022} \"find unused/dead code\" / \"clean up exports\" \u{2192} find_dead_code\n",
+                "  \u{2022} \"find similar/duplicate functions\" \u{2192} find_similar_code\n",
+                "  \u{2022} \"what does file X depend on?\" / \"who imports X?\" \u{2192} dependency_graph\n",
+                "  \u{2022} \"show me function X\" / inspect before editing \u{2192} get_ast_node (with include_references/include_impact)"
             )
         }))
     }
