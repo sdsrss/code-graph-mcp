@@ -7,6 +7,7 @@ const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic } = require('./lifecycle');
 const { clearCache: clearBinaryCache } = require('./find-binary');
+const { readBinaryVersion, isDevMode } = require('./version-utils');
 
 // ── Environment Checks ────────────────────────────────────
 
@@ -32,7 +33,6 @@ const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h
 const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
 const FETCH_TIMEOUT_MS = 3000;
-const VERSION_OUTPUT_RE = /^code-graph-mcp\s+(\d+\.\d+\.\d+)$/;
 
 function isSilentMode(argv = process.argv.slice(2), env = process.env) {
   return argv.includes('--silent') || env.CODE_GRAPH_AUTO_UPDATE_SILENT === '1';
@@ -63,18 +63,6 @@ function saveState(state) {
   try {
     writeJsonAtomic(STATE_FILE, state);
   } catch { /* ok */ }
-}
-
-// ── Dev Mode Detection ─────────────────────────────────────
-
-function isDevMode() {
-  // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
-  const pluginRoot = path.resolve(__dirname, '..');
-  // Dev mode: running from source repo (has Cargo.toml nearby)
-  if (fs.existsSync(path.join(pluginRoot, '..', 'Cargo.toml'))) return true;
-  // Dev mode: plugin root is a symlink
-  try { if (fs.lstatSync(pluginRoot).isSymbolicLink()) return true; } catch { /* ok */ }
-  return false;
 }
 
 // ── Throttle ───────────────────────────────────────────────
@@ -182,19 +170,6 @@ function copyDirSync(src, dst) {
 function getExtractedPluginVersion(pluginSrc) {
   const manifest = readJson(path.join(pluginSrc, '.claude-plugin', 'plugin.json'));
   return manifest && typeof manifest.version === 'string' ? manifest.version : null;
-}
-
-function readBinaryVersion(binaryPath) {
-  try {
-    const out = execFileSync(binaryPath, ['--version'], {
-      timeout: 2000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).toString().trim();
-    const match = out.match(VERSION_OUTPUT_RE);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
 }
 
 function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
