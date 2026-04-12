@@ -32,6 +32,9 @@ fn main() -> Result<()> {
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
             let project_root = std::env::current_dir()?;
+            if !project_root.join(".git").exists() {
+                return Ok(());
+            }
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
         Some("health-check") => {
