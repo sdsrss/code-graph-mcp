@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 
-/// Newtype wrapper around `Arc<Mutex<io::Stdout>>` so both the main loop
-/// and `McpServer::send_notification` share a single, mutex-protected handle.
+/// Newtype wrapper around `Arc<Mutex<io::Stdout>>` for concurrent stdout access.
+/// Allows main loop and background threads to safely share stdout without interleaving JSON.
 struct SharedStdout(Arc<Mutex<io::Stdout>>);
 
 impl Write for SharedStdout {
@@ -15,6 +15,7 @@ impl Write for SharedStdout {
     }
 }
 
+/// Entry point for code-graph-mcp CLI dispatcher.
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
@@ -32,7 +33,9 @@ fn main() -> Result<()> {
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
             let project_root = std::env::current_dir()?;
-            if !project_root.join(".git").exists() {
+            // Walk ancestors to find a git repo (.git as file or dir)
+            let in_git_repo = project_root.ancestors().any(|ancestor| ancestor.join(".git").exists());
+            if !in_git_repo {
                 return Ok(());
             }
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
@@ -153,10 +156,12 @@ fn main() -> Result<()> {
     }
 }
 
+/// Print version information to stdout.
 fn print_version() {
     println!("code-graph-mcp {}", env!("CARGO_PKG_VERSION"));
 }
 
+/// Print full help text with command and option descriptions.
 fn print_help() {
     print_version();
     println!("AST-based code graph with semantic search\n");
@@ -206,6 +211,7 @@ fn print_help() {
     println!("    -V, --version       Show version");
 }
 
+/// Run MCP JSON-RPC server on stdio, handling requests until EOF.
 fn run_serve() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -308,6 +314,7 @@ const SUBCOMMANDS: &[&str] = &[
     "dead-code", "incremental-index", "health-check", "doctor", "benchmark",
 ];
 
+/// Suggest a likely subcommand match based on Levenshtein distance.
 fn suggest_subcommand(input: &str) -> Option<&'static str> {
     let input_lower = input.to_lowercase();
     let mut best: Option<(&str, usize)> = None;
@@ -321,6 +328,7 @@ fn suggest_subcommand(input: &str) -> Option<&'static str> {
     best.map(|(cmd, _)| cmd)
 }
 
+/// Compute Levenshtein distance between two strings.
 fn levenshtein_small(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
