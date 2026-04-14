@@ -220,6 +220,88 @@ function migrateOldPluginIds(settings) {
   return changed;
 }
 
+// --- Plugin-cache hooks.json guard ---
+// Claude Code loads hooks from TWO places: settings.json AND the plugin cache
+// at ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json. If both have
+// our hooks, every event fires twice. We register to settings.json (reliable),
+// so cache copies must stay empty. Auto-updates can re-populate cache hooks.json
+// from the marketplace source — this scan+clear runs on every install/update and
+// every SessionStart (via session-init.js) as a second layer of defense.
+
+const EMPTY_HOOKS_STUB = Object.freeze({
+  description: 'code-graph-mcp hooks',
+  _note: 'Hooks are registered to ~/.claude/settings.json by lifecycle.js. Cleared automatically to prevent double-firing.',
+  hooks: {},
+});
+
+function isOurPluginMarketplace(mpDir) {
+  try {
+    const meta = readJson(path.join(mpDir, '.claude-plugin', 'marketplace.json'));
+    if (meta && meta.name === MARKETPLACE_NAME) return true;
+  } catch { /* fallthrough */ }
+  return path.basename(mpDir) === MARKETPLACE_NAME;
+}
+
+function scanPluginHooksJsonCopies() {
+  const HOME = os.homedir();
+  const paths = [];
+
+  // Marketplace source (git-cloned by Claude Code on install)
+  const mpRoot = path.join(HOME, '.claude', 'plugins', 'marketplaces');
+  try {
+    for (const name of fs.readdirSync(mpRoot)) {
+      const mpDir = path.join(mpRoot, name);
+      try { if (!fs.statSync(mpDir).isDirectory()) continue; } catch { continue; }
+      if (!isOurPluginMarketplace(mpDir)) continue;
+      const p = path.join(mpDir, 'claude-plugin', 'hooks', 'hooks.json');
+      if (fs.existsSync(p)) paths.push(p);
+    }
+  } catch { /* no marketplaces dir */ }
+
+  // Cache (what Claude Code actually loads at runtime), per plugin + per version
+  const cacheRoot = path.join(HOME, '.claude', 'plugins', 'cache', MARKETPLACE_NAME);
+  try {
+    for (const pluginName of fs.readdirSync(cacheRoot)) {
+      const pluginDir = path.join(cacheRoot, pluginName);
+      try { if (!fs.statSync(pluginDir).isDirectory()) continue; } catch { continue; }
+      for (const ver of fs.readdirSync(pluginDir)) {
+        const verDir = path.join(pluginDir, ver);
+        try { if (!fs.statSync(verDir).isDirectory()) continue; } catch { continue; }
+        const p = path.join(verDir, 'hooks', 'hooks.json');
+        if (fs.existsSync(p)) paths.push(p);
+      }
+    }
+  } catch { /* no cache dir */ }
+
+  return paths;
+}
+
+function findStalePluginHooksJson() {
+  const stale = [];
+  for (const p of scanPluginHooksJsonCopies()) {
+    try {
+      const cur = readJson(p);
+      if (cur && cur.hooks && typeof cur.hooks === 'object' && Object.keys(cur.hooks).length > 0) {
+        stale.push(p);
+      }
+    } catch { /* unreadable — skip */ }
+  }
+  return stale;
+}
+
+function clearStalePluginCacheHooks() {
+  const cleared = [];
+  const stamp = new Date().toISOString();
+  for (const p of findStalePluginHooksJson()) {
+    try {
+      const stub = { ...EMPTY_HOOKS_STUB, _note: `${EMPTY_HOOKS_STUB._note} (cleared ${stamp})` };
+      writeJsonAtomic(p, stub);
+      cleared.push(p);
+    } catch { /* write failure — skip */ }
+  }
+  return cleared;
+}
+
 // --- Hook Registration ---
 // Plugin system's hooks.json auto-loading is unreliable (observed across GSD,
 // superpowers, code-graph-mcp). Write hooks directly to settings.json instead.
@@ -366,13 +448,17 @@ function install() {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
+  // 3b. Clear cache/marketplace hooks.json copies after settings.json is authoritative,
+  //     so next session only fires hooks from settings.json (no double-firing).
+  const clearedHookCopies = clearStalePluginCacheHooks();
+
   // 4. Write manifest with version
   manifest.version = version;
   manifest.installedAt = manifest.installedAt || new Date().toISOString();
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine };
+  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, clearedHookCopies };
 }
 
 // --- Uninstall (clean all config) ---
@@ -475,6 +561,10 @@ function update() {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
+  // 4b. Clear cache/marketplace hooks.json copies after settings.json is updated.
+  //     Auto-update can re-populate cache from marketplace source; stamp it out.
+  const clearedHookCopies = clearStalePluginCacheHooks();
+
   // 5. Clear update-check cache (force re-check after update)
   const updateCache = path.join(CACHE_DIR, 'update-check');
   try { fs.unlinkSync(updateCache); } catch { /* ok */ }
@@ -487,7 +577,7 @@ function update() {
   // 7. Clean up old cached versions (keep latest 3)
   cleanupOldCacheVersions(3);
 
-  return { oldVersion, version, settingsChanged };
+  return { oldVersion, version, settingsChanged, clearedHookCopies };
 }
 
 /**
@@ -584,6 +674,7 @@ module.exports = {
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   registerHooksToSettings, removeHooksFromSettings, getHookDefinitions,
+  scanPluginHooksJsonCopies, findStalePluginHooksJson, clearStalePluginCacheHooks,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 

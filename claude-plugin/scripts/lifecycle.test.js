@@ -95,3 +95,81 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
 });
+
+function nonEmptyHooksJson() {
+  return {
+    hooks: {
+      SessionStart: [{
+        matcher: 'startup',
+        hooks: [{ type: 'command', command: 'node "/plugin/session-init.js"' }],
+      }],
+    },
+  };
+}
+
+test('findStalePluginHooksJson detects non-empty cache and marketplace copies', () => {
+  const homeDir = mkHome();
+  const mpHooks = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'code-graph-mcp', 'claude-plugin', 'hooks', 'hooks.json');
+  const mpManifest = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'code-graph-mcp', '.claude-plugin', 'marketplace.json');
+  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
+
+  writeJson(mpManifest, { name: 'code-graph-mcp' });
+  writeJson(mpHooks, nonEmptyHooksJson());
+  writeJson(cacheHooks, nonEmptyHooksJson());
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { findStalePluginHooksJson } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(findStalePluginHooksJson()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  const stale = JSON.parse(out).sort();
+  assert.equal(stale.length, 2);
+  assert.ok(stale.some(p => p === mpHooks));
+  assert.ok(stale.some(p => p === cacheHooks));
+});
+
+test('clearStalePluginCacheHooks empties non-empty hooks.json copies', () => {
+  const homeDir = mkHome();
+  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
+  writeJson(cacheHooks, nonEmptyHooksJson());
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { clearStalePluginCacheHooks } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(clearStalePluginCacheHooks()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  const cleared = JSON.parse(out);
+  assert.deepEqual(cleared, [cacheHooks]);
+
+  const payload = JSON.parse(fs.readFileSync(cacheHooks, 'utf8'));
+  assert.deepEqual(payload.hooks, {});
+  assert.ok(payload._note && payload._note.includes('cleared'));
+});
+
+test('clearStalePluginCacheHooks is idempotent and skips already-empty copies', () => {
+  const homeDir = mkHome();
+  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
+  writeJson(cacheHooks, { hooks: {} });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { clearStalePluginCacheHooks } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(clearStalePluginCacheHooks()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.deepEqual(JSON.parse(out), []);
+});
+
+test('scanPluginHooksJsonCopies ignores unrelated marketplaces', () => {
+  const homeDir = mkHome();
+  const otherMp = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'some-other-plugin', 'claude-plugin', 'hooks', 'hooks.json');
+  const otherManifest = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'some-other-plugin', '.claude-plugin', 'marketplace.json');
+  writeJson(otherManifest, { name: 'some-other-plugin' });
+  writeJson(otherMp, nonEmptyHooksJson());
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { scanPluginHooksJsonCopies } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(scanPluginHooksJsonCopies()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.deepEqual(JSON.parse(out), []);
+});

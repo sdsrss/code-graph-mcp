@@ -5,7 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { getPluginVersion, readJson, healthCheck, CACHE_DIR } = require('./lifecycle');
+const {
+  getPluginVersion, readJson, healthCheck, CACHE_DIR,
+  findStalePluginHooksJson, clearStalePluginCacheHooks,
+} = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
 // ── Diagnostics ───────────────────────────────────────────
@@ -163,6 +166,21 @@ function runDiagnostics() {
     });
   }
 
+  // 7. Plugin cache hooks.json sanity — non-empty copies cause every hook to fire twice
+  try {
+    const stale = findStalePluginHooksJson();
+    if (stale.length === 0) {
+      results.push({ name: 'Plugin cache', status: 'ok', detail: 'no stale hooks.json' });
+    } else {
+      results.push({
+        name: 'Plugin cache',
+        status: 'warn',
+        detail: `${stale.length} stale hooks.json (hooks fire twice per event)`,
+        fixId: 'hooks-cache-stale',
+      });
+    }
+  } catch { /* lifecycle probe failed — skip */ }
+
   return results;
 }
 
@@ -317,6 +335,15 @@ function runRepairs(results) {
         const { install } = require('./lifecycle');
         install();
         console.log('  \u2705 Hooks repaired');
+        fixed++;
+        break;
+      }
+
+      case 'hooks-cache-stale': {
+        console.log('\n  Clearing stale plugin cache hooks.json...');
+        const cleared = clearStalePluginCacheHooks();
+        console.log(`  \u2705 Cleared ${cleared.length} file(s) — restart Claude Code to apply`);
+        for (const p of cleared) console.log(`     - ${p}`);
         fixed++;
         break;
       }

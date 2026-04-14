@@ -57,21 +57,3 @@ cargo test --no-default-features   # Tests without embedding
 ## Code Graph Integration
 
 Code graph tools are available via MCP. The MCP server injects `instructions` at session start with decision rules for tool selection (e.g., "who calls X?" → `get_call_graph`). CLI commands (`code-graph-mcp <cmd>`) complement MCP tools for Bash workflows.
-
-
-<claude-mem-context>
-### Last Session
-Request: 要实现
-
-### File Lessons
-- user-prompt-context.js: Node.js --test runner TAP reporter may fail on certain test structures; spec reporter is more relia… (#5755)
-- user-prompt-context.js: Prompt filtering requires distinguishing between action-only prompts (lacking code context) and cod… (#5754)
-
-### Key Context
-- [bugfix] Dead code false positive elimination: trait impl, struct expr, callback patterns (#5800)
-- [discovery] Reviewed 0 files: (#5797)
-- [discovery] Reviewed 1 files: db.rs (#5794)
-- [discovery] code-graph-mcp lacks external module handling in schema (#5791)
-- [discovery] Worked on schema.rs (#5787)
-
-</claude-mem-context>

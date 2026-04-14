@@ -1,16 +1,5 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|clear|compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.js\"",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
+  "description": "code-graph-mcp hooks",
+  "_note": "Hooks are registered to ~/.claude/settings.json by scripts/lifecycle.js. This file is intentionally empty to prevent double-firing — Claude Code would otherwise load hooks from both the plugin cache copy AND settings.json, causing each hook to run twice per event.",
+  "hooks": {}
 }
