@@ -79,6 +79,30 @@ pub(super) fn normalize_type_filter_mcp(input: &str) -> Vec<String> {
     result.into_iter().map(String::from).collect()
 }
 
+/// Strip one layer of generic brackets, returning the most informative inner type.
+/// Used by `tool_ast_search` to offer "did you mean?" hints when a returns-filter
+/// like `Vec<Relation>` yields zero results.
+///
+/// Examples:
+///   "Vec<Relation>"          -> Some("Relation")
+///   "Result<Vec<Relation>>"  -> Some("Relation")   (innermost <> wins via rfind)
+///   "Result<T, E>"           -> Some("E")          (last comma-separated param)
+///   "HashMap<K, V>"          -> Some("V")
+///   "&[T]"                   -> None
+///   "String"                 -> None
+pub(super) fn strip_outer_generic(s: &str) -> Option<String> {
+    let last_lt = s.rfind('<')?;
+    let after_lt = &s[last_lt + 1..];
+    let first_gt = after_lt.find('>')?;
+    let inner = after_lt[..first_gt].trim();
+    let candidate = inner.rsplit(',').next().unwrap_or(inner).trim();
+    if candidate.is_empty() || candidate == s {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
 /// Centralized compression for tool results that exceed the token threshold.
 /// Handlers that already produce custom compressed output (with a "mode" key)
 /// are left unchanged. For other results, this truncates large string values
@@ -254,5 +278,29 @@ mod tests {
         assert_eq!(arr.len(), 10);
         assert!(out.get("_array_truncations").is_none(),
             "_array_truncations should only appear when arrays truncated");
+    }
+
+    #[test]
+    fn strip_outer_generic_simple() {
+        assert_eq!(strip_outer_generic("Vec<Relation>"), Some("Relation".into()));
+        assert_eq!(strip_outer_generic("Option<T>"), Some("T".into()));
+    }
+
+    #[test]
+    fn strip_outer_generic_nested_picks_innermost() {
+        assert_eq!(strip_outer_generic("Result<Vec<Relation>>"), Some("Relation".into()));
+    }
+
+    #[test]
+    fn strip_outer_generic_multi_param_takes_last() {
+        assert_eq!(strip_outer_generic("HashMap<K, V>"), Some("V".into()));
+        assert_eq!(strip_outer_generic("Result<T, E>"), Some("E".into()));
+    }
+
+    #[test]
+    fn strip_outer_generic_no_brackets_returns_none() {
+        assert_eq!(strip_outer_generic("String"), None);
+        assert_eq!(strip_outer_generic("&[T]"), None);
+        assert_eq!(strip_outer_generic(""), None);
     }
 }

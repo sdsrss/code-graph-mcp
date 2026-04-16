@@ -1647,6 +1647,7 @@ pub fn fts5_search_with_tests(conn: &Connection, query: &str, limit: i64) -> Res
 
 fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: bool) -> Result<FtsResult> {
     // Preprocess query: filter stopwords, split identifiers (camelCase/snake_case),
+    // expand domain acronyms (RRF → reciprocal rank fusion, etc.),
     // then sanitize for FTS5. Porter stemming is handled by the FTS5 tokenizer.
     let terms: Vec<String> = query
         .split_whitespace()
@@ -1654,7 +1655,15 @@ fn fts5_search_impl(conn: &Connection, query: &str, limit: i64, exclude_tests: b
         .flat_map(|word| {
             // Split camelCase/snake_case identifiers into constituent words
             let split = crate::search::tokenizer::split_identifier(word);
-            split.split_whitespace().map(String::from).collect::<Vec<_>>()
+            let mut out: Vec<String> = split.split_whitespace().map(String::from).collect();
+            // Acronym expansion: append full-form terms alongside the original token.
+            // BTreeSet below handles dedup if original already expanded form.
+            for token in split.split_whitespace() {
+                for exp in crate::search::acronyms::expand_acronym(token) {
+                    out.push((*exp).to_string());
+                }
+            }
+            out
         })
         .collect::<std::collections::BTreeSet<_>>() // deduplicate (sorted for deterministic queries)
         .into_iter()

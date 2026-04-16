@@ -82,9 +82,23 @@ impl McpServer {
 
         // RRF fusion (FTS + Vec when available, FTS-only otherwise)
         // k=30: sharper rank sensitivity than default 60 (top results matter more)
-        // fts=1.0, vec=1.2: slightly favor vector similarity since FTS is now stronger
-        // with name_tokens and type columns in v2 schema
-        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, 1.0, 1.2);
+        // Default fts=1.0, vec=1.2: slightly favor vector similarity since FTS is now stronger
+        // with name_tokens and type columns in v2 schema.
+        //
+        // Acronym-heavy override: queries that are entirely short uppercase tokens
+        // (≤3 tokens, each ≤5 chars, all [A-Z0-9]) are letter-exact identifiers —
+        // embeddings handle them poorly (training corpora rarely teach "RRF" ≈
+        // "reciprocal rank fusion"), while FTS5's token-exact match is reliable.
+        // Shift the weight toward FTS to let the precise channel dominate.
+        let is_acronym_heavy = !meaningful_tokens.is_empty()
+            && meaningful_tokens.len() <= 3
+            && meaningful_tokens.iter().all(|t| {
+                let len_ok = t.chars().count() <= 5;
+                let shape_ok = t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+                len_ok && shape_ok
+            });
+        let (fts_weight, vec_weight) = if is_acronym_heavy { (2.0, 0.8) } else { (1.0, 1.2) };
+        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, fts_weight, vec_weight);
 
         // Match confidence: penalize when search signals are weak
         let match_confidence = {
@@ -424,11 +438,87 @@ impl McpServer {
 
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
+            // File-level rollup: group by (file_path, direction), emit counts + a small
+            // sample of names/node_ids + depth range. Previously this path returned
+            // `mode: compressed_call_graph` with the raw flat list (which still ate
+            // tokens). The rollup collapses dense fanouts (e.g. 12 handlers in one
+            // tools.rs file → one line with count=12 + first-10 node_ids), while
+            // preserving the node_ids needed for `get_ast_node` drill-down.
+            use std::collections::BTreeMap;
+            const SAMPLE_LIMIT: usize = 10;
+
+            struct Rollup {
+                names: Vec<String>,
+                node_ids: Vec<i64>,
+                min_depth: i64,
+                max_depth: i64,
+            }
+
+            let mut groups: BTreeMap<(String, String), Rollup> = BTreeMap::new();
+            for node in &all_nodes {
+                let file = node["file_path"].as_str().unwrap_or("").to_string();
+                let dir = node["direction"].as_str().unwrap_or("").to_string();
+                let name = node["name"].as_str().unwrap_or("").to_string();
+                let node_id = node["node_id"].as_i64().unwrap_or(0);
+                let depth = node["depth"].as_i64().unwrap_or(0);
+                let entry = groups.entry((file, dir)).or_insert(Rollup {
+                    names: Vec::new(), node_ids: Vec::new(),
+                    min_depth: depth, max_depth: depth,
+                });
+                entry.names.push(name);
+                entry.node_ids.push(node_id);
+                entry.min_depth = entry.min_depth.min(depth);
+                entry.max_depth = entry.max_depth.max(depth);
+            }
+
+            let mut caller_entries: Vec<(usize, serde_json::Value)> = Vec::new();
+            let mut callee_entries: Vec<(usize, serde_json::Value)> = Vec::new();
+            let mut caller_total = 0usize;
+            let mut callee_total = 0usize;
+
+            for ((file, direction), rollup) in groups {
+                let count = rollup.names.len();
+                let truncated = count > SAMPLE_LIMIT;
+                let names: Vec<String> = rollup.names.iter().take(SAMPLE_LIMIT).cloned().collect();
+                let node_ids: Vec<i64> = rollup.node_ids.iter().take(SAMPLE_LIMIT).copied().collect();
+                let entry = json!({
+                    "file": file,
+                    "count": count,
+                    "names": names,
+                    "node_ids": node_ids,
+                    "min_depth": rollup.min_depth,
+                    "max_depth": rollup.max_depth,
+                    "sample_truncated": truncated,
+                });
+                if direction == "callers" {
+                    caller_total += count;
+                    caller_entries.push((count, entry));
+                } else {
+                    callee_total += count;
+                    callee_entries.push((count, entry));
+                }
+            }
+
+            // Sort by count desc so the densest files appear first.
+            caller_entries.sort_by(|a, b| b.0.cmp(&a.0));
+            callee_entries.sort_by(|a, b| b.0.cmp(&a.0));
+            let caller_rollups: Vec<serde_json::Value> = caller_entries.into_iter().map(|(_, v)| v).collect();
+            let callee_rollups: Vec<serde_json::Value> = callee_entries.into_iter().map(|(_, v)| v).collect();
+
             return Ok(json!({
-                "mode": "compressed_call_graph",
-                "message": "Call graph exceeded token limit. Use get_ast_node(node_id) to expand individual nodes.",
+                "mode": "rollup_call_graph",
+                "message": "Call graph is dense; returned as file-level rollup. Pick any node_id and call get_ast_node(node_id) to expand a specific symbol.",
                 "function": function_name,
-                "results": all_nodes,
+                "direction": direction,
+                "total_nodes": all_nodes.len(),
+                "callers": {
+                    "rollups": caller_rollups,
+                    "total_count": caller_total,
+                },
+                "callees": {
+                    "rollups": callee_rollups,
+                    "total_count": callee_total,
+                },
             }));
         }
 
@@ -1766,10 +1856,43 @@ impl McpServer {
             })
         }).collect();
 
-        Ok(json!({
+        let mut response = json!({
             "results": items,
             "count": items.len(),
-        }))
+        });
+
+        // Generic-fallback hint: when returns_filter has angle brackets and zero hits,
+        // retry with the inner-most type as a suggestion so the caller sees "did you mean Relation?"
+        // rather than an empty response.
+        if items.is_empty() {
+            if let Some(rf) = returns_filter {
+                if let Some(inner) = strip_outer_generic(rf) {
+                    let normalized = type_filter.map(normalize_type_filter_mcp);
+                    let type_refs: Option<Vec<&str>> = normalized.as_ref()
+                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                    let retry = queries::get_nodes_with_files_by_filters(
+                        self.db.conn(), type_refs.as_deref(),
+                        Some(&inner), params_filter, 100,
+                    )?;
+                    if !retry.is_empty() {
+                        let n = retry.len();
+                        let plural = if n == 1 { "" } else { "es" };
+                        response["hint"] = json!(format!(
+                            "No match for returns='{}'. Substring '{}' has {} match{} — try that.",
+                            rf, inner, n, plural
+                        ));
+                        let mut suggested = serde_json::Map::new();
+                        suggested.insert("returns".to_string(), json!(inner));
+                        if let Some(tf) = type_filter { suggested.insert("type".to_string(), json!(tf)); }
+                        if let Some(pf) = params_filter { suggested.insert("params".to_string(), json!(pf)); }
+                        if let Some(q) = query { suggested.insert("query".to_string(), json!(q)); }
+                        response["suggested_query"] = serde_json::Value::Object(suggested);
+                    }
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     pub(super) fn tool_find_dead_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {

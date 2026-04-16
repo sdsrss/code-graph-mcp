@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.11.4 — Integration-friction fixes: ast_search hint + acronym expansion + call graph rollup
+
+Integration-test pass against Claude Code found three specific friction points
+where tool responses forced a second round-trip or missed relevant nodes.
+All three fixed. Additive — no schema change, no re-index.
+
+### Fixes
+
+1. **`ast_search` generic-fallback hint.** When `returns="Vec<Relation>"` yields
+   zero hits because the codebase uses `Vec<ParsedRelation>`, the response now
+   carries `hint` + `suggested_query` instead of a bare `count: 0`. Example:
+   `{ "count": 0, "hint": "No match for returns='Vec<Relation>'. Substring
+   'Relation' has 7 matches — try that.", "suggested_query": {"returns":
+   "Relation", "type": "fn"} }`. Strip rule: innermost `<…>` wins; multi-param
+   types take the last comma-separated param. See
+   `src/mcp/server/helpers.rs::strip_outer_generic`.
+
+2. **Acronym query expansion.** `fts5_search` preprocessing now expands
+   common CS/IR/DB acronyms into full-form terms alongside the original:
+   `RRF` → `RRF` + `reciprocal` + `rank` + `fusion`; same for `BM25`, `FTS`,
+   `AST`, `LSP`, `MCP`, `RPC`, `SQL`, `ORM`, `CTE`, `JWT`, `TTL`, `DAG`,
+   `RBAC`, `CRUD`, `CORS`. Benchmark before/after on query `"RRF fusion BM25"`:
+   `weighted_rrf_fusion` now appears at rank 3 (previously absent from top-5).
+   New static dict in `src/search/acronyms.rs`; expansions deduped via the
+   existing BTreeSet pass.
+
+3. **`semantic_code_search` acronym-heavy FTS bias.** Queries that are entirely
+   short uppercase tokens (≤3 tokens, each ≤5 chars, all `[A-Z0-9]`) now run
+   with `fts_weight=2.0, vec_weight=0.8` instead of the default `1.0/1.2`.
+   Rationale: embeddings handle letter-exact acronyms poorly while FTS5's
+   token-exact match is reliable; shift the weight toward the precise channel.
+
+4. **`get_call_graph` file-level rollup replaces `compressed_call_graph`.**
+   When the flat node list exceeds `COMPRESSION_TOKEN_THRESHOLD` (previously
+   this mode dumped the raw list anyway), group by `(file_path, direction)`
+   and emit `{file, count, names[], node_ids[], min_depth, max_depth}` sorted
+   by count desc. New mode string `"rollup_call_graph"`. Measured on
+   `ensure_indexed` (86 nodes): previously 86 flat entries → now 2 caller
+   rollups + 5 callee rollups, preserving `node_ids` for `get_ast_node`
+   drill-down. Contract Δ: consumers matching on
+   `mode == "compressed_call_graph"` must update to `"rollup_call_graph"`.
+
+### Tests
+
+- `strip_outer_generic` unit tests (4/4) cover `Vec<T>`, nested generics,
+  multi-param (`Result<T, E>`), and no-bracket cases.
+- `acronyms::expand_acronym` unit tests (4/4) cover case-insensitivity,
+  unknown tokens, `BM25` numeric acronym, and an FTS-length-filter guardrail.
+- 230 lib tests + 44 integration tests all green.
+
+### Internal
+
+New module `src/search/acronyms.rs`. `strip_outer_generic` in
+`src/mcp/server/helpers.rs`. All other edits localized to `tool_ast_search`,
+`tool_semantic_search`, and `format_call_graph_response` in
+`src/mcp/server/tools.rs`, plus one flat_map augmentation in
+`storage::queries::fts5_search_impl`.
+
 ## v0.11.3 — Doc: "hidden but callable" clarified (Claude Code vs. raw MCP)
 
 User-facing: no behavior change; corrects a misleading claim in the adopted
