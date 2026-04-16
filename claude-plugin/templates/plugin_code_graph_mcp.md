@@ -6,7 +6,11 @@ type: reference
 # code-graph-mcp 插件契约
 
 > Invited-memory 模式：MCP `instructions` 仅留指针，决策细则集中在此。
-> 启用条件：`CODE_GRAPH_QUIET_HOOKS=1`（在 `~/.claude/settings.json` 的 `env` 中设置）。
+>
+> **v0.9.0 起**：插件（`/plugin install`）模式下首次 SessionStart 自动 adopt，
+> 本文件自动写入，自动切换 quietHooks（跳过每次 project_map 注入）。
+> 退出：`CODE_GRAPH_NO_AUTO_ADOPT=1` 阻止，`code-graph-mcp unadopt` 回退。
+> 手动强控：`CODE_GRAPH_QUIET_HOOKS=0` 强制注入 / `=1` 强制静默（覆盖 adoption 推导）。
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
 
@@ -27,9 +31,9 @@ type: reference
 
 ## 不要替代
 
-- 精确字符串 / 常量 / 正则 → 仍用 `Grep`
-- 非代码文件（README/JSON/log） → 仍用 `Grep`
-- 即将编辑的具体文件 → 仍用 `Read`
+- 非代码文件（README/JSON/log） → 用内置 `Grep`
+- 代码里查常量/函数名/字符串首选 `code-graph-mcp grep "pattern" [path]`（每个命中带 containing function/module 上下文，结构化）；只做纯文本匹配且不关心上下文时用内置 `Grep`
+- 即将编辑的具体文件 → 用 `Read`（`overview <file>` 看概览，`show SYMBOL` 看某符号）
 
 ## 工作流惯例
 
@@ -65,6 +69,8 @@ code-graph-mcp health-check              # 索引健康
 - `impact` 在 `--change-type signature` 时返回最严格的破坏面
 - 索引陈旧 → SessionStart 自带 `ensureIndexFresh`；手动跑 `incremental-index`
 
-## 卸载
+## 卸载 / 回退
 
-`code-graph-mcp unadopt` 精确移除 sentinel 段 + 本文件；或取消 `CODE_GRAPH_QUIET_HOOKS` 即恢复原注入。
+- `code-graph-mcp unadopt` — 精确移除 sentinel 段 + 本文件，quietHooks 自动回到 false（下次 SessionStart 恢复 project_map 注入）。
+- `CODE_GRAPH_NO_AUTO_ADOPT=1`（`~/.claude/settings.json` env） — 阻止未来自动 adopt，不影响已 adopted 状态。
+- `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 project_map 注入（即使已 adopted）。

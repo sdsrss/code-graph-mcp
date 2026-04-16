@@ -1349,6 +1349,30 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
     let context_lines: usize = context_lines_explicit
         .unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
 
+    // If positional arg points at a real file on disk (has a recognized code
+    // extension), nudge the user toward `overview` — `show` takes symbol names.
+    if node_id_arg.is_none() {
+        if let Some(arg) = get_positional(args, 0) {
+            if !arg.is_empty()
+                && crate::utils::config::detect_language(arg).is_some()
+                && project_root.join(arg).is_file()
+            {
+                eprintln!(
+                    "[code-graph] `{}` looks like a file path. `show` takes a symbol name (function/struct/const).",
+                    arg
+                );
+                eprintln!(
+                    "            File-level symbols: code-graph-mcp overview {}",
+                    arg
+                );
+                eprintln!(
+                    "            Full file content:  Read the file directly."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
@@ -1665,6 +1689,49 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
 
 /// File-level dependency graph.
 /// CLI equivalent of MCP `dependency_graph`.
+/// Scan a file for language-appropriate barrel / re-export / import patterns.
+/// Used by `cmd_deps` as a fallback when the graph has no tracked edges for
+/// a file (e.g. Rust `mod.rs` barrels that only contain `pub mod X;`).
+fn scan_barrel_patterns(project_root: &Path, file_path: &str) -> Option<Vec<(usize, String)>> {
+    let full = project_root.join(file_path);
+    let content = std::fs::read_to_string(&full).ok()?;
+    let lang = crate::utils::config::detect_language(file_path);
+    let mut hits = Vec::new();
+    for (idx, line) in content.lines().enumerate().take(1000) {
+        let t = line.trim_start();
+        let matched = match lang {
+            Some("rust") => {
+                t.starts_with("pub mod ")
+                    || t.starts_with("mod ")
+                    || t.starts_with("pub use ")
+                    || t.starts_with("use ")
+            }
+            Some("typescript") | Some("tsx") | Some("javascript") => {
+                t.starts_with("import ")
+                    || (t.starts_with("export ") && t.contains(" from "))
+            }
+            Some("python") => {
+                (t.starts_with("from ") && t.contains(" import "))
+                    || t.starts_with("import ")
+            }
+            Some("go") | Some("java") | Some("csharp") | Some("kotlin") => {
+                t.starts_with("import ")
+            }
+            Some("ruby") => t.starts_with("require ") || t.starts_with("require_relative "),
+            Some("php") => {
+                t.starts_with("use ")
+                    || t.starts_with("require ")
+                    || t.starts_with("include ")
+            }
+            _ => false,
+        };
+        if matched {
+            hits.push((idx + 1, line.to_string()));
+        }
+    }
+    if hits.is_empty() { None } else { Some(hits) }
+}
+
 pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     let raw_file_path = get_positional(args, 0)
         .filter(|s| !s.is_empty())
@@ -1686,7 +1753,35 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
 
     let deps = queries::get_import_tree(conn, file_path, direction, depth)?;
     if deps.is_empty() {
-        anyhow::bail!("[code-graph] No dependencies found for: {}", file_path);
+        // Barrel / index-file fallback — scan source for re-export / import lines.
+        // Rust `mod.rs` with only `pub mod X;` has no tracked edges in the graph.
+        if let Some(lines) = scan_barrel_patterns(project_root, file_path) {
+            let mut stdout = std::io::stdout().lock();
+            if json_mode {
+                let result = serde_json::json!({
+                    "file": file_path,
+                    "depends_on": [],
+                    "depended_by": [],
+                    "barrel_scan": lines.iter().map(|(ln, t)| {
+                        serde_json::json!({"line": ln, "text": t.trim()})
+                    }).collect::<Vec<_>>(),
+                    "note": "no tracked dep edges; barrel_scan is raw re-export/import lines from file scan",
+                });
+                writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
+            } else {
+                writeln!(stdout, "{}", file_path)?;
+                writeln!(stdout, "  (no tracked dep edges \u{2014} raw re-export/import lines from file scan:)")?;
+                for (ln, text) in lines {
+                    writeln!(stdout, "    {}: {}", ln, text.trim())?;
+                }
+            }
+            return Ok(());
+        }
+        anyhow::bail!(
+            "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
+            file_path,
+            file_path
+        );
     }
 
     // Filter out cross-language false edges (name-based resolution artifacts)

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary } = require('./session-init');
+const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary, computeQuietHooks } = require('./session-init');
 
 test('syncLifecycleConfig is exported as a callable helper', () => {
   assert.equal(typeof syncLifecycleConfig, 'function');
@@ -81,6 +81,30 @@ test('consistencyCheck is exported as a function', () => {
 test('consistencyCheck returns empty array when binary version matches plugin', () => {
   const result = consistencyCheck('/tmp/nonexistent-binary');
   assert.ok(Array.isArray(result));
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// v0.9.0 — quietHooks inference from adopted state
+// ──────────────────────────────────────────────────────────────────────────
+
+test('computeQuietHooks: env "0" forces noisy regardless of adoption', () => {
+  assert.equal(computeQuietHooks({ adopted: true, env: { CODE_GRAPH_QUIET_HOOKS: '0' } }), false);
+  assert.equal(computeQuietHooks({ adopted: false, env: { CODE_GRAPH_QUIET_HOOKS: '0' } }), false);
+});
+
+test('computeQuietHooks: env "1" forces quiet regardless of adoption', () => {
+  assert.equal(computeQuietHooks({ adopted: true, env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), true);
+  assert.equal(computeQuietHooks({ adopted: false, env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), true);
+});
+
+test('computeQuietHooks: env unset → follows adopted state', () => {
+  assert.equal(computeQuietHooks({ adopted: true, env: {} }), true);
+  assert.equal(computeQuietHooks({ adopted: false, env: {} }), false);
+});
+
+test('computeQuietHooks: env unset, no env arg → follows adopted state', () => {
+  assert.equal(computeQuietHooks({ adopted: true }), true);
+  assert.equal(computeQuietHooks({ adopted: false }), false);
 });
 
 test('consistencyCheck returns version-mismatch when versions differ', (t) => {

@@ -7,6 +7,17 @@ const path = require("path");
 // and detect dev mode from bin/ → repo root (one level up)
 process.env._FIND_BINARY_ROOT = path.resolve(__dirname, "..");
 
+// Intercept adopt / unadopt before forwarding — they're node-only concerns
+// (write to ~/.claude/projects/<slug>/memory/) and have no Rust counterpart.
+// Lets `code-graph-mcp adopt` / `unadopt` work uniformly across plugin / npm / npx.
+const sub = process.argv[2];
+if (sub === "adopt" || sub === "unadopt") {
+  const { adopt, unadopt, formatResult } = require("../claude-plugin/scripts/adopt");
+  const result = sub === "unadopt" ? unadopt() : adopt();
+  process.stdout.write(formatResult(sub, result) + "\n");
+  process.exit(result.ok === false ? 1 : 0);
+}
+
 const { findBinary } = require("../claude-plugin/scripts/find-binary");
 
 const binary = findBinary();

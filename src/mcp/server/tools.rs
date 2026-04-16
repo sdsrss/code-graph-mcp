@@ -136,6 +136,7 @@ impl McpServer {
             if let Some(nwf) = nwf_map.remove(&r.node_id) {
                 let node = &nwf.node;
                 if node.node_type == "module" && node.name == "<module>" { continue; }
+                if nwf.file_path == "<external>" { continue; }
                 if is_test_symbol(&node.name, &nwf.file_path) { continue; }
                 if let Some(nt) = node_type_filter {
                     let normalized = normalize_type_filter_mcp(nt);
@@ -1473,6 +1474,9 @@ impl McpServer {
             .filter_map(|(id, distance)| {
                 let nf = node_map.get(id)?;
                 if nf.node.node_type == "module" && nf.node.name == "<module>" {
+                    return None;
+                }
+                if nf.file_path == "<external>" {
                     return None;
                 }
                 if is_test_symbol(&nf.node.name, &nf.file_path) {

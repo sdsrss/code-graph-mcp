@@ -6,6 +6,7 @@ const path = require('path');
 const os = require('os');
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH,
 } = require('./adopt');
 
@@ -211,6 +212,140 @@ test('unadopt heals malformed sentinel (orphan BEGIN)', () => {
     assert.ok(!final.includes(SENTINEL_BEGIN), 'orphan BEGIN purged');
     assert.ok(final.includes('keep.md'), 'content past blank-line preserved');
   } finally { sb.cleanup(); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// v0.9.0 — C' context-aware auto-adopt
+// ──────────────────────────────────────────────────────────────────────────
+
+test('isAdopted returns false on fresh project (no files)', () => {
+  const sb = makeSandbox();
+  try {
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('isAdopted returns true after adopt()', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), true);
+  } finally { sb.cleanup(); }
+});
+
+test('isAdopted returns false after unadopt()', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('isAdopted returns false when target file exists but index has no sentinel', () => {
+  const sb = makeSandbox();
+  try {
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    fs.writeFileSync(indexPath, '# Memory Index\n- [foo.md](foo.md) — unrelated\n');
+    fs.writeFileSync(path.join(sb.dir, 'plugin_code_graph_mcp.md'), 'stale copy');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('isPluginModeInstall recognizes ~/.claude/plugins/... paths', () => {
+  const pluginPath = '/home/user/.claude/plugins/cache/code-graph-mcp@0.9.0/scripts';
+  assert.strictEqual(isPluginModeInstall(pluginPath), true);
+});
+
+test('isPluginModeInstall rejects npm global install paths', () => {
+  const npmPath = '/usr/local/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts';
+  assert.strictEqual(isPluginModeInstall(npmPath), false);
+});
+
+test('isPluginModeInstall rejects dev-checkout paths', () => {
+  const devPath = '/mnt/data_ssd/dev/projects/code-graph-mcp/claude-plugin/scripts';
+  assert.strictEqual(isPluginModeInstall(devPath), false);
+});
+
+test('isPluginModeInstall rejects npx cache paths', () => {
+  const npxPath = '/tmp/npx-abc123/node_modules/@sdsrs/code-graph/claude-plugin/scripts';
+  assert.strictEqual(isPluginModeInstall(npxPath), false);
+});
+
+test('maybeAutoAdopt skips when CODE_GRAPH_NO_AUTO_ADOPT=1', () => {
+  const sb = makeSandbox();
+  try {
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: { CODE_GRAPH_NO_AUTO_ADOPT: '1' },
+    });
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'opted-out');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt skips when not plugin-mode (npm install)', () => {
+  const sb = makeSandbox();
+  try {
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/usr/local/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'not-plugin-mode');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt skips when already adopted (idempotent)', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'already-adopted');
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt runs adopt when plugin-mode + unadopted + no opt-out', () => {
+  const sb = makeSandbox();
+  try {
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, true);
+    assert.strictEqual(res.result.ok, true);
+    assert.strictEqual(res.result.indexed, true);
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), true);
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt returns no-memory-dir when project memory missing', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-cwd-'));
+  try {
+    const res = maybeAutoAdopt({
+      cwd, home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    // Plugin-mode + not adopted + no opt-out → attempt runs, but adopt() fails gracefully
+    assert.strictEqual(res.attempted, true);
+    assert.strictEqual(res.result.ok, false);
+    assert.strictEqual(res.result.reason, 'no-memory-dir');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test('Windows platform is rejected with clear reason', { skip: process.platform === 'win32' }, () => {

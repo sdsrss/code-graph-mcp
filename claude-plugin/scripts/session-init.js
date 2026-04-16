@@ -9,6 +9,16 @@ const {
   cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
+const { maybeAutoAdopt, isAdopted } = require('./adopt');
+
+// v0.9.0 — quietHooks 推导：显式 env override > adopted 状态。
+// CODE_GRAPH_QUIET_HOOKS='0' 强制 noisy；'1' 强制 quiet；未设 → 跟随 adopted。
+function computeQuietHooks({ adopted, env = {} } = {}) {
+  const envQuiet = env.CODE_GRAPH_QUIET_HOOKS;
+  if (envQuiet === '0') return false;
+  if (envQuiet === '1') return true;
+  return !!adopted;
+}
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
   try {
@@ -247,9 +257,23 @@ function runSessionInit() {
 
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
-  // CODE_GRAPH_QUIET_HOOKS=1 → skip the 60-line project-map injection; rely
-  // on MEMORY.md pointer + on-demand `project_map` tool call instead.
-  const quietHooks = process.env.CODE_GRAPH_QUIET_HOOKS === '1';
+
+  // v0.9.0 C' 上下文感知默认：插件模式下首次 SessionStart 自动 adopt。
+  // 仅一次 stderr 提示（采纳成功时），让用户知道发生了什么 + 如何回退。
+  const autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
+  if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
+    process.stderr.write(
+      '[code-graph] Auto-adopted into project MEMORY.md (plugin install → knowing consent).\n' +
+      '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
+      '            Reverse:    code-graph-mcp unadopt\n'
+    );
+  }
+
+  // quietHooks: adopted → quiet by default (rely on MEMORY.md pointer + on-demand
+  // project_map tool); env '1'/'0' overrides for explicit control.
+  const adopted = isAdopted();
+  const quietHooks = computeQuietHooks({ adopted, env: process.env });
+
   const mapInjected = binaryCheck.available && !quietHooks ? injectProjectMap() : false;
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
@@ -257,7 +281,7 @@ function runSessionInit() {
   return {
     inactive: false, lifecycle,
     autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
-    quietHooks,
+    quietHooks, adopted, autoAdopted: autoAdopt.attempted,
   };
 }
 
@@ -298,6 +322,7 @@ module.exports = {
   verifyBinary,
   consistencyCheck,
   runSessionInit,
+  computeQuietHooks,
 };
 
 if (require.main === module) {
