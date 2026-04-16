@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::default_dead_code_ignores;
 
 impl McpServer {
     pub(super) fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -587,6 +588,7 @@ impl McpServer {
                             "file_path": &nf.file_path,
                             "type": nf.node.node_type,
                             "node_id": nf.node.id,
+                            "start_line": nf.node.start_line,
                         })
                     }).collect();
                     Ok(json!({
@@ -1777,11 +1779,22 @@ impl McpServer {
         let min_lines = args["min_lines"].as_u64().unwrap_or(3) as u32;
         let compact = args["compact"].as_bool().unwrap_or(true);
 
+        // ignore_paths: prefix-match exclusions. When omitted, apply defaults for
+        // shell-invoked entry points (plugin hooks / lifecycle scripts) that the
+        // static AST call graph can't track. Pass an empty array to disable.
+        let (ignore_prefixes, ignore_was_defaulted) = match args.get("ignore_paths") {
+            Some(serde_json::Value::Array(arr)) => (
+                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>(),
+                false,
+            ),
+            _ => (default_dead_code_ignores(), true),
+        };
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
 
-        let results = queries::find_dead_code(
+        let raw_results = queries::find_dead_code(
             self.db.conn(),
             path,
             node_type,
@@ -1789,13 +1802,28 @@ impl McpServer {
             min_lines,
             200,
         )?;
+        let pre_filter_count = raw_results.len();
+        let results: Vec<_> = raw_results.into_iter()
+            .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+            .collect();
+        let ignored_count = pre_filter_count - results.len();
 
         if results.is_empty() {
+            let mut summary = "No dead code found with the given filters.".to_string();
+            if ignored_count > 0 {
+                summary.push_str(&format!(
+                    " ({} result(s) suppressed by ignore_paths; pass ignore_paths:[] to see them.)",
+                    ignored_count
+                ));
+            }
             return Ok(json!({
                 "results": [],
                 "orphan_count": 0,
                 "exported_unused_count": 0,
-                "summary": "No dead code found with the given filters."
+                "ignored_count": ignored_count,
+                "ignore_paths_applied": ignore_prefixes,
+                "ignore_paths_defaulted": ignore_was_defaulted,
+                "summary": summary,
             }));
         }
 
@@ -1836,23 +1864,43 @@ impl McpServer {
             "results": all_items,
             "orphan_count": orphan_items.len(),
             "exported_unused_count": exported_items.len(),
-            "summary": format!("Dead code: {} results ({} orphan, {} exported-unused)",
-                all_items.len(), orphan_items.len(), exported_items.len())
+            "ignored_count": ignored_count,
+            "ignore_paths_applied": ignore_prefixes,
+            "ignore_paths_defaulted": ignore_was_defaulted,
+            "summary": if ignored_count > 0 {
+                format!("Dead code: {} results ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them)",
+                    all_items.len(), orphan_items.len(), exported_items.len(), ignored_count)
+            } else {
+                format!("Dead code: {} results ({} orphan, {} exported-unused)",
+                    all_items.len(), orphan_items.len(), exported_items.len())
+            },
         }))
     }
 
     pub(super) fn tool_find_references(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let symbol_name = required_str(args, "symbol_name")?;
+        // node_id takes precedence — lets callers disambiguate multi-def same-file
+        // collisions (e.g. two `fn new()` in one module) that file_path alone can't resolve.
+        let node_id = args["node_id"].as_i64();
+        let symbol_name_arg = args["symbol_name"].as_str();
         let file_path = args["file_path"].as_str();
         let relation = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
+
+        if node_id.is_none() && symbol_name_arg.is_none() {
+            return Err(anyhow!("symbol_name or node_id is required"));
+        }
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
 
         // Resolve symbol to node_id(s)
-        let target_ids: Vec<i64> = if let Some(fp) = file_path {
+        let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
+            let node = queries::get_node_by_id(self.db.conn(), nid)?
+                .ok_or_else(|| anyhow!("node_id {} not found in index", nid))?;
+            (vec![nid], node.name)
+        } else if let Some(fp) = file_path {
+            let symbol_name = symbol_name_arg.unwrap();
             // Specific file: find the symbol in that file
             let nodes = queries::get_nodes_by_file_path(self.db.conn(), fp)?;
             let matching: Vec<i64> = nodes.iter()
@@ -1862,8 +1910,31 @@ impl McpServer {
             if matching.is_empty() {
                 return Err(anyhow!("Symbol '{}' not found in file '{}'.", symbol_name, fp));
             }
-            matching
+            // Multi-def in same file — report ambiguity with node_ids and start_lines
+            // so callers can pick the specific definition.
+            if matching.len() > 1 {
+                let suggestions: Vec<_> = nodes.iter()
+                    .filter(|n| n.name == symbol_name)
+                    .map(|n| json!({
+                        "name": n.name,
+                        "file_path": fp,
+                        "type": n.node_type,
+                        "node_id": n.id,
+                        "start_line": n.start_line,
+                    }))
+                    .collect();
+                return Ok(json!({
+                    "symbol": symbol_name,
+                    "error": format!(
+                        "Ambiguous symbol '{}' in '{}': {} definitions in the same file. Pass node_id to select one.",
+                        symbol_name, fp, suggestions.len()
+                    ),
+                    "suggestions": suggestions,
+                }));
+            }
+            (matching, symbol_name.to_string())
         } else {
+            let symbol_name = symbol_name_arg.unwrap();
             // No file_path: fuzzy resolve
             match self.resolve_fuzzy_name(symbol_name)? {
                 FuzzyResolution::Unique(resolved_name) => {
@@ -1875,12 +1946,12 @@ impl McpServer {
                     if ids.is_empty() {
                         return Err(anyhow!("Symbol '{}' not found in index.", symbol_name));
                     }
-                    ids
+                    (ids, resolved_name)
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {
                     return Ok(json!({
                         "symbol": symbol_name,
-                        "error": format!("Ambiguous symbol '{}': {} matches. Specify file_path to disambiguate.", symbol_name, suggestions.len()),
+                        "error": format!("Ambiguous symbol '{}': {} matches. Specify file_path or node_id to disambiguate.", symbol_name, suggestions.len()),
                         "suggestions": suggestions,
                     }));
                 }

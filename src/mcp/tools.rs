@@ -120,11 +120,11 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "symbol_name": { "type": "string", "description": "Symbol to find references for" },
-                        "file_path": { "type": "string", "description": "Disambiguate same-name symbols" },
+                        "node_id": { "type": "integer", "description": "Exact node from a prior suggestion — overrides symbol_name. Use to disambiguate same-name defs in one file." },
+                        "file_path": { "type": "string", "description": "Disambiguate same-name symbols across files" },
                         "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "all"], "description": "Relation type filter (default 'all')" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" }
-                    },
-                    "required": ["symbol_name"]
+                    }
                 }),
             },
         ];

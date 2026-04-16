@@ -991,6 +991,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     let prefix_pattern = format!("{}%", escaped_prefix);
 
     // Phase 1: Try explicit exports (JS/TS)
+    // Filter n.is_test=0 — AST-level flag catches inline `#[cfg(test)] mod tests`
+    // whose names don't match the name-heuristic in is_test_symbol.
     let sql_exports =
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count
@@ -1000,6 +1002,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
          LEFT JOIN (SELECT target_id, COUNT(*) as cnt FROM edges WHERE relation = ?3 GROUP BY target_id) cc
            ON cc.target_id = n.id
          WHERE f.path LIKE ?2 ESCAPE '\\'
+           AND n.is_test = 0
          ORDER BY caller_count DESC";
     let mut stmt = conn.prepare(sql_exports)?;
     let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, &prefix_pattern, REL_CALLS], |row| {
@@ -1029,6 +1032,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
          WHERE f.path LIKE ?1 ESCAPE '\\'
            AND n.type != 'module'
            AND n.name != '<module>'
+           AND n.is_test = 0
          ORDER BY caller_count DESC";
     let mut stmt2 = conn.prepare(sql_fallback)?;
     let rows2 = stmt2.query_map(rusqlite::params![&prefix_pattern, REL_CALLS], |row| {
@@ -1067,6 +1071,8 @@ pub struct NameCandidate {
     pub name: String,
     pub file_path: String,
     pub node_type: String,
+    pub node_id: i64,
+    pub start_line: i64,
 }
 
 /// Find symbol names that match the given input.
@@ -1082,7 +1088,7 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
     let token_pattern = format!("%{}%", token_escaped);
 
     let sql =
-        "SELECT DISTINCT n.name, f.path, n.type
+        "SELECT DISTINCT n.name, f.path, n.type, n.id, n.start_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          WHERE (n.name LIKE ?1 ESCAPE '\\' OR n.name_tokens LIKE ?3 ESCAPE '\\')
@@ -1100,6 +1106,8 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
             name: row.get(0)?,
             file_path: row.get(1)?,
             node_type: row.get(2)?,
+            node_id: row.get(3)?,
+            start_line: row.get(4)?,
         })
     })?;
     let results: Vec<NameCandidate> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1116,7 +1124,7 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
     };
 
     let sql2 =
-        "SELECT DISTINCT n.name, f.path, n.type
+        "SELECT DISTINCT n.name, f.path, n.type, n.id, n.start_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          WHERE n.type != 'module'
@@ -1127,6 +1135,8 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
             name: row.get(0)?,
             file_path: row.get(1)?,
             node_type: row.get(2)?,
+            node_id: row.get(3)?,
+            start_line: row.get(4)?,
         })
     })?;
 
@@ -2127,6 +2137,40 @@ mod tests {
         let exports = get_module_exports(conn, "src/auth/").unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "validateUser");
+    }
+
+    #[test]
+    fn test_get_module_exports_filters_is_test_nodes() {
+        // Rust fallback path: inline `#[cfg(test)] mod tests { #[test] fn foo }`
+        // whose names don't prefix-match `test_` must still be excluded via the
+        // AST-level n.is_test flag. See feedback_test_filter_propagation.md.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('src/foo.rs', 'h1', 0, 'rust', 0)",
+            [],
+        ).unwrap();
+        // Real export — name doesn't match is_test_symbol heuristic
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'compute_thing', 'compute_thing', 1, 5, 'fn compute_thing(){}', 0)",
+            [],
+        ).unwrap();
+        // Inline test fn — name doesn't match heuristic either, but is_test=1
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'arrays_are_homogeneous', 'arrays_are_homogeneous', 10, 20, 'fn arrays_are_homogeneous(){}', 1)",
+            [],
+        ).unwrap();
+
+        let exports = get_module_exports(conn, "src/foo.rs").unwrap();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"compute_thing"), "real export missing: {:?}", names);
+        assert!(
+            !names.contains(&"arrays_are_homogeneous"),
+            "is_test=1 node leaked into module exports: {:?}", names,
+        );
     }
 
     #[test]

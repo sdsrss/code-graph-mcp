@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.11.2 — Post-audit follow-up: 4 residual precision fixes
+
+Follow-up audit on top of v0.11.1. All additive/tightening — no schema breakage.
+
+### Fixes
+
+1. **`module_overview` no longer leaks inline `#[cfg(test)]` test fns.**
+   Name-heuristic `is_test_symbol` couldn't catch `#[cfg(test)] mod tests { #[test] fn anything_goes }`
+   whose names don't prefix `test_`. Root fix: `get_module_exports` SQL now
+   `WHERE n.is_test = 0` on both the explicit-exports (JS/TS) path and the
+   fallback (Rust / Go / Python) path — AST-level flag propagates through.
+
+2. **Disambiguation suggestions carry `node_id` + `start_line`.**
+   `resolve_fuzzy_name` and `disambiguate_symbol` suggestions now include
+   both fields so callers can pick a specific definition when multiple
+   same-name functions live in one file (e.g. two `fn new()` in different
+   `impl` blocks of the same module). `disambiguate_symbol` also fires on
+   same-file multi-def, not just cross-file collisions.
+
+3. **`find_references` gains `node_id` parameter.** Lets callers pass the
+   `node_id` from a suggestion directly, skipping the ambiguous name-lookup
+   step. When a name is ambiguous within one file, the tool now returns
+   a per-definition suggestion list (with `start_line`) instead of silently
+   merging refs across defs.
+
+4. **`find_dead_code` gets `ignore_paths` (MCP) / `--ignore` (CLI).**
+   Shell-invoked plugin entry points (lifecycle/hook scripts in
+   `claude-plugin/`) are not in the static AST call graph, so they surfaced
+   as false-positive orphans. Added prefix-match exclusions with a sensible
+   default (`["claude-plugin/"]`). Pass `ignore_paths: []` or
+   `--no-ignore` to see the full list. Response carries `ignored_count`,
+   `ignore_paths_applied`, `ignore_paths_defaulted` for transparency.
+
+### Docs
+
+- `plugin_code_graph_mcp.md`: hidden-5 tools now have an explicit
+  required/optional parameter table (notably `trace_http_chain` takes
+  `route_path`, not `route`) — users calling by name no longer need to
+  trigger the error message to discover arg names.
+
+### Tests
+
++4 new (+1 unit in `queries.rs`, +3 integration covering Bug #1 / Issue #3 /
+Bug #2). Full suite: **347 passed / 0 failed** default features,
+**340 passed / 0 failed** `--no-default-features`; clippy
+`-D warnings` clean under both feature configs.
+
 ## v0.11.1 — 12-tool accuracy audit: 1 critical bugfix + 5 precision improvements
 
 Post-audit fixes for tool output correctness. All changes are additive/tightening —

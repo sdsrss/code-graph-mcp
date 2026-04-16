@@ -1578,3 +1578,163 @@ pub fn something_else() { println!("no refs to OrphanStruct"); }
     assert!(result["warning"].is_string(),
         "type query must carry the type_warning alongside UNKNOWN");
 }
+
+/// v0.11.2 fix: `module_overview` must not leak inline `#[cfg(test)]` functions
+/// whose names don't match the `test_*` / `*Test` naming heuristic.
+#[test]
+fn test_module_overview_excludes_cfg_test_functions() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub fn compute_thing() -> i32 { 42 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn arrays_are_homogeneous() { assert_eq!(1, 1); }
+
+    #[test]
+    fn nothing_prefix_matches_test() { assert_eq!(2, 2); }
+}
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("module_overview", serde_json::json!({"path":"."}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    // All exported names across active + inactive — no leaked test fns.
+    let mut all_names: Vec<String> = Vec::new();
+    if let Some(active) = result["active_exports"].as_array() {
+        for e in active { if let Some(n) = e["name"].as_str() { all_names.push(n.into()); } }
+    }
+    if let Some(inactive) = result["inactive_summary"].as_array() {
+        for bucket in inactive {
+            if let Some(names) = bucket["names"].as_array() {
+                for n in names { if let Some(s) = n.as_str() { all_names.push(s.into()); } }
+            }
+        }
+    }
+    assert!(all_names.iter().any(|n| n == "compute_thing"),
+        "expected real export 'compute_thing' in overview, got: {:?}", all_names);
+    for leak in ["arrays_are_homogeneous", "nothing_prefix_matches_test"] {
+        assert!(!all_names.iter().any(|n| n == leak),
+            "#[cfg(test)] fn '{}' leaked into module_overview: {:?}", leak, all_names);
+    }
+}
+
+/// v0.11.2 fix: disambiguation suggestions carry `node_id` AND `start_line`
+/// so callers can pick a specific definition — and same-file multi-defs
+/// (e.g. two `fn new()` in one module for different impl blocks) are flagged
+/// instead of silently merged.
+#[test]
+fn test_disambiguation_suggestions_include_node_id_and_start_line() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub struct Foo;
+pub struct Bar;
+
+impl Foo {
+    pub fn new() -> Self { Foo }
+}
+
+impl Bar {
+    pub fn new() -> Self { Bar }
+}
+
+pub fn make_them() {
+    let _ = Foo::new();
+    let _ = Bar::new();
+}
+"#).unwrap();
+    let server = common::init_server(&project);
+
+    // find_references on an ambiguous same-file symbol should enumerate
+    // per-definition suggestions with node_id + start_line.
+    let msg = tool_call_json("find_references",
+        serde_json::json!({"symbol_name":"new","file_path":"lib.rs"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    assert!(result.get("error").is_some(),
+        "expected ambiguity error for same-file multi-def 'new': {}", result);
+    let suggestions = result["suggestions"].as_array()
+        .expect("suggestions array missing");
+    assert!(suggestions.len() >= 2,
+        "expected ≥2 suggestions for two fn new(), got {}: {}", suggestions.len(), result);
+    for s in suggestions {
+        assert!(s["node_id"].as_i64().is_some(),
+            "suggestion missing node_id: {}", s);
+        assert!(s["start_line"].as_i64().is_some(),
+            "suggestion missing start_line: {}", s);
+    }
+    let lines: Vec<i64> = suggestions.iter()
+        .filter_map(|s| s["start_line"].as_i64())
+        .collect();
+    assert!(lines.windows(2).any(|w| w[0] != w[1]),
+        "expected distinct start_line values across same-name defs, got: {:?}", lines);
+
+    // Caller should now be able to pass node_id from the suggestion
+    // and get a clean single-definition result.
+    let picked = suggestions[0].clone();
+    let nid = picked["node_id"].as_i64().unwrap();
+    let msg2 = tool_call_json("find_references",
+        serde_json::json!({"node_id": nid}));
+    let resp2 = server.handle_message(&msg2).unwrap();
+    let result2 = parse_tool_result(&resp2);
+    assert!(result2.get("error").is_none(),
+        "node_id selection should not be ambiguous: {}", result2);
+}
+
+/// v0.11.2 fix: `find_dead_code` must filter out shell-invoked plugin entry
+/// points by default (claude-plugin/** prefix). Users opt in to the full list
+/// by passing `ignore_paths: []`.
+#[test]
+fn test_find_dead_code_default_ignores_plugin_scripts() {
+    let project = TempDir::new().unwrap();
+    // A clearly-unused function in a regular src file.
+    fs::write(project.path().join("lib.rs"), r#"
+pub fn genuinely_dead_thing() {
+    let x = 1;
+    let y = 2;
+    let z = x + y;
+    println!("{}", z);
+}
+"#).unwrap();
+    // Simulate a claude-plugin hook script — function invoked only via shell.
+    fs::create_dir_all(project.path().join("claude-plugin/scripts")).unwrap();
+    fs::write(project.path().join("claude-plugin/scripts/lifecycle.js"), r#"
+function uninstall() {
+    console.log("hook cleanup step 1");
+    console.log("hook cleanup step 2");
+    console.log("hook cleanup step 3");
+}
+uninstall();
+"#).unwrap();
+
+    let server = common::init_server(&project);
+
+    // Default call — `uninstall` must NOT appear; real dead code still visible.
+    let msg = tool_call_json("find_dead_code", serde_json::json!({"min_lines": 3}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let names: Vec<&str> = result["results"].as_array().unwrap()
+        .iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(!names.contains(&"uninstall"),
+        "claude-plugin/ entry point leaked as dead code: {:?}", names);
+    assert!(result["ignored_count"].as_u64().unwrap_or(0) >= 1,
+        "expected at least 1 ignored result, got: {}", result);
+    assert_eq!(result["ignore_paths_defaulted"], true,
+        "defaulted ignore should be flagged: {}", result);
+
+    // Opt-out — pass `[]` and the plugin script now shows up.
+    let msg2 = tool_call_json("find_dead_code",
+        serde_json::json!({"min_lines": 3, "ignore_paths": []}));
+    let resp2 = server.handle_message(&msg2).unwrap();
+    let result2 = parse_tool_result(&resp2);
+    let names2: Vec<&str> = result2["results"].as_array().unwrap()
+        .iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(names2.contains(&"uninstall"),
+        "ignore_paths=[] should surface plugin entry points, got: {:?}", names2);
+    assert_eq!(result2["ignore_paths_defaulted"], false,
+        "explicit [] must not be flagged as defaulted: {}", result2);
+}

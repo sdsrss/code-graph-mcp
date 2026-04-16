@@ -128,6 +128,23 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// Collect all repeated values for a flag (e.g. `--ignore a --ignore b` → ["a","b"]).
+fn collect_flag_values(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Get a flag value that represents a file path, normalizing `./` prefix.
 fn get_path_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     get_flag_value(args, flag).map(|p| p.strip_prefix("./").unwrap_or(p))
@@ -2077,13 +2094,38 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     let compact = !has_flag(args, "--no-compact");
     let json_mode = has_flag(args, "--json");
 
+    // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
+    // Default = claude-plugin/ (hook/lifecycle scripts the AST graph can't reach).
+    let ignore_prefixes: Vec<String> = if has_flag(args, "--no-ignore") {
+        Vec::new()
+    } else {
+        let explicit: Vec<String> = collect_flag_values(args, "--ignore");
+        if explicit.is_empty() {
+            crate::domain::default_dead_code_ignores()
+        } else {
+            explicit
+        }
+    };
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let results = queries::find_dead_code(conn, path_filter, type_filter, include_tests, min_lines, 200)?;
+    let raw = queries::find_dead_code(conn, path_filter, type_filter, include_tests, min_lines, 200)?;
+    let pre_count = raw.len();
+    let results: Vec<_> = raw.into_iter()
+        .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+        .collect();
+    let ignored = pre_count - results.len();
 
     if results.is_empty() {
-        eprintln!("[code-graph] No dead code found.");
+        if ignored > 0 {
+            eprintln!(
+                "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
+                ignored,
+            );
+        } else {
+            eprintln!("[code-graph] No dead code found.");
+        }
         return Ok(());
     }
 

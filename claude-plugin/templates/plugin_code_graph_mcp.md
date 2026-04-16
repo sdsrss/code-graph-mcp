@@ -36,13 +36,17 @@ type: reference
 
 ### 进阶 5（隐藏但可调）
 
-| 意图 | 工具 | 关键参数 / 例子 |
-|------|------|----------------|
-| ⚙ "改 X 会炸啥？" | `impact_analysis` / `impact X` | 修改签名前用；或 `get_ast_node` + `include_impact=true` |
-| ⚙ HTTP 路由 → handler 链路 | `trace_http_chain` / `trace ROUTE` | API 调试 |
-| ⚙ "X 文件依赖谁？" | `dependency_graph` / `deps X` | file 级别 |
-| ⚙ "相似/重复函数" | `find_similar_code` / `similar X` | 需 embedding |
-| ⚙ "未使用的代码" | `find_dead_code` / `dead-code [path]` | 清理 exports |
+这 5 个工具从 `tools/list` 隐藏（省 token），但**仍可按名调用**。由于 schema 不在 list 里，**必须用下表列出的精确参数名**（猜错会返回 `"<param> is required"` 错误）。
+
+| 意图 | 工具 | 必填参数 | 可选参数 |
+|------|------|----------|----------|
+| "改 X 会炸啥？" | `impact_analysis` | `symbol_name` | `file_path`, `change_type` ∈ {signature,behavior,remove}, `depth` |
+| HTTP 路由 → handler 链路 | `trace_http_chain` | **`route_path`** ⚠（不是 `route`） | `depth` |
+| "X 文件依赖谁？" | `dependency_graph` | `file_path` | `direction` ∈ {outgoing,incoming,both}, `depth`, `compact` |
+| "相似/重复函数"（需 embedding） | `find_similar_code` | `symbol_name` 或 `node_id` | `top_k`, `max_distance` |
+| "未使用的代码" | `find_dead_code` | — | `path`, `node_type`, `include_tests`, `min_lines`, `compact`, **`ignore_paths`** (prefix glob 数组；默认 `["claude-plugin/"]`，传 `[]` 关闭默认豁免) |
+
+CLI 等价：`impact/trace/deps/similar/dead-code`（见下方 CLI 速查）。
 
 ## 不要替代
 
@@ -73,7 +77,9 @@ code-graph-mcp callgraph SYMBOL          # 调用图
 code-graph-mcp impact SYMBOL             # 影响面
 code-graph-mcp show SYMBOL                # 节点详情
 code-graph-mcp refs SYMBOL --relation calls  # 引用筛选
-code-graph-mcp dead-code [path]           # 未使用代码
+code-graph-mcp dead-code [path]           # 未使用代码（默认豁免 claude-plugin/）
+code-graph-mcp dead-code --ignore tmp/ --ignore scripts/bin/  # 自定义豁免前缀
+code-graph-mcp dead-code --no-ignore      # 关掉默认豁免，看完整列表
 code-graph-mcp health-check              # 索引健康
 ```
 

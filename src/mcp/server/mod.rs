@@ -782,6 +782,7 @@ impl McpServer {
             // to the exact matches so callers disambiguate the real collision.
             let suggestions = exact.iter().map(|c| json!({
                 "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                "node_id": c.node_id, "start_line": c.start_line,
             })).collect();
             return Ok(FuzzyResolution::Ambiguous(suggestions));
         }
@@ -790,6 +791,7 @@ impl McpServer {
         } else if !candidates.is_empty() {
             let suggestions = candidates.iter().map(|c| json!({
                 "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                "node_id": c.node_id, "start_line": c.start_line,
             })).collect();
             Ok(FuzzyResolution::Ambiguous(suggestions))
         } else {
@@ -797,7 +799,11 @@ impl McpServer {
         }
     }
 
-    /// Check if a symbol name is ambiguous (exists in multiple files).
+    /// Check if a symbol name is ambiguous (multiple non-test definitions).
+    /// Fires on both cross-file collisions AND same-file multi-definitions
+    /// (e.g. two `fn new()` in one module for different impl blocks) — the
+    /// latter needs `node_id`/`start_line` to disambiguate because `file_path`
+    /// alone doesn't uniquely identify the target.
     /// Returns Some(suggestions) if ambiguous, None if unambiguous or not found.
     fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
         let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), name)?;
@@ -805,21 +811,16 @@ impl McpServer {
             .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
             .collect();
         if non_test.len() > 1 {
-            let mut seen_files = std::collections::HashSet::new();
-            for nf in &non_test {
-                seen_files.insert(nf.node.file_id);
-            }
-            if seen_files.len() > 1 {
-                let suggestions: Vec<_> = non_test.iter().map(|nf| {
-                    json!({
-                        "name": &nf.node.name,
-                        "file_path": &nf.file_path,
-                        "type": &nf.node.node_type,
-                        "node_id": nf.node.id,
-                    })
-                }).collect();
-                return Ok(Some(suggestions));
-            }
+            let suggestions: Vec<_> = non_test.iter().map(|nf| {
+                json!({
+                    "name": &nf.node.name,
+                    "file_path": &nf.file_path,
+                    "type": &nf.node.node_type,
+                    "node_id": nf.node.id,
+                    "start_line": nf.node.start_line,
+                })
+            }).collect();
+            return Ok(Some(suggestions));
         }
         Ok(None)
     }

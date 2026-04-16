@@ -103,6 +103,18 @@ pub fn is_test_symbol_or_annotated(name: &str, file_path: &str, is_test_from_ast
     is_test_from_ast || is_test_symbol(name, file_path)
 }
 
+// -- Dead-code ignore defaults --
+/// Path-prefix defaults for `find_dead_code` ignore_paths.
+///
+/// Shell-invoked entry points (Claude Code plugin hook handlers, lifecycle
+/// scripts, auto-update hooks) are not in the static AST call graph because
+/// their callers are settings.json hook definitions / shell commands, not
+/// JS imports. Without this default they dominate orphan results with false
+/// positives. Callers wanting the unfiltered list pass `ignore_paths: []`.
+pub fn default_dead_code_ignores() -> Vec<String> {
+    vec!["claude-plugin/".to_string()]
+}
+
 // -- Node type normalization --
 /// Normalize shorthand type filter into canonical AST node types.
 /// Shared by CLI and MCP tool implementations.
