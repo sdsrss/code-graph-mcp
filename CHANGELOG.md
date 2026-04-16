@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.1 — Rust 1.95 clippy cleanup
+
+CI-only cleanup; no runtime behavior changes, no user-visible differences. Fixes 9 clippy errors surfaced by Rust 1.95.0's stricter lints (pre-existing since ~v0.8.1, was shipping with red CI):
+
+- `collapsible_match` (4): merge `match arm => if cond` into `match arm if cond =>` in `src/parser/relations.rs` C# arms + Python decorator scan.
+- `unnecessary_sort_by` (4): `.sort_by(|a,b| b.x.cmp(&a.x))` → `.sort_by_key(|e| Reverse(e.x))` in `src/mcp/server/tools.rs` and `src/storage/queries.rs`.
+- `useless_conversion` (1): drop redundant `.into_iter()` in a chained iterator in `src/graph/query.rs`.
+
+Verified with `cargo +1.95.0 clippy -- -D warnings` on both `--no-default-features` and default feature sets.
+
 ## v0.9.0 — Context-aware auto-adopt (C')
 
 ### Migration note

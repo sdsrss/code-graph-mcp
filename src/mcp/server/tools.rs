@@ -1189,7 +1189,7 @@ impl McpServer {
         let mut hot_candidates: Vec<_> = exports.iter()
             .filter(|e| e.caller_count > 0)
             .collect();
-        hot_candidates.sort_by(|a, b| b.caller_count.cmp(&a.caller_count));
+        hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
         let hot_paths: Vec<serde_json::Value> = hot_candidates.iter()
             .take(5)
             .map(|e| json!({
@@ -1204,7 +1204,7 @@ impl McpServer {
         const MAX_ACTIVE: usize = 30;
         let active_capped = active.len() > MAX_ACTIVE;
         let mut active_sorted = active.clone();
-        active_sorted.sort_by(|a, b| b.caller_count.cmp(&a.caller_count));
+        active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
         let active_exports: Vec<serde_json::Value> = active_sorted.iter()
             .take(MAX_ACTIVE)
             .map(|e| json!({

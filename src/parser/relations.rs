@@ -403,49 +403,16 @@ fn walk_for_relations(
         }
 
         // C# using directives: using System; using System.Collections.Generic;
-        "using_directive" => {
-            if config.name == "csharp" {
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i) {
-                        if child.kind() == "qualified_name" || child.kind() == "identifier" {
-                            let name = node_text(&child, source).to_string();
-                            if !name.is_empty() && name != "using" {
-                                results.push(ParsedRelation {
-                                    source_name: "<module>".into(),
-                                    target_name: name,
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // C# inheritance: class Dog : Animal, IWalkable
-        "base_list" => {
-            if config.name == "csharp" {
-                // Get the class/struct name from the parent node
-                let owner_name = node.parent()
-                    .and_then(|p| p.child_by_field_name("name"))
-                    .map(|n| node_text(&n, source).to_string());
-                let owner = owner_name.as_deref().or(active_scope).unwrap_or("<module>");
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i) {
-                        let base_name = node_text(&child, source).to_string();
-                        if !base_name.is_empty() {
-                            let rel = if config.interface_by_prefix
-                                && base_name.starts_with('I') && base_name.len() > 1
-                                && base_name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
-                                REL_IMPLEMENTS
-                            } else {
-                                REL_INHERITS
-                            };
+        "using_directive" if config.name == "csharp" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    if child.kind() == "qualified_name" || child.kind() == "identifier" {
+                        let name = node_text(&child, source).to_string();
+                        if !name.is_empty() && name != "using" {
                             results.push(ParsedRelation {
-                                source_name: owner.to_string(),
-                                target_name: base_name,
-                                relation: rel.into(),
+                                source_name: "<module>".into(),
+                                target_name: name,
+                                relation: REL_IMPORTS.into(),
                                 metadata: None,
                             });
                         }
@@ -454,29 +421,56 @@ fn walk_for_relations(
             }
         }
 
-        // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
-        "invocation_expression" => {
-            if config.name == "csharp" {
-                if let Some(scope) = active_scope {
-                    if let Some(func) = node.named_child(0) {
-                        let callee = match func.kind() {
-                            "identifier" => Some(node_text(&func, source).to_string()),
-                            "member_access_expression" => {
-                                // e.g. Console.WriteLine — extract "WriteLine"
-                                func.child_by_field_name("name")
-                                    .map(|n| node_text(&n, source).to_string())
-                            }
-                            _ => None,
+        // C# inheritance: class Dog : Animal, IWalkable
+        "base_list" if config.name == "csharp" => {
+            // Get the class/struct name from the parent node
+            let owner_name = node.parent()
+                .and_then(|p| p.child_by_field_name("name"))
+                .map(|n| node_text(&n, source).to_string());
+            let owner = owner_name.as_deref().or(active_scope).unwrap_or("<module>");
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    let base_name = node_text(&child, source).to_string();
+                    if !base_name.is_empty() {
+                        let rel = if config.interface_by_prefix
+                            && base_name.starts_with('I') && base_name.len() > 1
+                            && base_name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
+                            REL_IMPLEMENTS
+                        } else {
+                            REL_INHERITS
                         };
-                        if let Some(name) = callee {
-                            if !name.is_empty() {
-                                results.push(ParsedRelation {
-                                    source_name: scope.to_string(),
-                                    target_name: name,
-                                    relation: REL_CALLS.into(),
-                                    metadata: None,
-                                });
-                            }
+                        results.push(ParsedRelation {
+                            source_name: owner.to_string(),
+                            target_name: base_name,
+                            relation: rel.into(),
+                            metadata: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
+        "invocation_expression" if config.name == "csharp" => {
+            if let Some(scope) = active_scope {
+                if let Some(func) = node.named_child(0) {
+                    let callee = match func.kind() {
+                        "identifier" => Some(node_text(&func, source).to_string()),
+                        "member_access_expression" => {
+                            // e.g. Console.WriteLine — extract "WriteLine"
+                            func.child_by_field_name("name")
+                                .map(|n| node_text(&n, source).to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(name) = callee {
+                        if !name.is_empty() {
+                            results.push(ParsedRelation {
+                                source_name: scope.to_string(),
+                                target_name: name,
+                                relation: REL_CALLS.into(),
+                                metadata: None,
+                            });
                         }
                     }
                 }
@@ -1259,14 +1253,12 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             match child.kind() {
-                "decorator" => {
-                    if matched_decorator.is_none() {
-                        let dec_text = node_text(&child, source);
-                        let has_receiver = known_receivers.iter().any(|p| dec_text.contains(p));
-                        let has_method = route_methods.iter().any(|m| dec_text.contains(m));
-                        if has_receiver && has_method {
-                            matched_decorator = Some(child);
-                        }
+                "decorator" if matched_decorator.is_none() => {
+                    let dec_text = node_text(&child, source);
+                    let has_receiver = known_receivers.iter().any(|p| dec_text.contains(p));
+                    let has_method = route_methods.iter().any(|m| dec_text.contains(m));
+                    if has_receiver && has_method {
+                        matched_decorator = Some(child);
                     }
                 }
                 "function_definition" => func_def = Some(child),

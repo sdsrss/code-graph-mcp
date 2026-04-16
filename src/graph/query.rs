@@ -130,7 +130,7 @@ fn query_direction(
 fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
     let mut by_key: HashMap<(i64, Direction), CallGraphNode> = HashMap::new();
 
-    for node in callees.into_iter().chain(callers.into_iter()) {
+    for node in callees.into_iter().chain(callers) {
         let key = (node.node_id, node.direction);
         by_key
             .entry(key)

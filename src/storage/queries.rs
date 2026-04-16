@@ -1482,7 +1482,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             key_symbols: dir_symbols.remove(dir).unwrap_or_default(),
         }
     }).collect();
-    modules.sort_by(|a, b| b.functions.cmp(&a.functions));
+    modules.sort_by_key(|m| std::cmp::Reverse(m.functions));
 
     // 3. Cross-module dependencies (C3: use REL_IMPORTS constant)
     let mut dep_map: HashMap<(String, String), usize> = HashMap::new();
@@ -1511,7 +1511,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     let mut deps: Vec<ModuleDep> = dep_map.into_iter()
         .map(|((from, to), count)| ModuleDep { from, to, import_count: count })
         .collect();
-    deps.sort_by(|a, b| b.import_count.cmp(&a.import_count));
+    deps.sort_by_key(|d| std::cmp::Reverse(d.import_count));
 
     // 4. HTTP entry points (C3: use REL_ROUTES_TO constant)
     let mut entry_points = Vec::new();
