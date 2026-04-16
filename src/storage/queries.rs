@@ -1066,7 +1066,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
 // --- Fuzzy name resolution ---
 
 /// Candidate result from fuzzy function name matching.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NameCandidate {
     pub name: String,
     pub file_path: String,

@@ -486,6 +486,97 @@ fn test_cli_incremental_index() {
 }
 
 // ============================================================
+// rebuild-index (§5 hard op — destructive path requires --confirm)
+// ============================================================
+
+#[test]
+fn test_cli_rebuild_index_requires_confirm() {
+    let project = setup_indexed_project();
+    let db_path = project.path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    assert!(db_path.exists(), "precondition: indexed project has index.db");
+    let pre_size = std::fs::metadata(&db_path).unwrap().len();
+
+    // Without --confirm: must bail non-zero AND leave index.db intact.
+    let (_, stderr, code) = run_cli(&project, &["rebuild-index"]);
+    assert_ne!(code, 0, "rebuild-index without --confirm must fail");
+    assert!(stderr.contains("--confirm"), "stderr should demand --confirm, got: {}", stderr);
+    assert!(db_path.exists(), "index.db must survive a rejected rebuild-index");
+    let post_size = std::fs::metadata(&db_path).unwrap().len();
+    assert_eq!(pre_size, post_size, "index.db size must be unchanged");
+}
+
+#[test]
+fn test_cli_rebuild_index_with_confirm_rebuilds() {
+    let project = setup_indexed_project();
+    let db_path = project.path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    assert!(db_path.exists());
+
+    // With --confirm: drop + re-create index. File should exist post-run and be non-empty.
+    let (_, stderr, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
+    assert_eq!(code, 0, "rebuild-index --confirm failed: {}", stderr);
+    assert!(db_path.exists(), "index.db must be recreated");
+    assert!(std::fs::metadata(&db_path).unwrap().len() > 0, "recreated index.db must be non-empty");
+}
+
+// ============================================================
+// refs --node-id (P1-1: MCP parity — node_id is authoritative)
+// ============================================================
+
+#[test]
+fn test_cli_refs_node_id_envelope() {
+    let project = setup_indexed_project();
+    // First resolve a known symbol to a node_id via search --json
+    let (search_out, _, search_code) = run_cli(&project, &["search", "validateToken", "--json", "--limit", "1"]);
+    assert_eq!(search_code, 0, "search must succeed");
+    let arr: serde_json::Value = serde_json::from_str(search_out.trim()).unwrap();
+    let nid = arr[0]["node_id"].as_i64().expect("search result must expose node_id");
+
+    let (out, _, code) = run_cli(&project, &["refs", "--node-id", &nid.to_string(), "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    // Envelope fields match MCP find_references
+    assert!(v["symbol"].is_string(), "envelope must include symbol");
+    assert!(v["total_references"].is_number(), "envelope must include total_references");
+    assert!(v["by_relation"].is_object(), "envelope must include by_relation map");
+    assert!(v["references"].is_array(), "envelope must include references array");
+}
+
+// ============================================================
+// trace --json single-object envelope (P1-4)
+// ============================================================
+
+#[test]
+fn test_cli_trace_json_single_object_envelope_on_empty() {
+    let project = setup_indexed_project();
+    let (out, _, code) = run_cli(&project, &["trace", "/api/nonexistent", "--json"]);
+    assert_ne!(code, 0, "no-match trace still exits non-zero");
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .expect("trace --json must emit a single parseable JSON object, not JSONL");
+    assert!(v.is_object(), "envelope must be an object");
+    assert!(v["handlers"].is_array(), "envelope must have handlers array");
+}
+
+// ============================================================
+// ast-search --json envelope (P2-6: {results, count})
+// ============================================================
+
+#[test]
+fn test_cli_ast_search_json_envelope() {
+    let project = setup_indexed_project();
+    let (out, _, code) = run_cli(&project, &["ast-search", "--type", "fn", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(v["results"].is_array(), "ast-search --json must wrap in {{results,count}}");
+    assert!(v["count"].is_number(), "ast-search --json must include count");
+    let count = v["count"].as_u64().unwrap();
+    assert_eq!(count, v["results"].as_array().unwrap().len() as u64);
+}
+
+// ============================================================
 // Edge cases and validation
 // ============================================================
 

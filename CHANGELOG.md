@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.11.3 — Doc: "hidden but callable" clarified (Claude Code vs. raw MCP)
+
+User-facing: no behavior change; corrects a misleading claim in the adopted
+plugin memory after a 12-tool UX audit.
+
+### Context
+
+v0.10.0 trimmed `tools/list` to 7 core tools and documented the other 5
+(`impact_analysis`, `trace_http_chain`, `dependency_graph`, `find_similar_code`,
+`find_dead_code`) as "hidden but callable by name". UX audit found this holds
+only for clients that invoke `tools/call` with a literal tool name (raw JSON-RPC,
+MCP SDKs, CLI). **Claude Code's MCP integration derives its callable set from
+`tools/list`** — `ToolSearch` returns `No matching deferred tools found` for the
+hidden 5, and direct invocation errors with `No such tool available`.
+
+### Fixes
+
+1. **`claude-plugin/templates/plugin_code_graph_mcp.md` "进阶 5" table
+   reworded**: CLI is now the primary column for Claude Code users; raw MCP
+   name calls annotated as SDK/scripts-only. v0.11.0 template auto-refresh
+   pushes this to previously-adopted projects on next SessionStart.
+2. **`src/mcp/tools.rs` doc comment**: spells out which MCP clients can reach
+   hidden tools and points to CLI fallback for Claude Code.
+
+### Why this matters
+
+Misleading docs caused agents to attempt `mcp__…__impact_analysis` /
+`mcp__…__trace_http_chain` and hit a terminal "No such tool available" error
+instead of routing to `code-graph-mcp impact|trace|deps|similar|dead-code`
+via Bash.
+
 ## v0.11.2 — Post-audit follow-up: 4 residual precision fixes
 
 Follow-up audit on top of v0.11.1. All additive/tightening — no schema breakage.

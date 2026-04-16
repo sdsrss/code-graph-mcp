@@ -34,6 +34,10 @@ fn main() -> Result<()> {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
+        Some("rebuild-index") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            code_graph_mcp::cli::cmd_rebuild_index(&project_root, &args)
+        }
         Some("health-check") => {
             // Support both --format json and --json for consistency with other commands
             let format = if args.iter().any(|a| a == "--json") {
@@ -133,7 +137,8 @@ fn print_help() {
     println!("    serve               Start MCP JSON-RPC server on stdio (default)");
     println!("    grep <pattern> [path]");
     println!("                        AST-context grep (ripgrep + containing function/class)");
-    println!("    search <query>      FTS5 semantic search by concept");
+    println!("    search <query>      FTS5 text search by concept (CLI is FTS-only;");
+    println!("                        MCP `semantic_code_search` adds vector+RRF fusion)");
     println!("    ast-search [query]  Structured search with --type/--returns/--params filters");
     println!("    callgraph <symbol>  Show call graph (callers/callees)");
     println!("    impact <symbol>     Impact analysis (callers, routes, risk level)");
@@ -146,7 +151,9 @@ fn print_help() {
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    incremental-index   Run incremental index update");
+    println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
     println!("    health-check        Query index status");
+    println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");
     println!("    benchmark           Benchmark index speed, query latency, token savings");
     println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
@@ -276,8 +283,8 @@ fn run_serve() -> Result<()> {
 const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
-    "dead-code", "incremental-index", "health-check", "doctor", "benchmark",
-    "adopt", "unadopt",
+    "dead-code", "incremental-index", "rebuild-index", "health-check", "doctor",
+    "benchmark", "adopt", "unadopt",
 ];
 
 /// Locate and exec a node script under claude-plugin/scripts/.

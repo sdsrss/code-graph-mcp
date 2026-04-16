@@ -5,9 +5,14 @@ use serde_json::json;
 /// Management tools (start_watch, stop_watch, get_index_status, rebuild_index)
 /// are still callable via tools/call but hidden from tools/list to save tokens.
 /// Niche tools (trace_http_chain, impact_analysis, dependency_graph,
-/// find_similar_code, find_dead_code) are also hidden — still callable by name
-/// for CLI / advanced use, but omitted from the default LLM surface to shrink
-/// tools/list token overhead (~40% reduction in listing payload).
+/// find_similar_code, find_dead_code) are also hidden. NOTE: "hidden but
+/// callable" only holds for clients that invoke `tools/call` by literal name
+/// (raw JSON-RPC, MCP SDKs, CLI). Claude Code's MCP integration derives its
+/// callable tool set from `tools/list` and will refuse calls to hidden names
+/// with "No such tool available" — for those flows, use the CLI subcommands
+/// (`impact`, `trace`, `deps`, `similar`, `dead-code`) via Bash instead.
+/// Hiding trades this partial reachability for ~40% reduction in tools/list
+/// payload at session start.
 /// Merged tools (find_http_route → trace_http_chain, read_snippet → get_ast_node)
 /// remain callable as aliases for backward compatibility.
 pub const TOOL_COUNT: usize = 7;

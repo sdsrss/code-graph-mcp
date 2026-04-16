@@ -18,9 +18,11 @@ type: reference
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
 
-> v0.10.0 起：tools/list 默认只暴露 7 个核心工具；下表中 `⚙` 标记的 5 个工具
-> 已从 tools/list 隐藏以节省 session 启动 tokens，但**仍可通过名称直接调用**
-> （向后兼容别名）或用 CLI 子命令。高频场景可优先用核心 7 个。
+> v0.10.0 起：tools/list 默认只暴露 7 个核心工具；下表"进阶 5"中的工具
+> 已从 tools/list 隐藏以节省 session 启动 tokens。**Claude Code 里请走 CLI
+> 子命令**（MCP schema 不在 list，Claude Code 的 ToolSearch 不会加载，直接
+> 调用会得到 `No such tool available`——实测验证见下方"进阶 5"）。写
+> MCP SDK / 原生 `tools/call` JSON-RPC 的脚本场景仍可按名调用。
 
 ### 核心 7（tools/list 默认暴露）
 
@@ -34,19 +36,24 @@ type: reference
 | "看 X 的源码 / 签名" | `get_ast_node` / `show X` | `include_impact=true` 含影响面（替代 impact_analysis） |
 | "项目结构总览" | `project_map` / `map` | 起手势用 `--compact` |
 
-### 进阶 5（隐藏但可调）
+### 进阶 5（Claude Code 里走 CLI；MCP 名调用仅限脚本/SDK）
 
-这 5 个工具从 `tools/list` 隐藏（省 token），但**仍可按名调用**。由于 schema 不在 list 里，**必须用下表列出的精确参数名**（猜错会返回 `"<param> is required"` 错误）。
+⚠ **实测**：从 Claude Code 里直接调 `mcp__plugin_code-graph-mcp_code-graph__<tool>`
+会得到 `No such tool available`——Claude Code 的 `ToolSearch` 只为 `tools/list`
+里的工具生成 schema，hidden 5 在 list 之外就加载不到。**Claude Code 场景一律用
+下表 CLI 列**。raw JSON-RPC (`tools/call`) 仍接受这 5 个名字（含向后兼容别名
+`find_http_route` → `trace_http_chain`, `read_snippet` → `get_ast_node`）。
 
-| 意图 | 工具 | 必填参数 | 可选参数 |
-|------|------|----------|----------|
-| "改 X 会炸啥？" | `impact_analysis` | `symbol_name` | `file_path`, `change_type` ∈ {signature,behavior,remove}, `depth` |
-| HTTP 路由 → handler 链路 | `trace_http_chain` | **`route_path`** ⚠（不是 `route`） | `depth` |
-| "X 文件依赖谁？" | `dependency_graph` | `file_path` | `direction` ∈ {outgoing,incoming,both}, `depth`, `compact` |
-| "相似/重复函数"（需 embedding） | `find_similar_code` | `symbol_name` 或 `node_id` | `top_k`, `max_distance` |
-| "未使用的代码" | `find_dead_code` | — | `path`, `node_type`, `include_tests`, `min_lines`, `compact`, **`ignore_paths`** (prefix glob 数组；默认 `["claude-plugin/"]`，传 `[]` 关闭默认豁免) |
+| 意图 | CLI（Claude Code 首选） | MCP 工具名（SDK/脚本） | 关键参数 |
+|------|--------------------------|------------------------|----------|
+| "改 X 会炸啥？" | `code-graph-mcp impact X` | `impact_analysis` | `symbol_name` (必), `file_path`, `change_type` ∈ {signature,behavior,remove}, `depth` |
+| HTTP 路由 → handler 链路 | `code-graph-mcp trace /api/x` | `trace_http_chain` | **`route_path`** ⚠ (不是 `route`), `depth` |
+| "X 文件依赖谁？" | `code-graph-mcp deps src/x.rs` | `dependency_graph` | `file_path` (必), `direction` ∈ {outgoing,incoming,both}, `depth`, `compact` |
+| "相似/重复函数"（需 embedding） | `code-graph-mcp similar X` | `find_similar_code` | `symbol_name` 或 `node_id` (必), `top_k`, `max_distance` |
+| "未使用的代码" | `code-graph-mcp dead-code [path]` | `find_dead_code` | `path`, `node_type`, `include_tests`, `min_lines`, `compact`, **`ignore_paths`** (prefix glob 数组；默认 `["claude-plugin/"]`，传 `[]` 关闭默认豁免) |
 
-CLI 等价：`impact/trace/deps/similar/dead-code`（见下方 CLI 速查）。
+**替代路径**：核心 7 里的 `get_ast_node include_impact=true` 覆盖 `impact_analysis`
+的常用场景（风险等级 + 直接/传递调用者 + 受影响文件/路由），不必跳到 CLI。
 
 ## 不要替代
 
@@ -59,8 +66,8 @@ CLI 等价：`impact/trace/deps/similar/dead-code`（见下方 CLI 速查）。
 1. 起手 `project_map --compact` 看架构
 2. `semantic_code_search` 默认带 `compact=true`，省 token
 3. 展开节点：`get_ast_node node_id=N compact=true` 看签名 / 不带 compact 看全文
-4. 改前评估影响：`get_ast_node symbol_name=X include_impact=true`（核心 7 内）
-   或直接 `impact_analysis symbol_name=X`（隐藏但可调，输出更细：风险等级 + 路由 + 文件计数）
+4. 改前评估影响：`get_ast_node symbol_name=X include_impact=true`（核心 7 内，首选）
+   或 Bash 调 `code-graph-mcp impact X`（独立进程；输出更细：风险等级 + 路由 + 文件计数）
 5. 搜不到结果 → `code-graph-mcp health-check` 检查索引与 embedding 覆盖率
 
 可用 prompts：`impact-analysis`、`understand-module`、`trace-request`

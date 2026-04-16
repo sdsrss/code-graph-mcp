@@ -170,6 +170,36 @@ fn strip_qualified_prefix(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// CLI-side fuzzy name resolution. Mirrors MCP server's `resolve_fuzzy_name` so
+/// CLI `callgraph`/`refs` auto-promote a unique fuzzy match to the exact name
+/// instead of just printing "Did you mean" and bailing out.
+pub(crate) enum CliFuzzyResolution {
+    Unique(String),
+    Ambiguous(Vec<queries::NameCandidate>),
+    NotFound,
+}
+
+fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<CliFuzzyResolution> {
+    let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(conn, name)?
+        .into_iter()
+        .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
+        .collect();
+    let exact: Vec<_> = candidates.iter().filter(|c| c.name == name).cloned().collect();
+    if exact.len() == 1 {
+        return Ok(CliFuzzyResolution::Unique(exact[0].name.clone()));
+    }
+    if exact.len() > 1 {
+        return Ok(CliFuzzyResolution::Ambiguous(exact));
+    }
+    if candidates.len() == 1 {
+        return Ok(CliFuzzyResolution::Unique(candidates.into_iter().next().unwrap().name));
+    }
+    if !candidates.is_empty() {
+        return Ok(CliFuzzyResolution::Ambiguous(candidates));
+    }
+    Ok(CliFuzzyResolution::NotFound)
+}
+
 /// Resolve a possibly-qualified symbol name (e.g. "Database.open") to a base name
 /// and optional file path for disambiguation. When the user passes a qualified name,
 /// we find the matching node and use its file_path as a filter so that downstream
@@ -325,6 +355,39 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// Drop the existing index.db (plus WAL/SHM) and trigger a full rebuild via
+/// `cmd_incremental_index` (which auto-detects the missing DB and does a full
+/// index). Mirrors MCP `rebuild_index` tool semantics.
+pub fn cmd_rebuild_index(project_root: &Path, args: &[String]) -> Result<()> {
+    let confirm = args.iter().any(|a| a == "--confirm");
+    let quiet = args.iter().any(|a| a == "--quiet");
+    if !confirm {
+        anyhow::bail!(
+            "rebuild-index drops the existing index and re-parses every file. \
+             Pass --confirm to proceed. Use `incremental-index` for incremental updates."
+        );
+    }
+    // Destructive-op sanity: refuse to operate on degenerate roots. Guards against
+    // a resolve_project_root regression that could return `/` or `""`.
+    if project_root.as_os_str().is_empty() || project_root == Path::new("/") {
+        anyhow::bail!(
+            "refusing to rebuild-index with degenerate project_root ({}). \
+             Run from within a git-tracked project directory.",
+            project_root.display()
+        );
+    }
+    let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
+    let db_path = code_graph_dir.join("index.db");
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)?;
+    }
+    let wal = db_path.with_extension("db-wal");
+    let shm = db_path.with_extension("db-shm");
+    if wal.exists() { std::fs::remove_file(&wal)?; }
+    if shm.exists() { std::fs::remove_file(&shm)?; }
+    cmd_incremental_index(project_root, quiet)
+}
+
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
@@ -350,7 +413,30 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
 
     // Embedding coverage (works without sqlite-vec loaded)
     let (vectors_done, vectors_total) = queries::count_nodes_with_vectors(conn).unwrap_or((0, 0));
-    let search_mode = if vectors_done > 0 { "hybrid" } else { "fts_only" };
+    let coverage_pct: i64 = if vectors_total > 0 {
+        (vectors_done as f64 / vectors_total as f64 * 100.0).round() as i64
+    } else {
+        0
+    };
+    // Embedding model availability: compile-time feature flag proxy (runtime-cheap,
+    // avoids loading weights which would violate CLI's hook-fast contract).
+    // NOTE: This diverges from MCP `get_index_status` (which checks runtime
+    // `embedding_model.is_some()` — true only after weights load). CLI reports
+    // `model_available=true` whenever the binary was built with --features
+    // embed-model, even if model weights are missing locally. Cross-check
+    // `embedding_progress`/`embedding_status` to tell apart "compiled but not
+    // loaded yet" from "compiled and embedding in progress".
+    let model_available: bool = cfg!(feature = "embed-model");
+    let search_mode = if model_available && vectors_done > 0 { "hybrid" } else { "fts_only" };
+    let embedding_status = if !model_available {
+        "unavailable"
+    } else if vectors_done == 0 {
+        "pending"
+    } else if vectors_done >= vectors_total && vectors_total > 0 {
+        "complete"
+    } else {
+        "partial"
+    };
 
     match format {
         "json" => {
@@ -364,6 +450,9 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "db_size_bytes": status.db_size_bytes,
                 "search_mode": search_mode,
                 "embedding_progress": format!("{}/{}", vectors_done, vectors_total),
+                "embedding_coverage_pct": coverage_pct,
+                "embedding_status": embedding_status,
+                "model_available": model_available,
             });
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
@@ -631,7 +720,7 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
         parse_flag_or(args, "--limit", 20_i64)
     } else {
         parse_flag_or(args, "--top-k", 20_i64)
-    }.max(1);
+    }.clamp(1, 100);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -764,7 +853,7 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
     let returns_filter = get_flag_value(args, "--returns");
     let params_filter = get_flag_value(args, "--params");
     let json_mode = has_flag(args, "--json");
-    let limit: usize = parse_flag_or(args, "--limit", 20_usize).max(1);
+    let limit: usize = parse_flag_or(args, "--limit", 20_usize).clamp(1, 100);
 
     // Require either a query or at least one structural filter
     let has_filters = type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();
@@ -783,7 +872,9 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
         // FTS5 search then filter in Rust
         let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
         if fts_result.nodes.is_empty() {
-            if json_mode { println!("[]"); }
+            if json_mode {
+                println!("{}", serde_json::json!({"results": [], "count": 0}));
+            }
             eprintln!("[code-graph] No results for: {}", query);
             return Ok(());
         }
@@ -845,6 +936,9 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
     };
 
     if results_with_files.is_empty() {
+        if json_mode {
+            println!("{}", serde_json::json!({"results": [], "count": 0}));
+        }
         eprintln!("[code-graph] No results matching filters.");
         return Ok(());
     }
@@ -868,7 +962,12 @@ pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
                 })
             })
             .collect();
-        writeln!(stdout, "{}", serde_json::to_string(&results)?)?;
+        // Envelope matches MCP ast_search: {results, count}
+        let envelope = serde_json::json!({
+            "results": results,
+            "count": results_with_files.len(),
+        });
+        writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
         return Ok(());
     }
 
@@ -918,20 +1017,52 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
     let file_filter = explicit_file.or(resolved_file.as_deref());
 
-    let nodes = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
+    let mut nodes = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
+    // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
+    // node with no edges) and no --file was specified, promote a unique fuzzy
+    // match. Matches MCP get_call_graph behavior.
+    let has_edges = nodes.iter().any(|n| n.depth > 0);
+    let has_seed = nodes.iter().any(|n| n.depth == 0);
+    let mut resolved_symbol: String = symbol.to_string();
+    if !(has_edges || (has_seed && file_filter.is_some())) {
+        match resolve_fuzzy_name_cli(conn, symbol)? {
+            CliFuzzyResolution::Unique(resolved) => {
+                resolved_symbol = resolved.clone();
+                nodes = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
+                eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
+            }
+            CliFuzzyResolution::Ambiguous(cands) => {
+                if json_mode {
+                    let sugg: Vec<serde_json::Value> = cands.iter().take(5).map(|c| serde_json::json!({
+                        "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                        "node_id": c.node_id, "start_line": c.start_line,
+                    })).collect();
+                    println!("{}", serde_json::json!({
+                        "results": [],
+                        "error": format!("Ambiguous symbol '{}': {} matches", symbol, cands.len()),
+                        "candidates": sugg,
+                    }));
+                } else {
+                    eprintln!("[code-graph] Ambiguous symbol '{}': {} matches. Did you mean:", symbol, cands.len());
+                    for c in cands.iter().take(5) {
+                        eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
+                    }
+                }
+                std::process::exit(1);
+            }
+            CliFuzzyResolution::NotFound => { /* fall through to empty-nodes branch */ }
+        }
+    }
+    // Intentional shadow: if fuzzy promoted, `resolved_symbol` holds the resolved
+    // name; otherwise it still equals the original input (initialized at
+    // `symbol.to_string()` above). Either way, `symbol` below is the correct
+    // identifier to print in the "No call graph results" eprintln.
+    let symbol = resolved_symbol.as_str();
     if nodes.is_empty() {
         if json_mode {
             println!("{{\"results\":[]}}");
         }
         eprintln!("[code-graph] No call graph results for: {}", symbol);
-        // Try fuzzy match
-        let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
-        if !candidates.is_empty() {
-            eprintln!("[code-graph] Did you mean:");
-            for c in candidates.iter().take(5) {
-                eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
-            }
-        }
         std::process::exit(1);
     }
 
@@ -1083,12 +1214,34 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     let routes: Vec<&&queries::CallerWithRouteInfo> = prod_callers.iter().filter(|c| c.route_info.is_some()).collect();
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
 
-    let risk = crate::domain::compute_risk_level(prod_callers.len(), routes.len(), change_type == "remove");
+    // Type-definition warning: call-graph-based impact only tracks function call chains.
+    // For struct/class/enum/interface/type_alias with zero function callers, the real
+    // usage (field access, instantiation, type annotations) may be broader.
+    // Mirror MCP impact_analysis: flag risk_level=UNKNOWN instead of misleadingly LOW.
+    let type_warning: Option<&'static str> = if prod_callers.is_empty() {
+        let is_type = symbol_nodes.iter().any(|n| matches!(
+            n.node_type.as_str(),
+            "struct" | "class" | "enum" | "interface" | "type_alias"
+        ));
+        if is_type {
+            Some("Impact analysis tracks function call chains. This is a type definition — actual usage (field access, type annotations, instantiation) may be broader than shown. Use `code-graph-mcp refs <symbol>` or `code-graph-mcp search` to find all references.")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let risk: &'static str = if type_warning.is_some() {
+        "UNKNOWN"
+    } else {
+        crate::domain::compute_risk_level(prod_callers.len(), routes.len(), change_type == "remove")
+    };
 
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "symbol": symbol,
             "risk": risk,
             "direct_callers": direct_callers,
@@ -1104,11 +1257,17 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
                 "route": c.route_info,
             })).collect::<Vec<_>>(),
         });
+        if let Some(warning) = type_warning {
+            result["warning"] = serde_json::json!(warning);
+        }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
 
     writeln!(stdout, "Impact: {} — Risk: {}", symbol, risk)?;
+    if let Some(warning) = type_warning {
+        writeln!(stdout, "  (warning: {})", warning)?;
+    }
     writeln!(
         stdout,
         "  {} direct callers, {} total, {} files, {} routes ({} tests affected)",
@@ -1653,8 +1812,10 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
         std::collections::HashMap::new()
     };
 
-    for rm in &rows {
-        if json_mode {
+    if json_mode {
+        // Single JSON object envelope matching MCP trace_http_chain shape
+        let mut handlers = Vec::with_capacity(rows.len());
+        for rm in &rows {
             let chain = crate::graph::query::get_call_graph(
                 conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
             )?;
@@ -1665,9 +1826,11 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
                 }))
                 .collect();
             let mut entry = serde_json::json!({
-                "route": path,
-                "handler": rm.handler_name,
+                "handler_name": rm.handler_name,
                 "file_path": rm.file_path,
+                "start_line": rm.start_line,
+                "end_line": rm.end_line,
+                "metadata": rm.metadata,
                 "call_chain": chain_nodes,
             });
             if include_middleware {
@@ -1676,29 +1839,37 @@ pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
                     .unwrap_or_default();
                 entry["downstream_calls"] = serde_json::json!(downstream);
             }
-            writeln!(stdout, "{}", serde_json::to_string(&entry)?)?;
-        } else {
-            writeln!(stdout, "{} → {} ({}:{})",
-                rm.metadata.as_deref().unwrap_or(path),
-                rm.handler_name, rm.file_path, rm.start_line)?;
+            handlers.push(entry);
+        }
+        let envelope = serde_json::json!({
+            "route": path,
+            "handlers": handlers,
+        });
+        writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
+        return Ok(());
+    }
 
-            if include_middleware {
-                if let Some(downstream) = downstream_map.get(&rm.node_id) {
-                    if !downstream.is_empty() {
-                        writeln!(stdout, "  downstream: {}", downstream.join(", "))?;
-                    }
+    for rm in &rows {
+        writeln!(stdout, "{} → {} ({}:{})",
+            rm.metadata.as_deref().unwrap_or(path),
+            rm.handler_name, rm.file_path, rm.start_line)?;
+
+        if include_middleware {
+            if let Some(downstream) = downstream_map.get(&rm.node_id) {
+                if !downstream.is_empty() {
+                    writeln!(stdout, "  downstream: {}", downstream.join(", "))?;
                 }
             }
+        }
 
-            // Show call chain
-            let chain = crate::graph::query::get_call_graph(
-                conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
-            )?;
-            for n in &chain {
-                if n.depth == 0 { continue; }
-                let indent = "  ".repeat(n.depth as usize);
-                writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
-            }
+        // Show call chain
+        let chain = crate::graph::query::get_call_graph(
+            conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
+        )?;
+        for n in &chain {
+            if n.depth == 0 { continue; }
+            let indent = "  ".repeat(n.depth as usize);
+            writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
         }
     }
 
@@ -1980,46 +2151,86 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
 }
 
 pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
-    let raw_symbol = get_positional(args, 0)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp refs <symbol> [--file path] [--relation calls|imports|inherits|implements] [--compact] [--json]"
-        ))?;
     let explicit_file = get_path_flag(args, "--file");
     let relation = get_flag_value(args, "--relation");
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
+    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
+        Some(parse_flag_or(args, "--node-id", 0_i64))
+    } else {
+        None
+    };
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-    let file_path = explicit_file.or(resolved_file.as_deref());
-
-    // Resolve symbol to node_id(s)
-    let target_ids: Vec<i64> = if let Some(fp) = file_path {
-        let nodes = queries::get_nodes_by_file_path(conn, fp)?;
-        let ids: Vec<i64> = nodes.iter().filter(|n| n.name == symbol).map(|n| n.id).collect();
-        if ids.is_empty() {
-            anyhow::bail!("Symbol '{}' not found in file '{}'.", symbol, fp);
-        }
-        ids
+    // Resolve to (target_ids, symbol_name) — prefer --node-id for same-file multi-def disambiguation.
+    // When --node-id is given, it is authoritative: --file is ignored (matches MCP find_references).
+    if node_id_arg.is_some() && explicit_file.is_some() {
+        eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
+    }
+    let (target_ids, symbol): (Vec<i64>, String) = if let Some(nid) = node_id_arg {
+        let node = queries::get_node_by_id(conn, nid)?
+            .ok_or_else(|| anyhow::anyhow!("node_id {} not found in index", nid))?;
+        (vec![nid], node.name)
     } else {
-        let ids = queries::get_node_ids_by_name(conn, symbol)?;
-        if ids.is_empty() {
-            if json_mode { println!("[]"); }
-            eprintln!("[code-graph] Symbol not found: {}", symbol);
-            let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
-            if !candidates.is_empty() {
-                eprintln!("[code-graph] Did you mean:");
-                for c in candidates.iter().take(5) {
-                    eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
-                }
+        let raw_symbol = get_positional(args, 0)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!(
+                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements] [--compact] [--json]"
+            ))?;
+        let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+        let file_path = explicit_file.or(resolved_file.as_deref());
+
+        if let Some(fp) = file_path {
+            let nodes = queries::get_nodes_by_file_path(conn, fp)?;
+            let matched: Vec<i64> = nodes.iter().filter(|n| n.name == base).map(|n| n.id).collect();
+            if matched.is_empty() {
+                anyhow::bail!("Symbol '{}' not found in file '{}'.", base, fp);
             }
-            std::process::exit(1);
+            (matched, base.to_string())
+        } else {
+            let ids = queries::get_node_ids_by_name(conn, base)?;
+            if ids.is_empty() {
+                // Fuzzy auto-resolve: unique match → promote; multi → suggest; none → bail
+                match resolve_fuzzy_name_cli(conn, base)? {
+                    CliFuzzyResolution::Unique(resolved) => {
+                        let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
+                        (resolved_ids.into_iter().map(|(id, _)| id).collect(), resolved)
+                    }
+                    CliFuzzyResolution::Ambiguous(cands) => {
+                        if json_mode {
+                            let sugg: Vec<serde_json::Value> = cands.iter().take(5).map(|c| serde_json::json!({
+                                "name": c.name, "file_path": c.file_path,
+                                "type": c.node_type, "node_id": c.node_id, "start_line": c.start_line,
+                            })).collect();
+                            println!("{}", serde_json::json!({
+                                "error": format!("Ambiguous symbol '{}': {} matches. Specify --file or --node-id to disambiguate.", base, cands.len()),
+                                "suggestions": sugg,
+                            }));
+                        } else {
+                            eprintln!("[code-graph] Ambiguous symbol '{}': {} matches. Specify --file or --node-id.", base, cands.len());
+                            for c in cands.iter().take(5) {
+                                eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
+                            }
+                        }
+                        std::process::exit(1);
+                    }
+                    CliFuzzyResolution::NotFound => {
+                        if json_mode { println!("[]"); }
+                        eprintln!("[code-graph] Symbol not found: {}", base);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                (ids.into_iter().map(|(id, _)| id).collect(), base.to_string())
+            }
         }
-        ids.into_iter().map(|(id, _)| id).collect()
     };
+    // Intentional shadow: downstream paths want &str. Do NOT "simplify" into a
+    // single binding — the tuple above must own the String so `get_node_by_id`'s
+    // return doesn't get dropped across the .as_str() borrow.
+    let symbol = symbol.as_str();
 
     use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS};
     let relation_filter = match relation {
@@ -2064,7 +2275,18 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
                 })
             }
         }).collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        // Group counts by relation, mirroring MCP find_references envelope
+        let mut by_relation: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for r in &all_refs {
+            *by_relation.entry(r.relation.clone()).or_insert(0) += 1;
+        }
+        let envelope = serde_json::json!({
+            "symbol": symbol,
+            "total_references": items.len(),
+            "by_relation": by_relation,
+            "references": items,
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         let mut stdout = std::io::stdout().lock();
         if all_refs.is_empty() {
@@ -2088,7 +2310,9 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
 /// CLI equivalent of MCP `find_dead_code`.
 pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     let path_filter = get_positional(args, 0).map(|p| p.strip_prefix("./").unwrap_or(p));
-    let type_filter = get_flag_value(args, "--type");
+    // Accept both --node-type (preferred, matches `search` CLI + MCP param) and --type (legacy).
+    let type_filter = get_flag_value(args, "--node-type")
+        .or_else(|| get_flag_value(args, "--type"));
     let include_tests = has_flag(args, "--include-tests");
     let min_lines: u32 = parse_flag_or(args, "--min-lines", 3_u32);
     let compact = !has_flag(args, "--no-compact");
