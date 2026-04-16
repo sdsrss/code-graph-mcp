@@ -762,11 +762,29 @@ impl McpServer {
     }
 
     /// Try fuzzy name resolution: returns the unique match, multiple suggestions, or nothing.
+    ///
+    /// Exact-name matches take precedence over substring matches. Without this,
+    /// `find_functions_by_fuzzy_name("handle_tool")` would return the exact
+    /// `handle_tool` alongside substring matches like `handle_tools_list` and
+    /// trigger false "ambiguous" reports in find_references/impact_analysis.
     fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
         let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(self.db.conn(), name)?
             .into_iter()
             .filter(|c| !is_test_symbol(&c.name, &c.file_path))
             .collect();
+        // Prefer exact name matches if any exist.
+        let exact: Vec<_> = candidates.iter().filter(|c| c.name == name).collect();
+        if exact.len() == 1 {
+            return Ok(FuzzyResolution::Unique(exact[0].name.clone()));
+        }
+        if exact.len() > 1 {
+            // Same name in multiple files — still ambiguous, but scope suggestions
+            // to the exact matches so callers disambiguate the real collision.
+            let suggestions = exact.iter().map(|c| json!({
+                "name": c.name, "file_path": c.file_path, "type": c.node_type,
+            })).collect();
+            return Ok(FuzzyResolution::Ambiguous(suggestions));
+        }
         if candidates.len() == 1 {
             Ok(FuzzyResolution::Unique(candidates.into_iter().next().unwrap().name))
         } else if !candidates.is_empty() {

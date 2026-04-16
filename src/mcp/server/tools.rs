@@ -1100,11 +1100,6 @@ impl McpServer {
                 c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok())
             }).collect();
 
-        // Risk based on production callers, not test callers
-        let risk_level = crate::domain::compute_risk_level(
-            prod_callers.len(), affected_routes.len(), change_type == "remove"
-        );
-
         let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
         let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();
 
@@ -1119,6 +1114,17 @@ impl McpServer {
             }
         } else {
             None
+        };
+
+        // Risk based on production callers, not test callers. When the target is a
+        // type with no call-graph callers, flag it UNKNOWN instead of LOW — the
+        // warning above already explains why, but risk_level is the field LLMs act on.
+        let risk_level: &'static str = if type_warning.is_some() {
+            "UNKNOWN"
+        } else {
+            crate::domain::compute_risk_level(
+                prod_callers.len(), affected_routes.len(), change_type == "remove"
+            )
         };
 
         let mut result = json!({
@@ -1351,8 +1357,11 @@ impl McpServer {
 
         // Filter out cross-language false edges (e.g. Rust file "calling" a JS function
         // due to name-based resolution matching common names like `update`, `read`, etc.)
+        // Also drop the synthetic `<external>` bucket — it's a container for unresolved
+        // imports, not a real file dependency.
         let root_lang = crate::utils::config::detect_language(file_path);
         let is_compatible_lang = |dep_path: &str| -> bool {
+            if dep_path == "<external>" { return false; }
             let dep_lang = crate::utils::config::detect_language(dep_path);
             match (root_lang, dep_lang) {
                 (None, _) | (_, None) => true, // unknown language → keep
@@ -1457,14 +1466,23 @@ impl McpServer {
             bytemuck::cast_slice(&bytes).to_vec()
         };
 
-        // Search for similar vectors
-        let results = queries::vector_search(self.db.conn(), &embedding, top_k + 1)?; // +1 to exclude self
+        // Search for similar vectors. Fetch extra so max_distance filtering
+        // doesn't silently starve `top_k` — we need enough candidates to know
+        // whether the cutoff actually dropped results.
+        let fetch_count = (top_k * 3).max(top_k + 1);
+        let results = queries::vector_search(self.db.conn(), &embedding, fetch_count)?;
 
-        // Pre-filter by distance and self, then batch-fetch nodes with file paths
-        let candidates: Vec<(i64, f64)> = results.iter()
-            .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
+        // Split raw (self excluded) from cutoff-filtered candidates so we can
+        // report whether max_distance is hiding matches.
+        let raw_non_self: Vec<(i64, f64)> = results.iter()
+            .filter(|(id, _)| *id != node_id)
             .map(|(id, dist)| (*id, *dist))
             .collect();
+        let candidates: Vec<(i64, f64)> = raw_non_self.iter()
+            .filter(|(_, dist)| *dist <= max_distance)
+            .copied()
+            .collect();
+        let cutoff_dropped = raw_non_self.len() - candidates.len();
         let candidate_ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
         let nodes_with_files = queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
         let node_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
@@ -1496,11 +1514,22 @@ impl McpServer {
             .take(top_k as usize)
             .collect();
 
-        Ok(json!({
+        let mut out = json!({
             "query_node_id": node_id,
             "results": similar,
             "count": similar.len(),
-        }))
+            "top_k": top_k,
+            "max_distance": max_distance,
+        });
+        if (similar.len() as i64) < top_k && cutoff_dropped > 0 {
+            out["cutoff_applied"] = json!(true);
+            out["cutoff_dropped"] = json!(cutoff_dropped);
+            out["hint"] = json!(format!(
+                "Fewer results than top_k ({}): {} candidate(s) exceeded max_distance={}. Raise max_distance to widen the search.",
+                top_k, cutoff_dropped, max_distance
+            ));
+        }
+        Ok(out)
     }
 
     pub(super) fn tool_project_map(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1561,6 +1590,7 @@ impl McpServer {
                     "route": e.route,
                     "handler": e.handler,
                     "file": e.file,
+                    "kind": e.kind,
                 })
             }).collect();
 
@@ -1632,11 +1662,12 @@ impl McpServer {
                 }).collect())
                 .unwrap_or_default();
 
-            // Trim entry_points: file+handler only
+            // Trim entry_points: file+handler+kind (kind lets LLM skip `main` when scanning HTTP surface)
             let compact_entries: Vec<serde_json::Value> = result["entry_points"].as_array()
                 .map(|arr| arr.iter().map(|e| json!({
                     "file": e["file"],
                     "handler": e["handler"],
+                    "kind": e["kind"],
                 })).collect())
                 .unwrap_or_default();
 

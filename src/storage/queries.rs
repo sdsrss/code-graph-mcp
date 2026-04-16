@@ -1357,6 +1357,9 @@ pub struct EntryPoint {
     pub route: String,
     pub handler: String,
     pub file: String,
+    /// `"http_route"` for framework-registered handlers; `"main"` for program entry
+    /// points (fn main). Lets consumers distinguish real routes from `route="main"`.
+    pub kind: String,
 }
 
 /// Hot function (most callers).
@@ -1539,7 +1542,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             } else {
                 "?".into()
             };
-            entry_points.push(EntryPoint { route, handler, file });
+            entry_points.push(EntryPoint { route, handler, file, kind: "http_route".into() });
         }
     }
 
@@ -1556,7 +1559,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
         })?;
         for row in rows {
             let (name, file) = row?;
-            entry_points.push(EntryPoint { route: "main".into(), handler: name, file });
+            entry_points.push(EntryPoint { route: "main".into(), handler: name, file, kind: "main".into() });
         }
     }
 
@@ -1579,7 +1582,9 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN edges e ON e.target_id = n.id \
              JOIN nodes src ON src.id = e.source_id \
              JOIN files sf ON sf.id = src.file_id \
-             WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
+             WHERE e.relation = ?1 \
+               AND n.type IN ('function', 'method') \
+               AND n.name != '<module>' \
                AND n.is_test = 0 \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \

@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.11.1 — 12-tool accuracy audit: 1 critical bugfix + 5 precision improvements
+
+Post-audit fixes for tool output correctness. All changes are additive/tightening —
+no consumer schema breakage.
+
+### Fixes
+
+1. **`find_references` — critical bugfix for exact-name resolution.**
+   `resolve_fuzzy_name` was matching substrings before exact names, so
+   `find_references("handle_tool")` falsely reported ambiguity with
+   `handle_tools_list` / `handle_tools_call`. Now exact-name matches win first;
+   same-name-in-multiple-files still produces `Ambiguous` but scoped to exact
+   matches only. Same fix benefits `impact_analysis` and `get_call_graph`
+   fuzzy-fallback paths.
+
+2. **Centralized truncation keeps arrays homogeneous.** The
+   `centralized_compress` pipeline used to splice a string sentinel
+   (`"... [N items truncated]"`) into the middle of object arrays, breaking
+   type consistency for strict JSON consumers and hiding how much was dropped.
+   Arrays now truncate silently to `first-10 + last-5` (15 homogeneous items),
+   and a new `_array_truncations: {<field>: {original, kept}}` sibling records
+   the true pre-truncation length so callers can reconcile `count`/`total`
+   siblings against what was actually returned.
+
+3. **`project_map` schema sharpened.**
+   - `hot_functions` SQL tightened to `n.type IN ('function','method')` so
+     structs/classes no longer leak into the "hot functions" bucket.
+   - `entry_points[].kind` added: `"main"` for program entry points, `"http_route"`
+     for framework-registered handlers. Lets LLMs skip `main` when scanning the
+     HTTP surface without sniffing the `route` string.
+
+4. **`dependency_graph` filters the `<external>` sentinel.** The synthetic
+   bucket for unresolved imports now no longer surfaces as a fake file dependency.
+
+5. **`find_similar_code` reports cutoff-driven shortfalls.** When
+   `max_distance` drops candidates below `top_k`, the response now carries
+   `cutoff_applied: true`, `cutoff_dropped: N`, and a `hint` suggesting the
+   user widen `max_distance`. Also echoes `top_k` and `max_distance` in every
+   response for transparency.
+
+6. **`impact_analysis` on types returns `risk_level: "UNKNOWN"`.** When the
+   target is a struct/class/enum/interface/type_alias and the call graph finds
+   zero callers, the risk level is now `UNKNOWN` instead of `LOW` — so LLMs
+   don't mistake "call graph can't see type usage" for "no one uses this".
+   The existing type_warning still explains why and points to
+   `semantic_code_search` for broader coverage.
+
+### Test coverage
+
+- +2 unit tests in `src/mcp/server/helpers.rs` (truncation homogeneity,
+  no-op when arrays < 20).
+- +6 integration tests in `tests/integration.rs` covering each fix above.
+- Full suite: lib 221 + integration 41 + cli_e2e 50 + parser 19 + plugin 6 +
+  hardening 6 = 343 passed, clippy clean.
+
 ## v0.11.0 — auto-refresh stale decision table on plugin upgrade
 
 ### Migration note

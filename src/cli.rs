@@ -1165,6 +1165,7 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
                 "route": e.route,
                 "handler": e.handler,
                 "file": e.file,
+                "kind": e.kind,
             })).collect::<Vec<_>>(),
             "hot_functions": hot_functions.iter().map(|h| {
                 let mut obj = serde_json::json!({

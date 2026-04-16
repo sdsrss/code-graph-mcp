@@ -1404,3 +1404,177 @@ fn test_unknown_method_returns_error() {
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32601); // Method not found
 }
+
+// ---- Audit regression fixes (2026-04-17) ----
+
+/// Fix #1: resolve_fuzzy_name must prefer exact name over substring matches.
+/// Without this, `find_references("handle")` would report ambiguity because
+/// `handle_foo`, `handle_bar` also match the LIKE '%handle%' fuzzy query.
+#[test]
+fn test_find_references_prefers_exact_over_substring() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.ts"), r#"
+function handle() { return 1; }
+function handle_one() { return handle(); }
+function handle_two() { return handle(); }
+function caller() { return handle(); }
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("find_references",
+        serde_json::json!({"symbol_name":"handle","compact":true}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    // Exact-name `handle` exists → must NOT report ambiguity with handle_one/handle_two
+    assert!(result.get("error").is_none(),
+        "find_references('handle') falsely reported ambiguity: {}", result);
+    assert_eq!(result["symbol"], "handle");
+    let refs = result["references"].as_array().unwrap();
+    assert!(!refs.is_empty(), "expected at least one caller of handle, got empty");
+}
+
+// Fix #2 (truncate_large_strings homogeneous arrays) is covered by a unit
+// test inside src/mcp/server/helpers.rs — helpers is a private module so
+// it must be tested from within the crate.
+
+/// Fix #3a: project_map.hot_functions must only contain function/method types.
+#[test]
+fn test_project_map_hot_functions_excludes_structs() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub struct Foo;
+pub fn bar() -> Foo { baz(); baz(); baz(); Foo }
+pub fn baz() -> i32 { 1 }
+pub fn call_bar() { bar(); bar(); bar(); }
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let hot = result["hot_functions"].as_array().unwrap();
+    for h in hot {
+        let ty = h["type"].as_str().unwrap_or("");
+        assert!(ty == "function" || ty == "method",
+            "hot_functions must not include non-function types: {}", h);
+    }
+}
+
+/// Fix #3b: entry_points must carry `kind` distinguishing `main` vs `http_route`.
+#[test]
+fn test_project_map_entry_points_have_kind() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("main.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+    let server = common::init_server(&project);
+
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let eps = result["entry_points"].as_array().unwrap();
+    assert!(!eps.is_empty(), "expected main entry point");
+    let kinds: Vec<&str> = eps.iter()
+        .filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"main"),
+        "main fn should produce kind='main', got kinds={:?}", kinds);
+}
+
+/// Fix #4: dependency_graph must drop the synthetic `<external>` bucket.
+#[test]
+fn test_dependency_graph_filters_external_sentinel() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/app.rs"), r#"
+use std::collections::HashMap;
+pub fn load() -> HashMap<String, String> { HashMap::new() }
+"#).unwrap();
+    fs::write(project.path().join("src/main.rs"), r#"
+mod app;
+fn main() { let _ = app::load(); }
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("dependency_graph",
+        serde_json::json!({"file_path":"src/main.rs"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let depends_on = result["depends_on"].as_array().unwrap();
+    for d in depends_on {
+        assert_ne!(d["file"].as_str().unwrap_or(""), "<external>",
+            "depends_on must not contain <external>: {:?}", depends_on);
+    }
+}
+
+/// Fix #5: find_similar_code must surface `cutoff_applied` when max_distance
+/// filters out candidates below top_k. Skips when embeddings unavailable
+/// (default test build has no `embed-model` feature, so the tool errors out
+/// before reaching the cutoff-tracking code path — that's a separate branch).
+#[test]
+fn test_find_similar_code_reports_cutoff() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub fn alpha() -> i32 { 1 }
+pub fn beta() -> i32 { 2 }
+pub fn gamma() -> i32 { 3 }
+"#).unwrap();
+    let server = common::init_server(&project);
+
+    let msg = tool_call_json("find_similar_code",
+        serde_json::json!({"symbol_name":"alpha","top_k":5,"max_distance":0.0}));
+    let resp = server.handle_message(&msg).unwrap();
+    let Some(raw) = resp.as_ref() else { return; };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return, // malformed → environment-specific, not the target regression
+    };
+
+    // Embedding-disabled build path: server returns JSON-RPC error. Skip cleanly.
+    if parsed.get("error").is_some()
+        || parsed["result"]["isError"] == serde_json::Value::Bool(true)
+    {
+        return;
+    }
+    let text = match parsed["result"]["content"][0]["text"].as_str() {
+        Some(t) => t,
+        None => return,
+    };
+    let result: serde_json::Value = serde_json::from_str(text).unwrap();
+    // count < top_k implies either cutoff fired or the tiny index had no candidates.
+    let count = result["count"].as_i64().unwrap_or(0);
+    if count < 5 {
+        let has_marker = result.get("cutoff_applied").is_some()
+            || result["results"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+        assert!(has_marker,
+            "find_similar_code with tight max_distance must report cutoff_applied or return empty: {}",
+            result);
+    }
+}
+
+/// Fix #6: impact_analysis on a struct with no call-graph callers must
+/// return risk_level="UNKNOWN" (not LOW) so LLMs don't misread it as safe.
+///
+/// Uses a struct that is never referenced by a function body so the call
+/// graph legitimately finds zero callers — which is the exact "risky UNKNOWN"
+/// case (call-graph says 0, but real usage may be broad).
+#[test]
+fn test_impact_analysis_struct_returns_unknown_risk() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub struct OrphanStruct { pub name: String }
+pub fn something_else() { println!("no refs to OrphanStruct"); }
+"#).unwrap();
+    let server = common::init_server(&project);
+
+    let msg = tool_call_json("impact_analysis",
+        serde_json::json!({"symbol_name":"OrphanStruct","change_type":"signature"}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    assert_eq!(result["risk_level"], "UNKNOWN",
+        "struct with no call-graph callers must be UNKNOWN, got: {}", result);
+    assert!(result["warning"].is_string(),
+        "type query must carry the type_warning alongside UNKNOWN");
+}

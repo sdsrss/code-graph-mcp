@@ -146,6 +146,11 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
                 .sum();
             let large_budget = budget.saturating_sub(small_fields_size);
 
+            // Record array truncations so consumers can reconcile `count`/`total`
+            // sibling fields against what was actually returned.
+            let mut array_truncations: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+
             let truncated: serde_json::Map<String, serde_json::Value> = map.into_iter()
                 .map(|(k, v)| {
                     let tv = match &v {
@@ -163,9 +168,15 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
                             }
                         }
                         serde_json::Value::Array(arr) if arr.len() > 20 => {
+                            let original = arr.len();
                             let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
-                            kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
                             kept.extend_from_slice(&arr[arr.len()-5..]);
+                            // Keep array homogeneous — consumers can read
+                            // `_array_truncations[k]` for the original length.
+                            array_truncations.insert(k.clone(), json!({
+                                "original": original,
+                                "kept": kept.len(),
+                            }));
                             serde_json::Value::Array(kept)
                         }
                         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
@@ -176,11 +187,21 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
                     (k, tv)
                 })
                 .collect();
-            serde_json::Value::Object(truncated)
+
+            let mut final_map = truncated;
+            if !array_truncations.is_empty() {
+                final_map.insert(
+                    "_array_truncations".to_string(),
+                    serde_json::Value::Object(array_truncations),
+                );
+            }
+            serde_json::Value::Object(final_map)
         }
         serde_json::Value::Array(arr) if arr.len() > 20 => {
+            // Top-level array: truncate silently, keep homogeneous. The outer
+            // `truncate_large_strings` wrapper adds `_truncated` metadata only
+            // when the root is an object; top-level arrays cannot carry it.
             let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
-            kept.push(json!(format!("... [{} items truncated]", arr.len() - 15)));
             kept.extend_from_slice(&arr[arr.len()-5..]);
             serde_json::Value::Array(kept)
         }
@@ -192,5 +213,46 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
             )
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_array_keeps_items_homogeneous_and_records_original_len() {
+        let items: Vec<serde_json::Value> = (0..50).map(|i| json!({
+            "id": i, "name": format!("item_{}", i),
+        })).collect();
+        let value = json!({
+            "count": 50,
+            "results": items,
+            "pad": "x".repeat(200_000),
+        });
+
+        let out = truncate_large_strings(value, 50);
+        let arr = out["results"].as_array().expect("results still an array");
+        for (i, v) in arr.iter().enumerate() {
+            assert!(v.is_object(), "results[{}] broke schema: {}", i, v);
+        }
+        let trunc = &out["_array_truncations"]["results"];
+        assert_eq!(trunc["original"], 50);
+        assert_eq!(trunc["kept"].as_u64().unwrap() as usize, arr.len());
+        assert_eq!(out["_truncated"], true);
+    }
+
+    #[test]
+    fn arrays_under_20_items_are_not_truncated() {
+        let items: Vec<serde_json::Value> = (0..10).map(|i| json!({"id": i})).collect();
+        let value = json!({
+            "results": items,
+            "pad": "y".repeat(200_000),
+        });
+        let out = truncate_large_strings(value, 50);
+        let arr = out["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 10);
+        assert!(out.get("_array_truncations").is_none(),
+            "_array_truncations should only appear when arrays truncated");
     }
 }
