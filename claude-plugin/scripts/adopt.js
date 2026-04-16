@@ -13,8 +13,11 @@ const INDEX_LINE = '- [code-graph-mcp](plugin_code_graph_mcp.md) — "谁调 X /
 const TEMPLATE_PATH = path.resolve(__dirname, '..', 'templates', 'plugin_code_graph_mcp.md');
 const TARGET_NAME = 'plugin_code_graph_mcp.md';
 
+// Claude Code slug convention: every non-alphanumeric-non-hyphen char → `-`.
+// `/mnt/data_ssd/dev/proj` → `-mnt-data-ssd-dev-proj`
+// `/home/sds/.claude/x`   → `-home-sds--claude-x`  (double-dash from `/.`)
 function memoryDir(cwd = process.cwd(), home = os.homedir()) {
-  const slug = cwd.replace(/\//g, '-');
+  const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-');
   return path.join(home, '.claude', 'projects', slug, 'memory');
 }
 

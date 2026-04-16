@@ -289,10 +289,26 @@ fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let candidates = [
-        exe_dir.join(format!("../../claude-plugin/scripts/{}", script)),
-        exe_dir.join(format!("../claude-plugin/scripts/{}", script)),
-    ];
+    // Lookup order:
+    //   1. $_FIND_BINARY_ROOT (set by bin/cli.js npm wrapper → main pkg root)
+    //   2. exe_dir/../../claude-plugin/scripts/  (dev mode: target/release/)
+    //   3. exe_dir/../claude-plugin/scripts/     (legacy fallback)
+    //
+    // Rationale: npm platform-pkg layout keeps the binary in
+    // node_modules/@sdsrs/code-graph-<plat>/ but claude-plugin/ lives in the
+    // sibling main pkg node_modules/@sdsrs/code-graph/. Relative-from-exe
+    // cannot reach it; env var set by cli.js bridges the two.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("_FIND_BINARY_ROOT") {
+        candidates.push(
+            std::path::PathBuf::from(root)
+                .join("claude-plugin")
+                .join("scripts")
+                .join(script),
+        );
+    }
+    candidates.push(exe_dir.join(format!("../../claude-plugin/scripts/{}", script)));
+    candidates.push(exe_dir.join(format!("../claude-plugin/scripts/{}", script)));
 
     for candidate in &candidates {
         if candidate.exists() {
@@ -310,7 +326,11 @@ fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
         }
     }
 
-    eprintln!("{} not found. Run directly: node claude-plugin/scripts/{}", script, script);
+    eprintln!("{} not found. Looked in:", script);
+    for c in &candidates {
+        eprintln!("  {}", c.display());
+    }
+    eprintln!("Tip: set _FIND_BINARY_ROOT to the main npm pkg dir, or run directly: node claude-plugin/scripts/{}", script);
     std::process::exit(1);
 }
 

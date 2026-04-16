@@ -26,6 +26,24 @@ test('memoryDir slugifies cwd path', () => {
   assert.strictEqual(dir, '/home/alice/.claude/projects/-home-alice-proj/memory');
 });
 
+test('memoryDir replaces underscores and dots (Claude Code slug convention)', () => {
+  // Real-world bug: /mnt/data_ssd/... needs data-ssd slug, not data_ssd
+  assert.strictEqual(
+    memoryDir('/mnt/data_ssd/dev/projects/code-graph-mcp', '/home/u'),
+    '/home/u/.claude/projects/-mnt-data-ssd-dev-projects-code-graph-mcp/memory'
+  );
+  // Hidden dirs: /home/sds/.claude/x → -home-sds--claude-x (double-dash)
+  assert.strictEqual(
+    memoryDir('/home/sds/.claude/x', '/home/sds'),
+    '/home/sds/.claude/projects/-home-sds--claude-x/memory'
+  );
+  // Preserves case and hyphens
+  assert.strictEqual(
+    memoryDir('/Users/Alice/my-Project_v2.1', '/'),
+    '/.claude/projects/-Users-Alice-my-Project-v2-1/memory'
+  );
+});
+
 test('adopt writes template and appends sentinel block when index absent', () => {
   const sb = makeSandbox();
   try {
