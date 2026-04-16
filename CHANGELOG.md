@@ -58,6 +58,25 @@ New module `src/search/acronyms.rs`. `strip_outer_generic` in
 `src/mcp/server/tools.rs`, plus one flat_map augmentation in
 `storage::queries::fts5_search_impl`.
 
+### Routing-recall benchmark (new)
+
+`tests/routing_bench.rs` — turns "does Claude Code naturally call our tools
+for the right intents?" from vibe-check into a P@1 number. 20 oracle queries
+(3 per tool for 6 tools + 2 for `find_references`), each sent to the Claude
+API with the live 7-tool schemas from `ToolRegistry`; asserts the picked
+tool matches the oracle expectation.
+
+- `oracle_well_formed` runs in default `cargo test` and verifies every
+  oracle entry references a real tool *and* every registered tool has at
+  least one oracle query — catches drift when tools are renamed/added.
+- `routing_recall_benchmark` is `#[ignore]` (requires `ANTHROPIC_API_KEY`).
+  Run locally: `ANTHROPIC_API_KEY=sk-... cargo test --test routing_bench -- --ignored --nocapture`.
+  Cost ≈ $0.10/run with `claude-sonnet-4-6` (20 queries × ~1.2K in + ~150 out).
+  Threshold starts at P@1 ≥ 0.70; tighten as descriptions improve.
+- New dev-dep `reqwest` (blocking + rustls-tls, no TLS-OpenSSL pulled in).
+- CI wiring deliberately not added yet — run manually or add a gated step
+  (`env: ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}`) when ready.
+
 ## v0.11.3 — Doc: "hidden but callable" clarified (Claude Code vs. raw MCP)
 
 User-facing: no behavior change; corrects a misleading claim in the adopted
