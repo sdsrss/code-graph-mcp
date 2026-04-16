@@ -464,3 +464,17 @@ test('skills: only expected skills exist', () => {
   const files = fs.readdirSync(skillsDir).filter(f => f.endsWith('.md')).sort();
   assert.deepEqual(files, ['explore.md', 'index.md']);
 });
+
+test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits before reading stdin', () => {
+  const { execFileSync } = require('node:child_process');
+  const script = path.join(__dirname, 'user-prompt-context.js');
+  const out = execFileSync(process.execPath, [script], {
+    input: JSON.stringify({ message: 'impact analysis for fn_that_would_trigger_search' }),
+    env: { ...process.env, CODE_GRAPH_QUIET_HOOKS: '1' },
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 2000,
+  });
+  // Quiet mode must produce no stdout — no [code-graph:*] prefix, nothing.
+  assert.equal(out, '');
+});

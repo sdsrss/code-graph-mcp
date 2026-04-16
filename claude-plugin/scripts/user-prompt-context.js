@@ -53,6 +53,10 @@ function markCooldown(type) {
   } catch { /* ok */ }
 }
 
+// CODE_GRAPH_QUIET_HOOKS=1 → skip passive per-prompt injection entirely.
+// Users opt in to this mode when MEMORY.md + explicit tool calls cover their needs.
+if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') process.exit(0);
+
 // --- Read user message ---
 let message;
 try {

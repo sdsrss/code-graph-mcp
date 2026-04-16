@@ -277,13 +277,17 @@ function runSessionInit() {
 
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
-  const mapInjected = binaryCheck.available ? injectProjectMap() : false;
+  // CODE_GRAPH_QUIET_HOOKS=1 → skip the 60-line project-map injection; rely
+  // on MEMORY.md pointer + on-demand `project_map` tool call instead.
+  const quietHooks = process.env.CODE_GRAPH_QUIET_HOOKS === '1';
+  const mapInjected = binaryCheck.available && !quietHooks ? injectProjectMap() : false;
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
     : [];
   return {
     inactive: false, lifecycle, cacheHookHeal,
     autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
+    quietHooks,
   };
 }
 

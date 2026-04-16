@@ -105,40 +105,10 @@ fn main() -> Result<()> {
             code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
         }
         Some("doctor") => {
-            // Delegate to plugin's doctor.js
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
-            let doctor_candidates = [
-                // Dev mode: binary is in target/release/, doctor.js is in claude-plugin/scripts/
-                exe_dir.join("../../claude-plugin/scripts/doctor.js"),
-                // Installed via npm: doctor.js is alongside the binary's package
-                exe_dir.join("../claude-plugin/scripts/doctor.js"),
-            ];
-
-            for candidate in &doctor_candidates {
-                if candidate.exists() {
-                    let mut cmd = std::process::Command::new("node");
-                    cmd.arg(candidate);
-                    if args.iter().any(|a| a == "--check-only") {
-                        cmd.arg("--check-only");
-                    }
-                    let status = cmd.status().map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            anyhow::anyhow!("Node.js not found. Install Node.js to use 'code-graph-mcp doctor'.")
-                        } else {
-                            e.into()
-                        }
-                    })?;
-                    std::process::exit(status.code().unwrap_or(1));
-                }
-            }
-
-            eprintln!("doctor.js not found. Run directly: node claude-plugin/scripts/doctor.js");
-            std::process::exit(1);
+            run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())
         }
+        Some("adopt") => run_node_script("adopt.js", &[]),
+        Some("unadopt") => run_node_script("adopt.js", &["unadopt".to_string()]),
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
             if let Some(suggestion) = suggest_subcommand(other) {
@@ -178,7 +148,9 @@ fn print_help() {
     println!("    incremental-index   Run incremental index update");
     println!("    health-check        Query index status");
     println!("    doctor              Diagnose and repair environment issues");
-    println!("    benchmark           Benchmark index speed, query latency, token savings\n");
+    println!("    benchmark           Benchmark index speed, query latency, token savings");
+    println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
+    println!("    unadopt             Remove the memory file + sentinel block\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
@@ -303,7 +275,41 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "health-check", "doctor", "benchmark",
+    "adopt", "unadopt",
 ];
+
+/// Locate and exec a node script under claude-plugin/scripts/.
+/// Searches both dev (target/release/) and installed (npm package) layouts.
+fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let candidates = [
+        exe_dir.join(format!("../../claude-plugin/scripts/{}", script)),
+        exe_dir.join(format!("../claude-plugin/scripts/{}", script)),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            let mut cmd = std::process::Command::new("node");
+            cmd.arg(candidate);
+            for a in extra_args { cmd.arg(a); }
+            let status = cmd.status().map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!("Node.js not found. Install Node.js to use this subcommand.")
+                } else {
+                    e.into()
+                }
+            })?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    eprintln!("{} not found. Run directly: node claude-plugin/scripts/{}", script, script);
+    std::process::exit(1);
+}
 
 fn suggest_subcommand(input: &str) -> Option<&'static str> {
     let input_lower = input.to_lowercase();

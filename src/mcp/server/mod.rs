@@ -1071,18 +1071,13 @@ impl McpServer {
     }
 
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        JsonRpcResponse::success(id, json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false },
-                "prompts": { "listChanged": false }
-            },
-            "serverInfo": {
-                "name": "code-graph-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "instructions": concat!(
+        // CODE_GRAPH_QUIET_HOOKS=1 → ship a one-liner pointer; full decision
+        // rules live in MEMORY.md's plugin detail file (invited-memory pattern).
+        let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
+        let instructions = if quiet {
+            "code-graph-mcp ready. Tools: project_map, semantic_code_search, module_overview, get_call_graph, impact_analysis, find_references, ast_search, dependency_graph, find_dead_code, find_similar_code, get_ast_node, trace_http_chain. Run `code-graph-mcp --help` for CLI. See MEMORY.md → plugin_code_graph_mcp.md for decision rules (if adopted)."
+        } else {
+            concat!(
                 "Code Graph CLI \u{2014} this project is indexed. CLI commands (via Bash) complement built-in tools:\n",
                 "\n",
                 "Replace Grep (code understanding):\n",
@@ -1123,6 +1118,19 @@ impl McpServer {
                 "  \u{2022} \"what does file X depend on?\" / \"who imports X?\" \u{2192} dependency_graph\n",
                 "  \u{2022} \"show me function X\" / inspect before editing \u{2192} get_ast_node (with include_references/include_impact)"
             )
+        };
+        JsonRpcResponse::success(id, json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": { "listChanged": false },
+                "resources": { "subscribe": false, "listChanged": false },
+                "prompts": { "listChanged": false }
+            },
+            "serverInfo": {
+                "name": "code-graph-mcp",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": instructions
         }))
     }
 
