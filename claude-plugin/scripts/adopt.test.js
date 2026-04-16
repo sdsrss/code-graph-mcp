@@ -5,7 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const {
-  adopt, unadopt, memoryDir, SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH,
+  adopt, unadopt, memoryDir, stripSentinelBlock,
+  SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH,
 } = require('./adopt');
 
 function makeSandbox() {
@@ -111,4 +112,103 @@ test('template file exists and contains decision table', () => {
   assert.ok(content.includes('get_call_graph'), 'mentions get_call_graph');
   assert.ok(content.includes('impact_analysis'), 'mentions impact_analysis');
   assert.ok(content.includes('CODE_GRAPH_QUIET_HOOKS'), 'mentions env gate');
+});
+
+test('stripSentinelBlock removes well-formed block', () => {
+  const before = `# Index\n${SENTINEL_BEGIN}\n${INDEX_LINE}\n${SENTINEL_END}\n- [x.md](x.md)\n`;
+  const after = stripSentinelBlock(before);
+  assert.ok(!after.includes(SENTINEL_BEGIN));
+  assert.ok(!after.includes(SENTINEL_END));
+  assert.ok(after.includes('- [x.md](x.md)'), 'preserves neighbors');
+});
+
+test('stripSentinelBlock self-heals orphan BEGIN without END', () => {
+  // Truncation / partial edit scenario
+  const before = `# Index\n- [a.md](a.md) — entry\n${SENTINEL_BEGIN}\n${INDEX_LINE}\n\n- [b.md](b.md) — survivor\n`;
+  const after = stripSentinelBlock(before);
+  assert.ok(!after.includes(SENTINEL_BEGIN), 'orphan BEGIN removed');
+  assert.ok(after.includes('survivor'), 'content past blank-line boundary preserved');
+  assert.ok(after.includes('entry'), 'content before BEGIN preserved');
+});
+
+test('stripSentinelBlock self-heals orphan END line', () => {
+  const before = `# Index\n- [a.md](a.md)\n${SENTINEL_END}\n- [b.md](b.md)\n`;
+  const after = stripSentinelBlock(before);
+  assert.ok(!after.includes(SENTINEL_END));
+  assert.ok(after.includes('- [a.md](a.md)') && after.includes('- [b.md](b.md)'));
+});
+
+test('adopt heals malformed sentinel (orphan BEGIN) on re-run', () => {
+  const sb = makeSandbox();
+  try {
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    // Simulate truncated prior adopt — BEGIN line + stale entry, no END
+    fs.writeFileSync(
+      indexPath,
+      `# Memory Index\n- [old.md](old.md) — preserved\n${SENTINEL_BEGIN}\n- [stale](stale.md) — wrong entry\n\n- [neighbor.md](neighbor.md) — survives\n`
+    );
+    const res = adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.healed, true, 'reports healed');
+    const final = fs.readFileSync(indexPath, 'utf8');
+    // Exactly one well-formed block now
+    const beginCount = (final.match(new RegExp(SENTINEL_BEGIN.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&'), 'g')) || []).length;
+    const endCount = (final.match(new RegExp(SENTINEL_END.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&'), 'g')) || []).length;
+    assert.strictEqual(beginCount, 1, 'one BEGIN');
+    assert.strictEqual(endCount, 1, 'one END');
+    assert.ok(final.includes('preserved'), 'preserves pre-BEGIN content');
+    assert.ok(final.includes('neighbor.md'), 'preserves post-malformed-block content');
+    assert.ok(!final.includes('stale.md'), 'old wrong entry purged');
+    assert.ok(final.includes(INDEX_LINE), 'fresh canonical line written');
+  } finally { sb.cleanup(); }
+});
+
+test('adopt is a true no-op when desired block is already present verbatim', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    const before = fs.readFileSync(indexPath, 'utf8');
+    const beforeMtime = fs.statSync(indexPath).mtimeMs;
+    const res2 = adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res2.indexed, false);
+    assert.strictEqual(res2.healed, false);
+    assert.strictEqual(fs.readFileSync(indexPath, 'utf8'), before, 'file content identical');
+    // mtime may equal beforeMtime since we skipped the write
+    assert.strictEqual(fs.statSync(indexPath).mtimeMs, beforeMtime, 'no write occurred');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt heals malformed sentinel (orphan BEGIN)', () => {
+  const sb = makeSandbox();
+  try {
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    fs.writeFileSync(
+      indexPath,
+      `# Index\n${SENTINEL_BEGIN}\n${INDEX_LINE}\n\n- [keep.md](keep.md) — survives\n`
+    );
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.indexPruned, true);
+    const final = fs.readFileSync(indexPath, 'utf8');
+    assert.ok(!final.includes(SENTINEL_BEGIN), 'orphan BEGIN purged');
+    assert.ok(final.includes('keep.md'), 'content past blank-line preserved');
+  } finally { sb.cleanup(); }
+});
+
+test('Windows platform is rejected with clear reason', { skip: process.platform === 'win32' }, () => {
+  const orig = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const sb = makeSandbox();
+    try {
+      const adoptRes = adopt({ cwd: sb.cwd, home: sb.home });
+      assert.strictEqual(adoptRes.ok, false);
+      assert.strictEqual(adoptRes.reason, 'windows-not-supported');
+      const unadoptRes = unadopt({ cwd: sb.cwd, home: sb.home });
+      assert.strictEqual(unadoptRes.ok, false);
+      assert.strictEqual(unadoptRes.reason, 'windows-not-supported');
+    } finally { sb.cleanup(); }
+  } finally {
+    Object.defineProperty(process, 'platform', { value: orig, configurable: true });
+  }
 });

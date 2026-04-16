@@ -280,6 +280,9 @@ const SUBCOMMANDS: &[&str] = &[
 
 /// Locate and exec a node script under claude-plugin/scripts/.
 /// Searches both dev (target/release/) and installed (npm package) layouts.
+///
+/// SAFETY: `script` MUST be a hard-coded literal. Never pass user input —
+/// the value is concatenated into a filesystem path and exec'd via node.
 fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
     let exe_dir = std::env::current_exe()
         .ok()

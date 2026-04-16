@@ -465,16 +465,17 @@ test('skills: only expected skills exist', () => {
   assert.deepEqual(files, ['explore.md', 'index.md']);
 });
 
-test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits before reading stdin', () => {
-  const { execFileSync } = require('node:child_process');
+test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0', () => {
+  const { spawnSync } = require('node:child_process');
   const script = path.join(__dirname, 'user-prompt-context.js');
-  const out = execFileSync(process.execPath, [script], {
+  const proc = spawnSync(process.execPath, [script], {
     input: JSON.stringify({ message: 'impact analysis for fn_that_would_trigger_search' }),
     env: { ...process.env, CODE_GRAPH_QUIET_HOOKS: '1' },
     encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 2000,
   });
-  // Quiet mode must produce no stdout — no [code-graph:*] prefix, nothing.
-  assert.equal(out, '');
+  // Quiet mode must be fully silent — any stderr leaks into Claude's display.
+  assert.equal(proc.stdout, '', 'stdout must be empty');
+  assert.equal(proc.stderr, '', 'stderr must be empty');
+  assert.equal(proc.status, 0, 'must exit 0');
 });

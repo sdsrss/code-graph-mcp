@@ -22,7 +22,41 @@ function escapeRegex(s) {
   return s.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&');
 }
 
+// Strip our sentinel block — well-formed first, then self-heal orphan begin/end.
+// Shared by adopt (so re-adopt rewrites a stale/malformed block) and unadopt.
+function stripSentinelBlock(text) {
+  const wellFormed = new RegExp(
+    `${escapeRegex(SENTINEL_BEGIN)}[\\s\\S]*?${escapeRegex(SENTINEL_END)}\\n?`, 'g'
+  );
+  let out = text.replace(wellFormed, '');
+  // Orphan BEGIN with no matching END (truncation / partial edit).
+  // Strip from BEGIN to the next blank line or EOF — the file is shared with
+  // claude-mem-lite, so we must not eat past a blank-line boundary.
+  if (out.includes(SENTINEL_BEGIN)) {
+    out = out.replace(
+      new RegExp(`${escapeRegex(SENTINEL_BEGIN)}[\\s\\S]*?(?=\\n\\n|$)`, 'g'),
+      ''
+    );
+  }
+  // Orphan END line by itself.
+  if (out.includes(SENTINEL_END)) {
+    out = out.split('\n').filter(l => l.trim() !== SENTINEL_END).join('\n');
+  }
+  // Collapse blank-line runs introduced by stripping mid-paragraph blocks.
+  return out.replace(/\n{3,}/g, '\n\n');
+}
+
+function platformGuard() {
+  if (process.platform === 'win32') {
+    return { ok: false, reason: 'windows-not-supported' };
+  }
+  return null;
+}
+
 function adopt({ cwd, home, templatePath } = {}) {
+  const blocked = platformGuard();
+  if (blocked) return blocked;
+
   const dir = memoryDir(cwd, home);
   if (!fs.existsSync(dir)) {
     return { ok: false, reason: 'no-memory-dir', dir };
@@ -35,18 +69,25 @@ function adopt({ cwd, home, templatePath } = {}) {
   fs.copyFileSync(tpl, target);
 
   const indexPath = path.join(dir, 'MEMORY.md');
-  let index = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Memory Index\n';
-  let indexed = false;
-  if (!index.includes(SENTINEL_BEGIN)) {
-    if (!index.endsWith('\n')) index += '\n';
-    index += `${SENTINEL_BEGIN}\n${INDEX_LINE}\n${SENTINEL_END}\n`;
-    fs.writeFileSync(indexPath, index);
-    indexed = true;
+  const index = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Memory Index\n';
+  const desiredBlock = `${SENTINEL_BEGIN}\n${INDEX_LINE}\n${SENTINEL_END}`;
+
+  // Already-adopted-and-well-formed: skip the write entirely.
+  if (index.includes(desiredBlock)) {
+    return { ok: true, target, indexPath, indexed: false, healed: false };
   }
-  return { ok: true, target, indexPath, indexed };
+
+  const cleaned = stripSentinelBlock(index);
+  const healed = cleaned !== index;
+  const base = cleaned.endsWith('\n') ? cleaned : cleaned + '\n';
+  fs.writeFileSync(indexPath, base + desiredBlock + '\n');
+  return { ok: true, target, indexPath, indexed: true, healed };
 }
 
 function unadopt({ cwd, home } = {}) {
+  const blocked = platformGuard();
+  if (blocked) return blocked;
+
   const dir = memoryDir(cwd, home);
   const target = path.join(dir, TARGET_NAME);
   const indexPath = path.join(dir, 'MEMORY.md');
@@ -59,8 +100,7 @@ function unadopt({ cwd, home } = {}) {
   }
   if (fs.existsSync(indexPath)) {
     const before = fs.readFileSync(indexPath, 'utf8');
-    const re = new RegExp(`${escapeRegex(SENTINEL_BEGIN)}[\\s\\S]*?${escapeRegex(SENTINEL_END)}\\n?`, 'g');
-    const after = before.replace(re, '');
+    const after = stripSentinelBlock(before);
     if (after !== before) {
       fs.writeFileSync(indexPath, after);
       indexPruned = true;
@@ -70,6 +110,10 @@ function unadopt({ cwd, home } = {}) {
 }
 
 function formatResult(action, result) {
+  if (!result.ok && result.reason === 'windows-not-supported') {
+    return '[code-graph] adopt/unadopt are POSIX-only — claude-mem-lite slug ' +
+           'convention on Windows is unverified. Edit MEMORY.md manually to opt in.';
+  }
   if (action === 'adopt') {
     if (!result.ok) {
       if (result.reason === 'no-memory-dir') {
@@ -82,8 +126,9 @@ function formatResult(action, result) {
       return `[code-graph] adopt failed: ${result.reason || 'unknown'}`;
     }
     const lines = [`[code-graph] Adopted → ${result.target}`];
-    if (result.indexed) lines.push(`[code-graph] Indexed → ${result.indexPath}`);
-    else lines.push(`[code-graph] Index already contains sentinel — left as-is`);
+    if (result.healed) lines.push(`[code-graph] Healed malformed sentinel block → ${result.indexPath}`);
+    else if (result.indexed) lines.push(`[code-graph] Indexed → ${result.indexPath}`);
+    else lines.push(`[code-graph] Index already up-to-date — no write`);
     lines.push('[code-graph] Activate: set CODE_GRAPH_QUIET_HOOKS=1 in ~/.claude/settings.json env');
     return lines.join('\n');
   }
@@ -105,6 +150,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  adopt, unadopt, memoryDir, formatResult,
+  adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
 };
