@@ -48,7 +48,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Call chain for a function. Use when: tracing who calls it / what it calls, understanding flow before modifying. Recursive with depth tracking.".into(),
+                description: "Who calls X, what X calls: multi-hop call-chain for a named function. Use when: 'who calls X?' or 'what does X call?' or tracing flow with depth. Returns a graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -64,7 +64,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Get symbol details: type, signature, code, references, impact. Use when: inspecting a function/class before editing it. Accepts symbol_name, node_id, or file_path+symbol_name.".into(),
+                description: "Inspect ONE named symbol: signature, full source, optional references/impact. Use when: you have a symbol name (or node_id) and want its definition/body.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -105,7 +105,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "ast_search".into(),
-                description: "Structural code search by type/return/params. Use when: finding all functions returning a type, or querying code structure that grep can't express.".into(),
+                description: "Enumerate MULTIPLE symbols by structural criteria (type, return, params). Use when: 'all structs in module X' or 'all fns returning Vec<T>'. For ONE known symbol, use get_ast_node.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -120,7 +120,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "All references to a symbol. Use when: checking if safe to rename/remove, or finding all usage points before refactoring. Shows callers, importers, inheritors.".into(),
+                description: "Flat enumeration of all usage sites (calls/imports/inherits/implements). Use when: auditing every place a symbol is touched before rename/remove. For 'who calls X?', use get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

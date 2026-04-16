@@ -2,37 +2,54 @@
 //!
 //! Turns "does Claude Code intelligently invoke our tools?" from vibe-check
 //! into a trackable number. For each natural-language query in the oracle,
-//! ask the Claude API which tool it would pick (given our live 7-tool schemas)
-//! and assert that the pick matches the expected tool.
+//! ask a Claude-family model which tool it would pick (given our live 7-tool
+//! schemas) and assert that the pick matches the expected tool.
+//!
+//! ## Backends
+//!
+//! Supports two API backends, auto-detected by env:
+//! - `ANTHROPIC_API_KEY` — native Anthropic Messages API
+//!   (`https://api.anthropic.com/v1/messages`, tools in Anthropic schema).
+//! - `OPENROUTER_API_KEY` — OpenRouter's OpenAI-compatible
+//!   `/api/v1/chat/completions` endpoint. Tools re-packaged as
+//!   `{"type": "function", "function": {...}}`. Model defaults to
+//!   `anthropic/claude-sonnet-4.5`; override with `ROUTING_BENCH_MODEL`.
+//!
+//! If both are set, `ANTHROPIC_API_KEY` wins. If neither, the test no-ops.
 //!
 //! ## Running
 //!
 //! ```bash
-//! # locally (needs your key):
-//! ANTHROPIC_API_KEY=sk-... cargo test --test routing_bench -- --ignored --nocapture
+//! # Anthropic native
+//! ANTHROPIC_API_KEY=sk-ant-... cargo test --test routing_bench -- --ignored --nocapture
 //!
-//! # skipped by default (no key, no cost):
-//! cargo test --test routing_bench
+//! # OpenRouter
+//! OPENROUTER_API_KEY=sk-or-... cargo test --test routing_bench -- --ignored --nocapture
+//!
+//! # Override model
+//! OPENROUTER_API_KEY=... ROUTING_BENCH_MODEL=anthropic/claude-opus-4.1 \
+//!   cargo test --test routing_bench -- --ignored --nocapture
 //! ```
 //!
 //! ## Tuning
 //!
-//! Threshold starts at 0.70. Track per-release; raise it as tool descriptions
-//! improve. Misses print with `expected` vs `got` so you can see whether the
-//! routing went to a semantically-adjacent tool (e.g. `find_references` where
-//! `get_call_graph` was expected) or a wrong tool entirely.
+//! Threshold starts at 0.70. Track per-release; raise as descriptions improve.
+//! Misses print with `expected` vs `got` so you can see whether routing went to
+//! a semantically-adjacent tool or a wrong tool entirely.
 //!
 //! ## Cost
 //!
 //! ~$0.10/run with `claude-sonnet-4-6` (20 queries × ~1.2K in + ~150 out tokens).
+//! OpenRouter adds a small markup (~5–10%).
 
 use code_graph_mcp::mcp::tools::ToolRegistry;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Duration;
 
-const MODEL: &str = "claude-sonnet-4-6";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const P_AT_1_THRESHOLD: f64 = 0.70;
+const SYSTEM_PROMPT: &str = "You are a code-search assistant. For the user's query, \
+    pick exactly ONE tool to invoke. Prefer the most specific tool whose description \
+    matches the intent. Do not answer in prose — call a tool.";
 
 /// (natural-language query, expected tool name).
 /// 20 queries × 7 tools — 3 per tool except `find_references` with 2.
@@ -66,20 +83,134 @@ const ORACLE: &[(&str, &str)] = &[
     ("Display the implementation of format_call_graph_response", "get_ast_node"),
 ];
 
+enum Backend {
+    Anthropic { key: String, model: String },
+    OpenRouter { key: String, model: String },
+}
+
+impl Backend {
+    fn label(&self) -> String {
+        match self {
+            Backend::Anthropic { model, .. } => format!("anthropic/{}", model),
+            Backend::OpenRouter { model, .. } => format!("openrouter/{}", model),
+        }
+    }
+}
+
+fn detect_backend() -> Option<Backend> {
+    let model_override = std::env::var("ROUTING_BENCH_MODEL").ok().filter(|s| !s.is_empty());
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+        if !k.is_empty() {
+            return Some(Backend::Anthropic {
+                key: k,
+                model: model_override.unwrap_or_else(|| "claude-sonnet-4-6".into()),
+            });
+        }
+    }
+    if let Ok(k) = std::env::var("OPENROUTER_API_KEY") {
+        if !k.is_empty() {
+            return Some(Backend::OpenRouter {
+                key: k,
+                model: model_override.unwrap_or_else(|| "anthropic/claude-sonnet-4.5".into()),
+            });
+        }
+    }
+    None
+}
+
+/// Call the backend, return the picked tool name, or None if the model produced no tool_use.
+fn call_backend(
+    client: &reqwest::blocking::Client,
+    backend: &Backend,
+    tools: &[Value],
+    query: &str,
+) -> Option<String> {
+    match backend {
+        Backend::Anthropic { key, model } => {
+            let body = json!({
+                "model": model,
+                "max_tokens": 1024,
+                "system": SYSTEM_PROMPT,
+                "tools": tools,
+                "tool_choice": { "type": "any" },
+                "messages": [{ "role": "user", "content": query }],
+            });
+            let resp = client.post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .expect("POST to Anthropic API");
+            if !resp.status().is_success() {
+                panic!("Anthropic API {}: {}", resp.status(), resp.text().unwrap_or_default());
+            }
+            let json_resp: Value = resp.json().expect("parse Anthropic JSON");
+            json_resp["content"]
+                .as_array()
+                .and_then(|arr| arr.iter().find(|c| c["type"] == "tool_use"))
+                .and_then(|c| c["name"].as_str())
+                .map(String::from)
+        }
+        Backend::OpenRouter { key, model } => {
+            // Convert Anthropic-style {name, description, input_schema} tools to
+            // OpenAI function-calling format {type, function: {name, description, parameters}}.
+            let openai_tools: Vec<Value> = tools.iter().map(|t| json!({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                }
+            })).collect();
+            let body = json!({
+                "model": model,
+                "max_tokens": 1024,
+                "tools": openai_tools,
+                "tool_choice": "required",
+                "messages": [
+                    { "role": "system", "content": SYSTEM_PROMPT },
+                    { "role": "user",   "content": query },
+                ],
+            });
+            let resp = client.post("https://openrouter.ai/api/v1/chat/completions")
+                .header("authorization", format!("Bearer {}", key))
+                .header("content-type", "application/json")
+                .header("http-referer", "https://github.com/sdsrss/code-graph-mcp")
+                .header("x-title", "code-graph-mcp routing_bench")
+                .json(&body)
+                .send()
+                .expect("POST to OpenRouter");
+            if !resp.status().is_success() {
+                panic!("OpenRouter API {}: {}", resp.status(), resp.text().unwrap_or_default());
+            }
+            let json_resp: Value = resp.json().expect("parse OpenRouter JSON");
+            // OpenAI shape: choices[0].message.tool_calls[0].function.name
+            json_resp["choices"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|choice| choice["message"]["tool_calls"].as_array())
+                .and_then(|calls| calls.first())
+                .and_then(|call| call["function"]["name"].as_str())
+                .map(String::from)
+        }
+    }
+}
+
 #[test]
-#[ignore = "requires ANTHROPIC_API_KEY; run: cargo test --test routing_bench -- --ignored"]
+#[ignore = "requires ANTHROPIC_API_KEY or OPENROUTER_API_KEY; run: cargo test --test routing_bench -- --ignored"]
 fn routing_recall_benchmark() {
-    let key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("[routing_bench] ANTHROPIC_API_KEY not set — skipping (run with the env var to exercise the bench).");
+    let backend = match detect_backend() {
+        Some(b) => b,
+        None => {
+            eprintln!("[routing_bench] Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY set — skipping.");
             return;
         }
     };
+    eprintln!("[routing_bench] using backend={}", backend.label());
 
-    // Source of truth: the same ToolRegistry that the live MCP server advertises.
     let registry = ToolRegistry::new();
-    let tools: Vec<serde_json::Value> = registry
+    let tools: Vec<Value> = registry
         .list_tools()
         .iter()
         .map(|t| json!({
@@ -95,45 +226,11 @@ fn routing_recall_benchmark() {
         .build()
         .expect("build reqwest client");
 
-    let system_prompt = "You are a code-search assistant. For the user's query, \
-        pick exactly ONE tool to invoke. Prefer the most specific tool whose description \
-        matches the intent. Do not answer in prose — call a tool.";
-
     let mut hits = 0usize;
     let mut misses: Vec<(String, String, Option<String>)> = Vec::new();
 
     for &(query, expected) in ORACLE {
-        let body = json!({
-            "model": MODEL,
-            "max_tokens": 1024,
-            "system": system_prompt,
-            "tools": tools,
-            "tool_choice": { "type": "any" },
-            "messages": [{ "role": "user", "content": query }],
-        });
-
-        let resp = client
-            .post(API_URL)
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .expect("POST to Anthropic API");
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().unwrap_or_default();
-            panic!("Anthropic API returned {}: {}", status, text);
-        }
-
-        let json_resp: serde_json::Value = resp.json().expect("parse JSON response");
-        let picked = json_resp["content"]
-            .as_array()
-            .and_then(|arr| arr.iter().find(|c| c["type"] == "tool_use"))
-            .and_then(|c| c["name"].as_str())
-            .map(String::from);
-
+        let picked = call_backend(&client, &backend, &tools, query);
         if picked.as_deref() == Some(expected) {
             hits += 1;
         } else {
@@ -144,8 +241,8 @@ fn routing_recall_benchmark() {
     let total = ORACLE.len();
     let p_at_1 = hits as f64 / total as f64;
     eprintln!(
-        "\n[routing_bench] model={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
-        MODEL, hits, total, p_at_1 * 100.0, P_AT_1_THRESHOLD * 100.0,
+        "\n[routing_bench] backend={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
+        backend.label(), hits, total, p_at_1 * 100.0, P_AT_1_THRESHOLD * 100.0,
     );
     if !misses.is_empty() {
         eprintln!("[routing_bench] misses ({}):", misses.len());

@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.11.6 — Tool-description tightening (+5% routing P@1) + OpenRouter backend
+
+First run of the routing-recall benchmark landed v0.11.4 at **P@1 = 18/20 = 90.0%**
+(`anthropic/claude-sonnet-4.5` via OpenRouter). The two misses were both semantic
+overlaps between adjacent tools. This release tightens 4 tool descriptions and
+re-runs the bench: **P@1 = 19/20 = 95.0%**, a net +5.0 points with one miss
+remaining (borderline — "show me the EmbeddingModel struct" routes to `ast_search`
+with `type=struct`, which returns the right answer albeit via the "enumerate"
+tool rather than the "inspect ONE" tool).
+
+### Tool-description changes (`src/mcp/tools.rs`)
+
+All stay under the 200-char registry limit.
+
+- **`get_call_graph`** — leads with `"Who calls X, what X calls"` + `"Returns a
+  graph (not a flat list)"`. Fixed routing for "Who calls ensure_indexed?"
+  (was → `find_references`, now → `get_call_graph`).
+- **`find_references`** — leads with `"Flat enumeration of all usage sites"` +
+  explicit deflection: `"For 'who calls X?', use get_call_graph."`.
+- **`get_ast_node`** — leads with `"Inspect ONE named symbol"` + `"you have a
+  symbol name (or node_id) and want its definition/body"` to claim the
+  "show me X / signature of Y" intent.
+- **`ast_search`** — leads with `"Enumerate MULTIPLE symbols by structural
+  criteria"` + deflection: `"For ONE known symbol, use get_ast_node."`.
+
+Pattern: each description now leads with a shape verb (`who calls`, `flat
+enumeration`, `inspect ONE`, `enumerate MULTIPLE`) and points at the
+adjacent tool when a query drifts into overlap.
+
+### Routing-bench OpenRouter backend (`tests/routing_bench.rs`)
+
+Auto-detects `ANTHROPIC_API_KEY` (native Messages API) or `OPENROUTER_API_KEY`
+(OpenAI-compatible `/chat/completions`). Tool schemas re-packaged as
+`{type: "function", function: {...}}` for the OpenRouter path. Model default
+`anthropic/claude-sonnet-4.5`; override with `ROUTING_BENCH_MODEL`. Anthropic
+wins if both keys present.
+
+### Baseline measurement (published)
+
+| Run | Backend / Model | P@1 |
+|-----|-----------------|-----|
+| v0.11.4 baseline | openrouter / anthropic/claude-sonnet-4.5 | 18/20 (90.0%) |
+| v0.11.6 post-tightening | openrouter / anthropic/claude-sonnet-4.5 | 19/20 (95.0%) |
+
+Cost ≈ $0.10/run. Threshold stays at 0.70; consider raising to 0.85 after two
+more releases confirm 95% as stable baseline (20-query sample is within model
+stochasticity range).
+
 ## v0.11.5 — Hotfix: clippy 1.95 parity (`unnecessary_sort_by`)
 
 `-D warnings` on stable clippy 1.95 flagged the two `sort_by(|a, b| b.0.cmp(&a.0))`
