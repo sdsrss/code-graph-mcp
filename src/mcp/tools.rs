@@ -4,9 +4,13 @@ use serde_json::json;
 /// Expected tool count — update this when adding/removing tools.
 /// Management tools (start_watch, stop_watch, get_index_status, rebuild_index)
 /// are still callable via tools/call but hidden from tools/list to save tokens.
+/// Niche tools (trace_http_chain, impact_analysis, dependency_graph,
+/// find_similar_code, find_dead_code) are also hidden — still callable by name
+/// for CLI / advanced use, but omitted from the default LLM surface to shrink
+/// tools/list token overhead (~40% reduction in listing payload).
 /// Merged tools (find_http_route → trace_http_chain, read_snippet → get_ast_node)
 /// remain callable as aliases for backward compatibility.
-pub const TOOL_COUNT: usize = 12;
+pub const TOOL_COUNT: usize = 7;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -54,19 +58,6 @@ impl ToolRegistry {
                 }),
             },
             ToolDefinition {
-                name: "trace_http_chain".into(),
-                description: "Trace HTTP route to handler and downstream calls. Use when: debugging API endpoints or finding which handler serves a route. depth=1 for handler only.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "route_path": { "type": "string", "description": "Route e.g. '/api/users' or 'POST /api/login'" },
-                        "depth": { "type": "number", "description": "Call chain depth (default 3, use 1 for handler only)" },
-                        "include_middleware": { "type": "boolean", "description": "Include middleware (default true)" }
-                    },
-                    "required": ["route_path"]
-                }),
-            },
-            ToolDefinition {
                 name: "get_ast_node".into(),
                 description: "Get symbol details: type, signature, code, references, impact. Use when: inspecting a function/class before editing it. Accepts symbol_name, node_id, or file_path+symbol_name.".into(),
                 input_schema: json!({
@@ -96,20 +87,6 @@ impl ToolRegistry {
                 }),
             },
             ToolDefinition {
-                name: "impact_analysis".into(),
-                description: "Blast radius before modifying code. Use when: about to change/rename/remove a function — shows risk level, affected callers, routes, and files.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol_name": { "type": "string", "description": "Symbol to analyze" },
-                        "file_path": { "type": "string", "description": "Disambiguate same-name symbols" },
-                        "change_type": { "type": "string", "enum": ["signature", "behavior", "remove"], "description": "Change type (default 'behavior')" },
-                        "depth": { "type": "number", "description": "Max depth (default 3)" }
-                    },
-                    "required": ["symbol_name"]
-                }),
-            },
-            ToolDefinition {
                 name: "module_overview".into(),
                 description: "Module structure and symbols. Use when: exploring a directory/module you haven't seen, or finding the right file to edit. Shows exports, hot paths, files.".into(),
                 input_schema: json!({
@@ -119,34 +96,6 @@ impl ToolRegistry {
                         "compact": { "type": "boolean", "description": "Compact mode: name+type+callers only, no signatures (saves tokens)" }
                     },
                     "required": ["path"]
-                }),
-            },
-            ToolDefinition {
-                name: "dependency_graph".into(),
-                description: "File-level import/dependency map. Use when: understanding dependencies before splitting/moving files, checking import chains, or finding circular deps.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": { "type": "string", "description": "File to analyze" },
-                        "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Direction (default 'both')" },
-                        "depth": { "type": "number", "description": "Max depth (default 2)" },
-                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts only, no symbol details (saves tokens)" }
-                    },
-                    "required": ["file_path"]
-                }),
-            },
-            ToolDefinition {
-                name: "find_similar_code".into(),
-                description: "Find semantically similar functions. Use when: looking for duplicate logic to extract, consistent refactoring, or related patterns. Requires embeddings.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol_name": { "type": "string", "description": "Symbol name (provide this OR node_id)" },
-                        "node_id": { "type": "number", "description": "Node ID (provide this OR symbol_name)" },
-                        "top_k": { "type": "number", "description": "Results count (default 5)" },
-                        "max_distance": { "type": "number", "description": "Max distance (default 0.8)" }
-                    },
-                    "required": []
                 }),
             },
             ToolDefinition {
@@ -178,21 +127,6 @@ impl ToolRegistry {
                     "required": ["symbol_name"]
                 }),
             },
-            ToolDefinition {
-                name: "find_dead_code".into(),
-                description: "Find unused code (orphans, exported-unused). Use when: cleaning up codebase, finding safe-to-delete functions, or reviewing for unused exports.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Directory/file path filter (e.g. 'src/auth/')" },
-                        "node_type": { "type": "string", "enum": ["fn", "class", "struct", "enum", "interface", "type", "const", "var"], "description": "Filter by node type" },
-                        "include_tests": { "type": "boolean", "description": "Include test symbols (default false)" },
-                        "min_lines": { "type": "integer", "description": "Minimum lines to report (default 3)" },
-                        "compact": { "type": "boolean", "description": "Compact mode: name+file+line only, no code (default true)" }
-                    },
-                    "required": []
-                }),
-            },
         ];
 
         debug_assert_eq!(tools.len(), TOOL_COUNT,
@@ -221,10 +155,10 @@ mod tests {
         let registry = ToolRegistry::new();
         let names: Vec<&str> = registry.list_tools().iter().map(|t| t.name.as_str()).collect();
         for expected in [
-            "semantic_code_search", "get_call_graph", "trace_http_chain",
-            "get_ast_node", "project_map", "impact_analysis",
-            "module_overview", "dependency_graph", "find_similar_code",
-            "ast_search", "find_references", "find_dead_code",
+            "semantic_code_search", "get_call_graph",
+            "get_ast_node", "project_map",
+            "module_overview",
+            "ast_search", "find_references",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }
@@ -236,6 +170,12 @@ mod tests {
         assert!(!names.contains(&"stop_watch"));
         assert!(!names.contains(&"get_index_status"));
         assert!(!names.contains(&"rebuild_index"));
+        // Niche tools hidden from tools/list (callable by name)
+        assert!(!names.contains(&"trace_http_chain"));
+        assert!(!names.contains(&"impact_analysis"));
+        assert!(!names.contains(&"dependency_graph"));
+        assert!(!names.contains(&"find_similar_code"));
+        assert!(!names.contains(&"find_dead_code"));
     }
 
     #[test]
