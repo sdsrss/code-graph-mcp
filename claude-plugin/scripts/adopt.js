@@ -10,9 +10,9 @@ const os = require('os');
 const SENTINEL_BEGIN = '<!-- code-graph-mcp:begin v1 -->';
 const SENTINEL_END = '<!-- code-graph-mcp:end -->';
 const INDEX_LINE = [
-  '- [code-graph-mcp](plugin_code_graph_mcp.md) — 代码理解 12 工具（替代 Grep/Read 多步）：',
-  '  - 问"谁调/改动/模块/概念/HTTP/相似" → `get_call_graph`/`impact_analysis`/`module_overview`/`semantic_code_search`/`trace_http_chain`/`find_similar_code`',
-  '  - 问"返回型/引用/死码/依赖/架构/看签名" → `ast_search`/`find_references`/`find_dead_code`/`dependency_graph`/`project_map`/`get_ast_node`',
+  '- [code-graph-mcp](plugin_code_graph_mcp.md) — v0.10.0 起 tools/list 默认 7 核心 + 5 隐藏可调（省启动 token）',
+  '  - 核心 7（默认暴露）：`get_call_graph`/`module_overview`/`semantic_code_search`/`ast_search`/`find_references`/`get_ast_node`/`project_map`',
+  '  - 进阶 5（隐藏按名可调）：`impact_analysis`/`trace_http_chain`/`dependency_graph`/`find_similar_code`/`find_dead_code`',
 ].join('\n');
 const TEMPLATE_PATH = path.resolve(__dirname, '..', 'templates', 'plugin_code_graph_mcp.md');
 const TARGET_NAME = 'plugin_code_graph_mcp.md';
@@ -102,6 +102,26 @@ function isAdopted({ cwd, home } = {}) {
   return index.includes(SENTINEL_BEGIN) && index.includes(SENTINEL_END);
 }
 
+// v0.11.0 — shipped template / INDEX_LINE 与已落地版本出现漂移时返回 true。
+// 让已 adopt 的项目在下次 SessionStart 自动对齐到插件最新决策表，避免"老用户
+// 永远停留在首次 adopt 时的 snapshot"。手动编辑会被覆盖——锁定方式：
+// CODE_GRAPH_NO_TEMPLATE_REFRESH=1。
+function needsRefresh({ cwd, home, templatePath } = {}) {
+  const dir = memoryDir(cwd, home);
+  const target = path.join(dir, TARGET_NAME);
+  const indexPath = path.join(dir, 'MEMORY.md');
+  const tpl = templatePath || TEMPLATE_PATH;
+  if (!fs.existsSync(target) || !fs.existsSync(tpl) || !fs.existsSync(indexPath)) {
+    return false;
+  }
+  const shipped = fs.readFileSync(tpl);
+  const current = fs.readFileSync(target);
+  if (!shipped.equals(current)) return true;
+  const index = fs.readFileSync(indexPath, 'utf8');
+  const desiredBlock = `${SENTINEL_BEGIN}\n${INDEX_LINE}\n${SENTINEL_END}`;
+  return !index.includes(desiredBlock);
+}
+
 // 检测脚本是否从 Claude Code 插件 cache 运行。
 // 走 __dirname 而非 CLAUDE_PLUGIN_ROOT — 后者在多插件共存时会互相污染
 // （见 feedback_plugin_env_isolation.md）。
@@ -122,6 +142,12 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
     return { attempted: false, reason: 'not-plugin-mode' };
   }
   if (isAdopted({ cwd, home })) {
+    // v0.11.0: shipped template / INDEX_LINE 漂移时重跑 adopt 对齐。
+    // opt-out: CODE_GRAPH_NO_TEMPLATE_REFRESH=1（锁定手动编辑）。
+    if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd, home })) {
+      const result = adopt({ cwd, home });
+      return { attempted: true, reason: 'refreshed', result };
+    }
     return { attempted: false, reason: 'already-adopted' };
   }
   const result = adopt({ cwd, home });
@@ -197,6 +223,6 @@ if (require.main === module) {
 
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
 };

@@ -259,14 +259,22 @@ function runSessionInit() {
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
 
   // v0.9.0 C' 上下文感知默认：插件模式下首次 SessionStart 自动 adopt。
-  // 仅一次 stderr 提示（采纳成功时），让用户知道发生了什么 + 如何回退。
+  // v0.11.0: 已 adopt 的项目如果 shipped template 漂移也会触发一次刷新。
+  // 两种情况都发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
   const autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
   if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
-    process.stderr.write(
-      '[code-graph] Auto-adopted into project MEMORY.md (plugin install → knowing consent).\n' +
-      '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
-      '            Reverse:    code-graph-mcp unadopt\n'
-    );
+    if (autoAdopt.reason === 'refreshed') {
+      process.stderr.write(
+        '[code-graph] Refreshed decision table to latest shipped version.\n' +
+        '            Lock file:  CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
+      );
+    } else {
+      process.stderr.write(
+        '[code-graph] Auto-adopted into project MEMORY.md (plugin install → knowing consent).\n' +
+        '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
+        '            Reverse:    code-graph-mcp unadopt\n'
+      );
+    }
   }
 
   // quietHooks: adopted → quiet by default (rely on MEMORY.md pointer + on-demand

@@ -6,8 +6,8 @@ const path = require('path');
 const os = require('os');
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt,
-  SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh,
+  SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
 } = require('./adopt');
 
 function makeSandbox() {
@@ -346,6 +346,123 @@ test('maybeAutoAdopt returns no-memory-dir when project memory missing', () => {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+// v0.11.0 — template-refresh on drift
+
+test('needsRefresh returns false when target matches shipped template + INDEX_LINE', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('needsRefresh returns true when target content drifted from shipped template', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const target = path.join(sb.dir, TARGET_NAME);
+    fs.writeFileSync(target, '# stale content from earlier plugin version\n');
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), true);
+  } finally { sb.cleanup(); }
+});
+
+test('needsRefresh returns true when MEMORY.md INDEX_LINE drifted', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    const stale = `# Memory Index\n\n${SENTINEL_BEGIN}\n- old 12-tool index line\n${SENTINEL_END}\n`;
+    fs.writeFileSync(indexPath, stale);
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), true);
+  } finally { sb.cleanup(); }
+});
+
+test('needsRefresh returns false when not adopted (nothing to refresh)', () => {
+  const sb = makeSandbox();
+  try {
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd, home: sb.home }), false);
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt refreshes drifted target on re-run (reason=refreshed)', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const target = path.join(sb.dir, TARGET_NAME);
+    fs.writeFileSync(target, '# stale\n');
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, true);
+    assert.strictEqual(res.reason, 'refreshed');
+    assert.strictEqual(res.result.ok, true);
+    // Target now matches shipped template
+    const shipped = fs.readFileSync(TEMPLATE_PATH);
+    const current = fs.readFileSync(target);
+    assert.ok(shipped.equals(current), 'target re-synced to shipped template');
+    // Sentinel preserved in MEMORY.md
+    assert.strictEqual(isAdopted({ cwd: sb.cwd, home: sb.home }), true);
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt refreshes drifted INDEX_LINE in MEMORY.md', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const indexPath = path.join(sb.dir, 'MEMORY.md');
+    const stale = `# Memory Index\n\n${SENTINEL_BEGIN}\n- old 12-tool index line\n${SENTINEL_END}\n`;
+    fs.writeFileSync(indexPath, stale);
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, true);
+    assert.strictEqual(res.reason, 'refreshed');
+    const index = fs.readFileSync(indexPath, 'utf8');
+    assert.ok(index.includes(INDEX_LINE), 'INDEX_LINE restored from current constant');
+    assert.ok(!index.includes('old 12-tool index line'), 'stale line removed');
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt skips refresh when CODE_GRAPH_NO_TEMPLATE_REFRESH=1 (locks manual edits)', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const target = path.join(sb.dir, TARGET_NAME);
+    const userEdit = '# my hand-edited decision table\n';
+    fs.writeFileSync(target, userEdit);
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: { CODE_GRAPH_NO_TEMPLATE_REFRESH: '1' },
+    });
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'already-adopted');
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), userEdit, 'user edit preserved');
+  } finally { sb.cleanup(); }
+});
+
+test('maybeAutoAdopt stays already-adopted when in sync (no gratuitous refresh)', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const target = path.join(sb.dir, TARGET_NAME);
+    const mtimeBefore = fs.statSync(target).mtimeMs;
+    const res = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home,
+      scriptPath: '/home/u/.claude/plugins/cache/code-graph-mcp/scripts',
+      env: {},
+    });
+    assert.strictEqual(res.attempted, false);
+    assert.strictEqual(res.reason, 'already-adopted');
+    const mtimeAfter = fs.statSync(target).mtimeMs;
+    assert.strictEqual(mtimeAfter, mtimeBefore, 'target file not touched when in sync');
+  } finally { sb.cleanup(); }
 });
 
 test('Windows platform is rejected with clear reason', { skip: process.platform === 'win32' }, () => {
