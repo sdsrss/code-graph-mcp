@@ -96,80 +96,102 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
   assert.equal(fs.existsSync(registryPath), false);
 });
 
-function nonEmptyHooksJson() {
+function legacyHooksFromPlugin() {
   return {
-    hooks: {
-      SessionStart: [{
-        matcher: 'startup',
-        hooks: [{ type: 'command', command: 'node "/plugin/session-init.js"' }],
-      }],
-    },
+    SessionStart: [{
+      matcher: 'startup|clear|compact',
+      description: 'StatusLine self-heal, lifecycle sync, project map injection',
+      hooks: [{ type: 'command', command: 'node "/stale/cache/0.8.2/claude-plugin/scripts/session-init.js"', timeout: 5 }],
+    }],
+    PostToolUse: [{
+      matcher: 'tool == "Write" || tool == "Edit"',
+      description: 'Auto-update code graph index after file edits',
+      hooks: [{ type: 'command', command: 'node "/stale/code-graph/incremental-index.js"', timeout: 10 }],
+    }],
   };
 }
 
-test('findStalePluginHooksJson detects non-empty cache and marketplace copies', () => {
-  const homeDir = mkHome();
-  const mpHooks = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'code-graph-mcp', 'claude-plugin', 'hooks', 'hooks.json');
-  const mpManifest = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'code-graph-mcp', '.claude-plugin', 'marketplace.json');
-  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
-
-  writeJson(mpManifest, { name: 'code-graph-mcp' });
-  writeJson(mpHooks, nonEmptyHooksJson());
-  writeJson(cacheHooks, nonEmptyHooksJson());
-
+test('isOurHookEntry matches legacy description-tagged entries', () => {
+  const entry = legacyHooksFromPlugin().SessionStart[0];
   const out = execFileSync(process.execPath, ['-e', `
-    const { findStalePluginHooksJson } = require(${JSON.stringify(lifecyclePath)});
-    process.stdout.write(JSON.stringify(findStalePluginHooksJson()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
-
-  const stale = JSON.parse(out).sort();
-  assert.equal(stale.length, 2);
-  assert.ok(stale.some(p => p === mpHooks));
-  assert.ok(stale.some(p => p === cacheHooks));
+    const { isOurHookEntry } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(isOurHookEntry(${JSON.stringify(entry)})));
+  `]).toString();
+  assert.equal(JSON.parse(out), true);
 });
 
-test('clearStalePluginCacheHooks empties non-empty hooks.json copies', () => {
-  const homeDir = mkHome();
-  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
-  writeJson(cacheHooks, nonEmptyHooksJson());
-
+test('isOurHookEntry matches script-name + path fallback (missing description)', () => {
+  const entry = {
+    matcher: 'tool == "Edit"',
+    hooks: [{ type: 'command', command: 'node "/cache/code-graph-mcp/scripts/pre-edit-guide.js"' }],
+  };
   const out = execFileSync(process.execPath, ['-e', `
-    const { clearStalePluginCacheHooks } = require(${JSON.stringify(lifecyclePath)});
-    process.stdout.write(JSON.stringify(clearStalePluginCacheHooks()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
-
-  const cleared = JSON.parse(out);
-  assert.deepEqual(cleared, [cacheHooks]);
-
-  const payload = JSON.parse(fs.readFileSync(cacheHooks, 'utf8'));
-  assert.deepEqual(payload.hooks, {});
-  assert.ok(payload._note && payload._note.includes('cleared'));
+    const { isOurHookEntry } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(isOurHookEntry(${JSON.stringify(entry)})));
+  `]).toString();
+  assert.equal(JSON.parse(out), true);
 });
 
-test('clearStalePluginCacheHooks is idempotent and skips already-empty copies', () => {
-  const homeDir = mkHome();
-  const cacheHooks = path.join(homeDir, '.claude', 'plugins', 'cache', 'code-graph-mcp', 'code-graph-mcp', '0.7.17', 'hooks', 'hooks.json');
-  writeJson(cacheHooks, { hooks: {} });
-
+test('isOurHookEntry leaves unrelated entries alone', () => {
+  const entry = {
+    matcher: 'startup',
+    description: 'some other plugin hook',
+    hooks: [{ type: 'command', command: 'node /some/other/script.js' }],
+  };
   const out = execFileSync(process.execPath, ['-e', `
-    const { clearStalePluginCacheHooks } = require(${JSON.stringify(lifecyclePath)});
-    process.stdout.write(JSON.stringify(clearStalePluginCacheHooks()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
-
-  assert.deepEqual(JSON.parse(out), []);
+    const { isOurHookEntry } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(isOurHookEntry(${JSON.stringify(entry)})));
+  `]).toString();
+  assert.equal(JSON.parse(out), false);
 });
 
-test('scanPluginHooksJsonCopies ignores unrelated marketplaces', () => {
-  const homeDir = mkHome();
-  const otherMp = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'some-other-plugin', 'claude-plugin', 'hooks', 'hooks.json');
-  const otherManifest = path.join(homeDir, '.claude', 'plugins', 'marketplaces', 'some-other-plugin', '.claude-plugin', 'marketplace.json');
-  writeJson(otherManifest, { name: 'some-other-plugin' });
-  writeJson(otherMp, nonEmptyHooksJson());
+test('removeHooksFromSettings strips our entries but keeps unrelated hooks', () => {
+  const settings = {
+    hooks: {
+      SessionStart: [
+        legacyHooksFromPlugin().SessionStart[0],
+        {
+          matcher: 'startup',
+          description: 'some other plugin hook',
+          hooks: [{ type: 'command', command: 'node /some/other/script.js' }],
+        },
+      ],
+      PostToolUse: [legacyHooksFromPlugin().PostToolUse[0]],
+    },
+  };
 
   const out = execFileSync(process.execPath, ['-e', `
-    const { scanPluginHooksJsonCopies } = require(${JSON.stringify(lifecyclePath)});
-    process.stdout.write(JSON.stringify(scanPluginHooksJsonCopies()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+    const { removeHooksFromSettings } = require(${JSON.stringify(lifecyclePath)});
+    const s = ${JSON.stringify(settings)};
+    const changed = removeHooksFromSettings(s);
+    process.stdout.write(JSON.stringify({ changed, s }));
+  `]).toString();
 
-  assert.deepEqual(JSON.parse(out), []);
+  const { changed, s } = JSON.parse(out);
+  assert.equal(changed, true);
+  // Only the unrelated SessionStart entry remains; PostToolUse removed entirely.
+  assert.equal(s.hooks.SessionStart.length, 1);
+  assert.equal(s.hooks.SessionStart[0].description, 'some other plugin hook');
+  assert.ok(!s.hooks.PostToolUse, 'empty event key should be deleted');
+});
+
+test('install() removes legacy code-graph hooks from settings.json without re-registering', () => {
+  const homeDir = mkHome();
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, {
+    statusLine: { type: 'command', command: 'echo previous-status' },
+    hooks: legacyHooksFromPlugin(),
+  });
+
+  execFileSync(process.execPath, [lifecyclePath, 'install'], {
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  // No code-graph hook entries should remain — cache hooks.json is authoritative now.
+  const serialized = JSON.stringify(after.hooks || {});
+  assert.ok(!serialized.includes('code-graph'), 'settings.json must not retain code-graph hook entries');
+  assert.ok(!serialized.includes('session-init.js'), 'settings.json must not retain session-init.js paths');
+  // StatusLine composite is still registered (only channel available).
+  assert.match(after.statusLine.command, /statusline-composite/);
 });

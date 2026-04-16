@@ -1,5 +1,54 @@
 {
-  "description": "code-graph-mcp hooks",
-  "_note": "Hooks are registered to ~/.claude/settings.json by scripts/lifecycle.js. This file is intentionally empty to prevent double-firing — Claude Code would otherwise load hooks from both the plugin cache copy AND settings.json, causing each hook to run twice per event.",
-  "hooks": {}
+  "description": "code-graph-mcp hooks — loaded directly by Claude Code from the plugin cache.",
+  "_note": "Authoritative source. settings.json is no longer used for hook registration as of v0.8.3 — session-init.js actively removes any legacy code-graph entries it finds there. Paths use ${CLAUDE_PLUGIN_ROOT} so they follow version directory updates automatically.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "tool == \"Edit\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-edit-guide.js\"",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "tool == \"Write\" || tool == \"Edit\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/incremental-index.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-context.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
 }

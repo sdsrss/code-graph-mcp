@@ -220,92 +220,12 @@ function migrateOldPluginIds(settings) {
   return changed;
 }
 
-// --- Plugin-cache hooks.json guard ---
-// Claude Code loads hooks from TWO places: settings.json AND the plugin cache
-// at ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json. If both have
-// our hooks, every event fires twice. We register to settings.json (reliable),
-// so cache copies must stay empty. Auto-updates can re-populate cache hooks.json
-// from the marketplace source — this scan+clear runs on every install/update and
-// every SessionStart (via session-init.js) as a second layer of defense.
-
-const EMPTY_HOOKS_STUB = Object.freeze({
-  description: 'code-graph-mcp hooks',
-  _note: 'Hooks are registered to ~/.claude/settings.json by lifecycle.js. Cleared automatically to prevent double-firing.',
-  hooks: {},
-});
-
-function isOurPluginMarketplace(mpDir) {
-  try {
-    const meta = readJson(path.join(mpDir, '.claude-plugin', 'marketplace.json'));
-    if (meta && meta.name === MARKETPLACE_NAME) return true;
-  } catch { /* fallthrough */ }
-  return path.basename(mpDir) === MARKETPLACE_NAME;
-}
-
-function scanPluginHooksJsonCopies() {
-  const HOME = os.homedir();
-  const paths = [];
-
-  // Marketplace source (git-cloned by Claude Code on install)
-  const mpRoot = path.join(HOME, '.claude', 'plugins', 'marketplaces');
-  try {
-    for (const name of fs.readdirSync(mpRoot)) {
-      const mpDir = path.join(mpRoot, name);
-      try { if (!fs.statSync(mpDir).isDirectory()) continue; } catch { continue; }
-      if (!isOurPluginMarketplace(mpDir)) continue;
-      const p = path.join(mpDir, 'claude-plugin', 'hooks', 'hooks.json');
-      if (fs.existsSync(p)) paths.push(p);
-    }
-  } catch { /* no marketplaces dir */ }
-
-  // Cache (what Claude Code actually loads at runtime), per plugin + per version
-  const cacheRoot = path.join(HOME, '.claude', 'plugins', 'cache', MARKETPLACE_NAME);
-  try {
-    for (const pluginName of fs.readdirSync(cacheRoot)) {
-      const pluginDir = path.join(cacheRoot, pluginName);
-      try { if (!fs.statSync(pluginDir).isDirectory()) continue; } catch { continue; }
-      for (const ver of fs.readdirSync(pluginDir)) {
-        const verDir = path.join(pluginDir, ver);
-        try { if (!fs.statSync(verDir).isDirectory()) continue; } catch { continue; }
-        const p = path.join(verDir, 'hooks', 'hooks.json');
-        if (fs.existsSync(p)) paths.push(p);
-      }
-    }
-  } catch { /* no cache dir */ }
-
-  return paths;
-}
-
-function findStalePluginHooksJson() {
-  const stale = [];
-  for (const p of scanPluginHooksJsonCopies()) {
-    try {
-      const cur = readJson(p);
-      if (cur && cur.hooks && typeof cur.hooks === 'object' && Object.keys(cur.hooks).length > 0) {
-        stale.push(p);
-      }
-    } catch { /* unreadable — skip */ }
-  }
-  return stale;
-}
-
-function clearStalePluginCacheHooks() {
-  const cleared = [];
-  const stamp = new Date().toISOString();
-  for (const p of findStalePluginHooksJson()) {
-    try {
-      const stub = { ...EMPTY_HOOKS_STUB, _note: `${EMPTY_HOOKS_STUB._note} (cleared ${stamp})` };
-      writeJsonAtomic(p, stub);
-      cleared.push(p);
-    } catch { /* write failure — skip */ }
-  }
-  return cleared;
-}
-
-// --- Hook Registration ---
-// Plugin system's hooks.json auto-loading is unreliable (observed across GSD,
-// superpowers, code-graph-mcp). Write hooks directly to settings.json instead.
-// Same strategy as claude-mem-lite. hooks.json is kept empty to prevent double-firing.
+// --- Hook identity ---
+// Claude Code loads hooks from cache/<mp>/<plugin>/<ver>/hooks/hooks.json —
+// that file is the authoritative source. Any entries matching our hooks
+// inside settings.json are legacy migration debris (v0.8.2 and earlier wrote
+// there) and must be stripped on every install/update/session-init so events
+// don't fire twice.
 
 const OUR_HOOK_SCRIPTS = ['session-init.js', 'incremental-index.js', 'user-prompt-context.js', 'pre-edit-guide.js'];
 const OUR_DESCRIPTIONS = [
@@ -317,67 +237,13 @@ const OUR_DESCRIPTIONS = [
 
 function isOurHookEntry(entry) {
   if (!entry || !entry.hooks) return false;
-  // Primary: match by description (immune to path pollution)
+  // Primary: match by description (legacy v0.7.x/0.8.x registrations).
   if (entry.description && OUR_DESCRIPTIONS.includes(entry.description)) return true;
-  // Fallback: match by script name + 'code-graph' in path
+  // Fallback: match by script name + 'code-graph' in path.
   return entry.hooks.some(h =>
     h.command && OUR_HOOK_SCRIPTS.some(s => h.command.includes(s)) &&
     h.command.includes('code-graph')
   );
-}
-
-function hookCommand(scriptName) {
-  return `node ${JSON.stringify(path.join(PLUGIN_ROOT, 'scripts', scriptName))}`;
-}
-
-function getHookDefinitions() {
-  return {
-    SessionStart: [{
-      matcher: 'startup|clear|compact',
-      hooks: [{ type: 'command', command: hookCommand('session-init.js'), timeout: 5 }],
-      description: 'StatusLine self-heal, lifecycle sync, project map injection',
-    }],
-    PreToolUse: [{
-      matcher: 'tool == "Edit"',
-      hooks: [{ type: 'command', command: hookCommand('pre-edit-guide.js'), timeout: 4 }],
-      description: 'Auto-inject impact analysis when editing functions with 2+ callers',
-    }],
-    PostToolUse: [{
-      matcher: 'tool == "Write" || tool == "Edit"',
-      hooks: [{ type: 'command', command: hookCommand('incremental-index.js'), timeout: 10 }],
-      description: 'Auto-update code graph index after file edits',
-    }],
-    UserPromptSubmit: [{
-      matcher: '',
-      hooks: [{ type: 'command', command: hookCommand('user-prompt-context.js'), timeout: 5 }],
-      description: 'Inject code-graph structural context based on user intent',
-    }],
-  };
-}
-
-function registerHooksToSettings(settings) {
-  if (!settings.hooks) settings.hooks = {};
-  const defs = getHookDefinitions();
-  let changed = false;
-
-  for (const [event, newEntries] of Object.entries(defs)) {
-    if (!settings.hooks[event]) settings.hooks[event] = [];
-
-    // First, remove ALL existing entries that match ours (cleans up duplicates
-    // from prior PLUGIN_ROOT pollution where isOurHookEntry couldn't match,
-    // causing infinite re-adds each session).
-    const beforeLen = settings.hooks[event].length;
-    settings.hooks[event] = settings.hooks[event].filter(e => !isOurHookEntry(e));
-    if (settings.hooks[event].length !== beforeLen) changed = true;
-
-    // Then add our entries fresh with correct paths
-    for (const newEntry of newEntries) {
-      settings.hooks[event].push(newEntry);
-      changed = true;
-    }
-  }
-
-  return changed;
 }
 
 function removeHooksFromSettings(settings) {
@@ -434,10 +300,11 @@ function install() {
   // Register code-graph provider
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 2. Hooks — register to settings.json (hooks.json auto-loading unreliable)
-  if (registerHooksToSettings(settings)) {
-    settingsChanged = true;
-  }
+  // 2. Hooks — cache/<ver>/hooks/hooks.json is authoritative. Strip any legacy
+  //    entries from settings.json that v0.8.2 or earlier registered, so events
+  //    don't fire twice.
+  const legacyHooksRemoved = removeHooksFromSettings(settings);
+  if (legacyHooksRemoved) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
   // Do NOT add enabledPlugins entries here — it causes phantom plugin entries
@@ -448,17 +315,13 @@ function install() {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
 
-  // 3b. Clear cache/marketplace hooks.json copies after settings.json is authoritative,
-  //     so next session only fires hooks from settings.json (no double-firing).
-  const clearedHookCopies = clearStalePluginCacheHooks();
-
   // 4. Write manifest with version
   manifest.version = version;
   manifest.installedAt = manifest.installedAt || new Date().toISOString();
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, clearedHookCopies };
+  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, legacyHooksRemoved };
 }
 
 // --- Uninstall (clean all config) ---
@@ -549,10 +412,10 @@ function update() {
   // 2. Update code-graph provider in registry
   registerStatuslineProvider('code-graph', codeGraphStatuslineCommand(), false);
 
-  // 3. Hooks — update command paths
-  if (registerHooksToSettings(settings)) {
-    settingsChanged = true;
-  }
+  // 3. Hooks — strip any legacy entries from settings.json. cache hooks.json
+  //    is the new authoritative source and always has the up-to-date paths.
+  const legacyHooksRemoved = removeHooksFromSettings(settings);
+  if (legacyHooksRemoved) settingsChanged = true;
 
   // NOTE: enabledPlugins is managed by Claude Code's plugin system, not by lifecycle.
 
@@ -560,10 +423,6 @@ function update() {
   if (settingsChanged) {
     writeJsonAtomic(SETTINGS_PATH, settings);
   }
-
-  // 4b. Clear cache/marketplace hooks.json copies after settings.json is updated.
-  //     Auto-update can re-populate cache from marketplace source; stamp it out.
-  const clearedHookCopies = clearStalePluginCacheHooks();
 
   // 5. Clear update-check cache (force re-check after update)
   const updateCache = path.join(CACHE_DIR, 'update-check');
@@ -574,10 +433,12 @@ function update() {
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  // 7. Clean up old cached versions (keep latest 3)
+  // 7. Clean up old cached versions (keep latest 3). Claude Code only fires
+  //    hooks from the active version (per installed_plugins.json), so older
+  //    cache dirs are inert disk clutter, not correctness risks.
   cleanupOldCacheVersions(3);
 
-  return { oldVersion, version, settingsChanged, clearedHookCopies };
+  return { oldVersion, version, settingsChanged, legacyHooksRemoved };
 }
 
 /**
@@ -673,8 +534,7 @@ module.exports = {
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
-  registerHooksToSettings, removeHooksFromSettings, getHookDefinitions,
-  scanPluginHooksJsonCopies, findStalePluginHooksJson, clearStalePluginCacheHooks,
+  removeHooksFromSettings, isOurHookEntry,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
 };
 
@@ -687,6 +547,7 @@ if (require.main === module) {
   } else if (cmd === 'uninstall') {
     const r = uninstall();
     console.log(`Uninstalled | settings cleaned=${r.settingsChanged}`);
+    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
   } else if (cmd === 'update') {
     const r = update();
     console.log(`Updated ${r.oldVersion} → ${r.version} | settings=${r.settingsChanged}`);

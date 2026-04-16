@@ -7,7 +7,6 @@ const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
-  clearStalePluginCacheHooks, findStalePluginHooksJson,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 
@@ -227,30 +226,6 @@ function consistencyCheck(binary) {
   return issues;
 }
 
-/**
- * Self-heal: Claude Code auto-update can re-populate cache hooks.json from the
- * marketplace source, which would double-fire every hook we registered to
- * settings.json. If our hooks are already in settings.json (install has run),
- * any non-empty cache/marketplace hooks.json is stale — clear it.
- * Gated on settings.json registration so pure plugin-only users (no install
- * script run; cache hooks.json is their only registration) are not broken.
- */
-function healStaleCacheHooks() {
-  try {
-    const settings = readJson(path.join(os.homedir(), '.claude', 'settings.json')) || {};
-    const manifest = readManifest();
-    if (!manifest || !manifest.version) return { checked: false, cleared: 0 };
-    const serialized = JSON.stringify(settings.hooks || {});
-    if (!serialized.includes('code-graph')) return { checked: false, cleared: 0 };
-    const stale = findStalePluginHooksJson();
-    if (stale.length === 0) return { checked: true, cleared: 0 };
-    const cleared = clearStalePluginCacheHooks();
-    return { checked: true, cleared: cleared.length };
-  } catch {
-    return { checked: false, cleared: 0 };
-  }
-}
-
 function runSessionInit() {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
@@ -267,11 +242,6 @@ function runSessionInit() {
 
   const lifecycle = syncLifecycleConfig();
 
-  // Self-heal stale plugin cache hooks.json (prevents double-firing after auto-update).
-  // syncLifecycleConfig's install/update path already clears; this catches the
-  // 'noop' case where version matches but cache was re-populated externally.
-  const cacheHookHeal = healStaleCacheHooks();
-
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();
 
@@ -285,7 +255,7 @@ function runSessionInit() {
     ? consistencyCheck(binaryCheck.binary)
     : [];
   return {
-    inactive: false, lifecycle, cacheHookHeal,
+    inactive: false, lifecycle,
     autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
     quietHooks,
   };
@@ -327,7 +297,6 @@ module.exports = {
   injectProjectMap,
   verifyBinary,
   consistencyCheck,
-  healStaleCacheHooks,
   runSessionInit,
 };
 

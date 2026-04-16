@@ -7,7 +7,7 @@ const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
-  findStalePluginHooksJson, clearStalePluginCacheHooks,
+  removeHooksFromSettings, isOurHookEntry, writeJsonAtomic,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -166,22 +166,38 @@ function runDiagnostics() {
     });
   }
 
-  // 7. Plugin cache hooks.json sanity — non-empty copies cause every hook to fire twice
+  // 7. Legacy hooks in settings.json — v0.8.2 and earlier wrote hooks there;
+  //    cache/<ver>/hooks/hooks.json is now authoritative. Duplicates cause
+  //    every hook to fire twice until settings.json is cleaned.
   try {
-    const stale = findStalePluginHooksJson();
-    if (stale.length === 0) {
-      results.push({ name: 'Plugin cache', status: 'ok', detail: 'no stale hooks.json' });
+    const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+    const settings = readJson(SETTINGS_PATH) || {};
+    const legacyCount = countLegacyHookEntries(settings);
+    if (legacyCount === 0) {
+      results.push({ name: 'Legacy hooks', status: 'ok', detail: 'settings.json is clean' });
     } else {
       results.push({
-        name: 'Plugin cache',
+        name: 'Legacy hooks',
         status: 'warn',
-        detail: `${stale.length} stale hooks.json (hooks fire twice per event)`,
-        fixId: 'hooks-cache-stale',
+        detail: `${legacyCount} entries in settings.json (fire twice per event)`,
+        fixId: 'legacy-hooks-in-settings',
       });
     }
-  } catch { /* lifecycle probe failed — skip */ }
+  } catch { /* probe failed — skip */ }
 
   return results;
+}
+
+function countLegacyHookEntries(settings) {
+  if (!settings || !settings.hooks) return 0;
+  let count = 0;
+  for (const entries of Object.values(settings.hooks)) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (isOurHookEntry(entry)) count++;
+    }
+  }
+  return count;
 }
 
 // ── Report Formatting ─────────────────────────────────────
@@ -339,12 +355,17 @@ function runRepairs(results) {
         break;
       }
 
-      case 'hooks-cache-stale': {
-        console.log('\n  Clearing stale plugin cache hooks.json...');
-        const cleared = clearStalePluginCacheHooks();
-        console.log(`  \u2705 Cleared ${cleared.length} file(s) — restart Claude Code to apply`);
-        for (const p of cleared) console.log(`     - ${p}`);
-        fixed++;
+      case 'legacy-hooks-in-settings': {
+        console.log('\n  Removing legacy code-graph hooks from settings.json...');
+        const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+        const settings = readJson(SETTINGS_PATH) || {};
+        if (removeHooksFromSettings(settings)) {
+          writeJsonAtomic(SETTINGS_PATH, settings);
+          console.log('  \u2705 settings.json cleaned — restart Claude Code to apply');
+          fixed++;
+        } else {
+          console.log('  \u2796 No legacy entries found');
+        }
         break;
       }
 

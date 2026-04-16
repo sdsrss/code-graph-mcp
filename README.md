@@ -146,6 +146,23 @@ Then reconnect the MCP server in Claude Code with `/mcp`.
 
 > **Note:** Auto-update is disabled in the source repo directory (dev mode). Use manual update when developing the plugin itself.
 
+#### Invited-memory mode (quieter prompts)
+
+By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on MEMORY.md + explicit tool calls, opt into invited-memory mode:
+
+1. Adopt the plugin contract into your project's memory index (idempotent, self-heals):
+   ```bash
+   code-graph-mcp adopt
+   ```
+   This writes `plugin_code_graph_mcp.md` (decision rules) into `~/.claude/projects/<slug>/memory/` and links it from `MEMORY.md` inside a sentinel block. Run `code-graph-mcp unadopt` to remove.
+2. Set the activation env var in `~/.claude/settings.json`:
+   ```json
+   {
+     "env": { "CODE_GRAPH_QUIET_HOOKS": "1" }
+   }
+   ```
+3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` become a short pointer to the MEMORY.md file.
+
 ### Option 2: Claude Code MCP Server Only
 
 Register as an MCP server without the plugin features:

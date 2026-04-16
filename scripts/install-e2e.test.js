@@ -76,42 +76,44 @@ test('§1.3 .mcp.json points to valid launcher script', () => {
   assert.ok(fs.existsSync(launcherPath), `Launcher script missing: ${launcherPath}`);
 });
 
-test('§1.4 plugin install registers all 4 hook events to settings.json', () => {
+test('§1.4 cache/<ver>/hooks/hooks.json covers all 4 hook events (authoritative source)', () => {
+  // As of v0.8.3, hook registration lives in the plugin cache — Claude Code
+  // loads it from cache/<mp>/<plugin>/<ver>/hooks/hooks.json. install() does
+  // NOT write hooks to settings.json (that was the old, broken bootstrap).
+  const cacheHooks = readJson(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'));
+  assert.ok(cacheHooks.hooks, 'cache hooks.json must have a hooks key');
+
+  const expectedEvents = ['SessionStart', 'PreToolUse', 'PostToolUse', 'UserPromptSubmit'];
+  for (const event of expectedEvents) {
+    assert.ok(cacheHooks.hooks[event], `cache hooks.${event} must be defined`);
+    assert.ok(Array.isArray(cacheHooks.hooks[event]), `cache hooks.${event} must be an array`);
+    assert.ok(cacheHooks.hooks[event].length > 0, `cache hooks.${event} must have entries`);
+  }
+
+  assert.ok(cacheHooks.hooks.SessionStart[0].hooks[0].command.includes('session-init.js'));
+  assert.ok(cacheHooks.hooks.PreToolUse[0].hooks[0].command.includes('pre-edit-guide.js'));
+  assert.ok(cacheHooks.hooks.PostToolUse[0].hooks[0].command.includes('incremental-index.js'));
+  assert.ok(cacheHooks.hooks.UserPromptSubmit[0].hooks[0].command.includes('user-prompt-context.js'));
+  assert.match(cacheHooks.hooks.SessionStart[0].matcher, /startup/);
+  assert.match(cacheHooks.hooks.PreToolUse[0].matcher, /Edit/);
+  assert.match(cacheHooks.hooks.PostToolUse[0].matcher, /Write|Edit/);
+
+  // install() must not write code-graph hooks into settings.json.
   const homeDir = mkHome();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
-
   writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });
   writeJson(installedPath, {
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
-
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
     env: { ...process.env, HOME: homeDir },
     stdio: 'pipe',
   });
-
   const settings = readJson(settingsPath);
-  assert.ok(settings.hooks, 'hooks key must exist after install');
-
-  // All 4 events registered
-  const expectedEvents = ['SessionStart', 'PreToolUse', 'PostToolUse', 'UserPromptSubmit'];
-  for (const event of expectedEvents) {
-    assert.ok(settings.hooks[event], `hooks.${event} must be registered`);
-    assert.ok(Array.isArray(settings.hooks[event]), `hooks.${event} must be an array`);
-    assert.ok(settings.hooks[event].length > 0, `hooks.${event} must have entries`);
-  }
-
-  // Verify each hook has correct structure
-  assert.ok(settings.hooks.SessionStart[0].hooks[0].command.includes('session-init.js'));
-  assert.ok(settings.hooks.PreToolUse[0].hooks[0].command.includes('pre-edit-guide.js'));
-  assert.ok(settings.hooks.PostToolUse[0].hooks[0].command.includes('incremental-index.js'));
-  assert.ok(settings.hooks.UserPromptSubmit[0].hooks[0].command.includes('user-prompt-context.js'));
-
-  // Verify matchers are set
-  assert.match(settings.hooks.SessionStart[0].matcher, /startup/);
-  assert.match(settings.hooks.PreToolUse[0].matcher, /Edit/);
-  assert.match(settings.hooks.PostToolUse[0].matcher, /Write|Edit/);
+  const hookSerialized = JSON.stringify(settings.hooks || {});
+  assert.ok(!hookSerialized.includes('code-graph'),
+    `install() must not register code-graph hooks in settings.json, got: ${hookSerialized}`);
 });
 
 test('§1.5 plugin install creates install manifest with version', () => {
@@ -171,18 +173,19 @@ test('§1.6 plugin install sets up composite statusline', () => {
   assert.match(cg.command, /statusline\.js/);
 });
 
-test('§1.7 plugin update refreshes hook paths and clears update cache', () => {
+test('§1.7 plugin update strips legacy settings.json hooks and clears update cache', () => {
   const homeDir = mkHome();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
   const updateCache = path.join(homeDir, '.cache', 'code-graph', 'update-check');
 
-  // Simulate existing install with stale hooks (must include 'code-graph' to match isOurHookEntry)
+  // Simulate a v0.8.2-era install: hooks were registered in settings.json.
   writeJson(settingsPath, {
     statusLine: { type: 'command', command: `node "${path.join(PLUGIN_ROOT, 'scripts', 'statusline-composite.js')}"` },
     hooks: {
       SessionStart: [{
         matcher: 'startup',
+        description: 'StatusLine self-heal, lifecycle sync, project map injection',
         hooks: [{ type: 'command', command: 'node "/old/code-graph/path/session-init.js"' }],
       }],
     },
@@ -191,7 +194,6 @@ test('§1.7 plugin update refreshes hook paths and clears update cache', () => {
   writeJson(installedPath, {
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
-  // Create fake update cache
   fs.mkdirSync(path.dirname(updateCache), { recursive: true });
   fs.writeFileSync(updateCache, '{}');
 
@@ -201,10 +203,11 @@ test('§1.7 plugin update refreshes hook paths and clears update cache', () => {
   });
 
   const settings = readJson(settingsPath);
-  // Hooks should be updated to current PLUGIN_ROOT paths
-  const sessionCmd = settings.hooks.SessionStart[0].hooks[0].command;
-  assert.ok(sessionCmd.includes(PLUGIN_ROOT), `Hook should reference PLUGIN_ROOT, got: ${sessionCmd}`);
-  // Update cache should be cleared
+  // Legacy code-graph entries must be gone (cache hooks.json is authoritative).
+  const hookSerialized = JSON.stringify(settings.hooks || {});
+  assert.ok(!hookSerialized.includes('code-graph'),
+    `update() must strip legacy code-graph hooks from settings.json, got: ${hookSerialized}`);
+  // Update-check cache cleared (forces freshness post-update).
   assert.equal(fs.existsSync(updateCache), false);
 });
 
@@ -724,7 +727,11 @@ test('§6.1 full lifecycle: fresh install → use → update → uninstall', () 
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], { env, stdio: 'pipe' });
   let settings = readJson(settingsPath);
-  assert.ok(settings.hooks, 'Hooks registered');
+  // install() no longer writes hooks to settings.json (cache hooks.json is
+  // authoritative as of v0.8.3). Only statusLine + registry should be set.
+  const hooksSerialized = JSON.stringify(settings.hooks || {});
+  assert.ok(!hooksSerialized.includes('code-graph'),
+    `install() must not register code-graph hooks in settings.json, got: ${hooksSerialized}`);
   assert.ok(settings.statusLine, 'StatusLine configured');
   assert.match(settings.statusLine.command, /statusline-composite/);
   assert.ok(fs.existsSync(manifestPath), 'Manifest created');
