@@ -500,8 +500,8 @@ impl McpServer {
             }
 
             // Sort by count desc so the densest files appear first.
-            caller_entries.sort_by(|a, b| b.0.cmp(&a.0));
-            callee_entries.sort_by(|a, b| b.0.cmp(&a.0));
+            caller_entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+            callee_entries.sort_by_key(|e| std::cmp::Reverse(e.0));
             let caller_rollups: Vec<serde_json::Value> = caller_entries.into_iter().map(|(_, v)| v).collect();
             let callee_rollups: Vec<serde_json::Value> = callee_entries.into_iter().map(|(_, v)| v).collect();
 

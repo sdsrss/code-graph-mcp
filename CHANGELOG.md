@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.11.5 — Hotfix: clippy 1.95 parity (`unnecessary_sort_by`)
+
+`-D warnings` on stable clippy 1.95 flagged the two `sort_by(|a, b| b.0.cmp(&a.0))`
+calls added in v0.11.4 rollup. Local clippy (0.1.91, ~4 months behind stable)
+accepted them. Functional behavior unchanged.
+
+### Fix
+
+- `src/mcp/server/tools.rs:503-504`: `sort_by(|a, b| b.0.cmp(&a.0))` →
+  `sort_by_key(|e| std::cmp::Reverse(e.0))` (applied exactly as clippy suggested).
+
+### Why v0.11.4 shipped red
+
+Local pre-push ran `cargo clippy --all-targets -- -D warnings` — passed on 0.1.91.
+CI uses `dtolnay/rust-toolchain@stable` which pulls whatever's latest
+(1.95.0 at ship time), catching `clippy::unnecessary_sort_by` which landed post-0.1.91.
+Functional code from v0.11.4 is unaffected; only the `-D warnings` gate broke.
+v0.11.4 tag + release left pointing at the failing commit as a historical artifact.
+
 ## v0.11.4 — Integration-friction fixes: ast_search hint + acronym expansion + call graph rollup
 
 Integration-test pass against Claude Code found three specific friction points
