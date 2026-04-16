@@ -83,9 +83,10 @@ test('consistencyCheck returns empty array when binary version matches plugin', 
   assert.ok(Array.isArray(result));
 });
 
-test('consistencyCheck returns version-mismatch when versions differ', () => {
+test('consistencyCheck returns version-mismatch when versions differ', (t) => {
   const os = require('os');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const bin = path.join(dir, 'code-graph-mcp');
   fs.writeFileSync(bin, [
     '#!/usr/bin/env bash',

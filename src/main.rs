@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         }
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
         Some("health-check") => {
@@ -45,63 +45,63 @@ fn main() -> Result<()> {
                     .map(|s| s.as_str())
                     .unwrap_or("oneline")
             };
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_health_check(&project_root, format)
         }
         Some("grep") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_grep(&project_root, &args)
         }
         Some("search") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_search(&project_root, &args)
         }
         Some("ast-search") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_ast_search(&project_root, &args)
         }
         Some("callgraph") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_callgraph(&project_root, &args)
         }
         Some("impact") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_impact(&project_root, &args)
         }
         Some("map") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_map(&project_root, &args)
         }
         Some("overview") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_overview(&project_root, &args)
         }
         Some("show") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_show(&project_root, &args)
         }
         Some("trace") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_trace(&project_root, &args)
         }
         Some("deps") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_deps(&project_root, &args)
         }
         Some("similar") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_similar(&project_root, &args)
         }
         Some("refs") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_refs(&project_root, &args)
         }
         Some("dead-code") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_dead_code(&project_root, &args)
         }
         Some("benchmark") => {
-            let project_root = std::env::current_dir()?;
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
         }
         Some("doctor") => {
@@ -184,7 +184,7 @@ fn run_serve() -> Result<()> {
         .with_writer(io::stderr)
         .init();
 
-    let project_root = std::env::current_dir()?;
+    let project_root = code_graph_mcp::cli::resolve_project_root()?;
     let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
     let session_start = std::time::Instant::now();
 

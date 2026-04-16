@@ -5,15 +5,17 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-function mkDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+function mkDir(t, prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 // ── readBinaryVersion ──
 
-test('readBinaryVersion returns version from valid binary', () => {
+test('readBinaryVersion returns version from valid binary', (t) => {
   const { readBinaryVersion } = require('./version-utils');
-  const dir = mkDir('vu-');
+  const dir = mkDir(t, 'vu-');
   const bin = path.join(dir, 'code-graph-mcp');
   fs.writeFileSync(bin, [
     '#!/usr/bin/env bash',
@@ -32,9 +34,9 @@ test('readBinaryVersion returns null for non-existent binary', () => {
   assert.equal(readBinaryVersion('/tmp/does-not-exist-binary'), null);
 });
 
-test('readBinaryVersion returns null for binary with unexpected output', () => {
+test('readBinaryVersion returns null for binary with unexpected output', (t) => {
   const { readBinaryVersion } = require('./version-utils');
-  const dir = mkDir('vu-');
+  const dir = mkDir(t, 'vu-');
   const bin = path.join(dir, 'code-graph-mcp');
   fs.writeFileSync(bin, '#!/usr/bin/env bash\necho "something else"');
   fs.chmodSync(bin, 0o755);
@@ -56,9 +58,9 @@ test('getNewestMtime returns 0 for non-existent directory', () => {
   assert.equal(getNewestMtime('/tmp/no-such-dir-xyz'), 0);
 });
 
-test('getNewestMtime finds newest .rs file mtime', () => {
+test('getNewestMtime finds newest .rs file mtime', (t) => {
   const { getNewestMtime } = require('./version-utils');
-  const dir = mkDir('vu-mtime-');
+  const dir = mkDir(t, 'vu-mtime-');
   const sub = path.join(dir, 'sub');
   fs.mkdirSync(sub);
 
@@ -75,9 +77,9 @@ test('getNewestMtime finds newest .rs file mtime', () => {
   assert.equal(result, newerMtime, 'should return exactly the newest file mtime');
 });
 
-test('getNewestMtime ignores non-matching extensions', () => {
+test('getNewestMtime ignores non-matching extensions', (t) => {
   const { getNewestMtime } = require('./version-utils');
-  const dir = mkDir('vu-ext-');
+  const dir = mkDir(t, 'vu-ext-');
   fs.writeFileSync(path.join(dir, 'file.js'), 'hello');
   assert.equal(getNewestMtime(dir, '.rs'), 0);
 });

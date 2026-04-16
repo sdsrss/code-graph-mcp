@@ -12,8 +12,10 @@ const lifecycleCli = path.join(__dirname, 'lifecycle.js');
 const compositeCli = path.join(__dirname, 'statusline-composite.js');
 const currentVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 
-function mkHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-e2e-'));
+function mkHome(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-e2e-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 function writeJson(filePath, value) {
@@ -38,8 +40,8 @@ function runScript(homeDir, scriptPath, args = [], options = {}) {
   }).toString();
 }
 
-test('lifecycle CLI handles install, disable self-heal, re-enable, and uninstall', () => {
-  const homeDir = mkHome();
+test('lifecycle CLI handles install, disable self-heal, re-enable, and uninstall', (t) => {
+  const homeDir = mkHome(t);
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
   const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');

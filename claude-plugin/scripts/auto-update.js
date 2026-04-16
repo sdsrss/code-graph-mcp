@@ -310,11 +310,18 @@ async function checkForUpdate() {
     if (isDevMode()) return null;
 
     const state = readState();
+    // manifest.version is authoritative — /plugin update writes it directly and
+    // bypasses auto-update.js, so re-sync state.installedVersion every call.
+    const installedVersion = readManifest().version || '0.0.0';
 
     // Time-based throttle
     if (!shouldCheck(state)) {
-      if (state.updateAvailable && state.latestVersion) {
-        return { updateAvailable: true, from: state.installedVersion, to: state.latestVersion };
+      if (state.installedVersion !== installedVersion) {
+        saveState({ ...state, installedVersion });
+      }
+      if (state.updateAvailable && state.latestVersion
+          && compareVersions(state.latestVersion, installedVersion) > 0) {
+        return { updateAvailable: true, from: installedVersion, to: state.latestVersion };
       }
       return null;
     }
@@ -322,21 +329,19 @@ async function checkForUpdate() {
     // Check GitHub for latest release
     const latest = await fetchLatestRelease();
     if (!latest) {
-      saveState({ ...state, lastCheck: new Date().toISOString() });
+      saveState({ ...state, installedVersion, lastCheck: new Date().toISOString() });
       return null;
     }
 
     // Compare versions
-    const manifest = readManifest();
-    const currentVersion = manifest.version || '0.0.0';
-    const hasUpdate = compareVersions(latest.version, currentVersion) > 0;
+    const hasUpdate = compareVersions(latest.version, installedVersion) > 0;
 
     if (hasUpdate) {
       const result = await downloadAndInstall(latest);
       const success = result.pluginUpdated;
       const newState = {
         lastCheck: new Date().toISOString(),
-        installedVersion: success ? latest.version : currentVersion,
+        installedVersion: success ? latest.version : installedVersion,
         latestVersion: latest.version,
         updateAvailable: !success,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
@@ -349,7 +354,7 @@ async function checkForUpdate() {
         updateAvailable: !success,
         updated: success,
         binaryUpdated: result.binaryUpdated,
-        from: currentVersion,
+        from: installedVersion,
         to: latest.version,
       };
     }
@@ -357,6 +362,7 @@ async function checkForUpdate() {
     // No update needed
     saveState({
       ...state,
+      installedVersion,
       lastCheck: new Date().toISOString(),
       latestVersion: latest.version,
       updateAvailable: false,

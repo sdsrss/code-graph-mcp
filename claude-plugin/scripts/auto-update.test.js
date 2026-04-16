@@ -14,12 +14,14 @@ const {
   promoteVerifiedBinary,
 } = require('./auto-update');
 
-function mkDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+function mkDir(t, prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
-test('getExtractedPluginVersion reads extracted plugin manifest version', () => {
-  const root = mkDir('code-graph-plugin-');
+test('getExtractedPluginVersion reads extracted plugin manifest version', (t) => {
+  const root = mkDir(t, 'code-graph-plugin-');
   const manifest = path.join(root, '.claude-plugin', 'plugin.json');
   fs.mkdirSync(path.dirname(manifest), { recursive: true });
   fs.writeFileSync(manifest, JSON.stringify({ version: '1.2.3' }, null, 2));
@@ -41,8 +43,8 @@ function writeFakeBinary(filePath, version) {
   fs.chmodSync(filePath, 0o755);
 }
 
-test('promoteVerifiedBinary accepts a runnable binary with the expected version', () => {
-  const dir = mkDir('code-graph-bin-');
+test('promoteVerifiedBinary accepts a runnable binary with the expected version', (t) => {
+  const dir = mkDir(t, 'code-graph-bin-');
   const tmp = path.join(dir, 'code-graph-mcp.tmp');
   const dst = path.join(dir, 'code-graph-mcp');
   writeFakeBinary(tmp, '1.2.3');
@@ -53,8 +55,8 @@ test('promoteVerifiedBinary accepts a runnable binary with the expected version'
   assert.equal(fs.existsSync(dst), true);
 });
 
-test('promoteVerifiedBinary rejects binaries with mismatched version', () => {
-  const dir = mkDir('code-graph-bin-');
+test('promoteVerifiedBinary rejects binaries with mismatched version', (t) => {
+  const dir = mkDir(t, 'code-graph-bin-');
   const tmp = path.join(dir, 'code-graph-mcp.tmp');
   const dst = path.join(dir, 'code-graph-mcp');
   writeFakeBinary(tmp, '1.2.2');

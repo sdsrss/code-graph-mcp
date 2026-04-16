@@ -7,6 +7,46 @@ use crate::domain::CODE_GRAPH_DIR;
 use crate::storage::db::Database;
 use crate::storage::queries;
 
+/// Resolve the project root from an explicit `cwd`.
+///
+/// Priority:
+/// 1. Existing `.code-graph/index.db` at `cwd` → use `cwd` (respects explicit per-dir indexes).
+/// 2. Nearest ancestor containing `.git` → use that (avoids polluting subdirs).
+/// 3. Fall back to `cwd`.
+pub fn resolve_project_root_from(cwd: &Path) -> PathBuf {
+    if cwd.join(CODE_GRAPH_DIR).join("index.db").exists() {
+        return cwd.to_path_buf();
+    }
+    let mut cursor: Option<&Path> = Some(cwd);
+    while let Some(c) = cursor {
+        if c.join(".git").exists() {
+            return c.to_path_buf();
+        }
+        cursor = c.parent();
+    }
+    cwd.to_path_buf()
+}
+
+/// Resolve the project root from the current working directory.
+pub fn resolve_project_root() -> std::io::Result<PathBuf> {
+    Ok(resolve_project_root_from(&std::env::current_dir()?))
+}
+
+/// Remove empty legacy database files left behind from past naming migrations.
+/// Pre-v0.5 iterations briefly used `code-graph.db`, `code_graph.db`, `graph.db`
+/// before settling on `index.db`; the renames never deleted the old 0-byte stubs.
+pub fn cleanup_legacy_db_files(code_graph_dir: &Path) {
+    const LEGACY: &[&str] = &["code-graph.db", "code_graph.db", "graph.db"];
+    for name in LEGACY {
+        let p = code_graph_dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.is_file() && meta.len() == 0 {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
 /// Lightweight CLI context for subcommands called by hooks.
 /// Does NOT load the embedding model (too slow for 5-10s hook timeouts).
 pub struct CliContext {
@@ -23,6 +63,7 @@ impl CliContext {
                 db_path.display()
             );
         }
+        cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
         let db = Database::open(&db_path)?;
         Ok(Self {
             db,
@@ -36,6 +77,7 @@ impl CliContext {
         if !db_path.exists() {
             return None;
         }
+        cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
         Database::open(&db_path).ok().map(|db| Self {
             db,
             project_root: project_root.to_path_buf(),
@@ -217,6 +259,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
             eprintln!("No index found, creating full index...");
         }
     }
+    cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
 
     // Open with vec support so embeddings can be stored
     let db = Database::open_with_vec(&db_path)?;
@@ -2146,6 +2189,79 @@ pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_project_root_prefers_existing_index_at_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let idx_dir = cwd.join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        std::fs::write(idx_dir.join("index.db"), b"").unwrap();
+        assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    #[test]
+    fn resolve_project_root_climbs_to_git_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let subdir = root.join("sub").join("deep");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert_eq!(resolve_project_root_from(&subdir), root);
+    }
+
+    #[test]
+    fn resolve_project_root_falls_back_to_cwd_when_no_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        // canonicalize both sides: on macOS `/tmp` ↔ `/private/tmp` symlinking;
+        // on Linux they match directly, so this is a no-op but keeps the test portable.
+        assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    #[test]
+    fn cleanup_legacy_db_files_removes_empty_legacy_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Empty legacy files — should be removed
+        std::fs::write(dir.join("code-graph.db"), b"").unwrap();
+        std::fs::write(dir.join("code_graph.db"), b"").unwrap();
+        std::fs::write(dir.join("graph.db"), b"").unwrap();
+        // Non-empty legacy file — must NOT be removed (guard against deleting real data)
+        std::fs::write(dir.join("index.db"), b"real data").unwrap();
+        // Unrelated file — must NOT be touched
+        std::fs::write(dir.join("usage.jsonl"), b"").unwrap();
+
+        cleanup_legacy_db_files(dir);
+
+        assert!(!dir.join("code-graph.db").exists());
+        assert!(!dir.join("code_graph.db").exists());
+        assert!(!dir.join("graph.db").exists());
+        assert!(dir.join("index.db").exists(), "non-empty index.db must survive");
+        assert!(dir.join("usage.jsonl").exists(), "unrelated file must survive");
+    }
+
+    #[test]
+    fn cleanup_legacy_db_files_keeps_non_empty_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // If a legacy file has content, it might be a real backup — don't delete.
+        std::fs::write(dir.join("graph.db"), b"some content").unwrap();
+        cleanup_legacy_db_files(dir);
+        assert!(dir.join("graph.db").exists());
+    }
+
+    #[test]
+    fn resolve_project_root_prefers_cwd_index_over_git_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let subdir = root.join("sub");
+        let sub_idx = subdir.join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&sub_idx).unwrap();
+        std::fs::write(sub_idx.join("index.db"), b"").unwrap();
+        assert_eq!(resolve_project_root_from(&subdir), subdir);
+    }
 
     #[test]
     fn test_get_positional() {

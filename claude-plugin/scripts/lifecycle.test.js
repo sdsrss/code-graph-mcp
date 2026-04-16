@@ -9,8 +9,10 @@ const { execFileSync } = require('child_process');
 const lifecyclePath = path.join(__dirname, 'lifecycle.js');
 const statuslinePath = path.join(__dirname, 'statusline.js');
 
-function mkHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-home-'));
+function mkHome(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-home-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 function writeJson(filePath, value) {
@@ -48,8 +50,8 @@ function seedOrphanedComposite(homeDir) {
   return { settingsPath, registryPath };
 }
 
-test('cleanupDisabledStatusline restores previous statusline and removes registry', () => {
-  const homeDir = mkHome();
+test('cleanupDisabledStatusline restores previous statusline and removes registry', (t) => {
+  const homeDir = mkHome(t);
   const { settingsPath, registryPath } = seedDisabledComposite(homeDir);
 
   const out = execFileSync(process.execPath, ['-e', `
@@ -63,10 +65,11 @@ test('cleanupDisabledStatusline restores previous statusline and removes registr
   assert.equal(fs.existsSync(registryPath), false);
 });
 
-test('statusline exits cleanly and self-heals when plugin is disabled', () => {
-  const homeDir = mkHome();
+test('statusline exits cleanly and self-heals when plugin is disabled', (t) => {
+  const homeDir = mkHome(t);
   const { settingsPath, registryPath } = seedDisabledComposite(homeDir);
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-project-'));
+  t.after(() => fs.rmSync(projectDir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(projectDir, '.code-graph'), { recursive: true });
   fs.writeFileSync(path.join(projectDir, '.code-graph', 'index.db'), '');
 
@@ -81,8 +84,8 @@ test('statusline exits cleanly and self-heals when plugin is disabled', () => {
   assert.equal(fs.existsSync(registryPath), false);
 });
 
-test('cleanupDisabledStatusline also heals orphaned statusline after uninstall', () => {
-  const homeDir = mkHome();
+test('cleanupDisabledStatusline also heals orphaned statusline after uninstall', (t) => {
+  const homeDir = mkHome(t);
   const { settingsPath, registryPath } = seedOrphanedComposite(homeDir);
 
   const out = execFileSync(process.execPath, ['-e', `
@@ -175,8 +178,8 @@ test('removeHooksFromSettings strips our entries but keeps unrelated hooks', () 
   assert.ok(!s.hooks.PostToolUse, 'empty event key should be deleted');
 });
 
-test('install() removes legacy code-graph hooks from settings.json without re-registering', () => {
-  const homeDir = mkHome();
+test('install() removes legacy code-graph hooks from settings.json without re-registering', (t) => {
+  const homeDir = mkHome(t);
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   writeJson(settingsPath, {
     statusLine: { type: 'command', command: 'echo previous-status' },
