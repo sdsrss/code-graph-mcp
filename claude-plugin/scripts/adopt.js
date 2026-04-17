@@ -13,6 +13,12 @@ const INDEX_LINE = [
   '- [code-graph-mcp](plugin_code_graph_mcp.md) — v0.10.0 起 tools/list 默认 7 核心 + 5 隐藏可调（省启动 token）',
   '  - 核心 7（默认暴露）：`get_call_graph`/`module_overview`/`semantic_code_search`/`ast_search`/`find_references`/`get_ast_node`/`project_map`',
   '  - 进阶 5（隐藏按名可调）：`impact_analysis`/`trace_http_chain`/`dependency_graph`/`find_similar_code`/`find_dead_code`',
+  '  - 场景速查（优先于 Grep）：',
+  '    - 改 X 影响面 → `get_ast_node symbol=X include_impact=true`（或 CLI `code-graph-mcp impact X`）',
+  '    - 谁调用 X / X 被谁用 → `get_call_graph X` 或 `find_references X`',
+  '    - 看 X 源码 / 签名 → `get_ast_node symbol=X`',
+  '    - Y 模块长啥样 → `module_overview` 或 CLI `code-graph-mcp overview Y/`',
+  '    - 概念查询（不知精确名）→ `semantic_code_search "Z"`；字面匹配用 Grep',
 ].join('\n');
 const TEMPLATE_PATH = path.resolve(__dirname, '..', 'templates', 'plugin_code_graph_mcp.md');
 const TARGET_NAME = 'plugin_code_graph_mcp.md';

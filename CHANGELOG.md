@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.12.0 — Scenario-keyed MEMORY.md index (auto-adopt template refresh)
+
+Auto-adopt (`claude-plugin/scripts/adopt.js`) now seeds MEMORY.md's sentinel
+block with a 5-row scenario→tool table in addition to the existing tool-name
+list. The always-loaded context gap this closes: Claude Code knew the 7+5 tool
+names but not the natural-language triggers ("who calls X?", "改 X 影响面")
+that should route to them, so sessions silently slid to `Grep` / `Read` when a
+code-graph tool would be more precise. The scenario phrases now live in the
+200-line-capped MEMORY.md itself, not a second-hop `plugin_code_graph_mcp.md`.
+
+### What changes
+
+Sentinel `<!-- code-graph-mcp:begin v1 -->...<!-- code-graph-mcp:end -->` grows
+from 3 lines to 9. Added block (nested under the existing index entry):
+
+    - 场景速查（优先于 Grep）：
+      - 改 X 影响面 → `get_ast_node symbol=X include_impact=true`（或 CLI `code-graph-mcp impact X`）
+      - 谁调用 X / X 被谁用 → `get_call_graph X` 或 `find_references X`
+      - 看 X 源码 / 签名 → `get_ast_node symbol=X`
+      - Y 模块长啥样 → `module_overview` 或 CLI `code-graph-mcp overview Y/`
+      - 概念查询（不知精确名）→ `semantic_code_search "Z"`；字面匹配用 Grep
+
+### Migration — existing adopted projects
+
+`needsRefresh()` detects INDEX_LINE drift automatically; the sentinel block
+rewrites once on next SessionStart. No user action required.
+
+### Opt-out
+
+- Lock current MEMORY.md block against this refresh: `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` (shipped in v0.11.0)
+- Disable auto-adopt entirely for new projects: `CODE_GRAPH_NO_AUTO_ADOPT=1` (shipped in v0.9.0)
+- Downgrade: reinstall `0.11.6` to restore the 3-line INDEX_LINE
+
+### Verification
+
+- `adopt.test.js`: 37/37 green — tests reference the `INDEX_LINE` constant, so the content extension is transparent.
+- `routing_bench`: 19/20 = 95.0% on `anthropic/claude-sonnet-4.5` via OpenRouter — unchanged from v0.11.6. This release doesn't touch `ToolRegistry` descriptions, which is what the bench measures; the adopted MEMORY.md lives outside the oracle's prompt.
+
 ## v0.11.6 — Tool-description tightening (+5% routing P@1) + OpenRouter backend
 
 First run of the routing-recall benchmark landed v0.11.4 at **P@1 = 18/20 = 90.0%**
