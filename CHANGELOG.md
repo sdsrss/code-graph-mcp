@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.14.1 — semantic search UX + find_references type hint
+
+Patch release. Six targeted accuracy/UX fixes to MCP tool responses surfaced by a
+3-round smoke test. All changes are additive or remove false-positive warnings;
+no schema changes, no behavior regressions.
+
+### `semantic_code_search` — compression estimator aligned to actual output
+
+The compression trigger estimated token cost from `context_string` (can exceed
+2000 chars) but the actual result JSON only carries `code_content` capped at
+`MAX_SEARCH_CODE_LEN = 500`. Small `top_k` queries (3, 5) were being forced into
+`compressed_nodes` mode unnecessarily, losing `relevance` and `signature` fields.
+
+Estimator now mirrors the output: it measures truncated `code_content` +
+signature + name + path + ~80 chars JSON framing per result. Small `top_k`
+responses return full arrays again.
+
+### `semantic_code_search` — `match_confidence` + `low_confidence_warning`
+
+Compressed responses (`compressed_nodes` / `compressed_files` /
+`compressed_directories`) now include a rounded `match_confidence` float. When
+`< 0.5`, a `low_confidence_warning` string explains that FTS found few matches
+and results are likely vector-similarity noise, with advice to use concrete
+identifiers or `ast_search`.
+
+The FTS sparsity and source-intersection penalties used to over-fire on
+precision queries (single-identifier FTS hits). The penalty now requires
+`fts_search.len() >= 5`; below that, the query is treated as precision-mode
+and not penalized.
+
+Exact-name-match exemption: when any top-5 candidate's `name` or
+`qualified_name` equals the query (case-insensitive), the warning is
+suppressed. `match_confidence` is still returned so callers can judge.
+
+### `find_references` — `type_definition_note` for type symbols
+
+When the target is a `struct` / `enum` / `trait` / `type` / `interface` /
+`class`, the response now includes a `type_definition_note` explaining that
+the edge index captures explicit imports/inherits/implements and
+struct-literal instantiation, but NOT method-qualified calls
+(`Type::method()`), field access, or type annotations. Guides the caller to
+query each method via `module_overview` for a complete rename audit.
+
+### `get_index_status` — `embedding_coverage_pct` floor
+
+When embedding is in progress with a small fraction done (e.g. 2/1052),
+integer percent rounded to 0 and looked stuck. Now floors to 1 whenever
+`vectors_done > 0`, so `embedding_status: in_progress` stays consistent with
+the percentage.
+
+### `get_ast_node(node_id)` — explanatory not-found error
+
+`Node N not found` replaced with a message that explains node_ids are
+rebuild-scoped and suggests re-resolving via `get_ast_node(symbol_name,
+file_path)` or `semantic_code_search`.
+
+### Tests
+
+43 `mcp::server` unit tests remain green. Routing bench
+(`tests/routing_bench.rs` via OpenRouter `anthropic/claude-sonnet-4.5`):
+**P@1 = 19/20 = 95.0%** (threshold 70%). Single miss is a semantic-neighbor
+pick (`ast_search` vs `get_ast_node` for a struct-def lookup) unrelated to
+this release.
+
+---
+
 ## v0.14.0 — durable statusline-provider chain + public register CLI
 
 Minor release. Addresses a long-standing fragility in the composite statusline

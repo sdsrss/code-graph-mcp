@@ -3,6 +3,9 @@ use crate::domain::default_dead_code_ignores;
 
 impl McpServer {
     pub(super) fn tool_semantic_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Per-result code_content cap used both in estimation (below) and the
+        // actual result payload so compression triggers reflect real output size.
+        const MAX_SEARCH_CODE_LEN: usize = 500;
         let query = required_str(args, "query")?;
         let top_k = args["top_k"].as_u64()
             .or_else(|| args["limit"].as_u64())
@@ -109,14 +112,23 @@ impl McpServer {
             } else if !fts_search.is_empty() {
                 // OR-fallback penalty: AND mode failed → query terms don't co-occur (weaker match)
                 if fts_or_fallback { c *= 0.6; }
-                // FTS sparsity: fewer results relative to fetch_count → weaker text match
-                let fts_ratio = fts_search.len() as f64 / fetch_count as f64;
-                if fts_ratio < 0.1 { c *= 0.5; }
-                else if fts_ratio < 0.25 { c *= 0.65; }
-                else if fts_ratio < 0.5 { c *= 0.8; }
+                // FTS sparsity: fewer results relative to fetch_count → weaker text match.
+                // Skip the ratio check for precision queries (fts returns ≤4 hits): a
+                // unique-identifier search legitimately has a low ratio but is a strong
+                // signal, not a weak one. Only apply when we have enough FTS breadth to
+                // judge "sparse vs. broad".
+                if fts_search.len() >= 5 {
+                    let fts_ratio = fts_search.len() as f64 / fetch_count as f64;
+                    if fts_ratio < 0.1 { c *= 0.5; }
+                    else if fts_ratio < 0.25 { c *= 0.65; }
+                    else if fts_ratio < 0.5 { c *= 0.8; }
+                }
             }
-            // Source intersection: when both sources available, low overlap → less confidence
-            if !fts_search.is_empty() && !vec_search.is_empty() {
+            // Source intersection: when both sources available, low overlap → less confidence.
+            // Only meaningful when FTS returned enough breadth to judge overlap; for
+            // precision queries (≤4 FTS hits) the intersection is naturally tiny and
+            // should not count against confidence.
+            if fts_search.len() >= 5 && !vec_search.is_empty() {
                 let top_ids: Vec<i64> = fused.iter().take(top_k as usize).map(|r| r.node_id).collect();
                 let in_both = top_ids.iter()
                     .filter(|id| fts_node_ids.contains(id) && vec_node_ids.contains(id))
@@ -204,7 +216,6 @@ impl McpServer {
                     "relevance": score,
                 }));
             } else {
-                const MAX_SEARCH_CODE_LEN: usize = 500;
                 let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
                     let safe_end = node.code_content.floor_char_boundary(MAX_SEARCH_CODE_LEN);
                     let truncated = &node.code_content[..node.code_content[..safe_end]
@@ -232,19 +243,26 @@ impl McpServer {
         lock_or_recover(&self.metrics, "metrics")
             .record_search(results.len(), query_quality, vec_search.is_empty());
 
-        // Context Sandbox: compress only if results likely exceed token threshold
+        // Context Sandbox: compress only if results likely exceed token threshold.
         // Skip compression when compact=true — compact results are already token-efficient
         // (~85% smaller than full results) and contain fields (relevance, signature)
         // that would be lost by compression.
+        //
+        // Estimation must mirror the actual result payload: code_content is capped at
+        // MAX_SEARCH_CODE_LEN per result, and context_string is NOT included in
+        // the output. Estimating from raw context_string massively overestimates and
+        // fires compression even for small top_k (e.g. 3) responses that would fit
+        // comfortably under the token budget.
         use crate::sandbox::compressor::CompressedOutput;
         let estimated_tokens: usize = if compact { 0 } else {
             candidates.iter()
                 .map(|c| {
                     let node = c.node;
-                    node.context_string.as_ref().map_or_else(
-                        || node.code_content.len() + node.name.len() + node.signature.as_ref().map_or(0, |s| s.len()),
-                        |ctx| ctx.len(),
-                    ) / crate::domain::CHARS_PER_TOKEN
+                    let code_chars = node.code_content.len().min(MAX_SEARCH_CODE_LEN);
+                    let sig_chars = node.signature.as_ref().map_or(0, |s| s.len());
+                    let name_chars = node.name.len() + c.file_path.len();
+                    // ~80 chars of JSON framing per result (keys, braces, quotes, node_id/line)
+                    (code_chars + sig_chars + name_chars + 80) / crate::domain::CHARS_PER_TOKEN
                 })
                 .sum()
         };
@@ -298,11 +316,36 @@ impl McpServer {
                     ("compressed_directories", items)
                 }
             };
-            return Ok(json!({
+            // match_confidence reflects FTS/vector agreement and coverage.
+            // Low values mean results are likely noise (especially vector-only hits
+            // for unknown queries), so surface it to the caller so they can skip
+            // acting on the list when it's untrustworthy.
+            //
+            // Exact-identifier exemption: when the query is a single identifier that
+            // appears verbatim as a candidate symbol name, the retrieval is precise
+            // regardless of the FTS breadth heuristics — skip the warning.
+            let query_trimmed = query.trim().to_lowercase();
+            let has_exact_name_match = candidates.iter().take(5).any(|c| {
+                c.node.name.to_lowercase() == query_trimmed
+                    || c.node.qualified_name.as_deref()
+                        .map(|q| q.to_lowercase() == query_trimmed)
+                        .unwrap_or(false)
+            });
+            let mut out = json!({
                 "mode": mode,
                 "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
+                "match_confidence": (match_confidence * 100.0).round() / 100.0,
                 "results": compact
-            }));
+            });
+            if match_confidence < 0.5 && !has_exact_name_match {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("low_confidence_warning".into(), json!(format!(
+                        "match_confidence={:.2} (< 0.5): FTS found few or no text matches — results are largely vector-similarity noise. Refine the query with concrete identifiers, or use ast_search with type/returns/params filters.",
+                        match_confidence
+                    )));
+                }
+            }
+            return Ok(out);
         }
         } // end estimated_tokens check
 
@@ -795,7 +838,10 @@ impl McpServer {
     /// Lookup AST node by node_id.
     pub(super) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_tests: bool, include_impact: bool, context_lines: usize, compact: bool) -> Result<serde_json::Value> {
         let nf = queries::get_node_with_file_by_id(self.db.conn(), node_id)?
-            .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
+            .ok_or_else(|| anyhow!(
+                "Node {} not found in index. node_ids are rebuild-scoped — a reindex (file change, incremental update, or rebuild_index) may have renumbered nodes. Re-resolve by calling get_ast_node(symbol_name, file_path) or semantic_code_search to obtain a current node_id.",
+                node_id
+            ))?;
         let node = nf.node;
         let file_path = nf.file_path;
 
@@ -998,8 +1044,13 @@ impl McpServer {
             obj.insert("embedding_status".into(), json!(embedding_status));
             obj.insert("embedding_progress".into(), json!(format!("{}/{}", vectors_done, vectors_total)));
             obj.insert("model_available".into(), json!(model_available));
+            // coverage_pct: integer for status-at-a-glance; avoid rounding to 0 when
+            // real progress exists (embedding_status == "in_progress" with small fraction)
+            // so callers don't mistake "making progress" for "stuck at zero".
             let coverage_pct = if vectors_total > 0 {
-                (vectors_done as f64 / vectors_total as f64 * 100.0).round() as i64
+                let ratio = vectors_done as f64 / vectors_total as f64;
+                let rounded = (ratio * 100.0).round() as i64;
+                if rounded == 0 && vectors_done > 0 { 1 } else { rounded }
             } else {
                 0
             };
@@ -2142,11 +2193,35 @@ impl McpServer {
             (rel.clone(), json!(refs.len()))
         }).collect::<serde_json::Map<String, serde_json::Value>>().into();
 
-        Ok(json!({
+        // Type-definition warning: for structs/enums/traits/types/interfaces/classes,
+        // the edge index only captures explicit call/import/inherit/implement edges.
+        // Field access, type annotations, and method-qualified calls (e.g. `Type::method()`
+        // which binds to the method node, not the type) will not appear here. Tell the
+        // caller so rename audits get broader coverage via a second query.
+        let type_kinds = ["struct", "enum", "trait", "type", "interface", "class"];
+        let target_types: Vec<String> = target_ids.iter()
+            .filter_map(|id| queries::get_node_by_id(self.db.conn(), *id).ok().flatten())
+            .map(|n| n.node_type)
+            .collect();
+        let is_type_def = target_types.iter().any(|t| type_kinds.contains(&t.as_str()));
+
+        let mut out = json!({
             "symbol": symbol_name,
             "total_references": all_refs.len(),
             "by_relation": summary,
             "references": all_refs,
-        }))
+        });
+        if is_type_def {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("type_definition_note".to_string(), json!(
+                    "Symbol is a type definition (struct/enum/trait/class). References list \
+                     captures explicit imports/inherits/implements and struct-literal instantiation, \
+                     but NOT method-qualified calls (e.g. `Type::method()`), field access, or type \
+                     annotations. For a rename audit, also query find_references on each method of \
+                     this type (see module_overview for method list) and grep for the bare name."
+                ));
+            }
+        }
+        Ok(out)
     }
 }

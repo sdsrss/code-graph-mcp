@@ -37,3 +37,6 @@ npm/*/code-graph-mcp.exe
 # npm artifacts
 node_modules/
 *.tgz
+
+# Local test harnesses and throwaway experiments
+tmp/
