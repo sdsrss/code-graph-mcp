@@ -32,6 +32,17 @@ fn main() -> Result<()> {
         Some("incremental-index") => {
             let quiet = args.iter().any(|a| a == "--quiet");
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            // Silent bail when the resolved root has neither a .git anchor nor an
+            // existing index. Without this guard the PostToolUse hook would create
+            // .code-graph/ in multi-repo workspace parents (issue #8).
+            let has_git = project_root.join(".git").exists();
+            let has_index = project_root
+                .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+                .join("index.db")
+                .exists();
+            if !has_git && !has_index {
+                return Ok(());
+            }
             code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
         }
         Some("rebuild-index") => {
