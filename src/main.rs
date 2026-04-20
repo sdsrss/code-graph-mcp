@@ -119,6 +119,10 @@ fn main() -> Result<()> {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
         }
+        Some("stats") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            code_graph_mcp::cli::cmd_stats(&project_root, &args)
+        }
         Some("doctor") => {
             run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())
         }
@@ -167,6 +171,8 @@ fn print_help() {
     println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");
     println!("    benchmark           Benchmark index speed, query latency, token savings");
+    println!("    stats               Aggregate session metrics from .code-graph/usage.jsonl");
+    println!("                        (which tools you used, search/index activity)");
     println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
     println!("    unadopt             Remove the memory file + sentinel block\n");
     println!("OPTIONS:");
@@ -191,6 +197,7 @@ fn print_help() {
     println!("    --ignore <prefix>   Exclude path prefix (dead-code; repeatable; default: claude-plugin/)");
     println!("    --no-ignore         Disable default --ignore prefixes (dead-code)");
     println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");
+    println!("    --last N            Limit to last N sessions (stats; default: all)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");
 }
@@ -295,7 +302,7 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "health-check", "doctor",
-    "benchmark", "adopt", "unadopt",
+    "benchmark", "stats", "adopt", "unadopt",
 ];
 
 /// Locate and exec a node script under claude-plugin/scripts/.

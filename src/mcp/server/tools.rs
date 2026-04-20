@@ -1071,11 +1071,18 @@ impl McpServer {
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
         // Wait for background embedding to finish before clearing data
-        // to avoid race where embedding thread writes vectors for deleted nodes
+        // to avoid race where embedding thread writes vectors for deleted nodes.
+        // Returning Ok({status:"busy"}) rather than Err matches
+        // `run_incremental_with_cache_restore`'s precedent and keeps the
+        // usage-metrics error counter from inflating on legitimate retry signals.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             if std::time::Instant::now() > deadline {
-                return Err(anyhow!("Background embedding still in progress. Try again shortly."));
+                return Ok(json!({
+                    "status": "busy",
+                    "message": "Background embedding still in progress. Retry in a few seconds.",
+                    "retry_after_ms": 2000,
+                }));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

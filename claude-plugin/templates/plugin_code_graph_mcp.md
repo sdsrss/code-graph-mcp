@@ -30,7 +30,7 @@ type: reference
 |------|------|----------------|
 | "谁调用 X？" / "X 调了啥？" | `get_call_graph` / `callgraph X` | 替代 `grep "X("` |
 | "Y 模块长啥样？" | `module_overview` / `overview Y/` | 替代逐文件 Read |
-| "找做 Z 的代码"（概念） | `semantic_code_search` / `search "Z"` | 不知道精确名 |
+| "找做 Z 的代码"（概念） | MCP `semantic_code_search`（RRF 混合）；CLI `search`（纯 FTS5） | 不知道精确名；要向量召回走 MCP |
 | "返回 T 类型的函数" | `ast_search --returns T` | 结构化筛选 |
 | "X 在哪被引用？" | `find_references` / `refs X` | 含 callers/importers |
 | "看 X 的源码 / 签名" | `get_ast_node` / `show X` | `include_impact=true` 含影响面（替代 impact_analysis） |
@@ -76,7 +76,7 @@ type: reference
 
 ```
 code-graph-mcp grep "pattern" [path]     # ripgrep + AST 上下文
-code-graph-mcp search "concept"          # FTS5 语义搜索
+code-graph-mcp search "concept"          # 纯 FTS5（要混合检索走 MCP semantic_code_search）
 code-graph-mcp ast-search "q" --type fn  # 结构化筛选
 code-graph-mcp map                       # 项目架构
 code-graph-mcp overview src/mcp/         # 模块总览

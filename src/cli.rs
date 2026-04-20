@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -492,6 +493,237 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Aggregated per-tool counts across sessions.
+pub struct ToolAgg {
+    pub n: u64,
+    pub total_ms: u64,
+    pub err: u64,
+    pub max_ms: u64,
+}
+
+/// Summary produced by `aggregate_usage_jsonl` — drives both human + JSON output.
+pub struct UsageSummary {
+    pub sessions: u64,
+    pub parse_errors: u64,
+    pub tools: HashMap<String, ToolAgg>,
+    pub search_queries: u64,
+    pub search_zero: u64,
+    pub search_quality_weighted_sum: f64,
+    pub search_fts_only: u64,
+    pub search_hybrid: u64,
+    pub full_index_count: u64,
+    pub full_index_ms_sum: u64,
+    pub incr_count: u64,
+    pub files_indexed: u64,
+    pub versions: std::collections::BTreeSet<String>,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+}
+
+impl UsageSummary {
+    pub fn total_tool_calls(&self) -> u64 {
+        self.tools.values().map(|a| a.n).sum()
+    }
+}
+
+/// Parse and aggregate `.code-graph/usage.jsonl` content.
+/// Pure function: no IO, no panics — malformed lines are counted, not fatal.
+/// `last_n`: if Some, keep only the last N records before aggregating.
+pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSummary {
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut parse_errors: u64 = 0;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(v) => records.push(v),
+            Err(_) => parse_errors += 1,
+        }
+    }
+    if let Some(n) = last_n {
+        if records.len() > n {
+            let drop = records.len() - n;
+            records.drain(..drop);
+        }
+    }
+
+    let mut summary = UsageSummary {
+        sessions: records.len() as u64,
+        parse_errors,
+        tools: HashMap::new(),
+        search_queries: 0,
+        search_zero: 0,
+        search_quality_weighted_sum: 0.0,
+        search_fts_only: 0,
+        search_hybrid: 0,
+        full_index_count: 0,
+        full_index_ms_sum: 0,
+        incr_count: 0,
+        files_indexed: 0,
+        versions: std::collections::BTreeSet::new(),
+        first_ts: None,
+        last_ts: None,
+    };
+
+    for rec in &records {
+        if let Some(v) = rec.get("v").and_then(|v| v.as_str()) {
+            summary.versions.insert(v.to_string());
+        }
+        if let Some(ts) = rec.get("ts").and_then(|v| v.as_str()) {
+            if summary.first_ts.is_none() { summary.first_ts = Some(ts.to_string()); }
+            summary.last_ts = Some(ts.to_string());
+        }
+        if let Some(tools_obj) = rec.get("tools").and_then(|v| v.as_object()) {
+            for (name, s) in tools_obj {
+                let agg = summary.tools.entry(name.clone()).or_insert(ToolAgg {
+                    n: 0, total_ms: 0, err: 0, max_ms: 0,
+                });
+                agg.n += s.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+                agg.total_ms += s.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                agg.err += s.get("err").and_then(|v| v.as_u64()).unwrap_or(0);
+                let m = s.get("max_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                if m > agg.max_ms { agg.max_ms = m; }
+            }
+        }
+        if let Some(s) = rec.get("search") {
+            let q = s.get("queries").and_then(|v| v.as_u64()).unwrap_or(0);
+            summary.search_queries += q;
+            summary.search_zero += s.get("zero").and_then(|v| v.as_u64()).unwrap_or(0);
+            summary.search_fts_only += s.get("fts_only").and_then(|v| v.as_u64()).unwrap_or(0);
+            summary.search_hybrid += s.get("hybrid").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Per-session avg_quality → re-weight by query count to merge.
+            let avg = s.get("avg_quality").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            summary.search_quality_weighted_sum += avg * q as f64;
+        }
+        if let Some(idx) = rec.get("index") {
+            if let Some(ms) = idx.get("full_ms").and_then(|v| v.as_u64()) {
+                summary.full_index_count += 1;
+                summary.full_index_ms_sum += ms;
+            }
+            summary.incr_count += idx.get("incr").and_then(|v| v.as_u64()).unwrap_or(0);
+            summary.files_indexed += idx.get("files").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+    }
+    summary
+}
+
+/// Print aggregated session metrics from `.code-graph/usage.jsonl`.
+/// Diagnostic: shows which tools you actually use + search/index activity.
+/// `--last N` limits to the most recent N sessions. `--json` emits structured output.
+pub fn cmd_stats(project_root: &Path, args: &[String]) -> Result<()> {
+    let json_mode = has_flag(args, "--json");
+    let last_n = get_flag_value(args, "--last").and_then(|s| s.parse::<usize>().ok());
+
+    let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
+    if !usage_path.exists() {
+        if json_mode {
+            println!("{}", serde_json::json!({
+                "sessions": 0,
+                "tools": {},
+                "note": format!("no usage data at {}", usage_path.display()),
+            }));
+        } else {
+            eprintln!("No usage data yet at {}", usage_path.display());
+            eprintln!("Run an MCP session first (sessions flush metrics on EOF).");
+        }
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&usage_path)?;
+    let summary = aggregate_usage_jsonl(&content, last_n);
+
+    if summary.sessions == 0 {
+        if json_mode {
+            println!("{}", serde_json::json!({"sessions": 0, "tools": {}}));
+        } else {
+            eprintln!("No sessions recorded.");
+        }
+        return Ok(());
+    }
+
+    if json_mode {
+        let tools_json: serde_json::Map<String, serde_json::Value> = summary.tools.iter().map(|(name, a)| {
+            let avg = a.total_ms.checked_div(a.n).unwrap_or(0);
+            (name.clone(), serde_json::json!({
+                "n": a.n, "total_ms": a.total_ms, "avg_ms": avg, "err": a.err, "max_ms": a.max_ms,
+            }))
+        }).collect();
+        let avg_q = if summary.search_queries > 0 {
+            summary.search_quality_weighted_sum / summary.search_queries as f64
+        } else { 0.0 };
+        let full_avg = summary.full_index_ms_sum.checked_div(summary.full_index_count).unwrap_or(0);
+        println!("{}", serde_json::json!({
+            "sessions": summary.sessions,
+            "parse_errors": summary.parse_errors,
+            "versions": summary.versions.iter().cloned().collect::<Vec<_>>(),
+            "first_ts": summary.first_ts,
+            "last_ts": summary.last_ts,
+            "total_tool_calls": summary.total_tool_calls(),
+            "tools": tools_json,
+            "search": {
+                "queries": summary.search_queries,
+                "zero": summary.search_zero,
+                "avg_quality": (avg_q * 100.0).round() / 100.0,
+                "fts_only": summary.search_fts_only,
+                "hybrid": summary.search_hybrid,
+            },
+            "index": {
+                "full_count": summary.full_index_count,
+                "full_avg_ms": full_avg,
+                "incr_count": summary.incr_count,
+                "files_indexed": summary.files_indexed,
+            },
+        }));
+    } else {
+        let versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
+        println!("Sessions: {}   versions: {}   {} → {}",
+            summary.sessions,
+            if versions.is_empty() { "-".into() } else { versions.join(",") },
+            summary.first_ts.as_deref().unwrap_or("-"),
+            summary.last_ts.as_deref().unwrap_or("-"),
+        );
+        println!("Total tool calls: {}", summary.total_tool_calls());
+        if summary.parse_errors > 0 {
+            println!("(warning: {} malformed line(s) skipped)", summary.parse_errors);
+        }
+        println!();
+
+        let mut sorted: Vec<(&String, &ToolAgg)> = summary.tools.iter().collect();
+        sorted.sort_by_key(|(_, a)| std::cmp::Reverse(a.n));
+
+        if sorted.is_empty() {
+            println!("(no tool calls recorded)");
+        } else {
+            println!("{:<28} {:>6} {:>10} {:>6} {:>8}", "Tool", "n", "avg_ms", "err", "max_ms");
+            println!("{}", "-".repeat(62));
+            for (name, agg) in &sorted {
+                let avg = agg.total_ms.checked_div(agg.n).unwrap_or(0);
+                println!("{:<28} {:>6} {:>10} {:>6} {:>8}", name, agg.n, avg, agg.err, agg.max_ms);
+            }
+        }
+
+        if summary.search_queries > 0 {
+            let zero_pct = (summary.search_zero as f64 / summary.search_queries as f64 * 100.0).round() as u64;
+            let avg_q = summary.search_quality_weighted_sum / summary.search_queries as f64;
+            println!();
+            println!("Search: {} queries, {} zero-result ({}%), hybrid/fts {}/{}, avg quality {:.2}",
+                summary.search_queries, summary.search_zero, zero_pct,
+                summary.search_hybrid, summary.search_fts_only, avg_q);
+        }
+
+        if summary.full_index_count > 0 || summary.incr_count > 0 {
+            let full_part = match summary.full_index_ms_sum.checked_div(summary.full_index_count) {
+                Some(avg) if summary.full_index_count > 0 => format!(" (avg {}ms)", avg),
+                _ => String::new(),
+            };
+            println!("Index:  {} full{}, {} incremental, {} files indexed",
+                summary.full_index_count, full_part, summary.incr_count, summary.files_indexed);
+        }
+    }
+
     Ok(())
 }
 
@@ -2727,5 +2959,79 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].file, "src/main.rs");
         assert_eq!(matches[0].line, 42);
+    }
+
+    #[test]
+    fn test_aggregate_usage_empty() {
+        let s = aggregate_usage_jsonl("", None);
+        assert_eq!(s.sessions, 0);
+        assert_eq!(s.parse_errors, 0);
+        assert!(s.tools.is_empty());
+        assert_eq!(s.total_tool_calls(), 0);
+    }
+
+    #[test]
+    fn test_aggregate_usage_skips_malformed_and_blank() {
+        let content = "\n\nnot-json\n{\"ts\":\"2026-04-20T00:00:00Z\",\"v\":\"0.12.1\",\"tools\":{}}\n";
+        let s = aggregate_usage_jsonl(content, None);
+        assert_eq!(s.sessions, 1);
+        assert_eq!(s.parse_errors, 1);
+    }
+
+    #[test]
+    fn test_aggregate_usage_merges_tool_counts_across_sessions() {
+        let line1 = r#"{"ts":"2026-04-19T10:00:00Z","v":"0.12.0","tools":{"get_call_graph":{"n":2,"ms":200,"err":0,"max_ms":150},"project_map":{"n":1,"ms":1000,"err":0,"max_ms":1000}}}"#;
+        let line2 = r#"{"ts":"2026-04-20T10:00:00Z","v":"0.12.1","tools":{"get_call_graph":{"n":3,"ms":900,"err":1,"max_ms":500}}}"#;
+        let content = format!("{}\n{}\n", line1, line2);
+        let s = aggregate_usage_jsonl(&content, None);
+        assert_eq!(s.sessions, 2);
+        assert_eq!(s.total_tool_calls(), 6);
+
+        let cg = s.tools.get("get_call_graph").unwrap();
+        assert_eq!(cg.n, 5);
+        assert_eq!(cg.total_ms, 1100);
+        assert_eq!(cg.err, 1);
+        assert_eq!(cg.max_ms, 500); // max across sessions
+
+        let pm = s.tools.get("project_map").unwrap();
+        assert_eq!(pm.n, 1);
+        assert_eq!(pm.max_ms, 1000);
+
+        assert_eq!(s.versions.len(), 2);
+        assert!(s.versions.contains("0.12.0") && s.versions.contains("0.12.1"));
+        assert_eq!(s.first_ts.as_deref(), Some("2026-04-19T10:00:00Z"));
+        assert_eq!(s.last_ts.as_deref(), Some("2026-04-20T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_aggregate_usage_last_n_keeps_tail() {
+        let lines: Vec<String> = (0..5).map(|i|
+            format!(r#"{{"ts":"2026-04-2{}T00:00:00Z","v":"0.12.1","tools":{{"t":{{"n":1,"ms":{},"err":0,"max_ms":{}}}}}}}"#, i, (i + 1) * 10, (i + 1) * 10)
+        ).collect();
+        let content = lines.join("\n");
+        let s = aggregate_usage_jsonl(&content, Some(2));
+        assert_eq!(s.sessions, 2);
+        let t = s.tools.get("t").unwrap();
+        // Last 2 sessions: ms 40 + 50 = 90
+        assert_eq!(t.total_ms, 90);
+        assert_eq!(t.max_ms, 50);
+    }
+
+    #[test]
+    fn test_aggregate_usage_search_and_index_merged() {
+        let l1 = r#"{"ts":"t1","v":"0.12.1","tools":{"t":{"n":1,"ms":1,"err":0,"max_ms":1}},"search":{"queries":10,"zero":2,"avg_quality":0.8,"fts_only":3,"hybrid":7},"index":{"full_ms":2000,"incr":5,"files":50,"nodes":100}}"#;
+        let l2 = r#"{"ts":"t2","v":"0.12.1","tools":{"t":{"n":1,"ms":1,"err":0,"max_ms":1}},"search":{"queries":5,"zero":0,"avg_quality":0.6,"fts_only":1,"hybrid":4},"index":{"full_ms":null,"incr":3,"files":10,"nodes":20}}"#;
+        let s = aggregate_usage_jsonl(&format!("{}\n{}", l1, l2), None);
+        assert_eq!(s.search_queries, 15);
+        assert_eq!(s.search_zero, 2);
+        assert_eq!(s.search_fts_only, 4);
+        assert_eq!(s.search_hybrid, 11);
+        // Weighted quality: (0.8 * 10 + 0.6 * 5) / 15 = 11.0 / 15 ≈ 0.7333
+        let weighted_avg = s.search_quality_weighted_sum / s.search_queries as f64;
+        assert!((weighted_avg - 0.7333).abs() < 0.01, "got {}", weighted_avg);
+        assert_eq!(s.full_index_count, 1);
+        assert_eq!(s.full_index_ms_sum, 2000);
+        assert_eq!(s.incr_count, 8);
+        assert_eq!(s.files_indexed, 60);
     }
 }

@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.13.0 — `stats` CLI + rebuild_index busy semantics + CLI/MCP search disambiguation
+
+Minor release. Three changes driven by real-usage-data review:
+
+### `stats` subcommand (new)
+
+`code-graph-mcp stats` aggregates `.code-graph/usage.jsonl` across sessions
+and prints per-tool counts (`n`, `avg_ms`, `err`, `max_ms`), search totals
+(queries, zero-result ratio, hybrid/FTS split, avg quality), and index
+activity (full vs incremental, avg full-rebuild time). Flags: `--last N`
+limits to the most recent N sessions, `--json` emits structured output.
+
+Motivation: the metrics module has been writing JSONL for months (1MB
+rotation), but there was no reader. Running on this repo's own history
+surfaced the `rebuild_index` error pattern that motivates change #2.
+
+### `rebuild_index` MCP tool — busy signal is no longer an error
+
+When the server rejects a rebuild request because background embedding is
+still running, it now returns `Ok({status: "busy", retry_after_ms: 2000})`
+instead of `Err("Background embedding still in progress")`. This matches
+the precedent in `run_incremental_with_cache_restore` (which returns
+`Ok(())` on the same condition) and keeps the usage-metrics `err` counter
+from inflating on legitimate retry signals.
+
+**Contract change** — SDK/script clients of the `rebuild_index` MCP tool
+must now distinguish `status: "busy"` success payloads from actual errors.
+JSON-RPC-level errors on `rebuild_index` now indicate real failures only
+(missing `confirm`, no project root, DB error).
+
+### CLI ↔ MCP search disambiguation
+
+`plugin_code_graph_mcp.md` template previously listed `search "Z"` and
+`semantic_code_search` as equivalent intents. They are not: the CLI
+`search` command is **FTS5-only** (`src/cli.rs:710` → `fts5_search`), while
+the MCP `semantic_code_search` tool performs **RRF fusion** of FTS5 + vector
+similarity (`src/mcp/server/tools.rs:42 → 101`). The template now states
+this explicitly in the core-7 decision table and the CLI cheat sheet.
+
+Adopted memory files auto-refresh from the template on the next
+SessionStart (v0.11.0+ behavior).
+
+### Clippy 1.95 parity
+
+Four `clippy::manual_checked_ops` and one `clippy::unnecessary_sort_by`
+flagged by the 1.95 toolchain in the new `cmd_stats` code path are fixed
+before push (local baseline: `cargo +1.95.0 clippy --no-default-features
+-- -D warnings && cargo +1.95.0 clippy --all-targets -- -D warnings`,
+both green).
+
 ## v0.12.1 — incremental-index skips non-project directories
 
 Bugfix release: the PostToolUse `incremental-index` hook no longer creates
