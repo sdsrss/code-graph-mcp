@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.12.1 — incremental-index skips non-project directories
+
+Bugfix release: the PostToolUse `incremental-index` hook no longer creates
+`.code-graph/` in directories that are not project roots. In multi-repo
+workspace layouts (one parent dir containing N independent git repos, parent
+not itself a repo), the hook previously materialized a stray 16 MB+ index at
+the workspace parent, overlapping every child repo.
+
+### What changes
+
+`src/main.rs` incremental-index arm now bails silently when the resolved
+project root has neither a `.git` anchor nor an existing
+`.code-graph/index.db` (the index check preserves the explicit per-dir index
+case where a user deliberately ran `incremental-index` in a non-git folder).
+
+Silent-skip matches the prevailing hook-layer convention:
+`incremental-index.js` swallows errors, `CliContext::try_open` returns `None`,
+`session-init.js` returns `'skipped'`.
+
+### Test coverage
+
+`claude-plugin/scripts/incremental-index.test.js` — two cases:
+- non-git tmpdir → exit 0, `.code-graph/` not created
+- fake `.git/` tmpdir → exit 0, guard does not block
+
+### Credits
+
+Reported + fixed by @jgangemi (issue #8, PR #9). Re-landed on top of current
+`resolve_project_root_from` helper with doc-comment scope creep removed.
+
 ## v0.12.0 — Scenario-keyed MEMORY.md index (auto-adopt template refresh)
 
 Auto-adopt (`claude-plugin/scripts/adopt.js`) now seeds MEMORY.md's sentinel
