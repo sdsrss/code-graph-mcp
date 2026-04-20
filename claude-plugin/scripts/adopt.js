@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 // adopt / unadopt — writes plugin_code_graph_mcp.md into this project's
-// claude-mem memory dir and maintains a sentinel-bracketed index entry in
-// MEMORY.md. Idempotent. Used by invited-memory pattern with CODE_GRAPH_QUIET_HOOKS=1.
+// Claude Code auto-memory dir (~/.claude/projects/<slug>/memory/, also
+// read/written by claude-mem-lite) and maintains a sentinel-bracketed index
+// entry in MEMORY.md. Idempotent. Used by invited-memory pattern with
+// CODE_GRAPH_QUIET_HOOKS=1.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');

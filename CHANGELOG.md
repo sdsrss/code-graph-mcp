@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.14.0 — durable statusline-provider chain + public register CLI
+
+Minor release. Addresses a long-standing fragility in the composite statusline
+integration: when the user cleaned `~/.cache/code-graph/`, the `_previous`
+snapshot (pre-install statusline, e.g. GSD) was lost, leaving only code-graph
+visible on the status bar.
+
+### Durable backup for `statusline-registry.json`
+
+`writeRegistry()` in `claude-plugin/scripts/lifecycle.js` now mirrors the
+registry to `~/.claude/statusline-providers.json` on every write. This file
+lives outside the `~/.cache/` hierarchy, so routine cache cleanup no longer
+strands third-party provider entries.
+
+`readRegistry()` self-heals: if the primary `~/.cache/code-graph/statusline-registry.json`
+is missing or empty, it falls back to the durable backup and rewrites the
+primary. No user action needed on upgrade — the first `writeRegistry()` call
+after install writes both files; recovery from a prior cache wipe happens
+automatically on next SessionStart.
+
+Clearing the registry (e.g. during uninstall) clears both files.
+
+### New public CLI: `statusline-chain.js`
+
+`claude-plugin/scripts/statusline-chain.js` exposes a documented registration
+surface for third-party plugins that want to coexist with code-graph's
+composite statusline:
+
+```
+node <plugin-cache>/scripts/statusline-chain.js register <id> <command> [--stdin]
+node <plugin-cache>/scripts/statusline-chain.js unregister <id>
+node <plugin-cache>/scripts/statusline-chain.js list
+```
+
+Reserved ids (`_previous`, `code-graph`) are rejected with exit code 2. The
+CLI uses existing `registerStatuslineProvider` / `unregisterStatuslineProvider`
+so writes land in both primary + durable backup.
+
+**Motivating use case:** GSD currently owns `settings.json.statusLine`
+directly and is captured as `_previous` when code-graph installs. With this
+CLI, GSD's install hook can instead call `statusline-chain.js register gsd
+"<gsd-statusline-command>" --stdin` and become a first-class provider in the
+composite, independent of install order. Fallback path (call without `--stdin`
+if the command doesn't read stdin; skip call entirely if code-graph isn't
+installed) keeps standalone operation working.
+
+### Tests
+
+Four new cases in `lifecycle.test.js`:
+
+- `writeRegistry` mirrors to durable backup
+- `readRegistry` self-heals primary from backup after simulated cache wipe
+- `writeRegistry([])` clears both files
+- `statusline-chain.js` CLI register/list/unregister + reserved-id guard
+
+12/12 lifecycle tests pass; 228/228 Rust lib tests green; clippy 1.95 clean on
+both `--no-default-features` and `--all-targets`.
+
 ## v0.13.0 — `stats` CLI + rebuild_index busy semantics + CLI/MCP search disambiguation
 
 Minor release. Three changes driven by real-usage-data review:

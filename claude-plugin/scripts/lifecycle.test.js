@@ -178,6 +178,94 @@ test('removeHooksFromSettings strips our entries but keeps unrelated hooks', () 
   assert.ok(!s.hooks.PostToolUse, 'empty event key should be deleted');
 });
 
+test('writeRegistry mirrors entries to durable backup outside ~/.cache/', (t) => {
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+
+  execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    registerStatuslineProvider('_previous', 'echo prev', true);
+    registerStatuslineProvider('code-graph', 'node /cg.js', false);
+  `], { env: { ...process.env, HOME: homeDir } });
+
+  const primary = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  const backup = JSON.parse(fs.readFileSync(backupPath, 'utf8'));
+  assert.deepEqual(primary, backup);
+  assert.equal(primary.length, 2);
+});
+
+test('readRegistry self-heals primary from durable backup after cache wipe', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+
+  // Seed both files, then simulate user wiping ~/.cache/code-graph/
+  writeJson(registryPath, [
+    { id: '_previous', command: 'echo gsd', needsStdin: true },
+    { id: 'code-graph', command: 'node /cg.js', needsStdin: false },
+  ]);
+  writeJson(backupPath, [
+    { id: '_previous', command: 'echo gsd', needsStdin: true },
+    { id: 'code-graph', command: 'node /cg.js', needsStdin: false },
+  ]);
+  fs.rmSync(cacheDir, { recursive: true, force: true });
+  assert.equal(fs.existsSync(registryPath), false);
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { readRegistry } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(readRegistry()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  const restored = JSON.parse(out);
+  assert.equal(restored.length, 2);
+  assert.equal(restored[0].id, '_previous');
+  // Primary file rebuilt from backup
+  assert.equal(fs.existsSync(registryPath), true);
+});
+
+test('writeRegistry([]) clears both primary and backup', (t) => {
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+
+  execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider, unregisterStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    registerStatuslineProvider('code-graph', 'node /cg.js', false);
+    unregisterStatuslineProvider('code-graph');
+  `], { env: { ...process.env, HOME: homeDir } });
+
+  assert.equal(fs.existsSync(registryPath), false);
+  assert.equal(fs.existsSync(backupPath), false);
+});
+
+test('statusline-chain CLI register/unregister/list + reserved-id guard', (t) => {
+  const homeDir = mkHome(t);
+  const chainPath = path.join(__dirname, 'statusline-chain.js');
+  const env = { ...process.env, HOME: homeDir };
+
+  const reg = execFileSync(process.execPath, [chainPath, 'register', 'gsd', 'node /gsd.cjs', '--stdin'], { env }).toString();
+  assert.match(reg, /registered gsd/);
+
+  const reRun = execFileSync(process.execPath, [chainPath, 'register', 'gsd', 'node /gsd.cjs', '--stdin'], { env }).toString();
+  assert.match(reRun, /unchanged gsd/);
+
+  const list = execFileSync(process.execPath, [chainPath, 'list'], { env }).toString();
+  assert.match(list, /gsd \[stdin\]: node \/gsd\.cjs/);
+
+  // Reserved ids rejected — both should exit 2 with stderr "reserved"
+  const { spawnSync } = require('child_process');
+  for (const rid of ['_previous', 'code-graph']) {
+    const r = spawnSync(process.execPath, [chainPath, 'register', rid, 'x'], { env });
+    assert.equal(r.status, 2, `${rid} should exit 2`);
+    assert.match(r.stderr.toString(), /reserved/);
+  }
+
+  const un = execFileSync(process.execPath, [chainPath, 'unregister', 'gsd'], { env }).toString();
+  assert.match(un, /unregistered gsd/);
+});
+
 test('install() removes legacy code-graph hooks from settings.json without re-registering', (t) => {
   const homeDir = mkHome(t);
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');

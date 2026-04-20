@@ -19,6 +19,10 @@ const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json');
 const REGISTRY_FILE = path.join(CACHE_DIR, 'statusline-registry.json');
+// Durable mirror outside ~/.cache/ — survives cache cleanup. Captures the
+// `_previous` snapshot (pre-install statusline) and any third-party providers
+// (GSD, etc.). readRegistry() self-heals from this file when primary is missing.
+const PROVIDERS_BACKUP_FILE = path.join(os.homedir(), '.claude', 'statusline-providers.json');
 
 // --- Helpers ---
 
@@ -75,15 +79,28 @@ function isOurComposite(settings) {
 // Multiple providers can register. The composite script runs them all.
 
 function readRegistry() {
-  return readJson(REGISTRY_FILE) || [];
+  const primary = readJson(REGISTRY_FILE);
+  if (primary && Array.isArray(primary) && primary.length > 0) return primary;
+  // Self-heal: primary missing or empty (e.g. user cleaned ~/.cache/code-graph/).
+  // Durable backup in ~/.claude/ retains `_previous` + third-party providers.
+  const backup = readJson(PROVIDERS_BACKUP_FILE);
+  if (backup && Array.isArray(backup) && backup.length > 0) {
+    try { writeJsonAtomic(REGISTRY_FILE, backup); } catch { /* ok */ }
+    return backup;
+  }
+  return [];
 }
 
 function writeRegistry(registry) {
   if (!registry || registry.length === 0) {
     try { fs.unlinkSync(REGISTRY_FILE); } catch { /* ok */ }
+    try { fs.unlinkSync(PROVIDERS_BACKUP_FILE); } catch { /* ok */ }
     return;
   }
   writeJsonAtomic(REGISTRY_FILE, registry);
+  // Mirror to durable location so cache cleanup doesn't strand `_previous`
+  // or third-party provider entries.
+  try { writeJsonAtomic(PROVIDERS_BACKUP_FILE, registry); } catch { /* ok */ }
 }
 
 function registerStatuslineProvider(id, command, needsStdin) {
@@ -535,7 +552,9 @@ module.exports = {
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
+  registerStatuslineProvider, unregisterStatuslineProvider,
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
+  PROVIDERS_BACKUP_FILE,
 };
 
 // CLI: node lifecycle.js <install|uninstall|update|health>
