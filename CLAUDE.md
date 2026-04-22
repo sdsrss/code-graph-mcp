@@ -57,3 +57,18 @@ cargo test --no-default-features   # Tests without embedding
 ## Code Graph Integration
 
 Code graph tools are available via MCP. The MCP server injects `instructions` at session start with decision rules for tool selection (e.g., "who calls X?" → `get_call_graph`). CLI commands (`code-graph-mcp <cmd>`) complement MCP tools for Bash workflows.
+
+## Autonomy
+
+`AUTONOMY_LEVEL: aggressive` — solo dev + bypassPermissions + fix-test-iterate workflow. Activates `~/.claude/CLAUDE.md` §5.1: cross-module refactor (≥3 Modules) → soft; internal-only Δ-contract → soft; dev-only deps → none; delete in safe-paths → no surface-required.
+
+**Published-client boundary (HARD — keeps Δ-contract at hard AUTH)**:
+- `src/mcp/tools.rs` tool schema — client is Claude Code (external) → published
+- `claude-plugin/**` CLI flags and npm-facing surface → published
+- Cargo `code-graph-mcp` CLI flags used by end users via npx/cargo install → published
+
+**Internal (Δ-contract → soft)**:
+- Rust module-to-module function signatures, struct fields, internal trait impls
+- SQLite schema changes are **always hard** (migration rule in core §5 never downgrades)
+
+**NEVER-downgrade** (from core §5.1): §8 SAFETY, Iron Law #2, Anti-hallucination, Destructive-smoke, Session-exit, User-global-state audit, `.env`/secrets, migration, `~/.claude/settings.json` / user-global hooks / MCP config, L3-enter.
