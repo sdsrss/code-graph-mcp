@@ -939,6 +939,28 @@ beforeEach(() => {
     }
 
     #[test]
+    fn test_parse_tsx_describe_it_marks_nested_as_test() {
+        // TSX went through LanguageConfig::for_language's default arm where `_ => "unknown"`
+        // silently disabled every `config.name == "tsx"` match. Regression: confirm the
+        // describe/it propagation fires for TSX after lang_config.rs adds the tsx case.
+        let code = r#"
+function prodFn() { return 1; }
+describe('Widget', () => {
+    function helper() { return 2; }
+    it('renders', () => { function inner() {} });
+});
+"#;
+        let nodes = parse_code(code, "tsx").unwrap();
+        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
+            .map(|n| (n.name.as_str(), n.is_test)).collect();
+        assert_eq!(by_name.get("prodFn").copied(), Some(false));
+        assert_eq!(by_name.get("helper").copied(), Some(true),
+            "tsx helper inside describe → is_test; nodes: {:?}",
+            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
+        assert_eq!(by_name.get("inner").copied(), Some(true));
+    }
+
+    #[test]
     fn test_parse_markdown_headings() {
         let code = "# Project Overview\n\nIntro.\n\n## Module Layout\n\ndetails\n\n### Important Patterns\n\nSubsection X\n--------------\n";
         let nodes = parse_code(code, "markdown").unwrap();

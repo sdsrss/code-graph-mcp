@@ -68,6 +68,7 @@ impl LanguageConfig {
             other => {
                 let static_name = match other {
                     "typescript" => "typescript",
+                    "tsx" => "tsx",
                     "javascript" => "javascript",
                     "go" => "go",
                     "python" => "python",

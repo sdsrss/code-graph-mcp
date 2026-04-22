@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.15.1 — TSX parity: LanguageConfig + require() + Express routes
+
+v0.15.0 audit of JS/TS support surfaced a silent breakage for `.tsx`
+files: `LanguageConfig::for_language("tsx")` hit the default arm where
+`_ => "unknown"`, so every `config.name == "tsx"` branch was dead code.
+Ripple effect: the describe/it `is_test` propagation added in v0.15.0
+(scoped `matches!(config.name, ... | "tsx")`) silently skipped TSX.
+
+Fixes:
+- `src/parser/lang_config.rs` — add `"tsx" => "tsx"` to the static-name
+  match so `config.name` is preserved through the default-config branch.
+- `src/parser/relations.rs:101` — `require()` arm now matches
+  `"javascript" | "typescript" | "tsx"` (was js/ts only).
+- `src/parser/relations.rs:1172` — `extract_route_pattern` now routes
+  `"tsx"` through `extract_express_route` alongside js/ts.
+
+Two new regression tests: `test_extract_tsx_commonjs_require_and_route`
+(parser) and `test_parse_tsx_describe_it_marks_nested_as_test`
+(treesitter). 369 total tests pass.
+
+C/C++ coverage audit surfaced three parallel gaps — `#include`
+not extracted, GoogleTest `TEST`/`TEST_F`/`TEST_P` macros not
+recognized, no scope qualification for `Class::method` / `obj.method` /
+`obj->method`. Tracked for v0.16.0.
+
 ## v0.15.0 — same-language edge resolution, JS require() imports, markdown indexing, JS test-block detection
 
 Multi-front accuracy pass motivated by user feedback that code-graph was

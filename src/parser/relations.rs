@@ -98,7 +98,7 @@ fn walk_for_relations(
             // Mirrors the Ruby `require` handling above; target is the last path
             // segment so node_modules imports become `<external>` sentinels and
             // relative imports can match a file module node by name.
-            if matches!(config.name, "javascript" | "typescript")
+            if matches!(config.name, "javascript" | "typescript" | "tsx")
                 && node.child_by_field_name("function")
                     .map(|f| node_text(&f, source) == "require")
                     .unwrap_or(false)
@@ -1169,7 +1169,7 @@ fn extract_export_names(
 
 fn extract_route_pattern(node: &tree_sitter::Node, source: &str, language: &str) -> Option<ParsedRelation> {
     match language {
-        "typescript" | "javascript" => extract_express_route(node, source),
+        "typescript" | "javascript" | "tsx" => extract_express_route(node, source),
         "go" => extract_go_route(node, source),
         _ => None,
     }
@@ -1532,6 +1532,29 @@ const versionUtils = require('../utils/version-utils.js');
         assert!(imports.contains(&"lifecycle"), "expected lifecycle import, got: {:?}", imports);
         assert!(imports.contains(&"version-utils"),
             "expected stripped .js extension, got: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_tsx_commonjs_require_and_route() {
+        // TSX shares the JS/TS pipeline but went through a distinct config.name —
+        // require() and Express route arms previously matched only "js"|"ts".
+        let code = r#"
+const React = require('react');
+const { helpers } = require('./helpers');
+app.get('/api/widgets', getWidgets);
+"#;
+        let relations = extract_relations(code, "tsx").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str()).collect();
+        assert!(imports.contains(&"react"),   "tsx require('react'); got: {:?}", imports);
+        assert!(imports.contains(&"helpers"), "tsx require('./helpers'); got: {:?}", imports);
+
+        let routes: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .map(|r| r.target_name.as_str()).collect();
+        assert!(routes.contains(&"getWidgets"),
+            "tsx Express route target; got: {:?}", routes);
     }
 
     #[test]
