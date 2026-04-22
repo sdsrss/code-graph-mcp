@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.14.3 — module_overview compact truncation fields + CLI deps `<external>` parity
+
+Patch release. Two UX bugs found during end-to-end tool audit.
+
+### MCP `module_overview` compact mode — surface truncation metadata
+
+Full mode already set `active_capped`/`showing`/`total_active`/`hint`
+when a module had >30 active exports, but `compact_module_overview`
+rebuilt the response by cherry-picking known fields and silently
+dropped the conditional truncation fields. Users calling with
+`compact=true` on a large module (e.g. `src/parser/` with 54 active
+exports) saw `"summary": "54 active + 2 inactive"` and 30 items — no
+signal that 24 were missing.
+
+Fix: forward the four conditional fields at the end of
+`compact_module_overview` with a `.get().cloned()` loop so any future
+addition of a conditional field stays forwarded by default.
+
+### CLI `deps` — filter synthetic `<external>` bucket like MCP does
+
+`dependency_graph` in the MCP handler filters the `<external>` pseudo-
+file (a container for unresolved third-party imports) from outgoing
+deps. The CLI `deps` subcommand had the language-compat filter but not
+the `<external>` guard, so CLI output at depth ≥2 could show
+`<external>` as a fake file dependency.
+
+Fix: add the one-line guard to `cmd_deps`'s `is_compatible_lang` so
+both entry points apply the same filter.
+
+### Verified
+
+`cargo test` 235/235, `cargo +1.95.0 clippy --lib -- -D warnings`
+clean. Before/after:
+
+- `module_overview(path="src/parser/", compact=true)` now returns
+  `active_capped: true, showing: 30, total_active: 54, hint: "..."`
+- `deps src/mcp/server/tools.rs --json` depends_on no longer contains
+  `{"file":"<external>","depth":2}`
+
 ## v0.14.2 — MCP init instructions fit Claude Code truncation budget
 
 Patch release. Fixes observed silent truncation of the MCP `initialize`
