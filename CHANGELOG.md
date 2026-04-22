@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.16.0 — production hardening pass (RRF math, schema v7 dim guard, readonly secondary, bounded watcher, CI matrix)
+
+Architecture audit surfaced nine correctness / safety gaps — this
+release addresses all of them plus four items flagged in a follow-up
+code review. Schema bump auto-migrates; no user action required.
+
+**Algorithmic correctness:**
+- `src/search/fusion.rs` — `SCORE_BLEND_FACTOR = 0.1` silently dominated
+  RRF by ~100× at k=30 (rank-0 RRF ≈ 0.0164 vs. max blend = 0.1),
+  inverting the docstring's own "doesn't override rank ordering"
+  contract and effectively converting RRF into per-source-raw-score
+  ranking. Replaced with adaptive `blend_scale = 0.5 / ((k+1)(k+2))` —
+  mathematically half the smallest adjacent-rank RRF gap. Semantic
+  search results will shift (for the better) on queries where one
+  source returns a high-raw-score item at a late rank.
+
+**Data safety — schema v7 embedding-dim guard:**
+- `SCHEMA_VERSION` 6 → 7. New `meta` table records embedding_dim. On
+  open, mismatch → atomic DROP + rebuild `node_vectors` at current
+  `EMBEDDING_DIM`. Prevents silent crash-on-INSERT when a user rebuilds
+  the binary at a different dim (e.g., swaps embedding model).
+- v6 → v7 upgrade path introspects the on-disk vec0 DDL via
+  `sqlite_master.sql` (`float[N]` regex) and rebuilds if the existing
+  table's dim ≠ current — the adversarial case where `meta` is empty
+  but a pre-existing vec0 is present.
+
+**Concurrency hardening:**
+- `src/indexer/watcher.rs` — bounded `sync_channel(4096)` with
+  overflow-drop policy (warn!). Unbounded channel had no cap on memory
+  during bulk fs events (branch switches, IDE reformats). Merkle
+  rescan is idempotent so dropped events don't lose data.
+- `src/storage/db.rs` + `src/mcp/server/mod.rs` — secondary instances
+  (flock denied) now open DB with `SQLITE_OPEN_READ_ONLY | query_only=ON`.
+  Eliminates race where a secondary could run migrations +
+  `INDEX_VERSION` DELETE sweep against the primary's DB. Secondary
+  polls up to 3s for the primary's bootstrap then bails with a clear
+  error rather than falling through to read-write.
+
+**Contract strengthening:**
+- `src/parser/relations.rs` — `ParsedRelation` carries `source_language`,
+  stamped by `extract_relations_from_tree`. Resolver at
+  `src/indexer/pipeline.rs` hard-errors on mismatch (bail!, not
+  debug_assert!) so parser regressions fail in release builds too.
+- `src/mcp/server/mod.rs` — `start_post_index_services` spawns a
+  once-per-process Phase-3 repair thread before background embedding.
+  README's "Startup repair for incomplete indexing" claim was
+  documentation-only until now; `repair_null_context_strings` now
+  actually fires on every session start (primary-only, idempotent).
+
+**Documentation accuracy:**
+- `README.md` — HTTP route tracing previously claimed Express, Flask/
+  FastAPI, Go, ASP.NET, Rails, Laravel, Vapor (8 frameworks). Only 3
+  are actually implemented in `extract_route_pattern`. Corrected.
+
+**CI + release:**
+- `.github/workflows/ci.yml` — matrix {ubuntu, macos, windows} × {no-embed,
+  with-embed} (was ubuntu-only), toolchain pinned `@1.95.0`.
+- `.github/workflows/release.yml` — new `smoke-verify` job runs after
+  `publish` on all 3 OSes: npm install with retry-backoff, `--version`
+  exact match, `incremental-index` + `map --json` on a tmp git repo.
+  Catches missing platform binaries / `find-binary.js` regressions /
+  version-sync drift before users hit them.
+
+**Test delta:** +18 unit tests (RRF invariants ×4, schema v7 paths ×5,
+readonly ×2, source_language stamp ×1, etc.). 250 unit + 56 integration
++ 44 hardening + 19 parser + 6 cli + 6 plugin + 1 routing = 382 tests
+pass. Clippy 1.95 clean on both feature modes.
+
+**Deferred to a later release (L3 refactor):** `tools.rs` (2236 LOC),
+`relations.rs` (2174), `queries.rs` (2783) file splits — flagged in the
+audit but require a dedicated session with plan-mode review.
+
 ## v0.15.2 — ast_search ranking + dead-code --json empty contract
 
 User-driven QA pass exercising every MCP tool + CLI subcommand surfaced
