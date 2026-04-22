@@ -1096,47 +1096,36 @@ impl McpServer {
         let instructions = if quiet {
             "code-graph-mcp ready. Tools: project_map, semantic_code_search, module_overview, get_call_graph, impact_analysis, find_references, ast_search, dependency_graph, find_dead_code, find_similar_code, get_ast_node, trace_http_chain. Run `code-graph-mcp --help` for CLI. See MEMORY.md → plugin_code_graph_mcp.md for decision rules (if adopted)."
         } else {
-            concat!(
-                "Code Graph CLI \u{2014} this project is indexed. CLI commands (via Bash) complement built-in tools:\n",
-                "\n",
-                "Replace Grep (code understanding):\n",
-                "  code-graph-mcp grep \"pattern\" [path]    \u{2014} grep + AST context (shows containing function/class)\n",
-                "  code-graph-mcp search \"concept\"         \u{2014} semantic search by concept (no exact name needed)\n",
-                "  code-graph-mcp ast-search \"q\" --type fn \u{2014} structural search by type/return/params\n",
-                "\n",
-                "Replace Read multiple files (understand structure):\n",
-                "  code-graph-mcp map                      \u{2014} project architecture (modules, deps, entry points)\n",
-                "  code-graph-mcp overview src/mcp/         \u{2014} module symbols grouped by file and type\n",
-                "  code-graph-mcp callgraph symbol          \u{2014} who calls it / what it calls\n",
-                "\n",
-                "Before modifying code:\n",
-                "  code-graph-mcp impact symbol             \u{2014} blast radius (callers, routes, risk level)\n",
-                "\n",
-                "Still use Grep: exact strings, constants, regex, non-code files.\n",
-                "Still use Read: specific file you will edit.\n",
-                "MCP tools also available for programmatic access with compact=true option.\n",
-                "\n",
-                "Workflow tips:\n",
-                "  1. Start with project_map (compact=true) for architecture overview\n",
-                "  2. Use semantic_code_search with compact=true first \u{2014} saves tokens\n",
-                "  3. Expand results: get_ast_node(node_id=N, compact=true) for signature, or without compact for full code\n",
-                "  4. Before changes: impact_analysis to check blast radius\n",
-                "  5. If search returns no/unexpected results: run `code-graph-mcp health-check` to check index health and embedding coverage\n",
-                "  Prompts available: impact-analysis, understand-module, trace-request\n",
-                "\n",
-                "Decision rules (use INSTEAD OF multi-step Grep/Read):\n",
-                "  \u{2022} \"who calls X?\" / \"what does X call?\" \u{2192} get_call_graph (NOT grep for function name)\n",
-                "  \u{2022} \"what will break if I change X?\" \u{2192} impact_analysis (BEFORE editing)\n",
-                "  \u{2022} \"how is module Y structured?\" \u{2192} module_overview (NOT reading files one by one)\n",
-                "  \u{2022} \"find code that does Z\" (concept) \u{2192} semantic_code_search (NOT grep)\n",
-                "  \u{2022} \"find all functions returning T\" \u{2192} ast_search with --returns filter\n",
-                "  \u{2022} \"is this function used anywhere?\" \u{2192} find_references\n",
-                "  \u{2022} modifying a function signature \u{2192} impact_analysis FIRST, then find all call sites\n",
-                "  \u{2022} \"find unused/dead code\" / \"clean up exports\" \u{2192} find_dead_code\n",
-                "  \u{2022} \"find similar/duplicate functions\" \u{2192} find_similar_code\n",
-                "  \u{2022} \"what does file X depend on?\" / \"who imports X?\" \u{2192} dependency_graph\n",
-                "  \u{2022} \"show me function X\" / inspect before editing \u{2192} get_ast_node (with include_references/include_impact)"
-            )
+            // Tight budget: Claude Code truncates MCP instructions near ~2KB
+            // (v0.14.1 session observed cut at "modifying a function s...").
+            // Pack all 10 decision rules with CLI aliases INSIDE the safe line;
+            // full details live in MEMORY.md \u{2192} plugin_code_graph_mcp.md.
+            const NOISY: &str = concat!(
+                "Code Graph CLI \u{2014} this project is indexed. Use these INSTEAD OF multi-step Grep/Read (CLI alias in parens):\n",
+                "  \u{2022} \"who calls X?\" / \"what does X call?\" \u{2192} get_call_graph (callgraph X)\n",
+                "  \u{2022} \"what breaks if I change X?\" \u{2192} impact_analysis (impact X)\n",
+                "  \u{2022} \"how is module Y structured?\" \u{2192} module_overview (overview Y/)\n",
+                "  \u{2022} \"find code that does Z\" (concept) \u{2192} semantic_code_search (search \"Z\"; CLI is FTS-only, MCP adds vector+RRF)\n",
+                "  \u{2022} \"functions returning T / signature matches\" \u{2192} ast_search --returns T\n",
+                "  \u{2022} \"is X used anywhere?\" \u{2192} find_references (refs X)\n",
+                "  \u{2022} modifying a signature \u{2192} impact_analysis FIRST, then edit\n",
+                "  \u{2022} \"unused/dead code\" \u{2192} find_dead_code (dead-code)\n",
+                "  \u{2022} \"similar/duplicate functions\" \u{2192} find_similar_code (similar X)\n",
+                "  \u{2022} \"what does file X depend on?\" \u{2192} dependency_graph (deps X)\n",
+                "  \u{2022} \"show/inspect X\" \u{2192} get_ast_node (show X; add include_impact=true for blast radius)\n",
+                "Start: project_map --compact (architecture). Stuck on results? code-graph-mcp health-check.\n",
+                "Still Grep for: exact strings, constants, regex, non-code files. Still Read for: files you will edit.\n",
+                "Prompts: impact-analysis, understand-module, trace-request.\n",
+                "Full decision table + 5 advanced tools: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+            );
+            // Compile-time guard: calibrated from observed Claude Code truncation
+            // at ~2048 bytes; 1500 leaves ~25% margin. Future edits that blow the
+            // budget fail `cargo check` instead of silently getting truncated.
+            const _: () = assert!(
+                NOISY.len() <= 1500,
+                "MCP noisy instructions exceed 1500-byte budget; Claude Code will truncate."
+            );
+            NOISY
         };
         JsonRpcResponse::success(id, json!({
             "protocolVersion": "2024-11-05",

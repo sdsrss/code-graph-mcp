@@ -1071,6 +1071,9 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     if fts_result.or_fallback {
         eprintln!("[code-graph] Note: AND match insufficient, showing OR results (broader match).");
     }
+    if !json_mode {
+        eprintln!("[code-graph] Tip: CLI search is FTS5-only. For vector+RRF hybrid recall use MCP semantic_code_search.");
+    }
 
     Ok(())
 }
