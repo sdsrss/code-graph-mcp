@@ -7,9 +7,25 @@ on:
     branches: [main]
 
 jobs:
+  # Full matrix: 3 OSes × 2 feature combos.
+  # Catches platform-specific issues (Windows path separators, macOS linker
+  # differences, sqlite-vec C compilation variance) that used to ship silently
+  # because CI only ran on ubuntu-latest while release.yml builds 5 platform
+  # binaries. Toolchain is pinned for reproducibility (memory:
+  # feedback_ship_baseline_and_flakes).
   check:
-    name: Check & Test
-    runs-on: ubuntu-latest
+    name: Check & Test (${{ matrix.os }}, ${{ matrix.feature-label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        feature-flag: ["--no-default-features", ""]
+        include:
+          - feature-flag: "--no-default-features"
+            feature-label: "no-embed"
+          - feature-flag: ""
+            feature-label: "with-embed"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -19,27 +35,32 @@ jobs:
         with:
           node-version: 20
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.feature-label }}
 
-      - name: Check (no embedding)
-        run: cargo check --no-default-features
+      - name: Check
+        run: cargo check ${{ matrix.feature-flag }}
 
-      - name: Check (with embedding)
-        run: cargo check
+      - name: Clippy
+        run: cargo clippy ${{ matrix.feature-flag }} -- -D warnings
 
-      - name: Test (no embedding)
-        run: cargo test --no-default-features
+      - name: Test
+        run: cargo test ${{ matrix.feature-flag }}
 
-      - name: Test (with embedding)
-        run: cargo test
-
+  # Plugin/lifecycle/release-smoke tests are Node-based and OS-independent —
+  # run once on Linux to avoid the 3× matrix blow-up.
+  plugin-tests:
+    name: Plugin & Lifecycle Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
       - name: Plugin lifecycle tests
         run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js scripts/release-smoke.test.js
-
-      - name: Clippy (no embedding)
-        run: cargo clippy --no-default-features -- -D warnings
-
-      - name: Clippy (with embedding)
-        run: cargo clippy -- -D warnings

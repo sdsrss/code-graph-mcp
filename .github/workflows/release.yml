@@ -138,3 +138,82 @@ jobs:
         with:
           generate_release_notes: true
           files: release-assets/*
+
+  # Post-publish verification: in a clean env on each OS, install the JUST-
+  # PUBLISHED package from the npm registry and assert the binary runs and
+  # reports the expected version. Catches:
+  #   - missing platform-binary optionalDependency
+  #   - find-binary.js OS/arch detection regressions
+  #   - sync-versions drift (npm pkg version != Cargo.toml version)
+  #   - npm registry propagation issues
+  # Retries the install with backoff since npm's CDN can lag ~30-60s behind
+  # the publish API.
+  smoke-verify:
+    name: Post-publish smoke (${{ matrix.os }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Extract version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      - name: Install published package (with retry for registry propagation)
+        shell: bash
+        run: |
+          set -eu
+          for attempt in 1 2 3 4 5; do
+            echo "Install attempt $attempt of 5..."
+            if npm install -g "@sdsrs/code-graph@${VERSION}"; then
+              echo "Install succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::npm install failed after 5 attempts for version ${VERSION}"
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
+      - name: Verify --version matches tag
+        shell: bash
+        run: |
+          set -eu
+          actual=$(code-graph-mcp --version)
+          expected="code-graph-mcp ${VERSION}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::--version mismatch: got '$actual', expected '$expected'"
+            exit 1
+          fi
+          echo "OK: $actual"
+
+      - name: Verify --help runs
+        run: code-graph-mcp --help
+
+      - name: Verify a real subcommand runs on a minimal project
+        shell: bash
+        run: |
+          set -eu
+          tmpdir=$(mktemp -d)
+          cd "$tmpdir"
+          git init -q
+          git config user.email ci@example.com
+          git config user.name CI
+          mkdir -p src
+          cat > src/main.rs <<'EOF'
+          fn hello() { println!("hi"); }
+          fn main() { hello(); }
+          EOF
+          git add . && git commit -q -m init
+          # map requires an index — build one first.
+          code-graph-mcp incremental-index --quiet
+          code-graph-mcp map --json > map.json
+          test -s map.json
+          node -e "const m = require('$tmpdir/map.json'); if (!m || typeof m !== 'object') { console.error('map.json is not a valid JSON object'); process.exit(1); } console.log('map OK:', Object.keys(m).slice(0, 5));"
