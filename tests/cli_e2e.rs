@@ -683,3 +683,22 @@ fn test_cli_json_empty_overview() {
     assert_eq!(code, 1);
     assert_eq!(stdout.trim(), "[]", "JSON overview with no results should output []");
 }
+
+#[test]
+fn test_cli_json_empty_dead_code() {
+    // Regression: dead-code --json with all results filtered by --ignore returned
+    // only stderr (no stdout), breaking JSON consumers piping stdout. Must emit `[]`.
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &[
+        "dead-code",
+        "--ignore", "src/",
+        "--ignore", "tests/",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "dead-code with no matches should exit 0");
+    assert_eq!(stdout.trim(), "[]", "dead-code --json with no results must output []");
+    assert!(
+        stderr.contains("No dead code"),
+        "stderr should still surface the human-readable reason; got: {stderr}",
+    );
+}

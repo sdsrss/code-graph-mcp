@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.15.2 — ast_search ranking + dead-code --json empty contract
+
+User-driven QA pass exercising every MCP tool + CLI subcommand surfaced
+two bugs whose contract violations were silent — both regressions guard
+against recurrence.
+
+Fixes:
+- `src/storage/queries.rs` — `get_nodes_with_files_by_filters` (the SQL
+  backing `ast_search` / `ast-search`) ordered by `f.path ASC` only, so
+  the `LIMIT` clause silently truncated alphabetically-late files
+  (`src/storage/queries.rs` itself, with 54 `Result`-returning fns) out
+  of the top-N. New ordering is `caller_count DESC, path ASC, line ASC`
+  so high-value symbols surface first regardless of file path.
+- `src/cli.rs:2655` — `dead-code --json` returned only stderr (no stdout)
+  when all results were filtered by `--ignore`, breaking JSON consumers
+  piping stdout. Now emits `[]` to stdout before the human stderr
+  message, matching the established empty-result contract used by
+  `search` / `grep` / `callgraph` / `show` / `trace` / `overview`.
+
+New regression tests:
+- `test_get_nodes_with_files_by_filters_ranks_by_caller_count`
+  (`src/storage/queries.rs`) — alphabetically-first low-caller fn must
+  not outrank alphabetically-last high-caller fn at any `LIMIT`.
+- `test_cli_json_empty_dead_code` (`tests/cli_e2e.rs`) — stdout must be
+  `[]` and stderr must still surface "No dead code" when --ignore filters
+  all results.
+
+371 tests pass (was 369). Clippy 1.95 clean on both feature combos.
+
 ## v0.15.1 — TSX parity: LanguageConfig + require() + Express routes
 
 v0.15.0 audit of JS/TS support surfaced a silent breakage for `.tsx`

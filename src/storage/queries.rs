@@ -701,6 +701,7 @@ pub fn get_nodes_with_files_by_filters(
     params_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NodeWithFile>> {
+    use crate::domain::REL_CALLS;
     let mut conditions = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let mut param_idx = 1;
@@ -732,9 +733,19 @@ pub fn get_nodes_with_files_by_filters(
         format!(" WHERE {}", conditions.join(" AND "))
     };
 
+    // Order by caller_count DESC so high-value symbols surface first; without
+    // this, `ORDER BY f.path` alphabetically truncated late-path files (e.g.
+    // src/storage/queries.rs — 54 Result-returning fns) out of the top-N.
     let sql = format!(
-        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id{} ORDER BY f.path, n.start_line LIMIT ?{}",
-        NODE_SELECT_ALIASED, where_clause, params.len() + 1
+        "SELECT {cols}, f.path, f.language \
+         FROM nodes n JOIN files f ON f.id = n.file_id{where_clause} \
+         ORDER BY (SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.relation = '{rel}') DESC, \
+                  f.path ASC, n.start_line ASC \
+         LIMIT ?{limit_idx}",
+        cols = NODE_SELECT_ALIASED,
+        where_clause = where_clause,
+        rel = REL_CALLS,
+        limit_idx = params.len() + 1,
     );
     params.push(Box::new(limit as i64));
 
@@ -2691,6 +2702,71 @@ mod tests {
         let alpha_paths: Vec<&str> = alpha_entries.iter().map(|(_, p, _)| p.as_str()).collect();
         assert!(alpha_paths.contains(&"src/a.ts"));
         assert!(alpha_paths.contains(&"src/b.ts"));
+    }
+
+    #[test]
+    fn test_get_nodes_with_files_by_filters_ranks_by_caller_count() {
+        // Regression: alphabetical ORDER BY silently truncated high-caller-count
+        // symbols in late-path files. New ranking is caller_count DESC, path ASC.
+        let (db, _tmp) = test_db();
+        let early = upsert_file(db.conn(), &FileRecord {
+            path: "a/early.rs".into(), blake3_hash: "h1".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+        let late = upsert_file(db.conn(), &FileRecord {
+            path: "z/late.rs".into(), blake3_hash: "h2".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        // Uncalled Result-fn in alphabetically-first file
+        let cold = insert_node(db.conn(), &NodeRecord {
+            file_id: early, node_type: "function".into(), name: "cold_fn".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn cold_fn() -> Result<()> {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: Some("Result<()>".into()),
+            param_types: None, is_test: false,
+        }).unwrap();
+
+        // Hot Result-fn in alphabetically-last file, called 3×
+        let hot = insert_node(db.conn(), &NodeRecord {
+            file_id: late, node_type: "function".into(), name: "hot_fn".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "fn hot_fn() -> Result<i32> {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: Some("Result<i32>".into()),
+            param_types: None, is_test: false,
+        }).unwrap();
+
+        for i in 0..3 {
+            let caller = insert_node(db.conn(), &NodeRecord {
+                file_id: early, node_type: "function".into(),
+                name: format!("caller_{}", i), qualified_name: None,
+                start_line: 10 + i as i64, end_line: 12 + i as i64,
+                code_content: "fn c() {}".into(), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+            insert_edge(db.conn(), caller, hot, "calls", None).unwrap();
+        }
+        insert_edge(db.conn(), cold, cold, "calls", None).unwrap(); // self-loop still = 1 caller
+
+        let types: &[&str] = &["function"];
+        let results = get_nodes_with_files_by_filters(
+            db.conn(), Some(types), Some("Result"), None, 10,
+        ).unwrap();
+
+        assert_eq!(results[0].node.id, hot, "hot_fn (3 callers) must outrank cold_fn (1)");
+        assert_eq!(results[0].file_path, "z/late.rs");
+        assert_eq!(results[1].node.id, cold);
+
+        // With limit=1, hot_fn still wins even though alphabetically-first file exists
+        let top1 = get_nodes_with_files_by_filters(
+            db.conn(), Some(types), Some("Result"), None, 1,
+        ).unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].node.id, hot,
+            "limit=1 with alphabetical ORDER BY would return cold_fn — regression guard");
     }
 
     #[test]

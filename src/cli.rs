@@ -2651,6 +2651,9 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     let ignored = pre_count - results.len();
 
     if results.is_empty() {
+        if json_mode {
+            writeln!(std::io::stdout().lock(), "[]")?;
+        }
         if ignored > 0 {
             eprintln!(
                 "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
