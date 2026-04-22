@@ -1126,7 +1126,10 @@ impl McpServer {
         // Returning Ok({status:"busy"}) rather than Err matches
         // `run_incremental_with_cache_restore`'s precedent and keeps the
         // usage-metrics error counter from inflating on legitimate retry signals.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // 30s accommodates larger projects whose embedding pass exceeds 10s;
+        // historical usage.jsonl showed rebuild_index max_ms=10009 across 5/9
+        // calls — a deadline cliff, not a real failure mode.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             if std::time::Instant::now() > deadline {
                 return Ok(json!({

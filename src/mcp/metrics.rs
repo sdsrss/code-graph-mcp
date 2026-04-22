@@ -3,12 +3,72 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+/// Canonical error categories for tool invocations. Written to usage.jsonl
+/// under `tools.<name>.err_kinds` so post-hoc analysis can separate real bugs
+/// from startup-grace retries, user typos, and ambiguous-symbol guards without
+/// re-classifying each error string by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrKind {
+    /// 2s grace timeout in ensure_indexed while startup indexing runs.
+    Timeout,
+    /// User-supplied symbol or node_id not present in the index.
+    NotFound,
+    /// Multiple symbols with same name; needs file_path/node_id disambiguation.
+    Ambiguous,
+    /// SQLite FOREIGN KEY violation — DB state inconsistent. Rare; indicates bug.
+    FkConstraint,
+    /// Missing/empty required input (empty query, missing params).
+    EmptyInput,
+    /// Unclassified — expand classify() if this bucket grows.
+    Other,
+}
+
+impl ErrKind {
+    /// Classify an error message via substring match on known error phrases.
+    /// Match order matters: FK check first (most specific), then grace, etc.
+    pub fn classify(err_msg: &str) -> Self {
+        if err_msg.contains("FOREIGN KEY constraint failed") {
+            Self::FkConstraint
+        } else if err_msg.contains("Indexing in progress")
+            || err_msg.contains("retry your request")
+        {
+            Self::Timeout
+        } else if err_msg.contains("Ambiguous symbol") {
+            Self::Ambiguous
+        } else if err_msg.contains("not found in index")
+            || err_msg.contains("not found in the index")
+        {
+            Self::NotFound
+        } else if err_msg.contains("must not be empty")
+            || err_msg.contains("Must pass")
+            || err_msg.starts_with("Usage:")
+        {
+            Self::EmptyInput
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::FkConstraint => "fk",
+            Self::EmptyInput => "empty_input",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Per-tool call statistics.
 pub struct ToolStats {
     pub count: u64,
     pub total_ms: u64,
     pub errors: u64,
     pub max_ms: u64,
+    /// Breakdown of `errors` by ErrKind::as_str(). Empty when `errors == 0`.
+    pub err_kinds: HashMap<String, u64>,
 }
 
 /// Aggregated search metrics for the session.
@@ -55,18 +115,20 @@ impl SessionMetrics {
         }
     }
 
-    /// Record a tool invocation.
-    pub fn record_tool_call(&mut self, name: &str, elapsed_ms: u64, is_error: bool) {
+    /// Record a tool invocation. `err_kind = None` means success.
+    pub fn record_tool_call(&mut self, name: &str, elapsed_ms: u64, err_kind: Option<ErrKind>) {
         let stats = self.tools.entry(name.to_string()).or_insert(ToolStats {
             count: 0,
             total_ms: 0,
             errors: 0,
             max_ms: 0,
+            err_kinds: HashMap::new(),
         });
         stats.count += 1;
         stats.total_ms += elapsed_ms;
-        if is_error {
+        if let Some(kind) = err_kind {
             stats.errors += 1;
+            *stats.err_kinds.entry(kind.as_str().into()).or_insert(0) += 1;
         }
         if elapsed_ms > stats.max_ms {
             stats.max_ms = elapsed_ms;
@@ -109,14 +171,19 @@ impl SessionMetrics {
         let dur_s = self.start.elapsed().as_secs();
         let ts = iso8601_now();
 
-        // Build tools map
+        // Build tools map. `err_kinds` is additive — older readers ignore it;
+        // we only emit when non-empty to keep lines compact for success-only sessions.
         let tools_json: serde_json::Map<String, serde_json::Value> = self.tools.iter().map(|(name, stats)| {
-            (name.clone(), serde_json::json!({
+            let mut obj = serde_json::json!({
                 "n": stats.count,
                 "ms": stats.total_ms,
                 "err": stats.errors,
                 "max_ms": stats.max_ms,
-            }))
+            });
+            if !stats.err_kinds.is_empty() {
+                obj["err_kinds"] = serde_json::json!(stats.err_kinds);
+            }
+            (name.clone(), obj)
         }).collect();
 
         let avg_quality = if self.search.total_queries > 0 {
@@ -258,7 +325,7 @@ mod tests {
     #[test]
     fn test_record_tool_call_basic() {
         let mut m = SessionMetrics::new();
-        m.record_tool_call("semantic_code_search", 150, false);
+        m.record_tool_call("semantic_code_search", 150, None);
         assert!(!m.is_empty());
         let stats = m.tools.get("semantic_code_search").unwrap();
         assert_eq!(stats.count, 1);
@@ -270,14 +337,15 @@ mod tests {
     #[test]
     fn test_record_tool_call_accumulates() {
         let mut m = SessionMetrics::new();
-        m.record_tool_call("get_call_graph", 100, false);
-        m.record_tool_call("get_call_graph", 200, true);
-        m.record_tool_call("get_call_graph", 50, false);
+        m.record_tool_call("get_call_graph", 100, None);
+        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other));
+        m.record_tool_call("get_call_graph", 50, None);
         let stats = m.tools.get("get_call_graph").unwrap();
         assert_eq!(stats.count, 3);
         assert_eq!(stats.total_ms, 350);
         assert_eq!(stats.errors, 1);
         assert_eq!(stats.max_ms, 200);
+        assert_eq!(stats.err_kinds.get("other").copied(), Some(1));
     }
 
     #[test]
@@ -319,8 +387,8 @@ mod tests {
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("semantic_code_search", 150, false);
-        m.record_tool_call("get_call_graph", 200, true);
+        m.record_tool_call("semantic_code_search", 150, None);
+        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other));
         m.record_search(3, 0.85, false);
         m.record_index(50, 200, true, 1500);
         m.flush(&usage_path, "0.5.26");
@@ -356,11 +424,11 @@ mod tests {
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m1 = SessionMetrics::new();
-        m1.record_tool_call("project_map", 100, false);
+        m1.record_tool_call("project_map", 100, None);
         m1.flush(&usage_path, "0.5.26");
 
         let mut m2 = SessionMetrics::new();
-        m2.record_tool_call("get_call_graph", 200, false);
+        m2.record_tool_call("get_call_graph", 200, None);
         m2.flush(&usage_path, "0.5.26");
 
         let content = std::fs::read_to_string(&usage_path).unwrap();
@@ -405,7 +473,7 @@ mod tests {
         assert!(size_before > 1_048_576);
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("test", 10, false);
+        m.record_tool_call("test", 10, None);
         m.flush(&usage_path, "0.5.26");
 
         let size_after = std::fs::metadata(&usage_path).unwrap().len();
@@ -439,7 +507,7 @@ mod tests {
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("test", 10, false); // need at least one tool call
+        m.record_tool_call("test", 10, None);
         m.record_search(5, 0.8, false);
         m.record_search(3, 0.6, true);
         m.flush(&usage_path, "0.5.26");
@@ -448,5 +516,65 @@ mod tests {
         let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         // avg_quality = (0.8 + 0.6) / 2 = 0.7
         assert_eq!(record["search"]["avg_quality"], 0.7);
+    }
+
+    #[test]
+    fn test_err_kind_classify_covers_canonical_patterns() {
+        // Real error strings produced by the tool handlers — anchors the
+        // classifier against regressions if the messages drift.
+        use ErrKind::*;
+        assert_eq!(
+            ErrKind::classify("Error: FOREIGN KEY constraint failed"),
+            FkConstraint,
+        );
+        assert_eq!(
+            ErrKind::classify(
+                "Indexing in progress — results will be available shortly. \
+                 Please retry your request in a few seconds."
+            ),
+            Timeout,
+        );
+        assert_eq!(
+            ErrKind::classify(
+                "Ambiguous symbol 'open': 2 matches in different files. \
+                 Specify file_path to disambiguate."
+            ),
+            Ambiguous,
+        );
+        assert_eq!(
+            ErrKind::classify(
+                "Symbol 'doesnotexist_ZZZ' not found in index. \
+                 Use semantic_code_search to find the correct symbol name."
+            ),
+            NotFound,
+        );
+        assert_eq!(ErrKind::classify("query must not be empty"), EmptyInput);
+        assert_eq!(ErrKind::classify("Must pass confirm: true to rebuild index"), EmptyInput);
+        assert_eq!(ErrKind::classify("Unknown tool: nonexistent_tool"), Other);
+    }
+
+    #[test]
+    fn test_flush_emits_err_kinds_breakdown() {
+        let dir = TempDir::new().unwrap();
+        let usage_path = dir.path().join("usage.jsonl");
+
+        let mut m = SessionMetrics::new();
+        m.record_tool_call("get_ast_node", 100, Some(ErrKind::Ambiguous));
+        m.record_tool_call("get_ast_node", 120, Some(ErrKind::Ambiguous));
+        m.record_tool_call("get_ast_node", 90, Some(ErrKind::NotFound));
+        m.record_tool_call("get_ast_node", 80, None); // success
+        // Tool with no errors — err_kinds must be omitted from output.
+        m.record_tool_call("project_map", 2000, None);
+        m.flush(&usage_path, "test");
+
+        let content = std::fs::read_to_string(&usage_path).unwrap();
+        let rec: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(rec["tools"]["get_ast_node"]["err"], 3);
+        assert_eq!(rec["tools"]["get_ast_node"]["err_kinds"]["ambiguous"], 2);
+        assert_eq!(rec["tools"]["get_ast_node"]["err_kinds"]["not_found"], 1);
+        // Success-only tool omits err_kinds entirely.
+        assert!(rec["tools"]["project_map"]["err_kinds"].is_null(),
+            "err_kinds must not appear for success-only tool, got: {}",
+            rec["tools"]["project_map"]);
     }
 }

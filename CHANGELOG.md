@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.14.5 — FK-recovery fix, rebuild_index busy-timeout relief, error-kind telemetry
+
+Patch release. Drops six observed bug classes surfaced by a full-fleet
+error-rate audit over 156 MCP sessions + 55 Claude Code transcripts.
+
+### Incremental-index FK recovery now truncates before rebuild
+
+Historical transcripts showed 6 agent-side `FOREIGN KEY constraint failed`
+errors on `project_map` (4), `module_overview` (1), and
+`semantic_code_search` (1). Root cause: `run_incremental_with_cache_restore`
+caught FK violations and fell back to `run_full_index`, but the latter
+only does per-file upsert — orphan rows from the failed incremental
+survived and re-triggered FK on the retry, bubbling the raw SQLite
+error to tool handlers.
+
+Fix (`src/mcp/server/mod.rs:987`): the FK branch now `DELETE FROM files`
+in a transaction before re-running full_index. CASCADE chains nodes →
+edges → node_vectors via the schema's existing `ON DELETE CASCADE`.
+Pattern lifted verbatim from `tool_rebuild_index`.
+
+Regression test (`test_fk_fallback_truncate_purges_stale_state_and_rebuild_recovers`)
+injects a phantom file + node + edge via `PRAGMA foreign_keys = OFF`
+and asserts truncate + full_index purge it while restoring on-disk
+symbols. Guards against future removal of the truncate step.
+
+### `rebuild_index` 10s "busy" cliff relaxed to 30s
+
+`usage.jsonl` showed `rebuild_index` err-rate 5/9 = 55%, with all 5
+failures hitting `max_ms ≈ 10009` — i.e. the `embedding_in_progress`
+wait deadline, returning `{status:"busy"}` which session metrics count
+as errors. Not a real failure mode; 30s accommodates larger projects
+whose embedding pass exceeds 10s.
+
+### `find_dead_code` excludes anonymous `_` constants
+
+`const _: () = assert!(...)` and `let _ = ...` patterns are
+compile-time-only bindings, never callable. They were being reported
+as dead code. New filter in `find_dead_code` SQL: `n.name != '_'`.
+
+### Canonical error-kind telemetry in `usage.jsonl`
+
+`SessionMetrics::record_tool_call` now classifies failures into
+`ErrKind { Timeout, NotFound, Ambiguous, FkConstraint, EmptyInput, Other }`
+and emits per-tool breakdowns as `tools.<name>.err_kinds`:
+
+```json
+"get_ast_node": {"n": 69, "ms": 4630, "err": 12, "max_ms": 2003,
+                 "err_kinds": {"timeout": 7, "ambiguous": 3, "not_found": 2}}
+```
+
+Additive — readers that only consume `n/ms/err/max_ms` are unaffected.
+Success-only tools omit the `err_kinds` field entirely for compact
+output. Unlocks post-hoc error analysis via `jq` instead of manual
+transcript grep.
+
+### Dev tooling: `scripts/analyze-search-queries.py`
+
+Persistent sampler that classifies `code-graph-mcp search` queries
+issued by the agent (extracted from Claude Code transcripts) into
+keyword-like vs concept-like. Used to validate decisions about
+MCP-vs-CLI routing trade-offs without needing a round-trip through
+`routing_bench`.
+
+---
+
 ## v0.14.4 — CLI `impact`/`callgraph` ambiguous-symbol guard (parity with MCP)
 
 Patch release. Closes a CLI/MCP behavior gap discovered in the same

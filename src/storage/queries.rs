@@ -1771,6 +1771,9 @@ pub fn find_dead_code(
         "n.type != 'module'".to_string(),
         "n.name != '<module>'".to_string(),
         "n.name != 'main'".to_string(),
+        // Anonymous consts (`const _: () = assert!(...)`) are compile-time checks,
+        // never callable; same pattern for anonymous `let _ = ...` bindings.
+        "n.name != '_'".to_string(),
         "f.path != '<external>'".to_string(),
         "(n.end_line - n.start_line + 1) >= :min_lines".to_string(),
     ];
@@ -2419,6 +2422,16 @@ mod tests {
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
+        // 9. anonymous `_` constant — `const _: () = assert!(...)` is a compile-time
+        //    check, never callable. Must be excluded by name filter.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "constant".into(), name: "_".into(),
+            qualified_name: None, start_line: 110, end_line: 115,
+            code_content: "const _: () = assert!(SOME_CONST <= 1500, \"budget\");".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
         // --- Create edges ---
         // Someone calls used_fn and passes callback_fn as a function pointer
         let caller_id = insert_node(conn, &NodeRecord {
@@ -2459,6 +2472,7 @@ mod tests {
         assert!(!names.contains(&"handle_login"), "route handler should be excluded");
         assert!(!names.contains(&"<module>"), "<module> should be excluded");
         assert!(!names.contains(&"callback_fn"), "callback_fn should be excluded (referenced as function pointer in caller's code)");
+        assert!(!names.contains(&"_"), "anonymous `_` constant (compile-time assert) should be excluded by name filter");
 
         // Verify has_export_edge classification
         let orphan = results.iter().find(|r| r.name == "orphan_fn").unwrap();
