@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.14.2 — MCP init instructions fit Claude Code truncation budget
+
+Patch release. Fixes observed silent truncation of the MCP `initialize`
+response `instructions` field at Claude Code's ~2KB harness boundary — the
+last 4 of 10 routing decision rules were being dropped, making Claude
+fall back to Grep/Read where code-graph tools should have been invoked.
+
+### MCP `instructions` — pack 10 decision rules under 1500-byte budget
+
+Old noisy-mode instructions were ~2.5KB with three section headers and
+verbose workflow tips. Claude Code's `initialize` handler truncated near
+~2048 bytes, cutting `modifying a function signature`, `find_dead_code`,
+`find_similar_code`, `dependency_graph`, and the `get_ast_node` row — all
+critical routing signals.
+
+Rewrite compresses to **1292 bytes** (~48% of original) while preserving
+all 10 decision rules verbatim. Each rule now carries its CLI alias
+inline (e.g. `get_call_graph (callgraph X)`), so the LLM learns the CLI
+invocation from the same line it learns the routing intent — no separate
+MEMORY.md cross-reference needed for the base case.
+
+Also re-adds a `Prompts:` line enumerating the three registered MCP
+prompts, and replaces the misleading `"5 CLI-only tools"` phrasing with
+`"5 advanced tools"` — the hidden 5 are still callable via raw MCP
+`tools/call`, they are just off `tools/list` by default to preserve
+startup-token budget.
+
+### Compile-time budget guard
+
+`const _: () = assert!(NOISY.len() <= 1500, ...)` added in
+`src/mcp/server/mod.rs`. Any future edit that blows the budget fails
+`cargo check` with `rustc E0080: evaluation panicked` — catches the
+regression at build time, not debug-build test time. Verified by
+tightening the cap to 1000 and observing the compile break.
+
+### CLI `search` — stderr hint directing concept queries to MCP
+
+CLI `code-graph-mcp search <q>` is FTS5-only; the MCP
+`semantic_code_search` tool adds vector similarity + RRF fusion. On
+non-JSON success paths, a stderr tip now points concept-query users to
+the MCP tool. `--json` mode is untouched so script consumers still see
+clean stdout.
+
+### Tests
+
+366 tests pass across integration suites (v0.14.1 baseline + compile-time
+assert test exercised via intentional budget-cap inversion). Clippy 1.95
+clean on both `--no-default-features` and `--all-targets`. Routing bench
+(`tests/routing_bench.rs` via OpenRouter `anthropic/claude-sonnet-4.5`):
+**P@1 = 19/20 = 95.0%** — unchanged from the v0.14.1 baseline, confirming
+the compression did not degrade routing quality. Single miss remains the
+known-borderline `ast_search` vs `get_ast_node` on a struct-def lookup.
+
+---
+
 ## v0.14.1 — semantic search UX + find_references type hint
 
 Patch release. Six targeted accuracy/UX fixes to MCP tool responses surfaced by a
