@@ -2209,8 +2209,10 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
     }
 
     // Filter out cross-language false edges (name-based resolution artifacts)
+    // and the synthetic `<external>` bucket (unresolved imports, not a real file).
     let root_lang = crate::utils::config::detect_language(file_path);
     let is_compatible_lang = |dep_path: &str| -> bool {
+        if dep_path == "<external>" { return false; }
         let dep_lang = crate::utils::config::detect_language(dep_path);
         match (root_lang, dep_lang) {
             (None, _) | (_, None) => true,

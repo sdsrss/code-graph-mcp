@@ -1462,6 +1462,12 @@ impl McpServer {
         if full.get("warning").is_some() {
             result["warning"] = full["warning"].clone();
         }
+        // Forward truncation metadata so compact callers see the cap, not silent truncation
+        for key in ["active_capped", "showing", "total_active", "hint"] {
+            if let Some(v) = full.get(key) {
+                result[key] = v.clone();
+            }
+        }
         Ok(result)
     }
 
