@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.14.4 — CLI `impact`/`callgraph` ambiguous-symbol guard (parity with MCP)
+
+Patch release. Closes a CLI/MCP behavior gap discovered in the same
+end-to-end audit that produced v0.14.3.
+
+### Bare-name queries on overloaded symbols now prompt for disambiguation
+
+MCP `get_call_graph` and `get_ast_node` already returned an
+`Ambiguous symbol` error with suggestion list when a bare name
+resolved to ≥2 non-test definitions in different files. The CLI
+counterparts (`callgraph`, `impact`) did not — they silently merged
+call graphs / caller lists across all same-named definitions,
+misreporting risk_level and blast radius.
+
+Example: this repo has two `open` functions (`Database::open` in
+`src/storage/db.rs` and `CliContext::open` in `src/cli.rs`). Before
+the fix:
+
+```
+$ code-graph-mcp impact open
+Impact: open — Risk: HIGH
+  26 direct callers, 31 total, 9 files ...
+```
+
+The 26 callers are a union of both `open`s. After the fix:
+
+```
+$ code-graph-mcp impact open
+[code-graph] Ambiguous symbol 'open': 2 matches in different files.
+Specify --file or --node-id:
+  open (function) in src/storage/db.rs [node_id 5717]
+  open (function) in src/cli.rs [node_id 7055]
+```
+
+Exit code 1 signals script-level callers that disambiguation is
+required. Qualified names (`Database.open`), `--file`, and `--node-id`
+paths still work unchanged.
+
+### Implementation
+
+New helper `detect_exact_ambiguity` in `src/cli.rs` queries
+`get_nodes_with_files_by_name`, filters non-test definitions, and
+returns `Some(candidates)` only when ≥2 distinct files are present
+(multiple definitions in one file, e.g. overloads, stay
+non-ambiguous). Shared `emit_exact_ambiguity` formatter handles both
+`--json` and human modes.
+
+Both `cmd_callgraph` and `cmd_impact` gain a `file_filter.is_none()`
+guard that invokes the helper before the downstream query runs.
+
+### Verified
+
+`cargo test` 235/235, `cargo +1.95.0 clippy --all-targets` clean.
+
 ## v0.14.3 — module_overview compact truncation fields + CLI deps `<external>` parity
 
 Patch release. Two UX bugs found during end-to-end tool audit.
