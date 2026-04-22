@@ -19,12 +19,19 @@ pub enum WatchEvent {
     Changed(Vec<String>),
 }
 
+/// Bound on pending watcher events. A full channel means the main-loop consumer
+/// is lagging; subsequent events are dropped (logged). This is safe because the
+/// downstream merkle rescan is idempotent — as long as *any* event remains in
+/// the buffer when drain_watcher_events runs, the bool signal fires and the
+/// rescan picks up all on-disk changes regardless of dropped events.
+pub const WATCHER_CHANNEL_BOUND: usize = 4096;
+
 pub struct FileWatcher {
     _watcher: notify::RecommendedWatcher,
 }
 
 impl FileWatcher {
-    pub fn start(root: &Path, tx: mpsc::Sender<WatchEvent>) -> Result<Self> {
+    pub fn start(root: &Path, tx: mpsc::SyncSender<WatchEvent>) -> Result<Self> {
         let root_path = root.to_path_buf();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
@@ -49,8 +56,18 @@ impl FileWatcher {
                         })
                         .collect();
                     if !paths.is_empty() {
-                        if let Err(e) = tx.send(WatchEvent::Changed(paths)) {
-                            tracing::debug!("Watcher channel send failed (receiver dropped): {}", e);
+                        match tx.try_send(WatchEvent::Changed(paths)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    "Watcher channel full ({} events buffered); dropping event. \
+                                     Main loop is lagging — next merkle rescan will pick up all changes.",
+                                    WATCHER_CHANNEL_BOUND
+                                );
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::debug!("Watcher channel receiver dropped");
+                            }
                         }
                     }
                 }
@@ -73,7 +90,7 @@ mod tests {
     #[test]
     fn test_watcher_detects_file_changes() {
         let tmp = TempDir::new().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(WATCHER_CHANNEL_BOUND);
         let watcher = FileWatcher::start(tmp.path(), tx).unwrap();
 
         // Create a file

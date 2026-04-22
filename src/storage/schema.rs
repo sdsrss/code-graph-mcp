@@ -1,4 +1,8 @@
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
+
+// Meta keys stored in the `meta` table (added in v7).
+pub const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
+pub const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
 
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
@@ -79,6 +83,14 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
 CREATE INDEX IF NOT EXISTS idx_edges_source_rel ON edges(source_id, relation);
 CREATE INDEX IF NOT EXISTS idx_edges_target_rel ON edges(target_id, relation);
+
+-- Key-value metadata table (v7+). Stores embedding_dim / embedding_model so
+-- a model swap is detected on open and the vec0 table gets rebuilt instead
+-- of silently producing dimension-mismatch junk.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
 "#)
 }
 
@@ -220,6 +232,22 @@ pub fn migrate_v5_to_v6(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);"
     )?;
     tracing::info!("[schema] Migration v5->v6 complete.");
+    Ok(())
+}
+
+/// Migrate v6 → v7: adds `meta` key-value table used to record
+/// embedding_dim / embedding_model. Dim-mismatch detection (drop + rebuild
+/// node_vectors) is handled post-migration in `Database::open_impl_inner`
+/// so it fires on every open, not just during the one-shot migration.
+pub fn migrate_v6_to_v7(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v6 -> v7: adding meta table for embedding-dim guard");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        );"
+    )?;
+    tracing::info!("[schema] Migration v6->v7 complete.");
     Ok(())
 }
 

@@ -176,6 +176,11 @@ pub(super) struct IndexingState {
     pub(super) startup_index_error: Arc<Mutex<Option<String>>>,
     /// True while a background embedding thread is running.
     pub(super) embedding_in_progress: Arc<AtomicBool>,
+    /// True once the Phase-3 startup repair has run in this session.
+    /// Used to guarantee `repair_null_context_strings` fires exactly once per process,
+    /// covering the case where a prior session crashed mid-Phase-3 and left nodes
+    /// with NULL context_string.
+    pub(super) startup_repair_done: Arc<AtomicBool>,
 }
 
 impl IndexingState {
@@ -187,6 +192,7 @@ impl IndexingState {
             startup_index_result: Arc::new(Mutex::new(None)),
             startup_index_error: Arc::new(Mutex::new(None)),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_repair_done: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -258,6 +264,41 @@ impl McpServer {
         Database::open_with_vec(db_path)
     }
 
+    /// Open the DB with the flag set appropriate for this instance's role.
+    /// Primary (holds flock): full read-write, migrations enabled.
+    /// Secondary (flock denied): strict read-only. We briefly wait for the
+    /// primary to bootstrap the DB and then bail if it never appears, rather
+    /// than fall through to read-write — a read-write open would run
+    /// migrations and potentially `DELETE FROM nodes/edges/files` on the
+    /// primary's DB via the INDEX_VERSION sweep at `db.rs:138-141`, defeating
+    /// the whole purpose of the primary/secondary split.
+    fn open_db_for_role(db_path: &Path, is_primary: bool) -> Result<Database> {
+        if is_primary {
+            return Self::open_db(db_path);
+        }
+        // Poll up to SECONDARY_DB_WAIT for primary to create the file.
+        const SECONDARY_DB_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + SECONDARY_DB_WAIT;
+        while !db_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !db_path.exists() {
+            anyhow::bail!(
+                "Secondary instance cannot open DB at {}: the primary has not yet \
+                 bootstrapped the index. Wait for the primary to finish its initial \
+                 indexing, then restart this instance.",
+                db_path.display()
+            );
+        }
+        Database::open_readonly(db_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Secondary read-only open failed at {}: {}. \
+                 Primary may be mid-bootstrap — retry in a moment.",
+                db_path.display(), e
+            )
+        })
+    }
+
     /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
     pub fn from_project_root(project_root: &Path) -> Result<Self> {
         let db_dir = project_root.join(CODE_GRAPH_DIR);
@@ -293,7 +334,7 @@ impl McpServer {
         let is_primary = index_lock.is_some();
 
         let embedding_model = EmbeddingModel::load()?;
-        let db = Self::open_db(&db_path)?;
+        let db = Self::open_db_for_role(&db_path, is_primary)?;
         let root_canonical = project_root.canonicalize().ok();
         Ok(Self {
             registry: ToolRegistry::new(),
@@ -625,7 +666,7 @@ impl McpServer {
         // Auto-start file watcher
         let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if watcher_guard.is_none() {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
             match FileWatcher::start(project_root, tx) {
                 Ok(fw) => {
                     *watcher_guard = Some(WatcherState {
@@ -641,10 +682,44 @@ impl McpServer {
         }
         drop(watcher_guard);
 
+        // Repair Phase-3 casualties (NULL context_string from prior-session crashes)
+        // BEFORE spawning embedding, so rebuilt context strings get vectorized in the
+        // same run. Fires at most once per process.
+        self.spawn_startup_repair(project_root);
+
         self.spawn_background_embedding();
 
         #[cfg(feature = "embed-model")]
         self.spawn_model_download();
+    }
+
+    /// Spawn a background thread that runs `repair_null_context_strings` once per
+    /// process. Covers the failure path where a prior session crashed mid-Phase-3
+    /// (post-node-insert, before context_string/embedding commit). Primary-only:
+    /// secondary instances can't write.
+    fn spawn_startup_repair(&self, project_root: &Path) {
+        if !self.is_primary {
+            return;
+        }
+        if self.indexing.startup_repair_done.swap(true, Ordering::AcqRel) {
+            return; // already ran this session
+        }
+        let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+        std::thread::spawn(move || {
+            let repair = (|| -> Result<usize> {
+                let db = Database::open_with_vec(&db_path)?;
+                #[cfg(feature = "embed-model")]
+                let model = EmbeddingModel::load().ok().flatten();
+                #[cfg(not(feature = "embed-model"))]
+                let model: Option<EmbeddingModel> = None;
+                crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())
+            })();
+            match repair {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("[startup-repair] Rebuilt {} NULL context_string rows", n),
+                Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
+            }
+        });
     }
 
     /// Spawn a background thread to embed nodes that don't yet have vectors.

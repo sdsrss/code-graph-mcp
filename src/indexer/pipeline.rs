@@ -751,6 +751,20 @@ fn index_files(
             let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
 
             for rel in &relations {
+                // Contract: extract_relations_from_tree stamps every relation with
+                // source_language equal to the language argument. The
+                // same-language resolution at line 811+ depends on it. Hard
+                // error instead of debug_assert so a parser regression fails
+                // loudly in release builds too (one string compare per
+                // relation is negligible against the SQL writes below).
+                if rel.source_language != pf.language {
+                    anyhow::bail!(
+                        "ParsedRelation.source_language ({}) does not match file language ({}); \
+                         parser regressed the source_language contract",
+                        rel.source_language, pf.language
+                    );
+                }
+
                 let source_ids = pf.node_names.iter()
                     .zip(pf.node_ids.iter())
                     .filter(|(name, _)| *name == &rel.source_name)

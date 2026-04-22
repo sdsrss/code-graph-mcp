@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::sync::Once;
 use super::schema;
@@ -39,6 +39,38 @@ impl Database {
 
     pub fn open_with_vec(path: &Path) -> Result<Self> {
         Self::open_impl(path, true)
+    }
+
+    /// Open an existing database in strict read-only mode. Used by secondary
+    /// MCP instances (those that failed to acquire the index flock) so the
+    /// SQLite driver hard-refuses any write, eliminating race conditions
+    /// against the primary instance's indexing transactions.
+    ///
+    /// Requires the file to already exist (returns Err if not). No schema
+    /// migrations or table creation happens — secondary relies entirely on
+    /// the primary's bootstrap.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        register_sqlite_vec();
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        // PRAGMA query_only is belt-and-suspenders on top of the flag —
+        // any accidental write attempt errors out at the SQL layer.
+        conn.execute_batch("
+            PRAGMA query_only = ON;
+            PRAGMA busy_timeout = 5000;
+        ")?;
+        // Detect vec tables via sqlite_master so consumers know if vector
+        // search is available without needing a separate probe.
+        let vec_enabled: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        Ok(Self { conn, vec_enabled })
     }
 
     fn open_impl(path: &Path, enable_vec: bool) -> Result<Self> {
@@ -116,12 +148,22 @@ impl Database {
                 schema::migrate_v5_to_v6(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 7 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v6_to_v7(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
 
         if enable_vec {
             conn.execute_batch(&schema::create_vec_tables_sql())?;
+            // Enforce that the on-disk vec0 table dimension matches the
+            // compile-time EMBEDDING_DIM. On mismatch (e.g., user upgrades
+            // the embedding model) we drop the vec table and rebuild at the
+            // new dim rather than silently producing corrupt similarity scores.
+            Self::ensure_embedding_dim_consistency(&conn)?;
         }
 
         conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
@@ -179,12 +221,263 @@ impl Database {
         self.conn.execute_batch("PRAGMA optimize;")?;
         Ok(())
     }
+
+    /// Compare the stored embedding dimension (meta table) against the
+    /// compile-time EMBEDDING_DIM. Mismatch → drop node_vectors and recreate
+    /// at the new dim so the next indexing run re-embeds cleanly.
+    ///
+    /// Three cases:
+    ///   1. meta.embedding_dim == current: no-op.
+    ///   2. meta.embedding_dim exists but != current: drop + rebuild.
+    ///   3. meta.embedding_dim absent (fresh install OR first post-v7 open on a
+    ///      v6 DB): introspect actual vec0 dim from sqlite_master.sql. If it
+    ///      exists at a different dim than current, drop + rebuild; otherwise
+    ///      just record the current dim. This catches the scenario where a
+    ///      user built the binary at one EMBEDDING_DIM, generated a v6 DB,
+    ///      then rebuilt the binary at a different EMBEDDING_DIM — without
+    ///      this introspection, v6→v7 would silently stamp the wrong dim and
+    ///      every subsequent INSERT into node_vectors would crash.
+    fn ensure_embedding_dim_consistency(conn: &rusqlite::Connection) -> Result<()> {
+        let current: i64 = crate::domain::EMBEDDING_DIM as i64;
+
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [schema::META_KEY_EMBEDDING_DIM],
+                |row| {
+                    let v: String = row.get(0)?;
+                    Ok(v.parse::<i64>().ok())
+                },
+            )
+            .unwrap_or(None);
+
+        let effective = stored.or_else(|| Self::vec0_dim_from_sqlite_master(conn));
+
+        match effective {
+            Some(dim) if dim == current => {} // match, nothing to do
+            Some(dim) => {
+                tracing::warn!(
+                    "[vec] Embedding dim changed: on-disk={} current={}. \
+                     Dropping node_vectors and rebuilding at the new dim. \
+                     Existing vectors were invalid for the new model.",
+                    dim, current
+                );
+                // Atomically drop + recreate so a mid-statement failure can't
+                // leave the DB with no vec0 table at all.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
+                tx.execute_batch(&schema::create_vec_tables_sql())?;
+                tx.commit()?;
+            }
+            None => {
+                tracing::debug!("[vec] No prior vec0 table found; recording embedding_dim={}", current);
+            }
+        }
+
+        // Upsert current dim (idempotent — same value on match).
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [schema::META_KEY_EMBEDDING_DIM, &current.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Parse `float[N]` from the node_vectors DDL stored in sqlite_master.sql.
+    /// Returns None when the table doesn't exist or the DDL shape is unexpected.
+    fn vec0_dim_from_sqlite_master(conn: &rusqlite::Connection) -> Option<i64> {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let start = sql.find("float[")?;
+        let remainder = &sql[start + 6..];
+        let end = remainder.find(']')?;
+        remainder[..end].trim().parse::<i64>().ok()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_v7_records_embedding_dim_on_fresh_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let db = Database::open_with_vec(&db_path).unwrap();
+
+        let stored: String = db.conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [schema::META_KEY_EMBEDDING_DIM],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, crate::domain::EMBEDDING_DIM.to_string());
+    }
+
+    #[test]
+    fn test_embedding_dim_mismatch_rebuilds_vec_table() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let current_dim = crate::domain::EMBEDDING_DIM as i64;
+
+        // First open: normal path records dim
+        drop(Database::open_with_vec(&db_path).unwrap());
+
+        // Simulate a model swap by poisoning meta with a wrong dim.
+        let fake_dim = current_dim + 1;
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute(
+                "UPDATE meta SET value = ?1 WHERE key = ?2",
+                [&fake_dim.to_string(), schema::META_KEY_EMBEDDING_DIM],
+            )
+            .unwrap();
+        }
+
+        // Reopen: guard should detect mismatch, drop + recreate node_vectors,
+        // and upsert current dim.
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let stored: i64 = db.conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
+                [schema::META_KEY_EMBEDDING_DIM],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, current_dim,
+            "stored dim must be upserted back to current EMBEDDING_DIM"
+        );
+        // node_vectors must exist and be empty (rebuilt)
+        let count: i64 = db.conn()
+            .query_row("SELECT COUNT(*) FROM node_vectors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_v6_upgrade_rebuilds_vec_table_when_dim_differs() {
+        // Reproduces the adversarial I1 scenario: a v6 DB already has a
+        // node_vectors vec0 table at a dim different from the current
+        // EMBEDDING_DIM (e.g., user rebuilt the binary with a new model).
+        // Without sqlite_master introspection, the v6→v7 migration would
+        // silently stamp the current dim into meta while leaving the old
+        // vec0 in place — every subsequent INSERT would fail at runtime.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let current_dim = crate::domain::EMBEDDING_DIM as i64;
+        let fake_dim = if current_dim == 128 { 256 } else { 128 };
+
+        // Hand-craft a v6 DB with a wrong-dim vec0 table.
+        {
+            register_sqlite_vec();
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE node_vectors USING vec0(
+                    node_id INTEGER PRIMARY KEY,
+                    embedding float[{}]
+                );",
+                fake_dim
+            ))
+            .unwrap();
+            c.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        // Reopen: guard must introspect actual vec0 dim, detect mismatch,
+        // drop + rebuild at current dim, and stamp meta.
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let actual = Database::vec0_dim_from_sqlite_master(db.conn()).unwrap();
+        assert_eq!(
+            actual, current_dim,
+            "node_vectors must be rebuilt at current EMBEDDING_DIM after v6→v7 upgrade"
+        );
+        let stored: String = db.conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [schema::META_KEY_EMBEDDING_DIM],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, current_dim.to_string());
+    }
+
+    #[test]
+    fn test_v6_to_v7_migration_adds_meta_table() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Build a v6 database by hand, then verify open upgrades it to v7.
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            // Minimal v6 shape: we don't need full tables for this test — just
+            // set user_version=6 so the migration path fires on reopen.
+            c.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let db = Database::open_with_vec(&db_path).unwrap();
+        // Meta table exists and has our dim recorded
+        let stored: String = db.conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [schema::META_KEY_EMBEDDING_DIM],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, crate::domain::EMBEDDING_DIM.to_string());
+
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_open_readonly_rejects_writes() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        // Primary bootstrap: create the DB normally.
+        drop(Database::open(&db_path).unwrap());
+
+        // Secondary opens read-only.
+        let ro = Database::open_readonly(&db_path).unwrap();
+
+        // Reads work.
+        let count: i64 = ro.conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Writes must fail at the SQLite layer — not bubble up as silent no-ops.
+        let err = ro.conn()
+            .execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) \
+                 VALUES ('a', 'b', 0, 'rust', 0)",
+                [],
+            )
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only") || msg.contains("read only"),
+            "Expected read-only error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_open_readonly_missing_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such.db");
+        assert!(Database::open_readonly(&missing).is_err());
+    }
 
     #[test]
     fn test_init_creates_db_and_tables() {

@@ -8,6 +8,11 @@ pub struct ParsedRelation {
     pub target_name: String,
     pub relation: String,
     pub metadata: Option<String>,
+    /// Language of the file that produced this relation. Stamped by
+    /// `extract_relations_from_tree`; used by the edge resolver in pipeline.rs
+    /// to enforce same-language hard equality on cross-file `calls` edges
+    /// (prevents false positives like Python `foo()` matching a C `foo()`).
+    pub source_language: String,
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
@@ -20,6 +25,12 @@ pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, langu
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
     walk_for_relations(tree.root_node(), source, language, &config, None, None, &mut relations, 0);
+    // Stamp source_language on every relation. walk_for_relations constructs
+    // ParsedRelation with source_language: String::new(), and we fill it in
+    // here so every call site inside walk doesn't need to propagate language.
+    for r in &mut relations {
+        r.source_language = language.to_string();
+    }
     relations
 }
 
@@ -122,6 +133,7 @@ fn walk_for_relations(
                                     target_name: segment,
                                     relation: REL_IMPORTS.into(),
                                     metadata: None,
+                                    source_language: String::new(),
                                 });
                             }
                         }
@@ -142,6 +154,7 @@ fn walk_for_relations(
                         target_name: callee,
                         relation: REL_CALLS.into(),
                         metadata: None,
+                        source_language: String::new(),
                     });
                 }
             }
@@ -161,6 +174,7 @@ fn walk_for_relations(
                             target_name: short_name.to_string(),
                             relation: REL_CALLS.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -182,6 +196,7 @@ fn walk_for_relations(
                                     target_name: string_val,
                                     relation: REL_IMPORTS.into(),
                                     metadata: None,
+                                    source_language: String::new(),
                                 });
                             }
                         }
@@ -193,6 +208,7 @@ fn walk_for_relations(
                         target_name: method_name.to_string(),
                         relation: REL_CALLS.into(),
                         metadata: None,
+                        source_language: String::new(),
                     });
                 }
             }
@@ -237,6 +253,7 @@ fn walk_for_relations(
                             target_name: name,
                             relation: REL_CALLS.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -276,6 +293,7 @@ fn walk_for_relations(
                                     target_name: name,
                                     relation: REL_IMPORTS.into(),
                                     metadata: None,
+                                    source_language: String::new(),
                                 });
                             }
                         }
@@ -299,6 +317,7 @@ fn walk_for_relations(
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
                                 metadata: None,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -337,6 +356,7 @@ fn walk_for_relations(
                                         target_name: name,
                                         relation: REL_IMPORTS.into(),
                                         metadata: None,
+                                        source_language: String::new(),
                                     });
                                 }
                             }
@@ -364,6 +384,7 @@ fn walk_for_relations(
                         target_name: parent,
                         relation: REL_INHERITS.into(),
                         metadata: None,
+                        source_language: String::new(),
                     });
                 }
 
@@ -397,6 +418,7 @@ fn walk_for_relations(
                                             target_name: method_name.to_string(),
                                             relation: REL_IMPLEMENTS.into(),
                                             metadata: None,
+                                            source_language: String::new(),
                                         });
                                     }
                                 }
@@ -424,6 +446,7 @@ fn walk_for_relations(
                             target_name: pkg_name.to_string(),
                             relation: REL_IMPORTS.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -449,6 +472,7 @@ fn walk_for_relations(
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
                                 metadata: None,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -479,6 +503,7 @@ fn walk_for_relations(
                             target_name: base_name,
                             relation: rel.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -505,6 +530,7 @@ fn walk_for_relations(
                                 target_name: name,
                                 relation: REL_CALLS.into(),
                                 metadata: None,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -618,6 +644,7 @@ fn extract_rust_use_imports(
             target_name: name,
             relation: REL_IMPORTS.into(),
             metadata: None,
+            source_language: String::new(),
         });
     }
 }
@@ -637,6 +664,7 @@ fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) -> Option<Par
         target_name: trait_name,
         relation: REL_IMPLEMENTS.into(),
         metadata: None,
+        source_language: String::new(),
     })
 }
 
@@ -704,6 +732,7 @@ fn extract_import_names(node: &tree_sitter::Node, source: &str, results: &mut Ve
                             target_name: name,
                             relation: REL_IMPORTS.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -729,6 +758,7 @@ fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, resul
                 target_name: name,
                 relation: REL_IMPORTS.into(),
                 metadata: None,
+                source_language: String::new(),
             });
         }
         return;
@@ -760,6 +790,7 @@ fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, 
                 target_name: name,
                 relation: REL_IMPORTS.into(),
                 metadata: None,
+                source_language: String::new(),
             });
         }
         return;
@@ -789,6 +820,7 @@ fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: 
                         target_name: name,
                         relation: REL_IMPORTS.into(),
                         metadata: Some(metadata),
+                        source_language: String::new(),
                     });
                 }
             } else if child.kind() == "aliased_import" {
@@ -805,6 +837,7 @@ fn extract_python_import_names(node: &tree_sitter::Node, source: &str, results: 
                             target_name: name,
                             relation: REL_IMPORTS.into(),
                             metadata: Some(metadata),
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -842,6 +875,7 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
                                 metadata,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -859,6 +893,7 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                             target_name: name,
                             relation: REL_IMPORTS.into(),
                             metadata,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -875,6 +910,7 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                                 target_name: name,
                                 relation: REL_IMPORTS.into(),
                                 metadata,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -889,6 +925,7 @@ fn extract_python_from_import_names(node: &tree_sitter::Node, source: &str, resu
                         target_name: "*".into(),
                         relation: REL_IMPORTS.into(),
                         metadata,
+                        source_language: String::new(),
                     });
                 }
                 _ => {}
@@ -1039,6 +1076,7 @@ fn extract_implements(
                                             target_name: node_text(&type_node, source).to_string(),
                                             relation: REL_IMPLEMENTS.into(),
                                             metadata: None,
+                                            source_language: String::new(),
                                         });
                                     }
                                     // Handle generic_type: IService<T> -> extract IService
@@ -1050,6 +1088,7 @@ fn extract_implements(
                                                     target_name: node_text(&name_node, source).to_string(),
                                                     relation: REL_IMPLEMENTS.into(),
                                                     metadata: None,
+                                                    source_language: String::new(),
                                                 });
                                             }
                                         }
@@ -1073,6 +1112,7 @@ fn extract_implements(
                                     target_name: name,
                                     relation: REL_IMPLEMENTS.into(),
                                     metadata: None,
+                                    source_language: String::new(),
                                 });
                             }
                         }
@@ -1092,6 +1132,7 @@ fn extract_implements(
                                             target_name: node_text(&type_node, source).to_string(),
                                             relation: REL_IMPLEMENTS.into(),
                                             metadata: None,
+                                            source_language: String::new(),
                                         });
                                     }
                                 }
@@ -1104,6 +1145,7 @@ fn extract_implements(
                                 target_name: node_text(&inner, source).to_string(),
                                 relation: REL_IMPLEMENTS.into(),
                                 metadata: None,
+                                source_language: String::new(),
                             });
                         }
                     }
@@ -1136,6 +1178,7 @@ fn extract_export_names(
                             target_name: name,
                             relation: REL_EXPORTS.into(),
                             metadata: None,
+                            source_language: String::new(),
                         });
                     }
                 }
@@ -1153,6 +1196,7 @@ fn extract_export_names(
                                         target_name: name,
                                         relation: REL_EXPORTS.into(),
                                         metadata: None,
+                                        source_language: String::new(),
                                     });
                                 }
                             }
@@ -1218,6 +1262,7 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             target_name: handler_name,
             relation: REL_ROUTES_TO.into(),
             metadata: Some(metadata),
+            source_language: String::new(),
         })
     } else if matches!(handler_arg.kind(), "arrow_function" | "function_expression" | "function") {
         // Inline handler: router.post('/path', async (req, res) => { ... })
@@ -1236,6 +1281,7 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             target_name: "<module>".into(),
             relation: REL_ROUTES_TO.into(),
             metadata: Some(metadata),
+            source_language: String::new(),
         })
     } else {
         None
@@ -1272,6 +1318,7 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
         target_name: handler,
         relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
+        source_language: String::new(),
     })
 }
 
@@ -1331,6 +1378,7 @@ fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Option<Parsed
         target_name: func_name.to_string(),
         relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
+        source_language: String::new(),
     })
 }
 
@@ -1410,6 +1458,7 @@ fn extract_dart_imports(
                 target_name: import_name,
                 relation: REL_IMPORTS.into(),
                 metadata: None,
+                source_language: String::new(),
             });
         }
     }
@@ -1474,6 +1523,7 @@ fn extract_dart_calls(
                 target_name: callee,
                 relation: REL_CALLS.into(),
                 metadata: None,
+                source_language: String::new(),
             });
         }
     }
@@ -2170,5 +2220,40 @@ impl McpServer {
             "lock_or_recover not found in: {:?}", calls);
         assert!(calls.iter().any(|(_, t)| *t == "record_tool_call"),
             "record_tool_call not found in: {:?}", calls);
+    }
+
+    /// Every ParsedRelation returned by extract_relations must be stamped with
+    /// the source language of its originating file. This invariant underpins
+    /// the same-language edge resolution in pipeline.rs; a parser regression
+    /// that silently returned empty source_language would reintroduce the
+    /// cross-language false-positive calls edges we guarded against.
+    #[test]
+    fn test_source_language_stamped_on_all_relations() {
+        // One minimal sample per supported language. We only assert:
+        //   (a) every returned relation carries the right source_language stamp
+        //   (b) across all cases combined, at least one relation was produced
+        //       (guards against the parser regressing to "zero relations globally")
+        let cases = &[
+            ("rust", "fn a() { b(); } fn b() {}"),
+            ("javascript", "function a() { b(); } function b() {}"),
+            ("typescript", "function a() { b(); } function b() {}"),
+            ("go", "package p\nfunc a() { b() }\nfunc b() {}\n"),
+        ];
+        let mut total_relations = 0usize;
+        for (lang, src) in cases {
+            let relations = extract_relations(src, lang).unwrap();
+            total_relations += relations.len();
+            for r in &relations {
+                assert_eq!(
+                    r.source_language, *lang,
+                    "{}: relation {:?} → {:?} has wrong source_language {:?}",
+                    lang, r.source_name, r.target_name, r.source_language
+                );
+            }
+        }
+        assert!(
+            total_relations > 0,
+            "expected at least one relation across all language samples — parser regression?"
+        );
     }
 }

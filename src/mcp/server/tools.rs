@@ -981,7 +981,7 @@ impl McpServer {
             }));
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
         let fw = FileWatcher::start(project_root, tx)?;
         *watcher_guard = Some(WatcherState {
             _watcher: fw,
