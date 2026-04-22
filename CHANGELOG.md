@@ -1,5 +1,114 @@
 # Changelog
 
+## v0.15.0 — same-language edge resolution, JS require() imports, markdown indexing, JS test-block detection
+
+Multi-front accuracy pass motivated by user feedback that code-graph was
+useful in Rust projects but under-utilized in JS / mixed / claudemd
+projects. Traced to four compounding issues; all four fixed in this
+release with regression tests.
+
+### Same-language edge resolution — eliminates cross-language phantom edges
+
+`src/indexer/pipeline.rs` resolved call/implements/imports target names
+via a flat global bare-name lookup. In mixed-language projects this
+produced catastrophic false positives: the Rust `hasher.update(&buf)`
+call in `src/indexer/merkle.rs:hash_file` was resolving to the JS
+`function update()` in `claude-plugin/scripts/lifecycle.js`, pulling
+11 phantom Rust→JS edges into `callgraph hash_file` (verified via
+dogfood before/after). Each same-named method (`update`, `open`,
+`init`, `run`, `read`, `write`, etc.) was a collision vector.
+
+Fix: edge resolution now uses a three-tier cascade — `same-file` →
+`same-language` → (for calls: drop; for imports/implements: global
+fallback to preserve the existing `<external>` sentinel path).
+Non-call relations keep cross-language fallback because sentinel
+nodes carry language `"external"` by design.
+
+Mechanically, `get_all_node_names_with_ids` and the per-batch
+`node_id_to_path` map now carry each node's `language`, enabling the
+filter. Public type alias `NameEntry = (i64, String, Option<String>)`
+added to keep clippy `type_complexity` happy.
+
+Regression test `test_cross_language_bare_name_call_resolution`
+plants an `update` collision across a Rust file and a JS file and
+asserts that Rust `caller_rs` does not resolve any call edge to the
+JS file.
+
+### CommonJS `require()` — JS import edges appear for the first time
+
+`src/parser/relations.rs` handled ES module `import` statements but
+had no branch for `require(...)` calls, the canonical CommonJS form.
+Consequence: Node.js code bases (including this repo's own
+`claude-plugin/scripts/*.js`) had 3 total `imports` edges across 19
+JS files before the fix. After the fix: 286 edges (path 27, fs 24,
+child_process 18, os 17, plus local modules).
+
+Require detection inserted into the existing `call_expression` arm;
+handles `node:fs` scheme normalization and strips `.js`/`.ts`/`.mjs`/
+`.cjs` suffixes so `require('./utils/version-utils.js')` resolves to
+the same target as an ES `import` binding named `version-utils`.
+Unresolved imports flow into the existing Phase 2b-ext external-
+sentinel mechanism (previously only wired for implements), so
+`<external>/fs` nodes now exist and are discoverable via `deps <file>`
+dependency graphs.
+
+Two new tests: `test_extract_js_commonjs_require` (parser level,
+covers node scheme + extension stripping + relative paths) and
+`test_js_require_creates_external_import_edges` (pipeline level,
+end-to-end DB assertion).
+
+### Markdown heading indexing — claudemd / docs projects become navigable
+
+Added `tree-sitter-md = "0.3"` (pinned to 0.3 because 0.5.x ships
+tree-sitter ABI 15 and this repo still runs tree-sitter 0.24 / ABI 14).
+`detect_language` accepts `.md` / `.mdx`; `LanguageConfig` exposes
+"markdown" for the default-config fallthrough; `extract_nodes` new arms
+for `atx_heading` (walks marker children to infer level 1–6) and
+`setext_heading` (paragraph + `setext_h{1,2}_underline`). Heading text
+becomes the node name, `h1`..`h6` the node type. Searchable via FTS;
+visible in `module_overview` and `project_map`.
+
+Dogfood: this repo's README, CHANGELOG, and 4 plugin docs now yield
+145 heading nodes. `code-graph-mcp search "Installation"` returns
+`h2 Installation README.md:117` as the top hit.
+
+Shell and JSON indexing deferred — tree-sitter-bash adds real value
+for hook-script projects; JSON alone is low-yield because the useful
+relations (hook → script name) cross file formats. Both tracked as
+follow-up.
+
+### JS `describe` / `it` / `test` AST blocks mark nested code as test
+
+`LanguageConfig::has_test_attributes = false` for JS/TS because the
+test framework is function-call-driven, not attribute-driven. The
+existing `is_test_symbol` file-path heuristic caught `.test.js` /
+`.spec.js` / `__tests__/` patterns but missed **in-source** test code
+(Vitest in-source testing, Jest co-location without the suffix, or
+any file that mixes prod + test definitions).
+
+`extract_nodes` now intercepts `call_expression` nodes whose function
+head is one of `describe`, `it`, `test`, `suite`, `context`,
+`beforeEach`, `beforeAll`, `afterEach`, `afterAll`, `before`, `after`,
+`fdescribe`, `xdescribe`, `fit`, `xit` (both bare and `.only` / `.skip`
+/ `.each` member forms). Child argument nodes recurse with
+`in_test_context = true` which flows into the existing `is_test` field
+on every nested function / class / method.
+
+Regression: `test_parse_js_describe_it_marks_nested_as_test` plants
+6 definitions across `describe` / `it` / `it.skip` / `beforeEach`
+nesting and asserts the `is_test` propagation is correct (plus a
+top-level prod function stays `is_test=false`).
+
+### Test + dogfood summary
+
+367 total tests pass (+4 net new). `cargo +1.95.0 clippy --all-targets
+-- -D warnings` clean. Full rebuild on this repo: 84 files → 1295
+nodes → 2590 edges (was 1068 / 2300 pre-release). Net per-dimension:
+- phantom Rust→JS call edges: 11 → 0
+- JS imports edges: 3 → 286
+- markdown heading nodes: 0 → 145
+- indexed languages: 16 → 17
+
 ## v0.14.5 — FK-recovery fix, rebuild_index busy-timeout relief, error-kind telemetry
 
 Patch release. Drops six observed bug classes surfaced by a full-fleet

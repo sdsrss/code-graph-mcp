@@ -117,6 +117,37 @@ fn extract_nodes(
         return;
     }
 
+    // JS/TS test-framework call blocks (Jest/Mocha/Vitest/Node): describe()/it()/
+    // test()/beforeEach()/etc. Function definitions inside these callback args are
+    // test code, not production. Propagate in_test_context so downstream filters
+    // (is_test_symbol_or_annotated) can exclude them.
+    if matches!(config.name, "javascript" | "typescript" | "tsx")
+        && kind == "call_expression"
+        && !in_test_context
+    {
+        if let Some(fn_node) = node.child_by_field_name("function") {
+            let fn_text = node_text(&fn_node, source);
+            // Match bare names and member forms like `describe.only`, `it.skip`, `test.each`.
+            let head = fn_text.split('.').next().unwrap_or(fn_text);
+            let is_test_block = matches!(head,
+                "describe" | "it" | "test" | "suite" | "context" |
+                "beforeEach" | "beforeAll" | "afterEach" | "afterAll" |
+                "before" | "after" | "fdescribe" | "xdescribe" | "fit" | "xit"
+            );
+            if is_test_block {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    for i in 0..args.named_child_count() {
+                        if let Some(child) = args.named_child(i) {
+                            extract_nodes(child, source, language, config, parent_class,
+                                results, depth + 1, true);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     // Check if this specific node has #[test] or #[cfg(test)] attributes
     let node_is_test = in_test_context || (config.has_test_attributes && has_test_attribute(&node, source));
 
@@ -405,6 +436,76 @@ fn extract_nodes(
                 let mut pn = make_simple_node("constant", name, &node, source, node_is_test);
                 pn.return_type = type_annotation;
                 results.push(pn);
+            }
+        }
+
+        // Markdown ATX heading: `# Title`, `## Subtitle`. Produces h1..h6 nodes so
+        // headings are searchable via FTS and browsable via module_overview.
+        "atx_heading" if config.name == "markdown" => {
+            let mut level = 1usize;
+            let mut text: Option<String> = None;
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    match child.kind() {
+                        "atx_h1_marker" => level = 1,
+                        "atx_h2_marker" => level = 2,
+                        "atx_h3_marker" => level = 3,
+                        "atx_h4_marker" => level = 4,
+                        "atx_h5_marker" => level = 5,
+                        "atx_h6_marker" => level = 6,
+                        "inline" => text = Some(node_text(&child, source).trim().to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(title) = text.filter(|s| !s.is_empty()) {
+                results.push(ParsedNode {
+                    node_type: format!("h{}", level),
+                    name: title.clone(),
+                    qualified_name: Some(title),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    code_content: truncate_code_content(node_text(&node, source)).into_owned(),
+                    signature: None,
+                    doc_comment: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                });
+            }
+        }
+
+        // Markdown setext heading: `Title\n=====` or `Subtitle\n-----` — paragraph
+        // + underline. The paragraph child's inline text is the heading name.
+        "setext_heading" if config.name == "markdown" => {
+            let mut level = 1usize;
+            let mut text: Option<String> = None;
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    match child.kind() {
+                        "setext_h1_underline" => level = 1,
+                        "setext_h2_underline" => level = 2,
+                        "paragraph" => {
+                            text = Some(node_text(&child, source).trim().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(title) = text.filter(|s| !s.is_empty()) {
+                results.push(ParsedNode {
+                    node_type: format!("h{}", level),
+                    name: title.clone(),
+                    qualified_name: Some(title),
+                    start_line: node.start_position().row as u32 + 1,
+                    end_line: node.end_position().row as u32 + 1,
+                    code_content: truncate_code_content(node_text(&node, source)).into_owned(),
+                    signature: None,
+                    doc_comment: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                });
             }
         }
 
@@ -802,6 +903,55 @@ fn extract_dart_declaration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_js_describe_it_marks_nested_as_test() {
+        let code = r#"
+function prodFn() { return 1; }
+
+describe('Suite', () => {
+    function helper() { return 2; }
+    const arrow = () => 3;
+    it('works', () => {
+        function innerFn() { return 4; }
+    });
+    it.skip('skipped', () => {
+        function skippedFn() {}
+    });
+});
+
+beforeEach(() => {
+    function setupFn() {}
+});
+"#;
+        let nodes = parse_code(code, "javascript").unwrap();
+        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
+            .map(|n| (n.name.as_str(), n.is_test))
+            .collect();
+        assert_eq!(by_name.get("prodFn").copied(), Some(false),
+            "prodFn outside describe must NOT be is_test; nodes: {:?}",
+            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
+        assert_eq!(by_name.get("helper").copied(), Some(true), "helper inside describe → is_test");
+        assert_eq!(by_name.get("arrow").copied(), Some(true), "arrow inside describe → is_test");
+        assert_eq!(by_name.get("innerFn").copied(), Some(true), "innerFn inside it → is_test");
+        assert_eq!(by_name.get("skippedFn").copied(), Some(true), "skippedFn inside it.skip → is_test");
+        assert_eq!(by_name.get("setupFn").copied(), Some(true), "setupFn inside beforeEach → is_test");
+    }
+
+    #[test]
+    fn test_parse_markdown_headings() {
+        let code = "# Project Overview\n\nIntro.\n\n## Module Layout\n\ndetails\n\n### Important Patterns\n\nSubsection X\n--------------\n";
+        let nodes = parse_code(code, "markdown").unwrap();
+        let by_name: std::collections::HashMap<&str, &str> = nodes.iter()
+            .map(|n| (n.name.as_str(), n.node_type.as_str()))
+            .collect();
+        assert_eq!(by_name.get("Project Overview").copied(), Some("h1"),
+            "nodes: {:?}", nodes.iter().map(|n| (&n.name, &n.node_type)).collect::<Vec<_>>());
+        assert_eq!(by_name.get("Module Layout").copied(), Some("h2"));
+        assert_eq!(by_name.get("Important Patterns").copied(), Some("h3"));
+        assert_eq!(by_name.get("Subsection X").copied(), Some("h2"),
+            "setext h2 (dashes) should be detected");
+    }
 
     #[test]
     fn test_parse_typescript_functions() {

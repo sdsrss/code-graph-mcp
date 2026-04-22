@@ -79,6 +79,7 @@ impl LanguageConfig {
                     "swift" => "swift",
                     "html" => "html",
                     "css" => "css",
+                    "markdown" => "markdown",
                     _ => "unknown",
                 };
                 Self {

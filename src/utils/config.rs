@@ -22,6 +22,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "php" => Some("php"),
         "swift" => Some("swift"),
         "dart" => Some("dart"),
+        "md" | "mdx" | "markdown" => Some("markdown"),
         _ => None,
     }
 }

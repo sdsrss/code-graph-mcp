@@ -19,6 +19,7 @@ pub fn get_language(name: &str) -> Option<Language> {
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         "dart" => Some(tree_sitter_dart_orchard::LANGUAGE.into()),
+        "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
         _ => None,
     }
 }

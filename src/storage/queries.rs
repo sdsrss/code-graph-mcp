@@ -395,19 +395,30 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
     Ok(results)
 }
 
-/// Load ALL node (name -> [(id, file_path)]) into a HashMap.
+/// Entry in a global name→node lookup: `(node_id, file_path, language)`.
+pub type NameEntry = (i64, String, Option<String>);
+
+/// Load ALL node (name -> [NameEntry]) into a HashMap.
 /// Used for building a global name resolution map once before the batch loop.
-pub fn get_all_node_names_with_ids(conn: &Connection) -> Result<HashMap<String, Vec<(i64, String)>>> {
+/// `language` enables same-language-preferred edge resolution to avoid
+/// cross-language bare-name collisions (e.g. Rust `hasher.update()` resolving
+/// to a JS `function update`).
+pub fn get_all_node_names_with_ids(conn: &Connection) -> Result<HashMap<String, Vec<NameEntry>>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT n.id, n.name, f.path FROM nodes n JOIN files f ON n.file_id = f.id"
+        "SELECT n.id, n.name, f.path, f.language FROM nodes n JOIN files f ON n.file_id = f.id"
     )?;
-    let mut map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    let mut map: HashMap<String, Vec<(i64, String, Option<String>)>> = HashMap::new();
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })?;
     for row in rows {
-        let (id, name, path) = row?;
-        map.entry(name).or_default().push((id, path));
+        let (id, name, path, language) = row?;
+        map.entry(name).or_default().push((id, path, language));
     }
     Ok(map)
 }
@@ -2666,7 +2677,7 @@ mod tests {
         // "alpha" should have 2 entries (from both files)
         let alpha_entries = map.get("alpha").unwrap();
         assert_eq!(alpha_entries.len(), 2, "alpha should have 2 entries");
-        let alpha_ids: Vec<i64> = alpha_entries.iter().map(|(id, _)| *id).collect();
+        let alpha_ids: Vec<i64> = alpha_entries.iter().map(|(id, _, _)| *id).collect();
         assert!(alpha_ids.contains(&nid1));
         assert!(alpha_ids.contains(&nid3));
 
@@ -2677,7 +2688,7 @@ mod tests {
         assert_eq!(beta_entries[0].1, "src/b.ts");
 
         // Check paths are correct for alpha entries
-        let alpha_paths: Vec<&str> = alpha_entries.iter().map(|(_, p)| p.as_str()).collect();
+        let alpha_paths: Vec<&str> = alpha_entries.iter().map(|(_, p, _)| p.as_str()).collect();
         assert!(alpha_paths.contains(&"src/a.ts"));
         assert!(alpha_paths.contains(&"src/b.ts"));
     }

@@ -94,6 +94,41 @@ fn walk_for_relations(
     match kind {
         // Call expressions
         "call_expression" => {
+            // JS/TS CommonJS: require('./foo') / require('pkg') → IMPORTS edge.
+            // Mirrors the Ruby `require` handling above; target is the last path
+            // segment so node_modules imports become `<external>` sentinels and
+            // relative imports can match a file module node by name.
+            if matches!(config.name, "javascript" | "typescript")
+                && node.child_by_field_name("function")
+                    .map(|f| node_text(&f, source) == "require")
+                    .unwrap_or(false)
+            {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    if let Some(first) = args.named_child(0) {
+                        if let Some(path) = extract_string_from_subtree(&first, source) {
+                            // Normalize `node:fs` → `fs`; strip trailing JS extensions.
+                            let normalized = path.strip_prefix("node:").unwrap_or(&path);
+                            let segment = normalized.trim_end_matches(".js")
+                                .trim_end_matches(".ts")
+                                .trim_end_matches(".mjs")
+                                .trim_end_matches(".cjs")
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(normalized)
+                                .to_string();
+                            if !segment.is_empty() {
+                                results.push(ParsedRelation {
+                                    source_name: "<module>".into(),
+                                    target_name: segment,
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             // Check for HTTP route registration patterns first
             if let Some(route_rel) = extract_route_pattern(&node, source, language) {
                 results.push(route_rel);
@@ -1477,6 +1512,26 @@ import jwt from 'jsonwebtoken';
             .map(|r| r.target_name.as_str())
             .collect();
         assert!(imports.contains(&"UserService"), "got imports: {:?}", imports);
+    }
+
+    #[test]
+    fn test_extract_js_commonjs_require() {
+        let code = r#"
+const fs = require('node:fs');
+const path = require('path');
+const lifecycle = require('./lifecycle');
+const versionUtils = require('../utils/version-utils.js');
+"#;
+        let relations = extract_relations(code, "javascript").unwrap();
+        let imports: Vec<&str> = relations.iter()
+            .filter(|r| r.relation == REL_IMPORTS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(imports.contains(&"fs"),        "expected fs import, got: {:?}", imports);
+        assert!(imports.contains(&"path"),      "expected path import, got: {:?}", imports);
+        assert!(imports.contains(&"lifecycle"), "expected lifecycle import, got: {:?}", imports);
+        assert!(imports.contains(&"version-utils"),
+            "expected stripped .js extension, got: {:?}", imports);
     }
 
     #[test]

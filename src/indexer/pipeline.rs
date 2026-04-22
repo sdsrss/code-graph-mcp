@@ -528,10 +528,12 @@ fn index_files(
     }
     let python_module_map = build_python_module_map(&all_python_paths);
 
-    // Pre-load global name->[(id, path)] map once before the batch loop.
+    // Pre-load global name->[(id, path, language)] map once before the batch loop.
     // This avoids a full table scan per batch in Phase 2 relation resolution.
     // The map is updated incrementally as each batch commits new nodes.
-    let mut global_name_map: HashMap<String, Vec<(i64, String)>> =
+    // `language` drives same-language-preferred resolution to avoid cross-language
+    // bare-name collisions (e.g. Rust `hasher.update()` resolving to JS `function update`).
+    let mut global_name_map: HashMap<String, Vec<crate::storage::queries::NameEntry>> =
         get_all_node_names_with_ids(db.conn())?;
 
     // Heavyweight per-file data used during Phase 1+2, dropped after each batch
@@ -709,22 +711,26 @@ fn index_files(
 
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
+        // Per-node language for same-language-preferred edge resolution (§ cross-lang collision).
+        let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
 
         // Add current batch's newly inserted nodes
         for pf in &batch_parsed {
             for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
                 name_to_ids.entry(name.clone()).or_default().push(*id);
                 node_id_to_path.insert(*id, pf.rel_path.clone());
+                node_id_to_language.insert(*id, Some(pf.language.clone()));
             }
         }
 
         // Add nodes from the global map, excluding those in current batch's files
         // (their old nodes were deleted and replaced by new ones above)
         for (name, entries) in &global_name_map {
-            for &(id, ref path) in entries {
+            for (id, path, language) in entries {
                 if !batch_file_paths.contains(path.as_str()) {
-                    name_to_ids.entry(name.clone()).or_default().push(id);
-                    node_id_to_path.insert(id, path.clone());
+                    name_to_ids.entry(name.clone()).or_default().push(*id);
+                    node_id_to_path.insert(*id, path.clone());
+                    node_id_to_language.insert(*id, language.clone());
                 }
             }
         }
@@ -789,7 +795,10 @@ fn index_files(
                     }
                 }
 
-                // Default resolution: global name-based lookup
+                // Default resolution: global name-based lookup with language-aware layering.
+                // Tier order: same-file → same-language → (calls: drop) / (other: global).
+                // Dropping calls without a same-language match prevents Rust `hasher.update()`
+                // binding to an unrelated JS `function update()` via bare-name collision.
                 let all_target_ids = name_to_ids.get(&rel.target_name)
                     .cloned()
                     .unwrap_or_default();
@@ -798,22 +807,42 @@ fn index_files(
                     .filter(|id| local_ids.contains(id))
                     .copied()
                     .collect();
+
+                let source_lang = pf.language.as_str();
+                let same_language_targets: Vec<i64> = all_target_ids.iter()
+                    .filter(|id| !local_ids.contains(id))
+                    .filter(|id| matches!(
+                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                        Some(l) if l == source_lang
+                    ))
+                    .copied()
+                    .collect();
+
                 let target_ids = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if rel.relation == REL_CALLS
                     && CROSS_FILE_CALL_NOISE.contains(&rel.target_name.as_str())
                 {
-                    // Skip cross-file edges for common stdlib method names
-                    // (e.g., "new", "default", "from") that produce false positives
-                    // when resolved by name alone without type context.
+                    // Stdlib method names (new/default/from) — drop regardless of language.
+                    continue;
+                } else if !same_language_targets.is_empty() {
+                    same_language_targets
+                } else if rel.relation == REL_CALLS {
+                    // No same-file, no same-language candidate → drop to avoid cross-language
+                    // false positives. Non-call edges keep global fallback below so external
+                    // sentinel nodes (imports/implements) still resolve.
                     continue;
                 } else {
                     all_target_ids
                 };
 
-                if target_ids.is_empty() && rel.relation == REL_IMPLEMENTS {
-                    // Unresolved implements target (e.g., external trait like Write, Default)
-                    // Collect for sentinel node creation in Phase 2b
+                if target_ids.is_empty()
+                    && (rel.relation == REL_IMPLEMENTS || rel.relation == REL_IMPORTS)
+                {
+                    // Unresolved implements target (external trait like Write, Default)
+                    // OR unresolved import target (JS `require('fs')`, unresolved JS
+                    // ES-import binding). Phase 2b-ext creates `<external>/<name>`
+                    // sentinel nodes so the dependency graph shows the link.
                     for &src_id in &source_ids {
                         unresolved_externals.push((src_id, rel.target_name.clone(), rel.relation.clone()));
                     }
@@ -982,17 +1011,18 @@ fn index_files(
 
         // Update global_name_map: remove old entries for batch files, add new ones
         for (_, entries) in global_name_map.iter_mut() {
-            entries.retain(|(_id, path)| !batch_file_paths.contains(path.as_str()));
+            entries.retain(|(_id, path, _lang)| !batch_file_paths.contains(path.as_str()));
         }
         global_name_map.retain(|_, entries| !entries.is_empty());
 
         // Convert to lightweight records — drops Tree and source string
         for pf in batch_parsed {
             // Add newly committed nodes to the global map
+            let pf_lang = Some(pf.language.clone());
             for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
                 global_name_map.entry(name.clone())
                     .or_default()
-                    .push((*id, pf.rel_path.clone()));
+                    .push((*id, pf.rel_path.clone(), pf_lang.clone()));
             }
             all_indexed.push(FileIndexed {
                 rel_path: pf.rel_path,
@@ -1147,6 +1177,98 @@ function handleLogin(req: Request) {
 
         // Verify context string was built
         assert!(nodes[0].context_string.is_some(), "context string should be set after Phase 3");
+    }
+
+    #[test]
+    fn test_cross_language_bare_name_call_resolution() {
+        // Regression: Rust method call `hasher.update(...)` was resolving to
+        // JS `function update()` via global bare-name lookup, producing phantom
+        // Rust → JS call edges in mixed projects. Fix: same-file > same-language
+        // tiers; drop call edges with no same-language candidate.
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        fs::create_dir_all(project_dir.path().join("src")).unwrap();
+        fs::create_dir_all(project_dir.path().join("scripts")).unwrap();
+
+        fs::write(project_dir.path().join("src/hasher.rs"), r#"
+pub fn caller_rs() {
+    let mut h = Hasher::new();
+    h.update(&[1, 2, 3]);
+    h.finalize();
+}
+"#).unwrap();
+
+        fs::write(project_dir.path().join("scripts/helper.js"), r#"
+function update() { return 1; }
+function caller_js() { update(); }
+"#).unwrap();
+
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        let rust_caller = crate::storage::queries::get_nodes_with_files_by_name(
+            db.conn(), "caller_rs",
+        ).unwrap();
+        let rust_caller = rust_caller.iter()
+            .find(|n| n.file_path == "src/hasher.rs")
+            .expect("Rust caller_rs should be indexed");
+        let edges = get_edges_from(db.conn(), rust_caller.node.id).unwrap();
+        for e in &edges {
+            if e.relation != REL_CALLS { continue; }
+            let tgt_path: Option<String> = db.conn().query_row(
+                "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+                [e.target_id], |row| row.get(0),
+            ).ok();
+            assert!(
+                !tgt_path.as_deref().unwrap_or("").ends_with(".js"),
+                "Rust caller must not resolve calls into JS; got edge → {:?}", tgt_path,
+            );
+        }
+
+        let js_caller = crate::storage::queries::get_nodes_with_files_by_name(
+            db.conn(), "caller_js",
+        ).unwrap();
+        let js_caller = js_caller.iter()
+            .find(|n| n.file_path == "scripts/helper.js")
+            .expect("JS caller_js should be indexed");
+        let js_edges = get_edges_from(db.conn(), js_caller.node.id).unwrap();
+        let js_call_targets: Vec<i64> = js_edges.iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .map(|e| e.target_id)
+            .collect();
+        assert!(!js_call_targets.is_empty(),
+            "JS caller_js → update edge within same file should still resolve");
+    }
+
+    #[test]
+    fn test_js_require_creates_external_import_edges() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        fs::write(project_dir.path().join("app.js"), r#"
+const fs = require('fs');
+const path = require('path');
+const lifecycle = require('./lifecycle');
+
+function main() { fs.readFileSync('x'); }
+"#).unwrap();
+
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        let imports: Vec<String> = db.conn().prepare(
+            "SELECT DISTINCT n2.name FROM edges e
+             JOIN nodes n ON n.id = e.source_id
+             JOIN files f ON f.id = n.file_id
+             JOIN nodes n2 ON n2.id = e.target_id
+             WHERE f.path = 'app.js' AND e.relation = 'imports'"
+        ).unwrap()
+         .query_map([], |row| row.get::<_, String>(0)).unwrap()
+         .filter_map(Result::ok)
+         .collect();
+
+        assert!(imports.contains(&"fs".to_string()),        "imports: {:?}", imports);
+        assert!(imports.contains(&"path".to_string()),      "imports: {:?}", imports);
+        assert!(imports.contains(&"lifecycle".to_string()), "imports: {:?}", imports);
     }
 
     #[test]
