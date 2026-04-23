@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.16.2 — cross-platform path normalization + watcher test stability
+
+Follow-up to v0.16.1. That release fixed Clippy on the 1.95 toolchain,
+which let the `Test` step run for the first time on macOS and Windows
+in this repo's CI matrix — and immediately surfaced a set of
+pre-existing cross-platform bugs the previous red baseline had been
+hiding. v0.16.2 addresses them.
+
+**Path normalization (fixes Windows runtime + tests):**
+- `src/indexer/merkle.rs` — new internal `normalize_rel_path(&Path)`
+  helper converts `\` to `/` on Windows. All relative paths that land
+  in the DB, CLI/MCP output, and gitignore-prefix checks now use `/`
+  on every platform. Without this, `starts_with(".git/")` style
+  filters only fired when the OS used `/`, and Windows users saw
+  `pkg\scripts\foo.js` in every tool response.
+- `src/indexer/watcher.rs` — notify events go through the same
+  normalizer before emission.
+- Fixes 4 pipeline tests and 2 merkle tests that were red on
+  `windows-latest` in v0.16.1 CI.
+
+**macOS FSEvents flake:**
+- `src/indexer/watcher.rs::tests::test_watcher_detects_file_changes`
+  — recv_timeout raised from 5s to 15s. macOS FSEvents coalescing on
+  loaded GH runners routinely exceeded 5s.
+- `src/mcp/server/tests::test_watcher_detects_changes_and_reindexes`
+  — replaced fixed 300ms sleep with bounded polling (40 × 200ms
+  ≈ 8s total), which is correct on slow hosts and instant on fast.
+
+**CI:**
+- `.github/workflows/release.yml` — post-publish smoke now reads
+  `map.json` via `fs.readFileSync('map.json',...)` instead of
+  `require('$tmpdir/map.json')`. On Git Bash under Windows,
+  `mktemp -d` returns a POSIX-looking `/tmp/tmp.XXXX` that Node.js
+  on Win32 cannot resolve; the `require` was failing despite the
+  file existing.
+
 ## v0.16.1 — JS edge resolution precision + CI clippy component fix
 
 **Parser / indexer correctness (JS/TS):**

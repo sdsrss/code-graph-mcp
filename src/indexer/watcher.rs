@@ -47,7 +47,10 @@ impl FileWatcher {
                     let paths: Vec<String> = event.paths.iter()
                         .filter_map(|p| {
                             match p.strip_prefix(&root_path) {
-                                Ok(rel) => rel.to_str().map(String::from),
+                                // Normalize `\` → `/` on Windows so the downstream
+                                // pipeline and DB consumers see the same path
+                                // shape they see on Unix (see merkle::normalize_rel_path).
+                                Ok(rel) => Some(crate::indexer::merkle::normalize_rel_path(rel)),
                                 Err(_) => {
                                     tracing::debug!("watcher: dropping out-of-root path {:?}", p);
                                     None
@@ -96,8 +99,10 @@ mod tests {
         // Create a file
         fs::write(tmp.path().join("test.ts"), "function foo() {}").unwrap();
 
-        // Wait for at least one event with a generous timeout (avoids flakiness on slow CI)
-        let first = rx.recv_timeout(Duration::from_secs(5))
+        // Wait for at least one event. macOS FSEvents (and loaded CI runners
+        // in general) can take several seconds to coalesce and emit; 5s was
+        // empirically flaky on GH macOS runners, 15s is not.
+        let first = rx.recv_timeout(Duration::from_secs(15))
             .expect("timed out waiting for watcher event");
         let mut events = vec![first];
         // Drain any additional buffered events

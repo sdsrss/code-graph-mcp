@@ -1755,14 +1755,17 @@ function handleLogin(req: Request) {
         // Modify file
         std::fs::write(project_dir.path().join("a.ts"), "function changed() {}").unwrap();
 
-        // Give watcher time to detect change
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        // Next ensure_indexed should detect change via watcher and run incremental
-        server.ensure_indexed().unwrap();
-
-        // Verify changed is now indexed
-        let nodes = queries::get_nodes_by_name(server.db().conn(), "changed").unwrap();
+        // Poll up to 8s for the watcher-triggered reindex to complete. FSEvents
+        // on macOS (and a cold CI runner in general) coalesces change events
+        // with 1–2s latency, so a fixed 300ms sleep flaked roughly every other
+        // macOS CI run. Bounded polling is correct-on-slow-host, cheap-on-fast.
+        let mut nodes = Vec::new();
+        for _ in 0..40 {
+            server.ensure_indexed().unwrap();
+            nodes = queries::get_nodes_by_name(server.db().conn(), "changed").unwrap();
+            if !nodes.is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         assert_eq!(nodes.len(), 1, "changed function should be indexed after watcher-triggered reindex");
 
         // Stop watching

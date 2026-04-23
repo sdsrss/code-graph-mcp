@@ -216,4 +216,9 @@ jobs:
           code-graph-mcp incremental-index --quiet
           code-graph-mcp map --json > map.json
           test -s map.json
-          node -e "const m = require('$tmpdir/map.json'); if (!m || typeof m !== 'object') { console.error('map.json is not a valid JSON object'); process.exit(1); } console.log('map OK:', Object.keys(m).slice(0, 5));"
+          # Use fs.readFileSync with a cwd-relative path so this works across
+          # shells where `$tmpdir` from `mktemp -d` is a POSIX-style path
+          # (`/tmp/tmp.XXXX` on Git Bash under Windows) that Node.js on
+          # Windows can't resolve. `node -e require('/tmp/...')` fails there
+          # because `/tmp/` doesn't exist in the Win32 filesystem view.
+          node -e "const m = JSON.parse(require('fs').readFileSync('map.json','utf8')); if (!m || typeof m !== 'object') { console.error('map.json is not a valid JSON object'); process.exit(1); } console.log('map OK:', Object.keys(m).slice(0, 5));"

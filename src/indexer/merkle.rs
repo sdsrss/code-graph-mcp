@@ -8,6 +8,27 @@ use rayon::prelude::*;
 
 use crate::utils::config::detect_language;
 
+/// Normalize a path's component separators to `/` regardless of host OS.
+///
+/// All code-graph relative paths (DB rows, CLI output, JSON responses,
+/// gitignore-style prefix checks) MUST use forward slashes. On Windows
+/// `Path::strip_prefix(...).to_string_lossy()` yields `pkg\scripts\foo.js`
+/// which breaks (1) literal `starts_with("src/")` checks, (2) cross-platform
+/// test assertions, (3) API contract parity between Linux and Windows
+/// users of the tool. This helper does the conversion on Windows and is
+/// a no-op on Unix.
+#[inline]
+pub(crate) fn normalize_rel_path(rel: &Path) -> String {
+    #[cfg(windows)]
+    {
+        rel.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        rel.to_string_lossy().to_string()
+    }
+}
+
 pub struct DiffResult {
     pub new_files: Vec<String>,
     pub changed_files: Vec<String>,
@@ -45,11 +66,11 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
         }
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(root) {
-            let rel_str = rel.to_string_lossy().to_string();
-            if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
+            let rel_str = normalize_rel_path(rel);
+            if rel_str == ".git" || rel_str.starts_with(".git/") {
                 continue;
             }
-            if rel_str.starts_with("vendor/") || rel_str.starts_with("vendor\\") {
+            if rel_str.starts_with("vendor/") {
                 continue;
             }
             if detect_language(&rel_str).is_none() {
@@ -121,7 +142,7 @@ pub fn scan_directory_cached(
             continue;
         }
         if let Ok(rel) = entry.path().strip_prefix(root) {
-            let rel_str = rel.to_string_lossy().to_string();
+            let rel_str = normalize_rel_path(rel);
             if rel_str.starts_with(".git") { continue; }
 
             if let Ok(meta) = entry.path().metadata() {
@@ -153,11 +174,11 @@ pub fn scan_directory_cached(
         }
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(root) {
-            let rel_str = rel.to_string_lossy().to_string();
-            if rel_str == ".git" || rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") {
+            let rel_str = normalize_rel_path(rel);
+            if rel_str == ".git" || rel_str.starts_with(".git/") {
                 continue;
             }
-            if rel_str.starts_with("vendor/") || rel_str.starts_with("vendor\\") {
+            if rel_str.starts_with("vendor/") {
                 continue;
             }
             if detect_language(&rel_str).is_none() {
@@ -165,7 +186,7 @@ pub fn scan_directory_cached(
             }
 
             let parent_dir = rel.parent()
-                .map(|p| p.to_string_lossy().to_string())
+                .map(normalize_rel_path)
                 .unwrap_or_default();
 
             // Track file mtime in the new cache
