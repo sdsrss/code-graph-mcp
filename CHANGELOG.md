@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.16.3 — macOS FSEvents root canonicalization
+
+Follow-up to v0.16.2. After the path-normalization fixes landed,
+Windows CI turned green but the two macOS watcher tests still
+timed out. Root cause: FSEvents emits every event path via realpath,
+so a watch registered on a non-canonical root like
+`/var/folders/xx/T/foo` (the `tempfile::TempDir` default on macOS)
+could never produce a prefix match against realpath output
+`/private/var/folders/...` — every event was silently dropped at
+`strip_prefix`.
+
+**Fix (`src/indexer/watcher.rs`):** `FileWatcher::start` canonicalizes
+the root path before passing it to notify. No-op on systems without
+symlinks in the path; unblocks macOS CI and also hardens production
+against project roots with symlinked ancestors (home-dir on systems
+where `/home` is a symlink to `/usr/home`, chrooted containers, etc.).
+
 ## v0.16.2 — cross-platform path normalization + watcher test stability
 
 Follow-up to v0.16.1. That release fixed Clippy on the 1.95 toolchain,
