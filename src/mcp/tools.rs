@@ -128,6 +128,7 @@ impl ToolRegistry {
                         "node_id": { "type": "integer", "description": "Exact node from a prior suggestion — overrides symbol_name. Use to disambiguate same-name defs in one file." },
                         "file_path": { "type": "string", "description": "Disambiguate same-name symbols across files" },
                         "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "all"], "description": "Relation type filter (default 'all')" },
+                        "include_tests": { "type": "boolean", "description": "Include references from test code (default true — tests are usage sites for rename audits). Set false to see production callers only." },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" }
                     }
                 }),

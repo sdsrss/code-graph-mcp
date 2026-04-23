@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.16.6 — semantic_code_search: doc demotion + find_references: include_tests
+
+Two MCP tool UX bugs surfaced during a user-simulation pass
+over the core 7 toolset on this very repo:
+
+**semantic_code_search: README headings outranked code.** Query
+`merkle tree change detection` returned `README.md` `License`
+(h2, 0.45) / `Features` (h2, 0.44) / `Build` (h3, 0.42) ahead
+of `DirectoryCache` struct in `src/indexer/merkle.rs` (0.37).
+Root: markdown heading nodes get respectable vector-similarity
+scores for unrelated queries (short heading text embeds close
+to many concepts), and the re-ranker (`name_boost` /
+`size_factor`) had no doc-tier preference. The tool is
+`semantic_code_*search*`; for code-intent queries, prose should
+not dominate.
+
+**Fix (`src/mcp/server/tools.rs:193-209`):** `doc_penalty = 0.4`
+multiplier applied when the candidate's language is `markdown`
+AND the caller did not pass `language="markdown"`. Same query
+after fix: TOP 6 all from `merkle.rs` / `watcher.rs`, first
+result `DirectoryCache` rose to 0.60. Explicit
+`language="markdown"` bypasses the penalty (verified
+`Installation` h2 comes back at 0.59 for "installation
+instructions" queries).
+
+**find_references: no test-filter opt-out.** `upsert_file`
+query returned 27 references, 24 of them `test_*` callers,
+drowning the 3 production usage sites. Inconsistent with
+`get_call_graph` and `get_ast_node include_impact=true`, which
+already default to hiding test callers.
+
+**Fix:** new `include_tests` boolean parameter (default `true`
+to preserve rename-audit semantics — tests ARE usage sites),
+plus `test_references_filtered` count in the response when
+callers opt out. Schema published in `src/mcp/tools.rs:131`.
+Call with `include_tests=false` to get production-only refs;
+call without the flag (or `true`) for the pre-v0.16.6
+behavior.
+
 ## v0.16.5 — impact_analysis: UNKNOWN risk for non-function symbols
 
 Three impact-analysis paths (`cmd_impact`, `tool_impact_analysis`,

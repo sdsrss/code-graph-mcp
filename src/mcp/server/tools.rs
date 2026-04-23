@@ -190,7 +190,18 @@ impl McpServer {
                     1.0
                 };
 
-                let adjusted = (base_score * name_boost * size_factor * 100.0).round() / 100.0;
+                // Doc penalty: markdown headings can match loosely via vector similarity
+                // for code-intent queries (the tool is `semantic_code_search`). When the
+                // caller has not explicitly requested markdown via `language="markdown"`,
+                // demote them so README/heading prose cannot outrank real code matches.
+                let doc_penalty = if nwf.language.as_deref() == Some("markdown")
+                    && language_filter != Some("markdown") {
+                    0.4
+                } else {
+                    1.0
+                };
+
+                let adjusted = (base_score * name_boost * size_factor * doc_penalty * 100.0).round() / 100.0;
                 candidates.push(Candidate { node, file_path: &nwf.file_path, adjusted_score: adjusted });
             }
         }
@@ -2091,6 +2102,9 @@ impl McpServer {
         let file_path = args["file_path"].as_str();
         let relation = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
+        // Default true preserves the "every usage site" contract for rename audits
+        // (tests must be renamed too). Pass false for "production callers only".
+        let include_tests = args["include_tests"].as_bool().unwrap_or(true);
 
         if node_id.is_none() && symbol_name_arg.is_none() {
             return Err(anyhow!("symbol_name or node_id is required"));
@@ -2179,9 +2193,16 @@ impl McpServer {
         // Collect references for all matching node IDs
         let mut all_refs: Vec<serde_json::Value> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut test_refs_filtered: usize = 0;
         for target_id in &target_ids {
             let refs = queries::get_incoming_references(self.db.conn(), *target_id, relation_filter)?;
             for r in refs {
+                // Test filter: caller (r.name + r.file_path) looks like a test node → skip
+                // unless caller opted in. Count separately so response shows the hidden total.
+                if !include_tests && is_test_symbol(&r.name, &r.file_path) {
+                    test_refs_filtered += 1;
+                    continue;
+                }
                 // Deduplicate by (name, file_path, relation)
                 let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
                 if seen.insert(key) {
@@ -2236,6 +2257,11 @@ impl McpServer {
             "by_relation": summary,
             "references": all_refs,
         });
+        if !include_tests && test_refs_filtered > 0 {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("test_references_filtered".to_string(), json!(test_refs_filtered));
+            }
+        }
         if is_type_def {
             if let Some(obj) = out.as_object_mut() {
                 obj.insert("type_definition_note".to_string(), json!(
