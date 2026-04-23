@@ -1702,13 +1702,17 @@ pub fn genuinely_dead_thing() {
 "#).unwrap();
     // Simulate a claude-plugin hook script — function invoked only via shell.
     fs::create_dir_all(project.path().join("claude-plugin/scripts")).unwrap();
+    // `uninstall` has no in-file caller here. It was self-called at module
+    // level in earlier versions of this fixture, but since the JS relation
+    // extractor now attributes module-level calls to `<module>` and those
+    // edges resolve same-file, adding a module-level `uninstall();` would
+    // make this function non-dead and defeat the ignore-prefix assertion.
     fs::write(project.path().join("claude-plugin/scripts/lifecycle.js"), r#"
 function uninstall() {
     console.log("hook cleanup step 1");
     console.log("hook cleanup step 2");
     console.log("hook cleanup step 3");
 }
-uninstall();
 "#).unwrap();
 
     let server = common::init_server(&project);

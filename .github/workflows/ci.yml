@@ -36,6 +36,8 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:

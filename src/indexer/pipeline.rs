@@ -840,7 +840,19 @@ fn index_files(
                     // Stdlib method names (new/default/from) — drop regardless of language.
                     continue;
                 } else if !same_language_targets.is_empty() {
-                    same_language_targets
+                    // Ambiguous cross-file same-language candidates (e.g. a helper
+                    // name like `readJson` defined in multiple JS files) used to
+                    // fan out — every same-name target got an edge, producing
+                    // phantom callers across unrelated modules. Refine by
+                    // non-test preference + longest common path prefix with the
+                    // caller file. See `refine_ambiguous_targets` for fallback
+                    // policy (keeps remaining pool on ambiguity to avoid
+                    // regressing dead-code on bare-name Rust scoped calls).
+                    refine_ambiguous_targets(
+                        &same_language_targets,
+                        &pf.rel_path,
+                        &node_id_to_path,
+                    )
                 } else if rel.relation == REL_CALLS {
                     // No same-file, no same-language candidate → drop to avoid cross-language
                     // false positives. Non-call edges keep global fallback below so external
@@ -1149,6 +1161,77 @@ fn index_files(
     })
 }
 
+/// Disambiguate N same-language cross-file candidates for a single call/import
+/// target. Returns a subset. A single-element result is the authoritative
+/// winner; ties fall back to the full input so the caller does not
+/// inadvertently drop legitimate edges.
+///
+/// Heuristic: (1) prefer non-test-file candidates when the caller is not
+/// itself a test file; (2) among the preferred pool, keep only those tied
+/// for the longest byte-common path prefix with the caller. Previous
+/// versions dropped on ambiguity, which regressed dead-code detection for
+/// bare-name Rust calls like `crate::domain::foo()` where scoped_identifier
+/// extraction keeps only `foo` and two `foo` definitions under `src/` tie
+/// on prefix — better to keep both edges than to report `foo` as dead.
+fn refine_ambiguous_targets(
+    candidates: &[i64],
+    caller_rel_path: &str,
+    node_id_to_path: &HashMap<i64, String>,
+) -> Vec<i64> {
+    if candidates.len() <= 1 {
+        return candidates.to_vec();
+    }
+
+    let is_test_path = |p: &str| {
+        p.contains(".test.") || p.contains("_test.")
+            || p.starts_with("tests/") || p.contains("/tests/")
+            || p.starts_with("test/") || p.contains("/test/")
+            || p.contains(".spec.")
+    };
+    let caller_is_test = is_test_path(caller_rel_path);
+
+    // Pass 1: prefer non-test candidates when the caller is non-test code.
+    let pool: Vec<i64> = if caller_is_test {
+        candidates.to_vec()
+    } else {
+        let non_test: Vec<i64> = candidates.iter().copied()
+            .filter(|id| {
+                let p = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
+                !is_test_path(p)
+            })
+            .collect();
+        if non_test.is_empty() { candidates.to_vec() } else { non_test }
+    };
+
+    if pool.len() == 1 { return pool; }
+
+    // Pass 2: keep only candidates tied for the longest common path prefix
+    // with the caller. Byte-wise prefix is a rough proxy for module locality
+    // — e.g. `claude-plugin/scripts/session-init.js` shares 21 bytes with
+    // `claude-plugin/scripts/lifecycle.js` but 0 bytes with `scripts/*`.
+    let prefix_len = |p: &str| -> usize {
+        caller_rel_path.bytes().zip(p.bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let max_prefix = pool.iter()
+        .map(|id| prefix_len(node_id_to_path.get(id).map(String::as_str).unwrap_or("")))
+        .max()
+        .unwrap_or(0);
+    let closest: Vec<i64> = pool.iter().copied()
+        .filter(|id| prefix_len(node_id_to_path.get(id).map(String::as_str).unwrap_or("")) == max_prefix)
+        .collect();
+
+    if closest.len() == 1 { return closest; }
+
+    // Still ambiguous — return the remaining pool rather than dropping. This
+    // keeps dead-code precision high for edges we cannot confidently prune
+    // (most notably Rust bare-name scoped calls) at the cost of leaving a
+    // small amount of fan-out; the single-winner fast path above handles
+    // the common case (unique non-test match, or unique closest path).
+    if !closest.is_empty() { closest } else { pool }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,6 +1366,108 @@ function main() { fs.readFileSync('x'); }
         assert!(imports.contains(&"fs".to_string()),        "imports: {:?}", imports);
         assert!(imports.contains(&"path".to_string()),      "imports: {:?}", imports);
         assert!(imports.contains(&"lifecycle".to_string()), "imports: {:?}", imports);
+    }
+
+    #[test]
+    fn test_js_same_name_cross_file_prefers_closest_path() {
+        // Regression: when JS defines the same helper name in multiple files
+        // (e.g., `readJson` in both `claude-plugin/scripts/lifecycle.js` and
+        // `scripts/install-e2e.test.js`), a caller in `claude-plugin/scripts/*`
+        // used to fan out an edge to every same-language match, producing
+        // false-positive callers across unrelated modules. The resolver must
+        // pick the candidate with the longest common path prefix to the
+        // caller file (and prefer non-test files) rather than all.
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        fs::create_dir_all(project_dir.path().join("pkg/scripts")).unwrap();
+        fs::create_dir_all(project_dir.path().join("tests")).unwrap();
+
+        fs::write(project_dir.path().join("pkg/scripts/lifecycle.js"), r#"
+function readJson(p) { return 1; }
+module.exports = { readJson };
+"#).unwrap();
+
+        fs::write(project_dir.path().join("pkg/scripts/session-init.js"), r#"
+function syncLifecycleConfig() { readJson('x'); }
+"#).unwrap();
+
+        fs::write(project_dir.path().join("tests/helpers.test.js"), r#"
+function readJson(p) { return 2; }
+"#).unwrap();
+
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        // Find the caller node
+        let caller = crate::storage::queries::get_nodes_with_files_by_name(
+            db.conn(), "syncLifecycleConfig",
+        ).unwrap();
+        let caller = caller.iter()
+            .find(|n| n.file_path == "pkg/scripts/session-init.js")
+            .expect("syncLifecycleConfig should be indexed");
+
+        let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
+        let call_edges: Vec<i64> = edges.iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .map(|e| e.target_id)
+            .collect();
+
+        // Resolve target paths
+        let target_paths: Vec<String> = call_edges.iter().filter_map(|tid| {
+            db.conn().query_row(
+                "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+                [*tid], |row| row.get(0)
+            ).ok()
+        }).collect();
+
+        // Must pick exactly the same-dir candidate, not fan out to the test file.
+        assert!(
+            target_paths.iter().any(|p| p == "pkg/scripts/lifecycle.js"),
+            "should resolve to same-dir readJson; got {:?}", target_paths
+        );
+        assert!(
+            !target_paths.iter().any(|p| p == "tests/helpers.test.js"),
+            "should NOT fan out to unrelated test-file readJson; got {:?}", target_paths
+        );
+    }
+
+    #[test]
+    fn test_js_module_level_test_callback_calls_resolve() {
+        // Regression: helpers defined in a JS test file that are called only
+        // from inside `test(() => {...})` / `describe(() => {...})` callbacks
+        // used to be reported as orphan by dead-code, because the anonymous
+        // arrow callback body attributed its calls to `<anonymous>`, a name
+        // that resolves to no node. Module-level call_expressions inside JS
+        // test files must attribute to `<module>` so a same-file edge lands.
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        fs::write(project_dir.path().join("helpers.test.js"), r#"
+function mkHome() { return '/tmp/x'; }
+function writeJson(p, v) { }
+
+test('uses helpers', () => {
+    const h = mkHome();
+    writeJson(h, { a: 1 });
+});
+"#).unwrap();
+
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+        // Both helper names must have at least one incoming call edge.
+        for helper in ["mkHome", "writeJson"] {
+            let cnt: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM edges e
+                 JOIN nodes tn ON tn.id = e.target_id
+                 JOIN files tf ON tf.id = tn.file_id
+                 WHERE tn.name = ?1 AND tf.path = 'helpers.test.js' AND e.relation = 'calls'",
+                [helper], |row| row.get(0),
+            ).unwrap();
+            assert!(cnt >= 1,
+                "{} should have at least one incoming call edge from the test callback, got {}",
+                helper, cnt);
+        }
     }
 
     #[test]

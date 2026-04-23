@@ -64,7 +64,14 @@ fn walk_for_relations(
                 })
         }
         "arrow_function" => {
-            // Try to get name from parent variable_declarator: const foo = () => {}
+            // `const foo = () => {}` → scope name is the binding.
+            // Other anonymous arrows (e.g. `test(() => {...})` callbacks,
+            // `.map(x => x)` inline lambdas) inherit the parent scope so
+            // calls inside them attribute to the enclosing named function
+            // or fall through to `<module>` at file top level. Returning
+            // `Some("<anonymous>")` here used to emit unresolvable edges
+            // (no node is named "<anonymous>"), silently dropping test
+            // callback calls and causing false-positive orphans.
             node.parent()
                 .filter(|p| p.kind() == "variable_declarator")
                 .and_then(|p| p.child_by_field_name("name"))
@@ -75,7 +82,6 @@ fn walk_for_relations(
                         None => name,
                     }
                 })
-                .or_else(|| Some("<anonymous>".to_string()))
         }
         // Dart: function_body is a sibling of method_signature in class_body
         // Look at previous sibling to find the method name
@@ -146,11 +152,22 @@ fn walk_for_relations(
                 results.push(route_rel);
             }
 
-            // Existing call relation extraction
-            if let Some(scope) = active_scope {
+            // Call relation extraction. For JS/TS/TSX, fall back to `<module>`
+            // when the call sits at file top level (imports, init code) or
+            // inside an anonymous callback (test/describe/it, Array.map, etc.)
+            // so same-file edges can still resolve. Other languages keep the
+            // named-scope-only rule to avoid polluting their callgraphs.
+            let call_scope: Option<String> = match active_scope {
+                Some(s) => Some(s.to_string()),
+                None if matches!(config.name, "javascript" | "typescript" | "tsx") => {
+                    Some("<module>".to_string())
+                }
+                None => None,
+            };
+            if let Some(scope) = call_scope {
                 if let Some(callee) = extract_callee_name(&node, source) {
                     results.push(ParsedRelation {
-                        source_name: scope.to_string(),
+                        source_name: scope,
                         target_name: callee,
                         relation: REL_CALLS.into(),
                         metadata: None,

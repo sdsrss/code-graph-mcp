@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.16.1 — JS edge resolution precision + CI clippy component fix
+
+**Parser / indexer correctness (JS/TS):**
+- `src/parser/relations.rs` — `walk_for_relations` no longer tags
+  anonymous arrow functions (`test(() => {...})`, `[1,2].map(x => x)`)
+  with the sentinel scope `<anonymous>`, which resolved to no source
+  node and silently dropped every call inside such callbacks. Arrows
+  without a `variable_declarator` parent now inherit the enclosing
+  scope; JS/TS/TSX calls at module top-level fall back to `<module>`
+  so they produce resolvable same-file edges. Test-file helpers like
+  `writeJson`, `mkHome`, `readCargoVersion` that are referenced only
+  from inside `test(...)` callbacks are no longer reported as orphan
+  dead code.
+- `src/indexer/pipeline.rs` — cross-file same-language resolution used
+  to fan out an edge to every same-name target whenever no same-file
+  match existed, turning a single `readJson()` call into N phantom
+  edges across unrelated modules. New `refine_ambiguous_targets`
+  prefers non-test candidates (when the caller is non-test code) and
+  the candidate with the longest byte-common path prefix; keeps the
+  remaining pool on true ties so Rust bare-name `crate::x::foo()`
+  calls that always tie on prefix don't get dropped.
+
+Before v0.16.1 this project indexed 28 cross-file JS `calls`
+fan-out edges, all of them pointing at the wrong target in at least
+one leg; after, 7 edges, each single-target and correct. `refs
+writeJson` rose from 2 → 5 (the 3 real test-callback callers
+previously lost).
+
+**CI:**
+- `.github/workflows/ci.yml` — `dtolnay/rust-toolchain@1.95.0` now
+  installs the `clippy` component explicitly. Without this, the
+  Clippy step failed with `'cargo-clippy' is not installed for the
+  toolchain '1.95.0'` on every OS/feature-matrix cell in v0.16.0.
+
 ## v0.16.0 — production hardening pass (RRF math, schema v7 dim guard, readonly secondary, bounded watcher, CI matrix)
 
 Architecture audit surfaced nine correctness / safety gaps — this
