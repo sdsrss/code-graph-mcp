@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.16.4 — watcher canonicalize: cfg-gate off Windows (UNC path trap)
+
+v0.16.3 canonicalized the watcher root on every platform to fix
+macOS FSEvents; on Windows that regressed the watcher because
+`std::fs::canonicalize` there returns UNC paths (`\\?\C:\...`) while
+the ReadDirectoryChangesW backend emits plain `C:\...` — the same
+`strip_prefix` silently-drop-all-events failure as before, mirrored.
+The canonicalize step is now cfg-gated to non-Windows only.
+
+Windows Release workflow (build + npm publish + smoke test) was
+always green because the watcher unit tests don't run there; this
+only surfaced on the CI matrix.
+
 ## v0.16.3 — macOS FSEvents root canonicalization
 
 Follow-up to v0.16.2. After the path-normalization fixes landed,

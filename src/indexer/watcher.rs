@@ -32,16 +32,19 @@ pub struct FileWatcher {
 
 impl FileWatcher {
     pub fn start(root: &Path, tx: mpsc::SyncSender<WatchEvent>) -> Result<Self> {
-        // Canonicalize so strip_prefix matches the form notify's event
-        // backends emit. macOS FSEvents reports paths via realpath, so a
-        // watch on `/var/folders/xx/T/foo` against a non-canonical `root`
-        // drops every event (the symlink target `/private/var/...` never
-        // has `/var/folders/...` as a prefix). Linux inotify and Windows
-        // ReadDirectoryChangesW don't need this, but canonicalizing on
-        // every platform is harmless (no-op when no symlinks) and keeps
-        // the contract platform-agnostic.
-        let root_path = root.canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf());
+        // macOS FSEvents reports event paths via realpath, so a watch on
+        // `/var/folders/xx/T/foo` against a non-canonical `root` drops
+        // every event at `strip_prefix` below (the symlink target
+        // `/private/var/...` never has `/var/folders/...` as a prefix).
+        // We canonicalize on Unix to fix this; on Windows we must NOT
+        // canonicalize, because `std::fs::canonicalize` there returns
+        // UNC paths (`\\?\C:\...`) while notify's ReadDirectoryChangesW
+        // backend emits plain `C:\...` paths — which would re-break
+        // `strip_prefix` in the other direction.
+        #[cfg(not(windows))]
+        let root_path = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        #[cfg(windows)]
+        let root_path = root.to_path_buf();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
