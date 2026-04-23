@@ -789,7 +789,7 @@ impl McpServer {
                 }
 
                 if include_impact {
-                    self.append_impact_summary(&mut result, &n.name, file_path)?;
+                    self.append_impact_summary(&mut result, &n.name, file_path, &n.node_type)?;
                 }
 
                 // Compact mode: strip code_content and context_string to save tokens
@@ -892,7 +892,7 @@ impl McpServer {
         }
 
         if include_impact {
-            self.append_impact_summary(&mut result, &node.name, &file_path)?;
+            self.append_impact_summary(&mut result, &node.name, &file_path, &node.node_type)?;
         }
 
         Ok(result)
@@ -900,7 +900,10 @@ impl McpServer {
 
     /// Append a lightweight impact summary to an existing result JSON.
     /// Reuses the impact_analysis query logic but returns a compact summary object.
-    pub(super) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str) -> Result<()> {
+    /// `node_type` is required so that impact on non-function symbols (constant /
+    /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
+    /// plus a warning, rather than a misleading LOW.
+    pub(super) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str, node_type: &str) -> Result<()> {
         let callers = queries::get_callers_with_route_info(
             self.db.conn(), symbol_name, Some(file_path), 3
         )?;
@@ -915,7 +918,14 @@ impl McpServer {
             .count();
 
         let test_callers_count = callers.len() - prod_callers.len();
-        let risk = crate::domain::compute_risk_level(prod_callers.len(), affected_routes, false);
+
+        let is_function_like = crate::domain::is_function_node_type(node_type);
+        let warn_non_function = prod_callers.is_empty() && !is_function_like;
+        let risk: &'static str = if warn_non_function {
+            "UNKNOWN"
+        } else {
+            crate::domain::compute_risk_level(prod_callers.len(), affected_routes, false)
+        };
 
         let mut impact = json!({
             "risk_level": risk,
@@ -926,6 +936,9 @@ impl McpServer {
         });
         if test_callers_count > 0 {
             impact["test_callers_filtered"] = json!(test_callers_count);
+        }
+        if warn_non_function {
+            impact["warning"] = json!(crate::domain::NON_FUNCTION_IMPACT_WARNING);
         }
         result["impact"] = impact;
         Ok(())
@@ -1256,12 +1269,15 @@ impl McpServer {
         let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
         let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();
 
-        // For non-function types (struct/class/enum), call graph may miss type-usage references
+        // Non-function symbols (constant/struct/enum/trait/...) have usages beyond
+        // the call graph (imports, field access, type annotations). With zero
+        // callers, risk must be UNKNOWN rather than the default LOW.
         let type_warning = if prod_callers.is_empty() {
             let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
-            let is_type = nodes.iter().any(|n| matches!(n.node_type.as_str(), "struct" | "class" | "enum" | "interface" | "type_alias"));
-            if is_type {
-                Some("Impact analysis tracks function call chains. This is a type definition — actual usage (field access, type annotations, instantiation) may be broader than shown. Use semantic_code_search to find all references.")
+            let is_function_like = nodes.iter()
+                .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
+            if !is_function_like {
+                Some(crate::domain::NON_FUNCTION_IMPACT_WARNING)
             } else {
                 None
             }

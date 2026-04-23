@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.16.5 — impact_analysis: UNKNOWN risk for non-function symbols
+
+Three impact-analysis paths (`cmd_impact`, `tool_impact_analysis`,
+`append_impact_summary`) each maintained their own inline list of
+"non-function" node types to flag as UNKNOWN. The lists had drifted:
+two only matched `struct|class|enum|interface|type_alias` (missing
+`constant` and `trait`), and `append_impact_summary` — the path
+reached by the core-7 `get_ast_node include_impact=true` that Claude
+Code actually uses — had no type check at all.
+
+Symptom: `code-graph-mcp impact REL_CALLS` returned
+`risk_level: LOW, 0 callers` even though 16 importers touch the
+constant. An LLM acting on that signal would confidently change the
+string and break every importer.
+
+**Fix (`src/domain.rs`):** single source of truth
+`is_function_node_type()` + `NON_FUNCTION_IMPACT_WARNING` constant.
+All three paths share them. Non-function symbols with zero call-graph
+callers now return `risk_level: UNKNOWN` plus an explicit warning
+directing to `find_references` / `code-graph-mcp refs <symbol>`.
+Function / method impact behavior is unchanged; `HIGH`/`MEDIUM`/`LOW`
+still flow from `compute_risk_level` as before.
+
 ## v0.16.4 — watcher canonicalize: cfg-gate off Windows (UNC path trap)
 
 v0.16.3 canonicalized the watcher root on every platform to fix

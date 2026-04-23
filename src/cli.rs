@@ -1521,17 +1521,16 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     let routes: Vec<&&queries::CallerWithRouteInfo> = prod_callers.iter().filter(|c| c.route_info.is_some()).collect();
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
 
-    // Type-definition warning: call-graph-based impact only tracks function call chains.
-    // For struct/class/enum/interface/type_alias with zero function callers, the real
-    // usage (field access, instantiation, type annotations) may be broader.
-    // Mirror MCP impact_analysis: flag risk_level=UNKNOWN instead of misleadingly LOW.
+    // Call-graph-based impact only tracks function call chains. For non-function
+    // symbols (constant/struct/class/enum/interface/type_alias/trait/module) with
+    // zero callers the real usage (imports, field access, instantiation, type
+    // annotations) is broader than the call graph. Flag risk_level=UNKNOWN so
+    // downstream consumers (LLMs) don't act on a misleading LOW.
     let type_warning: Option<&'static str> = if prod_callers.is_empty() {
-        let is_type = symbol_nodes.iter().any(|n| matches!(
-            n.node_type.as_str(),
-            "struct" | "class" | "enum" | "interface" | "type_alias"
-        ));
-        if is_type {
-            Some("Impact analysis tracks function call chains. This is a type definition — actual usage (field access, type annotations, instantiation) may be broader than shown. Use `code-graph-mcp refs <symbol>` or `code-graph-mcp search` to find all references.")
+        let is_function_like = symbol_nodes.iter()
+            .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
+        if !is_function_like {
+            Some(crate::domain::NON_FUNCTION_IMPACT_WARNING)
         } else {
             None
         }

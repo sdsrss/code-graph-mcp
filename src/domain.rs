@@ -84,6 +84,20 @@ pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_remova
     }
 }
 
+/// True when a node type is a function-like symbol whose usages are fully
+/// captured by the `calls` call graph. False for types, constants, traits,
+/// modules, etc. — whose real blast-radius includes imports / field access /
+/// instantiation / type annotations that impact analysis does not track.
+pub fn is_function_node_type(node_type: &str) -> bool {
+    matches!(node_type, "function" | "method")
+}
+
+/// Warning surfaced by impact analysis when the target is non-function-like
+/// and has zero call-graph callers. Prevents the risk level from reading as
+/// a misleading `LOW` for constants / types / traits whose real users are
+/// imports or type references, not calls.
+pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function call chains. This symbol is not a function — actual usage (imports, field access, type annotations, instantiation) may be broader than shown. Use `find_references` (MCP) or `code-graph-mcp refs <symbol>` (CLI) to find all references.";
+
 // -- Test symbol detection --
 /// Check if a symbol is a test function/file based on naming conventions.
 /// Used by both MCP server and CLI to separate test vs production callers.
@@ -172,5 +186,19 @@ mod tests {
     #[test]
     fn test_parse_timeout_ms_default() {
         assert_eq!(parse_timeout_ms(), 5000);
+    }
+
+    #[test]
+    fn test_is_function_node_type() {
+        assert!(is_function_node_type("function"));
+        assert!(is_function_node_type("method"));
+        assert!(!is_function_node_type("constant"));
+        assert!(!is_function_node_type("struct"));
+        assert!(!is_function_node_type("enum"));
+        assert!(!is_function_node_type("trait"));
+        assert!(!is_function_node_type("interface"));
+        assert!(!is_function_node_type("type_alias"));
+        assert!(!is_function_node_type("module"));
+        assert!(!is_function_node_type(""));
     }
 }

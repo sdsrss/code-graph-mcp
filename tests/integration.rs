@@ -922,8 +922,8 @@ export class UserModel {
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert!(result["warning"].is_string(), "class with no callers should have type-usage warning");
-    assert!(result["warning"].as_str().unwrap().contains("type definition"),
-        "warning should mention type definition, got: {}", result["warning"]);
+    assert!(result["warning"].as_str().unwrap().contains("not a function"),
+        "warning should flag non-function symbol, got: {}", result["warning"]);
 }
 
 #[test]
