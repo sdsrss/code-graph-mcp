@@ -1199,6 +1199,7 @@ impl McpServer {
                 "  \u{2022} \"similar/duplicate functions\" \u{2192} find_similar_code (similar X)\n",
                 "  \u{2022} \"what does file X depend on?\" \u{2192} dependency_graph (deps X)\n",
                 "  \u{2022} \"show/inspect X\" \u{2192} get_ast_node (show X; add include_impact=true for blast radius)\n",
+                "Claude Code MCP only exposes 7 tools; impact_analysis/find_dead_code/find_similar_code/dependency_graph/trace_http_chain are CLI-only \u{2014} run the parens form via Bash.\n",
                 "Start: project_map --compact (architecture). Stuck on results? code-graph-mcp health-check.\n",
                 "Still Grep for: exact strings, constants, regex, non-code files. Still Read for: files you will edit.\n",
                 "Prompts: impact-analysis, understand-module, trace-request.\n",

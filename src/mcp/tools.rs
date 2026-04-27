@@ -93,7 +93,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "module_overview".into(),
-                description: "Module structure and symbols. Use when: exploring a directory/module you haven't seen, or finding the right file to edit. Shows exports, hot paths, files.".into(),
+                description: "Module structure and symbols. Use when: exploring a directory/module you haven't seen, or finding the right file to edit. Shows exports, hot paths, files; callers count includes tests.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -120,7 +120,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Flat enumeration of all usage sites (calls/imports/inherits/implements). Use when: auditing every place a symbol is touched before rename/remove. For 'who calls X?', use get_call_graph.".into(),
+                description: "Usage sites (calls/imports/inherits/implements; consts: imports only, not value-uses). Use when: auditing every place a symbol is touched before rename/remove. For 'who calls X?', use get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

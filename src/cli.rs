@@ -1397,6 +1397,7 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
                     "file_path": n.file_path,
                     "depth": n.depth,
                     "direction": n.direction.as_str(),
+                    "parent_id": n.parent_id,
                 })
             })
             .collect();
@@ -1412,38 +1413,69 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     let root = display_nodes.iter().find(|n| n.depth == 0);
     if let Some(root) = root {
         writeln!(stdout, "{} ({})", root.name, root.file_path)?;
+    } else {
+        return Ok(());
     }
+    let root_id = root.unwrap().node_id;
 
-    // Group by direction, deduplicate same (name, file, direction, depth)
-    // e.g. cfg-gated conditional compilation variants
-    let mut seen = std::collections::HashSet::new();
-    for node in &display_nodes {
-        if node.depth == 0 {
+    // Build parent_id → children map per direction, so depth-N nodes nest under
+    // their *actual* depth-(N-1) parent rather than visually clumping under the
+    // last sibling. Same direction filter so callers/callees subtrees stay
+    // separate when --direction=both.
+    use std::collections::HashMap;
+    let mut children: HashMap<(i64, &'static str), Vec<&crate::graph::query::CallGraphNode>> =
+        HashMap::new();
+    let mut dedup = std::collections::HashSet::new();
+    for n in &display_nodes {
+        if n.depth == 0 {
             continue;
         }
-        let key = (&node.name, &node.file_path, node.direction.as_str(), node.depth);
-        if !seen.insert(key) {
-            continue; // skip duplicate (e.g. #[cfg] conditional compilation variants)
+        // Dedup cfg-gated duplicates (same name+file+direction+depth, different node_id).
+        if !dedup.insert((&n.name, &n.file_path, n.direction.as_str(), n.depth)) {
+            continue;
         }
-        let arrow = match node.direction {
-            crate::graph::query::Direction::Callers => "←",
-            crate::graph::query::Direction::Callees => "→",
-        };
-        let indent = "  ".repeat(node.depth as usize);
-        if compact {
-            writeln!(stdout, "{}{} {} ({})", indent, arrow, node.name, node.file_path)?;
-        } else {
-            let arrow_text = match node.direction {
-                crate::graph::query::Direction::Callers => "← called by",
-                crate::graph::query::Direction::Callees => "→ calls",
-            };
-            writeln!(
-                stdout,
-                "{}{}: {} ({}) [{}]",
-                indent, arrow_text, node.name, node.file_path, node.node_type
-            )?;
-        }
+        let parent = n.parent_id.unwrap_or(root_id);
+        children
+            .entry((parent, n.direction.as_str()))
+            .or_default()
+            .push(n);
     }
+
+    fn render_subtree<W: std::io::Write>(
+        out: &mut W,
+        children: &HashMap<(i64, &'static str), Vec<&crate::graph::query::CallGraphNode>>,
+        parent_id: i64,
+        direction: &'static str,
+        compact: bool,
+    ) -> std::io::Result<()> {
+        let arrow = match direction {
+            "callers" => "←",
+            _ => "→",
+        };
+        let arrow_text = match direction {
+            "callers" => "← called by",
+            _ => "→ calls",
+        };
+        if let Some(kids) = children.get(&(parent_id, direction)) {
+            for n in kids {
+                let indent = "  ".repeat(n.depth as usize);
+                if compact {
+                    writeln!(out, "{}{} {} ({})", indent, arrow, n.name, n.file_path)?;
+                } else {
+                    writeln!(
+                        out,
+                        "{}{}: {} ({}) [{}]",
+                        indent, arrow_text, n.name, n.file_path, n.node_type
+                    )?;
+                }
+                render_subtree(out, children, n.node_id, direction, compact)?;
+            }
+        }
+        Ok(())
+    }
+
+    render_subtree(&mut stdout, &children, root_id, "callers", compact)?;
+    render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
 
     if test_count > 0 {
         writeln!(stdout, "  ({} test callers hidden, use --include-tests to show)", test_count)?;
@@ -2272,6 +2304,15 @@ pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
             }
             return Ok(());
         }
+        if json_mode {
+            let result = serde_json::json!({
+                "file": file_path,
+                "depends_on": [],
+                "depended_by": [],
+                "error": "No tracked dependencies (not a barrel/import file)",
+            });
+            println!("{}", serde_json::to_string(&result)?);
+        }
         anyhow::bail!(
             "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
             file_path,
@@ -2377,9 +2418,11 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve to node_id: by --node-id or by positional symbol name
-    let node_id = if let Some(nid) = node_id_arg {
-        nid
+    // Resolve to node_id: by --node-id or by positional symbol name. `target_label`
+    // is what we display in error messages — symbol name when resolved by name,
+    // "node_id N" when resolved by --node-id.
+    let (node_id, target_label) = if let Some(nid) = node_id_arg {
+        (nid, format!("node_id {}", nid))
     } else {
         let symbol = get_positional(args, 0)
             .filter(|s| !s.is_empty())
@@ -2388,10 +2431,19 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
         match queries::get_first_node_id_by_name(conn, symbol)? {
-            Some(id) => id,
+            Some(id) => (id, symbol.to_string()),
             None => {
                 if json_mode { println!("[]"); }
-                eprintln!("[code-graph] Symbol not found: {}", symbol);
+                // All-digit positional is almost certainly a node_id mistakenly passed
+                // without the flag — guide the user instead of "Symbol not found: 1010".
+                if !symbol.is_empty() && symbol.chars().all(|c| c.is_ascii_digit()) {
+                    eprintln!(
+                        "[code-graph] Symbol not found: {} \u{2014} did you mean `code-graph-mcp similar --node-id {}`?",
+                        symbol, symbol
+                    );
+                } else {
+                    eprintln!("[code-graph] Symbol not found: {}", symbol);
+                }
                 std::process::exit(1);
             }
         }
@@ -2409,7 +2461,10 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
 
     let embedding: Vec<f32> = {
         let bytes = queries::get_node_embedding(conn, node_id)
-            .map_err(|_| anyhow::anyhow!("No embedding for node_id {} ({}/{} nodes embedded)", node_id, embedded_count, total_nodes))?;
+            .map_err(|_| anyhow::anyhow!(
+                "No embedding for {} ({}/{} nodes embedded \u{2014} embeddings still generating; try again shortly or pick a node with `--node-id` from `show {}`)",
+                target_label, embedded_count, total_nodes, target_label
+            ))?;
         bytemuck::cast_slice(&bytes).to_vec()
     };
 
@@ -2427,12 +2482,15 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
         if similar.len() >= top_k as usize { break; }
     }
 
+    let mut stdout = std::io::stdout().lock();
+
     if similar.is_empty() {
+        if json_mode {
+            writeln!(stdout, "[]")?;
+        }
         eprintln!("[code-graph] No similar code found for node_id: {}", node_id);
         return Ok(());
     }
-
-    let mut stdout = std::io::stdout().lock();
 
     if json_mode {
         let json_results: Vec<serde_json::Value> = similar.iter().map(|(node, fp, distance)| {
@@ -2627,7 +2685,7 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     let json_mode = has_flag(args, "--json");
 
     // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
-    // Default = claude-plugin/ (hook/lifecycle scripts the AST graph can't reach).
+    // Defaults are owned by `domain::default_dead_code_ignores()` (claude-plugin/, benches/).
     let ignore_prefixes: Vec<String> = if has_flag(args, "--no-ignore") {
         Vec::new()
     } else {

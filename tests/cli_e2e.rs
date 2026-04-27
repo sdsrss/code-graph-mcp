@@ -702,3 +702,60 @@ fn test_cli_json_empty_dead_code() {
         "stderr should still surface the human-readable reason; got: {stderr}",
     );
 }
+
+#[test]
+fn test_cli_json_empty_similar() {
+    // Regression: `similar <existing-symbol>` where vector search yielded no matches
+    // wrote only stderr and exited 0 with empty stdout, breaking JSON consumers.
+    // Symbol-not-found path already emits []; this guards the no-match path too.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["similar", "xyznonexistent", "--json"]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout.trim(), "[]", "JSON similar with unknown symbol should output []");
+}
+
+#[test]
+fn test_cli_json_empty_deps() {
+    // Regression: `deps <unknown-file>` bailed with stderr only, leaving stdout empty.
+    // Must emit a JSON error object on stdout for machine consumers.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["deps", "src/nonexistent_file_xyz.rs", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("deps --json must output valid JSON even on no-match");
+    assert!(v.is_object(), "JSON deps error should output JSON object");
+    assert_eq!(v["file"], "src/nonexistent_file_xyz.rs");
+}
+
+#[test]
+fn test_cli_similar_digit_positional_suggests_node_id() {
+    // Regression: `similar 1010` (digits as positional) used to print a confusing
+    // "Symbol not found: 1010" instead of nudging the user toward `--node-id 1010`.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["similar", "9999"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("--node-id 9999"),
+        "all-digit positional should suggest --node-id flag; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_callgraph_json_includes_parent_id() {
+    // Regression: depth>1 callgraph used to render depth-N nodes flat-indented under
+    // the last depth-(N-1) sibling. Tree rendering needs `parent_id` on each row.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--depth", "2", "--json"],
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let results = v["results"].as_array().expect("results is array");
+    let with_parent = results.iter().filter(|r| !r["parent_id"].is_null()).count();
+    let depth_gt_zero = results.iter().filter(|r| r["depth"].as_i64().unwrap_or(0) > 0).count();
+    assert!(
+        with_parent > 0 && with_parent == depth_gt_zero,
+        "every non-root row must carry parent_id; with_parent={with_parent} depth>0={depth_gt_zero}"
+    );
+}

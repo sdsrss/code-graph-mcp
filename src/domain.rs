@@ -120,13 +120,18 @@ pub fn is_test_symbol_or_annotated(name: &str, file_path: &str, is_test_from_ast
 // -- Dead-code ignore defaults --
 /// Path-prefix defaults for `find_dead_code` ignore_paths.
 ///
-/// Shell-invoked entry points (Claude Code plugin hook handlers, lifecycle
-/// scripts, auto-update hooks) are not in the static AST call graph because
-/// their callers are settings.json hook definitions / shell commands, not
-/// JS imports. Without this default they dominate orphan results with false
-/// positives. Callers wanting the unfiltered list pass `ignore_paths: []`.
+/// Macro/harness-invoked entry points are not in the static AST call graph
+/// because the references go through tokens the parser can't (or doesn't yet)
+/// resolve:
+/// - `claude-plugin/`: hook handlers / lifecycle scripts / auto-update hooks
+///   called from `settings.json` hook definitions or shell, not JS imports.
+/// - `benches/`: Criterion bench fns named inside `criterion_group!(...)`
+///   tokens; macro arguments are not parsed as references.
+///
+/// Callers wanting the unfiltered list pass `ignore_paths: []` (CLI:
+/// `--no-ignore`).
 pub fn default_dead_code_ignores() -> Vec<String> {
-    vec!["claude-plugin/".to_string()]
+    vec!["claude-plugin/".to_string(), "benches/".to_string()]
 }
 
 // -- Node type normalization --
@@ -186,6 +191,22 @@ mod tests {
     #[test]
     fn test_parse_timeout_ms_default() {
         assert_eq!(parse_timeout_ms(), 5000);
+    }
+
+    /// Pin the dead-code ignore defaults: `criterion_group!`-named bench fns
+    /// and `claude-plugin/` shell-hook scripts are unreachable from the static
+    /// AST graph and would otherwise dominate orphan results.
+    #[test]
+    fn test_default_dead_code_ignores_includes_macro_invoked_dirs() {
+        let ignores = default_dead_code_ignores();
+        assert!(
+            ignores.iter().any(|p| p == "benches/"),
+            "benches/ must be ignored — Criterion's criterion_group!() args aren't reference-tracked, so bench fns appear orphan"
+        );
+        assert!(
+            ignores.iter().any(|p| p == "claude-plugin/"),
+            "claude-plugin/ must be ignored — hook handlers are invoked from settings.json shell, not JS imports"
+        );
     }
 
     #[test]

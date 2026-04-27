@@ -166,6 +166,43 @@ function assertToolText(resp) {
   return text;
 }
 
+// Asserts the tool's text body contains a substring that proves the query
+// actually resolved against real data, not an empty/error path. Pass the
+// expected substring (case-sensitive). Use this whenever the query targets a
+// known-existing symbol/file — it catches silent rename/move regressions that
+// `assertToolText` misses (since "Symbol not found: X" is also non-empty text).
+function assertTextContains(resp, expected) {
+  const text = assertToolText(resp);
+  if (!text.includes(expected)) {
+    const snippet = text.length > 200 ? text.slice(0, 200) + "..." : text;
+    throw new Error(`Expected response body to contain ${JSON.stringify(expected)}; got: ${snippet}`);
+  }
+  return text;
+}
+
+// Asserts the tool's text body does NOT match any of these "empty result"
+// patterns. Catches `[code-graph] Symbol not found:` / `No callers found` etc.
+// that look like a successful response to assertToolText but are actually
+// failures.
+function assertNotEmptyResult(resp, label) {
+  const text = assertToolText(resp);
+  const emptyPatterns = [
+    /Symbol not found/i,
+    /No call graph results/i,
+    /No callers found/i,
+    /No tracked dependencies/i,
+    /No references found/i,
+    /No routes matching/i,
+  ];
+  for (const re of emptyPatterns) {
+    if (re.test(text)) {
+      const snippet = text.length > 200 ? text.slice(0, 200) + "..." : text;
+      throw new Error(`${label}: empty/error result (${re.source}); got: ${snippet}`);
+    }
+  }
+  return text;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -225,17 +262,29 @@ async function main() {
   await new Promise((r) => setTimeout(r, STARTUP_WAIT_MS));
 
   // -----------------------------------------------------------------------
-  // 4. tools/list — verify 12 visible tools (6 hidden: start_watch, stop_watch, get_index_status, rebuild_index, find_http_route, read_snippet)
+  // 4. tools/list — verify 7 core tools advertised. Since v0.10.0 the registry
+  //    splits into 7 core (always listed) + 5 advanced (callable but hidden) +
+  //    6 infra (callable but hidden: start_watch, stop_watch, get_index_status,
+  //    rebuild_index, read_snippet, find_http_route alias). All 18 are
+  //    exercised below via tools/call.
   // -----------------------------------------------------------------------
   console.log("\n--- tools/list ---");
 
+  const EXPECTED_CORE_TOOLS = [
+    "get_call_graph", "module_overview", "semantic_code_search",
+    "ast_search", "find_references", "get_ast_node", "project_map",
+  ];
   let toolNames = [];
   await testRequest("tools/list", "tools/list", {}, (resp) => {
     assertNoError(resp);
     const tools = resp.result?.tools;
     if (!Array.isArray(tools)) throw new Error("Expected tools array");
-    if (tools.length !== 12) throw new Error(`Expected 12 tools, got ${tools.length}`);
+    if (tools.length !== EXPECTED_CORE_TOOLS.length) {
+      throw new Error(`Expected ${EXPECTED_CORE_TOOLS.length} core tools, got ${tools.length}`);
+    }
     toolNames = tools.map((t) => t.name);
+    const missing = EXPECTED_CORE_TOOLS.filter((n) => !toolNames.includes(n));
+    if (missing.length) throw new Error(`Missing core tools: ${missing.join(", ")}`);
     console.log(`    Tools (${tools.length}): ${toolNames.join(", ")}`);
   });
 
@@ -250,10 +299,12 @@ async function main() {
     (resp) => { assertToolText(resp); }
   );
 
-  // 5.2 get_call_graph
+  // 5.2 get_call_graph — `handle_message` is the stable JSON-RPC entry on
+  //   McpServer; if it's renamed the call graph is structurally broken and the
+  //   regression should surface here.
   await testToolCall("get_call_graph", "get_call_graph",
-    { symbol_name: "handle_call_tool", direction: "both", depth: 2 },
-    (resp) => { assertToolText(resp); }
+    { symbol_name: "handle_message", direction: "callees", depth: 2 },
+    (resp) => { assertNotEmptyResult(resp, "get_call_graph(handle_message)"); }
   );
 
   // 5.3 find_http_route (expect empty / no match — still a success response)
@@ -268,12 +319,13 @@ async function main() {
     (resp) => { assertToolContent(resp); }
   );
 
-  // 5.5 get_ast_node
+  // 5.5 get_ast_node — `src/mcp/server/mod.rs` is the post-split path of the
+  //   McpServer struct.
   let nodeId = null;
   await testToolCall("get_ast_node", "get_ast_node",
-    { file_path: "src/mcp/server.rs", symbol_name: "McpServer" },
+    { file_path: "src/mcp/server/mod.rs", symbol_name: "McpServer" },
     (resp) => {
-      const text = assertToolText(resp);
+      const text = assertTextContains(resp, "McpServer");
       // Try to extract a node_id from the JSON response
       try {
         const parsed = JSON.parse(text);
@@ -294,10 +346,11 @@ async function main() {
     (resp) => { assertToolContent(resp); }
   );
 
-  // 5.7 impact_analysis
+  // 5.7 impact_analysis — `handle_message` is a hot entry point with many
+  //   callers; an empty result here means the call graph is broken.
   await testToolCall("impact_analysis", "impact_analysis",
-    { symbol_name: "handle_call_tool" },
-    (resp) => { assertToolText(resp); }
+    { symbol_name: "handle_message" },
+    (resp) => { assertNotEmptyResult(resp, "impact_analysis(handle_message)"); }
   );
 
   // 5.8 module_overview
@@ -306,10 +359,18 @@ async function main() {
     (resp) => { assertToolText(resp); }
   );
 
-  // 5.9 dependency_graph
+  // 5.9 dependency_graph — post-split path; this file imports many siblings,
+  //   so a missing `depends_on` array means dep extraction regressed.
+  //   The MCP tool returns JSON (CLI uses human text); assert on the JSON key.
   await testToolCall("dependency_graph", "dependency_graph",
-    { file_path: "src/mcp/server.rs" },
-    (resp) => { assertToolText(resp); }
+    { file_path: "src/mcp/server/mod.rs" },
+    (resp) => {
+      const text = assertToolText(resp);
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed.depends_on) || parsed.depends_on.length === 0) {
+        throw new Error(`dependency_graph(src/mcp/server/mod.rs): expected non-empty depends_on array; got keys=${Object.keys(parsed).join(",")}`);
+      }
+    }
   );
 
   // 5.10 find_similar_code
@@ -336,10 +397,11 @@ async function main() {
     (resp) => { assertToolContent(resp); }
   );
 
-  // 5.14 find_references
+  // 5.14 find_references — `conn` is the hottest symbol in the project; if
+  //   refs comes back empty, something is wrong with relation extraction.
   await testToolCall("find_references", "find_references",
     { symbol_name: "conn" },
-    (resp) => { assertToolText(resp); }
+    (resp) => { assertNotEmptyResult(resp, "find_references(conn)"); }
   );
 
   // 5.15 start_watch

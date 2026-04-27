@@ -1,5 +1,103 @@
 # Changelog
 
+## v0.16.8 — callgraph tree, JSON contracts, dead-code defaults, E2E hardening
+
+End-to-end usability pass: simulated a Claude Code session driving every
+MCP tool and CLI subcommand on real symbols. Five independent fixes for
+issues that surfaced — none blocking on their own, but each was eroding
+the trust-layer agents need to act on tool output.
+
+**1. `callgraph` rendered depth>1 nodes under the wrong parent.** The
+recursive CTE was collapsing duplicates with `GROUP BY MIN(depth)`,
+which lost the actual traversal parent and made every depth-N node
+appear nested under the *last* depth-(N-1) sibling. So `A→B→C` plus
+`D→B` printed as if `D` lived under `A` once `B` was already shown.
+
+**Fix:** the CTE now tracks `parent_id` (the cg row that produced each
+new node) on each inductive step, and dedup uses
+`ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY depth)` so the
+shortest-path parent survives. CLI renderer builds a `parent_id →
+children` map per direction and recurses, so callers/callees subtrees
+stay separate under `--direction=both`. JSON output now includes
+`parent_id` (null for the root) for any consumer that wants to rebuild
+the tree.
+
+**2. `similar` and `deps` violated the `--json` empty-result contract.**
+Both subcommands had paths that wrote nothing to stdout and exited
+with stderr only — breaking machine consumers per
+`feedback_cli_json_empty_contract`. Added: `similar --json` writes
+`[]` when vector search returns no neighbors; `deps --json` writes a
+JSON error object `{"file":..., "depends_on":[], "depended_by":[],
+"error":"..."}` when the file has no tracked imports. Two new
+regression tests guard these paths.
+
+Bonus: `similar 1010` (digits as positional) used to print the
+unhelpful "Symbol not found: 1010". Now nudges toward
+`similar --node-id 1010`. And `similar` with an existing symbol that
+hasn't been embedded yet ("No embedding for node_id 342") explains
+*why* (`(1033/1321 nodes embedded — embeddings still generating; try
+again shortly or pick a node with --node-id from \`show X\`)`).
+
+**3. MCP tool descriptions misled agents on subtle defaults.** Two
+tools had descriptions that didn't match their actual behavior, so
+agents made decisions on stale info:
+
+- `module_overview` — caller counts include test callers, but the
+  description didn't say so; agents reading "5 callers" couldn't tell
+  if a function was prod-hot or only test-driven. Description now
+  states "callers count includes tests" so the LLM picks a different
+  tool when it actually needs prod-only callers.
+- `find_references` — for constants, only `imports` edges are
+  recorded; usage sites where the const is read don't appear because
+  Rust grammar emits them as identifiers without an import-context.
+  Description now says "consts: imports only, not value-uses" so the
+  agent escalates to grep when auditing a const for rename.
+
+Also added one line to the MCP `instructions` payload telling the
+agent that `impact_analysis`/`find_dead_code`/`find_similar_code`/
+`dependency_graph`/`trace_http_chain` are CLI-only after the v0.10.0
+core/advanced split — Claude Code only sees the 7 core tools, so
+agents trying to invoke the advanced 5 directly via MCP would 404.
+
+**4. E2E suite was passing on dead queries.** `scripts/e2e-validate.js`
+called `get_call_graph(handle_call_tool)`, `impact_analysis(
+handle_call_tool)`, and `dependency_graph(src/mcp/server.rs)` —
+all three symbols/paths had been renamed/moved sessions ago. The
+assertions only checked "response contains non-empty text", so
+"`[code-graph] Symbol not found: handle_call_tool`" passed as
+success. 24/24 green, but actually testing zero-result paths. Real
+response sizes told the story: get_call_graph 221 bytes (now 2628),
+impact_analysis 220 bytes (now 498), dependency_graph 304 bytes
+(now 2291).
+
+**Fix:** swapped the queries to stable hot symbols (`handle_message`,
+`conn`, `src/mcp/server/mod.rs`) and added two stricter assertions:
+`assertNotEmptyResult(resp, label)` rejects 6 known empty-result
+patterns ("Symbol not found", "No callers found", etc.); the MCP
+`dependency_graph` returns JSON, not the human "Depends on" text, so
+its assertion now `JSON.parse`s and checks `depends_on` is a non-empty
+array.
+
+**5. `dead-code` falsely flagged Criterion benchmarks as orphan.**
+`benches/indexing.rs` defines three bench functions, all referenced
+only via `criterion_group!(benches, bench_full_index, ...)`. The AST
+relation extractor doesn't parse macro arguments as references, so
+the benches showed up as ORPHAN every time — drowning out the four
+real `EXPORTED-UNUSED` results worth attention.
+
+**Fix:** added `benches/` to `domain::default_dead_code_ignores()`,
+mirroring the existing `claude-plugin/` exclusion for shell-invoked
+hook scripts. The rule generalizes: any directory whose entry points
+are reached through tokens the AST can't resolve (macro arguments,
+shell command strings, settings.json hook definitions) belongs in
+the default ignore list. CLI `--no-ignore` still surfaces them. New
+unit test pins the policy.
+
+Together these don't change any external schema, but they materially
+improve the signal an agent gets per tool call — fewer phantom
+orphans, a callgraph tree that reads like one, and an E2E suite that
+actually fails when a hot symbol moves.
+
 ## v0.16.7 — install reliability: 3 independent failure paths fixed
 
 Reported on a fresh `/plugin install code-graph-mcp` on another

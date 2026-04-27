@@ -27,6 +27,11 @@ pub struct CallGraphNode {
     pub file_path: String,
     pub depth: i32,
     pub direction: Direction,
+    /// node_id of the immediate parent in the traversal (the caller for
+    /// `Direction::Callers`, the callee for `Direction::Callees`). `None` for
+    /// the root (depth=0). When a node is reachable via multiple paths, this
+    /// records one parent on the shortest path.
+    pub parent_id: Option<i64>,
 }
 
 /// Traverse the call graph starting from a function by name.
@@ -79,9 +84,14 @@ fn query_direction(
         ),
     };
 
+    // The CTE tracks `parent_id` (the cg row that produced each new node) so
+    // the renderer can show real tree edges instead of inferring nesting from
+    // depth alone (which collapses sibling subtrees under the last depth-N
+    // entry). On dedup we keep the parent on the shortest path via
+    // ROW_NUMBER() ... ORDER BY depth.
     let sql = format!(
-        "WITH RECURSIVE call_graph(node_id, name, type, depth, visited) AS (
-            SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT)
+        "WITH RECURSIVE call_graph(node_id, name, type, depth, visited, parent_id) AS (
+            SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT), NULL
             FROM nodes n
             JOIN files f ON f.id = n.file_id
             WHERE n.name = ?1
@@ -90,18 +100,21 @@ fn query_direction(
             UNION ALL
 
             SELECT t.id, t.name, t.type, cg.depth + 1,
-                   cg.visited || ',' || CAST(t.id AS TEXT)
+                   cg.visited || ',' || CAST(t.id AS TEXT),
+                   cg.node_id
             FROM call_graph cg
             {edge_join}
             {next_node_join}
             WHERE cg.depth < ?3
             AND (',' || cg.visited || ',') NOT LIKE '%,' || CAST(t.id AS TEXT) || ',%'
         )
-        SELECT DISTINCT cg.node_id, cg.name, cg.type, f.path, MIN(cg.depth) as depth
-        FROM call_graph cg
-        JOIN nodes n ON n.id = cg.node_id
-        JOIN files f ON f.id = n.file_id
-        GROUP BY cg.node_id
+        SELECT node_id, name, type, file_path, depth, parent_id FROM (
+            SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
+                   ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
+            FROM call_graph cg
+            JOIN nodes n ON n.id = cg.node_id
+            JOIN files f ON f.id = n.file_id
+        ) WHERE rn = 1
         ORDER BY depth
         LIMIT 200"
     );
@@ -116,6 +129,7 @@ fn query_direction(
             file_path: row.get(3)?,
             depth: row.get(4)?,
             direction,
+            parent_id: row.get(5)?,
         })
     };
 
@@ -126,20 +140,23 @@ fn query_direction(
     Ok(results)
 }
 
-/// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the minimum depth.
+/// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the entry
+/// with minimum depth (preserving its `parent_id` so the renderer can build a tree).
 fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
     let mut by_key: HashMap<(i64, Direction), CallGraphNode> = HashMap::new();
 
     for node in callees.into_iter().chain(callers) {
         let key = (node.node_id, node.direction);
-        by_key
-            .entry(key)
-            .and_modify(|existing| {
-                if node.depth < existing.depth {
-                    existing.depth = node.depth;
+        match by_key.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if node.depth < e.get().depth {
+                    e.insert(node);
                 }
-            })
-            .or_insert(node);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(node);
+            }
+        }
     }
 
     let mut results: Vec<CallGraphNode> = by_key.into_values().collect();
@@ -322,5 +339,43 @@ mod tests {
         // B should be at depth 0
         let b_node = result.iter().find(|n| n.name == "B").unwrap();
         assert_eq!(b_node.depth, 0);
+    }
+
+    /// Verify parent_id is populated so the renderer can build a real tree.
+    /// Setup: A→B→C, D→B. Query callers of C depth 2.
+    /// Expected: B has parent_id=C; A and D have parent_id=B.
+    #[test]
+    fn test_parent_id_populated() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+
+        let a = insert_node(conn, &node("A", fid)).unwrap();
+        let b = insert_node(conn, &node("B", fid)).unwrap();
+        let c = insert_node(conn, &node("C", fid)).unwrap();
+        let d = insert_node(conn, &node("D", fid)).unwrap();
+
+        insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, b, c, REL_CALLS, None).unwrap();
+        insert_edge(conn, d, b, REL_CALLS, None).unwrap();
+
+        let result = get_call_graph(conn, "C", "callers", 2, None).unwrap();
+
+        let c_node = result.iter().find(|n| n.name == "C").unwrap();
+        assert_eq!(c_node.parent_id, None, "root must have no parent");
+
+        let b_node = result.iter().find(|n| n.name == "B").unwrap();
+        assert_eq!(b_node.parent_id, Some(c), "depth-1 caller B's parent is the root C");
+
+        let a_node = result.iter().find(|n| n.name == "A").unwrap();
+        assert_eq!(a_node.parent_id, Some(b), "depth-2 caller A's parent is depth-1 B (NOT C)");
+        let d_node = result.iter().find(|n| n.name == "D").unwrap();
+        assert_eq!(d_node.parent_id, Some(b), "depth-2 caller D's parent is depth-1 B (NOT C)");
     }
 }
