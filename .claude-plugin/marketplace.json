@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "AST knowledge graph plugin for Claude Code — semantic search, call graph, HTTP tracing, impact analysis",
-    "version": "0.16.6"
+    "version": "0.16.7"
   },
   "plugins": [
     {
       "name": "code-graph-mcp",
       "source": "./claude-plugin",
       "description": "AST knowledge graph for intelligent code navigation — auto-indexes your codebase and provides semantic search, call graph traversal, HTTP route tracing, and impact analysis via MCP tools",
-      "version": "0.16.6",
+      "version": "0.16.7",
       "author": {
         "name": "sdsrs"
       },

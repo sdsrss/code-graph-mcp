@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.16.7 — install reliability: 3 independent failure paths fixed
+
+Reported on a fresh `/plugin install code-graph-mcp` on another
+machine: MCP couldn't connect, the binary was nowhere to be found.
+Triage found three independent breakages along the launcher chain;
+each is fixed and tested separately so the chain is fault-tolerant
+on first install.
+
+**1. `find-binary.js`: didn't search npm global `node_modules`.**
+`require.resolve('@sdsrs/code-graph-{platform}-{arch}/package.json')`
+only walks the `node_modules` chain rooted at the requiring file —
+it does NOT search global installs, because nvm and standard Unix
+prefixes don't set `NODE_PATH`. So a working `npm install -g
+@sdsrs/code-graph-linux-x64` was previously invisible to the
+launcher even when the binary was sitting at
+`~/.nvm/.../lib/node_modules/@sdsrs/code-graph-linux-x64/code-graph-mcp`.
+
+**Fix:** new `globalNodeModulesCandidates()` probes 4 prefix
+sources — `process.execPath`-derived (Linux/macOS:
+`<prefix>/lib/node_modules`; Windows: next to `node.exe`),
+`NPM_CONFIG_PREFIX` env, `~/.npm-global/lib/node_modules`, and
+`npm root -g` (last resort, ~50-200ms). New `findPlatformBinary()`
+combines fast-path (`require.resolve`) + slow-path (global probe).
+
+**2. `auto-update.js`: trusted state file over filesystem.** When
+`installedVersion === latestVersion`, `checkForUpdate` short-circuited
+to the no-update branch without verifying that
+`~/.cache/code-graph/bin/code-graph-mcp` actually exists. Once the
+state file recorded "installed v0.16.6", a wiped cache or a
+silently-failed prior download would never be repaired. Real-world
+artifact: `update-state.json` says "Up to date" while the cache
+directory is empty.
+
+**Fix:** new `downloadBinary()` helper extracted from
+`downloadAndInstall` so the binary download can run in either
+context. Throttle bypassed when cache binary is missing (a hard
+failure overrides the 6h check window). No-update branch
+self-heals by calling `downloadBinary(latest)` when binary is
+absent. `cachedBinaryPath()` exported for test harnesses.
+
+**3. `mcp-launcher.js`: only one fallback strategy.** When
+`findBinary()` returned null, the launcher tried `npm install -g
+@sdsrs/code-graph` once and gave up if that didn't yield a binary.
+But npm's `optionalDependencies` failure mode is to silently
+accept partial installs (an OS-mismatch tolerance feature that
+also masks transient registry/network errors), so the wrapper
+package would install successfully while the platform binary
+package was dropped.
+
+**Fix:** second-stage fallback runs `auto-update.js --silent`
+which downloads the platform binary directly from the GitHub
+release into `~/.cache/code-graph/bin/`. Bypasses npm registry
+entirely. Final error message also names the platform-specific
+package (`@sdsrs/code-graph-{platform}-{arch}`) for manual
+recovery.
+
+**Tests:** 7 new (`find-binary.test.js` × 4 covering candidate
+derivation + dedup + integration; `auto-update.test.js` × 3
+covering `cachedBinaryPath` + `downloadBinary` null safety).
+117 plugin JS + 385 Rust = 502 total green.
+
 ## v0.16.6 — semantic_code_search: doc demotion + find_references: include_tests
 
 Two MCP tool UX bugs surfaced during a user-simulation pass

@@ -42,10 +42,29 @@ if (!binary) {
   }
 }
 
+// Fallback: npm install may have succeeded but optionalDependencies for the
+// platform binary can fail silently (npm tolerates OS-mismatch + flaky
+// registry). Pull the platform binary directly from the GitHub release.
+if (!binary) {
+  process.stderr.write('[code-graph] Falling back to GitHub release download...\n');
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), '--silent'], {
+      timeout: 90000, stdio: 'pipe',
+    });
+    clearCache();
+    binary = findBinary();
+    if (binary) {
+      process.stderr.write(`[code-graph] Installed at ${binary}\n`);
+    }
+  } catch { /* fall through to manual-install message */ }
+}
+
 if (!binary) {
   process.stderr.write(
     '[code-graph] Binary not found. Install manually:\n' +
-    '  npm install -g @sdsrs/code-graph\n'
+    '  npm install -g @sdsrs/code-graph\n' +
+    '  # or\n' +
+    '  npm install -g @sdsrs/code-graph-' + process.platform + '-' + process.arch + '\n'
   );
   process.exit(1);
 }

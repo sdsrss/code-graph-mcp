@@ -9,6 +9,53 @@ const PLATFORM = os.platform();
 const ARCH = os.arch();
 const CACHE_FILE = path.join(os.homedir(), '.cache', 'code-graph', 'binary-path');
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
+const PLATFORM_PKG = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
+
+/**
+ * Candidate paths for npm global `node_modules`.
+ *
+ * `require.resolve` only searches `node_modules` walking up from the requiring
+ * file — it does NOT search global installations (no NODE_PATH set in default
+ * Node setups, including nvm). When a user runs `npm install -g`, the platform
+ * package lands somewhere we have to discover ourselves.
+ */
+function globalNodeModulesCandidates() {
+  const out = [];
+  const nodeBinDir = path.dirname(process.execPath);
+
+  // 1. Derive from process.execPath. Works for nvm + standard Unix prefixes
+  //    (`<prefix>/bin/node` → globals at `<prefix>/lib/node_modules`); on
+  //    Windows globals sit next to `node.exe`.
+  if (PLATFORM === 'win32') {
+    out.push(path.join(nodeBinDir, 'node_modules'));
+  } else {
+    out.push(path.resolve(nodeBinDir, '..', 'lib', 'node_modules'));
+  }
+
+  // 2. NPM_CONFIG_PREFIX env override (set by users using `~/.npm-global` etc.)
+  const envPrefix = process.env.NPM_CONFIG_PREFIX || process.env.npm_config_prefix;
+  if (envPrefix) {
+    out.push(PLATFORM === 'win32'
+      ? path.join(envPrefix, 'node_modules')
+      : path.join(envPrefix, 'lib', 'node_modules'));
+  }
+
+  // 3. Common no-sudo user prefix
+  out.push(path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'));
+
+  // 4. Last resort: ask npm directly. Slow (~50-200ms) but most accurate when
+  //    user has a non-standard prefix. Cached at the disk-cache layer above.
+  try {
+    const root = execFileSync('npm', ['root', '-g'], {
+      timeout: 2000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    }).trim();
+    if (root) out.push(root);
+  } catch { /* npm not on PATH or timed out */ }
+
+  return [...new Set(out)];
+}
 
 function isNativeBinary(candidate) {
   if (!candidate) return false;
@@ -60,6 +107,32 @@ function isDevRepo(rootDir) {
   return fs.existsSync(path.join(rootDir, 'Cargo.toml'));
 }
 
+/**
+ * Locate the platform-specific binary in npm package layouts.
+ *   - First via `require.resolve` (parent-walk node_modules / linked / npx).
+ *   - Then by explicit probe of npm global `node_modules` candidates.
+ *
+ * `require.resolve` does NOT search global installs (no NODE_PATH on
+ * nvm/standard setups), so a working `npm install -g @sdsrs/code-graph` can
+ * still be invisible without the fallback.
+ */
+function findPlatformBinary() {
+  // Fast path: standard module resolution.
+  try {
+    const pkgPath = require.resolve(`${PLATFORM_PKG}/package.json`);
+    const bin = path.join(path.dirname(pkgPath), BINARY_NAME);
+    if (isNativeBinary(bin)) return bin;
+  } catch { /* not in node_modules walk-up */ }
+
+  // Slow path: explicit global node_modules probe.
+  for (const globalRoot of globalNodeModulesCandidates()) {
+    const bin = path.join(globalRoot, '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`, BINARY_NAME);
+    if (isNativeBinary(bin)) return bin;
+  }
+
+  return null;
+}
+
 function findBinaryUncached() {
   // --- Dev mode: always prefer cargo build output when running from source repo ---
   // This covers: npm link, direct invocation from repo, CLAUDE_PROJECT_DIR set to repo
@@ -88,12 +161,8 @@ function findBinaryUncached() {
   if (isNativeBinary(autoUpdateBin)) return autoUpdateBin;
 
   // --- Platform-specific npm package (@sdsrs/code-graph-{os}-{arch}) ---
-  const platformPkg = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
-  try {
-    const pkgPath = require.resolve(`${platformPkg}/package.json`);
-    const bin = path.join(path.dirname(pkgPath), BINARY_NAME);
-    if (isNativeBinary(bin)) return bin;
-  } catch { /* not installed via npm */ }
+  const platformBin = findPlatformBinary();
+  if (platformBin) return platformBin;
 
   // --- Bundled binary (in same directory as cli.js or plugin scripts) ---
   // Check bin/ directory of the npm package
@@ -140,7 +209,11 @@ function clearCache() {
   try { fs.unlinkSync(CACHE_FILE); } catch { /* ok */ }
 }
 
-module.exports = { findBinary, findBinaryUncached, clearCache, CACHE_FILE, BINARY_NAME };
+module.exports = {
+  findBinary, findBinaryUncached, clearCache,
+  globalNodeModulesCandidates, findPlatformBinary,
+  CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
+};
 
 // Allow direct invocation for testing
 if (require.main === module) {

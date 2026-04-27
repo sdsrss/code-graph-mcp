@@ -172,6 +172,46 @@ function getExtractedPluginVersion(pluginSrc) {
   return manifest && typeof manifest.version === 'string' ? manifest.version : null;
 }
 
+function cachedBinaryPath() {
+  const name = os.platform() === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
+  return path.join(BINARY_CACHE_DIR, name);
+}
+
+/**
+ * Download just the platform binary from a GitHub release into the cache.
+ * Used in two paths:
+ *   1. As part of `downloadAndInstall` after a plugin tarball update.
+ *   2. As a standalone self-heal when the cached binary is missing but the
+ *      installed plugin version already matches `latest` (e.g. previous
+ *      download failed silently, cache was wiped, optionalDependency
+ *      install dropped the platform package).
+ *
+ * Returns true on successful promote, false otherwise. Never throws.
+ */
+async function downloadBinary(latest) {
+  if (!latest || !latest.binaryUrl) return false;
+  if (!commandExists('curl')) {
+    console.error('[code-graph] Binary download skipped: curl not on PATH.');
+    return false;
+  }
+
+  const binaryDst = cachedBinaryPath();
+  const binaryTmp = binaryDst + '.tmp.' + process.pid;
+
+  try {
+    fs.mkdirSync(BINARY_CACHE_DIR, { recursive: true });
+    execFileSync('curl', [
+      '-sL', '-o', binaryTmp,
+      latest.binaryUrl,
+    ], { timeout: 60000, stdio: 'pipe' });
+
+    return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version);
+  } catch (e) {
+    console.error(`[code-graph] Binary download failed: ${e.message}`);
+    return false;
+  }
+}
+
 function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
   try {
     const stat = fs.statSync(binaryTmp);
@@ -272,25 +312,8 @@ async function downloadAndInstall(latest) {
     }
 
     // ── Step 2: Download platform binary directly from GitHub release ──
-    if (latest.binaryUrl) {
-      try {
-        const binaryName = os.platform() === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
-        const binaryDst = path.join(BINARY_CACHE_DIR, binaryName);
-        const binaryTmp = binaryDst + '.tmp.' + process.pid;
-
-        fs.mkdirSync(BINARY_CACHE_DIR, { recursive: true });
-        execFileSync('curl', [
-          '-sL', '-o', binaryTmp,
-          latest.binaryUrl,
-        ], { timeout: 60000, stdio: 'pipe' });
-
-        if (promoteVerifiedBinary(binaryTmp, binaryDst, latest.version)) {
-          binaryUpdated = true;
-        }
-      } catch (e) {
-        // Binary download failed — plugin update still counts as success
-        console.error(`[code-graph] Binary download failed: ${e.message}`);
-      }
+    if (await downloadBinary(latest)) {
+      binaryUpdated = true;
     }
 
     return { pluginUpdated, binaryUpdated };
@@ -314,8 +337,11 @@ async function checkForUpdate() {
     // bypasses auto-update.js, so re-sync state.installedVersion every call.
     const installedVersion = readManifest().version || '0.0.0';
 
-    // Time-based throttle
-    if (!shouldCheck(state)) {
+    // Time-based throttle. A missing cache binary is a hard failure (launcher
+    // cannot start) so it overrides the throttle — without this bypass the
+    // session wedges for up to 6h waiting for the next check window.
+    const binaryMissing = !fs.existsSync(cachedBinaryPath());
+    if (!binaryMissing && !shouldCheck(state)) {
       if (state.installedVersion !== installedVersion) {
         saveState({ ...state, installedVersion });
       }
@@ -359,7 +385,15 @@ async function checkForUpdate() {
       };
     }
 
-    // No update needed
+    // No update needed — but self-heal if cache binary is missing.
+    // State file alone is not authoritative; previous download may have failed
+    // silently, cache may have been wiped, or `npm install -g` optionalDependency
+    // may have dropped the platform package.
+    let selfHealedBinary = false;
+    if (latest.binaryUrl && !fs.existsSync(cachedBinaryPath())) {
+      selfHealedBinary = await downloadBinary(latest);
+    }
+
     saveState({
       ...state,
       installedVersion,
@@ -367,8 +401,11 @@ async function checkForUpdate() {
       latestVersion: latest.version,
       updateAvailable: false,
       rateLimited: false,
+      binaryUpdated: selfHealedBinary || state.binaryUpdated,
     });
-    return null;
+    return selfHealedBinary
+      ? { updated: false, binaryUpdated: true, from: installedVersion, to: installedVersion }
+      : null;
   } catch {
     // Silent failure — never block session
     return null;
@@ -379,6 +416,7 @@ module.exports = {
   checkForUpdate, commandExists, isDevMode, readState, compareVersions,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary, isSilentMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
+  downloadBinary, cachedBinaryPath,
 };
 
 // CLI: node auto-update.js [check|status]
@@ -398,6 +436,8 @@ if (require.main === module) {
         console.log(`Updated: v${result.from} → v${result.to} (binary: ${result.binaryUpdated ? 'yes' : 'no'})`);
       } else if (result && result.updateAvailable) {
         console.log(`Update available: v${result.to} (auto-install failed)`);
+      } else if (result && result.binaryUpdated) {
+        console.log(`Repaired binary cache (v${result.to})`);
       } else if (isDevMode()) {
         console.log('Dev mode — auto-update skipped');
       } else {

@@ -12,6 +12,8 @@ const {
   parseLatestRelease,
   readBinaryVersion,
   promoteVerifiedBinary,
+  cachedBinaryPath,
+  downloadBinary,
 } = require('./auto-update');
 
 function mkDir(t, prefix) {
@@ -91,6 +93,24 @@ test('commandExists returns true for a known command (node)', () => {
 
 test('commandExists returns false for a non-existent command', () => {
   assert.equal(commandExists('__nonexistent_cmd_xyz_12345__'), false);
+});
+
+test('cachedBinaryPath returns expected platform binary path', () => {
+  const p = cachedBinaryPath();
+  const expectedName = process.platform === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
+  assert.equal(path.basename(p), expectedName);
+  assert.ok(p.includes('.cache') && p.includes('code-graph'),
+    `expected cache path to live under ~/.cache/code-graph: ${p}`);
+});
+
+test('downloadBinary returns false for missing binaryUrl (no-op safety)', async () => {
+  const result = await downloadBinary({ version: '1.0.0', binaryUrl: null });
+  assert.equal(result, false);
+});
+
+test('downloadBinary returns false when latest is null', async () => {
+  const result = await downloadBinary(null);
+  assert.equal(result, false);
 });
 
 test('fetchLatestRelease parses JSON without relying on global fetch', async () => {
