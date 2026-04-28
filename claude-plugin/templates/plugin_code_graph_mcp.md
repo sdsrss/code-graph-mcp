@@ -63,7 +63,7 @@ type: reference
 
 ## 工作流惯例
 
-1. 起手 `project_map --compact` 看架构
+1. 起手 `project_map`（或 Bash 调 `code-graph-mcp map --compact`）看架构
 2. `semantic_code_search` 默认带 `compact=true`，省 token
 3. 展开节点：`get_ast_node node_id=N compact=true` 看签名 / 不带 compact 看全文
 4. 改前评估影响：`get_ast_node symbol_name=X include_impact=true`（核心 7 内，首选）

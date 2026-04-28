@@ -11,6 +11,18 @@ const os = require('os');
 
 const SENTINEL_BEGIN = '<!-- code-graph-mcp:begin v1 -->';
 const SENTINEL_END = '<!-- code-graph-mcp:end -->';
+// Collision-detection marker. Slug encoding `[^a-zA-Z0-9-]→'-'` is lossy,
+// so two cwds (e.g. /foo/bar and /foo bar) can resolve to the same memory
+// dir. Adopt records its absolute cwd as the file's first-line HTML comment;
+// re-adopt from a different cwd surfaces a warning.
+const ADOPTED_BY_RE = /^<!-- adopted-by: (.+?) -->\r?\n?/;
+function readAdoptedBy(filePath) {
+  try {
+    const first = fs.readFileSync(filePath, 'utf8').split('\n', 1)[0];
+    const m = first.match(/^<!-- adopted-by: (.+?) -->/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
 const INDEX_LINE = [
   '- [code-graph-mcp](plugin_code_graph_mcp.md) — v0.10.0 起 tools/list 默认 7 核心 + 5 隐藏可调（省启动 token）',
   '  - 核心 7（默认暴露）：`get_call_graph`/`module_overview`/`semantic_code_search`/`ast_search`/`find_references`/`get_ast_node`/`project_map`',
@@ -68,20 +80,49 @@ function platformGuard() {
   return null;
 }
 
+// Project-marker check: cwd looks like a real project (not /tmp / $HOME).
+// Used to gate auto-mkdir of the auto-memory dir so adopt doesn't pollute
+// random directories. Mirrors the markers Claude Code itself recognizes.
+const PROJECT_MARKERS = [
+  '.git', '.code-graph', 'package.json', 'Cargo.toml',
+  'pyproject.toml', 'go.mod', 'pom.xml', 'build.gradle',
+];
+function isProjectRoot(cwd) {
+  return PROJECT_MARKERS.some(m => fs.existsSync(path.join(cwd, m)));
+}
+
 function adopt({ cwd, home, templatePath } = {}) {
   const blocked = platformGuard();
   if (blocked) return blocked;
 
+  const effectiveCwd = cwd || process.cwd();
   const dir = memoryDir(cwd, home);
   if (!fs.existsSync(dir)) {
-    return { ok: false, reason: 'no-memory-dir', dir };
+    // Auto-create only when cwd has a project marker. Without markers the
+    // user is likely in /tmp or $HOME, where adopt would litter
+    // ~/.claude/projects/ with bogus slugs.
+    if (!isProjectRoot(effectiveCwd)) {
+      return { ok: false, reason: 'not-a-project', dir, cwd: effectiveCwd };
+    }
+    fs.mkdirSync(dir, { recursive: true });
   }
   const target = path.join(dir, TARGET_NAME);
   const tpl = templatePath || TEMPLATE_PATH;
   if (!fs.existsSync(tpl)) {
     return { ok: false, reason: 'no-template', template: tpl };
   }
-  fs.copyFileSync(tpl, target);
+  // Slug-collision detection: read prior adopted-by marker before overwrite.
+  let collisionWith = null;
+  if (fs.existsSync(target)) {
+    const prevCwd = readAdoptedBy(target);
+    if (prevCwd && prevCwd !== effectiveCwd) collisionWith = prevCwd;
+  }
+  // Write marker + template. Marker is HTML comment → invisible in rendered
+  // markdown but preserved by needsRefresh's bytewise compare (skipped via
+  // ADOPTED_BY_RE strip below).
+  const tplBody = fs.readFileSync(tpl);
+  const marker = Buffer.from(`<!-- adopted-by: ${effectiveCwd} -->\n`);
+  fs.writeFileSync(target, Buffer.concat([marker, tplBody]));
 
   const indexPath = path.join(dir, 'MEMORY.md');
   const index = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Memory Index\n';
@@ -89,14 +130,14 @@ function adopt({ cwd, home, templatePath } = {}) {
 
   // Already-adopted-and-well-formed: skip the write entirely.
   if (index.includes(desiredBlock)) {
-    return { ok: true, target, indexPath, indexed: false, healed: false };
+    return { ok: true, target, indexPath, indexed: false, healed: false, collisionWith };
   }
 
   const cleaned = stripSentinelBlock(index);
   const healed = cleaned !== index;
   const base = cleaned.endsWith('\n') ? cleaned : cleaned + '\n';
   fs.writeFileSync(indexPath, base + desiredBlock + '\n');
-  return { ok: true, target, indexPath, indexed: true, healed };
+  return { ok: true, target, indexPath, indexed: true, healed, collisionWith };
 }
 
 // v0.9.0 — "已 adopt" 判定：template 文件在 + MEMORY.md 内有我们的 sentinel 块。
@@ -124,7 +165,15 @@ function needsRefresh({ cwd, home, templatePath } = {}) {
   }
   const shipped = fs.readFileSync(tpl);
   const current = fs.readFileSync(target);
-  if (!shipped.equals(current)) return true;
+  // Strip the leading "<!-- adopted-by: ... -->\n" collision marker (D fix)
+  // before bytewise comparing — its presence/path naturally diverges from
+  // the shipped template.
+  let body = current;
+  const nl = current.indexOf(0x0a);
+  if (nl > 0 && ADOPTED_BY_RE.test(current.subarray(0, nl + 1).toString())) {
+    body = current.subarray(nl + 1);
+  }
+  if (!shipped.equals(body)) return true;
   const index = fs.readFileSync(indexPath, 'utf8');
   const desiredBlock = `${SENTINEL_BEGIN}\n${INDEX_LINE}\n${SENTINEL_END}`;
   return !index.includes(desiredBlock);
@@ -198,12 +247,22 @@ function formatResult(action, result) {
         return `[code-graph] Memory dir not found: ${result.dir}\n` +
                '  Run \`claude\` at least once in this project to create it.';
       }
+      if (result.reason === 'not-a-project') {
+        return `[code-graph] Not a project root: ${result.cwd}\n` +
+               '  No project marker (.git, Cargo.toml, package.json, pyproject.toml, ...).\n' +
+               '  cd into a real project before running adopt.';
+      }
       if (result.reason === 'no-template') {
         return `[code-graph] Template missing: ${result.template}`;
       }
       return `[code-graph] adopt failed: ${result.reason || 'unknown'}`;
     }
     const lines = [`[code-graph] Adopted → ${result.target}`];
+    if (result.collisionWith) {
+      lines.push(`[code-graph] ⚠ slug collision: this dir was previously adopted by ${result.collisionWith}.`);
+      lines.push('[code-graph]   Memory dir is shared — sentinels overwritten. ' +
+                 'Investigate path encoding clash (Claude Code slug = path with non-[a-zA-Z0-9-] → "-").');
+    }
     if (result.healed) lines.push(`[code-graph] Healed malformed sentinel block → ${result.indexPath}`);
     else if (result.indexed) lines.push(`[code-graph] Indexed → ${result.indexPath}`);
     else lines.push(`[code-graph] Index already up-to-date — no write`);
@@ -231,6 +290,7 @@ if (require.main === module) {
 
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
+  PROJECT_MARKERS,
 };

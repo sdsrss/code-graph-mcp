@@ -1,6 +1,6 @@
 {
   "name": "@sdsrs/code-graph",
-  "version": "0.16.8",
+  "version": "0.16.9",
   "description": "MCP server that indexes codebases into an AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing",
   "license": "MIT",
   "repository": {
@@ -28,16 +28,17 @@
   ],
   "scripts": {
     "build": "cargo build --release --no-default-features && node scripts/copy-binary.js",
-    "prepare": "git rev-parse --git-dir > /dev/null 2>&1 && ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit || true"
+    "prepare": "git rev-parse --git-dir > /dev/null 2>&1 && ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit || true",
+    "preuninstall": "node claude-plugin/scripts/lifecycle.js uninstall || true"
   },
   "engines": {
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@sdsrs/code-graph-linux-x64": "0.16.8",
-    "@sdsrs/code-graph-linux-arm64": "0.16.8",
-    "@sdsrs/code-graph-darwin-x64": "0.16.8",
-    "@sdsrs/code-graph-darwin-arm64": "0.16.8",
-    "@sdsrs/code-graph-win32-x64": "0.16.8"
+    "@sdsrs/code-graph-linux-x64": "0.16.9",
+    "@sdsrs/code-graph-linux-arm64": "0.16.9",
+    "@sdsrs/code-graph-darwin-x64": "0.16.9",
+    "@sdsrs/code-graph-darwin-arm64": "0.16.9",
+    "@sdsrs/code-graph-win32-x64": "0.16.9"
   }
 }

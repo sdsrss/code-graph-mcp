@@ -19,6 +19,7 @@ const ROOT = path.resolve(__dirname, '..');
 const PLUGIN_ROOT = path.join(ROOT, 'claude-plugin');
 const BIN_CLI = path.join(ROOT, 'bin', 'cli.js');
 const FIND_BINARY = path.join(PLUGIN_ROOT, 'scripts', 'find-binary.js');
+const VERSION_UTILS = path.join(PLUGIN_ROOT, 'scripts', 'version-utils.js');
 const LIFECYCLE = path.join(PLUGIN_ROOT, 'scripts', 'lifecycle.js');
 const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
 const PLATFORM = os.platform();
@@ -443,8 +444,10 @@ test('§2.8 bin/cli.js shows install instructions when binary is missing', () =>
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(fakePlugin, { recursive: true });
 
-  // Copy find-binary.js to fake root
+  // Copy find-binary.js + its module deps to fake root.
+  // (find-binary.js requires ./version-utils for B fix's cache version check.)
   fs.copyFileSync(FIND_BINARY, path.join(fakePlugin, 'find-binary.js'));
+  fs.copyFileSync(VERSION_UTILS, path.join(fakePlugin, 'version-utils.js'));
 
   // Create a minimal cli.js that uses the fake find-binary
   const cliScript = `

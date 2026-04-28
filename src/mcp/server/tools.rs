@@ -1464,14 +1464,16 @@ impl McpServer {
     }
 
     pub(super) fn compact_module_overview(&self, full: &serde_json::Value) -> Result<serde_json::Value> {
-        // Compact: keep node_id for chaining, drop signature
+        // Compact: keep node_id for chaining, drop signature.
+        // Field name `caller_count` matches the non-compact envelope and the
+        // CLI `overview --json` output (parity across surfaces).
         let active: Vec<serde_json::Value> = full["active_exports"].as_array()
             .map(|arr| arr.iter().map(|e| json!({
                 "node_id": e["node_id"],
                 "name": e["name"],
                 "type": e["type"],
                 "file": e["file"],
-                "callers": e["caller_count"],
+                "caller_count": e["caller_count"],
             })).collect())
             .unwrap_or_default();
 
@@ -1833,11 +1835,15 @@ impl McpServer {
                 })).collect())
                 .unwrap_or_default();
 
-            // Trim hot_functions: top 10, name+file+counts only
+            // Trim hot_functions: top 10, name+type+file+counts.
+            // `type` retained so callers can distinguish function vs method
+            // without a follow-up get_ast_node call (parity with non-compact
+            // envelope and CLI `map --json`).
             let compact_hot: Vec<serde_json::Value> = result["hot_functions"].as_array()
                 .map(|arr| arr.iter().take(10).map(|h| {
                     let mut obj = json!({
                         "name": h["name"],
+                        "type": h["type"],
                         "file": h["file"],
                         "caller_count": h["caller_count"],
                     });

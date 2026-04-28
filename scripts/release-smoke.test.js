@@ -55,3 +55,20 @@ test('marketplace points at the plugin directory and matching plugin name', () =
   assert.equal(marketplace.name, pluginManifest.name);
 });
 
+// Opt-in real-network smoke. Off by default (CI / local dev runs all mocked
+// auto-update tests). Set CODE_GRAPH_AUTO_UPDATE_E2E=1 once per release to
+// catch GitHub-API shape regressions that mocked tests will never see.
+test('auto-update parses real GitHub releases/latest shape',
+  { skip: process.env.CODE_GRAPH_AUTO_UPDATE_E2E !== '1' },
+  async () => {
+    const { fetchLatestRelease } = require('../claude-plugin/scripts/auto-update');
+    // fetchLatestRelease returns null on rate-limit / network failure / parse
+    // failure, so this test asserts the happy path: real shape from GH that
+    // parseLatestRelease can lift into {version, tarballUrl, binaryUrl}.
+    const parsed = await fetchLatestRelease();
+    assert.ok(parsed, 'fetchLatestRelease returned null — likely rate-limited or GH API shape regressed');
+    assert.match(parsed.version, /^\d+\.\d+\.\d+$/, `version must look semver-ish: got ${parsed.version}`);
+    assert.ok(parsed.tarballUrl, 'expected tarballUrl in parsed release');
+  }
+);
+

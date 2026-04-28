@@ -4,12 +4,31 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { readBinaryVersion } = require('./version-utils');
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
 const CACHE_FILE = path.join(os.homedir(), '.cache', 'code-graph', 'binary-path');
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 const PLATFORM_PKG = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
+
+/** Read the npm pkg version from this script's package.json (claude-plugin/../package.json). */
+function getPackageVersion() {
+  try { return require('../../package.json').version; }
+  catch { return null; }
+}
+
+/** Compare semver-ish "M.m.p" strings; returns -1, 0, or 1. Non-numeric parts → 0. */
+function compareVersions(a, b) {
+  const pa = String(a).split('.').map(s => parseInt(s, 10));
+  const pb = String(b).split('.').map(s => parseInt(s, 10));
+  for (let i = 0; i < 3; i++) {
+    const x = Number.isFinite(pa[i]) ? pa[i] : 0;
+    const y = Number.isFinite(pb[i]) ? pb[i] : 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
 
 /**
  * Candidate paths for npm global `node_modules`.
@@ -157,8 +176,19 @@ function findBinaryUncached() {
   }
 
   // --- Auto-update cache (binary downloaded directly from GitHub release) ---
+  // Cache wins when its version >= the npm pkg version. After `npm update`
+  // refreshes the platform-pkg, an older auto-update cache binary must NOT
+  // shadow the freshly-installed one; this version check prevents the
+  // upgrade-race where users keep running stale binary until auto-update fires.
   const autoUpdateBin = path.join(os.homedir(), '.cache', 'code-graph', 'bin', BINARY_NAME);
-  if (isNativeBinary(autoUpdateBin)) return autoUpdateBin;
+  if (isNativeBinary(autoUpdateBin)) {
+    const cacheVer = readBinaryVersion(autoUpdateBin);
+    const pkgVer = getPackageVersion();
+    if (!pkgVer || !cacheVer || compareVersions(cacheVer, pkgVer) >= 0) {
+      return autoUpdateBin;
+    }
+    // Cache is older than npm pkg — fall through to platform-pkg.
+  }
 
   // --- Platform-specific npm package (@sdsrs/code-graph-{os}-{arch}) ---
   const platformBin = findPlatformBinary();
@@ -212,6 +242,7 @@ function clearCache() {
 module.exports = {
   findBinary, findBinaryUncached, clearCache,
   globalNodeModulesCandidates, findPlatformBinary,
+  getPackageVersion, compareVersions,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
 };
 

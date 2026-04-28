@@ -5,7 +5,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { globalNodeModulesCandidates, findPlatformBinary, BINARY_NAME } = require('./find-binary');
+const { globalNodeModulesCandidates, findPlatformBinary, BINARY_NAME,
+        compareVersions, getPackageVersion } = require('./find-binary');
 
 function mkDir(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -107,4 +108,40 @@ test('findPlatformBinary returns null when no platform pkg installed anywhere re
     return;
   }
   assert.equal(real, null);
+});
+
+// ─── compareVersions (B fix: cache version invalidation helper) ───────────
+
+test('compareVersions: equal', () => {
+  assert.equal(compareVersions('1.2.3', '1.2.3'), 0);
+});
+
+test('compareVersions: cache older than pkg', () => {
+  // After `npm update` to 0.16.8, an auto-update cache from 0.16.7 must NOT
+  // shadow the freshly-installed platform-pkg binary. Returns -1 here so
+  // findBinaryUncached falls through to platform-pkg.
+  assert.equal(compareVersions('0.16.7', '0.16.8'), -1);
+});
+
+test('compareVersions: cache newer than pkg', () => {
+  // Auto-update may legitimately be ahead of npm pkg (cache fetched 0.17.0
+  // before npm shipped it). Returns 1 → cache wins.
+  assert.equal(compareVersions('0.17.0', '0.16.8'), 1);
+});
+
+test('compareVersions: minor and patch boundaries', () => {
+  assert.equal(compareVersions('1.0.0', '0.999.999'), 1);
+  assert.equal(compareVersions('1.10.0', '1.9.99'), 1);  // numeric, not lexical
+  assert.equal(compareVersions('1.0.10', '1.0.9'), 1);
+});
+
+test('compareVersions: tolerates non-numeric / short input', () => {
+  // Non-numeric → treated as 0; shorter strings padded with 0.
+  assert.equal(compareVersions('1.2', '1.2.0'), 0);
+  assert.equal(compareVersions('foo', '0.0.0'), 0);
+});
+
+test('getPackageVersion reads root package.json', () => {
+  const v = getPackageVersion();
+  assert.match(v, /^\d+\.\d+\.\d+$/, `expected semver-ish, got: ${v}`);
 });

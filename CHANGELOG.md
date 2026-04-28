@@ -1,5 +1,129 @@
 # Changelog
 
+## v0.16.9 — install/uninstall lifecycle hardening + MCP/CLI parity
+
+Audit-driven fixes after sandboxed end-to-end testing of the install,
+adopt, update, and uninstall flows. Three real bugs surfaced that the
+existing 97-test suite couldn't see because none of them tested the
+*real* user path: `npm uninstall`, post-upgrade binary resolution, and
+adopt-from-fresh-clone. Plus a parity sweep on the MCP↔CLI surface.
+
+**1. `npm uninstall` left dangling hooks in `~/.claude/settings.json`.**
+The package shipped a full `lifecycle.js uninstall` that strips our
+hook entries from settings.json — but nothing wired it to npm. After
+`npm uninstall -g @sdsrs/code-graph` the package files were gone but
+`settings.json` still pointed PostToolUse / SessionStart hooks at the
+deleted scripts. Claude Code subsequently failed to fire those hooks
+or surfaced ENOENT spam.
+
+**Fix:** added `"preuninstall": "node claude-plugin/scripts/lifecycle.js
+uninstall || true"` to `package.json`. npm now invokes the existing
+uninstall path before removing files. The `|| true` ensures a
+lifecycle failure never blocks the uninstall itself. Verified end-to-end
+in a sandboxed HOME: settings.json hooks containing `code-graph` paths
+get stripped; foreign hooks and `otherKey` configuration are preserved
+byte-for-byte.
+
+**2. `find-binary` cache shadowed fresh `npm update` binaries.** The
+cache priority was: dev mode → auto-update cache (`~/.cache/code-graph/
+bin/`) → platform npm pkg. After `npm update -g 0.16.7→0.16.8` the
+platform-pkg binary was refreshed, but the auto-update cache still
+held 0.16.7. find-binary returned the stale cache because it only
+verified the binary was *executable*, never that the version matched.
+Users kept running 0.16.7 until auto-update fired (up to 6h later).
+
+**Fix:** when the auto-update cache hits, read its `--version` and
+compare against the npm pkg version (`require('../../package.json').
+version`). Cache wins when `cache.ver >= pkg.ver` (legitimate case:
+auto-update fetched a newer release than npm has shipped). Cache loses
+when older — find-binary falls through to platform-pkg. Includes a
+3-digit semver compare helper that tolerates short / non-numeric input.
+
+**3. `adopt` couldn't bootstrap a fresh clone.** The path required
+`~/.claude/projects/<slug>/memory/` to already exist (created by
+Claude Code on first session that writes memory). Fresh-cloned project
+with no memory dir → `adopt` errored `no-memory-dir` and told the user
+to "run claude at least once". CI / scripted setup / first-time users
+on a new project all hit the wall.
+
+**Fix:** introduced a project-marker check (`.git`, `Cargo.toml`,
+`package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`,
+`.code-graph`). Memory dir missing AND cwd has any marker → `mkdir -p`
+and proceed. No marker → return `not-a-project` with a clearer error
+("cd into a real project before running adopt"). The slug-pollution
+guard remains in place for `/tmp` / `$HOME` accidents.
+
+### Slug collision marker
+
+Claude Code's slug encoding (`[^a-zA-Z0-9-]→'-'`) is lossy: `/foo/bar`
+and `/foo bar` resolve to the same memory dir. Two projects can
+silently share state with no signal. Added: `adopt` writes
+`<!-- adopted-by: <abs-cwd> -->` as the first line of
+`plugin_code_graph_mcp.md`. Re-adopt from a different cwd surfaces
+`result.collisionWith` and a stderr warning. `needsRefresh`'s
+bytewise compare strips the marker line first, so the marker doesn't
+cause false-positive drift detection on every SessionStart.
+
+### MCP↔CLI parity sweep
+
+Drove every MCP tool against its CLI counterpart on the same query
+and compared output. Three real divergences fixed:
+
+- **`hot_functions`**: CLI used `callers` / `test_callers`, MCP used
+  `caller_count` / `test_caller_count`; CLI cap=15, MCP cap=10. Both
+  now use `caller_count` / `test_caller_count`. CLI honors `--compact`
+  for top-10 cap (matching MCP `compact:true`); default returns top-15
+  (the underlying SQL `LIMIT 15`).
+- **`module_overview` compact**: MCP renamed `caller_count` → `callers`
+  in compact mode but kept `caller_count` in full mode. Aligned both
+  to `caller_count`.
+- **`get_call_graph` self-edge**: CLI included the queried symbol
+  itself with `direction=callers` AND `direction=callees` (count off
+  by 2 for `direction=both`). MCP filtered `depth > 0`. CLI now
+  filters seed in JSON output too. Human renderer keeps the seed for
+  the tree root.
+- **`project_map` compact `type` field**: MCP non-compact had `type`
+  on each hot_function, compact dropped it. Both surfaces now keep
+  `type` for parity.
+
+### CLI accepts MCP tool names as aliases
+
+Real-world friction observed in another project where Claude typed
+`code-graph-mcp project_map --compact` (the MCP tool name) verbatim
+into Bash and hit "Unknown subcommand: project_map". The MCP
+`instructions` had `Start: project_map --compact` without the
+parens-form CLI alias hint that the other 10 rules use. Two-layer fix:
+
+- Fixed the instructions text: `Start: project_map (map --compact)`
+  follows the existing `MCP-name (CLI-alias)` convention.
+- Defense in depth: CLI dispatch now accepts MCP tool names directly.
+  `project_map` / `module_overview` / `get_ast_node` / `find_references`
+  / `get_call_graph` / `impact_analysis` / `find_similar_code` /
+  `dependency_graph` / `trace_http_chain` / `find_dead_code` /
+  `ast_search` / `semantic_code_search` all map to existing short-name
+  handlers. `code-graph-mcp project_map --compact` now works. Typo
+  suggester also learned the MCP names so `project_mapp` →
+  `project_map`.
+
+### Opt-in real-network auto-update test
+
+`scripts/release-smoke.test.js` gained `auto-update parses real GitHub
+releases/latest shape`, gated on `CODE_GRAPH_AUTO_UPDATE_E2E=1`. The
+existing 10 auto-update unit tests are all mocked — there's no
+guardrail against GitHub API shape regression. Run once per release
+to validate `parseLatestRelease` against the real payload.
+
+### Validation
+
+- 165 node tests pass + 1 opt-in skip across 12 suites
+- 391 cargo tests pass + 1 ignored (routing_bench needs API key)
+- Sandbox lifecycle E2E: 16/16 pass with HOME-isolated mkdtemp
+  (binary smoke / adopt / re-adopt / status / check / session-init /
+  unadopt / residue audit, no orphan plugin file)
+- A end-to-end: realistic settings.json with `code-graph` hook paths
+  → `lifecycle uninstall || true` strips ours, preserves foreign
+  hooks + `otherKey`
+
 ## v0.16.8 — callgraph tree, JSON contracts, dead-code defaults, E2E hardening
 
 End-to-end usability pass: simulated a Claude Code session driving every

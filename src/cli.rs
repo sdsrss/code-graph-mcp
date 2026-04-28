@@ -1365,7 +1365,10 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Filter test callers unless --include-tests is set
+    // Filter test callers unless --include-tests is set.
+    // The seed (depth=0) is kept here because the human-readable renderer
+    // below uses it as the tree root. The JSON path filters it separately
+    // for parity with MCP `get_call_graph` (which excludes the seed).
     let (display_nodes, test_count) = if include_tests {
         (nodes.iter().collect::<Vec<_>>(), 0usize)
     } else {
@@ -1387,8 +1390,13 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
+        // Drop the seed (depth=0) — parity with MCP `get_call_graph`
+        // (`format_call_graph_response` filters `n.depth > 0`). With
+        // `direction=both` the seed appears twice (once per direction),
+        // inflating result counts.
         let results: Vec<serde_json::Value> = display_nodes
             .iter()
+            .filter(|n| n.depth > 0)
             .map(|n| {
                 serde_json::json!({
                     "node_id": n.node_id,
@@ -1660,6 +1668,23 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
+        // Field names (`caller_count` / `test_caller_count`) and `--compact`
+        // cap (top-10) match MCP `project_map`. CLI default returns top-15
+        // (the DB LIMIT in get_project_map).
+        let hot_cap = if compact { 10 } else { hot_functions.len() };
+        let hot_json: Vec<serde_json::Value> = hot_functions.iter().take(hot_cap).map(|h| {
+            let mut obj = serde_json::json!({
+                "name": h.name,
+                "type": h.node_type,
+                "file": h.file,
+                "caller_count": h.caller_count,
+            });
+            if h.test_caller_count > 0 {
+                obj["test_caller_count"] = serde_json::json!(h.test_caller_count);
+            }
+            obj
+        }).collect();
+
         let result = serde_json::json!({
             "modules": modules.iter().map(|m| serde_json::json!({
                 "path": m.path,
@@ -1681,18 +1706,7 @@ pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
                 "file": e.file,
                 "kind": e.kind,
             })).collect::<Vec<_>>(),
-            "hot_functions": hot_functions.iter().map(|h| {
-                let mut obj = serde_json::json!({
-                    "name": h.name,
-                    "type": h.node_type,
-                    "file": h.file,
-                    "callers": h.caller_count,
-                });
-                if h.test_caller_count > 0 {
-                    obj["test_callers"] = serde_json::json!(h.test_caller_count);
-                }
-                obj
-            }).collect::<Vec<_>>(),
+            "hot_functions": hot_json,
         });
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
@@ -1791,6 +1805,7 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
+        // `caller_count` matches MCP `module_overview.active_exports[].caller_count`.
         let results: Vec<serde_json::Value> = exports
             .iter()
             .map(|e| {
@@ -1799,7 +1814,7 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
                     "type": e.node_type,
                     "file": e.file_path,
                     "signature": e.signature,
-                    "callers": e.caller_count,
+                    "caller_count": e.caller_count,
                 })
             })
             .collect();

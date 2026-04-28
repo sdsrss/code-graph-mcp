@@ -67,51 +67,56 @@ fn main() -> Result<()> {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_grep(&project_root, &args)
         }
-        Some("search") => {
+        // MCP tool names (e.g. `semantic_code_search`) accepted as aliases for
+        // their CLI short forms. Reason: MCP `instructions` and adopted memory
+        // both reference tools by MCP name; agents copy-pasting the MCP name
+        // into Bash should not hit "Unknown subcommand". Note: `search` runs
+        // FTS5 only — MCP `semantic_code_search` adds vector+RRF fusion.
+        Some("search" | "semantic_code_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_search(&project_root, &args)
         }
-        Some("ast-search") => {
+        Some("ast-search" | "ast_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_ast_search(&project_root, &args)
         }
-        Some("callgraph") => {
+        Some("callgraph" | "get_call_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_callgraph(&project_root, &args)
         }
-        Some("impact") => {
+        Some("impact" | "impact_analysis") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_impact(&project_root, &args)
         }
-        Some("map") => {
+        Some("map" | "project_map") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_map(&project_root, &args)
         }
-        Some("overview") => {
+        Some("overview" | "module_overview") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_overview(&project_root, &args)
         }
-        Some("show") => {
+        Some("show" | "get_ast_node") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_show(&project_root, &args)
         }
-        Some("trace") => {
+        Some("trace" | "trace_http_chain") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_trace(&project_root, &args)
         }
-        Some("deps") => {
+        Some("deps" | "dependency_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_deps(&project_root, &args)
         }
-        Some("similar") => {
+        Some("similar" | "find_similar_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_similar(&project_root, &args)
         }
-        Some("refs") => {
+        Some("refs" | "find_references") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_refs(&project_root, &args)
         }
-        Some("dead-code") => {
+        Some("dead-code" | "find_dead_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_dead_code(&project_root, &args)
         }
@@ -303,6 +308,11 @@ const SUBCOMMANDS: &[&str] = &[
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "health-check", "doctor",
     "benchmark", "stats", "adopt", "unadopt",
+    // MCP tool names accepted as aliases (see dispatch above). Listed here so
+    // typo-suggester picks the closer alias for inputs like "project_mapp".
+    "project_map", "module_overview", "get_ast_node", "find_references",
+    "get_call_graph", "impact_analysis", "find_similar_code", "dependency_graph",
+    "trace_http_chain", "find_dead_code", "ast_search", "semantic_code_search",
 ];
 
 /// Locate and exec a node script under claude-plugin/scripts/.
