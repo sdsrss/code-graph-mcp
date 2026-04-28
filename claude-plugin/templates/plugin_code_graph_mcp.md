@@ -8,13 +8,19 @@ type: reference
 > Invited-memory 模式：MCP `instructions` 仅留指针，决策细则集中在此。
 >
 > **v0.9.0 起**：插件（`/plugin install`）模式下首次 SessionStart 自动 adopt，
-> 本文件自动写入，自动切换 quietHooks（跳过每次 project_map 注入）。
+> 本文件自动写入到项目 memory 目录。
 > 退出：`CODE_GRAPH_NO_AUTO_ADOPT=1` 阻止，`code-graph-mcp unadopt` 回退。
-> 手动强控：`CODE_GRAPH_QUIET_HOOKS=0` 强制注入 / `=1` 强制静默（覆盖 adoption 推导）。
 >
 > **v0.11.0 起**：已 adopt 的项目在下次 SessionStart 会自动对齐到插件 shipped
 > 的最新决策表（本文件 SHA 与 template 差异时覆盖）。手动编辑会被覆盖——
 > 要锁定自己的版本，设 `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（不影响首次 adopt）。
+>
+> **v0.17.0 起**：SessionStart `project_map` 注入 **默认 OFF**（不再随 adoption
+> 切换）。本文件 + 7 个工具描述已经覆盖路由所需的全部决策信息，每次会话再
+> dump ≈2.3 KB 的项目地图是冗余的常驻上下文成本。
+> 显式启用：`CODE_GRAPH_VERBOSE_HOOKS=1` —— Bash 调 `code-graph-mcp map --compact`
+> 也是等价的按需替代。
+> 向后兼容：`CODE_GRAPH_QUIET_HOOKS=0` 强制 noisy / `=1` 强制 quiet（优先级最高）。
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
 
@@ -100,7 +106,8 @@ code-graph-mcp health-check              # 索引健康
 
 ## 卸载 / 回退
 
-- `code-graph-mcp unadopt` — 精确移除 sentinel 段 + 本文件，quietHooks 自动回到 false（下次 SessionStart 恢复 project_map 注入）。
+- `code-graph-mcp unadopt` — 精确移除 sentinel 段 + 本文件。
 - `CODE_GRAPH_NO_AUTO_ADOPT=1`（`~/.claude/settings.json` env） — 阻止未来自动 adopt，不影响已 adopted 状态。
 - `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（v0.11.0+） — 锁定本文件不随插件升级刷新；允许手动编辑长久保留。
-- `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 project_map 注入（即使已 adopted）。
+- `CODE_GRAPH_VERBOSE_HOOKS=1`（v0.17.0+） — opt in 到 SessionStart `project_map` 注入（默认 OFF）。
+- `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 `project_map` 注入；优先级高于 VERBOSE_HOOKS（向后兼容路径）。

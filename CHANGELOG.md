@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.17.0 — quiet by default + tighter routing instructions
+
+Two-part SessionStart context-cost reduction. The plugin used to inject
+a ~2.3 KB `project_map` every session for un-adopted projects, plus a
+1418-byte MCP `instructions` block packing 10 per-tool decision rules.
+Both are redundant with what already exists: each tool's own
+`description` carries its routing hint, and `MEMORY.md →
+plugin_code_graph_mcp.md` already holds the full decision table for
+adopted projects. v0.17.0 cuts both, and tightens the two tool
+descriptions whose phrasing demonstrably mis-routed in benchmarks.
+
+**1. SessionStart `project_map` injection: OFF by default.**
+Old contract (v0.9.0): adopted → quiet, un-adopted → noisy. The
+assumption was that adoption installed the MEMORY.md decision table
+so the dump only became redundant *after* adopt.
+
+New contract: quiet unconditionally. The decision table + the
+on-demand `project_map` MCP tool + the per-tool descriptions cover
+every workflow that the SessionStart map dump used to support, so
+paying ~2.3 KB of context per session is wasteful — even pre-adopt.
+
+- `CODE_GRAPH_VERBOSE_HOOKS=1` opts in to the dump (new).
+- Legacy `CODE_GRAPH_QUIET_HOOKS=0` (force noisy) / `=1` (force quiet)
+  still wins, preserving the v0.9.0 escape hatches.
+- `computeQuietHooks({ adopted, env })` accepts but ignores `adopted`
+  — kept only to avoid breaking call-sites.
+
+**2. MCP `instructions` field trimmed 1418 → ~700 B.**
+The old noisy block packed all 10 routing rules with CLI aliases
+inline. Compile-time guard was 1500 B, against an observed Claude
+Code truncation cutoff of ~2048 B. The 10 rules now live in
+per-tool `description` strings (where clients actually read them to
+pick a tool) and in the adopted-project decision table.
+
+What remains in `instructions` is the boundary signal — which 5
+advanced tools are CLI-only (MCP integration can't call them by
+name), what to still use Grep / Read for, and where to find the
+adopted decision table.
+
+**3. Tool description tightening (LLM-visible).**
+
+- `semantic_code_search` now adds *"If module path is known, prefer
+  module_overview"* — closes the "I know the path AND a concept word"
+  ambiguity that previously routed to semantic search and burned a
+  vector lookup.
+- `find_references` now adds *"For plain literals (string/regex),
+  prefer Grep"* — `find_references` only tracks defined-symbol usage
+  sites, not raw text. Before tightening it caught literal-string
+  queries that should have gone to Grep.
+
+**4. routing_bench: +2 regression guards.**
+Two new oracle items in `tests/routing_bench.rs` directly probe the
+tightened phrasings:
+
+- *"How does the embedding pipeline work in src/embedding/?"* →
+  expects `module_overview` (path > concept tie-breaker).
+- *"I need to rename parse_tree to parse_ast — find every place I'd
+  update."* → expects `find_references` (rename-audit intent
+  preserved despite the new "prefer Grep for literals" line).
+
+**Verification.** `OPENROUTER_API_KEY=… cargo test --release --test
+routing_bench -- --ignored` against `anthropic/claude-sonnet-4.5`
+returned **P@1 = 21/22 = 95.5%**, up from baseline v0.16.7's
+19/20 = 95.0%. Both new guards passed. The single miss is *"Show me
+the EmbeddingModel struct definition"* routing to `ast_search`
+instead of `get_ast_node` — pre-existing oracle item, semantically
+defensible (`ast_search` returns nodes by name+kind), not introduced
+by this release.
+
 ## v0.16.9 — install/uninstall lifecycle hardening + MCP/CLI parity
 
 Audit-driven fixes after sandboxed end-to-end testing of the install,

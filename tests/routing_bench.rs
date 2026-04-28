@@ -81,6 +81,18 @@ const ORACLE: &[(&str, &str)] = &[
     ("Show me the EmbeddingModel struct definition", "get_ast_node"),
     ("What's the signature of weighted_rrf_fusion?", "get_ast_node"),
     ("Display the implementation of format_call_graph_response", "get_ast_node"),
+    // v0.17.0 — description-tightening regression guards.
+    // semantic_code_search now says "If module path is known, prefer
+    // module_overview". This query bait-tests that hint: it has both a
+    // concept word ("pipeline") AND an explicit module path. Pre-tightening
+    // it would route to semantic_code_search; post-tightening it should
+    // settle on module_overview.
+    ("How does the embedding pipeline work in src/embedding/?", "module_overview"),
+    // find_references now says "For plain literals (string/regex), prefer
+    // Grep". The bench cannot register Grep as a decoy tool, so we instead
+    // assert the rename-audit phrasing still hits find_references — the
+    // intent we want to preserve through the tightening.
+    ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
 ];
 
 enum Backend {

@@ -266,9 +266,12 @@ function formatResult(action, result) {
     if (result.healed) lines.push(`[code-graph] Healed malformed sentinel block → ${result.indexPath}`);
     else if (result.indexed) lines.push(`[code-graph] Indexed → ${result.indexPath}`);
     else lines.push(`[code-graph] Index already up-to-date — no write`);
-    // v0.9.0: adoption auto-implies quietHooks; no env var needed for the common case.
-    lines.push('[code-graph] Active — quietHooks auto-enabled via adopted state.');
-    lines.push('[code-graph] Force inject:  CODE_GRAPH_QUIET_HOOKS=0   Force silent: =1');
+    // v0.17.0: SessionStart project_map injection is OFF by default (regardless
+    // of adoption). Adoption now only governs MEMORY.md sentinel + decision-table
+    // refresh; the noisy hook needs an explicit opt-in.
+    lines.push('[code-graph] Active. SessionStart project_map injection: OFF (default).');
+    lines.push('[code-graph] Opt in to map dump:  CODE_GRAPH_VERBOSE_HOOKS=1');
+    lines.push('[code-graph] Legacy override:     CODE_GRAPH_QUIET_HOOKS=0 (force noisy) / =1 (force quiet)');
     return lines.join('\n');
   }
   if (action === 'unadopt') {

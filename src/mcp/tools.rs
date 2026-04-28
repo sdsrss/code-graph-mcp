@@ -32,7 +32,7 @@ impl ToolRegistry {
         let tools = vec![
             ToolDefinition {
                 name: "semantic_code_search".into(),
-                description: "Search code by concept, not exact text. Use when: you know what code does but not its name, or grep returns noise. Returns AST nodes ranked by relevance.".into(),
+                description: "Search code by concept when symbol/module name is unknown. Use when: grep returns noise and you can't name what you want. If module path is known, prefer module_overview. Returns ranked AST nodes.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -120,7 +120,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Usage sites (calls/imports/inherits/implements; consts: imports only, not value-uses). Use when: auditing every place a symbol is touched before rename/remove. For 'who calls X?', use get_call_graph.".into(),
+                description: "Usage sites (calls/imports/inherits/implements). Use when: rename/remove audit of a defined symbol. For plain literals (string/regex), prefer Grep. For 'who calls X?', use get_call_graph.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

@@ -84,27 +84,46 @@ test('consistencyCheck returns empty array when binary version matches plugin', 
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// v0.9.0 — quietHooks inference from adopted state
+// v0.17.0 — quietHooks: unconditional quiet default
+// Priority: legacy QUIET_HOOKS=0/1 > new VERBOSE_HOOKS=1 > default true.
+// `adopted` param is dead (unconditional default does not consult it) but
+// the destructured signature still accepts it for backward compat.
 // ──────────────────────────────────────────────────────────────────────────
 
-test('computeQuietHooks: env "0" forces noisy regardless of adoption', () => {
-  assert.equal(computeQuietHooks({ adopted: true, env: { CODE_GRAPH_QUIET_HOOKS: '0' } }), false);
-  assert.equal(computeQuietHooks({ adopted: false, env: { CODE_GRAPH_QUIET_HOOKS: '0' } }), false);
+test('computeQuietHooks: legacy QUIET_HOOKS="0" forces noisy', () => {
+  assert.equal(computeQuietHooks({ env: { CODE_GRAPH_QUIET_HOOKS: '0' } }), false);
 });
 
-test('computeQuietHooks: env "1" forces quiet regardless of adoption', () => {
-  assert.equal(computeQuietHooks({ adopted: true, env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), true);
-  assert.equal(computeQuietHooks({ adopted: false, env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), true);
+test('computeQuietHooks: legacy QUIET_HOOKS="1" forces quiet', () => {
+  assert.equal(computeQuietHooks({ env: { CODE_GRAPH_QUIET_HOOKS: '1' } }), true);
 });
 
-test('computeQuietHooks: env unset → follows adopted state', () => {
+test('computeQuietHooks: VERBOSE_HOOKS="1" opts in to noisy', () => {
+  assert.equal(computeQuietHooks({ env: { CODE_GRAPH_VERBOSE_HOOKS: '1' } }), false);
+});
+
+test('computeQuietHooks: legacy QUIET_HOOKS="1" wins over VERBOSE_HOOKS="1"', () => {
+  // Conflicting opt-ins: legacy explicit-quiet wins over new verbose opt-in.
+  // (Legacy QUIET_HOOKS="0" + VERBOSE_HOOKS="1" both mean noisy — no conflict.)
+  assert.equal(
+    computeQuietHooks({ env: { CODE_GRAPH_QUIET_HOOKS: '1', CODE_GRAPH_VERBOSE_HOOKS: '1' } }),
+    true
+  );
+});
+
+test('computeQuietHooks: env unset → quiet by default', () => {
+  assert.equal(computeQuietHooks({ env: {} }), true);
+});
+
+test('computeQuietHooks: no args → quiet by default', () => {
+  assert.equal(computeQuietHooks(), true);
+});
+
+test('computeQuietHooks: legacy `adopted` param is ignored under new default', () => {
+  // adopted=true used to imply quiet; now quiet is unconditional.
+  // adopted=false used to imply noisy; now still quiet by default.
   assert.equal(computeQuietHooks({ adopted: true, env: {} }), true);
-  assert.equal(computeQuietHooks({ adopted: false, env: {} }), false);
-});
-
-test('computeQuietHooks: env unset, no env arg → follows adopted state', () => {
-  assert.equal(computeQuietHooks({ adopted: true }), true);
-  assert.equal(computeQuietHooks({ adopted: false }), false);
+  assert.equal(computeQuietHooks({ adopted: false, env: {} }), true);
 });
 
 test('consistencyCheck returns version-mismatch when versions differ', (t) => {

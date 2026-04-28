@@ -11,13 +11,22 @@ const {
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted } = require('./adopt');
 
-// v0.9.0 — quietHooks 推导：显式 env override > adopted 状态。
-// CODE_GRAPH_QUIET_HOOKS='0' 强制 noisy；'1' 强制 quiet；未设 → 跟随 adopted。
-function computeQuietHooks({ adopted, env = {} } = {}) {
+// v0.17.0 — quietHooks: unconditional quiet 默认。
+// 项目地图与 MEMORY.md plugin contract + on-demand `project_map` 工具高度重叠，
+// 默认每次 SessionStart 都注入 ≈2.3 KB 是不必要的常驻上下文成本。
+// 优先级（高到低）：
+//   1. legacy CODE_GRAPH_QUIET_HOOKS='0'  → forced noisy（向后兼容）
+//   2. legacy CODE_GRAPH_QUIET_HOOKS='1'  → forced quiet（向后兼容）
+//   3. CODE_GRAPH_VERBOSE_HOOKS='1'       → opt-in noisy（新）
+//   4. 默认                                 → quiet
+// `adopted` 参数已弃用（unconditional 默认不再依赖该信号），保留接口签名只为
+// 不破坏既有调用 / 测试。
+function computeQuietHooks({ env = {} } = {}) {
   const envQuiet = env.CODE_GRAPH_QUIET_HOOKS;
   if (envQuiet === '0') return false;
   if (envQuiet === '1') return true;
-  return !!adopted;
+  if (env.CODE_GRAPH_VERBOSE_HOOKS === '1') return false;
+  return true;
 }
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
@@ -277,10 +286,11 @@ function runSessionInit() {
     }
   }
 
-  // quietHooks: adopted → quiet by default (rely on MEMORY.md pointer + on-demand
-  // project_map tool); env '1'/'0' overrides for explicit control.
+  // quietHooks: default quiet (project_map injection duplicates MEMORY.md +
+  // on-demand tool). CODE_GRAPH_VERBOSE_HOOKS=1 to opt in to the dump;
+  // legacy CODE_GRAPH_QUIET_HOOKS=0/1 still force the old behavior.
   const adopted = isAdopted();
-  const quietHooks = computeQuietHooks({ adopted, env: process.env });
+  const quietHooks = computeQuietHooks({ env: process.env });
 
   const mapInjected = binaryCheck.available && !quietHooks ? injectProjectMap() : false;
   const consistencyIssues = binaryCheck.available

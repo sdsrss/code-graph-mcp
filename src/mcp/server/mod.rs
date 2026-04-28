@@ -1182,28 +1182,17 @@ impl McpServer {
         let instructions = if quiet {
             "code-graph-mcp ready. Tools: project_map, semantic_code_search, module_overview, get_call_graph, impact_analysis, find_references, ast_search, dependency_graph, find_dead_code, find_similar_code, get_ast_node, trace_http_chain. Run `code-graph-mcp --help` for CLI. See MEMORY.md → plugin_code_graph_mcp.md for decision rules (if adopted)."
         } else {
-            // Tight budget: Claude Code truncates MCP instructions near ~2KB
-            // (v0.14.1 session observed cut at "modifying a function s...").
-            // Pack all 10 decision rules with CLI aliases INSIDE the safe line;
-            // full details live in MEMORY.md \u{2192} plugin_code_graph_mcp.md.
+            // v0.17.0: trimmed from 1418B to ~700B by dropping the 10 per-tool
+            // decision rows that already live in tool descriptions and in
+            // MEMORY.md \u{2192} plugin_code_graph_mcp.md. What remains is the
+            // boundary signal (Grep/Read still applies) and the CLI-only-tools
+            // pointer that the MCP tools/list cannot convey on its own.
             const NOISY: &str = concat!(
-                "Code Graph CLI \u{2014} this project is indexed. Use these INSTEAD OF multi-step Grep/Read (CLI alias in parens):\n",
-                "  \u{2022} \"who calls X?\" / \"what does X call?\" \u{2192} get_call_graph (callgraph X)\n",
-                "  \u{2022} \"what breaks if I change X?\" \u{2192} impact_analysis (impact X)\n",
-                "  \u{2022} \"how is module Y structured?\" \u{2192} module_overview (overview Y/)\n",
-                "  \u{2022} \"find code that does Z\" (concept) \u{2192} semantic_code_search (search \"Z\"; CLI is FTS-only, MCP adds vector+RRF)\n",
-                "  \u{2022} \"functions returning T / signature matches\" \u{2192} ast_search --returns T\n",
-                "  \u{2022} \"is X used anywhere?\" \u{2192} find_references (refs X)\n",
-                "  \u{2022} modifying a signature \u{2192} impact_analysis FIRST, then edit\n",
-                "  \u{2022} \"unused/dead code\" \u{2192} find_dead_code (dead-code)\n",
-                "  \u{2022} \"similar/duplicate functions\" \u{2192} find_similar_code (similar X)\n",
-                "  \u{2022} \"what does file X depend on?\" \u{2192} dependency_graph (deps X)\n",
-                "  \u{2022} \"show/inspect X\" \u{2192} get_ast_node (show X; add include_impact=true for blast radius)\n",
-                "Claude Code MCP only exposes 7 tools; impact_analysis/find_dead_code/find_similar_code/dependency_graph/trace_http_chain are CLI-only \u{2014} run the parens form via Bash.\n",
-                "Start: project_map (map --compact) for architecture. Stuck on results? code-graph-mcp health-check.\n",
+                "Code Graph MCP \u{2014} this project is indexed. The 7 registered tools cover code structure, calls, references, and concept search; their own descriptions carry the routing rules.\n",
+                "Five advanced tools (impact / dead-code / similar / deps / trace) are CLI-only \u{2014} Claude Code's MCP integration cannot call them by name. Invoke via Bash: `code-graph-mcp impact|dead-code|similar|deps|trace`.\n",
                 "Still Grep for: exact strings, constants, regex, non-code files. Still Read for: files you will edit.\n",
-                "Prompts: impact-analysis, understand-module, trace-request.\n",
-                "Full decision table + 5 advanced tools: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+                "Diagnostics: `code-graph-mcp health-check`. Prompts: impact-analysis, understand-module, trace-request.\n",
+                "Full decision table: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
             );
             // Compile-time guard: calibrated from observed Claude Code truncation
             // at ~2048 bytes; 1500 leaves ~25% margin. Future edits that blow the
