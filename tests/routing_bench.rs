@@ -300,6 +300,47 @@ fn detect_mode() -> BenchMode {
     detect_mode_for(std::env::var("ROUTING_BENCH_MODE").ok().as_deref())
 }
 
+/// Decoy tools added in context-rich mode. Mirrors the most common Claude
+/// Code native tools that compete with code-graph for routing. Descriptions
+/// are calibrated against the spec's strict-A FP boundary: "Prefer over
+/// code-graph" anchor language matches the v0.17.0 description tightening.
+#[allow(dead_code)]
+fn decoy_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "Grep",
+            "description": "Fast text/regex search across files. Use for literal strings, regex patterns, or finding occurrences of fixed text. Prefer over code-graph tools when you don't need structural understanding (e.g., grep for `TODO`, `FIXME`, literal log strings).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Pattern to search for (literal or regex)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional path to scope the search"
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }),
+        json!({
+            "name": "Read",
+            "description": "Read file contents from disk by path. Use when you need to see specific contents of a known file (e.g., 'what's in CHANGELOG.md', 'show line 50 of foo.rs', '.gitignore contents'). Prefer over code-graph tools for non-source files (config, docs, logs).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["file_path"]
+            }
+        }),
+    ]
+}
+
 /// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
 /// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
 /// Single source of truth is adopt.js; the Rust mirror is a snapshot used
@@ -379,3 +420,45 @@ mod mode_tests {
         assert!(matches!(m, BenchMode::ToolOnly));
     }
 }
+
+#[cfg(test)]
+mod decoy_tests {
+    use super::*;
+
+    #[test]
+    fn decoy_tools_has_grep_and_read() {
+        let tools = decoy_tools();
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Read"));
+    }
+
+    #[test]
+    fn decoy_tools_have_required_fields() {
+        for tool in decoy_tools() {
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert!(tool["input_schema"].is_object());
+            assert!(tool["input_schema"]["properties"].is_object());
+            assert!(tool["input_schema"]["required"].is_array());
+        }
+    }
+
+    #[test]
+    fn decoy_descriptions_reference_prefer_over_code_graph() {
+        // Sanity check that decoys are calibrated to compete with code-graph
+        // tools (per the spec's measurement-fairness requirement). If a future
+        // edit weakens decoy descriptions, this test makes the regression visible.
+        for tool in decoy_tools() {
+            let desc = tool["description"].as_str().unwrap();
+            assert!(
+                desc.contains("Prefer over code-graph"),
+                "decoy description must signal 'prefer over code-graph' to be measurement-fair"
+            );
+        }
+    }
+}
+
