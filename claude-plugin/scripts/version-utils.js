@@ -18,13 +18,22 @@ function readBinaryVersion(binaryPath) {
   }
 }
 
-function isDevMode() {
-  // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
-  const pluginRoot = path.resolve(__dirname, '..');
-  // Dev mode: running from source repo (has Cargo.toml nearby)
-  if (fs.existsSync(path.join(pluginRoot, '..', 'Cargo.toml'))) return true;
-  // Dev mode: plugin root is a symlink
+function isDevMode(pluginRoot = path.resolve(__dirname, '..')) {
+  // Explicit opt-in always wins (also lets users force dev mode in any layout)
+  if (process.env.CODE_GRAPH_DEV === '1') return true;
+  // Plugin root is a symlink (e.g. `npm link`)
   try { if (fs.lstatSync(pluginRoot).isSymbolicLink()) return true; } catch { /* ok */ }
+  // Source repo: Cargo.toml AND target/ at parent. Marketplace installs ship
+  // Cargo.toml (git-tracked) but NOT target/ (gitignored), so target/ is the
+  // discriminator — without it, a marketplace clone was being misclassified as
+  // dev mode and the launcher's GitHub-release fallback was unreachable
+  // (see GitHub issue #12). If a dev hasn't built yet, they fall through to
+  // the user-mode auto-install path, which still produces a working binary.
+  const parent = path.dirname(pluginRoot);
+  if (fs.existsSync(path.join(parent, 'Cargo.toml')) &&
+      fs.existsSync(path.join(parent, 'target'))) {
+    return true;
+  }
   return false;
 }
 

@@ -7,7 +7,7 @@
  * Used by .mcp.json so the plugin controls binary discovery instead of
  * relying on the binary being in PATH.
  */
-const { spawn, execFileSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -28,42 +28,69 @@ if (!binary) {
   } catch { /* use latest */ }
 
   process.stderr.write(`[code-graph] Binary not found, installing @sdsrs/code-graph@${version}...\n`);
-  try {
-    execFileSync('npm', ['install', '-g', `@sdsrs/code-graph@${version}`], {
-      timeout: 60000, stdio: 'pipe',
-    });
+  const npmResult = spawnSync('npm', ['install', '-g', `@sdsrs/code-graph@${version}`], {
+    timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
+  });
+  if (npmResult.error || npmResult.status !== 0) {
+    process.stderr.write('[code-graph] npm install failed.\n');
+    if (npmResult.stderr) {
+      process.stderr.write(npmResult.stderr.trim().split('\n').map(l => `[code-graph][npm] ${l}\n`).join(''));
+    }
+  } else {
     clearCache();
     binary = findBinary();
     if (binary) {
       process.stderr.write(`[code-graph] Installed at ${binary}\n`);
     }
-  } catch {
-    process.stderr.write('[code-graph] npm install failed.\n');
   }
 }
 
 // Fallback: npm install may have succeeded but optionalDependencies for the
 // platform binary can fail silently (npm tolerates OS-mismatch + flaky
 // registry). Pull the platform binary directly from the GitHub release.
+//
+// --install-missing bypasses auto-update.js's isDevMode() short-circuit. The
+// marketplace ships the full repo (including Cargo.toml at the workspace root),
+// so dev-mode heuristics that look for Cargo.toml were misclassifying every
+// marketplace install as dev mode and skipping this fallback (issue #12).
 if (!binary) {
   process.stderr.write('[code-graph] Falling back to GitHub release download...\n');
-  try {
-    execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), '--silent'], {
-      timeout: 90000, stdio: 'pipe',
-    });
-    clearCache();
-    binary = findBinary();
-    if (binary) {
-      process.stderr.write(`[code-graph] Installed at ${binary}\n`);
-    }
-  } catch { /* fall through to manual-install message */ }
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, 'auto-update.js'), '--silent', '--install-missing'],
+    { timeout: 90000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }
+  );
+  if (result.stderr && result.stderr.trim()) {
+    process.stderr.write(result.stderr.trim().split('\n').map(l => `[code-graph][auto-update] ${l}\n`).join(''));
+  }
+  if (result.error) {
+    process.stderr.write(`[code-graph] auto-update spawn failed: ${result.error.message}\n`);
+  } else if (result.status !== 0) {
+    process.stderr.write(`[code-graph] auto-update exited with status ${result.status}\n`);
+  }
+  clearCache();
+  binary = findBinary();
+  if (binary) {
+    process.stderr.write(`[code-graph] Installed at ${binary}\n`);
+  }
 }
 
 if (!binary) {
+  const installedViaMarketplace = fs.existsSync(
+    path.join(__dirname, '..', '.claude-plugin', 'plugin.json')
+  );
+  process.stderr.write('[code-graph] Binary not found. Install manually:\n');
+  if (installedViaMarketplace) {
+    process.stderr.write(
+      '  # Re-install the plugin via Claude Code marketplace:\n' +
+      '  /plugin uninstall code-graph-mcp && /plugin install code-graph-mcp@code-graph-mcp\n' +
+      '  # Or install the binary directly via npm:\n'
+    );
+  }
   process.stderr.write(
-    '[code-graph] Binary not found. Install manually:\n' +
+    '  npm install -g @sdsrs/code-graph @sdsrs/code-graph-' + process.platform + '-' + process.arch + '\n' +
+    '  # or, equivalent split form:\n' +
     '  npm install -g @sdsrs/code-graph\n' +
-    '  # or\n' +
     '  npm install -g @sdsrs/code-graph-' + process.platform + '-' + process.arch + '\n'
   );
   process.exit(1);

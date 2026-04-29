@@ -45,10 +45,66 @@ test('readBinaryVersion returns null for binary with unexpected output', (t) => 
 
 // ── isDevMode ──
 
-test('isDevMode returns true in source repo (Cargo.toml nearby)', () => {
+function makeFakePluginRoot(t, { withCargo = false, withTarget = false, asSymlink = false } = {}) {
+  const parent = mkDir(t, 'vu-dev-');
+  const pluginRoot = path.join(parent, 'claude-plugin');
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  if (withCargo) fs.writeFileSync(path.join(parent, 'Cargo.toml'), '[package]\nname = "x"\n');
+  if (withTarget) fs.mkdirSync(path.join(parent, 'target'), { recursive: true });
+
+  if (asSymlink) {
+    const real = path.join(parent, 'real-plugin');
+    fs.mkdirSync(real, { recursive: true });
+    fs.rmSync(pluginRoot, { recursive: true, force: true });
+    fs.symlinkSync(real, pluginRoot);
+  }
+  return pluginRoot;
+}
+
+function withEnv(t, key, value) {
+  const original = process.env[key];
+  if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  t.after(() => {
+    if (original === undefined) delete process.env[key]; else process.env[key] = original;
+  });
+}
+
+test('isDevMode returns true in source repo when Cargo.toml AND target/ both exist', (t) => {
   const { isDevMode } = require('./version-utils');
-  // Running from source repo: __dirname/../.. has Cargo.toml → true
-  assert.equal(isDevMode(), true);
+  withEnv(t, 'CODE_GRAPH_DEV', undefined);
+  const pluginRoot = makeFakePluginRoot(t, { withCargo: true, withTarget: true });
+  assert.equal(isDevMode(pluginRoot), true);
+});
+
+test('isDevMode returns false for marketplace clone (Cargo.toml without target/)', (t) => {
+  const { isDevMode } = require('./version-utils');
+  withEnv(t, 'CODE_GRAPH_DEV', undefined);
+  // Marketplace clones the full repo (Cargo.toml is git-tracked) but `target/`
+  // is gitignored, so a fresh marketplace install has no target/. This is the
+  // exact misclassification fixed for issue #12.
+  const pluginRoot = makeFakePluginRoot(t, { withCargo: true, withTarget: false });
+  assert.equal(isDevMode(pluginRoot), false);
+});
+
+test('isDevMode returns false for fully unrelated install (no Cargo.toml, no target/)', (t) => {
+  const { isDevMode } = require('./version-utils');
+  withEnv(t, 'CODE_GRAPH_DEV', undefined);
+  const pluginRoot = makeFakePluginRoot(t);
+  assert.equal(isDevMode(pluginRoot), false);
+});
+
+test('isDevMode honors CODE_GRAPH_DEV=1 even when neither Cargo.toml nor target/ exist', (t) => {
+  const { isDevMode } = require('./version-utils');
+  withEnv(t, 'CODE_GRAPH_DEV', '1');
+  const pluginRoot = makeFakePluginRoot(t);
+  assert.equal(isDevMode(pluginRoot), true);
+});
+
+test('isDevMode returns true when plugin root is a symlink', (t) => {
+  const { isDevMode } = require('./version-utils');
+  withEnv(t, 'CODE_GRAPH_DEV', undefined);
+  const pluginRoot = makeFakePluginRoot(t, { asSymlink: true });
+  assert.equal(isDevMode(pluginRoot), true);
 });
 
 // ── getNewestMtime ──

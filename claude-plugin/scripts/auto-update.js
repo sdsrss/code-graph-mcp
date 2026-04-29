@@ -38,6 +38,10 @@ function isSilentMode(argv = process.argv.slice(2), env = process.env) {
   return argv.includes('--silent') || env.CODE_GRAPH_AUTO_UPDATE_SILENT === '1';
 }
 
+function isInstallMissingMode(argv = process.argv.slice(2)) {
+  return argv.includes('--install-missing');
+}
+
 // ── Platform → GitHub release asset name mapping ──────────
 function getPlatformAssetName() {
   const platform = os.platform();
@@ -327,10 +331,12 @@ async function downloadAndInstall(latest) {
 
 // ── Main Entry ─────────────────────────────────────────────
 
-async function checkForUpdate() {
+async function checkForUpdate({ installMissing = false } = {}) {
   try {
-    // Skip in dev mode
-    if (isDevMode()) return null;
+    // Skip in dev mode — unless the launcher explicitly requested a missing-
+    // binary install, in which case we MUST proceed regardless of mode (the
+    // alternative is wedging the MCP server with no binary on disk).
+    if (!installMissing && isDevMode()) return null;
 
     const state = readState();
     // manifest.version is authoritative — /plugin update writes it directly and
@@ -414,23 +420,25 @@ async function checkForUpdate() {
 
 module.exports = {
   checkForUpdate, commandExists, isDevMode, readState, compareVersions,
-  getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary, isSilentMode,
+  getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
+  isSilentMode, isInstallMissingMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath,
 };
 
-// CLI: node auto-update.js [check|status]
+// CLI: node auto-update.js [check|status] [--silent] [--install-missing]
 if (require.main === module) {
   (async () => {
     const argv = process.argv.slice(2);
     const cmd = argv.find(arg => !arg.startsWith('--')) || 'check';
     const silent = isSilentMode(argv);
+    const installMissing = isInstallMissingMode(argv);
     if (cmd === 'status') {
       const state = readState();
       console.log(JSON.stringify(state, null, 2));
     } else {
       if (!silent) console.log('Checking for updates...');
-      const result = await checkForUpdate();
+      const result = await checkForUpdate({ installMissing });
       if (silent) return;
       if (result && result.updated) {
         console.log(`Updated: v${result.from} → v${result.to} (binary: ${result.binaryUpdated ? 'yes' : 'no'})`);
@@ -438,7 +446,7 @@ if (require.main === module) {
         console.log(`Update available: v${result.to} (auto-install failed)`);
       } else if (result && result.binaryUpdated) {
         console.log(`Repaired binary cache (v${result.to})`);
-      } else if (isDevMode()) {
+      } else if (!installMissing && isDevMode()) {
         console.log('Dev mode — auto-update skipped');
       } else {
         const manifest = readManifest();

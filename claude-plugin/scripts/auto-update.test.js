@@ -14,6 +14,8 @@ const {
   promoteVerifiedBinary,
   cachedBinaryPath,
   downloadBinary,
+  isInstallMissingMode,
+  isSilentMode,
 } = require('./auto-update');
 
 function mkDir(t, prefix) {
@@ -111,6 +113,21 @@ test('downloadBinary returns false for missing binaryUrl (no-op safety)', async 
 test('downloadBinary returns false when latest is null', async () => {
   const result = await downloadBinary(null);
   assert.equal(result, false);
+});
+
+// ── Flag parsing ───────────────────────────────────────────
+
+test('isInstallMissingMode detects --install-missing in argv', () => {
+  assert.equal(isInstallMissingMode(['--install-missing']), true);
+  assert.equal(isInstallMissingMode(['check', '--install-missing']), true);
+  assert.equal(isInstallMissingMode(['check']), false);
+  assert.equal(isInstallMissingMode([]), false);
+});
+
+test('isSilentMode honors --silent flag and CODE_GRAPH_AUTO_UPDATE_SILENT env', () => {
+  assert.equal(isSilentMode(['--silent'], {}), true);
+  assert.equal(isSilentMode([], { CODE_GRAPH_AUTO_UPDATE_SILENT: '1' }), true);
+  assert.equal(isSilentMode([], {}), false);
 });
 
 test('fetchLatestRelease parses JSON without relying on global fetch', async () => {
