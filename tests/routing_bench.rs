@@ -44,6 +44,7 @@
 
 use code_graph_mcp::mcp::tools::ToolRegistry;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const P_AT_1_THRESHOLD: f64 = 0.70;
@@ -394,6 +395,72 @@ fn build_oracle(mode: BenchMode) -> Vec<(&'static str, &'static str)> {
     all
 }
 
+/// Recall over ORACLE: fraction of code-graph queries where the picked tool
+/// matches the expected tool exactly.
+#[allow(dead_code)]
+fn compute_recall(picks: &HashMap<String, String>) -> f64 {
+    let hits = ORACLE.iter()
+        .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
+        .count();
+    hits as f64 / ORACLE.len() as f64
+}
+
+/// FP-rate over FP_ORACLE: fraction of FP queries where the picked tool is
+/// NOT one of the decoys (i.e., a code-graph tool was wrongly chosen).
+/// Note: picking the *wrong* decoy (Read when Grep expected) is NOT a FP —
+/// the boundary held, only the specific decoy was off.
+#[allow(dead_code)]
+fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
+    let violations = FP_ORACLE.iter()
+        .filter(|(q, _expected_decoy)| {
+            let picked = picks.get(*q).map(|s| s.as_str()).unwrap_or("(none)");
+            !["Grep", "Read"].contains(&picked)
+        })
+        .count();
+    violations as f64 / FP_ORACLE.len() as f64
+}
+
+/// Overall summary: (recall_hits + fp_avoidance) / total. Loose metric —
+/// FP_avoidance counts wrong-decoy picks as good (boundary held). Use
+/// recall and fp_rate separately for candidate comparison.
+#[allow(dead_code)]
+fn compute_overall(picks: &HashMap<String, String>) -> f64 {
+    let recall_hits = ORACLE.iter()
+        .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
+        .count();
+    let fp_violations = FP_ORACLE.iter()
+        .filter(|(q, _)| {
+            let picked = picks.get(*q).map(|s| s.as_str()).unwrap_or("(none)");
+            !["Grep", "Read"].contains(&picked)
+        })
+        .count();
+    let fp_avoidance = FP_ORACLE.len() - fp_violations;
+    let total = ORACLE.len() + FP_ORACLE.len();
+    (recall_hits + fp_avoidance) as f64 / total as f64
+}
+
+/// Majority vote across multiple runs of the same query. Returns the most-
+/// frequent pick. Tie-break: first occurrence wins (preserves run-1 result
+/// when temperature: 0 fails to fully converge).
+#[allow(dead_code)]
+fn majority_vote(picks: &[&str]) -> Option<String> {
+    if picks.is_empty() {
+        return None;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for &p in picks {
+        *counts.entry(p).or_insert(0) += 1;
+    }
+    let max = counts.values().max().copied().unwrap();
+    // Iterate in original order to break ties by first-seen.
+    for &p in picks {
+        if counts[p] == max {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
 /// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
 /// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
 /// Single source of truth is adopt.js; the Rust mirror is a snapshot used
@@ -595,6 +662,89 @@ mod builder_tests {
     fn build_oracle_context_rich_concatenates() {
         let o = build_oracle(BenchMode::ContextRich);
         assert_eq!(o.len(), ORACLE.len() + FP_ORACLE.len());
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn picks(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(q, t)| (q.to_string(), t.to_string())).collect()
+    }
+
+    #[test]
+    fn compute_recall_full_hit() {
+        let p: HashMap<String, String> = ORACLE.iter()
+            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(compute_recall(&p), 1.0);
+    }
+
+    #[test]
+    fn compute_recall_zero_picks() {
+        let p = HashMap::new();
+        assert_eq!(compute_recall(&p), 0.0);
+    }
+
+    #[test]
+    fn compute_fp_rate_zero_when_all_picks_grep_or_read() {
+        let p = picks(&[
+            ("Find every TODO comment in source files.", "Grep"),
+            ("Show me lines 50 through 80 of src/main.rs.", "Read"),
+            ("What does the .gitignore file contain?", "Read"),
+            ("Print the first 100 lines of CHANGELOG.md.", "Read"),
+            ("Search for the literal string `FIXME` across the codebase.", "Grep"),
+            ("Search for all occurrences of the regex `error\\d+` in log files.", "Grep"),
+            ("Read the contents of Cargo.toml.", "Read"),
+            ("Find every line that mentions `deprecated` in comments.", "Grep"),
+            ("Show me the contents of build.rs.", "Read"),
+            ("Grep for the regex pattern `^test_` in test files.", "Grep"),
+        ]);
+        assert_eq!(compute_fp_rate(&p), 0.0);
+    }
+
+    #[test]
+    fn compute_fp_rate_full_violation() {
+        let p: HashMap<String, String> = FP_ORACLE.iter()
+            .map(|(q, _)| (q.to_string(), "get_call_graph".to_string()))
+            .collect();
+        assert_eq!(compute_fp_rate(&p), 1.0);
+    }
+
+    #[test]
+    fn compute_fp_rate_wrong_decoy_does_not_count_as_violation() {
+        // Picking Read when Grep was expected is still NOT a FP — boundary held.
+        let p: HashMap<String, String> = FP_ORACLE.iter()
+            .map(|(q, _)| (q.to_string(), "Read".to_string()))
+            .collect();
+        assert_eq!(compute_fp_rate(&p), 0.0);
+    }
+
+    #[test]
+    fn majority_vote_unanimous() {
+        let v = majority_vote(&["a", "a", "a"]);
+        assert_eq!(v, Some("a".to_string()));
+    }
+
+    #[test]
+    fn majority_vote_two_to_one() {
+        let v = majority_vote(&["a", "b", "a"]);
+        assert_eq!(v, Some("a".to_string()));
+    }
+
+    #[test]
+    fn majority_vote_three_distinct_uses_first() {
+        // Per design: tie → first run's pick.
+        let v = majority_vote(&["a", "b", "c"]);
+        assert_eq!(v, Some("a".to_string()));
+    }
+
+    #[test]
+    fn majority_vote_empty_returns_none() {
+        let v: Option<String> = majority_vote(&[] as &[&str]);
+        assert_eq!(v, None);
     }
 }
 
