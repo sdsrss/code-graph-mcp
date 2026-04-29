@@ -100,6 +100,24 @@ const ORACLE: &[(&str, &str)] = &[
     ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
 ];
 
+/// Strict-A FP corpus: 10 queries that should route to a decoy (Grep or Read),
+/// not to any code-graph tool. Each query has explicit literal-text or
+/// path-based markers and zero structural component. Used in context-rich
+/// mode to compute FP-rate (boundary-leak rate into code-graph).
+#[allow(dead_code)]
+const FP_ORACLE: &[(&str, &str)] = &[
+    ("Find every TODO comment in source files.", "Grep"),
+    ("Search for the literal string `FIXME` across the codebase.", "Grep"),
+    ("Show me lines 50 through 80 of src/main.rs.", "Read"),
+    ("What does the .gitignore file contain?", "Read"),
+    ("Print the first 100 lines of CHANGELOG.md.", "Read"),
+    ("Search for all occurrences of the regex `error\\d+` in log files.", "Grep"),
+    ("Read the contents of Cargo.toml.", "Read"),
+    ("Find every line that mentions `deprecated` in comments.", "Grep"),
+    ("Show me the contents of build.rs.", "Read"),
+    ("Grep for the regex pattern `^test_` in test files.", "Grep"),
+];
+
 enum Backend {
     Anthropic { key: String, model: String },
     OpenRouter { key: String, model: String },
@@ -458,6 +476,35 @@ mod decoy_tests {
                 desc.contains("Prefer over code-graph"),
                 "decoy description must signal 'prefer over code-graph' to be measurement-fair"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fp_oracle_tests {
+    use super::*;
+
+    #[test]
+    fn fp_oracle_has_ten_entries() {
+        assert_eq!(FP_ORACLE.len(), 10);
+    }
+
+    #[test]
+    fn fp_oracle_entries_target_grep_or_read() {
+        for &(query, expected) in FP_ORACLE {
+            assert!(
+                expected == "Grep" || expected == "Read",
+                "FP_ORACLE entry expects {} but must be Grep or Read: query={:?}",
+                expected, query
+            );
+        }
+    }
+
+    #[test]
+    fn fp_oracle_queries_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for &(query, _) in FP_ORACLE {
+            assert!(seen.insert(query), "duplicate FP_ORACLE query: {:?}", query);
         }
     }
 }
