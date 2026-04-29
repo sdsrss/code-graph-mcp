@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.17.1 — adoption-memory hook line: spec compliance
+
+Single-file structural fix. `claude-plugin/scripts/adopt.js`
+`INDEX_LINE` changes from an 11-line `array.join('\n')` block to a
+single-line string, complying with the MEMORY.md spec ("each entry
+should be one line"). The sentinel block written to
+`~/.claude/projects/<slug>/memory/MEMORY.md` shrinks 11 lines → 1
+line at next SessionStart per the v0.11.0 template-refresh
+contract.
+
+**No behavior change.** All 12 tool names (7 core + 5 hidden), all
+6 中文 scene phrases (改 X 影响面 / 谁调用 X / X 被谁用 / 看 X 源码 /
+Y 模块长啥样 / 概念查询), the `优先于 Grep` anchor, and the
+`字面匹配走 Grep` reverse signal are kept verbatim. New:
+spec-canonical tag syntax
+`[impact, callgraph, refs, overview, semantic, ast-search, dead-code, similar, deps, trace]`
+for explicit keyword matching. Reduces always-loaded MEMORY.md
+context by ~366 chars per session.
+
+The adoption-memory detail file (`plugin_code_graph_mcp.md`) is
+unchanged — it already holds the full decision table the
+multi-line block was duplicating.
+
+**Bench scope.** `tests/routing_bench.rs` only consumes tool
+`name + description + input_schema` (verified at
+`tests/routing_bench.rs:224-233` + `:50-52`); it does not consume
+MEMORY.md, the adoption-memory file, or MCP `instructions`. So it
+cannot grade adoption-memory hook quality. A context-rich bench
+(MEMORY.md in system prompt + Grep-decoy false-positive corpus) is
+a separate change. Existing routing_bench is unaffected by this
+PR.
+
+**Tests.** `cargo test` 26/26, `node --test claude-plugin/scripts/*.test.js` 132/132,
+`adopt.test.js` 43/43.
+
 ## v0.17.0 — quiet by default + tighter routing instructions
 
 Two-part SessionStart context-cost reduction. The plugin used to inject
