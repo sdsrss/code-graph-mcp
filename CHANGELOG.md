@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.17.2 — routing_bench context-rich mode
+
+Adds a measurement capability the existing bench architecture lacked:
+grading the MEMORY.md hook line quality (added in v0.17.1). The
+existing `tests/routing_bench.rs` only consumed tool descriptions;
+it could not detect routing changes from MEMORY.md, the adoption-
+memory file, or MCP `instructions`. Stage 3 hook content tuning
+needed an oracle.
+
+**`ROUTING_BENCH_MODE=context-rich` mode.** Adds:
+
+- `INDEX_LINE_MIRROR` Rust constant + drift-detection test that
+  spawns Node and asserts byte-equality with `adopt.js`'s
+  `INDEX_LINE` export. Drift fails on every `cargo test`.
+- Decoy `Grep` and `Read` tools added to the API call's `tools`
+  array (descriptions calibrated with "Prefer over code-graph"
+  anchors to be measurement-fair).
+- 10-entry `FP_ORACLE` of strict-boundary queries (literal text,
+  file reads by path, doc/config content) that should route to
+  decoys, not code-graph.
+- 3-run majority-vote aggregation per query (tie-break: first run);
+  applied to both modes.
+- Three reported metrics: Recall (out of 22 ORACLE), FP-rate (out
+  of 10 FP_ORACLE), Overall (out of 32, loose summary).
+
+**`temperature: 0` added to both backends** (Anthropic + OpenRouter)
+in tool-only mode too. Pre-existing latent ±3-5pp single-run noise
+masked Stage 3-level differences. Reproducible from this version on.
+
+**First baselines** (2026-04-30, OpenRouter `anthropic/claude-sonnet-4.5`):
+
+- Tool-only: **21/22 = 95.5%** (178s, 60 calls). Same residual miss
+  as v0.16.7 (`Show me the EmbeddingModel struct definition` →
+  `ast_search` instead of `get_ast_node` — pre-existing semantic
+  borderline). Note: `feedback_routing_bench.md` had been tracking
+  19/20 — that was against the 20-entry pre-v0.17.0 oracle; v0.17.0
+  added 2 regression-guard queries, real total is 22.
+- Context-rich: **Recall 22/22 = 100%** · **FP-rate 0/10 = 0%** ·
+  **Overall 32/32 = 100%** (255s, 90 calls). The historically-stuck
+  `EmbeddingModel struct` query routes correctly here — the MEMORY.md
+  hook + Grep/Read decoys provide enough disambiguation context to
+  flip it. Caveat: single bench run; Stage 3 will tell us how robust
+  this is to hook-content variations.
+
+**Default mode unchanged.** With `ROUTING_BENCH_MODE` unset or any
+value other than `context-rich`, the bench behaves identically to
+v0.17.1 except for `temperature: 0` and 3-run aggregation. The
+`oracle_well_formed` and `index_line_drift_check` tests run on
+every `cargo test`; the live benchmark stays `#[ignore]`'d.
+
 ## v0.17.1 — adoption-memory hook line: spec compliance
 
 Single-file structural fix. `claude-plugin/scripts/adopt.js`
