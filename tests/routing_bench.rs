@@ -39,7 +39,12 @@
 //!
 //! ## Cost
 //!
-//! ~$0.10/run with `claude-sonnet-4-6` (20 queries × ~1.2K in + ~150 out tokens).
+//! Tool-only mode (default): ~$0.10/run with `claude-sonnet-4-6` (20 queries ×
+//! 1 run × ~1.2K in + ~150 out tokens).
+//!
+//! Context-rich mode (`ROUTING_BENCH_MODE=context-rich`): ~$0.45/run (30
+//! queries × 3 runs majority vote, system prompt grows by INDEX_LINE_MIRROR).
+//!
 //! OpenRouter adds a small markup (~5–10%).
 
 use code_graph_mcp::mcp::tools::ToolRegistry;
@@ -297,7 +302,7 @@ fn routing_recall_benchmark() {
             eprintln!(
                 "\n[routing_bench] mode=tool-only backend={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
                 backend.label(),
-                (recall * ORACLE.len() as f64) as usize,
+                (recall * ORACLE.len() as f64).round() as usize,
                 ORACLE.len(),
                 recall * 100.0,
                 P_AT_1_THRESHOLD * 100.0,
@@ -317,11 +322,11 @@ fn routing_recall_benchmark() {
                 "\n[routing_bench] mode=context-rich backend={}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
                 backend.label(),
                 recall * 100.0,
-                (recall * ORACLE.len() as f64) as usize, ORACLE.len(),
+                (recall * ORACLE.len() as f64).round() as usize, ORACLE.len(),
                 fp_rate * 100.0,
-                (fp_rate * FP_ORACLE.len() as f64) as usize, FP_ORACLE.len(),
+                (fp_rate * FP_ORACLE.len() as f64).round() as usize, FP_ORACLE.len(),
                 overall * 100.0,
-                (overall * (ORACLE.len() + FP_ORACLE.len()) as f64) as usize,
+                (overall * (ORACLE.len() + FP_ORACLE.len()) as f64).round() as usize,
                 ORACLE.len() + FP_ORACLE.len(),
                 P_AT_1_THRESHOLD * 100.0,
             );
