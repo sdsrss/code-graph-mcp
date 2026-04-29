@@ -142,6 +142,7 @@ fn call_backend(
             let body = json!({
                 "model": model,
                 "max_tokens": 1024,
+                "temperature": 0,
                 "system": SYSTEM_PROMPT,
                 "tools": tools,
                 "tool_choice": { "type": "any" },
@@ -178,6 +179,7 @@ fn call_backend(
             let body = json!({
                 "model": model,
                 "max_tokens": 1024,
+                "temperature": 0,
                 "tools": openai_tools,
                 "tool_choice": "required",
                 "messages": [
