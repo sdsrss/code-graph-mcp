@@ -277,6 +277,29 @@ fn routing_recall_benchmark() {
     );
 }
 
+/// Bench mode selector. `tool-only` is the legacy behavior (existing 20-query
+/// oracle, no decoys, no MEMORY.md injection). `context-rich` adds decoys,
+/// MEMORY.md, and FP_ORACLE — measures hook line quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchMode {
+    ToolOnly,
+    ContextRich,
+}
+
+/// Pure helper for testing — accepts the env value directly.
+fn detect_mode_for(env: Option<&str>) -> BenchMode {
+    match env {
+        Some("context-rich") => BenchMode::ContextRich,
+        _ => BenchMode::ToolOnly,
+    }
+}
+
+/// Production wrapper — reads `ROUTING_BENCH_MODE` env.
+#[allow(dead_code)]
+fn detect_mode() -> BenchMode {
+    detect_mode_for(std::env::var("ROUTING_BENCH_MODE").ok().as_deref())
+}
+
 /// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
 /// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
 /// Single source of truth is adopt.js; the Rust mirror is a snapshot used
@@ -325,5 +348,34 @@ fn oracle_well_formed() {
             "Tool '{}' has no oracle coverage — add at least one query.",
             name,
         );
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn detect_mode_defaults_to_tool_only_when_unset() {
+        let m = detect_mode_for(None);
+        assert!(matches!(m, BenchMode::ToolOnly));
+    }
+
+    #[test]
+    fn detect_mode_explicit_tool_only() {
+        let m = detect_mode_for(Some("tool-only"));
+        assert!(matches!(m, BenchMode::ToolOnly));
+    }
+
+    #[test]
+    fn detect_mode_context_rich() {
+        let m = detect_mode_for(Some("context-rich"));
+        assert!(matches!(m, BenchMode::ContextRich));
+    }
+
+    #[test]
+    fn detect_mode_unknown_value_falls_back_to_tool_only() {
+        let m = detect_mode_for(Some("invalid"));
+        assert!(matches!(m, BenchMode::ToolOnly));
     }
 }
