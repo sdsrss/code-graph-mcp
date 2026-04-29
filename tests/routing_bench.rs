@@ -51,6 +51,11 @@ const SYSTEM_PROMPT: &str = "You are a code-search assistant. For the user's que
     pick exactly ONE tool to invoke. Prefer the most specific tool whose description \
     matches the intent. Do not answer in prose — call a tool.";
 
+/// Mirror of `claude-plugin/scripts/adopt.js` `INDEX_LINE`. Used by
+/// context-rich bench mode to inject MEMORY.md hook into system prompt.
+/// Drift-checked at test time via `index_line_drift_check`.
+const INDEX_LINE_MIRROR: &str = "- [code-graph-mcp](plugin_code_graph_mcp.md) [impact, callgraph, refs, overview, semantic, ast-search, dead-code, similar, deps, trace] — 改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map）+ 进阶 5（impact_analysis/trace_http_chain/dependency_graph/find_similar_code/find_dead_code），决策表见全文";
+
 /// (natural-language query, expected tool name).
 /// 20 queries × 7 tools — 3 per tool except `find_references` with 2.
 const ORACLE: &[(&str, &str)] = &[
@@ -269,6 +274,33 @@ fn routing_recall_benchmark() {
         p_at_1 >= P_AT_1_THRESHOLD,
         "Routing P@1 {:.1}% below threshold {:.0}% — {} miss(es), see output above",
         p_at_1 * 100.0, P_AT_1_THRESHOLD * 100.0, misses.len(),
+    );
+}
+
+/// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
+/// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
+/// Single source of truth is adopt.js; the Rust mirror is a snapshot used
+/// by context-rich bench mode. This test catches forgotten updates.
+#[test]
+fn index_line_drift_check() {
+    let output = std::process::Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write(require('./claude-plugin/scripts/adopt.js').INDEX_LINE)",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("node binary required to verify INDEX_LINE drift");
+    assert!(
+        output.status.success(),
+        "node exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let js_value = String::from_utf8(output.stdout).expect("INDEX_LINE is utf-8");
+    assert_eq!(
+        INDEX_LINE_MIRROR, js_value,
+        "INDEX_LINE drift between adopt.js and routing_bench.rs — \
+         update INDEX_LINE_MIRROR to match adopt.js"
     );
 }
 
