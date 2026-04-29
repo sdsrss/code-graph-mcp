@@ -359,6 +359,41 @@ fn decoy_tools() -> Vec<Value> {
     ]
 }
 
+/// Build the `tools` array for the API call. ToolOnly returns the registry
+/// tools unchanged; ContextRich appends Grep and Read decoys.
+#[allow(dead_code)]
+fn build_tools(mode: BenchMode, registry_tools: Vec<Value>) -> Vec<Value> {
+    let mut tools = registry_tools;
+    if matches!(mode, BenchMode::ContextRich) {
+        tools.extend(decoy_tools());
+    }
+    tools
+}
+
+/// Build the system prompt. ToolOnly returns SYSTEM_PROMPT verbatim;
+/// ContextRich appends the MEMORY.md framing line + INDEX_LINE_MIRROR.
+#[allow(dead_code)]
+fn build_system_prompt(mode: BenchMode) -> String {
+    match mode {
+        BenchMode::ToolOnly => SYSTEM_PROMPT.to_string(),
+        BenchMode::ContextRich => format!(
+            "{}\n\nUser has the following entry in their project MEMORY.md (auto-loaded):\n{}",
+            SYSTEM_PROMPT, INDEX_LINE_MIRROR
+        ),
+    }
+}
+
+/// Build the oracle (query → expected-tool pairs). ToolOnly returns ORACLE
+/// only; ContextRich appends FP_ORACLE.
+#[allow(dead_code)]
+fn build_oracle(mode: BenchMode) -> Vec<(&'static str, &'static str)> {
+    let mut all = ORACLE.to_vec();
+    if matches!(mode, BenchMode::ContextRich) {
+        all.extend_from_slice(FP_ORACLE);
+    }
+    all
+}
+
 /// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
 /// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
 /// Single source of truth is adopt.js; the Rust mirror is a snapshot used
@@ -506,6 +541,60 @@ mod fp_oracle_tests {
         for &(query, _) in FP_ORACLE {
             assert!(seen.insert(query), "duplicate FP_ORACLE query: {:?}", query);
         }
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    fn fake_registry_tools() -> Vec<Value> {
+        vec![
+            json!({"name": "tool_a", "description": "A", "input_schema": {}}),
+            json!({"name": "tool_b", "description": "B", "input_schema": {}}),
+        ]
+    }
+
+    #[test]
+    fn build_tools_tool_only_returns_registry_unchanged() {
+        let registry = fake_registry_tools();
+        let tools = build_tools(BenchMode::ToolOnly, registry.clone());
+        assert_eq!(tools, registry);
+    }
+
+    #[test]
+    fn build_tools_context_rich_appends_decoys() {
+        let registry = fake_registry_tools();
+        let tools = build_tools(BenchMode::ContextRich, registry.clone());
+        assert_eq!(tools.len(), 4); // 2 fake + 2 decoys
+        assert!(tools.iter().any(|t| t["name"] == "Grep"));
+        assert!(tools.iter().any(|t| t["name"] == "Read"));
+    }
+
+    #[test]
+    fn build_system_prompt_tool_only_unchanged() {
+        let p = build_system_prompt(BenchMode::ToolOnly);
+        assert_eq!(p, SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn build_system_prompt_context_rich_appends_memory_line() {
+        let p = build_system_prompt(BenchMode::ContextRich);
+        assert!(p.starts_with(SYSTEM_PROMPT));
+        assert!(p.contains("MEMORY.md"));
+        assert!(p.contains(INDEX_LINE_MIRROR));
+    }
+
+    #[test]
+    fn build_oracle_tool_only_returns_only_oracle() {
+        let o = build_oracle(BenchMode::ToolOnly);
+        assert_eq!(o.len(), ORACLE.len());
+    }
+
+    #[test]
+    fn build_oracle_context_rich_concatenates() {
+        let o = build_oracle(BenchMode::ContextRich);
+        assert_eq!(o.len(), ORACLE.len() + FP_ORACLE.len());
     }
 }
 
