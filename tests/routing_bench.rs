@@ -95,9 +95,10 @@ const ORACLE: &[(&str, &str)] = &[
     // settle on module_overview.
     ("How does the embedding pipeline work in src/embedding/?", "module_overview"),
     // find_references now says "For plain literals (string/regex), prefer
-    // Grep". The bench cannot register Grep as a decoy tool, so we instead
-    // assert the rename-audit phrasing still hits find_references — the
-    // intent we want to preserve through the tightening.
+    // Grep". In tool-only mode the bench cannot register Grep as a decoy
+    // (only context-rich mode adds Grep+Read decoys); regardless, this
+    // query asserts the rename-audit phrasing still hits find_references
+    // — the intent we want to preserve through the tightening.
     ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
 ];
 
@@ -105,7 +106,6 @@ const ORACLE: &[(&str, &str)] = &[
 /// not to any code-graph tool. Each query has explicit literal-text or
 /// path-based markers and zero structural component. Used in context-rich
 /// mode to compute FP-rate (boundary-leak rate into code-graph).
-#[allow(dead_code)]
 const FP_ORACLE: &[(&str, &str)] = &[
     ("Find every TODO comment in source files.", "Grep"),
     ("Search for the literal string `FIXME` across the codebase.", "Grep"),
@@ -159,6 +159,7 @@ fn call_backend(
     client: &reqwest::blocking::Client,
     backend: &Backend,
     tools: &[Value],
+    system_prompt: &str,
     query: &str,
 ) -> Option<String> {
     match backend {
@@ -167,7 +168,7 @@ fn call_backend(
                 "model": model,
                 "max_tokens": 1024,
                 "temperature": 0,
-                "system": SYSTEM_PROMPT,
+                "system": system_prompt,
                 "tools": tools,
                 "tool_choice": { "type": "any" },
                 "messages": [{ "role": "user", "content": query }],
@@ -207,7 +208,7 @@ fn call_backend(
                 "tools": openai_tools,
                 "tool_choice": "required",
                 "messages": [
-                    { "role": "system", "content": SYSTEM_PROMPT },
+                    { "role": "system", "content": system_prompt },
                     { "role": "user",   "content": query },
                 ],
             });
@@ -245,10 +246,11 @@ fn routing_recall_benchmark() {
             return;
         }
     };
-    eprintln!("[routing_bench] using backend={}", backend.label());
+    let mode = detect_mode();
+    eprintln!("[routing_bench] backend={} mode={:?}", backend.label(), mode);
 
     let registry = ToolRegistry::new();
-    let tools: Vec<Value> = registry
+    let registry_tools: Vec<Value> = registry
         .list_tools()
         .iter()
         .map(|t| json!({
@@ -257,43 +259,90 @@ fn routing_recall_benchmark() {
             "input_schema": t.input_schema,
         }))
         .collect();
-    assert!(!tools.is_empty(), "ToolRegistry returned no tools");
+    assert!(!registry_tools.is_empty(), "ToolRegistry returned no tools");
+
+    let tools = build_tools(mode, registry_tools);
+    let system_prompt = build_system_prompt(mode);
+    let oracle = build_oracle(mode);
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .expect("build reqwest client");
 
-    let mut hits = 0usize;
-    let mut misses: Vec<(String, String, Option<String>)> = Vec::new();
+    // 3-run majority vote per query.
+    const RUNS: usize = 3;
+    let mut picks: HashMap<String, String> = HashMap::new();
+    let mut all_misses: Vec<(String, String, Vec<Option<String>>)> = Vec::new();
 
-    for &(query, expected) in ORACLE {
-        let picked = call_backend(&client, &backend, &tools, query);
-        if picked.as_deref() == Some(expected) {
-            hits += 1;
-        } else {
-            misses.push((query.to_string(), expected.to_string(), picked));
+    for &(query, expected) in &oracle {
+        let mut run_picks: Vec<Option<String>> = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            run_picks.push(call_backend(&client, &backend, &tools, &system_prompt, query));
         }
+        let pick_strs: Vec<&str> = run_picks.iter()
+            .map(|p| p.as_deref().unwrap_or("(none)"))
+            .collect();
+        let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
+        if voted != expected {
+            all_misses.push((query.to_string(), expected.to_string(), run_picks.clone()));
+        }
+        picks.insert(query.to_string(), voted);
     }
 
-    let total = ORACLE.len();
-    let p_at_1 = hits as f64 / total as f64;
-    eprintln!(
-        "\n[routing_bench] backend={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
-        backend.label(), hits, total, p_at_1 * 100.0, P_AT_1_THRESHOLD * 100.0,
-    );
-    if !misses.is_empty() {
-        eprintln!("[routing_bench] misses ({}):", misses.len());
-        for (q, exp, got) in &misses {
-            eprintln!("  expected={} got={:?}  query=\"{}\"", exp, got, q);
+    // Mode-specific reporting.
+    match mode {
+        BenchMode::ToolOnly => {
+            let recall = compute_recall(&picks);
+            eprintln!(
+                "\n[routing_bench] mode=tool-only backend={} P@1={}/{} = {:.1}% (threshold {:.0}%)",
+                backend.label(),
+                (recall * ORACLE.len() as f64) as usize,
+                ORACLE.len(),
+                recall * 100.0,
+                P_AT_1_THRESHOLD * 100.0,
+            );
+            print_misses(&all_misses);
+            assert!(
+                recall >= P_AT_1_THRESHOLD,
+                "Routing P@1 {:.1}% below threshold {:.0}% — {} miss(es)",
+                recall * 100.0, P_AT_1_THRESHOLD * 100.0, all_misses.len(),
+            );
+        }
+        BenchMode::ContextRich => {
+            let recall = compute_recall(&picks);
+            let fp_rate = compute_fp_rate(&picks);
+            let overall = compute_overall(&picks);
+            eprintln!(
+                "\n[routing_bench] mode=context-rich backend={}\n  Recall  = {:.1}% ({}/{})\n  FP-rate = {:.1}% ({}/{})\n  Overall = {:.1}% ({}/{}, threshold {:.0}%)",
+                backend.label(),
+                recall * 100.0,
+                (recall * ORACLE.len() as f64) as usize, ORACLE.len(),
+                fp_rate * 100.0,
+                (fp_rate * FP_ORACLE.len() as f64) as usize, FP_ORACLE.len(),
+                overall * 100.0,
+                (overall * (ORACLE.len() + FP_ORACLE.len()) as f64) as usize,
+                ORACLE.len() + FP_ORACLE.len(),
+                P_AT_1_THRESHOLD * 100.0,
+            );
+            print_misses(&all_misses);
+            assert!(
+                overall >= P_AT_1_THRESHOLD,
+                "Overall P@1 {:.1}% below threshold {:.0}% — {} miss(es)",
+                overall * 100.0, P_AT_1_THRESHOLD * 100.0, all_misses.len(),
+            );
         }
     }
+}
 
-    assert!(
-        p_at_1 >= P_AT_1_THRESHOLD,
-        "Routing P@1 {:.1}% below threshold {:.0}% — {} miss(es), see output above",
-        p_at_1 * 100.0, P_AT_1_THRESHOLD * 100.0, misses.len(),
-    );
+fn print_misses(misses: &[(String, String, Vec<Option<String>>)]) {
+    if misses.is_empty() {
+        return;
+    }
+    eprintln!("[routing_bench] misses ({}):", misses.len());
+    for (q, exp, run_picks) in misses {
+        eprintln!("  expected={} runs={:?}  query={:?}", exp, run_picks, q);
+    }
 }
 
 /// Bench mode selector. `tool-only` is the legacy behavior (existing 20-query
@@ -314,7 +363,6 @@ fn detect_mode_for(env: Option<&str>) -> BenchMode {
 }
 
 /// Production wrapper — reads `ROUTING_BENCH_MODE` env.
-#[allow(dead_code)]
 fn detect_mode() -> BenchMode {
     detect_mode_for(std::env::var("ROUTING_BENCH_MODE").ok().as_deref())
 }
@@ -323,7 +371,6 @@ fn detect_mode() -> BenchMode {
 /// Code native tools that compete with code-graph for routing. Descriptions
 /// are calibrated against the spec's strict-A FP boundary: "Prefer over
 /// code-graph" anchor language matches the v0.17.0 description tightening.
-#[allow(dead_code)]
 fn decoy_tools() -> Vec<Value> {
     vec![
         json!({
@@ -362,7 +409,6 @@ fn decoy_tools() -> Vec<Value> {
 
 /// Build the `tools` array for the API call. ToolOnly returns the registry
 /// tools unchanged; ContextRich appends Grep and Read decoys.
-#[allow(dead_code)]
 fn build_tools(mode: BenchMode, registry_tools: Vec<Value>) -> Vec<Value> {
     let mut tools = registry_tools;
     if matches!(mode, BenchMode::ContextRich) {
@@ -373,7 +419,6 @@ fn build_tools(mode: BenchMode, registry_tools: Vec<Value>) -> Vec<Value> {
 
 /// Build the system prompt. ToolOnly returns SYSTEM_PROMPT verbatim;
 /// ContextRich appends the MEMORY.md framing line + INDEX_LINE_MIRROR.
-#[allow(dead_code)]
 fn build_system_prompt(mode: BenchMode) -> String {
     match mode {
         BenchMode::ToolOnly => SYSTEM_PROMPT.to_string(),
@@ -386,7 +431,6 @@ fn build_system_prompt(mode: BenchMode) -> String {
 
 /// Build the oracle (query → expected-tool pairs). ToolOnly returns ORACLE
 /// only; ContextRich appends FP_ORACLE.
-#[allow(dead_code)]
 fn build_oracle(mode: BenchMode) -> Vec<(&'static str, &'static str)> {
     let mut all = ORACLE.to_vec();
     if matches!(mode, BenchMode::ContextRich) {
@@ -397,7 +441,6 @@ fn build_oracle(mode: BenchMode) -> Vec<(&'static str, &'static str)> {
 
 /// Recall over ORACLE: fraction of code-graph queries where the picked tool
 /// matches the expected tool exactly.
-#[allow(dead_code)]
 fn compute_recall(picks: &HashMap<String, String>) -> f64 {
     let hits = ORACLE.iter()
         .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
@@ -409,7 +452,6 @@ fn compute_recall(picks: &HashMap<String, String>) -> f64 {
 /// NOT one of the decoys (i.e., a code-graph tool was wrongly chosen).
 /// Note: picking the *wrong* decoy (Read when Grep expected) is NOT a FP —
 /// the boundary held, only the specific decoy was off.
-#[allow(dead_code)]
 fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
     let violations = FP_ORACLE.iter()
         .filter(|(q, _expected_decoy)| {
@@ -423,7 +465,6 @@ fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
 /// Overall summary: (recall_hits + fp_avoidance) / total. Loose metric —
 /// FP_avoidance counts wrong-decoy picks as good (boundary held). Use
 /// recall and fp_rate separately for candidate comparison.
-#[allow(dead_code)]
 fn compute_overall(picks: &HashMap<String, String>) -> f64 {
     let recall_hits = ORACLE.iter()
         .filter(|(q, exp)| picks.get(*q).map(|p| p == exp).unwrap_or(false))
@@ -442,7 +483,6 @@ fn compute_overall(picks: &HashMap<String, String>) -> f64 {
 /// Majority vote across multiple runs of the same query. Returns the most-
 /// frequent pick. Tie-break: first occurrence wins (preserves run-1 result
 /// when temperature: 0 fails to fully converge).
-#[allow(dead_code)]
 fn majority_vote(picks: &[&str]) -> Option<String> {
     if picks.is_empty() {
         return None;
