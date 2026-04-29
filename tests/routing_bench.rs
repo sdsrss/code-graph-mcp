@@ -299,8 +299,7 @@ fn index_line_drift_check() {
     let js_value = String::from_utf8(output.stdout).expect("INDEX_LINE is utf-8");
     assert_eq!(
         INDEX_LINE_MIRROR, js_value,
-        "INDEX_LINE drift between adopt.js and routing_bench.rs — \
-         update INDEX_LINE_MIRROR to match adopt.js"
+        "INDEX_LINE drift detected.\n  Rust mirror:  tests/routing_bench.rs INDEX_LINE_MIRROR\n  JS source:    claude-plugin/scripts/adopt.js INDEX_LINE\nFix: copy the JS value into INDEX_LINE_MIRROR (single-line literal preferred to avoid `\\`-continuation whitespace bugs)."
     );
 }
 
