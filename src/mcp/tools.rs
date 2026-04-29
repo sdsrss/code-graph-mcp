@@ -32,7 +32,7 @@ impl ToolRegistry {
         let tools = vec![
             ToolDefinition {
                 name: "semantic_code_search".into(),
-                description: "Search code by concept when symbol/module name is unknown. Use when: grep returns noise and you can't name what you want. If module path is known, prefer module_overview. Returns ranked AST nodes.".into(),
+                description: "Concept search when no symbol/module is named. If a symbol is named (e.g., 'show X struct'), use get_ast_node; if module path is known, use module_overview. Use when grep is noisy.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -64,7 +64,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_ast_node".into(),
-                description: "Inspect ONE named symbol: signature, full source, optional references/impact. Use when: you have a symbol name (or node_id) and want its definition/body.".into(),
+                description: "Inspect ONE named symbol: signature, full source, optional references/impact. Use when: query names a symbol asking for its definition/body/signature/implementation. PREFER over semantic_code_search.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

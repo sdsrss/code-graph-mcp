@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.17.3 — get_ast_node disambiguation (description tightening)
+
+Bench-driven fix on **published tool descriptions** for the
+"named-symbol queries leak to semantic_code_search" boundary.
+
+**Background.** v0.17.2's context-rich bench (haiku-4.5 stress test)
+surfaced 3 systematic misses: `EmbeddingModel struct definition`,
+`weighted_rrf_fusion signature`, `format_call_graph_response
+implementation` — all routing to `semantic_code_search` instead of
+`get_ast_node`. The MEMORY.md hook already had `看 X 源码/签名 →
+get_ast_node` but weak models ignored it at tool-selection.
+
+**Diagnosis.** `semantic_code_search`'s description led with "Search
+code by concept" with no explicit handoff to `get_ast_node` for
+named-symbol queries. v0.17.0 added analogous redirects for
+`semantic_code_search → module_overview` and `find_references → Grep`;
+the named-symbol boundary was the missing one.
+
+**Fix.** Two description edits in `src/mcp/tools.rs`:
+
+- `semantic_code_search` (197 chars): rewritten to "Concept search
+  when no symbol/module is named. If a symbol is named (e.g., 'show
+  X struct'), use get_ast_node; if module path is known, use
+  module_overview. Use when grep is noisy."
+- `get_ast_node` (200 chars): "Inspect ONE named symbol: signature,
+  full source, optional references/impact. Use when: query names a
+  symbol asking for its definition/body/signature/implementation.
+  PREFER over semantic_code_search."
+
+Both fit the project's 200-char-per-description cap (asserted by
+`mcp::tools::tests::test_descriptions_are_concise`). Tighter
+example-list patterns were tested first but exceeded the cap.
+
+**Bench results** (3-run majority vote on each model):
+
+- **Sonnet 4.5 context-rich**: 22/22 / 0/10 / 32/32 = 100%
+  pre-fix and post-fix. Zero regression.
+- **Haiku 4.5 context-rich**: 19/22 → **20/22** (Recall 86.4% →
+  90.9%, Overall 90.6% → 93.8%). `weighted_rrf_fusion signature`
+  recovered to `get_ast_node`. Two queries still miss
+  (`EmbeddingModel struct`, `format_call_graph_response
+  implementation`) — they need stronger anchor patterns than fit in
+  the 200-char budget; tracked as a follow-up.
+
+**Iteration history (recorded for future tuning).** A higher-budget
+description with three named example phrasings ('show X struct
+definition', 'signature of Y', 'implementation of Z') recovered
+`EmbeddingModel struct` on haiku but exceeded the 200-char cap and
+caused a `List all structs in storage module → module_overview`
+regression on the same model. Compressing to fit the cap dropped
+the EmbeddingModel recovery but eliminated the regression. Net
+haiku improvement: +1 query.
+
+**Drift test still passes** — `INDEX_LINE_MIRROR` byte-equal to
+`adopt.js` (no MEMORY.md hook change in this commit). Per-tool
+descriptions are LLM-visible metadata (L3 published surface);
+content is description-only with bench-verified outcomes on both
+strong and weak models.
+
 ## v0.17.2 — routing_bench context-rich mode
 
 Adds a measurement capability the existing bench architecture lacked:
