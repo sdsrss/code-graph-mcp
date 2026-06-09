@@ -551,6 +551,23 @@ impl HealthCheckArgs {
     }
 }
 
+/// Recording-side state of the recommend→use conversion metric, surfaced by
+/// `stats` and `health-check` so a dark metric is a visible signal rather than
+/// silence. `"absent"` = `recommendations.jsonl` missing (the PreToolUse hooks
+/// that record recommendations are not active in this project — e.g. it runs a
+/// dev `.mcp.json` server with the marketplace plugin disabled, so the metric is
+/// structurally dark); `"empty"` = file present, no recommendations yet;
+/// `"live"` = recommendations recorded.
+pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
+    let p = project_root.join(CODE_GRAPH_DIR).join("recommendations.jsonl");
+    match std::fs::read_to_string(&p) {
+        Err(_) => "absent",
+        Ok(c) => {
+            if aggregate_recommendations_jsonl(&c).total > 0 { "live" } else { "empty" }
+        }
+    }
+}
+
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // JSON callers (doctor.js, scripts, MCP UIs) need a parseable response
@@ -678,6 +695,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "embedding_status": embedding_status,
                 "model_available": model_available,
                 "snapshot": snapshot_block,
+                "conversion_metric": recommendation_metric_state(project_root),
             });
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
@@ -706,6 +724,11 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     status.nodes_count, status.edges_count, status.files_count, age_info
                 );
                 println!("Snapshot: {}", snapshot_status);
+                println!("Conversion metric: {}", match recommendation_metric_state(project_root) {
+                    "live" => "live (recommendations recorded)",
+                    "empty" => "active, no recommendations recorded yet",
+                    _ => "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
+                });
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",
@@ -746,11 +769,37 @@ pub struct UsageSummary {
     pub versions: std::collections::BTreeSet<String>,
     pub first_ts: Option<String>,
     pub last_ts: Option<String>,
+    /// Recommend→use funnel (per-session, window-joined from `recs` field).
+    pub sessions_with_deny: u64,
+    pub sessions_with_deny_and_cg: u64,
+    pub sessions_with_hint: u64,
+    pub sessions_with_hint_and_cg: u64,
 }
 
 impl UsageSummary {
     pub fn total_tool_calls(&self) -> u64 {
         self.tools.values().map(|a| a.n).sum()
+    }
+}
+
+/// Code-understanding cg tools the DENY hook steers grep toward. Housekeeping
+/// tools (start/stop_watch, get_index_status, rebuild_index) are excluded so the
+/// funnel measures real "used cg instead of grep" substitution, not background
+/// bookkeeping. Kept in sync by hand with the `src/mcp/tools.rs` registry.
+const CG_QUERY_TOOLS: &[&str] = &[
+    "get_call_graph", "get_ast_node", "module_overview", "semantic_code_search",
+    "ast_search", "find_references", "project_map", "impact_analysis",
+    "trace_http_chain", "dependency_graph", "find_similar_code", "find_dead_code",
+    "find_http_route", "read_snippet",
+];
+
+/// Per-session funnel conversion = `num/denom` rounded to 2 decimals, or JSON
+/// `null` when the bucket is empty (avoids a misleading 0.0 for "no data").
+fn session_conversion(num: u64, denom: u64) -> serde_json::Value {
+    if denom == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!((num as f64 / denom as f64 * 100.0).round() / 100.0)
     }
 }
 
@@ -791,6 +840,10 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
         versions: std::collections::BTreeSet::new(),
         first_ts: None,
         last_ts: None,
+        sessions_with_deny: 0,
+        sessions_with_deny_and_cg: 0,
+        sessions_with_hint: 0,
+        sessions_with_hint_and_cg: 0,
     };
 
     for rec in &records {
@@ -830,6 +883,25 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
             }
             summary.incr_count += idx.get("incr").and_then(|v| v.as_u64()).unwrap_or(0);
             summary.files_indexed += idx.get("files").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+        // Recommend→use funnel: per-session, did a session that saw a deny/hint
+        // (window-joined into the `recs` field at flush) also call a cg query tool?
+        let used_cg = rec.get("tools").and_then(|v| v.as_object()).is_some_and(|tools| {
+            CG_QUERY_TOOLS.iter().any(|t| {
+                tools.get(*t).and_then(|s| s.get("n")).and_then(|n| n.as_u64()).unwrap_or(0) > 0
+            })
+        });
+        if let Some(recs) = rec.get("recs") {
+            let deny = recs.get("deny").and_then(|v| v.as_u64()).unwrap_or(0);
+            let hint = recs.get("hint").and_then(|v| v.as_u64()).unwrap_or(0);
+            if deny > 0 {
+                summary.sessions_with_deny += 1;
+                if used_cg { summary.sessions_with_deny_and_cg += 1; }
+            }
+            if hint > 0 {
+                summary.sessions_with_hint += 1;
+                if used_cg { summary.sessions_with_hint_and_cg += 1; }
+            }
         }
     }
     summary
@@ -940,9 +1012,14 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     // has no per-session boundary, so it is aggregated whole (last_n applies only
     // to usage sessions). Absent file → empty (default) summary.
     let rec_path = project_root.join(CODE_GRAPH_DIR).join("recommendations.jsonl");
+    let rec_exists = rec_path.exists();
     let recs = std::fs::read_to_string(&rec_path).ok()
         .map(|c| aggregate_recommendations_jsonl(&c))
         .unwrap_or_default();
+    // Recording-side state of the conversion metric, made explicit so a dark
+    // metric (file absent → PreToolUse hooks not recording here) is never
+    // silently indistinguishable from "feature absent" or "no data yet".
+    let rec_state = if recs.total > 0 { "live" } else if rec_exists { "empty" } else { "absent" };
 
     if summary.sessions == 0 {
         if json_mode {
@@ -988,6 +1065,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "files_indexed": summary.files_indexed,
             },
             "recommendations": {
+                "state": rec_state,
                 "total": recs.total,
                 "by_action": recs.by_action.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
@@ -997,6 +1075,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "conversion_ratio": if recs.total > 0 {
                     (summary.total_tool_calls() as f64 / recs.total as f64 * 100.0).round() / 100.0
                 } else { 0.0 },
+                // Per-session deny→use / hint→use funnel (window-joined attribution).
+                "funnel": {
+                    "deny_sessions": summary.sessions_with_deny,
+                    "deny_then_cg": summary.sessions_with_deny_and_cg,
+                    "deny_conversion": session_conversion(summary.sessions_with_deny_and_cg, summary.sessions_with_deny),
+                    "hint_sessions": summary.sessions_with_hint,
+                    "hint_then_cg": summary.sessions_with_hint_and_cg,
+                    "hint_conversion": session_conversion(summary.sessions_with_hint_and_cg, summary.sessions_with_hint),
+                },
             },
         }));
     } else {
@@ -1046,8 +1133,8 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 summary.full_index_count, full_part, summary.incr_count, summary.files_indexed);
         }
 
+        println!();
         if recs.total > 0 {
-            println!();
             let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
             let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
             println!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
@@ -1055,6 +1142,29 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             // cg tool calls vs hook recommendations. ≪1 = recommendations ignored.
             println!("Conversion (proxy): {} cg tool calls / {} recommendations = {ratio:.2}",
                 summary.total_tool_calls(), recs.total);
+        } else if rec_exists {
+            // File present but empty: hooks are wired and recording, just no
+            // recommendation has fired yet.
+            println!("Recommendations: 0 recorded (PreToolUse hooks active; conversion metric live, no data yet)");
+        } else {
+            // No file at all: the recording hooks are not active in this project
+            // (e.g. a dev `.mcp.json` server with the marketplace plugin's
+            // PreToolUse hooks disabled). Surface the dark state instead of
+            // printing nothing — silence reads as "feature absent".
+            println!("Conversion metric: DARK — no recommendations.jsonl. PreToolUse hooks are not");
+            println!("  recording here, so recommend→use conversion cannot be measured in this project.");
+        }
+        // Per-session funnel: of sessions that saw a deny/hint, how many also called
+        // a cg query tool. This is the deny→use attribution the aggregate ratio can't give.
+        if summary.sessions_with_deny > 0 {
+            let pct = (summary.sessions_with_deny_and_cg as f64 / summary.sessions_with_deny as f64 * 100.0).round() as u64;
+            println!("Deny→use: {}/{} deny-sessions also called cg = {}%",
+                summary.sessions_with_deny_and_cg, summary.sessions_with_deny, pct);
+        }
+        if summary.sessions_with_hint > 0 {
+            let pct = (summary.sessions_with_hint_and_cg as f64 / summary.sessions_with_hint as f64 * 100.0).round() as u64;
+            println!("Hint→use: {}/{} hint-sessions also called cg = {}%",
+                summary.sessions_with_hint_and_cg, summary.sessions_with_hint, pct);
         }
     }
 
@@ -4212,6 +4322,26 @@ mod tests {
         assert!(s.versions.contains("0.12.0") && s.versions.contains("0.12.1"));
         assert_eq!(s.first_ts.as_deref(), Some("2026-04-19T10:00:00Z"));
         assert_eq!(s.last_ts.as_deref(), Some("2026-04-20T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_aggregate_funnel_deny_and_hint_to_use() {
+        // s1: deny + called cg (converted). s2: deny + NO cg (not converted).
+        // s3: hint + called cg. s4: no recs (ignored by funnel). s5: deny but only
+        // a housekeeping tool (get_index_status) → NOT counted as cg use.
+        let s1 = r#"{"ts":"2026-06-10T10:00:00Z","v":"0.45.4","tools":{"get_call_graph":{"n":1,"ms":5,"err":0,"max_ms":5}},"recs":{"deny":2,"hint":0}}"#;
+        let s2 = r#"{"ts":"2026-06-10T11:00:00Z","v":"0.45.4","tools":{},"recs":{"deny":1,"hint":1}}"#;
+        let s3 = r#"{"ts":"2026-06-10T12:00:00Z","v":"0.45.4","tools":{"find_references":{"n":3,"ms":9,"err":0,"max_ms":4}},"recs":{"deny":0,"hint":1}}"#;
+        let s4 = r#"{"ts":"2026-06-10T13:00:00Z","v":"0.45.4","tools":{"get_call_graph":{"n":1,"ms":5,"err":0,"max_ms":5}}}"#;
+        let s5 = r#"{"ts":"2026-06-10T14:00:00Z","v":"0.45.4","tools":{"get_index_status":{"n":1,"ms":0,"err":0,"max_ms":0}},"recs":{"deny":1,"hint":0}}"#;
+        let content = format!("{s1}\n{s2}\n{s3}\n{s4}\n{s5}\n");
+        let s = aggregate_usage_jsonl(&content, None);
+        // deny sessions: s1, s2, s5 = 3; of those, only s1 called a cg query tool.
+        assert_eq!(s.sessions_with_deny, 3, "s1+s2+s5 saw a deny");
+        assert_eq!(s.sessions_with_deny_and_cg, 1, "only s1 called a cg query tool (s5's get_index_status is housekeeping)");
+        // hint sessions: s2, s3 = 2; of those, only s3 called cg.
+        assert_eq!(s.sessions_with_hint, 2);
+        assert_eq!(s.sessions_with_hint_and_cg, 1);
     }
 
     #[test]

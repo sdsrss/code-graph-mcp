@@ -733,6 +733,71 @@ fn test_cli_stats_unknown_flag_errors() {
         "clap should name the unknown flag; got: {stderr:?}");
 }
 
+// Dark-metric visibility: when usage data is present but recommendations.jsonl
+// is absent, `stats` must SAY so (the recording hooks aren't active here) rather
+// than silently skipping the block — that silence is what hid the dark metric.
+#[test]
+fn test_cli_stats_recommendations_dark_when_absent() {
+    let project = setup_indexed_project();
+    // One real session so stats reaches the conversion block (sessions==0 bails).
+    std::fs::write(
+        project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR).join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    ).unwrap();
+    // No recommendations.jsonl written → dark.
+    let (stdout, _, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("DARK") && stdout.contains("recommendations.jsonl"),
+        "stats must surface the dark conversion metric when recommendations.jsonl is absent; got: {stdout:?}");
+
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    assert_eq!(v["recommendations"]["state"], "absent",
+        "JSON stats must mark recommendations.state=absent; got: {jstdout:?}");
+}
+
+#[test]
+fn test_cli_stats_recommendations_empty_distinct_from_absent() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::write(
+        cg.join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    ).unwrap();
+    // Present but empty → "live but no data", NOT dark.
+    std::fs::write(cg.join("recommendations.jsonl"), "").unwrap();
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    assert_eq!(v["recommendations"]["state"], "empty",
+        "an empty recommendations.jsonl is 'empty', distinct from 'absent'; got: {jstdout:?}");
+}
+
+// Deny→use funnel: stats must print the per-session attribution line when usage
+// records carry the window-joined `recs` field.
+#[test]
+fn test_cli_stats_deny_to_use_funnel() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    // Two deny-sessions, one of which called a cg query tool → 1/2 = 50%.
+    let s1 = "{\"ts\":\"2026-06-10T10:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}},\"recs\":{\"deny\":1,\"hint\":0}}";
+    let s2 = "{\"ts\":\"2026-06-10T11:00:00Z\",\"v\":\"0.45.4\",\"tools\":{},\"recs\":{\"deny\":1,\"hint\":0}}";
+    std::fs::write(cg.join("usage.jsonl"), format!("{s1}\n{s2}\n")).unwrap();
+    let (stdout, _, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Deny→use: 1/2 deny-sessions also called cg = 50%"),
+        "stats must print the deny→use funnel; got: {stdout:?}");
+
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    let funnel = &v["recommendations"]["funnel"];
+    assert_eq!(funnel["deny_sessions"], 2);
+    assert_eq!(funnel["deny_then_cg"], 1);
+    assert_eq!(funnel["deny_conversion"], 0.5);
+}
+
 // ============================================================
 // benchmark (clap-migrated, audit #4) — contract lock
 // ============================================================

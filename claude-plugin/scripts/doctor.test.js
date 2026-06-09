@@ -2,7 +2,18 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { runDiagnostics, formatReport } = require('./doctor');
+const { runDiagnostics, formatReport, surveyHookCoverage } = require('./doctor');
+const { buildSettingsHookEntries } = require('./lifecycle');
+
+// Build a settings.json whose hooks exactly mirror what we'd register now.
+function settingsWithCurrentHooks() {
+  const desired = buildSettingsHookEntries();
+  const hooks = {};
+  for (const [event, entries] of Object.entries(desired)) {
+    hooks[event] = entries.map(e => JSON.parse(JSON.stringify(e)));
+  }
+  return { hooks };
+}
 
 test('runDiagnostics returns an array of check results', () => {
   const results = runDiagnostics();
@@ -44,4 +55,28 @@ test('formatReport shows all-clear when no problems', () => {
   ];
   const output = formatReport(results);
   assert.ok(output.includes('All checks passed') || output.includes('0 issues'));
+});
+
+test('surveyHookCoverage reports clean when all entries are current', () => {
+  const cov = surveyHookCoverage(settingsWithCurrentHooks());
+  assert.equal(cov.missing.length, 0, 'no missing entries');
+  assert.equal(cov.stale.length, 0, 'no stale entries');
+});
+
+test('surveyHookCoverage flags a present-but-stale hook path', () => {
+  const settings = settingsWithCurrentHooks();
+  // Repoint one PreToolUse entry at an old plugin-cache version dir — present,
+  // recognized as ours (description unchanged), but command no longer current.
+  const bash = settings.hooks.PreToolUse.find(e => e.matcher === 'Bash');
+  bash.hooks[0].command = bash.hooks[0].command.replace('/scripts/', '/0.0.1-old/scripts/');
+  const cov = surveyHookCoverage(settings);
+  assert.equal(cov.missing.length, 0, 'entry is present, not missing');
+  assert.ok(cov.stale.includes('PreToolUse:Bash'),
+    `stale Bash path should be flagged; got stale=${JSON.stringify(cov.stale)}`);
+});
+
+test('surveyHookCoverage flags missing entries when settings empty', () => {
+  const cov = surveyHookCoverage({});
+  assert.ok(cov.missing.length === cov.expected.length, 'all expected entries missing');
+  assert.equal(cov.stale.length, 0, 'nothing present to be stale');
 });

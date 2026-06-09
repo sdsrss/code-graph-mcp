@@ -22,6 +22,11 @@ fn spawn_server(cwd: &std::path::Path) -> std::process::Child {
         cwd.join("Cargo.toml"),
         "[package]\nname = \"e2e-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
     );
+    // A `.git` marker anchors `cli::resolve_project_root_from` to this fixture dir
+    // so the server's metrics flush stays local. Without it, a fixture spawned
+    // under a real repo (e.g. `target/`, or any TMPDIR nested in a checkout)
+    // walks up to the ancestor `.git` and pollutes the real `usage.jsonl`.
+    let _ = std::fs::create_dir_all(cwd.join(".git"));
     Command::new(binary_path())
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -330,4 +335,44 @@ fn test_stdio_unknown_tool() {
 
     drop(stdin);
     let _ = child.wait();
+}
+
+/// Regression: a server spawned in a project dir that lives UNDER another git
+/// repo must flush its metrics into ITS OWN `.code-graph`, never walk up to the
+/// ancestor repo's `usage.jsonl`. Before `spawn_server` dropped a `.git` marker,
+/// `cli::resolve_project_root_from` walked from the bare fixture dir up to the
+/// real code-graph-mcp repo's `.git` and appended test metrics (`nonexistent_tool`,
+/// `dur_s:0`) into the real `usage.jsonl`, polluting the recommend→use conversion
+/// denominator. A `/tmp` TempDir has no ancestor `.git`, so reproducing the leak
+/// requires putting the fixture under the repo (`target/` is gitignored).
+#[test]
+fn test_stdio_metrics_isolated_from_ancestor_repo() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    let dir = base.join(format!("metrics-iso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut child = spawn_server(&dir);
+    let mut stdin = child.stdin.take().unwrap();
+    let rx = spawn_reader(child.stdout.take().unwrap());
+
+    send(&mut stdin, &initialize_msg());
+    let _ = read_response(&rx, TIMEOUT).expect("no response to initialize");
+    // One (error) tool call makes the session non-empty so flush_metrics writes.
+    send(&mut stdin, &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})));
+    let _ = read_response(&rx, TIMEOUT);
+
+    drop(stdin);
+    let _ = child.wait();
+
+    // Metrics must land in the fixture's own .code-graph, proving the server did
+    // NOT adopt the ancestor repo as its project root.
+    let local_usage = dir.join(".code-graph").join("usage.jsonl");
+    let isolated = local_usage.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        isolated,
+        "metrics leaked: a server spawned under the repo did not write its own \
+         .code-graph/usage.jsonl — resolve_project_root walked up to the ancestor .git"
+    );
 }

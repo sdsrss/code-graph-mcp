@@ -206,17 +206,26 @@ function runDiagnostics() {
   try {
     const settings = readJson(settingsPath()) || {};
     const cov = surveyHookCoverage(settings);
-    if (cov.missing.length === 0) {
+    if (cov.missing.length === 0 && cov.stale.length === 0) {
       results.push({
         name: 'Hook coverage',
         status: 'ok',
         detail: `settings.json has all ${cov.expected.length} expected entries`,
       });
-    } else {
+    } else if (cov.missing.length > 0) {
       results.push({
         name: 'Hook coverage',
         status: 'warn',
         detail: `missing ${cov.missing.length}/${cov.expected.length} settings.json entries: ${cov.missing.join(', ')}`,
+        fixId: 'missing-hooks-in-settings',
+      });
+    } else {
+      // Present but stale path(s) — re-register rewrites them to the current
+      // version. A stale PreToolUse hook can keep the conversion metric dark.
+      results.push({
+        name: 'Hook coverage',
+        status: 'warn',
+        detail: `${cov.stale.length}/${cov.expected.length} settings.json entries point at a stale path (re-register to current version): ${cov.stale.join(', ')}`,
         fixId: 'missing-hooks-in-settings',
       });
     }
@@ -230,26 +239,42 @@ function runDiagnostics() {
 function surveyHookCoverage(settings) {
   const desired = buildSettingsHookEntries();
   const expected = [];
+  const desiredCmd = {}; // key -> command string we would write now
   for (const [event, entries] of Object.entries(desired)) {
     for (const e of entries) {
-      expected.push(`${event}:${e.matcher || '*'}`);
+      const key = `${event}:${e.matcher || '*'}`;
+      expected.push(key);
+      desiredCmd[key] = e.hooks && e.hooks[0] && e.hooks[0].command;
     }
   }
 
   const present = new Set();
+  const presentCmd = {}; // key -> command currently registered
   if (settings && settings.hooks) {
     for (const [event, entries] of Object.entries(settings.hooks)) {
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
         if (isOurHookEntry(entry)) {
-          present.add(`${event}:${entry.matcher || '*'}`);
+          const key = `${event}:${entry.matcher || '*'}`;
+          present.add(key);
+          if (entry.hooks && entry.hooks[0] && entry.hooks[0].command) {
+            presentCmd[key] = entry.hooks[0].command;
+          }
         }
       }
     }
   }
 
   const missing = expected.filter(k => !present.has(k));
-  return { expected, present: [...present], missing };
+  // Stale = present but the registered command no longer matches what we'd write
+  // now (points at an old plugin-cache version dir / moved path). A stale path can
+  // run pre-recordRecommendation hook code, so the hook fires but the conversion
+  // metric stays dark — invisible to a present/absent check. This is the
+  // 0.45.1-registered-while-0.45.4-active case the RCA surfaced.
+  const stale = expected.filter(k =>
+    present.has(k) && desiredCmd[k] && presentCmd[k] && presentCmd[k] !== desiredCmd[k]
+  );
+  return { expected, present: [...present], missing, stale };
 }
 
 // ── Report Formatting ─────────────────────────────────────
@@ -449,7 +474,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage };
 
 if (require.main === module) {
   const args = process.argv.slice(2);

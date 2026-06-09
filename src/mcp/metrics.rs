@@ -88,6 +88,10 @@ pub struct SearchMetrics {
 /// Lightweight session metrics — append-only JSONL flush at session end.
 pub struct SessionMetrics {
     start: Instant,
+    /// Wallclock session-start (ISO 8601 UTC), captured at construction. Used to
+    /// window-join PreToolUse recommendations (`recommendations.jsonl`) that fired
+    /// during this session, so the recommend→use funnel can attribute per-session.
+    started_at: String,
     tools: HashMap<String, ToolStats>,
     search: SearchMetrics,
     pub full_index_ms: Option<u64>,
@@ -105,6 +109,7 @@ impl SessionMetrics {
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
+            started_at: iso8601_now(),
             tools: HashMap::new(),
             search: SearchMetrics {
                 total_queries: 0,
@@ -231,7 +236,19 @@ impl SessionMetrics {
         // CODE_GRAPH_DOGFOOD=1 tags this session as dev self-test traffic so it
         // can be filtered out of real-adoption metrics (audit §7).
         let dogfood = std::env::var("CODE_GRAPH_DOGFOOD").ok().as_deref() == Some("1");
-        let record = self.build_record(version, dogfood);
+        let mut record = self.build_record(version, dogfood);
+
+        // Window-join PreToolUse recommendations that fired during this session so
+        // the recommend→use funnel can attribute per-session (P#5211). Additive +
+        // only-when-non-zero: older readers ignore it, success lines stay compact.
+        if let Some(dir) = usage_path.parent() {
+            if let Ok(content) = std::fs::read_to_string(dir.join("recommendations.jsonl")) {
+                let (deny, hint) = count_recs_in_window(&content, &self.started_at);
+                if deny > 0 || hint > 0 {
+                    record["recs"] = serde_json::json!({ "deny": deny, "hint": hint });
+                }
+            }
+        }
 
         let line = match serde_json::to_string(&record) {
             Ok(s) => s,
@@ -288,6 +305,34 @@ impl SessionMetrics {
     }
 }
 
+/// Count PreToolUse recommendation events (`recommendations.jsonl` content) whose
+/// `ts` falls inside the current session window `[started_at, ∞)`. Returns
+/// `(deny, hint)`. Pure: ISO-8601 UTC strings compare lexicographically at second
+/// granularity (a sub-second boundary event may be off by one — accepted per spec).
+pub(crate) fn count_recs_in_window(rec_content: &str, started_at: &str) -> (u64, u64) {
+    let mut deny = 0u64;
+    let mut hint = 0u64;
+    for line in rec_content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        if ts < started_at {
+            continue;
+        }
+        match v.get("action").and_then(|a| a.as_str()) {
+            Some("deny") => deny += 1,
+            Some("hint") => hint += 1,
+            _ => {}
+        }
+    }
+    (deny, hint)
+}
+
 /// Generate an ISO 8601 timestamp from SystemTime (no chrono dependency).
 fn iso8601_now() -> String {
     use std::time::SystemTime;
@@ -341,6 +386,26 @@ mod tests {
         assert_eq!(m.files_indexed, 0);
         assert_eq!(m.nodes_created, 0);
         assert!(m.full_index_ms.is_none());
+    }
+
+    #[test]
+    fn test_count_recs_in_window() {
+        let content = "\
+{\"ts\":\"2026-06-10T00:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}
+{\"ts\":\"2026-06-10T01:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}
+{\"ts\":\"2026-06-10T01:00:05Z\",\"hook\":\"read\",\"action\":\"hint\"}
+{\"ts\":\"2026-06-10T01:00:09Z\",\"hook\":\"grep\",\"action\":\"hint\"}
+not json
+{\"ts\":\"2026-06-10T02:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}
+";
+        // Window starts at 01:00:00 → the 00:00:00 deny is excluded; 2 denies + 2 hints remain.
+        let (deny, hint) = count_recs_in_window(content, "2026-06-10T01:00:00Z");
+        assert_eq!((deny, hint), (2, 2), "in-window deny/hint count, pre-window excluded, malformed skipped");
+
+        // Window after everything → nothing in range.
+        assert_eq!(count_recs_in_window(content, "2026-06-10T03:00:00Z"), (0, 0));
+        // Empty content → zero, no panic.
+        assert_eq!(count_recs_in_window("", "2026-06-10T01:00:00Z"), (0, 0));
     }
 
     #[test]
