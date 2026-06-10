@@ -30,6 +30,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
+const { runGrepAnswer } = require('./cg-answer');
 
 // --- Pure logic (testable) ---
 
@@ -43,7 +44,11 @@ const GREP_HEAD = /^\s*(?:env\s+\S+=\S+\s+)*(grep|rg|ag)\b/;
 // entities/migrations/tasks/jobs/workers/features/modules/api/web. Generic
 // terms like `core`/`utils`/`shared`/`common`/`types` deliberately omitted —
 // they appear in too many non-code contexts to be precise enough.
-const SRC_PATH = /(?:^|\s|["'])(src|tests|lib|libs|scripts|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web)\//;
+const SRC_PREFIXES =
+  'src|tests|lib|libs|scripts|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web';
+const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
+// Anchored variant for whole-token matching in extractSearchPath.
+const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
 const PIPE_INTO_GREP = /\|\s*(?:grep|rg|ag)\b/;
 const CG_INVOKED = /\bcode-graph-mcp\b/;
 // A file argument that ends in a config/lockfile extension AND no source-tree
@@ -112,6 +117,24 @@ function shouldBlock(cmd) {
   return patterns.some(p => IDENTIFIER_LIKE.test(p));
 }
 
+// v0.47.0 — pull the first source-tree path token out of the denied command so
+// the inline answer can scope its search the same way the raw grep would have.
+function extractSearchPath(cmd) {
+  if (!cmd || typeof cmd !== 'string') return undefined;
+  for (const raw of cmd.split(/\s+/)) {
+    const token = raw.replace(/^["']|["']$/g, '');
+    if (!token || token.startsWith('-')) continue;
+    if (token.includes('..')) return undefined; // traversal — don't scope, don't guess
+    if (SRC_PATH_TOKEN.test(token)) return token;
+  }
+  return undefined;
+}
+
+// v0.47.0 — the pattern that justified the block: first identifier-like one.
+function pickBlockPattern(cmd) {
+  return extractPatterns(cmd).find(p => IDENTIFIER_LIKE.test(p));
+}
+
 function commandHash(cmd) {
   return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
 }
@@ -155,6 +178,34 @@ function buildBlockReason() {
   ].join('\n');
 }
 
+// v0.47.0 — deny WITH the answer inline. Hint-only had ~0% transfer and a bare
+// deny still asks the model to initiate a new tool call; embedding the actual
+// results removes that choice entirely. Keep the escape hatch line — raw-text
+// regex (BRE alternation, log scans) remains a legitimate need.
+function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
+  const cmdShown = `code-graph-mcp grep "${pattern}"${searchPath ? ` ${searchPath}` : ''}`;
+  const lines = [
+    '[code-graph] Raw `grep` on indexed source — denied; the AST-aware equivalent already ran for you:',
+    `$ ${cmdShown}`,
+    answer.text,
+  ];
+  if (answer.truncated) {
+    lines.push(`(truncated — run \`${cmdShown}\` yourself for the full list)`);
+  }
+  lines.push(
+    'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
+    'For raw-text regex (alternation, log/comment scans), re-run with `CODE_GRAPH_NO_BLOCK_GREP=1` prepended.',
+  );
+  return lines.join('\n');
+}
+
+// v0.47.0 — cg grep found nothing. Regex-dialect differences (BRE `\|` vs
+// ripgrep) mean 0 hits is NOT proof of absence, so denying here could mislead.
+// Let the raw grep through with an honest one-liner.
+function buildNoHitsFyi(pattern) {
+  return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` found no matches — raw grep proceeding.`;
+}
+
 // --- Main execution (only when run directly) ---
 
 // Kill switch: matches user-prompt-context.js convention. =1 forces silence
@@ -172,6 +223,12 @@ function isBlockDisabled(env = process.env) {
   return env.CODE_GRAPH_NO_BLOCK_GREP === '1';
 }
 
+// v0.47.0 — opt-out for the inline-answer tier only: =1 restores the v0.46
+// static deny (no CLI run inside the hook). Independent of NO_BLOCK_GREP.
+function isAnswerDisabled(env = process.env) {
+  return env.CODE_GRAPH_NO_ANSWER_IN_DENY === '1';
+}
+
 function runMain() {
   if (isSilenced()) return;
   const cwd = process.cwd();
@@ -180,7 +237,10 @@ function runMain() {
 
   let input;
   try {
-    input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+    // fd 0, not '/dev/stdin': the path form open(2)s the symlink target, which
+    // fails with ENXIO when stdin is a socketpair (e.g. spawnSync {input}).
+    // Reading the fd directly works for pipes, sockets, and files alike.
+    input = JSON.parse(fs.readFileSync(0, 'utf8'));
   } catch { return; }
 
   const cmd = (input.tool_input && input.tool_input.command) || '';
@@ -190,17 +250,37 @@ function runMain() {
   markCooldown(cmd);
 
   if (!isBlockDisabled() && shouldBlock(cmd)) {
+    // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
+    // results in the deny reason ("answer in the deny"). Degrades to the
+    // v0.46 static deny on any failure; downgrades to allow+FYI on 0 hits
+    // (regex-dialect differences mean 0 hits ≠ proof of absence).
+    let answer = { status: 'unavailable' };
+    const pattern = pickBlockPattern(cmd);
+    if (!isAnswerDisabled() && pattern) {
+      answer = runGrepAnswer({ cwd, pattern, searchPath: extractSearchPath(cmd) });
+    }
+
+    if (answer.status === 'no-hits') {
+      recordRecommendation(cwd, { hook: 'grep', action: 'hint', fallthrough: 'no-hits' });
+      process.stdout.write(buildNoHitsFyi(pattern) + '\n');
+      return;
+    }
+
     // PreToolUse block via current CC schema (`hookSpecificOutput.permissionDecision`).
     // Verified empirically 2026-05-24: legacy `{decision:"block",reason}` was
     // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
-    recordRecommendation(cwd, { hook: 'grep', action: 'deny' });
+    recordRecommendation(cwd, {
+      hook: 'grep', action: 'deny', answered: answer.status === 'hits',
+    });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
-        permissionDecisionReason: buildBlockReason(),
+        permissionDecisionReason: answer.status === 'hits'
+          ? buildBlockReasonWithAnswer(pattern, extractSearchPath(cmd), answer)
+          : buildBlockReason(),
       },
     }) + '\n');
     return;
@@ -218,11 +298,16 @@ module.exports = {
   shouldHint,
   shouldBlock,
   extractPatterns,    // v0.32.1 — exposed for tests
+  extractSearchPath,  // v0.47.0 — deny-with-answer
+  pickBlockPattern,
   buildHint,
   buildBlockReason,
+  buildBlockReasonWithAnswer,
+  buildNoHitsFyi,
   commandHash,
   isOnCooldown,
   markCooldown,
   isSilenced,
   isBlockDisabled,
+  isAnswerDisabled,
 };

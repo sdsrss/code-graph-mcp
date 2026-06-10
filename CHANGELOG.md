@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.47.0 — feat: answer in the deny — denied greps now return the actual results
+
+**What changes for users**: when the PreToolUse hook denies a symbol-shaped raw grep, the
+deny message now CONTAINS the results of the AST-aware equivalent (`code-graph-mcp grep
+"<pattern>" [path]`, run synchronously inside the hook, ~20ms warm / 2s timeout) instead of
+only suggesting the command. Rationale: measured recommend→use transfer of suggestion-style
+interventions is ~0% — the model rarely initiates a new tool call because a message told it
+to, but it will use results already in front of it.
+**Opt-out / revert**: `CODE_GRAPH_NO_ANSWER_IN_DENY=1` restores the v0.46 static deny;
+`CODE_GRAPH_NO_BLOCK_GREP=1` still downgrades the whole block tier to hint.
+
+- **Three deny outcomes** (new `cg-answer.js`, all failure modes degrade, never break the
+  tool call): ≥1 hit → deny with embedded results (truncated at line boundary to ≤4KB);
+  CLI missing/error/timeout → v0.46 static deny; **0 hits → the raw grep is ALLOWED** with a
+  one-line FYI (regex-dialect differences — BRE `\|` vs ripgrep — mean 0 hits is not proof
+  of absence, so a hard deny could mislead).
+- **Funnel semantics**: deny records gain `answered: true|false`; no-hit fallthroughs record
+  `{action:"hint", fallthrough:"no-hits"}`. Rust readers ignore the extra fields (verified:
+  CLI `grep` does not write `usage.jsonl`, so hook-initiated runs cannot inflate deny→use).
+  **Reading note**: an answered deny satisfies the need in-place, so `Deny→use` will read
+  LOW even when this feature works — segment by `answered` when reading Piece 3.
+- **Hook stdin hardening**: hooks now read fd 0 directly instead of `/dev/stdin` (the path
+  form fails silently when stdin is a socketpair, e.g. under `spawnSync({input})` test
+  harnesses; real Claude Code pipes were unaffected).
+
 ## v0.46.0 — feat: measure whether the DENY stick converts + honest conversion metric
 
 The recommend→use conversion metric (v0.39.0) was producing **zero usable data** in this repo
