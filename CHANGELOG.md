@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.47.1 — fix: grep guard now matches absolute paths (it was missing ~97% of real traffic)
+
+The deny/hint tier of `pre-grep-guide.js` only matched **relative** source paths
+(`grep -rn "X" backend/app/…`), but Claude Code's harness explicitly steers Bash toward
+**absolute** paths — so `grep -rn "X" /abs/project/backend/app/…`, the dominant real-world
+shape, never fired. Field replay (daagu, 3 real coding sessions, 2026-06-11): 42/42 raw
+greps used absolute paths → 1 hint / 0 blocks as-is vs **30 hints / 16 blocks** after this
+fix. The v0.47.0 answer-in-the-deny feature was unreachable on consumer projects until now.
+
+- Fix: strip `<cwd>/` (the hook's cwd IS the project root) from the command before
+  matching — absolute paths under the root now behave exactly like their relative
+  spelling; paths outside the project still never fire (conservative edge preserved).
+  The inline answer's CLI scope argument is passed in relative form.
+- Replay methodology added to tests: real transcript commands asserted in both spellings.
+- Known limitation (pre-existing, unchanged): the CLI `grep` shells to ripgrep, whose
+  gitignore handling can diverge from git on `dir/` + `!negation` whitelists (observed:
+  rg 14.1.0 prunes a git-whitelisted directory when walking from above). Worst case is
+  the honest no-hits fallthrough: the raw grep is allowed through and finds the truth.
+
 ## v0.47.0 — feat: answer in the deny — denied greps now return the actual results
 
 **What changes for users**: when the PreToolUse hook denies a symbol-shaped raw grep, the

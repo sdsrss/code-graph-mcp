@@ -117,6 +117,20 @@ function shouldBlock(cmd) {
   return patterns.some(p => IDENTIFIER_LIKE.test(p));
 }
 
+// v0.47.1 — CC harness steers Bash toward ABSOLUTE paths (cd in compound
+// commands triggers permission prompts), so `grep -rn "X" /abs/root/backend/…`
+// is the dominant real shape — and SRC_PATH's lookbehind (^|\s|quote) never
+// matched it (daagu 2026-06-11 replay: 42/42 head-greps absolute → 1 hint /
+// 0 block as-is vs 30 / 16 after this strip). Strip `<cwd>/` everywhere before
+// matching: the hook's cwd IS the project root, so this is exact — paths
+// outside the project stay absolute and keep not firing (conservative edge).
+// split/join, not regex: cwd may contain regex metacharacters.
+function normalizeCommandPaths(cmd, cwd) {
+  if (!cmd || typeof cmd !== 'string') return cmd;
+  if (!cwd || typeof cwd !== 'string' || cwd === '/') return cmd;
+  return cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('');
+}
+
 // v0.47.0 — pull the first source-tree path token out of the denied command so
 // the inline answer can scope its search the same way the raw grep would have.
 function extractSearchPath(cmd) {
@@ -243,11 +257,15 @@ function runMain() {
     input = JSON.parse(fs.readFileSync(0, 'utf8'));
   } catch { return; }
 
-  const cmd = (input.tool_input && input.tool_input.command) || '';
+  const rawCmd = (input.tool_input && input.tool_input.command) || '';
+  // v0.47.1 — match against the cwd-stripped form so absolute paths under the
+  // project root behave exactly like their relative spelling. Cooldown stays
+  // keyed on the raw command (what Claude actually sent).
+  const cmd = normalizeCommandPaths(rawCmd, cwd);
   if (!shouldHint(cmd)) return;
-  if (isOnCooldown(cmd)) return;
+  if (isOnCooldown(rawCmd)) return;
 
-  markCooldown(cmd);
+  markCooldown(rawCmd);
 
   if (!isBlockDisabled() && shouldBlock(cmd)) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
@@ -299,6 +317,7 @@ module.exports = {
   shouldBlock,
   extractPatterns,    // v0.32.1 — exposed for tests
   extractSearchPath,  // v0.47.0 — deny-with-answer
+  normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
   pickBlockPattern,
   buildHint,
   buildBlockReason,

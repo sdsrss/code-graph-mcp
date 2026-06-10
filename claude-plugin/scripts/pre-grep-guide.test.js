@@ -6,6 +6,7 @@ const {
   shouldBlock,
   extractPatterns,
   extractSearchPath,
+  normalizeCommandPaths,
   pickBlockPattern,
   buildHint,
   buildBlockReason,
@@ -530,6 +531,74 @@ test('I4: grep -rn "fn render" src/ → BLOCK (decl anchor at start)', () => {
   assert.equal(shouldBlock('grep -rn "fn render" src/'), true);
 });
 
+// ── v0.47.1 abs-path matcher fix: normalizeCommandPaths ─────────────
+// CC harness steers Bash toward ABSOLUTE paths (cd in compound commands
+// triggers permission prompts), so `grep -rn "X" /abs/root/backend/...` is
+// the dominant real-world shape. SRC_PATH's lookbehind (^|\s|quote) never
+// matched it: daagu 2026-06-11 replay — 42/42 head-greps absolute, 1 hint /
+// 0 block as-is vs 30 hint / 16 block after cwd-strip.
+
+test('normalizeCommandPaths: strips cwd prefix from path args', () => {
+  assert.equal(
+    normalizeCommandPaths('grep -rn "X" /proj/root/src/storage/', '/proj/root'),
+    'grep -rn "X" src/storage/');
+});
+
+test('normalizeCommandPaths: strips every occurrence', () => {
+  assert.equal(
+    normalizeCommandPaths('grep -rn "X" /proj/root/src/a.rs /proj/root/tests/', '/proj/root'),
+    'grep -rn "X" src/a.rs tests/');
+});
+
+test('normalizeCommandPaths: strips inside quotes', () => {
+  assert.equal(
+    normalizeCommandPaths('grep -rn "X" "/proj/root/backend/app/"', '/proj/root'),
+    'grep -rn "X" "backend/app/"');
+});
+
+test('normalizeCommandPaths: leaves foreign absolute paths alone', () => {
+  assert.equal(
+    normalizeCommandPaths('grep -rn "X" /other/place/src/', '/proj/root'),
+    'grep -rn "X" /other/place/src/');
+});
+
+test('normalizeCommandPaths: no-op when cwd absent / falsy inputs', () => {
+  assert.equal(normalizeCommandPaths('grep -rn "X" src/', '/proj/root'), 'grep -rn "X" src/');
+  assert.equal(normalizeCommandPaths('', '/proj/root'), '');
+  assert.equal(normalizeCommandPaths('grep "X" src/', ''), 'grep "X" src/');
+});
+
+// Real daagu transcript commands (2026-06-11 session 23f149f0…), the exact
+// shape that was invisible to v0.47.0. Replay must fire post-normalization.
+const DAAGU = '/mnt/data_ssd/dev/projects/daagu';
+
+test('replay: real abs-path symbol grep → BLOCK after normalization', () => {
+  const cmd = `grep -n "_parse_finish_reason\\|_last_finish_reason\\|class OpenRouterProvider" ${DAAGU}/backend/app/services/llm_engine/openrouter.py`;
+  assert.equal(shouldHint(cmd), false);                       // documents the v0.47.0 blindspot
+  const norm = normalizeCommandPaths(cmd, DAAGU);
+  assert.equal(shouldHint(norm), true);
+  assert.equal(shouldBlock(norm), true);
+});
+
+test('replay: real abs-path -rln grep → HINT only after normalization (precision flag)', () => {
+  const cmd = `grep -rln "load_active_config_standalone" ${DAAGU}/backend/tests/ | head -5`;
+  const norm = normalizeCommandPaths(cmd, DAAGU);
+  assert.equal(shouldHint(norm), true);
+  assert.equal(shouldBlock(norm), false);                     // -l cluster disqualifies block
+});
+
+test('replay: abs-path config-only grep stays silent after normalization', () => {
+  const cmd = `grep -n '"typecheck"\\|"type-check"\\|vue-tsc' ${DAAGU}/frontend/package.json`;
+  assert.equal(shouldHint(normalizeCommandPaths(cmd, DAAGU)), false);
+});
+
+test('replay: extractSearchPath gets relative path from normalized abs command', () => {
+  const cmd = `grep -rn "config_version" ${DAAGU}/backend/app/services/stock_picker/data_providers.py 2>/dev/null | head -5`;
+  assert.equal(
+    extractSearchPath(normalizeCommandPaths(cmd, DAAGU)),
+    'backend/app/services/stock_picker/data_providers.py');
+});
+
 // ── v0.47.0 deny-with-answer: extractSearchPath / pickBlockPattern ──
 
 test('extractSearchPath: dir path after pattern', () => {
@@ -719,6 +788,26 @@ test('e2e: stub fails → static deny (v0.46 fallback) + records answered:false'
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
     assert.equal(rec.action, 'deny');
     assert.equal(rec.answered, false);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: ABS-path grep under fixture root → deny fires, CLI argv gets relative path', () => {
+  const uniq = `StubAbs${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + JSON.stringify(process.argv.slice(2)) + '\\n');`);
+  // fs.realpathSync: on macOS/Linux tmpdir may be a symlink; the hook sees the
+  // resolved cwd, so build the command from the same resolved form.
+  const realDir = fsE2e.realpathSync(fixture.dir);
+  const cmd = `grep -rn "${uniq}" ${realDir}/src/storage/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(out.hookSpecificOutput.permissionDecisionReason,
+      /args=\["grep","StubAbs\d+","src\/storage\/"\]/);
   } finally {
     cleanupFixture(fixture, cmd);
   }
