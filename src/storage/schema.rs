@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 // Meta keys stored in the `meta` table (added in v7).
 pub const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
@@ -289,6 +289,34 @@ pub fn migrate_v7_to_v8(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);"
     )?;
     tracing::info!("[schema] Migration v7->v8 complete.");
+    Ok(())
+}
+
+/// v8 -> v9: add `edges.confidence` (resolution confidence tier). Without this,
+/// `CREATE TABLE IF NOT EXISTS edges` is a no-op on an existing table, so an
+/// upgraded DB would keep a column-less `edges` and crash with
+/// `no such column: confidence` on the next index pass (Phase 2e UPDATE) or
+/// `refs`/`find_references` query. Raw guarded ALTER rather than
+/// `add_column_if_not_exists` because the quoted `DEFAULT 'extracted'` fails that
+/// helper's identifier validator. The DEFAULT backfills existing rows to
+/// 'extracted'; the next index pass reclassifies via classify_edge_confidence.
+pub fn migrate_v8_to_v9(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v8 -> v9: adding edges.confidence (resolution confidence tier)");
+    // The `edges` table may not exist yet when migrating a contentless older DB
+    // (migrations run BEFORE create_tables_sql, which then creates `edges` WITH
+    // the column). Only ALTER an existing `edges` table that lacks the column —
+    // ALTERing a not-yet-created table would error and fail the whole open.
+    let edges_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='edges'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if edges_exists && !column_exists(conn, "edges", "confidence") {
+        conn.execute_batch(
+            "ALTER TABLE edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'extracted'"
+        )?;
+    }
+    tracing::info!("[schema] Migration v8->v9 complete.");
     Ok(())
 }
 

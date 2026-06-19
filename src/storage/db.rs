@@ -198,6 +198,11 @@ impl Database {
                 schema::migrate_v7_to_v8(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 9 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v8_to_v9(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
@@ -557,6 +562,57 @@ mod tests {
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
         assert!(version >= 8, "version must have advanced to at least 8");
+    }
+
+    /// v8 → v9 adds `edges.confidence`. Critical: a real upgrade keeps the
+    /// existing `edges` table, so `CREATE TABLE IF NOT EXISTS` is a no-op and the
+    /// column must arrive via ALTER. Without the migration an upgraded user's DB
+    /// crashed with `no such column: confidence` on the next index pass / `refs`
+    /// query. We hand-build a COLUMN-LESS edges table (the pre-v9 shape) — using
+    /// create_tables_sql() would wrongly include the new column and mask the bug.
+    #[test]
+    fn test_v8_to_v9_migration_adds_confidence_column() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            // Pre-v9 edges shape: no `confidence` column.
+            c.execute_batch(
+                "CREATE TABLE edges (
+                    id          INTEGER PRIMARY KEY,
+                    source_id   INTEGER NOT NULL,
+                    target_id   INTEGER NOT NULL,
+                    relation    TEXT NOT NULL,
+                    metadata    TEXT
+                );"
+            ).unwrap();
+            c.pragma_update(None, "user_version", 8).unwrap();
+        }
+
+        // Open via Database::open — the v8→v9 migration must run.
+        let db = Database::open(&db_path).unwrap();
+
+        // (a) The column now exists with the backfill default.
+        let has_col: bool = db.conn().query_row(
+            "SELECT 1 FROM pragma_table_info('edges') WHERE name = 'confidence'",
+            [], |_| Ok(true),
+        ).unwrap_or(false);
+        assert!(has_col, "edges.confidence must exist after v8→v9 migration");
+
+        // (b) The exact query that crashed pre-fix now succeeds (no rows is fine).
+        let _: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM edges WHERE confidence = 'extracted'",
+            [], |r| r.get(0),
+        ).expect("SELECT on edges.confidence must not error after migration");
+
+        // (c) user_version advanced.
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
+        assert!(version >= 9, "version must have advanced to at least 9");
     }
 
     #[test]
