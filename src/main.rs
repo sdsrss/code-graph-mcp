@@ -164,6 +164,11 @@ fn main() -> Result<()> {
             let affected_args = code_graph_mcp::cli::AffectedArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_affected(&project_root, affected_args)
         }
+        Some("centrality") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let centrality_args = code_graph_mcp::cli::CentralityArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_centrality(&project_root, centrality_args)
+        }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
@@ -235,6 +240,7 @@ fn print_help() {
     println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
+    println!("    centrality          Rank architectural chokepoints (betweenness over the call graph)");
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
     println!("    reindex [--from-snapshot]");
@@ -256,7 +262,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
-    println!("    --limit N           Limit results (search, ast-search; default: 20)");
+    println!("    --limit N           Limit results (search, ast-search default: 20; centrality default: 15)");
     println!("    --language <lang>   Filter by language (search)");
     println!("    --node-type <type>  Filter by node type (search)");
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
@@ -267,7 +273,7 @@ fn print_help() {
     println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)");
     println!("    --node-id N         Lookup by node ID (show, similar)");
     println!("    --change-type <t>   signature, behavior, or remove (impact; default: behavior)");
-    println!("    --include-tests     Show test callers (callgraph, show; hidden by default)");
+    println!("    --include-tests     Show test callers / include test symbols (callgraph, show, centrality; hidden by default)");
     println!("    --refs              Show callers/callees (show; alias: --include-refs)");
     println!("    --impact            Show impact summary (show; alias: --include-impact)");
     println!("    --context-lines N   Surrounding source lines (show; default: 0)");
@@ -400,7 +406,7 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
-    "benchmark", "stats", "adopt", "unadopt", "snapshot",
+    "centrality", "benchmark", "stats", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
     "project_map", "module_overview", "get_ast_node", "find_references",
