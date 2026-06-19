@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.54.2 — routing template: centrality + refs --min-confidence
+
+- **docs(adoption)**: the shipped routing template (`claude-plugin/templates/plugin_code_graph_mcp.md`)
+  now lists `centrality` (architectural chokepoints, CLI-only) and
+  `refs --min-confidence` (filter low-confidence by-name edges) in its decision
+  tables + CLI cheat-sheet, so Claude Code auto-routes to the v0.53/v0.54 commands.
+  Adopted project copies refresh from the template on next SessionStart.
+
 ## v0.54.1 — edge confidence polish (post-review follow-ups)
 
 Two non-blocking items from the v0.54.0 integration review. No schema change,

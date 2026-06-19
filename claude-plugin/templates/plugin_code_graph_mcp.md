@@ -60,7 +60,7 @@ type: reference
 | "Y 模块长啥样？" | `module_overview` / `overview Y/` | 替代逐文件 Read |
 | "找做 Z 的代码"（概念） | MCP `semantic_code_search`（RRF 混合）；CLI `search`（纯 FTS5） | 不知道精确名；要向量召回走 MCP |
 | "返回 T 类型的函数" | `ast_search --returns T` | 结构化筛选 |
-| "X 在哪被引用？" | `find_references` / `refs X` | 含 callers/importers |
+| "X 在哪被引用？" | `find_references` / `refs X` | 含 callers/importers；`refs X --min-confidence extracted` 滤掉跨文件裸名低置信边（inferred/ambiguous） |
 | "看 X 的源码 / 签名" | `get_ast_node` / `show X` | `include_impact=true` 影响面 / `include_similar=true` 嵌入近邻 |
 | "项目结构总览" | `project_map` / `map` | 起手势用 `--compact` |
 | "X 文件依赖谁？" / "Y 模块下的死代码" | `module_overview path=Y include_deps=true` / `include_dead=true` | 文件路径走 deps；目录/文件走 dead |
@@ -81,6 +81,7 @@ hidden 5 加载 schema —— 实操中走新 flag。CLI 子命令保持原样�
 | "X 文件依赖谁？" | `code-graph-mcp deps src/x.rs` | `module_overview path="src/x.rs" include_deps=true` |
 | "相似/重复函数"（需 embedding） | `code-graph-mcp similar X` | `get_ast_node symbol_name=X include_similar=true` |
 | "未使用的代码" | `code-graph-mcp dead-code [path]` | `module_overview path=<path> include_dead=true` |
+| "架构咽喉/桥节点是谁？" | `code-graph-mcp centrality` | —（CLI-only；betweenness 中心性，补 `map` 的 caller_count 度中心性） |
 
 **dead-code 的 `ignore_paths`**：CLI 默认豁免 `["claude-plugin/", "benches/"]`
 （macro/shell 入口点）；`--no-ignore` 关闭。MCP 端也接同名参数。
@@ -114,6 +115,8 @@ code-graph-mcp callgraph SYMBOL          # 调用图
 code-graph-mcp impact SYMBOL             # 影响面
 code-graph-mcp show SYMBOL                # 节点详情
 code-graph-mcp refs SYMBOL --relation calls  # 引用筛选
+code-graph-mcp refs SYMBOL --min-confidence extracted  # 只看精确边（滤跨文件裸名 inferred/ambiguous）
+code-graph-mcp centrality                 # 架构咽喉（betweenness 桥节点；补 map 的 caller_count）
 code-graph-mcp dead-code [path]           # 未使用代码（默认豁免 claude-plugin/）
 code-graph-mcp dead-code --ignore tmp/ --ignore scripts/bin/  # 自定义豁免前缀
 code-graph-mcp dead-code --no-ignore      # 关掉默认豁免，看完整列表
