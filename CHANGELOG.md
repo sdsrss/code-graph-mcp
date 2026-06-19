@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.53.0 — `centrality`: architectural chokepoints
+
+New CLI command that ranks functions by **betweenness centrality** over the call graph.
+Read-only over the existing index — no `INDEX_VERSION` bump, no breaking changes.
+
+### New: `code-graph-mcp centrality [--limit N] [--include-tests] [--json]`
+
+- Surfaces the *structural bridges* — functions lying on the most shortest call paths
+  between other functions. This is orthogonal to `map`'s `caller_count` "hot functions"
+  (degree centrality): a chokepoint can have **few callers** yet route most cross-cluster
+  traffic. (On this repo, `walk_for_relations` has 1 caller but ranks #3 by betweenness.)
+- Exact **Brandes' algorithm** (O(V·E)) over the directed `calls` edge set; directed
+  scores are not halved. Reports raw betweenness, a size-normalized `(n-1)(n-2)` figure,
+  and `caller_count` side-by-side. Top `--limit` (default 15).
+- Test symbols are excluded from the graph entirely (endpoints **and** intermediate hops)
+  unless `--include-tests`, reusing the canonical `is_test_symbol` classifier rather than
+  a parallel SQL heuristic.
+- **CLI-only by design** — the model reaches it via Bash; no new MCP tool, keeping the
+  LLM-visible instructions budget and tool-routing surface unchanged. The algorithm core
+  lives in `src/graph/centrality.rs` (pure, unit-tested).
+
+### New: PR impact review GitHub Action
+
+- `.github/workflows/pr-impact-review.yml` posts a **sticky comment** on each PR with a
+  code-graph `affected` analysis: test files to re-run, the blast radius, and changed
+  **production files with no covering test** ("test gaps"). Productizes the already-shipped
+  `affected` command — no new graph logic.
+- Comment rendering + the gh sticky-upsert (find-by-marker → PATCH-or-POST) live in
+  `claude-plugin/scripts/pr-impact-comment.js`; the render path is pure and unit-tested
+  (`pr-impact-comment.test.js`, in the CI plugin-test set). Binary calls carry
+  `CODE_GRAPH_INTERNAL=1` so CI runs never inflate the deny→use conversion funnel.
+- **Opt-in merge gate**: repo variable `CODE_GRAPH_FAIL_ON_RISK=true` fails the job when a
+  changed production file has no test in its reverse-dependency closure (default: off).
+- Minimal permissions (`contents: read`, `pull-requests: write`); builds `--no-default-features`
+  (impact analysis needs no embeddings), reusing the pinned `1.95.0` toolchain + rust-cache.
+
 ## v0.52.0 — `tour`: dependency-ordered reading order
 
 New CLI command that answers "where do I start reading this repo?" deterministically.
