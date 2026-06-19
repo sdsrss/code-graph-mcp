@@ -74,7 +74,12 @@ CREATE TABLE IF NOT EXISTS edges (
     source_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     target_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     relation    TEXT NOT NULL,
-    metadata    TEXT
+    metadata    TEXT,
+    -- Resolution confidence (v17+): extracted | inferred | ambiguous. Assigned
+    -- by classify_edge_confidence after Phase 2 + the pending sweep. Defaults to
+    -- 'extracted' so the ~10 precise insert sites need no change; only cross-file
+    -- by-name calls/references get downgraded. See domain::CONF_* .
+    confidence  TEXT NOT NULL DEFAULT 'extracted'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));

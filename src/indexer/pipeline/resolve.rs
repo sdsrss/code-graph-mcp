@@ -314,6 +314,44 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
     Ok(removed)
 }
 
+/// Phase 2e: assign `edges.confidence` for cross-file `calls`/`references` edges
+/// in one set-based pass, run after all edges exist (post Phase-2 + pending sweep
+/// + prune). Purely additive metadata — no edge is added or removed.
+///
+/// The column defaults to `extracted`, so every precise insert (same-file
+/// resolution + the structural relations imports/inherits/implements/routes_to/
+/// exports) is correct without touching its insert site. This pass only
+/// DOWNGRADES cross-file `calls`/`references` edges — the by-name-resolved class:
+///   - `inferred`  when the target name is unique among same-language nodes;
+///   - `ambiguous` when >1 same-language node shares the target name (the
+///     by-name resolution could not pick uniquely — the known false-positive
+///     class: bare_name_call_qualifier / method_call_edge_drops /
+///     value_reference_candidate_gen).
+///
+/// Idempotent: re-running recomputes from current node state, so an `inferred`
+/// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
+/// back when it is removed). Returns the number of edges downgraded.
+pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
+    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES};
+    let downgraded = db.conn().execute(
+        "UPDATE edges
+         SET confidence = CASE WHEN namecount.cnt > 1 THEN ?3 ELSE ?4 END
+         FROM nodes AS src, nodes AS tgt, files AS tf,
+              (SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+               FROM nodes n JOIN files f ON f.id = n.file_id
+               GROUP BY n.name, f.language) AS namecount
+         WHERE edges.source_id = src.id
+           AND edges.target_id = tgt.id
+           AND tf.id = tgt.file_id
+           AND src.file_id <> tgt.file_id
+           AND edges.relation IN (?1, ?2)
+           AND namecount.nm = tgt.name
+           AND namecount.lang IS tf.language",
+        rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED],
+    )?;
+    Ok(downgraded)
+}
+
 /// Filter a candidate set down to those matching the Path qualifier:
 ///   (1) file path contains "/seg1/seg2/" OR starts with "seg1/seg2/", OR
 ///   (2) qualified_name contains the segment chain joined by `.` as a
@@ -502,5 +540,113 @@ mod tests {
         // Other relations also use metadata; resolver should skip non-call shapes.
         assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
         assert!(parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#)).is_none());
+    }
+
+    mod confidence {
+        use super::*;
+        use crate::domain::{REL_CALLS, REL_IMPORTS, REL_REFERENCES};
+        use crate::storage::db::Database;
+        use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
+        use tempfile::TempDir;
+
+        fn node(name: &str, file_id: i64) -> NodeRecord {
+            NodeRecord {
+                file_id, node_type: "function".into(), name: name.into(),
+                qualified_name: None, start_line: 1, end_line: 5,
+                code_content: format!("function {name}() {{}}"), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }
+        }
+        fn file(conn: &rusqlite::Connection, path: &str, lang: &str) -> i64 {
+            upsert_file(conn, &FileRecord {
+                path: path.into(), blake3_hash: format!("h-{path}"),
+                last_modified: 1, language: Some(lang.into()),
+            }).unwrap()
+        }
+        fn conf_of(conn: &rusqlite::Connection, s: i64, t: i64, rel: &str) -> String {
+            conn.query_row(
+                "SELECT confidence FROM edges WHERE source_id=?1 AND target_id=?2 AND relation=?3",
+                rusqlite::params![s, t, rel], |r| r.get(0),
+            ).unwrap()
+        }
+
+        /// Same-file → extracted; cross-file unique by-name → inferred;
+        /// cross-file with a same-language duplicate name → ambiguous; non-calls
+        /// relation (imports) stays extracted even cross-file; references behave
+        /// like calls.
+        #[test]
+        fn classify_splits_extracted_inferred_ambiguous() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let f1 = file(conn, "src/a.ts", "typescript");
+            let f2 = file(conn, "src/b.ts", "typescript");
+            let f3 = file(conn, "src/c.ts", "typescript");
+
+            // same-file call A->B
+            let a = insert_node(conn, &node("A", f1)).unwrap();
+            let b = insert_node(conn, &node("B", f1)).unwrap();
+            insert_edge(conn, a, b, REL_CALLS, None).unwrap();
+
+            // cross-file unique call C(f1)->D(f2)
+            let c = insert_node(conn, &node("C", f1)).unwrap();
+            let d = insert_node(conn, &node("D", f2)).unwrap();
+            insert_edge(conn, c, d, REL_CALLS, None).unwrap();
+
+            // cross-file ambiguous call E(f1)->F(f2), with a duplicate F in f3 (same lang)
+            let e = insert_node(conn, &node("E", f1)).unwrap();
+            let f_target = insert_node(conn, &node("F", f2)).unwrap();
+            insert_node(conn, &node("F", f3)).unwrap(); // duplicate same-language name
+            insert_edge(conn, e, f_target, REL_CALLS, None).unwrap();
+
+            // cross-file imports G(f1)->H(f2) — must stay extracted (structural)
+            let g = insert_node(conn, &node("G", f1)).unwrap();
+            let h = insert_node(conn, &node("H", f2)).unwrap();
+            insert_edge(conn, g, h, REL_IMPORTS, None).unwrap();
+
+            // cross-file unique references I(f1)->J(f2) — inferred like calls
+            let i = insert_node(conn, &node("I", f1)).unwrap();
+            let j = insert_node(conn, &node("J", f2)).unwrap();
+            insert_edge(conn, i, j, REL_REFERENCES, None).unwrap();
+
+            let downgraded = classify_edge_confidence(&db).unwrap();
+            assert_eq!(downgraded, 3, "3 cross-file calls/refs edges downgraded (C->D, E->F, I->J)");
+
+            assert_eq!(conf_of(conn, a, b, REL_CALLS), "extracted", "same-file call stays extracted");
+            assert_eq!(conf_of(conn, c, d, REL_CALLS), "inferred", "cross-file unique name → inferred");
+            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous", "cross-file duplicate name → ambiguous");
+            assert_eq!(conf_of(conn, g, h, REL_IMPORTS), "extracted", "imports stays extracted cross-file");
+            assert_eq!(conf_of(conn, i, j, REL_REFERENCES), "inferred", "cross-file unique reference → inferred");
+        }
+
+        /// Idempotency: removing the duplicate flips ambiguous→inferred on re-run;
+        /// re-running without change is stable.
+        #[test]
+        fn classify_is_idempotent_and_recomputes() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let f1 = file(conn, "src/a.ts", "typescript");
+            let f2 = file(conn, "src/b.ts", "typescript");
+            let f3 = file(conn, "src/c.ts", "typescript");
+
+            let e = insert_node(conn, &node("E", f1)).unwrap();
+            let f_target = insert_node(conn, &node("F", f2)).unwrap();
+            let dup = insert_node(conn, &node("F", f3)).unwrap();
+            insert_edge(conn, e, f_target, REL_CALLS, None).unwrap();
+
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous");
+            // re-run, no change → still ambiguous (stable)
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous");
+
+            // remove the duplicate node → name now unique → inferred on re-run
+            conn.execute("DELETE FROM nodes WHERE id=?1", [dup]).unwrap();
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "inferred",
+                "removing the duplicate must flip ambiguous→inferred");
+        }
     }
 }

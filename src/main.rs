@@ -281,6 +281,7 @@ fn print_help() {
     println!("    --ignore <prefix>   Exclude path prefix (dead-code; repeatable; default: claude-plugin/, benches/)");
     println!("    --no-ignore         Disable default --ignore prefixes (dead-code)");
     println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");
+    println!("    --min-confidence <t> Min edge confidence: extracted|inferred|ambiguous (refs; default: all)");
     println!("    --last N            Limit to last N sessions (stats; default: all)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");

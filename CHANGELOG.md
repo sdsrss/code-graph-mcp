@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.54.0 — edge confidence tiers
+
+Edges now carry a **resolution confidence** so consumers can tell precise edges
+from heuristic by-name guesses. **Schema migration** — `INDEX_VERSION 16→17`
+forces a one-time index rebuild on first run.
+
+### New: `edges.confidence` (extracted | inferred | ambiguous)
+
+- A single post-resolution classification pass (`classify_edge_confidence`,
+  Phase 2e) assigns confidence — **not** threaded through the ~10 insert sites.
+  Purely additive metadata: **no edge is added or removed**, no default behavior
+  change to `impact`/`dead-code`/`affected`.
+  - `extracted`: same-file resolution, or a structural relation (imports /
+    inherits / implements / routes_to / exports). Precise.
+  - `inferred`: a cross-file `calls`/`references` edge resolved by bare name,
+    target name unique among same-language nodes.
+  - `ambiguous`: cross-file by-name where >1 same-language node shares the name
+    — the class behind known false positives (bare-name calls, method-call drops,
+    value-reference flood).
+- The classification is idempotent and recomputed every index pass (an `inferred`
+  edge becomes `ambiguous` when a duplicate-named sibling is later added, and back).
+
+### `refs` exposes + filters by confidence
+
+- `code-graph-mcp refs <symbol>` annotates non-`extracted` refs (`~inferred` /
+  `~ambiguous`) and accepts `--min-confidence extracted|inferred|ambiguous` to
+  hide lower-confidence edges (default: show all). JSON gains a `confidence` field.
+- (MCP `find_references` output is unchanged in this release — CLI-first; a future
+  release may surface confidence on the published tool schema.)
+
 ## v0.53.0 — `centrality`: architectural chokepoints
 
 New CLI command that ranks functions by **betweenness centrality** over the call graph.

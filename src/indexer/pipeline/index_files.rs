@@ -47,7 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::resolve::{prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
+use super::resolve::{classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
@@ -1026,6 +1026,18 @@ pub(super) fn index_files(
         tracing::info!(
             "[index] Phase 2d: pruned {} import-contradicted call edges",
             contradicted
+        );
+    }
+
+    // Phase 2e: classify edge confidence. One set-based pass that downgrades
+    // cross-file by-name `calls`/`references` edges to inferred/ambiguous; every
+    // precise edge keeps the column default `extracted`. Purely additive metadata
+    // — no edge added or removed. Runs after 2c/2d so the final edge set is classified.
+    let downgraded = classify_edge_confidence(db)?;
+    if downgraded > 0 {
+        tracing::info!(
+            "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",
+            downgraded
         );
     }
 

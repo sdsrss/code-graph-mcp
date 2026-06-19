@@ -33,6 +33,9 @@ pub struct IncomingReference {
     pub file_path: String,
     pub start_line: i64,
     pub relation: String,
+    /// Edge resolution confidence (extracted | inferred | ambiguous) — see
+    /// domain::CONF_*. Lets `refs` surface and filter low-confidence by-name edges.
+    pub confidence: String,
 }
 
 // --- Edge CRUD ---
@@ -219,14 +222,14 @@ pub fn get_incoming_references(
     relation_filter: Option<&str>,
 ) -> Result<Vec<IncomingReference>> {
     let sql = if relation_filter.is_some() {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
          WHERE e.target_id = ?1 AND e.relation = ?2
          ORDER BY f.path, n.start_line"
     } else {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
@@ -250,6 +253,7 @@ fn map_incoming_ref(row: &rusqlite::Row) -> rusqlite::Result<IncomingReference> 
         file_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
         start_line: row.get(4)?,
         relation: row.get(5)?,
+        confidence: row.get(6)?,
     })
 }
 

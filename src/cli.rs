@@ -4128,6 +4128,11 @@ pub struct RefsArgs {
     /// Filter: calls, imports, inherits, implements, references, all
     #[arg(long)]
     pub relation: Option<String>,
+    // Validated in-handler (not a clap ValueEnum) so a bad value reports a clear
+    // tier error before symbol resolution, consistent with --relation.
+    /// Minimum edge confidence: extracted (precise), inferred, ambiguous (default: show all)
+    #[arg(long = "min-confidence")]
+    pub min_confidence: Option<String>,
     /// Compact output
     #[arg(long)]
     pub compact: bool,
@@ -4170,6 +4175,18 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             );
         }
     }
+    // Validate --min-confidence at entry (before index open), mirroring --relation,
+    // so a typo'd tier errors loudly instead of silently passing all rows.
+    let min_confidence: Option<&'static str> = match args.min_confidence.as_deref() {
+        None => None,
+        Some(c) => match crate::domain::normalize_confidence(c) {
+            Some(tier) => Some(tier),
+            None => anyhow::bail!(
+                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                c
+            ),
+        },
+    };
     let json_mode = args.json;
     let compact = args.compact;
     let node_id_arg: Option<i64> = args.node_id;
@@ -4197,7 +4214,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         let raw_symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
-                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements|references] [--compact] [--json]"
+                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements|references] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]"
             ))?;
         let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
         let file_path = explicit_file.or(resolved_file.as_deref());
@@ -4273,9 +4290,19 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
 
     let mut all_refs = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut conf_filtered = 0usize;
     for target_id in &target_ids {
         let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
         for r in refs {
+            // --min-confidence: drop refs below the requested tier (default: keep all).
+            if let Some(min) = min_confidence {
+                if crate::domain::confidence_rank(&r.confidence)
+                    < crate::domain::confidence_rank(min)
+                {
+                    conf_filtered += 1;
+                    continue;
+                }
+            }
             let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
             if seen.insert(key) {
                 all_refs.push(r);
@@ -4291,6 +4318,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                     "file_path": r.file_path,
                     "start_line": r.start_line,
                     "relation": r.relation,
+                    "confidence": r.confidence,
                     "node_id": r.node_id,
                 })
             } else {
@@ -4301,6 +4329,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                     "file_path": r.file_path,
                     "start_line": r.start_line,
                     "relation": r.relation,
+                    "confidence": r.confidence,
                 })
             }
         }).collect();
@@ -4318,17 +4347,25 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         let mut stdout = std::io::stdout().lock();
+        // Annotate only non-extracted edges so precise refs stay visually clean;
+        // inferred/ambiguous are the ones worth scrutiny (by-name cross-file).
+        let tag = |c: &str| -> String {
+            if c == crate::domain::CONF_EXTRACTED { String::new() } else { format!(" ~{c}") }
+        };
         if all_refs.is_empty() {
             writeln!(stdout, "No references found for '{}'.", symbol)?;
         } else {
             writeln!(stdout, "{} references to '{}':", all_refs.len(), symbol)?;
             for r in &all_refs {
                 if compact {
-                    writeln!(stdout, "  [{}] {} {}", r.relation, r.name, r.file_path)?;
+                    writeln!(stdout, "  [{}] {} {}{}", r.relation, r.name, r.file_path, tag(&r.confidence))?;
                 } else {
-                    writeln!(stdout, "  [{}] {} ({}:{})", r.relation, r.name, r.file_path, r.start_line)?;
+                    writeln!(stdout, "  [{}] {} ({}:{}){}", r.relation, r.name, r.file_path, r.start_line, tag(&r.confidence))?;
                 }
             }
+        }
+        if conf_filtered > 0 {
+            writeln!(stdout, "({} lower-confidence ref(s) hidden by --min-confidence)", conf_filtered)?;
         }
     }
 

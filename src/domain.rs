@@ -17,6 +17,46 @@ pub const REL_EXPORTS: &str = "exports";
 /// usage (`field: MyStruct`). Edgeless under calls/imports, so tracked separately.
 pub const REL_REFERENCES: &str = "references";
 
+// -- Edge confidence tiers (v17+) --
+// How an edge's target was resolved. Stored on `edges.confidence` and assigned
+// by a single post-resolution classification pass (classify_edge_confidence),
+// NOT threaded through the ~10 insert sites. Purely additive metadata: every
+// edge still exists; consumers may OPT IN to filtering via --min-confidence.
+//
+// - extracted: same-file resolution, or a structural relation (imports / inherits
+//   / implements / routes_to / exports) resolved by explicit path/parent. Precise.
+// - inferred:  a cross-file `calls`/`references` edge resolved by bare name where
+//   the target name is UNIQUE among same-language nodes. Likely correct.
+// - ambiguous: a cross-file `calls`/`references` edge whose target name has >1
+//   same-language definition — the by-name resolution could not pick uniquely.
+//   The class behind the known false-positive flood (bare_name_call_qualifier,
+//   method_call_edge_drops, value_reference_candidate_gen).
+pub const CONF_EXTRACTED: &str = "extracted";
+pub const CONF_INFERRED: &str = "inferred";
+pub const CONF_AMBIGUOUS: &str = "ambiguous";
+
+/// Rank a confidence tier high→low (extracted=2, inferred=1, ambiguous=0).
+/// Unknown strings rank 0 so a corrupt/legacy value is treated as lowest, never
+/// silently passing a `--min-confidence extracted` filter.
+pub fn confidence_rank(c: &str) -> u8 {
+    match c {
+        CONF_EXTRACTED => 2,
+        CONF_INFERRED => 1,
+        _ => 0,
+    }
+}
+
+/// Parse a user-supplied `--min-confidence` value to its canonical tier string,
+/// or None if unrecognized (caller should error loudly, not silently pass-all).
+pub fn normalize_confidence(input: &str) -> Option<&'static str> {
+    match input.to_lowercase().as_str() {
+        "extracted" | "exact" | "high" => Some(CONF_EXTRACTED),
+        "inferred" | "medium" | "med" => Some(CONF_INFERRED),
+        "ambiguous" | "low" | "all" => Some(CONF_AMBIGUOUS),
+        _ => None,
+    }
+}
+
 // -- Index version --
 // Bump this when parser/indexer logic changes in a way that produces different
 // nodes or edges for the same source files. The server will detect a mismatch
@@ -25,7 +65,7 @@ pub const REL_REFERENCES: &str = "references";
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 16;
+pub const INDEX_VERSION: i32 = 17;
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
