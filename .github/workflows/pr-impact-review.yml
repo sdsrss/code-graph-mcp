@@ -1,0 +1,66 @@
+name: PR Impact Review
+
+# Posts a sticky comment on each PR with a code-graph `affected` analysis:
+# which test files to re-run, the blast radius, and changed production files
+# with no covering test. Read-only analysis — productizes the already-shipped
+# `affected` command; introduces no new graph logic.
+#
+# Opt-in merge gate: set repo variable CODE_GRAPH_FAIL_ON_RISK=true to fail the
+# job when a changed production file has no test in its reverse-dependency
+# closure (default: off — comment only).
+
+on:
+  pull_request:
+    branches: [main]
+
+# Minimal permissions: read the code, write the PR comment. No other scope.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact:
+    name: Impact analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          # Full history so the PR base SHA is present for the diff.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      # Pinned toolchain for reproducibility (memory: feedback_ship_baseline_and_flakes).
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-impact
+
+      # Impact analysis needs only the AST graph, not embeddings — build without
+      # the Candle ML stack for a much faster, lighter job.
+      - name: Build (no-embed)
+        run: cargo build --release --no-default-features
+
+      - name: Index repository
+        run: ./target/release/code-graph-mcp incremental-index --quiet
+
+      - name: Compute changed files
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD > changed.txt
+          echo "Changed files:"; cat changed.txt
+
+      - name: Post impact review comment
+        env:
+          _CG_REVIEW_BINARY: ./target/release/code-graph-mcp
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CODE_GRAPH_FAIL_ON_RISK: ${{ vars.CODE_GRAPH_FAIL_ON_RISK }}
+        run: node claude-plugin/scripts/pr-impact-comment.js changed.txt

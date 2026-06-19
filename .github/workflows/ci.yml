@@ -81,7 +81,9 @@ jobs:
         # several tests need target/release/code-graph-mcp — its gate is
         # pre-commit, which runs it whenever claude-plugin/ or scripts/ JS is
         # staged (it went stale for 3 months when neither gate ran it).
-        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
+        # pr-impact-comment.test.js added in v0.53.0; vetted locally — node-only,
+        # stub binary via _CG_REVIEW_BINARY shim, tmpdir fixtures, no cargo build.
+        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
   # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero
