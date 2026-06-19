@@ -1033,12 +1033,22 @@ pub(super) fn index_files(
     // cross-file by-name `calls`/`references` edges to inferred/ambiguous; every
     // precise edge keeps the column default `extracted`. Purely additive metadata
     // — no edge added or removed. Runs after 2c/2d so the final edge set is classified.
-    let downgraded = classify_edge_confidence(db)?;
-    if downgraded > 0 {
-        tracing::info!(
-            "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",
-            downgraded
-        );
+    //
+    // Gate (L2): the UPDATE is a full-graph GROUP-BY over nodes + join over edges.
+    // When this pass indexed nothing and deleted nothing, no node/edge changed, so
+    // the duplicate-counts are identical and reclassification is a guaranteed no-op
+    // — skip it to keep no-change invocations (e.g. query-time freshness checks
+    // where the file hash matched) off the full scan. When anything DID change it
+    // must still run globally: adding/removing a duplicate-named node in one file
+    // flips the ambiguity of cross-file edges in OTHER unchanged files.
+    if !all_indexed.is_empty() || !delete_paths.is_empty() {
+        let downgraded = classify_edge_confidence(db)?;
+        if downgraded > 0 {
+            tracing::info!(
+                "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",
+                downgraded
+            );
+        }
     }
 
     // Optimize query planner statistics after bulk writes

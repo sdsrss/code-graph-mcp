@@ -4288,8 +4288,14 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all", other),
     };
 
-    let mut all_refs = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
+    // Dedup key is (name, file_path, relation) — it does NOT include the target,
+    // so two edges from the same source to DIFFERENT same-name targets collapse to
+    // one row. When their confidence differs, show the LOWEST (most conservative)
+    // tier: the displayed confidence must not understate a hidden sibling's
+    // ambiguity (L1 — surfacing low confidence is the whole point of the feature).
+    let mut seen: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
     let mut conf_filtered = 0usize;
     for target_id in &target_ids {
         let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
@@ -4304,8 +4310,19 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 }
             }
             let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-            if seen.insert(key) {
-                all_refs.push(r);
+            match seen.get(&key) {
+                Some(&idx) => {
+                    // Keep the worst-case (lowest) confidence among deduped siblings.
+                    if crate::domain::confidence_rank(&r.confidence)
+                        < crate::domain::confidence_rank(&all_refs[idx].confidence)
+                    {
+                        all_refs[idx].confidence = r.confidence;
+                    }
+                }
+                None => {
+                    seen.insert(key, all_refs.len());
+                    all_refs.push(r);
+                }
             }
         }
     }

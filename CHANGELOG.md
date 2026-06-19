@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.54.1 — edge confidence polish (post-review follow-ups)
+
+Two non-blocking items from the v0.54.0 integration review. No schema change,
+no `INDEX_VERSION` bump.
+
+- **fix(cli)**: `refs` dedup keeps the **lowest** confidence among collapsed
+  siblings. The dedup key is `(name, file_path, relation)` — two edges from one
+  source to different same-name targets collapse to one row; the displayed
+  confidence now shows the most conservative tier instead of an arbitrary
+  first-wins value, so it can't understate a hidden sibling's ambiguity.
+- **perf(indexer)**: Phase 2e (`classify_edge_confidence`) is now skipped when an
+  index pass indexed and deleted nothing — the full-graph classification UPDATE
+  was a guaranteed no-op there (e.g. query-time freshness checks where the file
+  hash matched). It still runs globally whenever anything changed, since a
+  duplicate-named node added/removed in one file flips cross-file edge ambiguity.
+
 ## v0.54.0 — edge confidence tiers
 
 Edges now carry a **resolution confidence** so consumers can tell precise edges
