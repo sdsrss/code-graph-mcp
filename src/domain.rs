@@ -29,6 +29,8 @@ pub const LIVE_MCP_TOOLS: &[&str] = &[
     "ast_search",
     "find_references",
     "invariance_check",
+    "list_skills",
+    "get_skill",
 ];
 
 // -- Relation types --

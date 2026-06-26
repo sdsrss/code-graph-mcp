@@ -145,6 +145,9 @@ const ORACLE: &[(&str, &str)] = &[
     ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
     // invariance_check
     ("Is the invariance tower healthy? Check all gates.", "invariance_check"),
+    // list_skills / get_skill
+    ("What skills are available in this code-graph instance?", "list_skills"),
+    ("Show me the invariance-tower skill documentation", "get_skill"),
 ];
 
 /// Frontend (JS/TS/Vue/React) phrasing of the same 7 tool intents. Activated
@@ -185,6 +188,9 @@ const FRONTEND_ORACLE: &[(&str, &str)] = &[
     ("Display the implementation of getAuthHeaders", "get_ast_node"),
     // invariance_check
     ("Run the invariance health check across all projects", "invariance_check"),
+    // list_skills / get_skill
+    ("List all the skill modules this server provides", "list_skills"),
+    ("Load the cross-spoke-audit skill reference", "get_skill"),
 ];
 
 /// System prompt for trigger-rate mode. Unlike `SYSTEM_PROMPT` it does NOT

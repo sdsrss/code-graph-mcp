@@ -15,7 +15,7 @@ use serde_json::json;
 /// are still callable via tools/call but hidden from tools/list to save tokens.
 /// Legacy alias `read_snippet → get_ast_node` remains callable for backward
 /// compatibility (it was always a same-shape rename, never a hidden tool).
-pub const TOOL_COUNT: usize = 8;
+pub const TOOL_COUNT: usize = 10;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -162,6 +162,25 @@ impl ToolRegistry {
                     }
                 }),
             },
+            ToolDefinition {
+                name: "list_skills".into(),
+                description: "List available skills (name + description). Skills are read from disk at runtime — never stale.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "get_skill".into(),
+                description: "Read a skill's full content by name. Returns SKILL.md with paths, interpretation guides, and verification commands.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name (from list_skills). Example: 'invariance-tower'." }
+                    },
+                    "required": ["name"]
+                }),
+            },
         ];
 
         debug_assert_eq!(tools.len(), TOOL_COUNT,
@@ -195,6 +214,7 @@ mod tests {
             "module_overview",
             "ast_search", "find_references",
             "invariance_check",
+            "list_skills", "get_skill",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }
