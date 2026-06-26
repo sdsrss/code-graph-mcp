@@ -1,5 +1,6 @@
 mod helpers;
 mod tools;
+pub mod registry;
 
 use helpers::*;
 
@@ -255,6 +256,9 @@ pub struct McpServer {
     pub(super) is_primary: bool,
     /// Held lock file handle — on Unix, flock is released when this is dropped.
     _index_lock: Option<std::fs::File>,
+    /// Multi-project registry. When Some, tool calls with a `project` param are
+    /// routed to the corresponding project server. None in single-project mode.
+    pub(crate) project_registry: Option<registry::ProjectRegistry>,
 }
 
 impl McpServer {
@@ -363,6 +367,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary,
             _index_lock: index_lock,
+            project_registry: None,
         })
     }
 
@@ -443,6 +448,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary: true,
             _index_lock: None,
+            project_registry: None,
         }
     }
 
@@ -468,6 +474,7 @@ impl McpServer {
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
             is_primary: true,
             _index_lock: None,
+            project_registry: None,
         }
     }
 
@@ -1600,6 +1607,30 @@ impl McpServer {
     }
 
     fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // list_projects: return registry summary (or empty stub in single-project mode)
+        if name == "list_projects" {
+            return match &self.project_registry {
+                Some(reg) => Ok(reg.list_projects_json()),
+                None => Ok(json!({
+                    "projects": [],
+                    "note": "Single-project mode. Set CODE_GRAPH_PROJECTS=alias=/path to enable multi-project routing."
+                })),
+            };
+        }
+
+        // Multi-project routing: if a project alias is given, delegate to that server.
+        // Strip the `project` key before delegating so the target doesn't recurse.
+        if let Some(alias) = args["project"].as_str() {
+            if let Some(registry) = &self.project_registry {
+                let target = registry.get(Some(alias))?;
+                let mut routed_args = args.clone();
+                if let Some(obj) = routed_args.as_object_mut() {
+                    obj.remove("project");
+                }
+                return target.handle_tool(name, &routed_args);
+            }
+        }
+
         let start = std::time::Instant::now();
         let result = match name {
             "semantic_code_search" => self.tool_semantic_search(args),
@@ -1633,6 +1664,14 @@ impl McpServer {
         // Handlers with custom compression (semantic_search, call_graph, http_chain, ast_node)
         // already return results with a "mode" key when compressed — those are left unchanged.
         result.map(centralized_compress)
+    }
+
+    /// Attach a multi-project registry to this server.
+    ///
+    /// Once attached, tool calls that include a `project` parameter are routed
+    /// to the corresponding project server in the registry.
+    pub fn attach_registry(&mut self, registry: registry::ProjectRegistry) {
+        self.project_registry = Some(registry);
     }
 
 }

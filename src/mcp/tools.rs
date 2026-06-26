@@ -41,7 +41,8 @@ impl ToolRegistry {
                         "limit": { "type": "number", "description": "Alias for top_k" },
                         "language": { "type": "string", "description": "Filter by language" },
                         "node_type": { "type": "string", "description": "Filter by node type" },
-                        "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     },
                     "required": ["query"]
                 }),
@@ -59,7 +60,8 @@ impl ToolRegistry {
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
                         "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
-                        "include_tests": { "type": "boolean", "description": "Include test callers (default false)" }
+                        "include_tests": { "type": "boolean", "description": "Include test callers (default false)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     }
                 }),
             },
@@ -78,7 +80,8 @@ impl ToolRegistry {
                         "include_similar": { "type": "boolean", "description": "Include embedding-similar nodes (default false; requires embed-model + indexed embeddings)" },
                         "similar_top_k": { "type": "number", "description": "With include_similar: max similar results (default 5)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },
-                        "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     },
                     "required": []
                 }),
@@ -89,7 +92,8 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     },
                     "required": []
                 }),
@@ -106,7 +110,8 @@ impl ToolRegistry {
                         "deps_direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "With include_deps: direction filter (default 'both')" },
                         "deps_depth": { "type": "number", "description": "With include_deps: max transitive depth (default 2)" },
                         "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered. Results are candidates to verify: receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked, so a flagged symbol may still be used." },
-                        "dead_min_lines": { "type": "number", "description": "With include_dead: min line count to flag (default 3)" }
+                        "dead_min_lines": { "type": "number", "description": "With include_dead: min line count to flag (default 3)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     },
                     "required": ["path"]
                 }),
@@ -121,7 +126,8 @@ impl ToolRegistry {
                         "type": { "type": "string", "description": "Node type: fn, class, struct, enum, interface, type, const, var, module" },
                         "returns": { "type": "string", "description": "Return type substring filter" },
                         "params": { "type": "string", "description": "Parameter text substring filter" },
-                        "limit": { "type": "number", "description": "Max results (default 20)" }
+                        "limit": { "type": "number", "description": "Max results (default 20)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     },
                     "required": []
                 }),
@@ -137,7 +143,8 @@ impl ToolRegistry {
                         "file_path": { "type": "string", "description": "Disambiguate same-name symbols across files" },
                         "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "references", "all"], "description": "Relation type filter (default 'all')" },
                         "include_tests": { "type": "boolean", "description": "Include references from test code (default true — tests are usage sites for rename audits). Set false to see production callers only." },
-                        "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" },
+                        "project": { "type": "string", "description": "Project alias (from CODE_GRAPH_PROJECTS). Omit for default project." }
                     }
                 }),
             },

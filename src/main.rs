@@ -395,7 +395,14 @@ fn run_serve() -> Result<()> {
     // no embedding model, no `.code-graph/`, no NOISY instructions. Otherwise the
     // plugin half-activates in throwaway dirs (the ~2035 headless /tmp `claude -p`
     // calls). CODE_GRAPH_FORCE_PLUGIN_MCP=1 overrides, same as the launcher.
-    let force_plugin = std::env::var("CODE_GRAPH_FORCE_PLUGIN_MCP").ok().as_deref() == Some("1");
+    // Multi-project mode: CODE_GRAPH_PROJECTS=alias1=/path1:alias2=/path2
+    // When set, bypass the cwd guard (explicit config implies intent) and route
+    // tool calls by the `project` parameter instead of using cwd.
+    let multi_project_registry =
+        code_graph_mcp::mcp::server::registry::ProjectRegistry::from_env()?;
+
+    let force_plugin = std::env::var("CODE_GRAPH_FORCE_PLUGIN_MCP").ok().as_deref() == Some("1")
+        || multi_project_registry.is_some();
     let cwd = std::env::current_dir()?;
     if !force_plugin && code_graph_mcp::cli::is_non_project_cwd(&cwd) {
         eprintln!(
@@ -408,18 +415,44 @@ fn run_serve() -> Result<()> {
         return Ok(());
     }
 
-    let project_root = code_graph_mcp::cli::resolve_project_root()?;
-    let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
-    let session_start = std::time::Instant::now();
-
-    tracing::info!("[session] Started v{}, project: {}", env!("CARGO_PKG_VERSION"), project_root.display());
-
-    // Shared stdout handle: prevents interleaved JSON when background threads
-    // send notifications concurrently with the main loop writing responses.
+    // In multi-project mode, the registry already holds a McpServer per project
+    // (each with its own DB, index lock, watcher). We take ownership of the
+    // default project's server as the "outer" server that runs the stdio loop,
+    // and attach the full registry for tool-call routing. This avoids the
+    // double-initialization bug where a second from_project_root() for the same
+    // path would lose the flock → become secondary → ensure_indexed() no-ops.
+    // Shared stdout — used by both the serve loop and notification writers.
     let stdout_shared = Arc::new(Mutex::new(io::stdout()));
 
-    // Enable MCP progress/log notifications via the same shared handle
-    server.set_notify_writer(Box::new(SharedStdout(Arc::clone(&stdout_shared))));
+    let (server, session_start, project_display) = if let Some(mut registry) = multi_project_registry {
+        let default_root = registry.default_root().to_path_buf();
+        let display = default_root.display().to_string();
+        let start = std::time::Instant::now();
+
+        // Wire stdout notifications to ALL registry servers (fixes silent
+        // progress drops on delegated projects).
+        let stdout_clone = Arc::clone(&stdout_shared);
+        registry.set_notify_writers(move || Box::new(SharedStdout(Arc::clone(&stdout_clone))));
+
+        // Take the default project's server out of the registry and use it as
+        // the outer server. The registry (now missing one entry for the default)
+        // is attached so tool calls with explicit `project` param still route.
+        // Calls without `project` go to the outer server directly — which IS the
+        // default project's primary server, holding the flock.
+        let mut srv = registry.take_default()?;
+        srv.set_notify_writer(Box::new(SharedStdout(Arc::clone(&stdout_shared))));
+        srv.attach_registry(registry);
+        (srv, start, display)
+    } else {
+        let project_root = code_graph_mcp::cli::resolve_project_root()?;
+        let srv = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
+        let display = project_root.display().to_string();
+        let start = std::time::Instant::now();
+        srv.set_notify_writer(Box::new(SharedStdout(Arc::clone(&stdout_shared))));
+        (srv, start, display)
+    };
+
+    tracing::info!("[session] Started v{}, project: {}", env!("CARGO_PKG_VERSION"), project_display);
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
