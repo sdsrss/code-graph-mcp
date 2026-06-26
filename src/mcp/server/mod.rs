@@ -1623,6 +1623,14 @@ impl McpServer {
             return self.tool_invariance_check(args);
         }
 
+        // list_skills / get_skill: runtime skill directory (read from disk, never compiled in)
+        if name == "list_skills" {
+            return self.tool_list_skills();
+        }
+        if name == "get_skill" {
+            return self.tool_get_skill(args);
+        }
+
         // Multi-project routing: if a project alias is given, delegate to that server.
         // Strip the `project` key before delegating so the target doesn't recurse.
         if let Some(alias) = args["project"].as_str() {
@@ -1669,6 +1677,107 @@ impl McpServer {
         // Handlers with custom compression (semantic_search, call_graph, http_chain, ast_node)
         // already return results with a "mode" key when compressed — those are left unchanged.
         result.map(centralized_compress)
+    }
+
+    /// Resolve the skills/ directory — sits at <repo>/skills/ relative to the binary
+    /// (binary is at <repo>/target/release/code-graph-mcp).
+    fn skills_dir(&self) -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .and_then(|bin_dir| bin_dir.parent().and_then(|p| p.parent()).map(|r| r.to_path_buf()))
+            .map(|repo| repo.join("skills"))
+            .unwrap_or_else(|| PathBuf::from("skills"))
+    }
+
+    /// Parse YAML frontmatter from a SKILL.md: `---\nname: ...\ndescription: ...\n---`
+    fn parse_skill_frontmatter(content: &str) -> (Option<String>, Option<String>) {
+        let trimmed = content.trim_start();
+        if !trimmed.starts_with("---") {
+            return (None, None);
+        }
+        let after_first = &trimmed[3..];
+        let end = after_first.find("\n---");
+        let yaml_block = match end {
+            Some(pos) => &after_first[..pos],
+            None => return (None, None),
+        };
+        let mut name = None;
+        let mut desc = None;
+        for line in yaml_block.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("name:") {
+                name = Some(val.trim().trim_matches('"').to_string());
+            }
+            if let Some(val) = line.strip_prefix("description:") {
+                desc = Some(val.trim().trim_matches('"').to_string());
+            }
+        }
+        (name, desc)
+    }
+
+    /// List all skills from the skills/ directory (names + descriptions).
+    fn tool_list_skills(&self) -> Result<serde_json::Value> {
+        let dir = self.skills_dir();
+        if !dir.exists() {
+            return Ok(json!({
+                "skills": [],
+                "note": format!("Skills directory not found at {}. Skills are read from disk at runtime.", dir.display()),
+            }));
+        }
+        let mut skills = vec![];
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() { continue; }
+            let skill_md = entry.path().join("SKILL.md");
+            if !skill_md.exists() { continue; }
+            let content = std::fs::read_to_string(&skill_md).unwrap_or_default();
+            let (name, desc) = Self::parse_skill_frontmatter(&content);
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            skills.push(json!({
+                "name": name.unwrap_or_else(|| dir_name.clone()),
+                "description": desc.unwrap_or_else(|| "(no description)".to_string()),
+                "path": skill_md.display().to_string(),
+            }));
+        }
+        skills.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(json!({ "skills": skills }))
+    }
+
+    /// Read a skill's SKILL.md content by name.
+    fn tool_get_skill(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let name = args.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("'name' parameter required for get_skill"))?;
+        let dir = self.skills_dir();
+        let skill_md = dir.join(name).join("SKILL.md");
+        if !skill_md.exists() {
+            // Try case-insensitive match
+            let found = std::fs::read_dir(&dir).ok().and_then(|entries| {
+                entries.filter_map(|e| e.ok()).find(|e| {
+                    e.file_name().to_string_lossy().eq_ignore_ascii_case(name)
+                        && e.path().join("SKILL.md").exists()
+                })
+            });
+            match found {
+                Some(entry) => {
+                    let content = std::fs::read_to_string(entry.path().join("SKILL.md"))?;
+                    return Ok(json!({ "name": name, "content": content }));
+                }
+                None => {
+                    let available: Vec<String> = std::fs::read_dir(&dir)
+                        .ok()
+                        .map(|entries| entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().join("SKILL.md").exists())
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect())
+                        .unwrap_or_default();
+                    anyhow::bail!("Skill '{}' not found. Available: {}", name, available.join(", "));
+                }
+            }
+        }
+        let content = std::fs::read_to_string(&skill_md)?;
+        Ok(json!({ "name": name, "content": content }))
     }
 
     /// Unified invariance toolkit: audit type locations + ratchet cross-references.

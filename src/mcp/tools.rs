@@ -150,7 +150,7 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "invariance_check".into(),
-                description: "Cross-spoke invariance verification: type existence audit + SDK/litellm/proxy/test ratchets. Compact output — only gaps and failures.".into(),
+                description: "Cross-spoke invariance verification: type audit + SDK/litellm/proxy/test ratchets. Compact output. Use get_skill('invariance-tower') for full context.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
