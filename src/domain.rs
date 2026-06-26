@@ -28,6 +28,7 @@ pub const LIVE_MCP_TOOLS: &[&str] = &[
     "module_overview",
     "ast_search",
     "find_references",
+    "invariance_check",
 ];
 
 // -- Relation types --

@@ -143,6 +143,8 @@ const ORACLE: &[(&str, &str)] = &[
     // query asserts the rename-audit phrasing still hits find_references
     // — the intent we want to preserve through the tightening.
     ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
+    // invariance_check
+    ("Is the invariance tower healthy? Check all gates.", "invariance_check"),
 ];
 
 /// Frontend (JS/TS/Vue/React) phrasing of the same 7 tool intents. Activated
@@ -181,6 +183,8 @@ const FRONTEND_ORACLE: &[(&str, &str)] = &[
     ("Show me the LoginForm component definition", "get_ast_node"),
     ("What's the signature of the useAuth hook?", "get_ast_node"),
     ("Display the implementation of getAuthHeaders", "get_ast_node"),
+    // invariance_check
+    ("Run the invariance health check across all projects", "invariance_check"),
 ];
 
 /// System prompt for trigger-rate mode. Unlike `SYSTEM_PROMPT` it does NOT

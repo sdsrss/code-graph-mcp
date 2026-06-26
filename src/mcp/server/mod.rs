@@ -1618,6 +1618,11 @@ impl McpServer {
             };
         }
 
+        // invariance_check: unified invariance toolkit (audit + ratchets with compact output)
+        if name == "invariance_check" {
+            return self.tool_invariance_check(args);
+        }
+
         // Multi-project routing: if a project alias is given, delegate to that server.
         // Strip the `project` key before delegating so the target doesn't recurse.
         if let Some(alias) = args["project"].as_str() {
@@ -1664,6 +1669,198 @@ impl McpServer {
         // Handlers with custom compression (semantic_search, call_graph, http_chain, ast_node)
         // already return results with a "mode" key when compressed — those are left unchanged.
         result.map(centralized_compress)
+    }
+
+    /// Unified invariance toolkit: audit type locations + ratchet cross-references.
+    /// Output is compact (model-context friendly) — only failures/gaps, not full inventories.
+    fn tool_invariance_check(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        use std::process::Command;
+
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+
+        // Resolve paths
+        let binary_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_default();
+        let repo_root = binary_dir.parent().and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let audit_script = repo_root.join("scripts/cgm-invariant-audit");
+        let cli_ops = std::env::var("CLI_OPS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join("Projects/cli-ops"))
+                    .unwrap_or_default()
+            });
+        let ratchet_dir = cli_ops.join("refs/api-references");
+
+        match action {
+            // ── status: compact dashboard, ~15 lines ──
+            "status" => {
+                let mut gates = vec![];
+
+                // Gate 1: cgm-invariant-audit
+                if audit_script.exists() {
+                    let out = Command::new(&audit_script).output();
+                    match out {
+                        Ok(o) => {
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            let pass = stdout.matches("✅").count();
+                            let fail = stdout.matches("❌").count();
+                            let warn = stdout.matches("⚠️").count();
+                            gates.push(json!({
+                                "gate": "type_audit",
+                                "status": if fail == 0 { "✅" } else { "❌" },
+                                "pass": pass, "fail": fail, "warn": warn,
+                            }));
+                        }
+                        Err(e) => gates.push(json!({
+                            "gate": "type_audit", "status": "⚠️", "error": e.to_string()
+                        })),
+                    }
+                }
+
+                // Gate 2-5: ratchet reports (read existing .md files, count gaps)
+                for (name, file) in [
+                    ("sdk_types", "sdk-type-coverage.md"),
+                    ("litellm_params", "litellm-transform-ratchet.md"),
+                    ("proxy_models", "proxy-model-coverage.md"),
+                    ("test_titles", "test-title-coverage.md"),
+                ] {
+                    let path = ratchet_dir.join(file);
+                    if path.exists() {
+                        let content = std::fs::read_to_string(&path).unwrap_or_default();
+                        let gaps = content.lines()
+                            .filter(|l| l.starts_with("- ❌") || l.contains("MISSING") || l.contains("DRIFTED"))
+                            .count();
+                        let covered = content.lines().filter(|l| l.starts_with("- ✅")).count();
+                        gates.push(json!({
+                            "gate": name,
+                            "status": if gaps == 0 { "✅" } else { "⚠️" },
+                            "covered": covered, "gaps": gaps,
+                            "report": file,
+                        }));
+                    } else {
+                        gates.push(json!({
+                            "gate": name, "status": "⚠️",
+                            "note": format!("{} not generated. Run: make -C refs/api-references ratchets", file),
+                        }));
+                    }
+                }
+
+                Ok(json!({ "action": "status", "gates": gates }))
+            }
+
+            // ── audit: only failures (suppress ✅ lines) ──
+            "audit" => {
+                if !audit_script.exists() {
+                    anyhow::bail!("cgm-invariant-audit not found at {}", audit_script.display());
+                }
+                let mut cmd = Command::new(&audit_script);
+                if let Some(layer) = args.get("layer").and_then(|v| v.as_str()) {
+                    cmd.args(["--layer", layer]);
+                }
+                let out = cmd.output()
+                    .map_err(|e| anyhow::anyhow!("Failed to run audit: {}", e))?;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+
+                // Filter to only non-✅ lines + section headers
+                let failures: Vec<&str> = stdout.lines()
+                    .filter(|l| !l.contains("✅") || l.starts_with("==="))
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+
+                let total = stdout.matches("✅").count() + stdout.matches("❌").count() + stdout.matches("⚠️").count();
+                let pass = stdout.matches("✅").count();
+                let fail = stdout.matches("❌").count();
+
+                Ok(json!({
+                    "action": "audit",
+                    "summary": format!("{}/{} ✅", pass, total),
+                    "failures": if failures.is_empty() { None } else { Some(failures) },
+                    "all_green": fail == 0,
+                }))
+            }
+
+            // ── ratchet: one or all, gaps only ──
+            "ratchet" => {
+                let name = args.get("name").and_then(|v| v.as_str());
+                let ratchets: Vec<(&str, &str)> = match name {
+                    Some("sdk-types") => vec![("sdk_types", "sdk-type-coverage.md")],
+                    Some("litellm-params") => vec![("litellm_params", "litellm-transform-ratchet.md")],
+                    Some("proxy-models") => vec![("proxy_models", "proxy-model-coverage.md")],
+                    Some("test-titles") => vec![("test_titles", "test-title-coverage.md")],
+                    Some(other) => anyhow::bail!(
+                        "Unknown ratchet '{}'. Valid: sdk-types, litellm-params, proxy-models, test-titles", other
+                    ),
+                    None => vec![
+                        ("sdk_types", "sdk-type-coverage.md"),
+                        ("litellm_params", "litellm-transform-ratchet.md"),
+                        ("proxy_models", "proxy-model-coverage.md"),
+                        ("test_titles", "test-title-coverage.md"),
+                    ],
+                };
+
+                let top_n = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let mut results = vec![];
+
+                for (rname, file) in ratchets {
+                    let path = ratchet_dir.join(file);
+                    if !path.exists() {
+                        results.push(json!({
+                            "ratchet": rname,
+                            "error": format!("Not generated. Run: make -C {} ratchets", ratchet_dir.display()),
+                        }));
+                        continue;
+                    }
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+                    // Extract gap lines (❌ or "MISSING" or "DRIFTED")
+                    let gap_lines: Vec<&str> = content.lines()
+                        .filter(|l| l.starts_with("- ❌") || l.starts_with("- `") && l.contains("not in settings"))
+                        .collect();
+                    let covered_count = content.lines().filter(|l| l.starts_with("- ✅") || l.starts_with("- `") && l.contains(" → ")).count();
+
+                    let top_gaps: Vec<&str> = gap_lines.iter().take(top_n).copied().collect();
+
+                    results.push(json!({
+                        "ratchet": rname,
+                        "covered": covered_count,
+                        "gaps": gap_lines.len(),
+                        "top_gaps": top_gaps,
+                        "truncated": gap_lines.len() > top_n,
+                    }));
+                }
+
+                Ok(json!({ "action": "ratchet", "results": results }))
+            }
+
+            // ── drift: compare audit against previous snapshot ──
+            "drift" => {
+                if !audit_script.exists() {
+                    anyhow::bail!("cgm-invariant-audit not found at {}", audit_script.display());
+                }
+                let out = Command::new(&audit_script)
+                    .arg("--drift")
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("Failed to run audit --drift: {}", e))?;
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+                Ok(json!({
+                    "action": "drift",
+                    "output": stdout.trim(),
+                    "has_drift": !out.status.success(),
+                    "error": if stderr.is_empty() { None } else { Some(stderr.trim().to_string()) },
+                }))
+            }
+
+            _ => anyhow::bail!(
+                "Unknown action '{}'. Valid: status, audit, ratchet, drift", action
+            ),
+        }
     }
 
     /// Attach a multi-project registry to this server.

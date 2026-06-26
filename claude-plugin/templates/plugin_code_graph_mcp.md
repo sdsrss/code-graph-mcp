@@ -68,6 +68,7 @@ type: reference
 | "项目结构总览" | `project_map` / `map` | 起手势用 `--compact` |
 | "X 文件依赖谁？" / "Y 模块下的死代码" | `module_overview path=Y include_deps=true` / `include_dead=true` | 文件路径走 deps；目录/文件走 dead |
 | HTTP 路由 → handler 链 | `get_call_graph route_path="GET /api/x"` | 取代 trace_http_chain |
+| "不变量塔健康吗？" | `invariance_check action=status` | 5 gate dashboard；`action=audit` 验类型位置；`action=ratchet name=sdk-types` 查 SDK 间隙 |
 
 ### 旧名兼容 + CLI 速查（v0.18.4 fold 后）
 

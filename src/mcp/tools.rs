@@ -15,7 +15,7 @@ use serde_json::json;
 /// are still callable via tools/call but hidden from tools/list to save tokens.
 /// Legacy alias `read_snippet → get_ast_node` remains callable for backward
 /// compatibility (it was always a same-shape rename, never a hidden tool).
-pub const TOOL_COUNT: usize = 7;
+pub const TOOL_COUNT: usize = 8;
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
@@ -148,6 +148,19 @@ impl ToolRegistry {
                     }
                 }),
             },
+            ToolDefinition {
+                name: "invariance_check".into(),
+                description: "Cross-spoke invariance verification: type existence audit + SDK/litellm/proxy/test ratchets. Compact output — only gaps and failures.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["status", "audit", "ratchet", "drift"], "description": "status: dashboard (5 gates, pass/fail). audit: verify 22 invariant types exist at expected paths. ratchet: cross-ref gaps against SDK/litellm/proxy sources. drift: compare audit against previous snapshot. Default: status." },
+                        "layer": { "type": "string", "enum": ["wire", "harness", "settings"], "description": "Scope audit to one invariance layer (only for action=audit)." },
+                        "name": { "type": "string", "enum": ["sdk-types", "litellm-params", "proxy-models", "test-titles"], "description": "Run one specific ratchet (only for action=ratchet). Omit for all four." },
+                        "top": { "type": "number", "description": "Max gap entries to return per ratchet (default 5, only for action=ratchet)." }
+                    }
+                }),
+            },
         ];
 
         debug_assert_eq!(tools.len(), TOOL_COUNT,
@@ -180,6 +193,7 @@ mod tests {
             "get_ast_node", "project_map",
             "module_overview",
             "ast_search", "find_references",
+            "invariance_check",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }
