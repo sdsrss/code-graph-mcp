@@ -303,4 +303,116 @@ mod tests {
         assert_eq!(strip_outer_generic("&[T]"), None);
         assert_eq!(strip_outer_generic(""), None);
     }
+
+    #[test]
+    fn normalize_tool_path_relative_passthrough() {
+        let root = std::path::Path::new("/projects/my-app");
+        assert_eq!(normalize_tool_path("src/main.rs", Some(root)).unwrap(), "src/main.rs");
+        assert_eq!(normalize_tool_path("./src/main.rs", Some(root)).unwrap(), "src/main.rs");
+        assert_eq!(normalize_tool_path(".", Some(root)).unwrap(), "");
+    }
+
+    #[test]
+    fn normalize_tool_path_absolute_under_root() {
+        let root = std::path::Path::new("/projects/my-app");
+        assert_eq!(
+            normalize_tool_path("/projects/my-app/src/main.rs", Some(root)).unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            normalize_tool_path("/projects/my-app/packages/core/", Some(root)).unwrap(),
+            "packages/core"
+        );
+        // Root itself → empty (whole project)
+        assert_eq!(
+            normalize_tool_path("/projects/my-app", Some(root)).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn normalize_tool_path_absolute_outside_root() {
+        let root = std::path::Path::new("/projects/my-app");
+        assert!(normalize_tool_path("/etc/passwd", Some(root)).is_err());
+        assert!(normalize_tool_path("/projects/other-app/src", Some(root)).is_err());
+    }
+
+    #[test]
+    fn normalize_tool_path_no_root() {
+        // Without a project root, absolute paths are rejected
+        assert!(normalize_tool_path("/some/absolute/path", None).is_err());
+        // Relative paths still pass through
+        assert_eq!(normalize_tool_path("src/main.rs", None).unwrap(), "src/main.rs");
+    }
+}
+
+/// Normalize a tool path argument: resolve absolute paths to project-relative,
+/// strip leading `./`, normalize `.` to `""` (whole project).
+///
+/// This enables MCP callers (IDEs, agents) to pass absolute disk paths like
+/// `/Users/dev/Projects/apex-ontap/packages/core/src/tools/ripGrep.ts` and have
+/// them resolve correctly against the indexed project root. Without this, the
+/// MCP server would reject the path with "must be relative to the project root".
+///
+/// # Behavior
+/// - `"src/main.rs"` → `"src/main.rs"` (relative passthrough)
+/// - `"./src/main.rs"` → `"src/main.rs"` (strip leading `./`)
+/// - `"."` → `""` (whole project)
+/// - `"/projects/my-app/src/main.rs"` with root `/projects/my-app` → `"src/main.rs"`
+/// - `"/etc/passwd"` → error (outside project root)
+/// - Trailing slashes are stripped from the result.
+pub(super) fn normalize_tool_path(raw: &str, project_root: Option<&std::path::Path>) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("path must not be empty — use '.' to scan the whole project root"));
+    }
+
+    // Handle absolute paths
+    let p = std::path::Path::new(trimmed);
+    if p.is_absolute() {
+        let root = project_root.ok_or_else(|| {
+            anyhow!(
+                "absolute path '{}' cannot be resolved — project root is not set. \
+                 Use a relative path instead.",
+                trimmed
+            )
+        })?;
+
+        // Try lexical strip_prefix first (fast, no syscall)
+        if let Ok(rel) = p.strip_prefix(root) {
+            let s = rel.to_string_lossy().into_owned();
+            let s = s.trim_end_matches('/').to_string();
+            return Ok(s);
+        }
+
+        // Fallback: canonicalize both sides (resolves symlinks)
+        if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), root.canonicalize()) {
+            if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
+                let s = rel.to_string_lossy().into_owned();
+                let s = s.trim_end_matches('/').to_string();
+                return Ok(s);
+            }
+        }
+
+        return Err(anyhow!(
+            "path '{}' is outside the indexed project root '{}'. \
+             Only paths under the project root can be queried.",
+            trimmed,
+            root.display()
+        ));
+    }
+
+    // Reject traversal attempts
+    if trimmed.starts_with("../") || trimmed.contains("/../") {
+        return Err(anyhow!(
+            "path '{}' escapes the project root via '..' — not allowed",
+            trimmed
+        ));
+    }
+
+    // Normalize relative paths
+    let path = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let path = if path == "." { "" } else { path };
+    let path = path.trim_end_matches('/');
+    Ok(path.to_string())
 }

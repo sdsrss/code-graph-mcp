@@ -11,9 +11,13 @@ impl McpServer {
         // Treat empty/whitespace-only as absent — empty string used to fall
         // through to fuzzy-resolve and silently match a random unique candidate.
         let symbol_name_arg = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
-        // Empty file_path => no filter (treat like missing). Otherwise we'd
-        // get "Symbol 'x' not found in file ''" which is a useless error.
-        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
+        // Normalize file_path: resolve absolute paths under project root → relative.
+        // Empty file_path => no filter (treat like missing).
+        let file_path_normalized = args["file_path"].as_str()
+            .filter(|s| !s.is_empty())
+            .map(|fp| super::super::helpers::normalize_tool_path(fp, self.project_root.as_deref()))
+            .transpose()?;
+        let file_path = file_path_normalized.as_deref();
         let relation = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
         // Default true preserves the "every usage site" contract for rename audits

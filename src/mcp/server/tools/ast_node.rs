@@ -7,12 +7,19 @@ use super::super::*;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Normalize file_path early: resolve absolute paths under project root → relative.
+        // Needed before ensure_file_fresh_opt, which uses the normalized path.
+        let file_path_normalized = args["file_path"].as_str()
+            .map(|fp| super::super::helpers::normalize_tool_path(fp, self.project_root.as_deref()))
+            .transpose()?;
+        let file_path = file_path_normalized.as_deref();
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             // Edit-aware refresh fires only on the file_path branch — node_id
             // lookups have no path to refresh against, and node_id stability
             // across reindex isn't guaranteed.
-            self.ensure_file_fresh_opt(args["file_path"].as_str())?;
+            self.ensure_file_fresh_opt(file_path)?;
         }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
@@ -38,7 +45,6 @@ impl McpServer {
         // Empty/whitespace-only symbol_name behaves like absent — prevents
         // "Symbol '' not found" and accidental fuzzy hits on the only candidate.
         let symbol_name = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
-        let file_path = args["file_path"].as_str();
 
         // If only symbol_name provided (no file_path), resolve by name lookup
         if let (Some(sym), None) = (symbol_name, file_path) {

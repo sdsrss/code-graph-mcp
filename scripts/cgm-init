@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# cgm-init — Initialize code-graph-mcp index for a project.
+#
+# Usage:
+#   cgm-init [path]           Index + hydrate embeddings for <path> (default: cwd)
+#   cgm-init --status [path]  Show index status without modifying
+#   cgm-init --rebuild [path] Drop and rebuild index from scratch
+#
+# Examples:
+#   cgm-init ~/Projects/apex-ontap
+#   cgm-init --rebuild .
+#   cgm-init --status /Users/dev/Projects/xli
+#
+# What it does:
+#   1. Resolves the project root (git root detection)
+#   2. Creates .code-graph/ directory
+#   3. Runs full AST index (tree-sitter parse → SQLite)
+#   4. Hydrates semantic embeddings (ONNX model, ~384-dim vectors)
+#   5. Reports index stats
+#
+# The binary is resolved from:
+#   1. $CODE_GRAPH_MCP env var
+#   2. code-graph-mcp on $PATH
+#   3. Cargo build in this repo (if run from source tree)
+
+set -euo pipefail
+
+# --- Resolve binary ---
+resolve_binary() {
+    if [[ -n "${CODE_GRAPH_MCP:-}" ]] && [[ -x "$CODE_GRAPH_MCP" ]]; then
+        echo "$CODE_GRAPH_MCP"
+        return
+    fi
+
+    if command -v code-graph-mcp &>/dev/null; then
+        command -v code-graph-mcp
+        return
+    fi
+
+    # If running from the source tree, try cargo
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local repo_root="${script_dir%/scripts}"
+    if [[ -f "$repo_root/Cargo.toml" ]]; then
+        local release_bin="$repo_root/target/release/code-graph-mcp"
+        if [[ -x "$release_bin" ]]; then
+            echo "$release_bin"
+            return
+        fi
+        echo >&2 "[cgm-init] Building code-graph-mcp from source..."
+        (cd "$repo_root" && cargo build --release --no-default-features 2>&1 | tail -3) >&2
+        if [[ -x "$release_bin" ]]; then
+            echo "$release_bin"
+            return
+        fi
+    fi
+
+    echo >&2 "[cgm-init] ERROR: Cannot find code-graph-mcp binary."
+    echo >&2 "  Set CODE_GRAPH_MCP=/path/to/binary or add it to PATH."
+    exit 1
+}
+
+# --- Parse args ---
+MODE="init"
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --status)  MODE="status"; shift ;;
+        --rebuild) MODE="rebuild"; shift ;;
+        --help|-h)
+            sed -n '2,/^$/s/^# //p' "$0"
+            exit 0
+            ;;
+        *)
+            TARGET="$1"; shift ;;
+    esac
+done
+
+# --- Resolve target directory ---
+if [[ -z "$TARGET" ]]; then
+    TARGET="$(pwd)"
+fi
+
+# Resolve to absolute
+TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || {
+    echo >&2 "[cgm-init] ERROR: Directory not found: $TARGET"
+    exit 1
+}
+
+CGM="$(resolve_binary)"
+echo "[cgm-init] Binary: $CGM"
+echo "[cgm-init] Project: $TARGET"
+
+# --- Execute ---
+case "$MODE" in
+    status)
+        echo "[cgm-init] Checking index status..."
+        (cd "$TARGET" && "$CGM" health-check)
+        ;;
+
+    rebuild)
+        echo "[cgm-init] Rebuilding index from scratch..."
+        (cd "$TARGET" && "$CGM" rebuild-index --confirm)
+        echo ""
+        echo "[cgm-init] Index rebuilt. Running health check..."
+        (cd "$TARGET" && "$CGM" health-check)
+        ;;
+
+    init)
+        # Check if already indexed
+        if [[ -f "$TARGET/.code-graph/index.db" ]]; then
+            echo "[cgm-init] Index already exists at $TARGET/.code-graph/index.db"
+            DB_SIZE=$(du -h "$TARGET/.code-graph/index.db" | cut -f1)
+            echo "[cgm-init] DB size: $DB_SIZE"
+            echo ""
+            read -rp "[cgm-init] Re-index? (y/N) " confirm
+            if [[ "$confirm" != [yY] ]]; then
+                echo "[cgm-init] Skipped. Use --rebuild to force."
+                (cd "$TARGET" && "$CGM" health-check)
+                exit 0
+            fi
+        fi
+
+        echo "[cgm-init] Starting full index..."
+        echo ""
+
+        # Time the full index
+        START_TIME=$(date +%s)
+        (cd "$TARGET" && "$CGM" rebuild-index --confirm)
+        END_TIME=$(date +%s)
+        ELAPSED=$((END_TIME - START_TIME))
+
+        echo ""
+        echo "[cgm-init] ✅ Index complete in ${ELAPSED}s"
+
+        # Show stats
+        if [[ -f "$TARGET/.code-graph/index.db" ]]; then
+            DB_SIZE=$(du -h "$TARGET/.code-graph/index.db" | cut -f1)
+            echo "[cgm-init] DB size: $DB_SIZE"
+        fi
+
+        echo ""
+        echo "[cgm-init] Health check:"
+        (cd "$TARGET" && "$CGM" health-check)
+
+        echo ""
+        echo "[cgm-init] Ready. Configure your MCP client:"
+        echo ""
+        echo "  # In .apex/settings.json, .claude/settings.json, etc:"
+        echo "  \"mcpServers\": {"
+        echo "    \"code-graph\": {"
+        echo "      \"command\": \"$CGM\","
+        echo "      \"cwd\": \"$TARGET\""
+        echo "    }"
+        echo "  }"
+        ;;
+esac

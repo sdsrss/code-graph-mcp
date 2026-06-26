@@ -84,10 +84,13 @@ impl McpServer {
             ));
         }
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
-        // Empty file_path is identical to absent — without this the
-        // disambiguation/fuzzy path treats Some("") as "filter by this exact
-        // path" and silently returns no edges.
-        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
+        // Normalize file_path: resolve absolute paths under project root → relative.
+        // Empty file_path is identical to absent.
+        let file_path_normalized = args["file_path"].as_str()
+            .filter(|s| !s.is_empty())
+            .map(|fp| super::super::helpers::normalize_tool_path(fp, self.project_root.as_deref()))
+            .transpose()?;
+        let file_path = file_path_normalized.as_deref();
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
 

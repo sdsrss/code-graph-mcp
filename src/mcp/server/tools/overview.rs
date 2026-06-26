@@ -25,36 +25,16 @@ impl McpServer {
 
         let raw_path = args["path"].as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
-        // Reject empty-string path explicitly: it normalizes to the "match all"
-        // prefix the same way "." does, but is almost always a variable-substitution
-        // bug at the call site (env var unset, optional chain returned ""). Surface
-        // it instead of silently dumping the whole project as if path:"." was passed.
-        if raw_path.is_empty() {
-            return Err(anyhow!(
-                "path must not be empty — use '.' to scan the whole project root"
-            ));
-        }
-        // Reject paths that obviously aim outside the project root. The index
-        // stores file paths relative to project_root, so '/etc', '../foo', or
-        // 'C:\Windows' will never match anything — but currently they silently
-        // return `0 files` with a generic warning. An upfront error is clearer
-        // and matches the lesson from #259 (validate at parse time).
-        if raw_path.starts_with('/')
-            || raw_path.starts_with("../")
-            || raw_path.contains("/../")
-            || (raw_path.len() >= 2 && raw_path.as_bytes()[1] == b':')
-        {
-            return Err(anyhow!(
-                "path '{}' must be relative to the project root (no leading '/' or '../', no absolute paths)",
-                raw_path
-            ));
-        }
+        // Normalize: absolute paths under project root → relative, "./" stripped,
+        // "." → "" (whole project). Rejects paths outside root and empty strings.
+        let path = super::super::helpers::normalize_tool_path(
+            raw_path,
+            self.project_root.as_deref(),
+        )?;
+        let path = path.as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_deps = args["include_deps"].as_bool().unwrap_or(false);
         let include_dead = args["include_dead"].as_bool().unwrap_or(false);
-        // Normalize: strip leading "./" and treat "." as empty prefix (match all)
-        let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
-        let path = if path == "." { "" } else { path };
 
         // Edit-aware refresh: when `path` names a single file (not a directory)
         // and the agent just edited it, sync-reindex before answering. Cache

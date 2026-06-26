@@ -23,7 +23,7 @@
 use anyhow::Result;
 use super::lang_config::LanguageConfig;
 use super::node_text;
-use crate::domain::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_IMPLEMENTS, MAX_RELATION_DEPTH};
+use crate::domain::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_IMPLEMENTS, REL_REFERENCES, MAX_RELATION_DEPTH};
 
 mod helpers;
 mod imports;
@@ -37,6 +37,7 @@ mod go;
 mod java;
 mod dart;
 mod cpp;
+mod decorators;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
 /// Bare → None (matches non-Rust callers and old DB rows).
@@ -66,6 +67,7 @@ use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
+use decorators::extract_ts_decorator;
 use python::{extract_python_type_reference, extract_python_value_reference};
 use go::{extract_go_type_reference, extract_go_value_reference};
 use cpp::extract_cpp_value_reference;
@@ -419,6 +421,53 @@ fn walk_for_relations(
         if let Some(r) = extract_js_value_reference(&node, source, active_scope) {
             results.push(r);
         }
+    }
+
+    // Additive TS/JS/TSX pass: emit `references` edges for DECORATOR usages.
+    // `@Tool({...})`, `@Injectable()`, `@Route('GET', '/api')` etc. Tree-sitter
+    // parses these as `decorator` nodes containing a `call_expression` (or bare
+    // `identifier`). The extractor emits a references edge from the decorated
+    // symbol to the decorator name, making decorators visible to find_references,
+    // dead-code analysis, and the call graph.
+    if matches!(config.name, "javascript" | "typescript" | "tsx") && kind == "decorator" {
+        results.extend(extract_ts_decorator(&node, source, active_scope));
+    }
+
+    // Additive TS/TSX pass: emit a `references` edge for type parameter
+    // constraints (`T extends Foo` → edge to `Foo`). Tree-sitter-typescript
+    // wraps the bound in a `constraint` node inside `type_parameter`:
+    //   type_parameter → constraint → type_identifier "Foo"
+    // We walk the constraint's children for `type_identifier` nodes and emit
+    // references edges to them. This closes the gap where
+    // `function stream<T extends ProviderAdapter>(...)` had no edge to
+    // `ProviderAdapter`.
+    if matches!(language, "typescript" | "tsx") && kind == "constraint" {
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                if child.kind() == "type_identifier" {
+                    let name = node_text(&child, source);
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: active_scope.unwrap_or("<module>").to_string(),
+                            target_name: name.to_string(),
+                            relation: REL_REFERENCES.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Additive Python pass: emit a `references` edge for a type-annotation usage.
+    // `@Tool(...)`, `@Route('GET', '/api')`, `@Injectable()` etc. produce a
+    // tree-sitter `decorator` node. We extract the decorator name (bare or
+    // dotted) as a references edge target, making decorators visible in
+    // find_references, dead-code analysis, and call graphs.
+    if matches!(config.name, "javascript" | "typescript" | "tsx") && kind == "decorator" {
+        let rels = extract_ts_decorator(&node, source, active_scope);
+        results.extend(rels);
     }
 
     // Additive Python pass: emit a `references` edge for a type-annotation usage.
