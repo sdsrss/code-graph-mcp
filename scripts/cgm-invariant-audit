@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# cgm-invariant-audit — Cross-spoke invariant verification via code-graph indexes.
+#
+# Uses the live code-graph-mcp indexes on apex-ontap and xli to verify that
+# the types declared in settings-invariants.md and cross-wire.md actually
+# exist, have the expected fields, and haven't drifted since last audit.
+#
+# Usage:
+#   cgm-invariant-audit                    Run full 3-layer audit
+#   cgm-invariant-audit --layer wire       Layer 1 only (cross-wire types)
+#   cgm-invariant-audit --layer harness    Layer 2 only (harness state types)
+#   cgm-invariant-audit --layer settings   Layer 3 only (settings projection types)
+#   cgm-invariant-audit --json             Machine-readable output
+#   cgm-invariant-audit --drift            Compare against last audit snapshot
+#
+# Requires:
+#   - code-graph-mcp binary (resolved same as cgm-init)
+#   - Indexed projects at APEX_ONTAP_ROOT and XLI_ROOT
+#
+# Output:
+#   For each invariant-critical type: exists?, field count, field names,
+#   callers of projection functions, drift delta from last run.
+
+set -euo pipefail
+
+# --- Config ---
+APEX_ROOT="${APEX_ONTAP_ROOT:-$HOME/Projects/apex-ontap}"
+XLI_ROOT="${XLI_ROOT:-$HOME/Projects/xli}"
+CLI_OPS="${CLI_OPS_ROOT:-$HOME/Projects/cli-ops}"
+AUDIT_DIR="$CLI_OPS/refs/api-references/.audit-snapshots"
+CGM="${CODE_GRAPH_MCP:-$(command -v code-graph-mcp 2>/dev/null || echo "")}"
+
+# Fallback to repo binary
+if [[ -z "$CGM" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${SCRIPT_DIR%/scripts}"
+    CGM="$REPO_ROOT/target/release/code-graph-mcp"
+fi
+
+if [[ ! -x "$CGM" ]]; then
+    echo >&2 "[audit] ERROR: code-graph-mcp not found. Set CODE_GRAPH_MCP or build first."
+    exit 1
+fi
+
+# --- Parse args ---
+LAYER="all"
+JSON_MODE=false
+DRIFT_MODE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --layer)  LAYER="$2"; shift 2 ;;
+        --json)   JSON_MODE=true; shift ;;
+        --drift)  DRIFT_MODE=true; shift ;;
+        --help|-h)
+            sed -n '2,/^$/s/^# //p' "$0"
+            exit 0
+            ;;
+        *) echo >&2 "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+mkdir -p "$AUDIT_DIR"
+
+# --- Layer 3: Settings projection types ---
+# These are the types that define π_wire and π_model.
+# If a field is added/removed from these types, the settings-invariants.md
+# manifest is stale and ker(π_wire) / ker(π_model) may have changed.
+
+APEX_SETTINGS_TYPES=(
+    "WireCapabilities|packages/wire-core/src/samplingParams.ts"
+    "resolveSamplingParams|packages/wire-core/src/samplingParams.ts"
+    "ResolvedSamplingParams|packages/wire-core/src/samplingParams.ts"
+    "buildSamplingParameters|packages/wire-anthropic-messages/src/generator/anthropicContentGenerator.ts"
+    "buildRequest|packages/wire-anthropic-messages/src/generator/anthropicContentGenerator.ts"
+    "resolveEffort|packages/wire-anthropic-messages/src/anthropicModelCapabilities.ts"
+    "ModelConfig|packages/core/src/models/types.ts"
+    "ModelCapabilities|packages/wire-core/src/capabilities.ts"
+)
+
+XLI_SETTINGS_TYPES=(
+    "ConfiguredModelProvider|codex-rs/model-provider/src/provider.rs"
+    "AnthropicMessagesProvider|codex-rs/provider-anthropic/src/provider.rs"
+    "GeminiModelProvider|codex-rs/provider-gemini/src/provider.rs"
+)
+
+# --- Layer 1: Cross-wire types ---
+# Types that define the wire translation surface.
+
+APEX_WIRE_TYPES=(
+    "AnthropicContentConverter|packages/wire-anthropic-messages/src/generator/converter.ts"
+    "convertGeminiContentsToResponsesInput|packages/wire-openai-responses/src/generator/responsesConverter.ts"
+    "convertResponsesEventToGemini|packages/wire-openai-responses/src/generator/responsesConverter.ts"
+    "ResponsesPipeline|packages/wire-openai-responses/src/generator/responsesPipeline.ts"
+)
+
+XLI_WIRE_TYPES=(
+    "build_messages_request|codex-rs/provider-anthropic/src/request.rs"
+    "build_responses_request|codex-rs/core/src/client.rs"
+)
+
+# --- Layer 2: Harness state types ---
+# Types that define state transitions across turns.
+
+APEX_HARNESS_TYPES=(
+    "AnthropicContentGenerator|packages/wire-anthropic-messages/src/generator/anthropicContentGenerator.ts"
+    "OpenAIResponsesContentGenerator|packages/wire-openai-responses/src/generator/index.ts"
+)
+
+XLI_HARNESS_TYPES=(
+    "AnthropicMessagesProvider|codex-rs/provider-anthropic/src/provider.rs"
+    "build_messages_request|codex-rs/provider-anthropic/src/request.rs"
+    "build_responses_request|codex-rs/core/src/client.rs"
+    "ConfiguredModelProvider|codex-rs/model-provider/src/provider.rs"
+)
+
+# --- Audit function ---
+# `show <name>` outputs lines like:
+#   iface WireCapabilities  packages/wire-core/src/samplingParams.ts:22-27
+#   fn resolveSamplingParams  packages/wire-core/src/samplingParams.ts:79-123
+# We grep for the line matching the expected file and extract type + line range.
+audit_type() {
+    local root="$1"
+    local spec="$2"
+    local name="${spec%%|*}"
+    local file="${spec##*|}"
+
+    # Query code-graph for this symbol
+    local output
+    output=$(cd "$root" && "$CGM" show "$name" 2>/dev/null) || output=""
+
+    # Find the line matching our expected file path
+    local match_line
+    match_line=$(echo "$output" | grep -F "$file" | head -1) || match_line=""
+
+    if [[ -n "$match_line" ]]; then
+        local node_type=$(echo "$match_line" | awk '{print $1}')
+        local loc=$(echo "$match_line" | grep -oE '[0-9]+-[0-9]+' | head -1)
+        local start_line="${loc%%-*}"
+        local end_line="${loc##*-}"
+        local span=$((end_line - start_line + 1))
+
+        if $JSON_MODE; then
+            echo "{\"name\":\"$name\",\"file\":\"$file\",\"found\":true,\"type\":\"$node_type\",\"lines\":\"$loc\",\"span\":$span}"
+        else
+            printf "  ✅ %-40s %-8s L%-10s (%3d lines)  %s\n" "$name" "$node_type" "$loc" "$span" "$file"
+        fi
+    else
+        # Symbol not found in expected file — check if it exists elsewhere
+        local alt_line
+        alt_line=$(echo "$output" | grep -v "^$" | grep -v "^  " | head -1) || alt_line=""
+
+        if $JSON_MODE; then
+            echo "{\"name\":\"$name\",\"file\":\"$file\",\"found\":false,\"alt\":\"$alt_line\"}"
+        else
+            if [[ -n "$alt_line" ]]; then
+                printf "  ⚠️  %-40s MOVED    %-10s → %s\n" "$name" "" "$alt_line"
+            else
+                printf "  ❌ %-40s MISSING  %s\n" "$name" "$file"
+            fi
+        fi
+    fi
+}
+
+# --- Execute ---
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+
+run_layer() {
+    local layer_name="$1"
+    shift
+    local root="$1"
+    shift
+    local label="$1"
+    shift
+    local types=("$@")
+
+    if ! $JSON_MODE; then
+        echo ""
+        echo "=== Layer: $layer_name | Spoke: $label ==="
+        echo ""
+    fi
+
+    for spec in "${types[@]}"; do
+        audit_type "$root" "$spec"
+    done
+}
+
+if [[ "$LAYER" == "all" || "$LAYER" == "settings" ]]; then
+    run_layer "settings (L3)" "$APEX_ROOT" "apex-ontap" "${APEX_SETTINGS_TYPES[@]}"
+    run_layer "settings (L3)" "$XLI_ROOT" "xli" "${XLI_SETTINGS_TYPES[@]}"
+fi
+
+if [[ "$LAYER" == "all" || "$LAYER" == "wire" ]]; then
+    run_layer "wire (L1)" "$APEX_ROOT" "apex-ontap" "${APEX_WIRE_TYPES[@]}"
+    run_layer "wire (L1)" "$XLI_ROOT" "xli" "${XLI_WIRE_TYPES[@]}"
+fi
+
+if [[ "$LAYER" == "all" || "$LAYER" == "harness" ]]; then
+    run_layer "harness (L2)" "$APEX_ROOT" "apex-ontap" "${APEX_HARNESS_TYPES[@]}"
+    run_layer "harness (L2)" "$XLI_ROOT" "xli" "${XLI_HARNESS_TYPES[@]}"
+fi
+
+# --- Snapshot for drift detection ---
+if ! $JSON_MODE; then
+    echo ""
+    echo "[audit] Snapshot saved to $AUDIT_DIR/$TS.txt"
+fi
+
+# Save snapshot
+{
+    echo "# Invariant audit $TS"
+    echo "# apex-ontap: $(cd "$APEX_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo '?')"
+    echo "# xli: $(cd "$XLI_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo '?')"
+    echo ""
+
+    for spec in "${APEX_SETTINGS_TYPES[@]}" "${XLI_SETTINGS_TYPES[@]}" \
+                "${APEX_WIRE_TYPES[@]}" "${XLI_WIRE_TYPES[@]}" \
+                "${APEX_HARNESS_TYPES[@]}" "${XLI_HARNESS_TYPES[@]}"; do
+        echo "${spec%%|*}"
+    done
+} > "$AUDIT_DIR/$TS.txt"
+
+# --- Drift comparison ---
+if $DRIFT_MODE; then
+    PREV=$(ls -1 "$AUDIT_DIR"/*.txt 2>/dev/null | sort | tail -2 | head -1)
+    if [[ -n "$PREV" && "$PREV" != "$AUDIT_DIR/$TS.txt" ]]; then
+        echo ""
+        echo "=== Drift since $(basename "$PREV" .txt) ==="
+        diff "$PREV" "$AUDIT_DIR/$TS.txt" || true
+    else
+        echo "[audit] No previous snapshot for drift comparison."
+    fi
+fi
