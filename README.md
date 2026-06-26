@@ -396,6 +396,38 @@ cargo check
 cargo bench --no-default-features
 ```
 
+## Invariance Tower (cli-ops integration)
+
+code-graph-mcp's `invariance_check` MCP tool is the verification layer for
+the 3-layer invariance tower documented in `~/Projects/cli-ops/refs/api-references/`.
+
+The skill that explains the full contract is reachable from any agent via:
+
+```
+get_skill(name="invariance-tower")
+```
+
+### Sync model
+
+- **code-graph-mcp owns:** the `invariance_check` MCP tool, the
+  `cgm-invariant-audit` shell script (in `scripts/`), the audit-snapshot
+  format, the skill text (in `skills/`).
+- **cli-ops owns:** the 3-layer invariance docs (`cross-wire.md`,
+  `harness-invariants*.md`, `settings-invariants.md`), the ratchet
+  generator scripts (`refs/api-references/scripts/gen-*-ratchet.py`),
+  the `make verify` pipeline, the audit-snapshot directory.
+- **`CLI_OPS_DIR` env var:** `invariance_check` reads this to find
+  cli-ops. Defaults to `$HOME/Projects/cli-ops`.
+- **The skill IS the documented contract.** When either repo evolves,
+  update the skill — changes are picked up immediately (read from disk
+  at runtime, never compiled in).
+
+### For other agents (Cursor, Codex, apex harness)
+
+Any agent that wires code-graph-mcp into its MCP config can reach the
+invariance tower via `tools/list` (`list_skills`, `get_skill`,
+`invariance_check`). No Claude-plugin-specific setup required.
+
 ## License
 
 See [LICENSE](LICENSE) for details.
