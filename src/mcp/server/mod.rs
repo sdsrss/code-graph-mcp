@@ -1895,6 +1895,19 @@ impl McpServer {
 
             // ── ratchet: one or all, gaps only ──
             "ratchet" => {
+                // refresh=true → regenerate reports before reading (runs make ratchets)
+                if args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if ratchet_dir.exists() {
+                        let out = Command::new("make")
+                            .arg("ratchets")
+                            .current_dir(&ratchet_dir)
+                            .output();
+                        if let Err(e) = &out {
+                            tracing::warn!("make ratchets failed: {}", e);
+                        }
+                    }
+                }
+
                 let name = args.get("name").and_then(|v| v.as_str());
                 let ratchets: Vec<(&str, &str)> = match name {
                     Some("sdk-types") => vec![("sdk_types", "sdk-type-coverage.md")],
@@ -1924,13 +1937,31 @@ impl McpServer {
                         }));
                         continue;
                     }
+
+                    // Report age so agents know freshness
+                    let age = std::fs::metadata(&path).ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| {
+                            let secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs() - d.as_secs();
+                            if secs < 60 { format!("{}s ago", secs) }
+                            else if secs < 3600 { format!("{}m ago", secs / 60) }
+                            else if secs < 86400 { format!("{}h ago", secs / 3600) }
+                            else { format!("{}d ago", secs / 86400) }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
 
                     // Extract gap lines (❌ or "MISSING" or "DRIFTED")
                     let gap_lines: Vec<&str> = content.lines()
-                        .filter(|l| l.starts_with("- ❌") || l.starts_with("- `") && l.contains("not in settings"))
+                        .filter(|l| l.starts_with("- ❌") || (l.starts_with("- `") && l.contains("not in settings")))
                         .collect();
-                    let covered_count = content.lines().filter(|l| l.starts_with("- ✅") || l.starts_with("- `") && l.contains(" → ")).count();
+                    let covered_count = content.lines()
+                        .filter(|l| l.starts_with("- ✅") || (l.starts_with("- `") && l.contains(" → ")))
+                        .count();
 
                     let top_gaps: Vec<&str> = gap_lines.iter().take(top_n).copied().collect();
 
@@ -1938,6 +1969,7 @@ impl McpServer {
                         "ratchet": rname,
                         "covered": covered_count,
                         "gaps": gap_lines.len(),
+                        "age": age,
                         "top_gaps": top_gaps,
                         "truncated": gap_lines.len() > top_n,
                     }));

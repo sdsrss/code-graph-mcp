@@ -154,10 +154,11 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["status", "audit", "ratchet", "drift"], "description": "status: dashboard (5 gates, pass/fail). audit: verify 22 invariant types exist at expected paths. ratchet: cross-ref gaps against SDK/litellm/proxy sources. drift: compare audit against previous snapshot. Default: status." },
+                        "action": { "type": "string", "enum": ["status", "audit", "ratchet", "drift"], "description": "status: read existing reports (fast). audit: LIVE — runs cgm-invariant-audit script against code-graph indexes. ratchet: read ratchet reports (add refresh=true to regenerate first). drift: LIVE — runs audit and compares against previous snapshot. Default: status." },
                         "layer": { "type": "string", "enum": ["wire", "harness", "settings"], "description": "Scope audit to one invariance layer (only for action=audit)." },
                         "name": { "type": "string", "enum": ["sdk-types", "litellm-params", "proxy-models", "test-titles"], "description": "Run one specific ratchet (only for action=ratchet). Omit for all four." },
-                        "top": { "type": "number", "description": "Max gap entries to return per ratchet (default 5, only for action=ratchet)." }
+                        "top": { "type": "number", "description": "Max gap entries to return per ratchet (default 5, only for action=ratchet)." },
+                        "refresh": { "type": "boolean", "description": "Regenerate ratchet reports before reading (runs make ratchets, ~10s). Only for action=ratchet. Default: false." }
                     }
                 }),
             },
