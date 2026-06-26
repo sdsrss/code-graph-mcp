@@ -150,3 +150,10 @@ make -C ~/Projects/cli-ops/refs/api-references ratchets
 | cross-wire.md | `~/Projects/cli-ops/refs/api-references/cross-wire.md` |
 | harness-invariants.md | `~/Projects/cli-ops/refs/api-references/harness-invariants-curated.md` |
 | Design doc | `~/Projects/code-graph-mcp/docs/INVARIANCE-TOOLKIT-DESIGN.md` |
+
+## Known issues
+
+- **sdk_types gate** reports `covered=0 gaps=0` despite report having 175 types — status aggregator counts `✅`/`❌` markers but SDK report uses different markers. Tracked: cli-ops sortie-15.
+- **proxy_models gate** reports 29 false-positive gaps — alias forms that apex's `canonicalizeModelId.ts` handles. Tracked: cli-ops sortie-16.
+- **litellm_params gate** doesn't distinguish wire-internal params (stream, tools) from settings-candidate params (cache_control, speed). Tracked: cli-ops sortie-17.
+- **Settings manifest generator** (§8 follow-on from settings-invariants.md) — auto-detect field adds/removes in both spokes. Tracked: cli-ops sortie-19.
