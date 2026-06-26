@@ -1819,14 +1819,21 @@ impl McpServer {
                             let pass = stdout.matches("✅").count();
                             let fail = stdout.matches("❌").count();
                             let warn = stdout.matches("⚠️").count();
-                            gates.push(json!({
+                            let mut gate = json!({
                                 "gate": "type_audit",
                                 "status": if fail == 0 { "✅" } else { "❌" },
                                 "pass": pass, "fail": fail, "warn": warn,
-                            }));
+                            });
+                            // Surface script path only on failure — breadcrumb for the agent to fix
+                            if fail > 0 {
+                                gate["script"] = json!(audit_script.display().to_string());
+                            }
+                            gates.push(gate);
                         }
                         Err(e) => gates.push(json!({
-                            "gate": "type_audit", "status": "⚠️", "error": e.to_string()
+                            "gate": "type_audit", "status": "⚠️",
+                            "error": e.to_string(),
+                            "script": audit_script.display().to_string(),
                         })),
                     }
                 }
@@ -1885,25 +1892,46 @@ impl McpServer {
                 let pass = stdout.matches("✅").count();
                 let fail = stdout.matches("❌").count();
 
-                Ok(json!({
+                let mut result = json!({
                     "action": "audit",
                     "summary": format!("{}/{} ✅", pass, total),
                     "failures": if failures.is_empty() { None } else { Some(failures) },
                     "all_green": fail == 0,
-                }))
+                });
+                if fail > 0 {
+                    result["script"] = json!(audit_script.display().to_string());
+                    result["fix_hint"] = json!("Update type manifests in the script's APEX_*/XLI_* arrays to match current file paths.");
+                }
+                Ok(result)
             }
 
             // ── ratchet: one or all, gaps only ──
             "ratchet" => {
                 // refresh=true → regenerate reports before reading (runs make ratchets)
+                let mut refresh_error: Option<serde_json::Value> = None;
                 if args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false) {
                     if ratchet_dir.exists() {
                         let out = Command::new("make")
                             .arg("ratchets")
                             .current_dir(&ratchet_dir)
                             .output();
-                        if let Err(e) = &out {
-                            tracing::warn!("make ratchets failed: {}", e);
+                        match out {
+                            Ok(o) if !o.status.success() => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                refresh_error = Some(json!({
+                                    "make_failed": true,
+                                    "makefile": ratchet_dir.join("Makefile").display().to_string(),
+                                    "stderr": stderr.lines().take(10).collect::<Vec<_>>().join("\n"),
+                                }));
+                            }
+                            Err(e) => {
+                                refresh_error = Some(json!({
+                                    "make_failed": true,
+                                    "error": e.to_string(),
+                                    "makefile": ratchet_dir.join("Makefile").display().to_string(),
+                                }));
+                            }
+                            _ => {} // success
                         }
                     }
                 }
@@ -1975,7 +2003,11 @@ impl McpServer {
                     }));
                 }
 
-                Ok(json!({ "action": "ratchet", "results": results }))
+                let mut resp = json!({ "action": "ratchet", "results": results });
+                if let Some(err) = refresh_error {
+                    resp["refresh_error"] = err;
+                }
+                Ok(resp)
             }
 
             // ── drift: compare audit against previous snapshot ──
