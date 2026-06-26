@@ -535,6 +535,32 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
     Ok(all_results)
 }
 
+/// Batch-fetch node id → file path for proximity hints during call resolution.
+pub fn get_node_paths_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, String>> {
+    let mut result = HashMap::new();
+    if node_ids.is_empty() {
+        return Ok(result);
+    }
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, path) = row?;
+            result.insert(id, path);
+        }
+    }
+    Ok(result)
+}
+
 /// Find nodes that are missing context strings (likely from a failed Phase 3).
 /// Excludes external pseudo-nodes which never have context strings.
 pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {

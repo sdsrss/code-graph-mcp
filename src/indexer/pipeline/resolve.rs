@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 use crate::storage::db::Database;
 use crate::storage::queries::{
-    delete_pending_unresolved_call, insert_edge_cached, list_pending_unresolved_calls,
+    delete_pending_unresolved_call, get_node_paths_by_ids, insert_edge_cached,
+    list_pending_unresolved_calls,
 };
 use crate::domain::REL_CALLS;
 
@@ -178,27 +179,12 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     }
 
     // Map source_id → source file path so refine_ambiguous_targets gets the
-    // proximity hint it needs.
-    let source_ids: Vec<i64> = pending.iter().map(|p| p.source_id).collect();
-    let mut source_id_to_path: HashMap<i64, String> = HashMap::new();
-    if !source_ids.is_empty() {
-        let placeholders = std::iter::repeat_n("?", source_ids.len()).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
-            placeholders
-        );
-        let mut stmt = db.conn().prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = source_ids.iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, path) = row?;
-            source_id_to_path.insert(id, path);
-        }
-    }
+    // proximity hint it needs. Dedupe first — pending rows repeat source_ids;
+    // batch via get_node_paths_by_ids to stay under SQLite's bind limit.
+    let mut source_ids: Vec<i64> = pending.iter().map(|p| p.source_id).collect();
+    source_ids.sort_unstable();
+    source_ids.dedup();
+    let source_id_to_path = get_node_paths_by_ids(db.conn(), &source_ids)?;
 
     let mut edges_added = 0usize;
     let mut to_delete: Vec<i64> = Vec::new();

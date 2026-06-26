@@ -37,7 +37,8 @@ pub use nodes::{
     get_first_node_id_by_name, get_inbound_calls_for_pending, get_inbound_cross_file_edges,
     get_node_by_id, get_node_ids_by_name, get_node_names_with_paths_excluding_files,
     get_node_with_file_by_id, get_nodes_by_file_path, get_nodes_by_name,
-    get_nodes_missing_context, get_nodes_with_files_by_filters, get_nodes_with_files_by_ids,
+    get_node_paths_by_ids, get_nodes_missing_context, get_nodes_with_files_by_filters,
+    get_nodes_with_files_by_ids,
     get_nodes_with_files_by_name, insert_node, insert_node_cached, update_context_strings_batch,
     NameEntry, NodeRecord, NodeResult, NodeWithFile,
 };
