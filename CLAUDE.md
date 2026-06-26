@@ -76,6 +76,21 @@ structural queries (LSP only sees open files; this sees everything). Fastest pat
 
 Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
+
+### Invariance Toolkit (cross-spoke)
+
+Verifies 22 invariant-critical types across the 3-layer tower defined in
+`cli-ops/refs/api-references/{settings-invariants,cross-wire,harness-invariants}.md`.
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/cgm-init <path>` | Index + embed a new project |
+| `scripts/cgm-invariant-audit` | Verify all 22 types exist at expected paths |
+| `scripts/cgm-invariant-audit --layer settings` | L3 only (π_wire ∘ π_model projection) |
+| `scripts/cgm-invariant-audit --drift` | Compare against last snapshot |
+
+Run after every upstream merge or sortie to catch type renames/moves before
+the invariance docs go stale. Snapshots in `cli-ops/refs/api-references/.audit-snapshots/`.
 <!-- code-graph-mcp:end -->
 
 ## Autonomy
