@@ -1,5 +1,7 @@
 # code-graph-mcp
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fsdsrss%2Fcode-graph-mcp.svg)](https://mcptoplist.com/server/glama%2Fsdsrss%2Fcode-graph-mcp)
+
 A high-performance code knowledge graph server implementing the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Indexes codebases into a structured AST knowledge graph with semantic search, call graph traversal, and HTTP route tracing — designed to give AI coding assistants deep, structured understanding of your code.
 
 ## Features
