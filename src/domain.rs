@@ -146,6 +146,22 @@ pub fn normalize_call_direction(input: &str) -> Option<&'static str> {
     }
 }
 
+/// Does a stored route method satisfy a requested HTTP verb?
+///
+/// Route extraction stores `"ANY"` when the framework leaves the verb
+/// unspecified (Flask `@app.route` without `methods=`) and `"ALL"` when the
+/// framework genuinely matches every verb (Go `net/http` HandleFunc). Both are
+/// wildcards for matching purposes — an exact-equality filter made
+/// `trace 'GET /health'` miss a Go route stored as `ALL /health` while the
+/// bare-path `trace /health` found it, and the no-match hint then blamed
+/// framework coverage. Comparison is case-insensitive (CLI uppercases the
+/// request; MCP used exact `==`, drifting from the CLI's eq_ignore case rule).
+pub fn route_method_matches(stored: &str, requested: &str) -> bool {
+    stored.eq_ignore_ascii_case("ANY")
+        || stored.eq_ignore_ascii_case("ALL")
+        || stored.eq_ignore_ascii_case(requested)
+}
+
 /// Canonicalize a dependency `--direction` / `direction` (outgoing|incoming|both).
 pub fn normalize_dep_direction(input: &str) -> Option<&'static str> {
     match input.to_lowercase().as_str() {

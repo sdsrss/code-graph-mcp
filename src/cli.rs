@@ -6871,7 +6871,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
                                 .and_then(|m| m.as_str())
                                 .map(|s| s.to_string())
                         })
-                        .is_some_and(|rm| rm.eq_ignore_ascii_case(method))
+                        .is_some_and(|rm| crate::domain::route_method_matches(&rm, method))
                 })
             });
         }

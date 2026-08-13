@@ -5267,6 +5267,51 @@ fn test_cli_trace_no_routes() {
     );
 }
 
+// Stored wildcard methods must satisfy any requested verb: Flask
+// `@app.route('/x')` without `methods=` is stored as "ANY" and Go net/http
+// HandleFunc as "ALL" — exact-equality filtering made `trace 'GET /x'` miss
+// both (while bare `trace /x` matched), and the no-match hint then wrongly
+// blamed framework coverage.
+#[test]
+fn test_cli_trace_verb_matches_wildcard_method_routes() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/orders')\ndef list_orders():\n    return []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("main.go"),
+        "package main\n\nimport \"net/http\"\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", healthHandler)\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["trace", "GET /orders"]);
+    assert_eq!(code, 0, "ANY-stored Flask route must match GET: {stderr}");
+    assert!(stdout.contains("list_orders"), "got: {stdout}");
+
+    let (stdout2, stderr2, code2) = run_cli(&project, &["trace", "GET /health"]);
+    assert_eq!(code2, 0, "ALL-stored Go route must match GET: {stderr2}");
+    assert!(stdout2.contains("healthHandler"), "got: {stdout2}");
+
+    // A real verb mismatch must still filter: no wildcard was stored for an
+    // explicit-method route, so this guard proves the wildcard isn't "match all".
+    std::fs::write(
+        project.path().join("post.py"),
+        "from flask import Flask\napp2 = Flask(__name__)\n\n@app2.route('/submit', methods=['POST'])\ndef submit():\n    return []\n",
+    )
+    .unwrap();
+    let db2 = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_incremental_index(&db2, project.path(), None, None)
+        .unwrap();
+    let (_, _, code3) = run_cli(&project, &["trace", "GET /submit"]);
+    assert_eq!(code3, 1, "explicit POST route must not match GET");
+}
+
 #[test]
 fn test_cli_trace_filters_test_symbols_by_default() {
     // Parity with the MCP trace_http_chain tool, which filters is_test_symbol out of

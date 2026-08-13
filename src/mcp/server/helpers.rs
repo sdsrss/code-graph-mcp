@@ -46,7 +46,7 @@ pub(super) fn filter_routes_by_method(
                             .and_then(|m| m.as_str())
                             .map(|s| s.to_string())
                     })
-                    .is_some_and(|rm| rm == *method)
+                    .is_some_and(|rm| crate::domain::route_method_matches(&rm, method))
             })
         });
     }
