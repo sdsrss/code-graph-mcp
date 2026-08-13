@@ -3088,6 +3088,40 @@ fn test_cli_grep_sigpipe_graceful() {
     );
 }
 
+// The grep contract above (EPIPE → silent, exit 0) must hold for EVERY command,
+// not just grep/stats: `health-check | head` used to panic in `println!` and
+// `map | head` used to print `Error: Broken pipe (os error 32)` via the anyhow
+// return path. Pre-closing the pipe's read end before spawn makes the child's
+// FIRST stdout write hit EPIPE deterministically — no output-size or timing
+// dependence, so small-output commands like health-check are testable too.
+#[cfg(unix)]
+#[test]
+fn test_cli_sigpipe_graceful_non_grep_commands() {
+    let project = setup_indexed_project();
+    for cmd in [["health-check"], ["map"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader); // read end closed before the child ever writes
+        let child = Command::new(binary_path())
+            .current_dir(project.path())
+            .args(cmd)
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("Broken pipe") && !err.contains("panicked"),
+            "{cmd:?}: EPIPE must be silent like grep, got stderr: {err:?}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{cmd:?}: early reader hangup is not an error"
+        );
+    }
+}
+
 // ============================================================
 // callgraph
 // ============================================================

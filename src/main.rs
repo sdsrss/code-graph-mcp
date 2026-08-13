@@ -26,7 +26,50 @@ impl Write for SharedStdout {
     }
 }
 
+/// EPIPE on stdout (reader of `cg map | head` hung up) is a normal end of
+/// conversation, not an error — grep and stats already exit 0 silently
+/// (`test_cli_grep_sigpipe_graceful`), but every other command either panicked
+/// inside `println!` or surfaced `Error: Broken pipe (os error 32)` through the
+/// anyhow return path. Two central hooks extend the same contract to all
+/// commands without routing hundreds of print sites through a macro:
+/// this panic hook catches the `println!` shape, and `exit_zero_on_epipe`
+/// catches the `?`-propagated shape.
+fn install_stdout_epipe_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("");
+        // std's exact stdout-print failure message: "failed printing to
+        // stdout: <io error>". Scoped to stdout so a genuine stderr failure
+        // or an unrelated panic still reports normally.
+        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+}
+
+/// Err-path half of the EPIPE contract: a `?`-propagated `BrokenPipe` io::Error
+/// anywhere in the chain means the consumer went away mid-write — exit 0
+/// silently instead of printing an error nobody is reading.
+fn exit_zero_on_epipe(result: &Result<()>) {
+    if let Err(e) = result {
+        let epipe = e
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|ioe| ioe.kind() == io::ErrorKind::BrokenPipe);
+        if epipe {
+            std::process::exit(0);
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    install_stdout_epipe_panic_hook();
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
 
@@ -335,6 +378,9 @@ fn main() -> Result<()> {
     // every future bail site; commands that already emitted their own JSON
     // error object exit via std::process::exit and never reach this.
     // stderr keeps the human-readable line via anyhow's Termination below.
+    // EPIPE check must run BEFORE the JSON error leg: the consumer is gone, so
+    // emitting the error object would itself hit the closed pipe (and panic).
+    exit_zero_on_epipe(&result);
     if let Err(e) = &result {
         if args.iter().skip(2).any(|a| a == "--json") {
             println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
