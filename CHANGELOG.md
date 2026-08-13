@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.115.0 (2026-08-13)
+
+Nine fixes from a three-round autonomous QA loop (every fix carries a
+regression test that fails on the pre-fix code; the full evidence ledger,
+replay transcripts and issue↔commit mapping live in the session's
+`docs/looptesting/` records). Minor bump because two JSON surfaces gained
+additive fields.
+
+### Fixed
+- **Piping a command into `head` or quitting `less` mid-stream panicked or
+  printed a spurious error.** The EPIPE-silent contract (exit 0, no stderr
+  noise) existed for `grep` and `stats` but nothing else: `health-check | head`
+  died with a `failed printing to stdout: Broken pipe` panic, and
+  `map | head` printed `Error: Broken pipe (os error 32)` through the anyhow
+  return path. Two central hooks in `main()` now extend the same contract to
+  every command — a panic hook that recognizes std's stdout-print failure
+  (matching the Unix "Broken pipe" rendering and the Windows closed-pipe os
+  error codes 232/109, which survive message localization), and a BrokenPipe
+  check on the error chain that runs *before* the `--json` error leg (which
+  would otherwise write into the same closed pipe). Scope note: the contract
+  covers the stdout pipe; a *stderr* pipe closing early still reports, by
+  design — stderr failures can signal real problems (full disk) that silence
+  would hide.
+- **`trace 'GET /health'` found nothing for routes that match every verb.**
+  Flask `@app.route` without `methods=` is stored as `ANY` and Go `net/http`
+  `HandleFunc` as `ALL`, but both trace surfaces (CLI and MCP) filtered by
+  exact equality — so adding the verb you knew the route served made the route
+  disappear, and the no-match hint then wrongly blamed framework coverage.
+  A shared `route_method_matches` treats stored `ANY`/`ALL` as wildcards,
+  case-insensitively on both surfaces (the MCP side had also drifted into
+  case-sensitive comparison). Stored metadata is unchanged — no reindex needed.
+  An explicit-method route still filters: `GET /submit` does not match a
+  `methods=['POST']` route. Known approximation: Flask's real default for a
+  bare `@app.route` is GET-only, so `trace 'DELETE /x'` now over-matches such a
+  route (405 at runtime) — trading the old false negative on the verb the route
+  *does* serve for a false positive on verbs it doesn't. Storing `GET` at
+  extraction is the precise fix and needs an index-format bump; deferred.
+- **`map` said "3 symbols" above a line naming four.** The module header's
+  total counted functions, classes and interfaces/traits, but `key_symbols`
+  also lists exported constants (`export const db`), so the count could be
+  smaller than the list printed right under it. A `constants` bucket now feeds
+  the total.
+- **`health-check` claimed "no download has been attempted on this machine"
+  while the model sat fully installed in `~/.cache/code-graph/models`.** The
+  npm plugin installs weights without writing the binary's download marker, so
+  the marker-based message contradicted the filesystem. A cheap fs-only
+  presence probe now reports "model files present but not loaded in this
+  process" — and the same fact travels through `health-check --json` as
+  `model_files_present`, because `doctor` classifies from the JSON arm and was
+  still printing the contradiction one surface over (the sibling-hole pattern
+  this changelog keeps documenting).
+- **`similar` on an embed-capable binary advised rebuilding with
+  `--features embed-model`.** The empty-embeddings remedy now matches the
+  running binary: an embed build is told to start the MCP server (which
+  backfills embeddings); only the FTS-only build keeps the rebuild advice.
+- **A symbol added after the last index read as nonexistent with no way out.**
+  Query-time freshness can only re-sync files a symbol is already indexed in,
+  so `show brandNewFn` printed a bare "Symbol not found". The no-candidate miss
+  paths of `show`, `impact`, `similar`, `refs` and `callgraph` now add one
+  stderr line pointing at `incremental-index` — on `callgraph` the hint fires
+  only when the symbol is genuinely absent, not when it merely has no edges.
+- **`deps` printed "(1 symbols)".** The existing `plural()` helper was never
+  wired into the two per-file dependency lines.
+- **`--help` overpromised `--json` "available on all commands".** It is not
+  accepted by the index commands (`incremental-index`, `rebuild-index`,
+  `reindex`), `doctor`, `adopt` or `unadopt`; the help now names the actual
+  scope.
+
+### Added
+- `map --json` modules now carry a `constants` count (always); MCP
+  `project_map` emits it when non-zero, same as `interfaces_traits`.
+- `health-check --json` always emits `model_files_present` (bool).
+
 ## v0.114.1 (2026-08-03)
 
 Documentation only — no behaviour change. The compiled binary's `.text` section
