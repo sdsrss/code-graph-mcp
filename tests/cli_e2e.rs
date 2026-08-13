@@ -4312,6 +4312,29 @@ fn test_cli_health_check_pending_reports_present_model_files() {
     );
 }
 
+// An embed-model binary that finds 0 embeddings used to advise "build with
+// --features embed-model" — a rebuild the user already has. The remedy line
+// must match the running binary's features (here: just start the MCP server).
+#[cfg(feature = "embed-model")]
+#[test]
+fn test_cli_similar_no_embeddings_remedy_matches_binary_features() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["similar", "validateToken"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("No embeddings found"),
+        "expected the empty-embeddings path, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--features embed-model"),
+        "embed-model build must not advise rebuilding with embed-model, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("start the MCP server"),
+        "remedy must point at running the server, got: {stderr}"
+    );
+}
+
 // A symbol ADDED after the last index has no indexed file for query-time
 // freshness to refresh, so `show` misses it — the miss must at least tell the
 // user the index may be stale instead of a bare "Symbol not found" that reads

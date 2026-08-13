@@ -7468,8 +7468,15 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             "[code-graph] No embeddings found ({}/{} nodes embedded).",
             embedded_count, total_nodes
         );
-        eprintln!("  To enable: build with `cargo build --release --features embed-model`,");
-        eprintln!("  then restart the MCP server to generate embeddings.");
+        // Tailor the remedy to THIS binary: telling an embed-model build to
+        // rebuild with --features embed-model sends the user to fix a problem
+        // they don't have (the missing step is just running the MCP server).
+        if cfg!(feature = "embed-model") {
+            eprintln!("  To enable: start the MCP server to generate embeddings.");
+        } else {
+            eprintln!("  To enable: build with `cargo build --release --features embed-model`,");
+            eprintln!("  then restart the MCP server to generate embeddings.");
+        }
         eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
         std::process::exit(1);
     }
