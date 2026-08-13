@@ -152,6 +152,14 @@ test('classifyEmbeddings reports the real download outcome, not "retry shortly" 
   // In-flight is the one state where waiting IS the right advice.
   const inflight = classifyEmbeddings({ ...base, model_download: 'download in flight (attempt 1)' });
   assert.match(inflight.detail, /in flight/);
+
+  // Weights already on disk (npm plugin installs them without the download
+  // marker): "NO download has ever been attempted" would contradict the
+  // filesystem — the missing step is only a server session to load them.
+  const present = classifyEmbeddings({ ...base, model_files_present: true });
+  assert.equal(present.status, 'warn');
+  assert.match(present.detail, /model files present/);
+  assert.doesNotMatch(present.detail, /NO download has ever been attempted/);
 });
 
 test('classifyEmbeddings WARNS when binary lacks embed-model feature', () => {

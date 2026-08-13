@@ -41,10 +41,16 @@ function classifyEmbeddings(hc) {
     // so a machine whose download can never succeed read as "be patient"
     // forever instead of "this is broken". Absent field = never attempted,
     // which is itself a distinct diagnosis, not a reason to advise waiting.
+    // EXCEPT when the weights are already on disk (`model_files_present`,
+    // health-check --json ≥0.115): the npm plugin installs them without the
+    // marker, so "never attempted" would contradict the filesystem — the only
+    // missing step then is a server session to load them.
     const why = (hc && hc.embedding_status === 'pending')
-      ? (hc.model_download
-          ? `last model download: ${hc.model_download}`
-          : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
+      ? (hc.model_files_present
+          ? 'model files present but not loaded — restart the MCP server (embeddings backfill there)'
+          : hc.model_download
+            ? `last model download: ${hc.model_download}`
+            : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
       : `embedding_status=${(hc && hc.embedding_status) || 'unknown'}`;
     return { name: 'Embeddings', status: 'warn',
       detail: `vector INACTIVE — ${total} embeddable nodes, 0 embedded; semantic search is FTS5-only (${why})` };

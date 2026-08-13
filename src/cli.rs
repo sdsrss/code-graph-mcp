@@ -1539,6 +1539,15 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         crate::embedding::model::EmbeddingModel::download_state_summary();
     #[cfg(not(feature = "embed-model"))]
     let model_download: Option<String> = None;
+    // On-disk model presence, independent of the download marker (the npm
+    // plugin installs weights without writing it). Shared by the text arm's
+    // pending message and the JSON arm — doctor.js classifies from the JSON,
+    // so leaving the field out re-created the "NO download has ever been
+    // attempted" contradiction one surface over (ISSUE-011's sibling).
+    #[cfg(feature = "embed-model")]
+    let model_files_present = crate::embedding::model::EmbeddingModel::model_files_present();
+    #[cfg(not(feature = "embed-model"))]
+    let model_files_present = false;
 
     // Snapshot metadata block — reads keys written by `snapshot install`.
     let snapshot_url =
@@ -1622,6 +1631,7 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
             if let Some(ref s) = model_download {
                 json["model_download"] = serde_json::json!(s);
             }
+            json["model_files_present"] = serde_json::json!(model_files_present);
             if let Some(ref r) = resolution {
                 json["resolution"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
             }
@@ -1702,14 +1712,10 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 // whose model download failed had no way to see vector was inactive).
                 // Model files can be on disk without any download marker (the
                 // npm plugin installs them out-of-band) — claiming "no download
-                // has been attempted" then contradicts the filesystem. Probe
-                // presence first; the marker only disambiguates the truly-absent
-                // case ("never attempted" vs "attempted and failed").
-                #[cfg(feature = "embed-model")]
-                let model_files_present =
-                    crate::embedding::model::EmbeddingModel::model_files_present();
-                #[cfg(not(feature = "embed-model"))]
-                let model_files_present = false;
+                // has been attempted" then contradicts the filesystem. Presence
+                // is probed once above (shared with the JSON arm); the marker
+                // only disambiguates the truly-absent case ("never attempted"
+                // vs "attempted and failed").
                 let pending_detail = if model_files_present {
                     "model files present but not loaded in this process — vector \
                      search activates in the MCP server (embeddings backfill there)"

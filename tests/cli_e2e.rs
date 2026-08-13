@@ -4310,6 +4310,22 @@ fn test_cli_health_check_pending_reports_present_model_files() {
         !stdout.contains("no download has been attempted"),
         "must not claim no-download when weights exist on disk, got: {stdout}"
     );
+
+    // The JSON arm must carry the same fact — doctor.js classifies from it,
+    // and without the field it re-derives the "NO download has ever been
+    // attempted" contradiction on its own surface.
+    let (json_out, _, code) = run_cli_env(
+        &project,
+        &["health-check", "--json"],
+        &[("CODE_GRAPH_MODEL_DIR", model_dir.path().to_str().unwrap())],
+    );
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
+    assert_eq!(
+        parsed["model_files_present"].as_bool(),
+        Some(true),
+        "health-check --json must expose model_files_present, got: {parsed}"
+    );
 }
 
 // An embed-model binary that finds 0 embeddings used to advise "build with
