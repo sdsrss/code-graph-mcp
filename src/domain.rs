@@ -1165,6 +1165,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_route_method_matches_wildcards_and_case() {
+        // ANY (Flask no-methods) and ALL (Go net/http) satisfy every verb.
+        assert!(route_method_matches("ANY", "GET"));
+        assert!(route_method_matches("ANY", "DELETE"));
+        assert!(route_method_matches("ALL", "POST"));
+        // Exact match is case-insensitive on BOTH sides — the MCP surface had
+        // drifted into case-sensitive `==` before this predicate unified them.
+        assert!(route_method_matches("GET", "get"));
+        assert!(route_method_matches("get", "GET"));
+        assert!(route_method_matches("any", "PATCH"));
+        // A real mismatch still filters.
+        assert!(!route_method_matches("POST", "GET"));
+        assert!(!route_method_matches("GET", "DELETE"));
+    }
+
+    #[test]
     fn test_max_file_size_default() {
         // Without env var set, should return the default 1 MB
         assert_eq!(max_file_size(), 1_048_576);

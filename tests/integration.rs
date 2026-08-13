@@ -1196,6 +1196,53 @@ fn test_trace_http_chain_no_routes_message() {
     );
 }
 
+// MCP half of the ANY/ALL wildcard contract (pre-tag review SF-2): reverting
+// filter_routes_by_method to exact equality must fail HERE, not only in the
+// CLI e2e — the MCP surface is where the original drift (case-sensitive
+// comparison) lived, and no test had ever exercised its verb filter.
+#[test]
+fn test_trace_http_chain_verb_matches_wildcard_and_filters_mismatch() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("app.py"),
+        "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/orders')\ndef list_orders():\n    return []\n\n@app.route('/submit', methods=['POST'])\ndef submit():\n    return []\n",
+    )
+    .unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    let warm = tool_call_json("semantic_code_search", serde_json::json!({"query": "orders"}));
+    let _ = server.handle_message(&warm).unwrap();
+
+    // ANY-stored Flask route must satisfy an explicit GET request.
+    let msg = tool_call_json(
+        "trace_http_chain",
+        serde_json::json!({"route_path": "GET /orders"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let handlers = result["handlers"].as_array().unwrap();
+    assert_eq!(
+        handlers.len(),
+        1,
+        "ANY-stored route must match GET, got: {result}"
+    );
+    assert_eq!(handlers[0]["handler_name"], "list_orders");
+
+    // Explicit-method route still filters: GET must not match a POST route.
+    let msg = tool_call_json(
+        "trace_http_chain",
+        serde_json::json!({"route_path": "GET /submit"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(
+        result["handlers"].as_array().unwrap().is_empty(),
+        "explicit POST route must not match GET, got: {result}"
+    );
+}
+
 #[test]
 fn test_project_map_detects_main_entry_points() {
     let project = TempDir::new().unwrap();

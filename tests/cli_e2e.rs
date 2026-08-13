@@ -4351,6 +4351,37 @@ fn test_cli_similar_no_embeddings_remedy_matches_binary_features() {
     );
 }
 
+// callgraph is ISSUE-006's fifth surface (pre-tag review SF-1): a just-added
+// symbol must get the stale-index hint here too — but ONLY when the symbol is
+// genuinely absent. A symbol that exists with zero edges reaches the same
+// empty-result branch, and a reindex hint there would be chasing a non-problem.
+#[test]
+fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src").join("fresh2.ts"),
+        "export function brandNewCgFn() { return 1; }\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "brandNewCgFn"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("incremental-index"),
+        "absent symbol must hint at reindexing, got: {stderr}"
+    );
+
+    // hashPassword exists in the index with no call edges — callgraph shows
+    // the seed node (exit 0) and must not print the reindex hint (negative
+    // control: the gate distinguishes absent from merely edge-less).
+    let (stdout2, stderr2, code2) = run_cli(&project, &["callgraph", "hashPassword"]);
+    assert_eq!(code2, 0, "existing symbol renders its seed: {stderr2}");
+    assert!(stdout2.contains("hashPassword"), "got: {stdout2}");
+    assert!(
+        !stderr2.contains("incremental-index"),
+        "existing edge-less symbol must NOT get the reindex hint, got: {stderr2}"
+    );
+}
+
 // A symbol ADDED after the last index has no indexed file for query-time
 // freshness to refresh, so `show` misses it — the miss must at least tell the
 // user the index may be stale instead of a bare "Symbol not found" that reads

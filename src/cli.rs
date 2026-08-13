@@ -4999,6 +4999,18 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             );
         }
         eprintln!("[code-graph] No call graph results for: {}", symbol);
+        // ISSUE-006's sibling surface (pre-tag review SF-1): callgraph is the
+        // command the decision table points at first, so a just-added symbol
+        // landing here needs the same stale-index hint as show/impact/similar/
+        // refs. Gated on the symbol being genuinely ABSENT — a symbol that
+        // exists with zero edges also reaches this branch, and hinting at
+        // reindexing there would send the user chasing a non-problem.
+        if queries::get_nodes_by_name(conn, symbol)
+            .map(|nodes| nodes.is_empty())
+            .unwrap_or(false)
+        {
+            hint_symbol_maybe_unindexed(symbol);
+        }
         std::process::exit(1);
     }
 

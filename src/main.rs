@@ -45,8 +45,16 @@ fn install_stdout_epipe_panic_hook() {
             .unwrap_or("");
         // std's exact stdout-print failure message: "failed printing to
         // stdout: <io error>". Scoped to stdout so a genuine stderr failure
-        // or an unrelated panic still reports normally.
-        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
+        // (e.g. ENOSPC on a redirect) or an unrelated panic still reports
+        // normally. The io-error rendering differs per platform: Unix says
+        // "Broken pipe"; Windows renders ERROR_NO_DATA (232) / ERROR_BROKEN_PIPE
+        // (109) with a FormatMessage-LOCALIZED message — but std's own
+        // "(os error N)" suffix is not localized, so match the codes.
+        if msg.starts_with("failed printing to stdout")
+            && (msg.contains("Broken pipe")
+                || msg.contains("os error 232")
+                || msg.contains("os error 109"))
+        {
             std::process::exit(0);
         }
         default_hook(info);

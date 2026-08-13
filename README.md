@@ -417,9 +417,10 @@ a manual install must be redone on each version bump.
 
 ### Diagnosing a model that never downloads
 
-`code-graph-mcp doctor` reports the last download outcome, distinguishing
-"no download has been attempted" from "download FAILED after N attempt(s): …"
-with the underlying error. The raw record is
+`code-graph-mcp doctor` reports the model state, distinguishing "model files
+present but not loaded" (weights on disk — e.g. installed by the npm plugin —
+just no MCP server session yet) from "no download has been attempted" and from
+"download FAILED after N attempt(s): …" with the underlying error. The raw record is
 `<platform cache>/code-graph/model-download.json`. On a network that performs
 TLS inspection, the download retries automatically against the OS certificate
 store after the bundled roots are rejected.
