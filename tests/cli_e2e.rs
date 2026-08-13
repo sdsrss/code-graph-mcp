@@ -4284,6 +4284,34 @@ fn test_cli_show_nonexistent() {
     assert!(stderr.contains("Symbol not found"));
 }
 
+// health-check's "pending" arm used to print "no download has been attempted on
+// this machine" even when model weights were already on disk (the npm plugin
+// installs them without writing the binary's download marker) — contradicting
+// the filesystem and telling the user to fix a problem they don't have.
+#[cfg(feature = "embed-model")]
+#[test]
+fn test_cli_health_check_pending_reports_present_model_files() {
+    let project = setup_indexed_project();
+    let model_dir = TempDir::new().unwrap();
+    // find_models_dir only stats model.safetensors — a stub is enough for the
+    // presence probe (nothing loads weights on this path: 0 vectors → pending).
+    std::fs::write(model_dir.path().join("model.safetensors"), b"stub").unwrap();
+    let (stdout, _, code) = run_cli_env(
+        &project,
+        &["health-check"],
+        &[("CODE_GRAPH_MODEL_DIR", model_dir.path().to_str().unwrap())],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("model files present"),
+        "pending arm must acknowledge on-disk model files, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("no download has been attempted"),
+        "must not claim no-download when weights exist on disk, got: {stdout}"
+    );
+}
+
 // A symbol ADDED after the last index has no indexed file for query-time
 // freshness to refresh, so `show` misses it — the miss must at least tell the
 // user the index may be stale instead of a bare "Symbol not found" that reads

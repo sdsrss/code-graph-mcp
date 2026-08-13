@@ -1700,15 +1700,31 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 // Vector/embedding status — make a silent FTS5-only degradation visible
                 // (the prior gap: text health-check never surfaced search_mode, so a user
                 // whose model download failed had no way to see vector was inactive).
-                let pending_detail = match model_download.as_deref() {
-                    // "never attempted" is itself actionable — it means the
-                    // background download never even started, which is a
-                    // different bug from one that started and failed.
-                    None => "model not loaded yet; no download has been attempted on this machine \
-                             — start the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually \
-                             populated model dir"
-                        .to_string(),
-                    Some(s) => format!("model not loaded yet; last download: {}", s),
+                // Model files can be on disk without any download marker (the
+                // npm plugin installs them out-of-band) — claiming "no download
+                // has been attempted" then contradicts the filesystem. Probe
+                // presence first; the marker only disambiguates the truly-absent
+                // case ("never attempted" vs "attempted and failed").
+                #[cfg(feature = "embed-model")]
+                let model_files_present =
+                    crate::embedding::model::EmbeddingModel::model_files_present();
+                #[cfg(not(feature = "embed-model"))]
+                let model_files_present = false;
+                let pending_detail = if model_files_present {
+                    "model files present but not loaded in this process — vector \
+                     search activates in the MCP server (embeddings backfill there)"
+                        .to_string()
+                } else {
+                    match model_download.as_deref() {
+                        // "never attempted" is itself actionable — it means the
+                        // background download never even started, which is a
+                        // different bug from one that started and failed.
+                        None => "model not loaded yet; no download has been attempted on this \
+                                 machine — start the MCP server, or set CODE_GRAPH_MODEL_DIR to \
+                                 a manually populated model dir"
+                            .to_string(),
+                        Some(s) => format!("model not loaded yet; last download: {}", s),
+                    }
                 };
                 println!(
                     "Search: {} — {}% embedded ({})",

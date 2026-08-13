@@ -598,6 +598,14 @@ mod inner {
             Ok(trust_path)
         }
 
+        /// Cheap fs-only probe: are model weights already on this machine at any
+        /// of the resolution locations? Pure `exists()` checks — no weight
+        /// loading — so hook-fast callers (CLI health-check) can distinguish
+        /// "present but not loaded in this process" from "never downloaded".
+        pub fn model_files_present() -> bool {
+            Self::find_models_dir().is_ok()
+        }
+
         fn find_models_dir() -> Result<std::path::PathBuf> {
             // 0. User-configured model directory (highest priority)
             if let Ok(custom_dir) = std::env::var("CODE_GRAPH_MODEL_DIR") {
