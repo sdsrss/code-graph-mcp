@@ -5995,6 +5995,12 @@ fn test_cli_help() {
     assert!(stdout.contains("deps"));
     assert!(stdout.contains("trace"));
     assert!(stdout.contains("similar"));
+    // --json is NOT accepted by the index commands (clap: unexpected argument),
+    // doctor (unknown flag), adopt or unadopt — the help must not overclaim.
+    assert!(
+        !stdout.contains("available on all commands"),
+        "--json help line overclaims: doctor/adopt/unadopt/index commands reject it"
+    );
 }
 
 #[test]

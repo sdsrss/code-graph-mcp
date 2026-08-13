@@ -490,7 +490,8 @@ fn print_help() {
     println!("    snapshot inspect <file>");
     println!("                        Print snapshot metadata as JSON (accepts .db or .db.zst)\n");
     println!("OPTIONS:");
-    println!("    --json              JSON output (available on all commands)");
+    println!("    --json              JSON output (query/analysis commands; not the index");
+    println!("                        commands, doctor, adopt or unadopt)");
     println!(
         "    --compact           Compact output (search, callgraph, map, overview, deps, refs)"
     );
