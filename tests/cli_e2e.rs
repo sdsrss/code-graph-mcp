@@ -4383,10 +4383,7 @@ fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
         &["callgraph", "hashPassword", "--file", "src/api.ts"],
     );
     assert_eq!(code2, 1, "empty scoped result exits 1: {stderr2}");
-    assert!(
-        stderr2.contains("No call graph results"),
-        "got: {stderr2}"
-    );
+    assert!(stderr2.contains("No call graph results"), "got: {stderr2}");
     assert!(
         !stderr2.contains("incremental-index"),
         "symbol present in index must NOT get the reindex hint, got: {stderr2}"

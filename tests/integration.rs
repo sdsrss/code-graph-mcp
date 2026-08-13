@@ -1212,7 +1212,10 @@ fn test_trace_http_chain_verb_matches_wildcard_and_filters_mismatch() {
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
-    let warm = tool_call_json("semantic_code_search", serde_json::json!({"query": "orders"}));
+    let warm = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "orders"}),
+    );
     let _ = server.handle_message(&warm).unwrap();
 
     // ANY-stored Flask route must satisfy an explicit GET request.
