@@ -46,6 +46,9 @@ impl McpServer {
                     if m.interfaces_traits > 0 {
                         obj["interfaces_traits"] = json!(m.interfaces_traits);
                     }
+                    if m.constants > 0 {
+                        obj["constants"] = json!(m.constants);
+                    }
                     if !m.languages.is_empty() {
                         obj["languages"] = json!(m.languages);
                     }

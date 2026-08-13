@@ -11,6 +11,7 @@ pub struct ModuleStats {
     pub functions: usize,
     pub classes: usize,
     pub interfaces_traits: usize,
+    pub constants: usize,
     pub languages: Vec<String>,
     pub key_symbols: Vec<String>,
 }
@@ -70,6 +71,7 @@ pub fn get_project_map(
                 SUM(CASE WHEN n.type IN ('function', 'method') THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('class', 'struct', 'enum') THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('interface', 'trait') THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN n.type = 'constant' THEN 1 ELSE 0 END), \
                 GROUP_CONCAT(DISTINCT f.language) \
          FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.type != 'module' AND n.name != '<module>' \
@@ -81,6 +83,7 @@ pub fn get_project_map(
     let mut dir_funcs: HashMap<String, usize> = HashMap::new();
     let mut dir_classes: HashMap<String, usize> = HashMap::new();
     let mut dir_ifaces: HashMap<String, usize> = HashMap::new();
+    let mut dir_consts: HashMap<String, usize> = HashMap::new();
     let mut dir_langs: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
     {
         let mut stmt = conn.prepare(&sql)?;
@@ -90,16 +93,18 @@ pub fn get_project_map(
                 row.get::<_, i64>(1)? as usize,
                 row.get::<_, i64>(2)? as usize,
                 row.get::<_, i64>(3)? as usize,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(4)? as usize,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         for row in rows {
-            let (path, funcs, classes, ifaces, langs) = row?;
+            let (path, funcs, classes, ifaces, consts, langs) = row?;
             let dir = dir_of(&path).to_string();
             dir_files.entry(dir.clone()).or_default().insert(path);
             *dir_funcs.entry(dir.clone()).or_default() += funcs;
             *dir_classes.entry(dir.clone()).or_default() += classes;
             *dir_ifaces.entry(dir.clone()).or_default() += ifaces;
+            *dir_consts.entry(dir.clone()).or_default() += consts;
             if let Some(l) = langs {
                 for lang in l.split(',').filter(|s| !s.is_empty()) {
                     dir_langs
@@ -175,6 +180,7 @@ pub fn get_project_map(
             functions: *dir_funcs.get(dir).unwrap_or(&0),
             classes: *dir_classes.get(dir).unwrap_or(&0),
             interfaces_traits: *dir_ifaces.get(dir).unwrap_or(&0),
+            constants: *dir_consts.get(dir).unwrap_or(&0),
             languages: dir_langs
                 .get(dir)
                 .map(|s| s.iter().cloned().collect())

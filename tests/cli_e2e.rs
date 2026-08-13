@@ -4442,6 +4442,42 @@ fn test_cli_map_compact() {
     assert!(stdout.contains("Modules:"));
 }
 
+// key_symbols lists exported constants (`export const db`), so the module
+// header's symbol total must count them too — it used to say "1 symbols" for a
+// module whose key-symbol line printed two names (1 fn + 1 const).
+#[test]
+fn test_cli_map_symbol_count_includes_constants() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("store.ts"),
+        "export const db = { q: 1 };\nexport function openDb() { return db; }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["map"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("2 symbols"),
+        "1 fn + 1 exported const must total 2 symbols, got: {stdout}"
+    );
+
+    let (json_out, _, code) = run_cli(&project, &["map", "--json"]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
+    let module = &parsed["modules"][0];
+    assert_eq!(
+        module["constants"].as_i64(),
+        Some(1),
+        "map --json must expose the constants bucket, got: {module}"
+    );
+}
+
 #[test]
 fn test_cli_map_json() {
     let project = setup_indexed_project();
