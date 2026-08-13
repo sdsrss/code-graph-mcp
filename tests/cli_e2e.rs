@@ -4832,6 +4832,12 @@ fn test_cli_deps() {
     assert_eq!(code, 0);
     assert!(stdout.contains("src/api.ts"), "should show the file");
     assert!(stdout.contains("src/auth.ts"), "api.ts depends on auth.ts");
+    // api.ts imports exactly one symbol (validateToken) from auth.ts — the
+    // count must pluralize ("1 symbol", not "1 symbols").
+    assert!(
+        stdout.contains("(1 symbol)") && !stdout.contains("1 symbols"),
+        "single-symbol dep must render '1 symbol', got: {stdout}"
+    );
 }
 
 #[test]

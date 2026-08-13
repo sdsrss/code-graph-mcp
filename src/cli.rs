@@ -7249,7 +7249,12 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             if compact {
                 writeln!(stdout, "    {}", d.file_path)?;
             } else if d.depth == 1 {
-                writeln!(stdout, "    {} ({} symbols)", d.file_path, d.symbol_count)?;
+                writeln!(
+                    stdout,
+                    "    {} ({})",
+                    d.file_path,
+                    plural(d.symbol_count, "symbol")
+                )?;
             } else {
                 writeln!(stdout, "    {} (depth {})", d.file_path, d.depth)?;
             }
@@ -7261,7 +7266,12 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             if compact {
                 writeln!(stdout, "    {}", d.file_path)?;
             } else if d.depth == 1 {
-                writeln!(stdout, "    {} ({} symbols)", d.file_path, d.symbol_count)?;
+                writeln!(
+                    stdout,
+                    "    {} ({})",
+                    d.file_path,
+                    plural(d.symbol_count, "symbol")
+                )?;
             } else {
                 writeln!(stdout, "    {} (depth {})", d.file_path, d.depth)?;
             }
