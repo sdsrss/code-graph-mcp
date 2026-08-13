@@ -774,6 +774,11 @@ pub struct IncrementalIndexArgs {
     /// query-ready index. Vectors backfill later (MCP server / a later run).
     #[arg(long)]
     pub no_embed: bool,
+    /// Print the run's counters as one JSON object on stdout (progress stays on
+    /// stderr). For CI and scripts: `--json` used to be a clap parse error here,
+    /// so the only way to learn what an index run did was to scrape prose.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Run incremental index update.
@@ -881,7 +886,7 @@ fn build_full_index_at(
     project_root: &Path,
     quiet: bool,
     no_embed: bool,
-) -> Result<()> {
+) -> Result<crate::indexer::pipeline::IndexResult> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
         cleanup_legacy_db_files(parent);
@@ -902,7 +907,35 @@ fn build_full_index_at(
     }
     warn_parse_errors(&result.stats, quiet);
     finish_embedding(&db, quiet, no_embed)?;
-    Ok(())
+    Ok(result)
+}
+
+/// The `--json` object shared by `incremental-index`, `rebuild-index` and
+/// `reindex`: one line on stdout, emitted only after the run has actually
+/// succeeded, so the tier-3 error contract in `main` stays the sole producer of
+/// output on the failure path (a command must never print both).
+///
+/// `mode` names the path that really ran, not the subcommand asked for —
+/// `incremental-index` on a fresh checkout reports `full`, and `reindex
+/// --from-snapshot` reports whatever the post-install pass did. A CI script
+/// reading `files_indexed` needs to know which of the two it is looking at.
+fn emit_index_json(
+    mode: &str,
+    result: &crate::indexer::pipeline::IndexResult,
+    started: std::time::Instant,
+) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "mode": mode,
+            "files_indexed": result.files_indexed,
+            "files_deleted": result.files_deleted,
+            "nodes_created": result.nodes_created,
+            "edges_created": result.edges_created,
+            "files_with_parse_errors": result.stats.files_with_parse_errors,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })
+    );
 }
 
 /// Shared structure-first → embedding handoff for the CLI index commands.
@@ -943,7 +976,7 @@ fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
 /// finding always reaches `tracing` (same split as `warn_parse_errors`): a flag
 /// whose job is to keep hook output clean must not also decide whether a hazard
 /// is looked for. Destructive callers use
-/// [`ensure_index_unlocked_for_replace`] instead — for them this is a refusal,
+/// [`lock_index_for_replace`] instead — for them this is a refusal,
 /// not a warning.
 fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
     if !crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
@@ -955,10 +988,15 @@ fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
         lock.display()
     );
     if !quiet {
+        // Same holders as the replace-gate's refusal names: since the CLI takes
+        // this lock too, "likely a running MCP server" was no longer true — it
+        // sent the user to stop a server that may not exist while a concurrent
+        // rebuild-index was the real holder.
         eprintln!(
-            "[code-graph] Warning: another process (likely a running MCP server) holds \
-             the index lock at {}. Indexing now may race its writes — stop the server \
-             first if results look inconsistent.",
+            "[code-graph] Warning: another process (a running MCP server, or a \
+             concurrent rebuild-index / reindex) holds the index lock at {}. \
+             Indexing now may race its writes — wait for it to finish, or stop the \
+             server, if results look inconsistent.",
             lock.display()
         );
     }
@@ -981,41 +1019,94 @@ fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
 /// Refusing is therefore the safe default; `--force` is the escape hatch for a
 /// user who knows the lock holder is defunct. As with `warn_if_index_locked`,
 /// `quiet` gates printing, never probing.
-fn ensure_index_unlocked_for_replace(
+///
+/// The gate also TAKES the lock and hands the guard back, instead of only
+/// probing it. Probing alone excluded nothing among CLI runs: two concurrent
+/// `rebuild-index --confirm` invocations both saw a free lock, both entered the
+/// temp-file sweep (which deletes ANY `index.db.rebuild-*`, by design, to clear
+/// crashed runs), and the loser died with a bare SQLite `disk I/O error` —
+/// no corruption, thanks to the atomic rename, but nothing a user could act on
+/// (QA ISSUE-008). Holding the lock turns that collision into this function's
+/// existing, explanatory refusal. Keep the returned guard alive until the swap
+/// is complete; dropping it releases the lock.
+///
+/// Failure modes are kept asymmetric on purpose: a lock HELD by someone else
+/// refuses, but a lock we merely cannot open (read-only dir, exotic FS with no
+/// flock) proceeds unlocked exactly as before — this gate must not be the reason
+/// a rebuild that used to work stops working.
+#[must_use = "the returned guard holds the index lock; dropping it early reopens the race"]
+fn lock_index_for_replace(
     code_graph_dir: &Path,
     force: bool,
     quiet: bool,
-) -> Result<()> {
-    if !crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
-        return Ok(());
-    }
+) -> Result<Option<crate::mcp::server::IndexLockGuard>> {
     let lock = code_graph_dir.join("index.lock");
-    if !force {
-        anyhow::bail!(
-            "another process (likely a running MCP server) holds the index lock at {}. \
-             Replacing index.db now would leave that process writing into a deleted file — \
-             its indexing and embedding work would be lost silently, and its answers would \
-             stay on the pre-rebuild index until it restarts.\n  \
-             Stop the MCP server first (end the Claude Code session using this project), \
-             then rerun. Pass --force to replace the index anyway.",
+    let refuse_or_force = |quiet: bool| -> Result<()> {
+        if !force {
+            anyhow::bail!(
+                "another process (a running MCP server, or a concurrent rebuild-index / \
+                 reindex) holds the index lock at {}. \
+                 Replacing index.db now would leave that process writing into a deleted file — \
+                 its indexing and embedding work would be lost silently, and its answers would \
+                 stay on the pre-rebuild index until it restarts.\n  \
+                 Stop the MCP server first (end the Claude Code session using this project) \
+                 or wait for the other rebuild to finish, then rerun. Pass --force to replace \
+                 the index anyway.",
+                lock.display()
+            );
+        }
+        tracing::warn!(
+            "--force: replacing index.db while another process holds {} — its pending writes will be lost",
             lock.display()
         );
+        if !quiet {
+            eprintln!(
+                "[code-graph] --force: another process holds the index lock at {}. \
+                 Replacing the index anyway — that process's pending writes will be lost.",
+                lock.display()
+            );
+        }
+        Ok(())
+    };
+
+    if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+        refuse_or_force(quiet)?;
+        return Ok(None);
     }
-    tracing::warn!(
-        "--force: replacing index.db while another process holds {} — its pending writes will be lost",
-        lock.display()
-    );
-    if !quiet {
-        eprintln!(
-            "[code-graph] --force: another process holds the index lock at {}. \
-             Replacing the index anyway — that process's pending writes will be lost.",
-            lock.display()
-        );
+    // Free a moment ago — claim it, so a rebuild starting now refuses instead of
+    // racing us. Losing this acquisition means someone took it in between, which
+    // is the same situation as the probe above; anything else (open error) is a
+    // non-answer and must not block the run.
+    match crate::mcp::server::acquire_index_lock_guard(code_graph_dir) {
+        Some(guard) => Ok(Some(guard)),
+        None if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) => {
+            refuse_or_force(quiet)?;
+            Ok(None)
+        }
+        None => {
+            tracing::warn!(
+                "could not take the index lock at {} (it is not held by anyone) — proceeding unlocked",
+                lock.display()
+            );
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
+    cmd_incremental_index_opts(project_root, quiet, no_embed, false)
+}
+
+/// `cmd_incremental_index` plus the `--json` switch, split out the same way
+/// `cmd_health_check_opts` is: the three-positional-bool entry point has a dozen
+/// call sites (tests included) that have no opinion about output format.
+pub fn cmd_incremental_index_opts(
+    project_root: &Path,
+    quiet: bool,
+    no_embed: bool,
+    json: bool,
+) -> Result<()> {
+    let started = std::time::Instant::now();
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR), quiet);
     // Covers the incremental path too, not just the full-index one inside
@@ -1035,7 +1126,11 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -
         if !quiet {
             eprintln!("No index found, creating full index...");
         }
-        return build_full_index_at(&db_path, project_root, quiet, no_embed);
+        let result = build_full_index_at(&db_path, project_root, quiet, no_embed)?;
+        if json {
+            emit_index_json("full", &result, started);
+        }
+        return Ok(());
     }
 
     cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
@@ -1062,6 +1157,9 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -
     warn_parse_errors(&stats.stats, quiet);
 
     finish_embedding(&db, quiet, no_embed)?;
+    if json {
+        emit_index_json("incremental", &stats, started);
+    }
     Ok(())
 }
 
@@ -1097,9 +1195,14 @@ pub struct RebuildIndexArgs {
     /// writes are lost — stop the MCP server instead when you can).
     #[arg(long)]
     pub force: bool,
+    /// Print the rebuild's counters as one JSON object on stdout, after the
+    /// atomic swap has succeeded (progress stays on stderr).
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<()> {
+    let started = std::time::Instant::now();
     let confirm = args.confirm;
     let quiet = args.quiet;
     let no_embed = args.no_embed;
@@ -1123,8 +1226,11 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     }
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
     let db_path = code_graph_dir.join("index.db");
-    // Before any work: refuse to rename over an index another process has open.
-    ensure_index_unlocked_for_replace(&code_graph_dir, args.force, quiet)?;
+    // Before any work: refuse to rename over an index another process has open,
+    // and hold the lock for the whole rebuild so a concurrent one refuses here
+    // rather than colliding in the temp sweep below. `_index_lock` must stay
+    // bound to the end of the function — `let _ = …` would drop it immediately.
+    let _index_lock = lock_index_for_replace(&code_graph_dir, args.force, quiet)?;
 
     // Atomic rebuild: build the fresh index into a temp file in the SAME dir,
     // then rename it over index.db in one syscall. Concurrent readers (a second
@@ -1166,10 +1272,13 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     // index.db intact — the rename below is the only mutation of the live index,
     // so a failed rebuild no longer leaves the user with NO index (the old
     // remove-first path did).
-    if let Err(e) = build_full_index_at(&temp_path, project_root, quiet, no_embed) {
-        remove_all(&temp_files);
-        return Err(e);
-    }
+    let result = match build_full_index_at(&temp_path, project_root, quiet, no_embed) {
+        Ok(result) => result,
+        Err(e) => {
+            remove_all(&temp_files);
+            return Err(e);
+        }
+    };
     // The temp DB closed cleanly inside build_full_index_at (WAL checkpointed);
     // remove any residual temp -wal/-shm so the renamed file is self-contained.
     remove_all(&temp_files[1..]);
@@ -1182,6 +1291,11 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
 
     // Atomic swap (temp and index.db share .code-graph/ → POSIX rename is atomic).
     std::fs::rename(&temp_path, &db_path)?;
+    // After the swap, never before: until the rename lands, the counters describe
+    // a temp file the user cannot query.
+    if args.json {
+        emit_index_json("rebuild", &result, started);
+    }
     Ok(())
 }
 
@@ -1545,9 +1659,15 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
     // so leaving the field out re-created the "NO download has ever been
     // attempted" contradiction one surface over (ISSUE-011's sibling).
     #[cfg(feature = "embed-model")]
-    let model_files_present = crate::embedding::model::EmbeddingModel::model_files_present();
+    let model_files_state = crate::embedding::model::EmbeddingModel::model_files_state();
     #[cfg(not(feature = "embed-model"))]
-    let model_files_present = false;
+    let model_files_state = "absent";
+    // `present` stays the coarse "something is on disk" bool the plugin already
+    // reads; `state` says whether this build will actually use it. Advice keyed
+    // on `present` alone told an offline user who hand-filled the platform cache
+    // to restart the MCP server — a restart that re-downloads instead (review
+    // NOTE-7).
+    let model_files_present = model_files_state != "absent";
 
     // Snapshot metadata block — reads keys written by `snapshot install`.
     let snapshot_url =
@@ -1632,6 +1752,7 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 json["model_download"] = serde_json::json!(s);
             }
             json["model_files_present"] = serde_json::json!(model_files_present);
+            json["model_files_state"] = serde_json::json!(model_files_state);
             if let Some(ref r) = resolution {
                 json["resolution"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
             }
@@ -1716,9 +1837,19 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 // is probed once above (shared with the JSON arm); the marker
                 // only disambiguates the truly-absent case ("never attempted"
                 // vs "attempted and failed").
-                let pending_detail = if model_files_present {
+                let pending_detail = if model_files_state == "ready" {
                     "model files present but not loaded in this process — vector \
                      search activates in the MCP server (embeddings backfill there)"
+                        .to_string()
+                } else if model_files_present {
+                    // Weights are in the platform cache but carry no current
+                    // `.model-id` marker, so the server will re-download rather
+                    // than adopt them. Saying "restart" here would send an offline
+                    // user through a restart that cannot succeed.
+                    "model files are on disk in the cache dir but are not verified as \
+                     this build's pinned weights — the MCP server re-downloads them on \
+                     next start (needs network). To use hand-placed weights offline, \
+                     point CODE_GRAPH_MODEL_DIR at them instead"
                         .to_string()
                 } else {
                     match model_download.as_deref() {
@@ -9052,6 +9183,10 @@ pub struct ReindexArgs {
     /// index lock (its pending writes are lost).
     #[arg(long)]
     pub force: bool,
+    /// Print the resulting index run's counters as one JSON object on stdout
+    /// (progress and snapshot notices stay on stderr).
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
@@ -9065,11 +9200,18 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     let no_embed = args.no_embed;
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
 
+    // Held across the unlink AND the snapshot install — the whole window in
+    // which index.db is missing or half-landed — then released explicitly before
+    // the incremental step below. It cannot stay held through that call:
+    // `cmd_incremental_index` probes the same lock, and flock is per open file
+    // DESCRIPTION, so our own guard would answer "another process holds it" and
+    // print a warning about ourselves.
+    let mut index_lock: Option<crate::mcp::server::IndexLockGuard> = None;
     if from_snapshot && cg_dir.exists() {
         // Same door as `rebuild-index`: unlinking index.db under a running
-        // server strands its open fd on the deleted inode (audit P1-3). Checked
+        // server strands its open fd on the deleted inode (audit P1-3). Taken
         // BEFORE the removal so a refusal leaves the index untouched.
-        ensure_index_unlocked_for_replace(&cg_dir, args.force, false)?;
+        index_lock = lock_index_for_replace(&cg_dir, args.force, false)?;
         // Remove just index.db + WAL files; leave usage.jsonl etc. intact.
         for name in ["index.db", "index.db-wal", "index.db-shm"] {
             let _ = std::fs::remove_file(cg_dir.join(name));
@@ -9081,7 +9223,8 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
             match crate::snapshot::try_install(&url, project_root) {
                 Ok(commit) => {
                     eprintln!("Snapshot installed at commit {commit}");
-                    return cmd_incremental_index(project_root, false, no_embed);
+                    drop(index_lock);
+                    return cmd_incremental_index_opts(project_root, false, no_embed, args.json);
                 }
                 Err(e) => eprintln!("Snapshot install failed ({e}), falling back to full index"),
             }
@@ -9090,7 +9233,8 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
         }
     }
 
-    cmd_incremental_index(project_root, false, no_embed)
+    drop(index_lock);
+    cmd_incremental_index_opts(project_root, false, no_embed, args.json)
 }
 
 #[cfg(test)]
@@ -11224,6 +11368,7 @@ mod tests {
                 quiet: false,
                 no_embed: true,
                 force: false,
+                json: false,
             },
         )
         .expect_err("a held index lock must block the rename");
@@ -11257,6 +11402,7 @@ mod tests {
                 quiet: true,
                 no_embed: true,
                 force: false,
+                json: false,
             },
         )
         .expect_err("--quiet must silence output, not the check");
@@ -11279,6 +11425,7 @@ mod tests {
                 quiet: true,
                 no_embed: true,
                 force: true,
+                json: false,
             },
         )
         .expect("--force must override the refusal");
@@ -11306,6 +11453,7 @@ mod tests {
                 from_snapshot: true,
                 no_embed: true,
                 force: false,
+                json: false,
             },
         )
         .expect_err("a held index lock must block the unlink");
@@ -11339,8 +11487,160 @@ mod tests {
                 quiet: true,
                 no_embed: true,
                 force: false,
+                json: false,
             },
         )
         .expect("an unlocked index must rebuild without --force");
+    }
+
+    /// The gate has to EXCLUDE, not just observe. While it only probed, two
+    /// `rebuild-index --confirm` runs both read the lock as free, both entered
+    /// the `index.db.rebuild-*` temp sweep — which deletes any other run's
+    /// in-progress temp on purpose — and the loser died with a bare SQLite
+    /// `disk I/O error` (QA ISSUE-008).
+    #[cfg(unix)]
+    #[test]
+    fn lock_index_for_replace_claims_the_lock_it_reports_free() {
+        let (project, lock) = locked_project();
+        drop(lock);
+        let cg = project.path().join(CODE_GRAPH_DIR);
+        assert!(
+            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            "precondition: the lock must start free, else the claim below is unobservable"
+        );
+
+        let guard = lock_index_for_replace(&cg, false, true).unwrap();
+        assert!(
+            guard.is_some(),
+            "a free lock must be CLAIMED, not merely observed to be free"
+        );
+        assert!(
+            crate::mcp::server::other_process_holds_index_lock(&cg),
+            "while the guard is alive the lock must read as HELD — that is the whole \
+             difference between excluding a concurrent rebuild and warning about a server"
+        );
+
+        drop(guard);
+        assert!(
+            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            "the guard must release on drop, or one rebuild would poison every later run"
+        );
+    }
+
+    /// Release is platform-asymmetric and only one side is observable here.
+    /// On unix the flock dies with the handle and the FILE is kept on purpose —
+    /// deleting it would hand a concurrent holder's lock to a different inode.
+    /// On Windows the file IS the lock, so the guard must delete it; a stranded
+    /// dead-PID lock file would refuse every later rebuild and push every server
+    /// start into secondary read-only mode. Both arms assert the same end state
+    /// through the probe, which is the thing that actually has to be right.
+    #[test]
+    fn index_lock_guard_releases_on_drop_on_this_platform() {
+        // Deliberately does NOT use `locked_project()` — that fixture is unix-only
+        // (it takes a raw flock), and the arm this test exists for is the Windows
+        // one. Nothing here is platform-specific but the final assertion.
+        let project = tempfile::TempDir::new().unwrap();
+        let cg = project.path().join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&cg).unwrap();
+        assert!(
+            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            "precondition: a fresh project has no lock"
+        );
+
+        let guard = crate::mcp::server::acquire_index_lock_guard(&cg)
+            .expect("a free lock must be acquirable");
+        assert!(
+            crate::mcp::server::other_process_holds_index_lock(&cg),
+            "precondition: the guard must actually hold the lock"
+        );
+        drop(guard);
+
+        assert!(
+            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            "the lock must read as FREE after the guard drops, or one CLI rebuild \
+             poisons every later run on this machine"
+        );
+        #[cfg(unix)]
+        assert!(
+            cg.join("index.lock").exists(),
+            "unix keeps the file (flock lives on the inode); removing it would \
+             break mutual exclusion with a concurrent holder"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !cg.join("index.lock").exists(),
+            "non-unix must remove the file — its existence IS the lock"
+        );
+    }
+
+    /// The third arm: the lock is not HELD, it simply cannot be opened. That arm
+    /// decides a rebuild proceeds UNLOCKED, so a wrong verdict here either bricks
+    /// a rebuild that used to work (if it refused) or silently drops the
+    /// exclusion. Reached with a read-only `.code-graph/`, which is also why the
+    /// asymmetry exists: refusing would make this gate the reason the command
+    /// stopped working, on a directory whose permissions have nothing to do with
+    /// concurrency.
+    #[cfg(unix)]
+    #[test]
+    fn lock_index_for_replace_proceeds_when_the_lock_file_cannot_be_opened() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let (project, lock) = locked_project();
+        drop(lock);
+        let cg = project.path().join(CODE_GRAPH_DIR);
+        std::fs::remove_file(cg.join("index.lock")).unwrap();
+        let original = std::fs::metadata(&cg).unwrap().permissions();
+        std::fs::set_permissions(&cg, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = lock_index_for_replace(&cg, false, true);
+
+        // Restore before asserting so a failure still leaves a removable TempDir.
+        std::fs::set_permissions(&cg, original).unwrap();
+        let guard = outcome.expect("an unopenable lock file must not refuse the replace");
+        assert!(
+            guard.is_none(),
+            "nothing was locked, so no guard can be handed back"
+        );
+    }
+
+    /// End of the same story, at the command level: with rebuild #1's guard held,
+    /// rebuild #2 gets the explanatory refusal instead of a SQLite error, and the
+    /// refusal names the concurrent-rebuild case (the old text blamed only "a
+    /// running MCP server", which was never true here).
+    #[cfg(unix)]
+    #[test]
+    fn a_second_rebuild_refuses_while_the_first_holds_the_lock() {
+        let (project, lock) = locked_project();
+        drop(lock);
+        let cg = project.path().join(CODE_GRAPH_DIR);
+        // Stand-in for rebuild #1: the exact guard cmd_rebuild_index now keeps
+        // alive for the length of its run.
+        let _first = lock_index_for_replace(&cg, false, true)
+            .unwrap()
+            .expect("rebuild #1 must get the lock");
+
+        let err = cmd_rebuild_index(
+            project.path(),
+            RebuildIndexArgs {
+                confirm: true,
+                quiet: true,
+                no_embed: true,
+                force: false,
+                json: false,
+            },
+        )
+        .expect_err("rebuild #2 must refuse while #1 holds the lock");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("holds the index lock"),
+            "the refusal must name the cause: {msg}"
+        );
+        assert!(
+            msg.contains("rebuild-index"),
+            "the refusal must cover the concurrent-CLI case, not just the MCP server: {msg}"
+        );
     }
 }

@@ -160,6 +160,24 @@ test('classifyEmbeddings reports the real download outcome, not "retry shortly" 
   assert.equal(present.status, 'warn');
   assert.match(present.detail, /model files present/);
   assert.doesNotMatch(present.detail, /NO download has ever been attempted/);
+
+  // ≥0.116 splits that bool. `ready` keeps the restart advice…
+  const ready = classifyEmbeddings({ ...base, model_files_present: true, model_files_state: 'ready' });
+  assert.match(ready.detail, /restart the MCP server/);
+
+  // …but `unverified` (weights hand-placed in the platform CACHE dir, no current
+  // .model-id) must NOT advise a restart: the server re-downloads instead, so the
+  // restart cannot help the offline user who put them there.
+  const unverified = classifyEmbeddings({ ...base, model_files_present: true, model_files_state: 'unverified' });
+  assert.equal(unverified.status, 'warn');
+  assert.match(unverified.detail, /re-downloads on next start/);
+  assert.match(unverified.detail, /CODE_GRAPH_MODEL_DIR/);
+  assert.doesNotMatch(unverified.detail, /restart the MCP server/);
+
+  // Absent state must still reach the download-history diagnosis, not the
+  // files-on-disk branch.
+  const absent = classifyEmbeddings({ ...base, model_files_present: false, model_files_state: 'absent' });
+  assert.match(absent.detail, /NO download has ever been attempted/);
 });
 
 test('classifyEmbeddings WARNS when binary lacks embed-model feature', () => {

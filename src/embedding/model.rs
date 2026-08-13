@@ -1,6 +1,49 @@
 // Re-export from domain (canonical source)
 pub use crate::domain::EMBEDDING_DIM;
 
+/// Marker file recording which model content a model dir holds. Written by
+/// `verify_model_dir` only after the weights hash AND the companion files check
+/// pass, so its presence means "this exact build blessed this directory".
+pub const MODEL_ID_MARKER: &str = ".model-id";
+
+/// Pure core of `EmbeddingModel::model_files_state` — `"absent"`, `"unverified"`
+/// or `"ready"` for one candidate directory.
+///
+/// Lives outside the `embed-model` gate deliberately: the decision is path logic
+/// with no tensor in it, and gating it would leave the branch that produces
+/// user-facing advice testable only in the heavyweight feature build — which is
+/// how the advice drifted from what the downloader actually does in the first
+/// place.
+///
+/// `is_platform_cache` is the whole subtlety. Weights in the platform cache dir
+/// are subject to the downloader's currency check, so ones that do not match this
+/// build get replaced on the next server start rather than used. Weights anywhere
+/// else — `CODE_GRAPH_MODEL_DIR`, `cwd/models`, `exe/models`, the documented
+/// offline routes — are loaded as-is and are therefore `ready` whatever marker
+/// they carry.
+pub fn model_files_state_for(
+    dir: &std::path::Path,
+    is_platform_cache: bool,
+    expected_model_id: &str,
+    companion_files: &[&str],
+) -> &'static str {
+    if !dir.join("model.safetensors").exists() {
+        return "absent";
+    }
+    if !is_platform_cache {
+        return "ready";
+    }
+    let companions_present = companion_files.iter().all(|f| dir.join(f).exists());
+    let marker_current = std::fs::read_to_string(dir.join(MODEL_ID_MARKER))
+        .map(|id| id.trim() == expected_model_id)
+        .unwrap_or(false);
+    if companions_present && marker_current {
+        "ready"
+    } else {
+        "unverified"
+    }
+}
+
 #[cfg(feature = "embed-model")]
 mod inner {
     use anyhow::Result;
@@ -216,7 +259,9 @@ mod inner {
             "8087e9bf97c265f8435ed268733ecf3791825ad24850fd5d84d89e32ee3a589a";
 
         /// Marker file recording which model content the cache dir holds.
-        const MODEL_ID_MARKER: &'static str = ".model-id";
+        /// Defined outside the feature gate so the ungated state probe
+        /// (`super::model_files_state_for`) reads the same filename.
+        const MODEL_ID_MARKER: &'static str = super::MODEL_ID_MARKER;
 
         /// Files the loader (`load_model_data`) reads BEYOND the hash-pinned weights.
         /// A cache dir with correct `model.safetensors` but missing either of these is
@@ -606,6 +651,43 @@ mod inner {
             Self::find_models_dir().is_ok()
         }
 
+        /// What the on-disk weights will actually DO for this build — `"absent"`,
+        /// `"unverified"`, or `"ready"`.
+        ///
+        /// `model_files_present` answers "is there a model.safetensors somewhere",
+        /// which is the wrong question for the advice built on top of it. Files in
+        /// the platform CACHE dir are additionally gated by the downloader's
+        /// currency check (`cached_model_is_current`): weights that do not match
+        /// this binary's pinned content are re-downloaded on the next server start,
+        /// so telling an OFFLINE user who hand-filled that directory to "restart the
+        /// MCP server" sends them through a restart that cannot help. Weights found
+        /// anywhere else (CODE_GRAPH_MODEL_DIR, cwd/models, exe/models — the
+        /// documented offline routes) are NOT gated: the loader takes them as they
+        /// are, so they report `ready`.
+        ///
+        /// O(1) on purpose — marker plus companion `exists()` calls, never a hash.
+        /// This runs on the health-check path, which hooks and the statusline call
+        /// often; blake3 over ~80 MB of weights on every poll is not acceptable
+        /// there, and the one place that legitimately hashes (the downloader) writes
+        /// the marker that makes this check cheap forever after. A correct but
+        /// not-yet-blessed cache therefore reads `unverified` until the next server
+        /// start blesses it — pessimistic in exactly the direction that cannot
+        /// mislead someone into a no-op restart.
+        pub fn model_files_state() -> &'static str {
+            let Ok(dir) = Self::find_models_dir() else {
+                return "absent";
+            };
+            let is_cache = Self::cache_models_dir()
+                .map(|cache| cache == dir)
+                .unwrap_or(false);
+            super::model_files_state_for(
+                &dir,
+                is_cache,
+                Self::MODEL_CONTENT_BLAKE3,
+                &Self::REQUIRED_COMPANION_FILES,
+            )
+        }
+
         fn find_models_dir() -> Result<std::path::PathBuf> {
             // 0. User-configured model directory (highest priority)
             if let Ok(custom_dir) = std::env::var("CODE_GRAPH_MODEL_DIR") {
@@ -832,6 +914,58 @@ fn l2_normalize(v: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Health-check advice used to key on "is there a model.safetensors", and
+    /// answered "restart the MCP server" for weights the server will REPLACE.
+    /// Hand-filling the platform cache is the offline user's move, and it is the
+    /// one place a restart re-downloads instead of adopting — so the cache dir is
+    /// the only location where a missing/stale `.model-id` downgrades the answer.
+    #[test]
+    fn model_files_state_separates_usable_weights_from_ones_that_get_replaced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path();
+        const ID: &str = "deadbeef";
+        const COMPANIONS: [&str; 2] = ["tokenizer.json", "config.json"];
+
+        assert_eq!(
+            model_files_state_for(p, true, ID, &COMPANIONS),
+            "absent",
+            "no weights at all"
+        );
+
+        std::fs::write(p.join("model.safetensors"), b"w").unwrap();
+        // Hand-placed in the CACHE dir: no marker, so the downloader will not
+        // adopt these.
+        assert_eq!(
+            model_files_state_for(p, true, ID, &COMPANIONS),
+            "unverified"
+        );
+        // The SAME directory reached through CODE_GRAPH_MODEL_DIR / cwd/models is
+        // loaded as-is — this is the control that keeps the check about the cache
+        // gate rather than about markers in general.
+        assert_eq!(model_files_state_for(p, false, ID, &COMPANIONS), "ready");
+
+        // A marker alone is not enough: the loader also needs the companions, and
+        // verify_model_dir refuses to write the marker without them.
+        std::fs::write(p.join(MODEL_ID_MARKER), ID).unwrap();
+        assert_eq!(
+            model_files_state_for(p, true, ID, &COMPANIONS),
+            "unverified",
+            "marker without companions must not read as ready"
+        );
+        for f in COMPANIONS {
+            std::fs::write(p.join(f), b"{}").unwrap();
+        }
+        assert_eq!(model_files_state_for(p, true, ID, &COMPANIONS), "ready");
+
+        // A marker from a DIFFERENT build is the stale-cache case the downloader
+        // re-downloads for; it must not read as ready either.
+        std::fs::write(p.join(MODEL_ID_MARKER), "some-older-release").unwrap();
+        assert_eq!(
+            model_files_state_for(p, true, ID, &COMPANIONS),
+            "unverified"
+        );
+    }
 
     #[test]
     fn test_model_loads_gracefully() {

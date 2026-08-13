@@ -1172,3 +1172,115 @@ fn js_test_files_neutralize_claude_config_dir() {
         offenders.join("\n  ")
     );
 }
+
+/// The `ignored_arguments` disclosure tells an LLM caller "this argument did
+/// nothing". That claim is sound only while the set of arguments the handlers
+/// READ matches the set the published schema DECLARES, plus the exemptions in
+/// `HONORED_UNDECLARED_ARGS` (src/mcp/server/mod.rs). A handler that starts
+/// reading a new undeclared key silently breaks it — the pre-tag review of
+/// v0.116.0 found two such keys already live (`function_name`, `skip_indexing`),
+/// each of which the first version of the feature reported as ignored while it
+/// was in force.
+///
+/// This pins the whole read-but-undeclared set. Adding one fails here until the
+/// author decides which it is: declare it in the schema, exempt it in
+/// `HONORED_UNDECLARED_ARGS`, or confirm its tool publishes no schema at all
+/// (`confirm` / `min_lines` / `ignore_paths` are that third case — their tools
+/// are skipped before the exemption list is consulted).
+#[test]
+fn test_no_new_undeclared_mcp_args() {
+    fn read_keys(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                read_keys(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for line in src.lines() {
+                // Comments name these keys while EXPLAINING them (including the
+                // one in advanced.rs that spells the bracket form verbatim), so a
+                // whole-file scan reports prose as code.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                let bytes = line.as_bytes();
+                // Match `args.get("key")` and `args["key"]`.
+                for (idx, _) in line.match_indices("args") {
+                    let rest = &line[idx + 4..];
+                    let key = if let Some(r) = rest.strip_prefix(".get(\"") {
+                        r.split('"').next()
+                    } else if let Some(r) = rest.strip_prefix("[\"") {
+                        r.split('"').next()
+                    } else {
+                        None
+                    };
+                    // Skip identifiers ENDING in "args" (dead_args, dep_args …):
+                    // those are locally-built payloads, not caller input.
+                    let preceded_by_ident = idx > 0
+                        && matches!(bytes[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+                    if let (Some(k), false) = (key, preceded_by_ident) {
+                        out.insert(k.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut read: std::collections::BTreeSet<String> = Default::default();
+    read_keys(&root.join("src/mcp/server"), &mut read);
+    assert!(
+        read.len() > 10,
+        "the scan found only {} argument reads — the match pattern has drifted \
+         and this guard is now vacuous",
+        read.len()
+    );
+
+    let tools_rs = std::fs::read_to_string(root.join("src/mcp/tools.rs")).unwrap();
+    // Declared property names look like `"name": { "type":` in the json! schemas.
+    let declared: std::collections::BTreeSet<String> = tools_rs
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let name = t.strip_prefix('"')?.split('"').next()?;
+            let after = t.strip_prefix(&format!("\"{name}\""))?.trim_start();
+            let after = after.strip_prefix(':')?.trim_start();
+            after
+                .strip_prefix('{')
+                .filter(|r| r.trim_start().starts_with("\"type\""))
+                .map(|_| name.to_string())
+        })
+        .collect();
+    assert!(
+        declared.contains("symbol_name") && declared.contains("query"),
+        "schema-property scan drifted (got {} names) — guard would be vacuous",
+        declared.len()
+    );
+
+    let undeclared: Vec<&str> = read
+        .iter()
+        .filter(|k| !declared.contains(*k))
+        .map(|s| s.as_str())
+        .collect();
+    // Pinned set as of v0.116.0. `function_name` + `skip_indexing` are exempted
+    // in HONORED_UNDECLARED_ARGS; the other three belong to schema-less tools.
+    let expected = [
+        "confirm",
+        "function_name",
+        "ignore_paths",
+        "min_lines",
+        "skip_indexing",
+    ];
+    assert_eq!(
+        undeclared, expected,
+        "the set of MCP arguments read but not declared in the published schema \
+         changed. Each entry must be one of: declared in src/mcp/tools.rs, listed \
+         in HONORED_UNDECLARED_ARGS (src/mcp/server/mod.rs), or read only by a \
+         tool that publishes no schema. Update this pin once classified."
+    );
+}

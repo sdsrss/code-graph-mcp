@@ -45,12 +45,25 @@ function classifyEmbeddings(hc) {
     // health-check --json ≥0.115): the npm plugin installs them without the
     // marker, so "never attempted" would contradict the filesystem — the only
     // missing step then is a server session to load them.
+    //
+    // `model_files_state` (≥0.116) splits that bool, because "on disk" did not
+    // imply "will be used": weights hand-placed in the platform CACHE dir carry
+    // no current `.model-id`, so the server re-downloads instead of adopting
+    // them, and "restart the MCP server" was advice that could not work for the
+    // offline user most likely to have hand-placed them. Older binaries omit the
+    // field; there `present` keeps its previous meaning.
+    const filesReady = hc && (hc.model_files_state
+      ? hc.model_files_state === 'ready'
+      : !!hc.model_files_present);
+    const filesUnverified = !!(hc && hc.model_files_state === 'unverified');
     const why = (hc && hc.embedding_status === 'pending')
-      ? (hc.model_files_present
+      ? (filesReady
           ? 'model files present but not loaded — restart the MCP server (embeddings backfill there)'
-          : hc.model_download
-            ? `last model download: ${hc.model_download}`
-            : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
+          : filesUnverified
+            ? 'model files are in the cache dir but are not this build\'s pinned weights — the server re-downloads on next start (needs network); for offline use point CODE_GRAPH_MODEL_DIR at them instead (see README → Offline usage)'
+            : hc.model_download
+              ? `last model download: ${hc.model_download}`
+              : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
       : `embedding_status=${(hc && hc.embedding_status) || 'unknown'}`;
     return { name: 'Embeddings', status: 'warn',
       detail: `vector INACTIVE — ${total} embeddable nodes, 0 embedded; semantic search is FTS5-only (${why})` };

@@ -367,9 +367,16 @@ pub(super) fn extract_python_route(
     // Flask `@app.route('/x', methods=['GET'])`: the decorator name is the
     // generic `.route`, so the verb lives in the `methods=` kwarg. Without
     // this, every Flask route was "ANY" and `trace 'GET /x'` (exact-method
-    // filter) matched nothing. No methods= kwarg → "ANY" (unspecified).
+    // filter) matched nothing.
+    //
+    // No `methods=` kwarg → GET, because that IS the framework default (Flask
+    // and Starlette both default `methods` to `["GET"]`; HEAD and OPTIONS are
+    // auto-derived from it). The earlier "ANY" wildcard fixed the false
+    // negative by buying a false positive: `trace 'DELETE /x'` matched a route
+    // that answers 405. HEAD/OPTIONS on a bare `@app.route` remain a knowingly
+    // unmodelled approximation — the metadata schema holds one verb.
     else {
-        parse_flask_methods_kwarg(dec_text).unwrap_or_else(|| "ANY".into())
+        parse_flask_methods_kwarg(dec_text).unwrap_or_else(|| "GET".into())
     };
 
     let metadata = serde_json::json!({"method": method, "path": path}).to_string();
@@ -385,9 +392,10 @@ pub(super) fn extract_python_route(
 
 /// Extract the first HTTP method from a Flask `methods=['GET', 'POST']` kwarg in
 /// an `@app.route(...)` decorator. Returns None when no `methods=` kwarg is
-/// present (caller falls back to "ANY"). The scan is confined to the bracketed
-/// list literal, so a path segment like `/get-methods` cannot be mistaken for a
-/// verb; the failure mode is always None → "ANY". The single-method metadata
+/// present (caller falls back to Flask's own default, "GET"). The scan is
+/// confined to the bracketed list literal, so a path segment like
+/// `/get-methods` cannot be mistaken for a
+/// verb; the failure mode is always None → "GET". The single-method metadata
 /// schema stores the first listed method when several are given.
 fn parse_flask_methods_kwarg(dec_text: &str) -> Option<String> {
     let after_kw = dec_text.split_once("methods").map(|(_, rest)| rest)?;

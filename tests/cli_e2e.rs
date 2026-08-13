@@ -3094,7 +3094,17 @@ fn test_cli_grep_sigpipe_graceful() {
 // return path. Pre-closing the pipe's read end before spawn makes the child's
 // FIRST stdout write hit EPIPE deterministically — no output-size or timing
 // dependence, so small-output commands like health-check are testable too.
-#[cfg(unix)]
+//
+// Deliberately NOT `#[cfg(unix)]`: `std::io::pipe()` is cross-platform, and the
+// Windows half of the contract is the part that was only ever reasoned about.
+// A dead reader there yields ERROR_NO_DATA (232) or ERROR_BROKEN_PIPE (109),
+// not Unix EPIPE (32), and Windows renders the text through a LOCALIZED
+// FormatMessage — which is why `install_stdout_epipe_panic_hook` matches std's
+// untranslated "(os error N)" suffix instead of the message. The forbidden
+// tokens below are split by platform: "Broken pipe" is the live one on Unix and
+// inert on Windows, "os error 232"/"109" the reverse; "panicked" is live on both
+// and catches a hook that fails to absorb the panic at all. Windows is in the
+// ci.yml matrix, so both arms really execute.
 #[test]
 fn test_cli_sigpipe_graceful_non_grep_commands() {
     let project = setup_indexed_project();
@@ -3111,7 +3121,10 @@ fn test_cli_sigpipe_graceful_non_grep_commands() {
         let out = child.wait_with_output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !err.contains("Broken pipe") && !err.contains("panicked"),
+            !err.contains("panicked")
+                && !err.contains("Broken pipe")
+                && !err.contains("os error 232")
+                && !err.contains("os error 109"),
             "{cmd:?}: EPIPE must be silent like grep, got stderr: {err:?}"
         );
         assert_eq!(
@@ -5322,11 +5335,14 @@ fn test_cli_trace_no_routes() {
     );
 }
 
-// Stored wildcard methods must satisfy any requested verb: Flask
-// `@app.route('/x')` without `methods=` is stored as "ANY" and Go net/http
-// HandleFunc as "ALL" — exact-equality filtering made `trace 'GET /x'` miss
-// both (while bare `trace /x` matched), and the no-match hint then wrongly
-// blamed framework coverage.
+// A requested verb must reach the routes that really answer it. Go net/http
+// HandleFunc genuinely serves every verb and is stored as the "ALL" wildcard —
+// exact-equality filtering made `trace 'GET /health'` miss it (while bare
+// `trace /health` matched) and the no-match hint then wrongly blamed framework
+// coverage. Flask `@app.route('/x')` without `methods=` is NOT that case: it
+// serves GET only, so it is stored as GET and a DELETE request must not match
+// it. The two halves of this test are each other's control — same code path,
+// opposite expectation on a non-GET verb.
 #[test]
 fn test_cli_trace_verb_matches_wildcard_method_routes() {
     let project = TempDir::new().unwrap();
@@ -5346,12 +5362,32 @@ fn test_cli_trace_verb_matches_wildcard_method_routes() {
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
 
     let (stdout, stderr, code) = run_cli(&project, &["trace", "GET /orders"]);
-    assert_eq!(code, 0, "ANY-stored Flask route must match GET: {stderr}");
+    assert_eq!(
+        code, 0,
+        "Flask route without methods= must match its default verb GET: {stderr}"
+    );
     assert!(stdout.contains("list_orders"), "got: {stdout}");
 
     let (stdout2, stderr2, code2) = run_cli(&project, &["trace", "GET /health"]);
     assert_eq!(code2, 0, "ALL-stored Go route must match GET: {stderr2}");
     assert!(stdout2.contains("healthHandler"), "got: {stdout2}");
+
+    // Precision: Flask answers 405 for DELETE on a bare `@app.route`, so trace
+    // must not claim it. Before the GET default this route was stored "ANY" and
+    // matched here — a false positive that the GET assertion above cannot see.
+    let (_, _, code_del) = run_cli(&project, &["trace", "DELETE /orders"]);
+    assert_eq!(
+        code_del, 1,
+        "bare @app.route serves GET only; DELETE must not match it"
+    );
+    // Control on the same code path: Go's HandleFunc really does serve DELETE,
+    // so the wildcard arm must still match — proving the assertion above is
+    // about the stored verb, not about DELETE being filtered everywhere.
+    let (stdout_del2, _, code_del2) = run_cli(&project, &["trace", "DELETE /health"]);
+    assert_eq!(
+        code_del2, 0,
+        "ALL-stored Go route must still match DELETE: {stdout_del2}"
+    );
 
     // A real verb mismatch must still filter: no wildcard was stored for an
     // explicit-method route, so this guard proves the wildcard isn't "match all".
@@ -5986,6 +6022,110 @@ fn test_cli_rebuild_index_help_exits_zero() {
     assert!(
         stdout.contains("Drop and rebuild") || stdout.contains("--confirm"),
         "help should describe the command; got: {stdout:?}"
+    );
+}
+
+// `--json` on the index family used to be a clap parse error (exit 2), so a CI
+// script could learn nothing structured about an index run — the counters only
+// ever existed as English on stderr. One object on stdout per successful run,
+// with `mode` naming the path that ACTUALLY ran rather than the subcommand
+// typed: the same `incremental-index` invocation is a full index on a fresh
+// checkout and an incremental one a second later.
+#[test]
+fn test_cli_index_family_json_summary() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("a.ts"),
+        "export function alpha(): number { return 1; }\n",
+    )
+    .unwrap();
+
+    let parse_one = |stdout: &str, label: &str| -> serde_json::Value {
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{label}: stdout must be exactly one JSON object ({e}); got: {stdout:?}")
+        })
+    };
+
+    // Before `git init`: the no-anchor guard exits 0 WITHOUT indexing. That leg
+    // must still answer in JSON — a successful exit with 0 bytes on stdout is a
+    // parse error for the consumer, not an empty result.
+    let (stdout_skip, _, code_skip) =
+        run_cli(&project, &["incremental-index", "--json", "--no-embed"]);
+    assert_eq!(code_skip, 0, "the no-anchor guard exits 0 by design");
+    let skipped = parse_one(&stdout_skip, "no-anchor skip");
+    assert_eq!(skipped["mode"], "skipped", "got: {skipped}");
+    assert_eq!(skipped["files_indexed"], 0, "got: {skipped}");
+    assert!(
+        skipped["skipped"].as_str().unwrap_or("").contains(".git"),
+        "the skip must say why the counters are zero: {skipped}"
+    );
+
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+
+    // No index yet → the full path.
+    let (stdout, stderr, code) = run_cli(&project, &["incremental-index", "--json", "--no-embed"]);
+    assert_eq!(code, 0, "incremental-index --json failed: {stderr}");
+    let first = parse_one(&stdout, "first index");
+    assert_eq!(
+        first["mode"], "full",
+        "fresh checkout indexes fully: {first}"
+    );
+    assert!(
+        first["files_indexed"].as_u64().unwrap() >= 1,
+        "got: {first}"
+    );
+    assert!(
+        first["nodes_created"].as_u64().unwrap() >= 1,
+        "got: {first}"
+    );
+    assert!(first["edges_created"].is_number(), "got: {first}");
+    assert!(first["files_with_parse_errors"].is_number(), "got: {first}");
+    assert!(first["elapsed_ms"].is_number(), "got: {first}");
+
+    // Index exists → the incremental path, same object shape.
+    let (stdout2, _, code2) = run_cli(&project, &["incremental-index", "--json", "--no-embed"]);
+    assert_eq!(code2, 0);
+    let second = parse_one(&stdout2, "second index");
+    assert_eq!(
+        second["mode"], "incremental",
+        "an existing index refreshes incrementally: {second}"
+    );
+
+    let (stdout3, stderr3, code3) = run_cli(
+        &project,
+        &["rebuild-index", "--confirm", "--json", "--no-embed"],
+    );
+    assert_eq!(code3, 0, "rebuild-index --json failed: {stderr3}");
+    let rebuilt = parse_one(&stdout3, "rebuild");
+    assert_eq!(rebuilt["mode"], "rebuild", "got: {rebuilt}");
+    assert!(
+        rebuilt["files_indexed"].as_u64().unwrap() >= 1,
+        "a rebuild re-parses every file: {rebuilt}"
+    );
+
+    let (stdout4, stderr4, code4) = run_cli(&project, &["reindex", "--json", "--no-embed"]);
+    assert_eq!(code4, 0, "reindex --json failed: {stderr4}");
+    assert_eq!(
+        parse_one(&stdout4, "reindex")["mode"],
+        "incremental",
+        "plain reindex is an incremental refresh"
+    );
+}
+
+// Error leg of the same contract (the three-tier JSON rule): a failing index
+// command under --json must still put an object on stdout, or a consumer gets a
+// parse error where it expected a diagnosis. The --confirm gate is the reachable
+// failure here.
+#[test]
+fn test_cli_index_family_json_error_object() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["rebuild-index", "--json"]);
+    assert_eq!(code, 1, "missing --confirm is an exit-1 bail");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be a JSON error object ({e}); got: {stdout:?}"));
+    assert!(
+        parsed["error"].as_str().unwrap_or("").contains("--confirm"),
+        "the error object must carry the reason: {parsed}"
     );
 }
 

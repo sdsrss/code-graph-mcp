@@ -190,6 +190,9 @@ fn pid_is_alive(pid: u32) -> bool {
 /// Try to acquire the index lock (`.code-graph/index.lock`) using flock().
 /// Returns `Some(File)` holding the advisory lock if this process becomes the primary indexer.
 /// The lock is automatically released when the returned File is dropped.
+///
+/// CLI callers go through [`acquire_index_lock_guard`], which owns the
+/// platform-correct release; this raw form is the server's own acquisition.
 #[cfg(unix)]
 fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
@@ -288,6 +291,50 @@ fn release_index_lock(code_graph_dir: &Path) {
     let _ = std::fs::remove_file(code_graph_dir.join("index.lock"));
 }
 
+/// A held index lock with a platform-correct release, for callers that take the
+/// lock for a bounded operation rather than for a whole process lifetime — the
+/// CLI's wholesale-replace commands (`rebuild-index`, `reindex --from-snapshot`).
+///
+/// The two platforms release differently and getting it wrong is not symmetric:
+/// - **Unix**: the flock lives on the open file description, so dropping the
+///   handle releases it. The lock FILE is deliberately left in place; an
+///   unlocked `index.lock` reads as free, because
+///   [`other_process_holds_index_lock`] re-flocks it to decide. Deleting it here
+///   would be worse than useless — a concurrent holder's lock lives on the
+///   inode, so a later opener would create a NEW file and the two would stop
+///   excluding each other.
+/// - **Non-unix**: the lock IS the file's existence plus its PID content, so a
+///   guard that dropped only the handle would strand a lock file naming a dead
+///   PID. Until the OS reused that PID for nothing, every later `rebuild-index`
+///   would refuse and every server start would fall back to secondary
+///   read-only mode — the permanent-secondary fault class the 2026-08-02
+///   indexing audit logged, newly reachable from the CLI once it started taking
+///   this lock at all. So the file is removed on drop.
+pub(crate) struct IndexLockGuard {
+    _file: std::fs::File,
+    #[cfg(not(unix))]
+    code_graph_dir: std::path::PathBuf,
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        #[cfg(not(unix))]
+        release_index_lock(&self.code_graph_dir);
+    }
+}
+
+/// Take the index lock for a bounded operation. `None` means somebody else holds
+/// it, or the lock file could not be opened at all — the caller decides which
+/// (see `lock_index_for_replace` in the CLI, which re-probes to tell them apart).
+pub(crate) fn acquire_index_lock_guard(code_graph_dir: &Path) -> Option<IndexLockGuard> {
+    let file = try_acquire_index_lock(code_graph_dir)?;
+    Some(IndexLockGuard {
+        _file: file,
+        #[cfg(not(unix))]
+        code_graph_dir: code_graph_dir.to_path_buf(),
+    })
+}
+
 /// Non-destructively check whether ANOTHER process currently holds the index lock
 /// (`.code-graph/index.lock`). Used by CLI rebuild/incremental to warn before racing
 /// a running MCP server (which holds the flock for its whole lifetime). Best-effort:
@@ -329,6 +376,26 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
         Err(_) => false,
     }
 }
+
+/// Arguments the handlers genuinely HONOR but the published schema does not
+/// declare — `("*", arg)` for every tool, `(tool_name, arg)` for one.
+///
+/// `note_ignored_arguments` reports "the tool did nothing with this", and the
+/// schema is the wrong source of truth for that claim on its own: an honored
+/// argument that is merely undocumented would be reported as dropped while it is
+/// in force, which inverts the whole point of the disclosure. `function_name` is
+/// the live legacy alias for `get_call_graph`'s `symbol_name` (callgraph.rs) and
+/// `skip_indexing` is read by every tool through `should_skip_indexing`
+/// (helpers.rs) — a caller passing either gets the behaviour it asked for.
+///
+/// The other undeclared-but-read keys in this crate — `confirm` (rebuild_index),
+/// `min_lines` / `ignore_paths` (find_dead_code) — belong to tools with no
+/// published schema at all, which are skipped before this list is consulted, so
+/// listing them here would be dead configuration. `test_no_new_undeclared_mcp_args`
+/// in tests/hardening.rs pins that whole set: adding a handler that reads a new
+/// undeclared key fails there until it is classified here.
+const HONORED_UNDECLARED_ARGS: &[(&str, &str)] =
+    &[("*", "skip_indexing"), ("get_call_graph", "function_name")];
 
 use super::metrics::ErrKind;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -2701,7 +2768,86 @@ impl McpServer {
         // Centralized compression: safety net for any result exceeding the token threshold.
         // Handlers with custom compression (semantic_search, call_graph, http_chain, ast_node)
         // already return results with a "mode" key when compressed — those are left unchanged.
-        result.map(centralized_compress)
+        //
+        // The ignored-argument note is attached AFTER compression on purpose: every
+        // compaction path in this codebase is an explicit field allowlist, and a new
+        // top-level key that forgets to enrol in one gets silently dropped — the exact
+        // bug the v0.97.1 audit found for `deps`. Attaching last makes that impossible.
+        result
+            .map(centralized_compress)
+            .map(|value| self.note_ignored_arguments(name, args, value))
+    }
+
+    /// Name back any argument the tool does not declare, as
+    /// `"ignored_arguments": ["language", …]` on the result object.
+    ///
+    /// Undeclared members were dropped in silence, which is fine for a human
+    /// reading a schema and fatal for the actual caller here: an LLM that sent
+    /// `ast_search {"language": "banana"}` got the whole repo back and had no way
+    /// to tell it apart from a language-filtered answer, so it reported the wrong
+    /// scope downstream (QA ISSUE-015). Rejecting the call outright would be the
+    /// other defensible reading, but it breaks the lenient-extra-members
+    /// convention every JSON-RPC client relies on, and it would turn a mislabelled
+    /// answer into no answer at all. Disclosure keeps the call working and lets
+    /// the caller see what its argument did — none of it.
+    ///
+    /// Only tools that publish an inputSchema are covered — the 7 in the registry,
+    /// plus `read_snippet`, which is a pure rename of `get_ast_node`. The hidden
+    /// backends (`trace_http_chain`, `dependency_graph`, `find_similar_code`,
+    /// `find_dead_code`, and the management tools) declare no properties anywhere,
+    /// so there is nothing to check them against; they are skipped rather than
+    /// reported against an empty allowlist, which would flag every real argument.
+    ///
+    /// The schema alone is NOT the honored set — see [`HONORED_UNDECLARED_ARGS`].
+    fn note_ignored_arguments(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        mut result: serde_json::Value,
+    ) -> serde_json::Value {
+        const MAX_REPORTED: usize = 10;
+        let schema_name = if name == "read_snippet" {
+            "get_ast_node"
+        } else {
+            name
+        };
+        let Some(sent) = args.as_object() else {
+            return result;
+        };
+        let Some(declared) = self
+            .registry
+            .list_tools()
+            .iter()
+            .find(|t| t.name == schema_name)
+            .and_then(|t| t.input_schema.get("properties"))
+            .and_then(|p| p.as_object())
+        else {
+            return result;
+        };
+        let honored_undeclared = |key: &str| {
+            HONORED_UNDECLARED_ARGS
+                .iter()
+                .any(|(tool, arg)| *arg == key && (*tool == "*" || *tool == schema_name))
+        };
+        let mut ignored: Vec<&str> = sent
+            .keys()
+            .filter(|k| !declared.contains_key(k.as_str()) && !honored_undeclared(k))
+            .map(|k| k.as_str())
+            .collect();
+        if ignored.is_empty() {
+            return result;
+        }
+        ignored.sort_unstable();
+        ignored.truncate(MAX_REPORTED); // the list is caller-supplied; keep it bounded
+        tracing::warn!(
+            "[tool] {} received undeclared arguments: {}",
+            name,
+            ignored.join(", ")
+        );
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("ignored_arguments".into(), json!(ignored));
+        }
+        result
     }
 
     fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -3293,6 +3439,129 @@ function handleLogin(req: Request) {
             .as_str()
             .unwrap()
             .contains("return 1"));
+    }
+
+    /// An argument the tool never declared used to vanish without a trace. The
+    /// caller is an LLM that cannot see the difference between "filtered by
+    /// language" and "language ignored, here is the whole repo" — QA ISSUE-015
+    /// reached `ast_search {"language": "banana"}` and got unfiltered results it
+    /// then reported as language-scoped. The call still succeeds (JSON-RPC
+    /// consumers are conventionally lenient about extra members); it now says
+    /// what it dropped.
+    #[test]
+    fn test_undeclared_tool_argument_is_reported_not_swallowed() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let req = tool_call_json(
+            "ast_search",
+            json!({"query": "alpha", "language": "banana"}),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(
+            result["ignored_arguments"],
+            json!(["language"]),
+            "an undeclared argument must be named back to the caller, got: {result}"
+        );
+
+        // Control: the identical call WITHOUT the stray argument must carry no
+        // such key, or the field would be noise every tool call pays for.
+        let req_ok = tool_call_json("ast_search", json!({"query": "alpha"}));
+        let result_ok = parse_tool_result(&server.handle_message(&req_ok).unwrap());
+        assert!(
+            result_ok.get("ignored_arguments").is_none(),
+            "a clean call must not carry the key at all, got: {result_ok}"
+        );
+
+        // Second control: a DECLARED argument must never be reported, however
+        // little the handler ends up using it. `limit` is in ast_search's schema.
+        let req_declared = tool_call_json("ast_search", json!({"query": "alpha", "limit": 5}));
+        let result_declared = parse_tool_result(&server.handle_message(&req_declared).unwrap());
+        assert!(
+            result_declared.get("ignored_arguments").is_none(),
+            "declared arguments must not be flagged, got: {result_declared}"
+        );
+
+        // The alias arm: `read_snippet` is a pure rename of `get_ast_node` and
+        // has no registry entry of its own, so it must be checked against
+        // get_ast_node's schema — not skipped, and not flagged wholesale.
+        let node_id = queries::get_nodes_by_name(server.db().conn(), "alpha").unwrap()[0].id;
+        let req_alias = tool_call_json("read_snippet", json!({"node_id": node_id, "bogus": 1}));
+        let result_alias = parse_tool_result(&server.handle_message(&req_alias).unwrap());
+        assert_eq!(
+            result_alias["ignored_arguments"],
+            json!(["bogus"]),
+            "the alias must resolve to get_ast_node's schema: {result_alias}"
+        );
+        let req_alias_ok = tool_call_json("read_snippet", json!({"node_id": node_id}));
+        let result_alias_ok = parse_tool_result(&server.handle_message(&req_alias_ok).unwrap());
+        assert!(
+            result_alias_ok.get("ignored_arguments").is_none(),
+            "`node_id` IS declared on get_ast_node: {result_alias_ok}"
+        );
+    }
+
+    /// The disclosure claims "the tool did nothing with this", and the published
+    /// schema is not by itself a sound source for that claim: two arguments are
+    /// honored without being declared. Reporting them as ignored would invert the
+    /// feature — the caller would be told the argument that actually selected its
+    /// answer had been dropped. Found by the pre-tag review of this batch.
+    #[test]
+    fn test_honored_but_undeclared_arguments_are_not_reported_as_ignored() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("a.ts"),
+            "function alpha() { return beta(); }\nfunction beta() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // `function_name` is get_call_graph's live legacy alias for symbol_name
+        // (callgraph.rs) — it SELECTS the symbol being graphed.
+        let req = tool_call_json("get_call_graph", json!({"function_name": "alpha"}));
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        assert!(
+            result.get("ignored_arguments").is_none(),
+            "function_name chose the symbol; calling it ignored is a lie: {result}"
+        );
+
+        // `skip_indexing` is read by every tool through should_skip_indexing.
+        let req2 = tool_call_json(
+            "ast_search",
+            json!({"query": "alpha", "skip_indexing": true}),
+        );
+        let result2 = parse_tool_result(&server.handle_message(&req2).unwrap());
+        assert!(
+            result2.get("ignored_arguments").is_none(),
+            "skip_indexing is honored on every tool: {result2}"
+        );
+
+        // Control: the exemption is per-argument, not a blanket amnesty — an
+        // undeclared argument on the SAME calls is still reported.
+        let req3 = tool_call_json(
+            "get_call_graph",
+            json!({"function_name": "alpha", "language": "banana"}),
+        );
+        let result3 = parse_tool_result(&server.handle_message(&req3).unwrap());
+        assert_eq!(
+            result3["ignored_arguments"],
+            json!(["language"]),
+            "got: {result3}"
+        );
+
+        // Control: the per-tool exemption does not leak to other tools.
+        let req4 = tool_call_json(
+            "ast_search",
+            json!({"query": "alpha", "function_name": "alpha"}),
+        );
+        let result4 = parse_tool_result(&server.handle_message(&req4).unwrap());
+        assert_eq!(
+            result4["ignored_arguments"],
+            json!(["function_name"]),
+            "ast_search does not honor function_name: {result4}"
+        );
     }
 
     #[test]

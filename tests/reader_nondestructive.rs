@@ -205,7 +205,10 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
 
     // The two legitimate sites, both of which BUILD an index rather than read
     // one: a full index into an explicit path, and the incremental refresh.
-    const ALLOWED_ANCHORS: [&str; 2] = ["fn build_full_index_at", "fn cmd_incremental_index"];
+    // The name is matched EXACTLY, so it tracks the function that holds the
+    // call: `cmd_incremental_index` is now a thin wrapper and the body (with the
+    // open) lives in `cmd_incremental_index_opts`.
+    const ALLOWED_ANCHORS: [&str; 2] = ["fn build_full_index_at", "fn cmd_incremental_index_opts"];
 
     // `Database::open` is the SAME destructive constructor with a different
     // vec flag (open_impl(path, false, revalidate=TRUE)) — the guard's first
@@ -215,7 +218,7 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
     // fine — it never touches the user's index.
     const ALLOWED_OPEN_ANCHORS: [&str; 3] = [
         "fn build_full_index_at",
-        "fn cmd_incremental_index",
+        "fn cmd_incremental_index_opts",
         "fn cmd_benchmark",
     ];
 

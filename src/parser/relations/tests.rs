@@ -239,11 +239,24 @@ fn test_extract_flask_route_methods_kwarg() {
         Some("POST"),
         "methods=['POST','PUT'] → first (POST)"
     );
-    // No methods= kwarg → "ANY" (unspecified) preserved.
+    // No methods= kwarg → GET, Flask's own default (`methods` defaults to
+    // `["GET"]`, with HEAD/OPTIONS auto-derived). Storing the wildcard "ANY"
+    // here traded a false negative for a false positive: `trace 'DELETE /noverb'`
+    // matched a route that answers 405 at runtime.
     assert_eq!(
         route_method("noverb").as_deref(),
-        Some("ANY"),
-        "no methods= → ANY"
+        Some("GET"),
+        "no methods= → GET (Flask default), not the ANY wildcard"
+    );
+    // The precision claim, stated as behaviour rather than storage: a verb Flask
+    // would reject must NOT match the stored route.
+    assert!(
+        !crate::domain::route_method_matches(&route_method("noverb").unwrap(), "DELETE"),
+        "no-methods Flask route must not match DELETE"
+    );
+    assert!(
+        crate::domain::route_method_matches(&route_method("noverb").unwrap(), "get"),
+        "no-methods Flask route still matches GET (case-insensitively)"
     );
 }
 

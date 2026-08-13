@@ -137,9 +137,37 @@ fn main() -> Result<()> {
                         project_root.display()
                     );
                 }
+                // This leg exits 0 without indexing anything, so under --json it
+                // would otherwise leave stdout at 0 bytes on a SUCCESSFUL run —
+                // the tier-1 hole the empty-result contract exists to close. Same
+                // keys as a real run, zeroed, plus the reason the counters are 0;
+                // a consumer that only reads files_indexed still parses.
+                if idx_args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "mode": "skipped",
+                            "files_indexed": 0,
+                            "files_deleted": 0,
+                            "nodes_created": 0,
+                            "edges_created": 0,
+                            "files_with_parse_errors": 0,
+                            "elapsed_ms": 0,
+                            "skipped": format!(
+                                "no .git anchor or existing .code-graph/ at {}",
+                                project_root.display()
+                            ),
+                        })
+                    );
+                }
                 return Ok(());
             }
-            code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet, no_embed)
+            code_graph_mcp::cli::cmd_incremental_index_opts(
+                &project_root,
+                quiet,
+                no_embed,
+                idx_args.json,
+            )
         }
         Some("rebuild-index") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

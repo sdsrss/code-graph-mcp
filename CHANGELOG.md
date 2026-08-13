@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.116.0 (2026-08-13)
+
+The six items the v0.115.0 post-release review left open, in the order it ranked
+them, plus the repairs an independent pre-tag review of the batch turned up.
+Every entry carries a regression test that fails on the pre-fix code.
+
+### Fixed
+- **`trace 'DELETE /x'` claimed a Flask route that answers 405.** v0.115.0 made
+  the stored `ANY` verb a matching wildcard, which fixed the false negative on
+  `GET` by buying a false positive on every other verb. A bare `@app.route('/x')`
+  now stores `GET` at extraction — Flask's and Starlette's own default — so the
+  route matches the verb it serves and no others. **Requires an index rebuild**
+  (`INDEX_VERSION` 59 → 60, automatic on next server start); old indexes keep the
+  over-matching `ANY` rows. HEAD/OPTIONS on a bare `@app.route` remain unmodelled,
+  as `methods=['POST','PUT']` → `POST` already was: the metadata schema holds one
+  verb. No extractor emits `ANY` any more; `route_method_matches` still accepts it
+  for Go `net/http`'s genuinely verb-agnostic `ALL`.
+- **Two concurrent `rebuild-index --confirm` runs collided with a bare SQLite
+  `disk I/O error`.** The pre-rebuild gate only *probed* the index lock (to catch
+  a running MCP server), so two CLI rebuilds both read it free, both entered the
+  `index.db.rebuild-*` temp sweep — which clears any other run's in-progress temp
+  by design — and the loser died with an error nothing in it could be acted on.
+  No data was ever at risk (the atomic rename saw to that). `rebuild-index` now
+  holds that lock for its whole run, so the second one gets the existing
+  explanatory refusal — whose text, along with the `incremental-index` warning
+  that shares the probe, now names the concurrent-CLI case instead of blaming
+  only the MCP server. `reindex --from-snapshot` holds it across the destructive
+  window (the unlink plus the snapshot install) and releases before the indexing
+  pass, which probes the same lock and would otherwise warn about this very
+  process; a rebuild racing that last phase is still possible and is not claimed
+  fixed here. A lock that cannot be *opened* (read-only dir, exotic FS) still
+  proceeds unlocked, exactly as before — this gate must not be why a rebuild that
+  used to work stops. On Windows, where the lock is a PID file rather than an
+  flock, the CLI now removes it on release: a stranded dead-PID lock file would
+  have refused every later rebuild and pushed every server start into secondary
+  read-only mode.
+- **`health-check` told offline users to restart the MCP server when a restart
+  could not help.** The probe behind that advice only asked "is there a
+  `model.safetensors`", but weights hand-placed in the *platform cache* dir carry
+  no current `.model-id`, so the server re-downloads them on next start rather
+  than adopting them. `health-check --json` gains `model_files_state`
+  (`absent` / `unverified` / `ready`), and both the text arm and `doctor` route
+  `unverified` to the advice that actually works: point `CODE_GRAPH_MODEL_DIR` at
+  the weights. Weights found through `CODE_GRAPH_MODEL_DIR`, `cwd/models` or
+  `exe/models` — the documented offline routes — are ungated and stay `ready`.
+  The probe is O(1) (marker + companion `exists()`, never a hash), because
+  health-check runs from hooks. `model_files_present` keeps its old meaning, so
+  older plugin copies are unaffected.
+
+### Added
+- **MCP tools name back arguments they do not declare.** `ast_search
+  {"language": "banana"}` silently dropped the filter and returned the whole
+  repo; the caller is an LLM that could not tell that apart from a
+  language-scoped answer, and it reported the wrong scope downstream. Results now
+  carry `"ignored_arguments": ["language", …]` when a call passes members the
+  tool's schema does not define. The call still succeeds — extra members are
+  conventionally tolerated, and refusing would turn a mislabelled answer into no
+  answer — but nothing is dropped in silence. Covers the seven schema-carrying
+  tools plus the `read_snippet` alias; the hidden backends declare no properties
+  anywhere, so they are skipped rather than checked against an empty allowlist.
+  The published schema is not by itself the honored set, and the pre-tag review
+  caught the inversion that follows from assuming it is: `get_call_graph`'s legacy
+  `function_name` alias and the universal `skip_indexing` are both honored while
+  undeclared, so the first version of this reported the argument that had just
+  selected the caller's answer as ignored. Both are now exempt, and a drift guard
+  (`test_no_new_undeclared_mcp_args`) pins the read-but-undeclared set so a new
+  one has to be classified rather than silently mislabelled.
+- **`--json` on `incremental-index`, `rebuild-index` and `reindex`.** It used to
+  be a clap parse error, so CI had no structured way to learn what an index run
+  did. One object on stdout per successful run — `mode`, `files_indexed`,
+  `files_deleted`, `nodes_created`, `edges_created`, `files_with_parse_errors`,
+  `elapsed_ms` — with progress and warnings left on stderr. `mode` names the path
+  that actually ran (`full` / `incremental` / `rebuild`), not the subcommand
+  typed, since `incremental-index` is a full index on a fresh checkout. The
+  no-`.git`-anchor guard, which exits 0 without indexing, reports the same shape
+  with zeroed counters plus a `skipped` reason rather than leaving stdout empty;
+  failures keep the established `{"error": …}` object.
+
+### Internal
+- The all-commands EPIPE contract test now runs on Windows too, not just Unix.
+  `std::io::pipe()` is cross-platform, and the Windows half — closed-pipe os
+  errors 232/109, which the panic hook matches precisely because the message text
+  is localized — had been reasoned about but never executed. Windows is in the CI
+  matrix, so both arms now really run.
+
 ## v0.115.0 (2026-08-13)
 
 Nine fixes from a three-round autonomous QA loop (every fix carries a
