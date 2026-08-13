@@ -4370,15 +4370,26 @@ fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
         "absent symbol must hint at reindexing, got: {stderr}"
     );
 
-    // hashPassword exists in the index with no call edges — callgraph shows
-    // the seed node (exit 0) and must not print the reindex hint (negative
-    // control: the gate distinguishes absent from merely edge-less).
-    let (stdout2, stderr2, code2) = run_cli(&project, &["callgraph", "hashPassword"]);
-    assert_eq!(code2, 0, "existing symbol renders its seed: {stderr2}");
-    assert!(stdout2.contains("hashPassword"), "got: {stdout2}");
+    // Live negative control (delta-review SF-1: the first version asserted on
+    // a code path that never ran — exit 0 seed rendering never enters the
+    // empty-result branch). `hashPassword` EXISTS in the index (src/auth.ts),
+    // but scoping to src/api.ts empties the result set — so this invocation
+    // reaches the same `result.nodes.is_empty()` branch as the absent-symbol
+    // case, and the gate (global name lookup) must suppress the hint because
+    // the symbol is present in the index. Under an ungated hint this prints
+    // `incremental-index` and the assertion goes red.
+    let (_, stderr2, code2) = run_cli(
+        &project,
+        &["callgraph", "hashPassword", "--file", "src/api.ts"],
+    );
+    assert_eq!(code2, 1, "empty scoped result exits 1: {stderr2}");
+    assert!(
+        stderr2.contains("No call graph results"),
+        "got: {stderr2}"
+    );
     assert!(
         !stderr2.contains("incremental-index"),
-        "existing edge-less symbol must NOT get the reindex hint, got: {stderr2}"
+        "symbol present in index must NOT get the reindex hint, got: {stderr2}"
     );
 }
 
