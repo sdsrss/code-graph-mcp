@@ -4284,6 +4284,26 @@ fn test_cli_show_nonexistent() {
     assert!(stderr.contains("Symbol not found"));
 }
 
+// A symbol ADDED after the last index has no indexed file for query-time
+// freshness to refresh, so `show` misses it — the miss must at least tell the
+// user the index may be stale instead of a bare "Symbol not found" that reads
+// as "doesn't exist" (a fresh `incremental-index` then makes it visible).
+#[test]
+fn test_cli_show_miss_hints_stale_index_for_new_symbol() {
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src").join("fresh.ts"),
+        "export function brandNewFn() { return 1; }\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["show", "brandNewFn"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("incremental-index"),
+        "miss without fuzzy candidates must hint at reindexing, got: {stderr}"
+    );
+}
+
 // Regression: when DB doesn't store `Class.method` as qualified_name (free
 // functions, languages where parser omits class prefix), `show Foo.bar` used
 // to fail "Symbol not found" even though `callgraph Foo.bar` resolved fine.

@@ -2342,6 +2342,18 @@ fn version_sort_key(v: &str) -> (u64, u64, u64) {
     )
 }
 
+/// One-line stderr hint after a symbol-name miss. Query-time freshness
+/// (`refresh_files_if_stale`) can only re-sync files the symbol is already
+/// indexed in — a symbol ADDED since the last index has no file to refresh, so
+/// a lookup miss is indistinguishable from "doesn't exist" without this hint.
+fn hint_symbol_maybe_unindexed(symbol: &str) {
+    eprintln!(
+        "[code-graph] If '{}' was added recently, the index may be stale — run \
+         `code-graph-mcp incremental-index` and retry.",
+        symbol
+    );
+}
+
 /// Pluralize a count for human-readable output: `1 file`, `0 files`, `2 files`.
 /// Avoids the "1 files"/"1 lines" grammar glitch on single-item results (common
 /// for single-file modules and one-line dead-code candidates). Naive `+s` only —
@@ -5223,6 +5235,8 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             for c in candidates.iter().take(5) {
                 eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
             }
+        } else {
+            hint_symbol_maybe_unindexed(symbol);
         }
         std::process::exit(1);
     }
@@ -6519,6 +6533,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 for c in candidates.iter().take(5) {
                     eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
                 }
+            } else {
+                hint_symbol_maybe_unindexed(symbol);
             }
             std::process::exit(1);
         }
@@ -7407,6 +7423,7 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
                     );
                 } else {
                     eprintln!("[code-graph] Symbol not found: {}", symbol);
+                    hint_symbol_maybe_unindexed(symbol);
                 }
                 std::process::exit(1);
             }
@@ -7759,6 +7776,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                             print_refs_notfound_json(base);
                         }
                         eprintln!("[code-graph] Symbol not found: {}", base);
+                        hint_symbol_maybe_unindexed(base);
                         std::process::exit(1);
                     }
                 }
