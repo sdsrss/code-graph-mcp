@@ -11527,18 +11527,27 @@ mod tests {
         );
     }
 
-    /// Release is platform-asymmetric and only one side is observable here.
+    /// Release is platform-asymmetric, and so is what "held" even LOOKS like.
     /// On unix the flock dies with the handle and the FILE is kept on purpose —
     /// deleting it would hand a concurrent holder's lock to a different inode.
     /// On Windows the file IS the lock, so the guard must delete it; a stranded
     /// dead-PID lock file would refuse every later rebuild and push every server
-    /// start into secondary read-only mode. Both arms assert the same end state
-    /// through the probe, which is the thing that actually has to be right.
+    /// start into secondary read-only mode.
+    ///
+    /// The probe cannot carry both arms. `other_process_holds_index_lock` answers
+    /// "does ANOTHER process hold it", and its non-unix arm says so literally
+    /// (`pid != std::process::id()`), so a lock this very process holds reads as
+    /// free there — correctly. Only unix's flock conflicts with a second open in
+    /// the same process. So the held-state precondition goes through the lock
+    /// FILE, which both platforms create and which is the whole lock on non-unix;
+    /// the probe is asserted on unix only. Keeping that precondition cfg-free is
+    /// deliberate: the line the Windows arm depends on is then executed by every
+    /// platform's CI, not just the one that cannot run here.
     #[test]
     fn index_lock_guard_releases_on_drop_on_this_platform() {
         // Deliberately does NOT use `locked_project()` — that fixture is unix-only
         // (it takes a raw flock), and the arm this test exists for is the Windows
-        // one. Nothing here is platform-specific but the final assertion.
+        // one.
         let project = tempfile::TempDir::new().unwrap();
         let cg = project.path().join(CODE_GRAPH_DIR);
         std::fs::create_dir_all(&cg).unwrap();
@@ -11550,8 +11559,15 @@ mod tests {
         let guard = crate::mcp::server::acquire_index_lock_guard(&cg)
             .expect("a free lock must be acquirable");
         assert!(
+            cg.join("index.lock").exists(),
+            "precondition: the guard must have created the lock file — on non-unix \
+             that file IS the lock, and the removal assertion below is vacuous without it"
+        );
+        #[cfg(unix)]
+        assert!(
             crate::mcp::server::other_process_holds_index_lock(&cg),
-            "precondition: the guard must actually hold the lock"
+            "precondition: on unix the flock must read as held — a second open in \
+             this same process conflicts, which is what the CLI gate relies on"
         );
         drop(guard);
 
