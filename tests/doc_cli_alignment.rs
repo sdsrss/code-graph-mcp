@@ -575,11 +575,29 @@ fn module_layout_blocks_list_every_top_level_module() {
         "sanity: found only {actual:?} under src/"
     );
 
-    for (label, path) in [
-        ("README.md", root.join("README.md")),
-        ("CLAUDE.md", root.join("CLAUDE.md")),
+    // (label, path, required). README.md is tracked, so its absence is a real
+    // failure. CLAUDE.md is NOT tracked (`.gitignore:39`), so a clean CI checkout
+    // does not have it — reading it unconditionally made this guard fail on every
+    // platform of the v0.118.0 pre-tag run while passing in every working tree.
+    // A test that depends on an untracked file can only ever be environment-
+    // dependent; the honest shape is to enforce it where it exists and say so
+    // where it does not.
+    let mut checked = 0;
+    for (label, path, required) in [
+        ("README.md", root.join("README.md"), true),
+        ("CLAUDE.md", root.join("CLAUDE.md"), false),
     ] {
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if !required => {
+                eprintln!(
+                    "skip: {label} not present ({e}) — untracked, checked in working trees only"
+                );
+                continue;
+            }
+            Err(e) => panic!("{label}: {e}"),
+        };
+        checked += 1;
         // Only the fenced layout block, so a passing mention elsewhere in the
         // prose cannot stand in for a row in the map.
         let block = text
@@ -604,4 +622,7 @@ fn module_layout_blocks_list_every_top_level_module() {
              routing off this map) would not know they exist"
         );
     }
+    // The optional leg must never be able to hollow the whole test out: README is
+    // required, so at least one document is always really checked.
+    assert!(checked >= 1, "no layout block was checked at all");
 }
