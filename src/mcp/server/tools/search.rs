@@ -106,9 +106,12 @@ impl McpServer {
         // pool wider than the FTS pool re-opens the post-filter starvation this
         // whole mechanism exists to prevent).
         type Fused = Vec<crate::search::fusion::SearchResult>;
-        let retrieve = |fetch: i64| -> Result<(Fused, Fused, bool)> {
+        // The trailing `Option<&str>` is the text channel's "I never ran" reason.
+        type NotSearched = Option<&'static str>;
+        let retrieve = |fetch: i64| -> Result<(Fused, Fused, bool, NotSearched)> {
             let fts_result = queries::fts5_search(self.db.conn(), query, fetch)?;
             let or_fallback = fts_result.or_fallback;
+            let fts_not_searched = fts_result.empty_reason;
             // Carry raw BM25 scores for score blending in RRF fusion.
             let fts_search: Fused = fts_result
                 .nodes
@@ -130,9 +133,9 @@ impl McpServer {
                     .collect(),
                 None => vec![],
             };
-            Ok((fts_search, vec_search, or_fallback))
+            Ok((fts_search, vec_search, or_fallback, fts_not_searched))
         };
-        let (fts_search, vec_search, fts_or_fallback) = retrieve(fetch_count)?;
+        let (fts_search, vec_search, fts_or_fallback, fts_not_searched) = retrieve(fetch_count)?;
 
         // Track search source IDs for confidence scoring
         let fts_node_ids: std::collections::HashSet<i64> =
@@ -311,6 +314,7 @@ impl McpServer {
                 {
                     let node = &nwf.node;
                     if crate::domain::is_skippable_result(
+                        node.is_test,
                         &node.node_type,
                         &node.name,
                         &nwf.file_path,
@@ -414,7 +418,7 @@ impl McpServer {
             && (skipped_noise_count + dropped_by_filter) > 0
             && retry_fetch > fetch_count
         {
-            let (fts_retry, vec_retry, _) = retrieve(retry_fetch)?;
+            let (fts_retry, vec_retry, _, _) = retrieve(retry_fetch)?;
             let fused_retry = fuse(&fts_retry, &vec_retry, retry_fetch as usize);
             let (retry_candidates, retry_dropped, retry_skipped) = build_candidates(&fused_retry)?;
             if retry_candidates.len() > candidates.len() {
@@ -651,6 +655,24 @@ impl McpServer {
                     ),
                     "skipped_noise": skipped_noise_count,
                     "hint": "Spelling and index freshness are not the problem. To reach test symbols use `find_references` with include_tests, or `code-graph-mcp grep`; for structural enumeration use `ast_search`.",
+                    "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+                    "vector_available": vector_available
+                }));
+            }
+            // The text channel never ran (single characters, stop words), so
+            // "check spelling / the index may need rebuilding" below would be a
+            // false diagnosis of a search that did not happen (2026-08-16 audit
+            // §四). With no vector channel either, nothing was searched at all.
+            if let Some(reason) = fts_not_searched {
+                return Ok(json!({
+                    "results": [],
+                    "message": format!("Text search did not run: {reason}."),
+                    "not_searched": reason,
+                    "hint": if vector_available {
+                        "Only the vector channel ran, and it found nothing above threshold. Spelling and index freshness are not the problem — use a longer or more specific term."
+                    } else {
+                        "Nothing was searched for. Spelling and index freshness are not the problem — use a longer or more specific term."
+                    },
                     "search_mode": if vector_available { "hybrid" } else { "fts_only" },
                     "vector_available": vector_available
                 }));

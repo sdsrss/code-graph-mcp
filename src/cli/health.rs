@@ -576,8 +576,15 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 };
                 println!(
                     "Search: {} — {}% embedded ({})",
+                    // Names the SURFACE. `search_mode` describes what the index can
+                    // support, which is reached through MCP `semantic_code_search`;
+                    // this binary's own `search` subcommand is FTS5-only whatever
+                    // the mode says. Reading "Search: hybrid (FTS5 + vector)" out of
+                    // a CLI command and then getting FTS-only ranking from
+                    // `code-graph-mcp search` on the same machine is the kind of
+                    // mismatch a user has no way to diagnose (2026-08-16 audit §四).
                     if search_mode == "hybrid" {
-                        "hybrid (FTS5 + vector)"
+                        "hybrid (FTS5 + vector) via MCP; CLI `search` is FTS5-only"
                     } else {
                         "FTS5-only (vector inactive)"
                     },

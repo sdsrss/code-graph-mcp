@@ -378,6 +378,26 @@ pub const SIMILAR_OVERFETCH: i64 = 3;
 /// filter is active (widens the pool so the post-KNN filter cannot starve top_k). The
 /// unfiltered value is byte-identical to the historical `(top_k*4).max(20)`, so the
 /// retrieval benchmark — which passes no filter — is unchanged by the filtered branch.
+/// Minimum AND-arm hit count for an FTS query to keep its precise results
+/// instead of widening to OR.
+///
+/// A small ABSOLUTE floor, deliberately not a fraction of anything. The previous
+/// rule, `fetch_limit / 10`, let [`search_fetch_count`]'s over-fetch factor leak
+/// into a ranking decision — and the two factors differ by 4×, so at `top_k=20`
+/// the floor was 8 unfiltered and **32** with `--language` set. Adding a filter,
+/// an operation that can only NARROW a result set, made a query 4× more likely
+/// to throw away its precise AND hits and answer with OR noise instead: same
+/// query, same index, opposite precision depending on an unrelated switch
+/// (2026-08-16 audit §四).
+///
+/// The direct-call path already used the floor's `max(3, …)` arm in practice,
+/// and `test_fts5_and_threshold_no_unnecessary_or_fallback` pins the judgement
+/// behind it: four precise AND hits for a `--limit 20` query are a better answer
+/// than twenty loose ones. This makes that the rule everywhere. The visible
+/// change is at large `top_k`, where a handful of exact matches is now kept
+/// rather than widened away.
+pub const AND_MATCH_FLOOR: usize = 3;
+
 pub fn search_fetch_count(top_k: i64, filtered: bool) -> i64 {
     if filtered {
         (top_k * SEARCH_FILTER_OVERFETCH).max(SEARCH_FILTER_FETCH_FLOOR)
@@ -545,10 +565,22 @@ pub fn is_test_node(is_test_flag: bool, name: &str, file_path: &str) -> bool {
 /// `cmd_search`/`tool_semantic_search` and `cmd_similar`/`tool_find_similar_code`
 /// across the CLI and MCP surfaces (a recurring drift site — the CLI search/
 /// similar paths historically omitted the `<external>` leg the MCP path applied).
-pub fn is_skippable_result(node_type: &str, node_name: &str, file_path: &str) -> bool {
+///
+/// Takes the authoritative `nodes.is_test` flag, not just the name/path
+/// heuristic. Without it the two halves of one query disagreed: the SQL side
+/// filters with [`is_test_node_sql`] (flag OR heuristic — `nodes.rs` calls it "a
+/// superset of is_skippable_result's check"), while this post-filter saw only
+/// the heuristic, so an inline `#[cfg(test)]` symbol in a `src/` file survived
+/// into search results through the channel that fetched it (2026-08-16 audit §四).
+pub fn is_skippable_result(
+    is_test_flag: bool,
+    node_type: &str,
+    node_name: &str,
+    file_path: &str,
+) -> bool {
     (node_type == "module" && node_name == "<module>")
         || file_path == EXTERNAL_FILE_PATH
-        || is_test_symbol(node_name, file_path)
+        || is_test_node(is_test_flag, node_name, file_path)
 }
 
 /// Pseudo-file holding the `<external>` sentinel nodes that unresolved imports
@@ -1605,13 +1637,38 @@ mod tests {
     fn test_is_skippable_result_covers_the_triad() {
         // <module> placeholder, <external> stub, and test symbols are skipped on
         // every search/similarity surface.
-        assert!(is_skippable_result("module", "<module>", "src/a.rs"));
-        assert!(is_skippable_result("function", "anything", "<external>"));
-        assert!(is_skippable_result("function", "test_foo", "src/a.rs"));
-        assert!(is_skippable_result("function", "foo", "tests/a.rs"));
+        assert!(is_skippable_result(false, "module", "<module>", "src/a.rs"));
+        assert!(is_skippable_result(
+            false,
+            "function",
+            "anything",
+            "<external>"
+        ));
+        assert!(is_skippable_result(
+            false, "function", "test_foo", "src/a.rs"
+        ));
+        assert!(is_skippable_result(false, "function", "foo", "tests/a.rs"));
         // Real production symbols and real (named) modules are kept.
-        assert!(!is_skippable_result("function", "realFn", "src/a.rs"));
-        assert!(!is_skippable_result("module", "my_mod", "src/a.rs"));
+        assert!(!is_skippable_result(
+            false, "function", "realFn", "src/a.rs"
+        ));
+        assert!(!is_skippable_result(false, "module", "my_mod", "src/a.rs"));
+
+        // The authoritative flag alone is enough (2026-08-16 audit §四): an inline
+        // `#[cfg(test)] fn compute_expected_layout()` in a `src/` file matches no
+        // name or path heuristic, so before this the SQL channel filtered it and
+        // the Rust post-filter did not — one query, two definitions of "test".
+        assert!(
+            is_skippable_result(true, "function", "compute_expected_layout", "src/a.rs"),
+            "nodes.is_test must be sufficient on its own"
+        );
+        // …and it must not swallow production symbols when the flag is clear.
+        assert!(!is_skippable_result(
+            false,
+            "function",
+            "compute_expected_layout",
+            "src/a.rs"
+        ));
     }
 
     #[test]

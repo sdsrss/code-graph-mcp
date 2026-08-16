@@ -1237,6 +1237,48 @@ fn test_cli_grep_json_errors_are_not_success_shaped() {
     );
 }
 
+/// P2 (2026-08-16 audit §四): a query whose every term is dropped before any SQL
+/// runs — a single character (the tokenizer stores nothing shorter than 2), or
+/// nothing but stop words — returned a result byte-identical to a genuine miss.
+/// The CLI then said "No results for: x" and MCP suggested checking the spelling
+/// and rebuilding the index, about a search that never happened.
+#[test]
+fn test_cli_search_discloses_a_query_that_never_ran() {
+    let project = setup_indexed_project();
+
+    for (query, needle) in [("x", "2-character minimum"), ("the of", "stop word")] {
+        let (stdout, stderr, code) = run_cli(&project, &["search", query, "--json"]);
+        assert_eq!(code, 0, "not an error, just nothing searched for");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{query:?} must emit JSON, got {stdout:?}: {e}"));
+        assert!(
+            v.get("not_searched")
+                .and_then(|r| r.as_str())
+                .is_some_and(|s| s.contains(needle)),
+            "{query:?} must disclose WHY nothing was searched: {v}"
+        );
+        assert!(
+            v["results"].as_array().is_some_and(|a| a.is_empty()),
+            "{query:?} keeps an empty results array for shape compatibility: {v}"
+        );
+        assert!(
+            stderr.contains("Nothing was searched for"),
+            "{query:?} human channel must say so too: {stderr}"
+        );
+    }
+
+    // Negative control: a real query that genuinely misses keeps the bare `[]`
+    // tier-1 shape. Without this, "always disclose" would pass the loop above
+    // while relabelling every honest zero-hit as a query defect.
+    let (stdout, _, code) = run_cli(&project, &["search", "zzzznosuchsymbolzzz", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "a query that really ran and found nothing keeps the tier-1 empty array"
+    );
+}
+
 #[test]
 fn test_cli_search_language_filter() {
     let project = setup_indexed_project();

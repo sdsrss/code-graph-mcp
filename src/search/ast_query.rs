@@ -183,7 +183,7 @@ pub fn run(conn: &Connection, p: &AstSearchParams<'_>) -> Result<AstSearchOutcom
         let n = &nwf.node;
         // Skip <module>/<external> placeholders and test symbols, consistent
         // with search/similar (domain::is_skippable_result).
-        if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path) {
+        if crate::domain::is_skippable_result(n.is_test, &n.node_type, &n.name, &nwf.file_path) {
             continue;
         }
         if let Some(tf) = p.type_filter {

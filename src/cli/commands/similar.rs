@@ -198,7 +198,7 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             continue;
         };
         let fp = queries::get_file_path(conn, node.file_id)?.unwrap_or_default();
-        if crate::domain::is_skippable_result(&node.node_type, &node.name, &fp) {
+        if crate::domain::is_skippable_result(node.is_test, &node.node_type, &node.name, &fp) {
             continue;
         }
         similar.push((node, fp, *distance));

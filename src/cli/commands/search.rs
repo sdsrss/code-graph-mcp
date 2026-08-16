@@ -110,6 +110,26 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     outcome.disclose();
 
     if fts_result.nodes.is_empty() {
+        // Tier-2 disclosure when the query never reached SQL (single characters,
+        // stop words): a bare `[]` here says "this repo has no such code", and the
+        // truth is that nothing was searched for (2026-08-16 audit §四).
+        if let Some(reason) = fts_result.empty_reason {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "query": query,
+                        "not_searched": reason,
+                    })
+                );
+            }
+            eprintln!(
+                "[code-graph] Nothing was searched for: {reason}. \
+                 Query: {query} — try a longer or more specific term."
+            );
+            return Ok(());
+        }
         if json_mode {
             println!("[]");
         }
@@ -165,7 +185,7 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
             .get(&n.id)
             .map(|nwf| nwf.file_path.as_str())
             .unwrap_or("");
-        if crate::domain::is_skippable_result(&n.node_type, &n.name, fp) {
+        if crate::domain::is_skippable_result(n.is_test, &n.node_type, &n.name, fp) {
             continue;
         }
         if let Some(lang) = language_filter {
@@ -235,6 +255,13 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
                 query,
                 language_filter.unwrap_or("any")
             );
+            // The FTS-only disclosure below used to live only on the SUCCESS
+            // path, so the one outcome where it changes what the user should do
+            // next — zero hits, which the vector channel might well have found —
+            // was the one that never saw it (2026-08-16 audit §四).
+            if !json_mode {
+                eprintln!("[code-graph] Tip: CLI search is FTS5-only — a concept the index has under different words needs MCP semantic_code_search.");
+            }
         }
         return Ok(());
     }

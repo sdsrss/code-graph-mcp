@@ -403,6 +403,7 @@ impl McpServer {
             .filter_map(|(id, distance)| {
                 let nf = node_map.get(id)?;
                 if crate::domain::is_skippable_result(
+                    nf.node.is_test,
                     &nf.node.node_type,
                     &nf.node.name,
                     &nf.file_path,

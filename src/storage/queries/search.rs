@@ -18,6 +18,16 @@ pub struct FtsResult {
     pub bm25_scores: Vec<f64>,
     /// True if AND mode failed and OR fallback was used (weaker match).
     pub or_fallback: bool,
+    /// Why the result set is empty, when the reason is the QUERY rather than the
+    /// index. `None` means the search really ran and found nothing.
+    ///
+    /// Without this a query whose every term was discarded before any SQL ran —
+    /// `search x` (single characters are dropped by the `len() >= 2` filter),
+    /// `search "the of"` (all stop words) — returned a result byte-identical to a
+    /// genuine miss, and the surfaces then told the user their symbol does not
+    /// exist. It was never looked for (2026-08-16 audit §四; the false-clean-empty
+    /// class this repo has been bitten by before).
+    pub empty_reason: Option<&'static str>,
 }
 
 pub fn fts5_search(conn: &Connection, query: &str, limit: i64) -> Result<FtsResult> {
@@ -84,12 +94,28 @@ fn fts5_search_impl(
         })
         .filter(|w| w.len() >= 2)
         .collect();
-    // Empty/whitespace-only queries would cause FTS5 MATCH error
+    // No usable term survived preprocessing, so no SQL will run. Say WHY: this
+    // return is otherwise byte-identical to a genuine miss, and the surfaces above
+    // then report the symbol as absent from a search that never happened.
     if terms.is_empty() {
+        let had_input = !raw_terms.is_empty();
+        let all_stop_words = had_input
+            && raw_terms
+                .iter()
+                .all(|w| FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()));
         return Ok(FtsResult {
             nodes: vec![],
             bm25_scores: vec![],
             or_fallback: false,
+            empty_reason: if !had_input {
+                Some("the query has no searchable characters")
+            } else if all_stop_words {
+                Some("every word in the query is a stop word")
+            } else {
+                Some(
+                    "every term is shorter than the 2-character minimum the index tokenizer stores",
+                )
+            },
         });
     }
 
@@ -127,12 +153,13 @@ fn fts5_search_impl(
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![and_query, limit], map_row_with_bm25)?;
         let pairs: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
-        if pairs.len() >= std::cmp::max(3, limit as usize / 10) {
+        if pairs.len() >= crate::domain::AND_MATCH_FLOOR {
             let (nodes, bm25_scores): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
             return Ok(FtsResult {
                 nodes,
                 bm25_scores,
                 or_fallback: false,
+                empty_reason: None,
             });
         }
 
@@ -210,6 +237,7 @@ fn fts5_search_impl(
                             // co-occur never reaches this branch — it returns from
                             // the AND above with the penalty correctly absent.
                             or_fallback: true,
+                            empty_reason: None,
                         });
                     }
                 }
@@ -217,6 +245,7 @@ fn fts5_search_impl(
                     nodes: vec![],
                     bm25_scores: vec![],
                     or_fallback: false,
+                    empty_reason: None,
                 });
             }
             if user_words <= 1 && original_terms.len() == 1 {
@@ -238,6 +267,7 @@ fn fts5_search_impl(
                             nodes: vec![],
                             bm25_scores: vec![],
                             or_fallback: false,
+                            empty_reason: None,
                         });
                     }
                 }
@@ -255,6 +285,7 @@ fn fts5_search_impl(
         nodes,
         bm25_scores,
         or_fallback: terms.len() > 1,
+        empty_reason: None,
     })
 }
 
@@ -957,15 +988,37 @@ mod tests {
         )
         .unwrap();
 
-        // With limit=20: old threshold was 20/2=10 (4 < 10 => fallback to OR)
-        // New threshold: max(3, 20/10)=3, so 4 >= 3 => no OR fallback
+        // 4 AND hits clear `AND_MATCH_FLOOR` (3), so the precise arm is kept.
         let fts = fts5_search(db.conn(), "parse json", 20).unwrap();
         assert!(
             !fts.or_fallback,
-            "4 AND results >= threshold 3, should NOT fall back to OR"
+            "4 AND results >= AND_MATCH_FLOOR, should NOT fall back to OR"
         );
         // All 4 handler nodes match both terms
         assert_eq!(fts.nodes.len(), 4);
+
+        // P2 (2026-08-16 audit §四): the AND→OR decision must not move with the
+        // caller's fetch-pool size. It used to be `limit / 10`, and `limit` here
+        // is the over-fetched POOL, whose factor is 4× for a plain search and 16×
+        // (floor 100) once a `--language`/`--node-type` filter is set. So the same
+        // query kept its 4 precise hits unfiltered and threw them away for OR
+        // noise with a filter — a filter that can only narrow, widening the
+        // answer. The three limits below are exactly the pools `search_fetch_count`
+        // produces for top_k=20 in each mode, plus the direct-call value.
+        for pool in [
+            20,
+            crate::domain::search_fetch_count(20, false),
+            crate::domain::search_fetch_count(20, true),
+        ] {
+            let fts = fts5_search(db.conn(), "parse json", pool).unwrap();
+            assert!(
+                !fts.or_fallback,
+                "pool size {pool} must not change the AND/OR verdict (old rule: \
+                 floor {} would have discarded 4 precise hits)",
+                pool / 10
+            );
+            assert_eq!(fts.nodes.len(), 4, "pool {pool} must return the same rows");
+        }
     }
 
     #[test]
