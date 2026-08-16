@@ -12,7 +12,7 @@ const {
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 const { hidden } = require('./proc-opts');
-const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
+const { MAX_UPDATE_ATTEMPTS, isBinaryHealExhausted } = require('./auto-update');
 
 // ── Diagnostics ───────────────────────────────────────────
 
@@ -799,6 +799,20 @@ function autoUpdateNoOpReason(state = readUpdateState(), env = process.env) {
   if (state.suspendedAt && (state.updateAttempts || 0) >= MAX_UPDATE_ATTEMPTS) {
     return `auto-update is SUSPENDED after ${state.updateAttempts} failed attempts on v${state.latestVersion} `
       + '(it retries once a day, and immediately when a newer release is published)';
+  }
+  // The BINARY self-heal carries its own budget, independent of the update
+  // suspension above: the updater can be perfectly healthy while the binary
+  // download has given up on this release. That is precisely the state a
+  // `binary-broken` / stale-version row comes from, and it was the one parked
+  // state doctor could not name — so the user was told to update manually with
+  // no hint that the automatic repair had already stopped trying (audit
+  // 2026-08-16 review Minor tail). Uses the updater's own predicate rather than
+  // a second copy of the condition, which is keyed to `latestVersion` and so
+  // re-arms itself when a newer release appears.
+  if (isBinaryHealExhausted(state)) {
+    return `the binary self-heal has given up on v${state.latestVersion} after `
+      + `${state.binaryHealAttempts} failed download attempts (it re-arms when a newer `
+      + 'release is published)';
   }
   if (state.rateLimited) {
     return 'the updater is in its GitHub rate-limit backoff (up to 1h)';

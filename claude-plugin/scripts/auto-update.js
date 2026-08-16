@@ -7,7 +7,7 @@ const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
-const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
+const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, readJsonResult, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
 const { clearCache: clearBinaryCache, globalNodeModulesCandidates, nvmNodeModulesDirs, PLATFORM_PKG, detectLibc } = require('./find-binary');
 const { readBinaryVersion, compareVersions, isDevMode } = require('./version-utils');
@@ -118,13 +118,34 @@ function getPlatformAssetName({ platform = os.platform(), arch = os.arch(), libc
 
 // ── State Persistence ──────────────────────────────────────
 
+// `readJson(STATE_FILE) || {}` was the lossy-read shape the audit swept for on
+// settings.json — still live here, on the one file that holds THREE independent
+// give-up budgets: the update suspension (`updateAttempts` / `suspendedAt`), the
+// binary self-heal budget (`binaryHealAttempts`) and the GitHub rate-limit
+// backoff (`rateLimited` + `lastCheck`). Collapsing "could not read it" into
+// "fresh install" re-armed all three at once, so one corrupt or unreadable cache
+// file turned off every guard that exists to stop an unbounded retry loop —
+// silently, and on every session thereafter (audit 2026-08-16 review Minor tail).
+//
+// Only a genuine ENOENT (or an empty file, which is what a crash mid-write
+// leaves) may be read as a fresh start. Anything else returns the marker below;
+// `checkForUpdate` skips the session and rewrites a clean file, so the next
+// session starts from real state rather than looping here.
 function readState() {
-  return readJson(STATE_FILE) || {};
+  const res = readJsonResult(STATE_FILE);
+  if (res.value) return res.value;
+  if (res.missing) return {};
+  return { stateUnreadable: (res.error && res.error.code) || 'invalid-json' };
 }
 
 function saveState(state) {
   try {
-    writeJsonAtomic(STATE_FILE, state);
+    // The marker is an in-memory signal, never a persisted field: several call
+    // sites do `saveState({ ...readState(), ... })`, and a persisted
+    // `stateUnreadable` would park the updater permanently.
+    const { stateUnreadable, ...clean } = state || {};
+    void stateUnreadable;
+    writeJsonAtomic(STATE_FILE, clean);
   } catch { /* ok */ }
 }
 
@@ -965,6 +986,16 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     // manifest.version is authoritative — /plugin update writes it directly and
     // bypasses auto-update.js, so re-sync state.installedVersion every call.
     const installedVersion = readManifest().version || '0.0.0';
+
+    // A state we could not read authorises nothing: every throttle, budget and
+    // suspension below is derived from it, so acting on a blank stand-in would
+    // bypass all of them at once. Skip this session and rewrite a clean file —
+    // `lastCheck` stamped now means the ordinary interval applies from here, so
+    // the recovery is bounded rather than an immediate retry.
+    if (state.stateUnreadable) {
+      saveState({ installedVersion, lastCheck: new Date().toISOString() });
+      return null;
+    }
 
     // Time-based throttle. Two conditions override it: a missing cache binary
     // (launcher cannot start) and a present-but-stale binary (otherwise it stays

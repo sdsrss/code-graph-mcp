@@ -23,6 +23,30 @@ because `index_files.rs` now imports `split_identifier` from its new home).
   (`unindexed_path_prefix`) used a `/`-boundary match, so the two halves of one
   command disagreed about what "under this path" means. Both are boundary-anchored
   now (`f.path = 'src' OR f.path LIKE 'src/%'`); an exact file path still matches.
+- **One unreadable cache file switched off all three of the updater's give-up
+  budgets.** `readState()` was `readJson(STATE_FILE) || {}` — the lossy-read
+  shape the audit swept for on settings.json, still live on the file that holds
+  the update suspension, the binary self-heal budget and the GitHub rate-limit
+  backoff. Collapsing "could not read it" into "fresh install" re-armed all
+  three at once, so a corrupt or `chmod 000` state file silently restored the
+  unbounded retry loops each of them exists to stop. Only ENOENT (or an empty
+  file) now reads as fresh; anything else skips the session's update work and
+  rewrites a clean state file, so recovery is bounded rather than immediate.
+- **`doctor` could not name the one parked state a broken binary comes from.**
+  `autoUpdateNoOpReason` covered the opt-out, the update suspension and the
+  rate-limit backoff, but not an exhausted *binary* self-heal — so a user with a
+  `binary-broken` row was told to update manually with no hint that the automatic
+  repair had already given up. It now reports that too, via the updater's own
+  predicate, which re-arms when a newer release appears.
+- **Two disclosures were being computed and thrown away.** `install()`/`update()`
+  have returned `manifestUnwritable` and `adopt()` has returned
+  `registryRecorded` since each stopped throwing, and nothing read either.
+  Neither is cosmetic: an unwritten manifest makes `syncLifecycleConfig` re-run
+  install() on every SessionStart forever, and an unrecorded adoption means
+  `/plugin uninstall` never strips the managed block from that project's
+  CLAUDE.md — with no plugin code left to do it later. Both are reported now,
+  each with the consequence, and a control test proves the lines stay quiet on a
+  clean run.
 - **`ast_search` dropped a disclosure whenever two hints applied at once, and the
   two surfaces dropped different ones.** Each surface assigned its `hint` field
   from several independent `if` blocks, so the last one executed won: for a result

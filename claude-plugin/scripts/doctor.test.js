@@ -923,3 +923,33 @@ test('autoUpdateNoOpReason names why the updater did nothing (closes the doctor 
     'no known blocker → say nothing rather than invent a cause');
   assert.equal(autoUpdateNoOpReason(null, {}), null);
 });
+
+test('autoUpdateNoOpReason names an EXHAUSTED binary self-heal', () => {
+  const { autoUpdateNoOpReason } = require('./doctor');
+  const { MAX_UPDATE_ATTEMPTS, isBinaryHealExhausted } = require('./auto-update');
+  // The binary self-heal has its OWN budget, separate from the update
+  // suspension: the updater is not suspended (updateAttempts is 0) but the
+  // binary download has given up. That is exactly the state a `binary-broken`
+  // row comes from, and it was the one parked state doctor could not name — so
+  // the user was told "update manually" with no hint that the automatic repair
+  // had already stopped trying (audit 2026-08-16 review Minor tail).
+  const exhausted = {
+    latestVersion: '9.9.9',
+    binaryHealVersion: '9.9.9',
+    binaryHealAttempts: MAX_UPDATE_ATTEMPTS,
+    updateAttempts: 0,
+  };
+  assert.ok(isBinaryHealExhausted(exhausted), 'fixture must really be exhausted');
+  assert.match(
+    autoUpdateNoOpReason(exhausted, {}) || '',
+    /binary/i,
+    'doctor must name the exhausted binary self-heal',
+  );
+  assert.match(autoUpdateNoOpReason(exhausted, {}) || '', /9\.9\.9/);
+  // Re-armed by a newer release: heal budget is keyed to the version it failed
+  // on, so a moved `latestVersion` is NOT a blocker.
+  assert.equal(
+    autoUpdateNoOpReason({ ...exhausted, latestVersion: '9.9.10' }, {}), null,
+    'a newer release re-arms the heal — do not report it as parked',
+  );
+});

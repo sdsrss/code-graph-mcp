@@ -234,7 +234,7 @@ test.after(() => {
   }
 });
 
-function runSessionInitHook(t, { adoptThrows = false, prefix = 'cg-si-failopen-' } = {}) {
+function runSessionInitHook(t, { adoptThrows = false, preloadSrc = null, prefix = 'cg-si-failopen-' } = {}) {
   const os = require('os');
   const { spawnSync } = require('child_process');
   const sb = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -268,6 +268,11 @@ function runSessionInitHook(t, { adoptThrows = false, prefix = 'cg-si-failopen-'
     `);
     args.push('--require', preload);
   }
+  if (preloadSrc) {
+    const p = path.join(sb, 'preload.js');
+    fs.writeFileSync(p, preloadSrc);
+    args.push('--require', p);
+  }
   args.push(path.join(__dirname, 'session-init.js'));
 
   const res = spawnSync(process.execPath, args, {
@@ -278,6 +283,61 @@ function runSessionInitHook(t, { adoptThrows = false, prefix = 'cg-si-failopen-'
   });
   return { res, proj, home };
 }
+
+// install()/update() have reported `manifestUnwritable` since they stopped
+// throwing on it, and nothing read the field. It is not cosmetic:
+// syncLifecycleConfig keys entirely off `manifest.version`, so a manifest that
+// could not be written makes EVERY later SessionStart re-run install() and
+// re-report 'installed', forever, with nothing to show for it.
+test('an unwritable plugin manifest is reported, not swallowed', (t) => {
+  const lifecycle = JSON.stringify(path.join(__dirname, 'lifecycle.js'));
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-manifest-',
+    preloadSrc: `
+      const lc = require(${lifecycle});
+      const realInstall = lc.install;
+      lc.install = (...a) => ({ ...(realInstall(...a) || {}), manifestUnwritable: 'EACCES' });
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(res.stdout, /manifest could not be written \(EACCES\)/,
+    `the unwritable manifest must be surfaced; stdout was:\n${res.stdout}`);
+  assert.match(res.stdout, /every session/,
+    'the message must name the consequence, not just the error code');
+});
+
+// adopt() has reported `registryRecorded` since it stopped throwing on a broken
+// registry, and nothing read it. uninstall() walks that registry to strip our
+// managed block from each adopted project's CLAUDE.md, so an unrecorded project
+// keeps the block forever after uninstall — with no plugin code left to remove it.
+test('an unrecorded adoption warns that uninstall will not clean this project', (t) => {
+  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-registry-',
+    preloadSrc: `
+      const ad = require(${adopt});
+      ad.maybeAutoAdopt = () => ({
+        attempted: true,
+        reason: 'installed',
+        result: { ok: true, detailWritten: true, registryRecorded: false },
+      });
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(res.stderr, /adopted-projects registry/,
+    `an unrecorded adoption must be surfaced; stderr was:\n${res.stderr}`);
+  assert.match(res.stderr, /unadopt/,
+    'the message must name the manual remedy');
+});
+
+// Control for the two tests above: the same harness with NO stubbed failure
+// must stay quiet, so neither assertion can be passing on an unconditional line.
+test('a clean session start emits neither disclosure', (t) => {
+  const { res } = runSessionInitHook(t, { prefix: 'cg-si-clean-' });
+  assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
+  assert.doesNotMatch(res.stdout, /manifest could not be written/);
+  assert.doesNotMatch(res.stderr, /adopted-projects registry/);
+});
 
 test('SessionStart fails OPEN when adoption throws: exit 0, later steps still run', (t) => {
   const { res } = runSessionInitHook(t, { adoptThrows: true });

@@ -216,6 +216,21 @@ function reportRebuild(r) {
       `still need (model / env / permissions / your own hooks) back by hand.\n`
     );
   }
+  // install()/update() have reported `manifestUnwritable` since they learned not
+  // to throw on it, and NOBODY read the field — so a manifest that could not be
+  // written (EACCES after a stray sudo, EROFS, a full disk) produced a silent
+  // partial install. It is not cosmetic: `syncLifecycleConfig` keys entirely off
+  // `manifest.version`, so an unwritten manifest makes every future SessionStart
+  // re-run install() and re-report 'installed', forever, with nothing to show
+  // for it (audit 2026-08-16 review Minor tail).
+  if (r && r.manifestUnwritable) {
+    process.stdout.write(
+      `[code-graph] The plugin manifest could not be written (${r.manifestUnwritable}). ` +
+      'Hooks are registered but the install will not be remembered, so this runs again ' +
+      'every session. Check permissions on ~/.claude/plugins/, then run ' +
+      '`code-graph-mcp doctor`.\n'
+    );
+  }
   return r;
 }
 function installReporting(...args) { return reportRebuild(install(...args)); }
@@ -664,6 +679,20 @@ function runSessionInit({ source } = {}) {
         '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
         '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
         '            Reverse:    code-graph-mcp unadopt\n'
+      );
+    }
+    // `adopt()` has returned `registryRecorded` since it stopped throwing on a
+    // broken registry, and nothing read it. The consequence is not cosmetic:
+    // `uninstall()` walks that registry to strip our managed block from every
+    // adopted project's CLAUDE.md, so an unrecorded project keeps the block
+    // FOREVER after uninstall, with no plugin code left to remove it — the
+    // teardown-asymmetry class this repo has already been bitten by (audit
+    // 2026-08-16 review Minor tail).
+    if (autoAdopt.result.registryRecorded === false) {
+      process.stderr.write(
+        '[code-graph] Note: this project could not be recorded in the adopted-projects registry,\n' +
+        '            so `/plugin uninstall` will NOT strip the block from this CLAUDE.md.\n' +
+        '            Remove it by hand with `code-graph-mcp unadopt` before uninstalling.\n'
       );
     }
   }

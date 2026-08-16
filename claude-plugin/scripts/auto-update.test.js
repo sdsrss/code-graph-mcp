@@ -1113,6 +1113,69 @@ test('a GitHub 403 leaves the rate-limit backoff armed after checkForUpdate retu
     'half an hour is still inside the window');
 });
 
+// `readState()` was `readJson(STATE_FILE) || {}` — the lossy-read shape the
+// audit swept for elsewhere, still live on the one file that holds THREE
+// independent give-up budgets. Collapsing "unreadable" into "fresh install"
+// re-arms all of them at once: the update suspension (updateAttempts), the
+// binary self-heal budget (binaryHealAttempts) and the GitHub rate-limit
+// backoff (rateLimited + lastCheck). A single corrupt/unreadable cache file
+// therefore turned every one of those guards off, silently and permanently —
+// each of which exists to stop an unbounded retry loop.
+//
+// Child process + sandboxed HOME: CACHE_DIR is resolved at module load.
+test('an UNREADABLE update state does not silently re-arm the give-up budgets', (t) => {
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-badstate-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const autoUpdate = path.join(__dirname, 'auto-update.js');
+  const script = `
+    const fs = require('fs'); const path = require('path');
+    const au = require(${JSON.stringify(autoUpdate)});
+    const { CACHE_DIR } = require(${JSON.stringify(path.join(__dirname, 'lifecycle.js'))});
+    const stateFile = path.join(CACHE_DIR, 'update-state.json');
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(stateFile, '{ this is not json');
+    const state = au.readState();
+    let fetched = 0;
+    (async () => {
+      await au.checkForUpdate({
+        installMissing: true, force: true,
+        requestJsonFn: async () => { fetched++; return { statusCode: 200, body: '{}' }; },
+      });
+      process.stdout.write(JSON.stringify({
+        state,
+        fetched,
+        afterRaw: fs.readFileSync(stateFile, 'utf8'),
+      }));
+    })().catch(e => { process.stderr.write(String(e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+
+  // 1. The read must not pretend the file was absent.
+  assert.ok(out.state.stateUnreadable,
+    `an unparseable state must be flagged, got ${JSON.stringify(out.state)}`);
+
+  // 2. Behaviour, not just the field: an unreadable state must not send us to
+  //    GitHub (and from there into the download path) on this session.
+  assert.equal(out.fetched, 0,
+    'a state we could not read must not authorise a fetch — that is how the ' +
+    'rate-limit backoff and the suspension get bypassed');
+
+  // 3. It self-heals: the cache file is rewritten as valid JSON so the NEXT
+  //    session starts from a real state instead of looping here forever.
+  const after = JSON.parse(out.afterRaw);
+  assert.ok(after.lastCheck, `state must be rewritten with a lastCheck: ${out.afterRaw}`);
+  assert.equal(after.stateUnreadable, undefined,
+    'the in-memory marker must never be persisted');
+});
+
 // ── Plugin tarball integrity is fail-closed ────────────────────────────────
 //
 // This chain extracts an archive and copies its JAVASCRIPT into the plugin
