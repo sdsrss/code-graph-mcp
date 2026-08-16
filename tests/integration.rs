@@ -1019,8 +1019,16 @@ fn test_index_skips_unparseable_files_without_crashing() {
     assert_eq!(nodes2.len(), 1);
 }
 
+/// Ten files, all indexed, every symbol present.
+///
+/// Renamed from `test_batch_indexing_commits_partial_on_many_files`, which
+/// claimed coverage it never had: `BATCH_SIZE` is 500, so ten files are ONE
+/// batch and no boundary is crossed (2026-08-16 audit §四). The real
+/// batch-boundary behaviour — the cross-batch deferred resolution that audit
+/// 2026-08-02 P0-1 was about — is covered in `src/indexer/pipeline/tests.rs`,
+/// which builds fixtures large enough to actually span batches.
 #[test]
-fn test_batch_indexing_commits_partial_on_many_files() {
+fn test_full_index_covers_every_file_in_a_multi_file_project() {
     use code_graph_mcp::indexer::pipeline::run_full_index;
 
     let project_dir = TempDir::new().unwrap();
@@ -2350,12 +2358,25 @@ fn main() { let _ = app::load(); }
     }
 }
 
-/// Fix #5: find_similar_code must surface `cutoff_applied` when max_distance
-/// filters out candidates below top_k. Skips when embeddings unavailable
-/// (default test build has no `embed-model` feature, so the tool errors out
-/// before reaching the cutoff-tracking code path — that's a separate branch).
+/// `find_similar_code` must surface `cutoff_applied` when `max_distance` filters
+/// candidates out below `top_k`.
+///
+/// This test used to be VACUOUS IN EVERY CI LEG (2026-08-16 audit §四). It had
+/// four silent `return`s and its only assertion behind `if count < 5`, and both
+/// the default and the `embed-model` build took the same early exit: the tool
+/// refuses with "No embeddings found" because the fixture has none, so the
+/// cutoff-tracking code it names was never executed. Measured, not inferred —
+/// instrumenting the arms showed the identical error payload on both legs.
+///
+/// The path is reachable without a model: `find_similar_code` needs
+/// `vec_enabled` (sqlite-vec is bundled regardless of the feature) and at least
+/// one embedded node. Embeddings are just f32 arrays, so the vectors are seeded
+/// directly and the assertions run unconditionally on both legs.
 #[test]
 fn test_find_similar_code_reports_cutoff() {
+    use code_graph_mcp::domain::EMBEDDING_DIM;
+    use code_graph_mcp::storage::queries;
+
     let project = TempDir::new().unwrap();
     fs::write(
         project.path().join("lib.rs"),
@@ -2367,42 +2388,86 @@ pub fn gamma() -> i32 { 3 }
     )
     .unwrap();
     let server = common::init_server(&project);
-
-    let msg = tool_call_json(
+    // `initialize` alone does not index; the first tool call is what triggers
+    // `ensure_indexed`. Force it before seeding, or there are no node ids to seed.
+    // A tool call that goes through `ensure_indexed`. `get_index_status` reads
+    // state without indexing, so it leaves the DB empty; this one errors (no
+    // embeddings yet, which is the point) but indexes on the way there.
+    let _ = server.handle_message(&tool_call_json(
         "find_similar_code",
-        serde_json::json!({"symbol_name":"alpha","top_k":5,"max_distance":0.0}),
+        serde_json::json!({"symbol_name":"alpha"}),
+    ));
+    assert!(
+        server.db().vec_enabled(),
+        "sqlite-vec is bundled in every build — without it this test cannot mean anything"
     );
-    let resp = server.handle_message(&msg).unwrap();
-    let Some(raw) = resp.as_ref() else {
-        return;
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return, // malformed → environment-specific, not the target regression
+
+    // Seed mutually distant unit vectors: each symbol gets a different basis
+    // vector, so every pairwise L2 distance is sqrt(2) ≈ 1.414 — comfortably
+    // above the tight max_distance below and comfortably below the loose one.
+    let mut seeded = 0usize;
+    for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+        for (id, _) in queries::get_node_ids_by_name(server.db().conn(), name).unwrap() {
+            let mut v = vec![0.0f32; EMBEDDING_DIM];
+            v[i] = 1.0;
+            queries::insert_node_vectors_batch(server.db().conn(), &[(id, v)]).unwrap();
+            seeded += 1;
+        }
+    }
+    assert!(
+        seeded >= 3,
+        "expected alpha/beta/gamma to be indexed, seeded {seeded}"
+    );
+
+    let ask = |max_distance: f64| {
+        let msg = tool_call_json(
+            "find_similar_code",
+            serde_json::json!({"symbol_name":"alpha","top_k":5,"max_distance":max_distance}),
+        );
+        let resp = server.handle_message(&msg).unwrap().expect("a response");
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            parsed["result"]["isError"] != serde_json::Value::Bool(true),
+            "the seeded vectors must get past the no-embeddings guard: {parsed}"
+        );
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()
     };
 
-    // Embedding-disabled build path: server returns JSON-RPC error. Skip cleanly.
-    if parsed.get("error").is_some() || parsed["result"]["isError"] == serde_json::Value::Bool(true)
-    {
-        return;
-    }
-    let text = match parsed["result"]["content"][0]["text"].as_str() {
-        Some(t) => t,
-        None => return,
-    };
-    let result: serde_json::Value = serde_json::from_str(text).unwrap();
-    // count < top_k implies either cutoff fired or the tiny index had no candidates.
-    let count = result["count"].as_i64().unwrap_or(0);
-    if count < 5 {
-        let has_marker = result.get("cutoff_applied").is_some()
-            || result["results"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true);
-        assert!(has_marker,
-            "find_similar_code with tight max_distance must report cutoff_applied or return empty: {}",
-            result);
-    }
+    // Positive control FIRST. Without it, a tool that returns nothing for any
+    // input would satisfy the cutoff assertion below for the wrong reason —
+    // which is exactly how the previous version of this test passed.
+    let loose = ask(2.0);
+    assert!(
+        loose["count"].as_i64().unwrap_or(0) > 0,
+        "a permissive max_distance must return the seeded neighbours: {loose}"
+    );
+
+    // Tight cutoff: every neighbour sits at sqrt(2), so nothing survives — and
+    // the response has to SAY that rather than look like an empty index.
+    let tight = ask(0.0);
+    let count = tight["count"].as_i64().unwrap_or(0);
+    assert!(
+        count < 5,
+        "a 0.0 cutoff must filter the neighbours out: {tight}"
+    );
+    // Demanded outright, with no "…or the result set is empty" escape hatch: the
+    // fixture guarantees candidates existed and were dropped, so an undisclosed
+    // empty answer is exactly the failure this test is named for. (That escape
+    // hatch is what let the previous version pass while asserting nothing.)
+    assert_eq!(
+        tight["cutoff_applied"],
+        serde_json::json!(true),
+        "a cutoff that removed candidates must say so — an undisclosed short list \
+         reads to the caller as 'nothing similar exists': {tight}"
+    );
+    assert!(
+        tight["cutoff_dropped"].as_i64().unwrap_or(0) >= 2,
+        "both non-query neighbours were dropped; the count must say so: {tight}"
+    );
 }
 
 /// v0.11.2 fix: `module_overview` must not leak inline `#[cfg(test)]` functions

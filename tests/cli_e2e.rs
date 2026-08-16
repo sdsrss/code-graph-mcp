@@ -2919,7 +2919,18 @@ fn test_cli_resync_partial_discloses_on_stderr() {
 }
 
 fn has_git() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
+    let present = Command::new("git").arg("--version").output().is_ok();
+    // Same CI rule as `has_ripgrep` above, which this helper was missing: an
+    // absent tool must REDDEN a CI run rather than silently skip the tests that
+    // gate on it. Sibling asymmetry — one probe asserted, the other did not, so
+    // the git-dependent cases could go dark on a runner image change and the run
+    // would still report green (2026-08-16 audit §四). Every CI image ships git,
+    // so this can only fire on a genuinely broken runner.
+    assert!(
+        present || std::env::var_os("CI").is_none(),
+        "git must be available on CI (the git-dependent grep tests would silently skip)"
+    );
+    present
 }
 
 #[test]

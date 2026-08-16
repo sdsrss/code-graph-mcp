@@ -3750,12 +3750,27 @@ function standalone() { return 1; }
     #[test]
     fn test_semantic_search_sandbox_compression() {
         let project_dir = TempDir::new().unwrap();
-        // Create many functions with large code to exceed 2000 token threshold
+        // Create many functions with large code to exceed 2000 token threshold.
+        //
+        // The names carry an ALPHABETIC suffix, not a numeric one. The fixture
+        // used `func0`..`func19` and queried "func", which returns ZERO results:
+        // `split_identifier` splits on case boundaries but not on the
+        // letter↔digit boundary, so `func0` is one token and "func" matches
+        // nothing. Measured against the real binary — `handleRequest` is findable
+        // as "handle", `func0` is not findable as "func". So this test, named for
+        // compression, was running the compressor over an empty result set
+        // (2026-08-16 audit §四). `funcAlpha` splits into `func` + `alpha`, which
+        // is what makes the query match all 20 and the payload large enough to
+        // cross the threshold.
+        const SUFFIXES: [&str; 20] = [
+            "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta", "Iota", "Kappa",
+            "Lambda", "Mu", "Nu", "Xi", "Omicron", "Pi", "Rho", "Sigma", "Tau", "Upsilon",
+        ];
         let mut code = String::new();
-        for i in 0..20 {
+        for suffix in SUFFIXES {
             code.push_str(&format!(
                 "function func{}() {{\n{}\n}}\n",
-                i,
+                suffix,
                 format!("  // {}\n", "x".repeat(500)).repeat(3)
             ));
         }
@@ -3772,14 +3787,25 @@ function standalone() { return 1; }
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
-        // Should be in compressed mode
+        // Precondition, asserted rather than assumed: without results there is
+        // nothing to compress, and every assertion below is vacuous. This is
+        // exactly how the test passed while measuring nothing.
+        let hits = result["results"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert!(
+            hits > 0,
+            "the fixture must actually be searchable — 0 results means this test \
+             compresses an empty payload: {result}"
+        );
+
+        // And the payload must be big enough to REACH the compressor, or the
+        // compressed arm below is dormant.
         let mode = result["mode"].as_str().unwrap_or("");
-        if mode.starts_with("compressed_") {
-            assert!(result["results"].is_array());
-            let compressed = result["results"].as_array().unwrap();
-            assert!(!compressed.is_empty());
-        }
-        // If not compressed (small code), that's also valid behavior
+        assert!(
+            mode.starts_with("compressed_"),
+            "20 functions x ~1.5KB must cross COMPRESSION_TOKEN_THRESHOLD; got mode {mode:?} \
+             with {hits} result(s). If this fires, the fixture stopped exercising compression."
+        );
+        assert!(!result["results"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -4055,7 +4081,14 @@ app.post('/api/login', handleLogin);
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
-        // Result should either be normal (if small enough) or compressed
+        // Measured 2026-08-16 (audit §四): this fixture does NOT reach the
+        // compressed arm — `mode` comes back absent, so the `else` branch is what
+        // runs and what this test actually covers. The compressed branch is kept
+        // (it is correct if the payload ever grows) but is dormant, and saying so
+        // beats leaving a reader to assume coverage from the branch's existence.
+        // Live compression coverage lives in
+        // `test_semantic_search_sandbox_compression`, whose fixture is asserted
+        // to cross the threshold.
         if result["mode"].as_str().is_some() {
             assert!(result["mode"].as_str().unwrap().starts_with("compressed_"));
             assert!(result["results"].is_array());
@@ -4139,7 +4172,14 @@ app.post('/api/login', handleLogin);
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
-        // Result should either be normal or compressed
+        // Measured 2026-08-16 (audit §四): the compressed arm is dormant here, and
+        // structurally so — `truncate_code_content` caps stored `code_content` at
+        // `max_code_content_len()` (4 KiB), so ONE node's payload cannot reach the
+        // 2000-token threshold no matter how large the source function is. The
+        // `else` branch is what this test covers. Left in place rather than
+        // deleted: the branch is the correct handling if a future response shape
+        // carries more per node. Live compression coverage is
+        // `test_semantic_search_sandbox_compression`.
         if result["mode"].as_str().is_some() {
             assert_eq!(result["mode"], "compressed_node");
             assert!(result["node_id"].is_number());
