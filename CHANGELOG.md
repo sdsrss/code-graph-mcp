@@ -2,7 +2,51 @@
 
 ## Unreleased
 
-Continuation of the 2026-08-16 audit remediation — the §十 "中期" tier.
+Continuation of the 2026-08-16 audit remediation — the §十 "中期" tier, then the
+§四 P2 tail.
+
+**§四 P2 tail — all seven clusters closed.** Roughly forty items, each verified
+against HEAD before being touched; eleven turned out to be already fixed and are
+recorded as such rather than re-fixed. Highlights, by what they cost a user:
+
+- *Silent wrong answers.* `similar new` answered about one arbitrary definition
+  out of five while `callgraph new` reported the ambiguity; `get_ast_node` kept
+  its own ambiguity copy that never filtered the `<external>` sentinel;
+  `show --impact` and `impact` reported different RISK levels for the same
+  symbol; MCP `trace` put inline `#[cfg(test)]` helpers in a route's production
+  call chain.
+- *Machine contracts that lied.* A clap parse error under `--json` produced zero
+  bytes on stdout; `grep --json` used the success-shaped `[]` on all five of its
+  error legs; `search --json` never disclosed AND→OR degradation; `search x`
+  reported "no results" for a query that never reached SQL;
+  `health-check --format jsonn` printed prose and exited 0.
+- *Ranking.* A `--language` filter made a query 4× more likely to discard its
+  precise results, because the AND→OR threshold keyed on the internal
+  over-fetch pool rather than on what the user asked for.
+- *Index/storage.* Unix lock release no longer unlinks the lock file (inode-scoped
+  flock — deleting it allows a second primary); `open_readonly` refuses a future
+  schema with the marker the statusline keys on; the query-time refresh stops
+  re-hashing files the indexer will never parse; the `<external>` reaper's gate
+  now matches the prune that orphans sentinels.
+- *Plugin.* `doctor` no longer exits 1 for the life of an install over advisory
+  warnings; injected context is capped at the one place all three hooks emit
+  through; a reinstall no longer resurrects the previous install's statusline
+  entry; `prepare` stopped writing `.git/config` on every `npm pack --dry-run`.
+- *Tests.* Two tests that were vacuous in every CI leg — measured, not inferred —
+  now assert what they are named for.
+- *Vocabularies.* `exports`/`routes_to` are filterable (they were visible in
+  results and refused by name), `module` is advertised as the type filter it has
+  always been, and `--min-confidence ""` means the same thing on every surface.
+
+Fourteen new guards ship with these so the same drift cannot recur; three caught
+real problems on their first run, including in this batch's own new code.
+
+Deliberately not done, with reasons recorded in the code: the unbounded deferred
+buffer, the per-batch name-map clone (unmeasurable on a 234-file repo), the
+array-shaped commands' `freshness_partial`, the Windows hook existence guard, a
+declared `rust-version`, and table-driving the calls axis — a parity probe found
+all sixteen call-bearing languages already emit the edge, so the refactor would
+close no gap and a guard was added instead.
 
 **Upgrade notes**
 
