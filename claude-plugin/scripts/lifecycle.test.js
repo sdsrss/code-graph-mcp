@@ -251,14 +251,21 @@ test('readRegistry self-heals primary from durable backup after cache wipe', (t)
   const registryPath = path.join(cacheDir, 'statusline-registry.json');
   const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
 
+  // Our own entry must name the composite THIS install registers, or the
+  // self-heal treats it as a leftover (see the stale case below). The fixture
+  // used a synthetic `node /cg.js`, which is not a shape the live scenario ever
+  // produces.
+  const { compositeCommand } = require('./lifecycle');
+  const liveComposite = compositeCommand();
+
   // Seed both files, then simulate user wiping ~/.cache/code-graph/
   writeJson(registryPath, [
     { id: '_previous', command: 'echo gsd', needsStdin: true },
-    { id: 'code-graph', command: 'node /cg.js', needsStdin: false },
+    { id: 'code-graph', command: liveComposite, needsStdin: false },
   ]);
   writeJson(backupPath, [
     { id: '_previous', command: 'echo gsd', needsStdin: true },
-    { id: 'code-graph', command: 'node /cg.js', needsStdin: false },
+    { id: 'code-graph', command: liveComposite, needsStdin: false },
   ]);
   fs.rmSync(cacheDir, { recursive: true, force: true });
   assert.equal(fs.existsSync(registryPath), false);
@@ -273,6 +280,39 @@ test('readRegistry self-heals primary from durable backup after cache wipe', (t)
   assert.equal(restored[0].id, '_previous');
   // Primary file rebuilt from backup
   assert.equal(fs.existsSync(registryPath), true);
+});
+
+// P2 (2026-08-16 audit §四): the durable backup lives in `~/.claude/`, so it
+// outlives the plugin cache — including an uninstall that REFUSED to rewrite the
+// registry (that refusal is deliberate: rewriting an unreadable registry is how
+// the user's providers got destroyed once already). The next install then
+// self-healed the previous install's `code-graph` entry back to life, pointing at
+// a versioned cache directory that no longer exists: a zombie in the composite
+// chain. `_previous` and third-party entries must still come back — those are the
+// user's data and the reason the backup exists.
+test('self-heal does not resurrect a stale code-graph entry from a dead install', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+
+  writeJson(backupPath, [
+    { id: '_previous', command: 'echo the-users-own-statusline', needsStdin: true },
+    { id: 'gsd', command: 'node /opt/gsd/statusline.js', needsStdin: false },
+    // A previous install's composite, under a cache version that is gone.
+    { id: 'code-graph', command: 'node "/home/u/.claude/plugins/cache/code-graph@0.1.0/scripts/statusline-composite.js"', needsStdin: false },
+  ]);
+  assert.equal(fs.existsSync(registryPath), false, 'cache is gone, as after uninstall');
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { readRegistry } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(readRegistry()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  const restored = JSON.parse(out);
+  const ids = restored.map(p => p.id).sort();
+  assert.deepEqual(ids, ['_previous', 'gsd'],
+    'the dead code-graph entry must not come back; the user\'s own and third-party entries must');
 });
 
 test('writeRegistry([]) clears both primary and backup', (t) => {

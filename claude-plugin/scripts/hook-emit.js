@@ -26,6 +26,39 @@
 //     permissionDecision), so the Bash-side grep answer can be injected without
 //     skipping CC's default permission prompt for the underlying tool call.
 
+// Ceiling on injected context, applied at the ONE place all three hooks emit
+// through. `cg-answer.js` has capped its own output at 4000 bytes since it was
+// written; the hook payloads it sits alongside had no cap at all, and they are
+// assembled from unbounded lists — pre-edit-guide joins every direct caller's
+// `name (file)` onto a single line, so editing a 200-caller symbol injected a
+// multi-kilobyte wall into the model's context on every Edit (2026-08-16 audit
+// §四). This is the model's context window, not a log: the whole value of an
+// impact summary is that it is small enough to read.
+//
+// Truncation is announced, never silent — a summary that stops mid-list without
+// saying so is worse than one that says it was cut, because the reader cannot
+// tell a short blast radius from a clipped one.
+const MAX_INJECTED_BYTES = 4000;
+
+function capContext(text) {
+  const s = String(text == null ? '' : text);
+  if (Buffer.byteLength(s, 'utf8') <= MAX_INJECTED_BYTES) return s;
+  const notice = `\n  … truncated at ${MAX_INJECTED_BYTES} bytes — re-run the CLI command above for the full result.\n`;
+  const budget = MAX_INJECTED_BYTES - Buffer.byteLength(notice, 'utf8');
+  // Slice on a CHARACTER boundary that fits the byte budget, so a multi-byte
+  // codepoint is never cut in half (the payload carries file paths and symbol
+  // names, which can be non-ASCII).
+  let end = s.length;
+  while (end > 0 && Buffer.byteLength(s.slice(0, end), 'utf8') > budget) {
+    end -= Math.max(1, Math.ceil((Buffer.byteLength(s.slice(0, end), 'utf8') - budget) / 4));
+  }
+  // Prefer cutting at the last newline inside the budget, so the truncated text
+  // ends on a whole line rather than mid-token.
+  const nl = s.lastIndexOf('\n', end);
+  if (nl > budget / 2) end = nl;
+  return s.slice(0, end) + notice;
+}
+
 /**
  * PreToolUse additionalContext envelope with NO permissionDecision (string, no
  * trailing newline). The permission-neutral shape: the tool's normal permission
@@ -37,7 +70,7 @@ function emitPreToolContext(text) {
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      additionalContext: text,
+      additionalContext: capContext(text),
     },
   });
 }
@@ -57,7 +90,7 @@ function emitPreToolAllowContext(text) {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'allow',
-      additionalContext: text,
+      additionalContext: capContext(text),
     },
   });
 }
@@ -73,9 +106,12 @@ function emitPostToolContext(text) {
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
-      additionalContext: text,
+      additionalContext: capContext(text),
     },
   });
 }
 
-module.exports = { emitPreToolContext, emitPreToolAllowContext, emitPostToolContext };
+module.exports = {
+  emitPreToolContext, emitPreToolAllowContext, emitPostToolContext,
+  capContext, MAX_INJECTED_BYTES,
+};

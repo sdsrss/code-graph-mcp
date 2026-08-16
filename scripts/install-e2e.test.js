@@ -399,7 +399,21 @@ test('§1.11 a stale-relic session-init defers to the active install (downgrade-
   const activeDir = path.join(cacheBase, '0.49.0');
 
   // Relic = a real copy of the plugin tree, version-stamped 0.48.0.
-  fs.cpSync(PLUGIN_ROOT, relicDir, { recursive: true });
+  // Copy regular files and directories only. `.gitignore`'s blanket `.*` lets a
+  // `.claude/` appear next to the plugin sources, grow, and never show up in
+  // `git status`; one did, and its `hooks` entry is a CHARACTER DEVICE, which
+  // `cpSync` cannot copy (EINVAL) — a fixture failing for a reason unrelated to
+  // what it asserts. Filtering by TYPE rather than by leading dot is what keeps
+  // `.claude-plugin/` (this plugin's own manifest dir, which the assertions below
+  // read) in the copy. Sibling of the same fix in auto-update.test.js
+  // (2026-08-16 audit §四).
+  const copyableOnly = (src) => {
+    try {
+      const st = fs.lstatSync(src);
+      return st.isFile() || st.isDirectory();
+    } catch { return false; }
+  };
+  fs.cpSync(PLUGIN_ROOT, relicDir, { recursive: true, filter: copyableOnly });
   const relicManifest = path.join(relicDir, '.claude-plugin', 'plugin.json');
   writeJson(relicManifest, { ...readJson(relicManifest), version: '0.48.0' });
 

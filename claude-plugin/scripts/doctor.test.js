@@ -953,3 +953,56 @@ test('autoUpdateNoOpReason names an EXHAUSTED binary self-heal', () => {
     'a newer release re-arms the heal — do not report it as parked',
   );
 });
+
+// P2 (2026-08-16 audit §四): doctor's exit code is what `doctor && <next step>`
+// and self-heal automation gate on, and ANY warn without a working repair pinned
+// it at 1 for the life of the install — including a binary deliberately built
+// without embed-model, and npm relics under a node version whose prefix the tool
+// cannot reach. Neither is broken; both were permanent failures.
+//
+// The rule now: every warn/error row is either repairable (a fixId `runRepairs`
+// really has a counting case for) or explicitly `advisory: true`. Inferring
+// "advisory" from a missing fixId would have exempted the next forgotten row,
+// so this checks the marker, not its absence.
+test('every doctor row is repairable or explicitly advisory', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'doctor.js'), 'utf8');
+
+  // fixIds `runRepairs` can actually resolve — the `case '…':` labels inside it.
+  const repairsBody = src.slice(src.indexOf('function runRepairs'), src.indexOf('function unresolvedCount'));
+  const repairable = new Set([...repairsBody.matchAll(/case '([a-z-]+)':/g)].map(m => m[1]));
+  assert.ok(repairable.size >= 8, `expected the repair switch to be found, got ${[...repairable]}`);
+
+  // Rows come from a real diagnostics run against a scratch HOME, so this reads
+  // whatever the current build actually emits rather than a transcription.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-rows-'));
+  const prevHome = process.env.HOME;
+  const prevConfig = process.env.CLAUDE_CONFIG_DIR;
+  let rows;
+  try {
+    process.env.HOME = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
+    rows = runDiagnostics({ checkOnly: true });
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevConfig;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+
+  const stuck = rows
+    .filter(r => r.status === 'warn' || r.status === 'error')
+    .filter(r => !r.advisory && !(r.fixId && repairable.has(r.fixId)));
+  assert.deepEqual(
+    stuck.map(r => `${r.name}${r.fixId ? ` (fixId ${r.fixId})` : ' (no fixId)'}`),
+    [],
+    'these rows can never be resolved, so doctor would exit 1 forever: mark them ' +
+    'advisory:true if nothing is broken, or wire a repair',
+  );
+
+  // Negative control: the check must be able to FAIL. A synthetic unrepairable
+  // row has to be caught, or the assertion above is vacuous whenever the scratch
+  // run happens to be clean.
+  const synthetic = [{ name: 'Synthetic', status: 'warn', detail: 'x' }]
+    .filter(r => !r.advisory && !(r.fixId && repairable.has(r.fixId)));
+  assert.equal(synthetic.length, 1, 'the predicate must catch an unrepairable row');
+});

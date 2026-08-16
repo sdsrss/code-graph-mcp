@@ -1355,7 +1355,22 @@ test('CODE_GRAPH_NO_AUTO_UPDATE=1 skips the update check entirely', (t) => {
   const { spawnSync } = require('child_process');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-optout-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.cpSync(__dirname, path.join(root, 'plugin', 'scripts'), { recursive: true });
+  // Copy regular files and directories only. `.gitignore`'s blanket `.*` lets a
+  // dot-directory appear next to the sources, grow, and never show up in
+  // `git status`. One did: a `.claude/` whose `hooks` entry is a CHARACTER
+  // DEVICE, which `cpSync` cannot copy — EINVAL, and a test failing for a reason
+  // that has nothing to do with what it asserts (2026-08-16 audit §四). Filtering
+  // by TYPE, not by leading dot, so a legitimate dot-entry is never dropped.
+  // CI never saw this; only a working tree does.
+  fs.cpSync(__dirname, path.join(root, 'plugin', 'scripts'), {
+    recursive: true,
+    filter: (src) => {
+      try {
+        const st = fs.lstatSync(src);
+        return st.isFile() || st.isDirectory();
+      } catch { return false; }
+    },
+  });
 
   const run = (extraEnv) => {
     const home = fs.mkdtempSync(path.join(root, 'home-'));

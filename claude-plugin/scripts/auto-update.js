@@ -138,6 +138,16 @@ function readState() {
   return { stateUnreadable: (res.error && res.error.code) || 'invalid-json' };
 }
 
+// One stderr line per process when the state file cannot be written. Not a
+// throw: the caller's job (checking for an update) is unaffected, and a hook that
+// dies over its own bookkeeping is worse than one that keeps going. But not
+// silence either — every throttle in this file (update cooldown, GitHub
+// rate-limit backoff, binary self-heal budget) is stored in that one file, so a
+// read-only or full ~/.claude means the updater re-runs its whole check EVERY
+// session, forever, with nothing anywhere saying why (2026-08-16 audit §四).
+// The unlink/cleanup `catch {}`s elsewhere in this file stay silent on purpose:
+// a failed cleanup costs a stale temp file, not a broken invariant.
+let stateWriteWarned = false;
 function saveState(state) {
   try {
     // The marker is an in-memory signal, never a persisted field: several call
@@ -146,7 +156,15 @@ function saveState(state) {
     const { stateUnreadable, ...clean } = state || {};
     void stateUnreadable;
     writeJsonAtomic(STATE_FILE, clean);
-  } catch { /* ok */ }
+  } catch (e) {
+    if (!stateWriteWarned) {
+      stateWriteWarned = true;
+      console.error(
+        `[code-graph] Could not save update state to ${STATE_FILE} (${e && e.message ? e.message : e}). ` +
+        'Update throttling and rate-limit backoff will not persist across sessions.',
+      );
+    }
+  }
 }
 
 // ── Throttle ───────────────────────────────────────────────
@@ -631,8 +649,13 @@ async function downloadAndInstall(latest, {
       return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
     }
     const tarballPath = path.join(tmpDir, PLUGIN_ASSET_NAME);
+    // `-f` like every sibling fetch in this file (the binary at :435 and both
+    // sha256 sidecars). This was the one download without it, so a 404/503 wrote
+    // GitHub's HTML body here and exited 0; the checksum below still failed
+    // closed, but as "sha mismatch" — a wrong diagnosis of a fetch that never
+    // succeeded (2026-08-16 audit §四).
     exec('curl', [
-      '-sL', '-o', tarballPath,
+      '-sfL', '-o', tarballPath,
       '-H', 'Accept: application/octet-stream',
       latest.pluginTarballUrl,
     ], hidden({ timeout: 30000, stdio: 'pipe' }));

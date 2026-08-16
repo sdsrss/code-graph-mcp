@@ -382,10 +382,25 @@ function readRegistryForWrite() {
   }
   // Self-heal: primary missing or empty (e.g. user cleaned ~/.cache/code-graph/).
   // Durable backup in ~/.claude/ retains `_previous` + third-party providers.
+  //
+  // Our OWN entry is dropped unless it names the composite this install would
+  // register right now. The backup lives in `~/.claude/`, which survives the
+  // plugin cache — including an uninstall that refused to rewrite the registry
+  // (`detachStatuslineIntegration`'s oneShot refusal leaves it in place by
+  // design, because rewriting is how the data got lost the first time). So the
+  // NEXT install self-healed the previous install's `code-graph` entry back to
+  // life, pointing at a versioned cache directory that no longer exists — a
+  // zombie provider in the composite chain (2026-08-16 audit §四). `_previous`
+  // and third-party entries are kept: those are the user's data and the reason
+  // this backup exists, and nothing else would restore them.
   const backup = readJsonResult(providersBackupFile(), asArray);
   if (backup.value && backup.value.length > 0) {
-    try { writeJsonAtomic(REGISTRY_FILE, backup.value); } catch { /* ok */ }
-    return { registry: backup.value, refuse: false };
+    const live = compositeCommand();
+    const healed = backup.value.filter(p => p && (p.id !== 'code-graph' || p.command === live));
+    if (healed.length > 0) {
+      try { writeJsonAtomic(REGISTRY_FILE, healed); } catch { /* ok */ }
+      return { registry: healed, refuse: false };
+    }
   }
   if (backup.corrupt) {
     return { registry: [], refuse: true, why: `${providersBackupFile()} exists but cannot be read as a provider list` };

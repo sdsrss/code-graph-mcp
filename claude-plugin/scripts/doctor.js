@@ -29,7 +29,7 @@ function classifyEmbeddings(hc) {
   const ep = (hc && hc.embedding_progress) || '0/0';
   const [done, total] = ep.split('/').map(Number);
   if (hc && hc.model_available === false) {
-    return { name: 'Embeddings', status: 'warn',
+    return { name: 'Embeddings', status: 'warn', advisory: true,
       detail: 'binary built without embed-model — semantic search is FTS5-only; reinstall via npm/plugin for the hybrid binary' };
   }
   if (!total) {
@@ -65,7 +65,7 @@ function classifyEmbeddings(hc) {
               ? `last model download: ${hc.model_download}`
               : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
       : `embedding_status=${(hc && hc.embedding_status) || 'unknown'}`;
-    return { name: 'Embeddings', status: 'warn',
+    return { name: 'Embeddings', status: 'warn', advisory: true,
       detail: `vector INACTIVE — ${total} embeddable nodes, 0 embedded; semantic search is FTS5-only (${why})` };
   }
   if (done < total) {
@@ -156,7 +156,10 @@ function classifyHealthReport(hc) {
   }
   const rows = [];
   if (hc.issue && String(hc.issue).includes('schema')) {
-    rows.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
+    // advisory: its "repair" only prints guidance (migration happens when the
+    // binary next runs), so it can never be counted fixed and would pin the
+    // exit code at 1 forever.
+    rows.push({ name: 'Schema', status: 'warn', advisory: true, detail: hc.issue, fixId: 'schema-mismatch' });
   } else {
     rows.push({ name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` });
   }
@@ -406,6 +409,7 @@ function runDiagnostics({ checkOnly = false } = {}) {
     results.push({
       name: 'Hooks',
       status: 'warn',
+      advisory: true,
       detail:
         `settings.json was unusable and has been REBUILT — your original is at ` +
         `${hookResult.rebuiltFrom}. Merge anything you need back by hand.`,
@@ -534,6 +538,7 @@ function runDiagnostics({ checkOnly = false } = {}) {
       results.push({
         name: 'Global npm relics',
         status: 'warn',
+        advisory: true,
         detail: relics.map((r) => `${r.name}@${r.version} (${r.nodeModulesDir.replace(home, '~')})`).join('; ')
           + ' — installed under a non-active node version; auto-heal cannot reach another node\'s prefix. '
           + 'Remove each via `nvm use <that node> && npm rm -g <pkg>`, or uninstall the unused node (`nvm uninstall <ver>`).',
@@ -1140,17 +1145,30 @@ function runRepairs(results, {
 // ── Main ──────────────────────────────────────────────────
 
 // Exit status for a doctor run reflects what remains BROKEN, not what was found:
-//   --check-only → every found issue is unresolved (report cleanliness, no repair).
-//   repair mode  → issueCount minus what runRepairs resolved. A run that fixes
+//   --check-only → every found BLOCKING issue is unresolved (report cleanliness,
+//                  no repair).
+//   repair mode  → blocking count minus what runRepairs resolved. A run that fixes
 //                  everything ("N/N addressed") reports 0 so `doctor && …` and
 //                  self-heal automation don't read a successful repair as a
 //                  failure. runRepairs counts an issue fixed only when its repair
 //                  reports success — and the hooks arm re-scans after install() to
 //                  confirm, so a still-broken re-scan is NOT counted (stays
-//                  unresolved → exit 1). An issue with no working repair
-//                  (schema-mismatch is advisory only) likewise keeps this > 0.
+//                  unresolved → exit 1).
+//
+// `advisory: true` rows are excluded. They are reported like any other warn but
+// describe something this tool cannot act on and that is not broken: a binary
+// deliberately built without embed-model, npm relics under a node version whose
+// prefix we cannot reach, a settings.json we already rebuilt, a schema note whose
+// "repair" only prints guidance. Every one of those used to pin the exit code at
+// 1 for the life of the install, so `doctor && <next step>` could never proceed —
+// a permanently-red check is one nobody reads (2026-08-16 audit §四).
+//
+// Advisory is an EXPLICIT marker, never inferred from a missing fixId: inferring
+// it would silently exempt the next row somebody forgets to wire to a repair,
+// which is the opposite failure. `doctor_rows_are_repairable_or_advisory`
+// (doctor.test.js) holds that line.
 function unresolvedCount({ checkOnly, issueCount, fixed }) {
-  return checkOnly ? issueCount : issueCount - fixed;
+  return checkOnly ? issueCount : Math.max(0, issueCount - fixed);
 }
 
 function runDoctor(opts = {}) {
@@ -1158,15 +1176,20 @@ function runDoctor(opts = {}) {
   console.log(formatReport(results, { checkOnly: opts.checkOnly }));
 
   const issues = results.filter(r => r.status === 'warn' || r.status === 'error');
+  const blocking = issues.filter(r => !r.advisory);
 
   let fixed = 0;
   if (issues.length > 0 && !opts.checkOnly) {
     fixed = runRepairs(results);
-    console.log(`\n  ${fixed}/${issues.length} issue(s) addressed.`);
+    console.log(`\n  ${fixed}/${blocking.length} issue(s) addressed.`);
+    const advisoryCount = issues.length - blocking.length;
+    if (advisoryCount > 0) {
+      console.log(`  ${advisoryCount} advisory note(s) above need no action here.`);
+    }
   }
 
   const unresolved = unresolvedCount({
-    checkOnly: opts.checkOnly, issueCount: issues.length, fixed,
+    checkOnly: opts.checkOnly, issueCount: blocking.length, fixed,
   });
   return { results, issueCount: issues.length, unresolved };
 }

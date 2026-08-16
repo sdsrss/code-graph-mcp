@@ -60,3 +60,39 @@ test('no hook hand-rolls an allow decision outside hook-emit.js', () => {
   assert.deepEqual(offenders, [],
     `inline allow envelopes bypass the shared boundary: ${offenders.join(', ')}`);
 });
+
+// P2 (2026-08-16 audit §四): the three injection hooks had no byte ceiling while
+// `cg-answer.js`, which emits alongside them, has capped at 4000 since it was
+// written. Their payloads are built from unbounded lists — pre-edit-guide joins
+// every direct caller's `name (file)` onto one line — so editing a heavily-called
+// symbol pushed a multi-kilobyte wall into the model's context on every Edit.
+test('injected context is capped, on every envelope, with the cut announced', () => {
+  const { capContext, MAX_INJECTED_BYTES, emitPreToolContext, emitPreToolAllowContext, emitPostToolContext } =
+    require('./hook-emit');
+
+  // Under the cap: byte-identical passthrough. Without this the cap could be a
+  // rewriter that mangles ordinary payloads.
+  const small = '[code-graph:impact] foo() — Risk: LOW\n  1 direct caller\n';
+  assert.equal(capContext(small), small);
+
+  const huge = Array.from({ length: 2000 }, (_, i) => `  caller_${i} (src/a/very/long/path/file_${i}.ts)`).join('\n');
+  for (const [name, emit] of [
+    ['PreToolUse', emitPreToolContext],
+    ['PreToolUse allow', emitPreToolAllowContext],
+    ['PostToolUse', emitPostToolContext],
+  ]) {
+    const ctx = JSON.parse(emit(huge)).hookSpecificOutput.additionalContext;
+    assert.ok(
+      Buffer.byteLength(ctx, 'utf8') <= MAX_INJECTED_BYTES,
+      `${name}: ${Buffer.byteLength(ctx, 'utf8')} bytes exceeds the ${MAX_INJECTED_BYTES} cap`,
+    );
+    assert.match(ctx, /truncated at \d+ bytes/, `${name}: a silent cut is worse than an announced one`);
+  }
+
+  // Multi-byte safety: paths and symbol names are not always ASCII, and a cut
+  // through a codepoint would inject U+FFFD into the model's context.
+  const cjk = '符号'.repeat(5000);
+  const cut = capContext(cjk);
+  assert.ok(Buffer.byteLength(cut, 'utf8') <= MAX_INJECTED_BYTES);
+  assert.ok(!cut.includes('�'), 'must not slice through a multi-byte codepoint');
+});
