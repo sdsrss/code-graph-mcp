@@ -1,12 +1,26 @@
 # Changelog
 
-## Unreleased
+## v0.117.0 (2026-08-16)
 
-Remediation batch for the 2026-08-16 full audit (docs/AUDIT-REPORT-2026-08-16.md):
-both P0s and the immediate/short-term P1 tiers, plus the repairs an independent
-review of the batch itself turned up. **Requires an index rebuild**
-(`INDEX_VERSION` 60 → 61, automatic on next server start): existing indexes may
-carry the permanent edge loss the first fix closes.
+Remediation batch for the 2026-08-16 full audit (report kept locally — `docs/` is
+gitignored in this repo): both P0s and the immediate/short-term P1 tiers, plus the
+repairs two independent reviews of the batch itself turned up.
+
+**Upgrade notes**
+
+- **Requires an index rebuild** (`INDEX_VERSION` 60 → 61, automatic on the next
+  server start, one-time). Existing indexes may carry the permanent edge loss
+  P0-1 created, so the rebuild is the fix being delivered, not a side effect.
+- **`semantic_code_search` now always answers an object.** The confident-hybrid
+  path previously returned a bare JSON array; it is now
+  `{"results": [...], "search_mode", "vector_available", "match_confidence"}`,
+  matching what its other branches already emitted. A consumer doing
+  `Array.isArray(payload)` must read `payload.results` instead. Nothing in this
+  repo relied on the array shape.
+- **Reverting:** pin the prior release — `npm install -g @sdsrs/code-graph@0.116.0`
+  (or `cargo install code-graph-mcp --version 0.116.0`). Downgrading never wipes
+  an index: the `INDEX_VERSION` comparison is directional, so a 0.116.0 binary
+  reads a 61-stamped index without destroying it, and only re-stamps on upgrade.
 
 ### Fixed
 - **P0-1: a file crossing the 1 MB / parse-timeout threshold aborted the whole
@@ -71,6 +85,9 @@ carry the permanent edge loss the first fix closes.
   single flag-shaped tokens like `--no-default-features` — so a single-token
   multi-fragment query gets one relaxed-AND retry (fragments absent from the
   index are dropped) and otherwise stays an honest empty instead of OR noise.
+  A retry that dropped a fragment reports itself as a widened match, so
+  `db.migratoin` takes the usual confidence penalty and prints the "AND match
+  insufficient" note rather than reading as a precise hit.
 - **`semantic_code_search` silently threw away its candidate pool.** The
   always-on module/external/test filter dropped up to 20 of 20 fetched
   candidates with no counter, no pool compensation, and an empty answer that
@@ -133,11 +150,11 @@ carry the permanent edge loss the first fix closes.
   ran. Adoption now reports instead of throwing, and `session-init` wraps its
   run so a failure in any one step cannot dark the rest.
 - **One SIGTERM-trapping statusline provider hung the whole status line
-  forever.** Node's `timeout` sends SIGTERM and waits. The two statusline
-  call sites (third-party providers, health-check) now kill with SIGKILL —
-  scoped there deliberately rather than defaulted globally, since hard-killing
-  a timed-out `git pull` would orphan `.git/index.lock` and silently break
-  marketplace refreshes.
+  forever.** Node's `timeout` sends SIGTERM and waits. The statusline provider
+  spawn, the statusline health-check and `doctor`'s health-check now kill with
+  SIGKILL — scoped to those deliberately rather than defaulted globally, since
+  hard-killing a timed-out `git pull` would orphan `.git/index.lock` and
+  silently break marketplace refreshes.
 - **`pr-impact-comment` reported a timed-out analysis as "covered".** A failed
   or timed-out `affected` spawn took the same branch as "zero affected tests";
   failures now render as their own "Not analyzed" section, and
