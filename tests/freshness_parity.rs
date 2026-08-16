@@ -379,7 +379,35 @@ fn project_map_compact_guard_detects_missing_key() {
 // Task 3 drift-guard: CLI + MCP query-time freshness resync coverage.
 // ---------------------------------------------------------------------------
 
-const CLI_SRC: &str = "src/cli.rs";
+const CLI_SRC: &str = "src/cli/";
+
+/// The CLI is a module tree (`src/cli/**`), not one file, so the source-level
+/// guards below read it whole. Concatenation is safe for them: every handler
+/// name they look for is unique crate-wide.
+fn read_cli_sources() -> String {
+    fn walk(dir: &std::path::Path, out: &mut String) {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort(); // deterministic order
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push_str(&fs::read_to_string(&path).unwrap());
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(std::path::Path::new(CLI_SRC), &mut out);
+    assert!(
+        out.contains("pub fn cmd_refs"),
+        "read_cli_sources found no CLI handlers under {CLI_SRC} — the module tree moved"
+    );
+    out
+}
 
 /// Line-number-emitting CLI subcommand handlers. Each MUST call
 /// `refresh_files_if_stale` before reading line numbers out of the DB, or an
@@ -428,7 +456,7 @@ fn cli_handlers_missing_refresh(cli_src: &str) -> Vec<String> {
 
 #[test]
 fn cli_line_number_commands_call_refresh() {
-    let src = fs::read_to_string(CLI_SRC).expect("read cli.rs");
+    let src = read_cli_sources();
     let missing = cli_handlers_missing_refresh(&src);
     assert!(
         missing.is_empty(),
@@ -462,7 +490,7 @@ fn mcp_file_path_tools_call_ensure_fresh() {
 /// mutating the shared, concurrently-edited src/cli.rs on disk.
 #[test]
 fn cli_freshness_guard_detects_missing_refresh() {
-    let src = fs::read_to_string(CLI_SRC).expect("read cli.rs");
+    let src = read_cli_sources();
     let broken = src.replace(
         "refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);",
         "/* neutralized for negative control */;",

@@ -31,6 +31,18 @@ because `index_files.rs` now imports `split_identifier` from its new home).
   → `indexer::lock::other_process_holds_index_lock`, `search::tokenizer` →
   `utils::tokenizer`). No CLI flag, MCP tool schema or on-disk format is affected.
 
+- **`src/cli.rs` (9,308 production lines) is now a module tree.** Pure mechanical
+  relocation, no behaviour change: `cli/paths.rs` (project-root + user-path
+  normalization), `cli/symbols.rs` (fuzzy/qualified symbol resolution),
+  `cli/index_ops.rs`, `cli/health.rs`, `cli/usage.rs`, `cli/grep.rs`,
+  `cli/freshness.rs` (the `refresh_files_if_stale` resync nine commands share)
+  and `cli/commands/<name>.rs` — one file per subcommand. Largest file is now
+  1,362 lines (`grep.rs`); `cli/mod.rs` is 170. Three source-scanning drift
+  guards had to learn the new shape and were re-verified by mutation, not by
+  their green result: `reader_nondestructive`'s destructive-constructor scan and
+  `freshness_parity`'s resync scan now walk the whole tree, and the
+  `cli → mcp` forbidden-edge row targets the directory.
+
 ### Added
 - **`tests/hardening.rs` layering guard is now a 30-row forbidden-edge table**
   instead of the single `storage → graph` assertion it had been since M9a. That

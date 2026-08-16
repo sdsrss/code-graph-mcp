@@ -293,7 +293,7 @@ const FORBIDDEN_EDGES: &[(&str, &str, &str)] = &[
     ("src/storage", "outcome", "storage is surface-agnostic"),
     // The two published surfaces must not borrow from each other.
     (
-        "src/cli.rs",
+        "src/cli",
         "mcp",
         "CLI must not borrow MCP-server internals — shared index-lock infra lives in indexer::lock",
     ),
@@ -824,7 +824,7 @@ fn assert_ignore_paths_normalized_in_source() {
             "normalize_path_arg",
         ),
         (
-            "src/cli.rs",
+            "src/cli/commands/dead_code.rs",
             "let ignore_prefixes: Vec<String>",
             "normalize_rel_str",
         ),

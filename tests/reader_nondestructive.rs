@@ -198,10 +198,30 @@ fn no_read_subcommand_wipes_a_version_lagging_index() {
 /// `Database::open_with_vec` — without needing anybody to extend a table.
 #[test]
 fn only_indexer_entry_points_use_the_destructive_constructor() {
-    let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
-    )
-    .expect("read src/cli.rs");
+    // The CLI is a module tree (`src/cli/**`), not one file. Scan it whole:
+    // splitting cli.rs must not silently shrink this guard's reach.
+    let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+    let mut cli_files: Vec<std::path::PathBuf> = Vec::new();
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                collect(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+    collect(&cli_root, &mut cli_files);
+    assert!(
+        cli_files.len() > 5,
+        "expected the CLI module tree under src/cli/, found {} file(s)",
+        cli_files.len()
+    );
 
     // The two legitimate sites, both of which BUILD an index rather than read
     // one: a full index into an explicit path, and the incremental refresh.
@@ -222,42 +242,51 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
         "fn cmd_benchmark",
     ];
 
-    let lines: Vec<&str> = src.lines().collect();
-    let mut current_fn = "<file scope>";
     let mut offenders: Vec<String> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim_start();
-        // The same mutation round showed `pub(crate) fn` slipping past a
-        // `fn `/`pub fn `-only tracker: current_fn stayed at the PREVIOUS
-        // declaration, inheriting its allowlist exemption.
-        let decl = t
-            .strip_prefix("pub(crate) fn ")
-            .or_else(|| t.strip_prefix("pub(super) fn "))
-            .or_else(|| t.strip_prefix("pub async fn "))
-            .or_else(|| t.strip_prefix("async fn "))
-            .or_else(|| t.strip_prefix("pub fn "))
-            .or_else(|| t.strip_prefix("fn "));
-        if let Some(rest) = decl {
-            current_fn = rest.split('(').next().unwrap_or(rest);
-        }
-        // Skip doc comments and ordinary comments: several of them name the
-        // constructor while explaining why a reader must NOT use it.
-        if t.starts_with("//") {
-            continue;
-        }
-        let hits_destructive = line.contains("Database::open_with_vec")
-            || (line.contains("Database::open(") && !line.contains("open_nondestructive"));
-        let allowed = if line.contains("Database::open_with_vec") {
-            ALLOWED_ANCHORS
-                .iter()
-                .any(|a| a.trim_start_matches("fn ") == current_fn)
-        } else {
-            ALLOWED_OPEN_ANCHORS
-                .iter()
-                .any(|a| a.trim_start_matches("fn ") == current_fn)
-        };
-        if hits_destructive && !allowed {
-            offenders.push(format!("src/cli.rs:{} (in fn {current_fn})", i + 1));
+    for cli_file in &cli_files {
+        let src = std::fs::read_to_string(cli_file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", cli_file.display()));
+        let rel = cli_file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(cli_file)
+            .display()
+            .to_string();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut current_fn = "<file scope>";
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // The same mutation round showed `pub(crate) fn` slipping past a
+            // `fn `/`pub fn `-only tracker: current_fn stayed at the PREVIOUS
+            // declaration, inheriting its allowlist exemption.
+            let decl = t
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| t.strip_prefix("pub(super) fn "))
+                .or_else(|| t.strip_prefix("pub async fn "))
+                .or_else(|| t.strip_prefix("async fn "))
+                .or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("fn "));
+            if let Some(rest) = decl {
+                current_fn = rest.split('(').next().unwrap_or(rest);
+            }
+            // Skip doc comments and ordinary comments: several of them name the
+            // constructor while explaining why a reader must NOT use it.
+            if t.starts_with("//") {
+                continue;
+            }
+            let hits_destructive = line.contains("Database::open_with_vec")
+                || (line.contains("Database::open(") && !line.contains("open_nondestructive"));
+            let allowed = if line.contains("Database::open_with_vec") {
+                ALLOWED_ANCHORS
+                    .iter()
+                    .any(|a| a.trim_start_matches("fn ") == current_fn)
+            } else {
+                ALLOWED_OPEN_ANCHORS
+                    .iter()
+                    .any(|a| a.trim_start_matches("fn ") == current_fn)
+            };
+            if hits_destructive && !allowed {
+                offenders.push(format!("{rel}:{} (in fn {current_fn})", i + 1));
+            }
         }
     }
     assert!(
