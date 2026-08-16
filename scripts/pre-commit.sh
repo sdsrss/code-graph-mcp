@@ -124,6 +124,28 @@ if [ "$rs_staged" -gt 0 ] || [ "$cargo_staged" -gt 0 ]; then
     exit 1
   fi
   echo "✓ cargo test passed"
+
+  # fmt + clippy. Both are CI gates, and neither ran here — the asymmetry has
+  # cost this repo a re-tagged release once already, because a commit that
+  # passes locally and fails in CI is only discovered after the push (audit
+  # 2026-08-16 §四). `--all-targets` matches ci.yml: without it clippy lints
+  # lib+bins only and a test-only warning still lands.
+  #
+  # Ordered after check/test on purpose: they share the compilation the slow
+  # step already did, so this adds seconds rather than a second build.
+  echo "Running cargo fmt --check..."
+  if ! "${git_clean[@]}" cargo fmt --all -- --check; then
+    echo "❌ cargo fmt --check failed — run: cargo fmt --all"
+    exit 1
+  fi
+  echo "✓ cargo fmt passed"
+
+  echo "Running cargo clippy..."
+  if ! "${git_clean[@]}" cargo clippy --all-targets --quiet -- -D warnings 2>&1; then
+    echo "❌ cargo clippy failed"
+    exit 1
+  fi
+  echo "✓ cargo clippy passed"
 fi
 
 echo "Pre-commit checks passed."

@@ -109,6 +109,9 @@ Real-world benchmarks comparing code-graph-mcp tools against traditional approac
 ```
 src/
 ├── domain.rs     # Shared constants, relation types, env-var config
+├── resolve.rs    # Shared symbol resolution + ambiguity verdicts (CLI and MCP)
+├── outcome.rs    # Retrieval-adoption metrics from session transcripts
+├── cli/          # Every `code-graph-mcp <cmd>` subcommand (one file per command)
 ├── mcp/          # MCP protocol layer (JSON-RPC, tool registry, server)
 │   └── server/   # McpServer with IndexingState + CacheState sub-structs
 ├── parser/       # Tree-sitter parsing, relation extraction, LanguageConfig dispatch
@@ -117,6 +120,7 @@ src/
 ├── graph/        # Recursive CTE call graph queries
 ├── search/       # RRF fusion search combining BM25 + vector
 ├── embedding/    # Candle embedding model (optional, masked mean pooling)
+├── snapshot/     # Portable graph snapshots (create / verify / install)
 ├── sandbox/      # Context compressor with token estimation
 └── utils/        # Language detection, config
 ```
@@ -301,6 +305,21 @@ All tools are also available as CLI subcommands for shell scripts, hooks, and te
 | `incremental-index` | — | Run incremental index update (auto-creates DB if needed) |
 | `health-check` | `get_index_status` | Query index status and freshness |
 | `benchmark` | — | Benchmark index speed, query latency, token savings |
+| `affected [files…]` | — | Changed files → the test files to re-run (`--stdin`, `--depth`) |
+| `tour [path]` | — | Dependency-ordered reading order for a repo or subtree |
+| `centrality` | `project_map` (`include_centrality=true`) | Rank architectural chokepoints (betweenness over the call graph) |
+| `cycles` | — | Detect circular import dependencies (file-level) |
+| `surprising` | — | Surface unexpected cross-module couplings (uncertain edges) |
+| `report` | — | Consolidated code-health report (summary + all analyses) |
+| `stats` | — | Aggregate session metrics from `.code-graph/usage.jsonl` |
+| `outcome` | — | Retrieval adoption from session transcripts (field-MRR; read-only) |
+| `rebuild-index` | `rebuild_index` | Drop and rebuild the index from scratch (requires `--confirm`) |
+| `reindex` | — | Incremental refresh; `--from-snapshot` refetches the published snapshot |
+| `snapshot create\|inspect` | — | Build or inspect a portable graph snapshot |
+| `doctor` | — | Diagnose and repair environment issues |
+| `adopt` | — | Install the steering block into the project `CLAUDE.md` + detail doc |
+| `unadopt` | — | Remove the steering block + detail doc |
+| `serve` | — | Start the MCP JSON-RPC server on stdio (the default with no subcommand) |
 
 Common options: `--json` (JSON output), `--compact` (compact output), `--limit N`, `--depth N`, `--file <path>`.
 

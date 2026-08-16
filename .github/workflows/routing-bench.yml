@@ -27,6 +27,14 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege: every job here only reads the repo. Without an explicit block
+# a workflow inherits the repository's DEFAULT token permissions, which on many
+# repos is still read-write across the whole API — so a compromised action in
+# any step would hold a write token it never needed. The other three workflows
+# already declare one; these two were the gap (2026-08-16 audit §四).
+permissions:
+  contents: read
+
 jobs:
   bench:
     name: P@1 routing recall

@@ -144,6 +144,43 @@ fn cli_surface() -> CliSurface {
     }
 }
 
+/// P2 (2026-08-16 audit §四): the README's "CLI Commands" table is the list a
+/// user reads to learn what this tool can do, and it had drifted eleven
+/// subcommands behind the dispatch — `affected`, `tour`, `centrality`, `cycles`,
+/// `surprising`, `report`, `stats`, `outcome`, `reindex`, `snapshot`, `serve`
+/// were all missing. A hand-maintained inventory with nothing checking it.
+#[test]
+fn readme_cli_table_lists_every_subcommand() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("README.md must be readable");
+    let table = readme
+        .split("## CLI Commands")
+        .nth(1)
+        .and_then(|s| s.split("## ").next())
+        .expect("README must have a CLI Commands section");
+
+    let mut expected = cli_surface().names;
+    expected.insert("serve".to_string());
+
+    // Matched inside a leading `| \u{60}name` cell, so a mention in the prose
+    // below the table cannot satisfy the check.
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|name| {
+            !table
+                .lines()
+                .filter(|l| l.starts_with("| `"))
+                .any(|l| l[3..].starts_with(name.as_str()))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "README's CLI Commands table is missing {missing:?} — a user reading it \
+         would not know these exist"
+    );
+}
+
 /// P2 (2026-08-16 audit §四): `--help`'s OPTIONS block claims `--json` covers
 /// "every subcommand except serve, doctor, adopt and unadopt". It previously
 /// claimed the opposite for the index commands ("not the index commands"), which
@@ -510,4 +547,61 @@ fn checker_rejects_fabricated_and_misattributed() {
             .any(|e| e.contains("--ignore") && e.contains("callgraph")),
         "checker failed to catch a flag misattributed to the wrong command; errs={errs2:?}"
     );
+}
+
+/// P2 (2026-08-16 audit §四): both module-layout blocks — README's "Architecture"
+/// and the project `CLAUDE.md` — had drifted from `src/`. Neither listed `cli/`
+/// (31 files, the largest module), `snapshot/`, `outcome.rs` or `resolve.rs`.
+///
+/// These blocks are steering surfaces: an agent reads the CLAUDE.md one to decide
+/// where to look, so a module missing from it is a module the agent does not know
+/// exists. Held against the real directory rather than against a transcription.
+#[test]
+fn module_layout_blocks_list_every_top_level_module() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // `lib.rs` / `main.rs` are crate roots, not modules anyone navigates to.
+    const NOT_A_MODULE: &[&str] = &["lib.rs", "main.rs"];
+
+    let mut actual: Vec<String> = std::fs::read_dir(root.join("src"))
+        .expect("src/ must be readable")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !NOT_A_MODULE.contains(&n.as_str()))
+        .filter(|n| n.ends_with(".rs") || root.join("src").join(n).is_dir())
+        .collect();
+    actual.sort();
+    assert!(
+        actual.len() >= 10,
+        "sanity: found only {actual:?} under src/"
+    );
+
+    for (label, path) in [
+        ("README.md", root.join("README.md")),
+        ("CLAUDE.md", root.join("CLAUDE.md")),
+    ] {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: {e}"));
+        // Only the fenced layout block, so a passing mention elsewhere in the
+        // prose cannot stand in for a row in the map.
+        let block = text
+            .split("src/\n")
+            .nth(1)
+            .and_then(|s| s.split("```").next())
+            .unwrap_or_else(|| panic!("{label} must contain an `src/` layout block"));
+        let missing: Vec<&String> = actual
+            .iter()
+            .filter(|m| {
+                let entry = if m.ends_with(".rs") {
+                    (*m).clone()
+                } else {
+                    format!("{m}/")
+                };
+                !block.contains(&entry)
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{label}'s src/ layout block omits {missing:?} — a reader (or an agent \
+             routing off this map) would not know they exist"
+        );
+    }
 }

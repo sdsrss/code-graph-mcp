@@ -252,6 +252,14 @@ jobs:
     name: Publish
     needs: build
     runs-on: ubuntu-latest
+    # `id-token: write` is what `npm publish --provenance` mints its attestation
+    # with; without it the publish step FAILS rather than degrading, so the flag
+    # and this permission are one change and must never be split (2026-08-16
+    # audit §四). Job-scoped, not workflow-scoped: nothing else here needs to
+    # mint tokens.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -449,7 +457,13 @@ jobs:
             # auth / 404 / network failures (must fail the job). Old "|| echo
             # warning" swallowed everything and made smoke tests the only fail
             # signal — 15 min of red retries before anyone noticed in v0.30.0.
-            if ! out=$(npm publish --access public 2>&1); then
+            # --provenance: a signed, verifiable link from this tarball back to
+            # the workflow run and commit that built it. Standard hardening for a
+            # package that ships NATIVE BINARIES, where "did this .node come from
+            # that source?" is not answerable any other way. Requires the
+            # `id-token: write` above; the failure mode if it is ever removed is
+            # a loud publish failure, not a silent unsigned release.
+            if ! out=$(npm publish --access public --provenance 2>&1); then
               if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
                 echo "::warning::$pkg already published at $VERSION — skipping"
               else
@@ -467,7 +481,8 @@ jobs:
 
       - name: Publish main package
         run: |
-          if ! out=$(npm publish --access public 2>&1); then
+          # --provenance, same as the platform packages above.
+          if ! out=$(npm publish --access public --provenance 2>&1); then
             if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
               echo "::warning::main package already published at $VERSION — skipping"
             else

@@ -3,6 +3,23 @@ name = "code-graph-mcp"
 version = "0.117.0"
 edition = "2021"
 license = "MIT"
+# No `rust-version` is declared, deliberately. The obvious candidate is CI's
+# pinned toolchain (1.95.0), but that is a CHOSEN toolchain, not this crate's
+# minimum: it compiles on 1.91.1 today, which declaring 1.95.0 would have
+# locked out — attempting it turned `cargo check` into an immediate hard error
+# here (2026-08-16 audit §四). Establishing the real floor means bisecting
+# toolchains, and a floor guessed too high excludes users for nothing. The
+# README states the situation instead of a number nobody measured.
+
+# Local `cargo clippy` was less strict than CI, which runs
+# `-D warnings`: drift landed in a working tree and only reddened on push.
+# Declaring the level here means the same bar applies to every invocation,
+# including an editor's rust-analyzer.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
 
 [features]
 # v0.18.4: default flipped to [] for direct `cargo install` users — gives a
