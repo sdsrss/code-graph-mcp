@@ -384,7 +384,14 @@ fn extract_nodes(
 
         // Methods: TS/JS (method_definition), Go/Java (method_declaration), Ruby (method, singleton_method)
         "method_definition" | "method_declaration" => {
-            if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
+            // Go declares methods at file scope with the owner in a RECEIVER
+            // rather than by nesting them in a type body, so `parent_class` is
+            // always None here and every method was stored with
+            // `qualified_name == name`. Two types with a `Start` method were
+            // then two indistinguishable `Start` nodes (audit 2026-08-16 P1-4).
+            let go_owner = go_receiver_type(&node, source);
+            let owner = go_owner.as_deref().or(parent_class);
+            if let Some(mut parsed) = extract_function_node(&node, source, "method", owner) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
             }
@@ -986,6 +993,36 @@ fn python_decorated_extent<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Nod
     match node.parent() {
         Some(parent) if parent.kind() == "decorated_definition" => parent,
         _ => *node,
+    }
+}
+
+/// The owner type of a Go method, from its receiver: `func (s *Server) Start()`
+/// → `Server`. `None` for any node without a `receiver` field, which is every
+/// non-Go `method_declaration` (Java nests its methods in a class body instead)
+/// and every Go `function_declaration`.
+///
+/// The base name is taken from the receiver's TEXT rather than by walking into
+/// `pointer_type` / `generic_type`: a Go receiver base type is always a single
+/// local identifier, so stripping a leading `*` and any `[…]` type arguments is
+/// exact, and it does not break when a grammar bump renames those inner kinds.
+/// The type arguments MUST come off — `Server[T].Generic` would never match a
+/// lookup for `Server`.
+fn go_receiver_type(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let decl = receiver.named_child(0)?;
+    let ty = decl.child_by_field_name("type")?;
+    let base = node_text(&ty, source)
+        .trim()
+        .trim_start_matches('*')
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
     }
 }
 
@@ -1821,6 +1858,68 @@ describe('Widget', () => {
             Some(("function", Some("free_fn"))),
             "free function should stay bare; got: {:?}",
             dump
+        );
+    }
+
+    /// P1-4: a Go method's RECEIVER is its owner, and it was never folded into
+    /// `qualified_name` — so `Server.Start` and `Client.Start` were two nodes
+    /// both spelled `Start`, indistinguishable to every symbol lookup. The
+    /// visible damage is silent: `callgraph Start` merges the callers of both,
+    /// and the ambiguity is folded out by the default confidence floor, so the
+    /// answer looks clean (audit 2026-08-16 P1-4). C++ has carried
+    /// `Class.method` since v0.91.0; Go is the same shape spelled differently.
+    #[test]
+    fn test_parse_go_method_receiver_qualifies_the_name() {
+        let code = "package p\n\
+            type Server struct{}\n\
+            type Client struct{}\n\
+            func (s *Server) Start() error { return nil }\n\
+            func (c Client) Start() error { return nil }\n\
+            func (s *Server[T]) Generic() {}\n\
+            func Plain() {}\n";
+        let nodes = parse_code(code, "go").unwrap();
+        let dump: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.node_type.clone(),
+                    n.qualified_name.clone(),
+                )
+            })
+            .collect();
+        let quals: Vec<&str> = nodes
+            .iter()
+            .filter_map(|n| n.qualified_name.as_deref())
+            .collect();
+
+        // Pointer receiver.
+        assert!(
+            quals.contains(&"Server.Start"),
+            "pointer receiver must qualify the method; got: {dump:?}"
+        );
+        // Value receiver — same method name, different owner. This pair is the
+        // whole point: before the fix both were bare `Start`.
+        assert!(
+            quals.contains(&"Client.Start"),
+            "value receiver must qualify the method; got: {dump:?}"
+        );
+        // Generic receiver: the type ARGUMENTS are not part of the owner name,
+        // or `Server[T].Generic` would never match a lookup for `Server`.
+        assert!(
+            quals.contains(&"Server.Generic"),
+            "a generic receiver must qualify by its BASE type; got: {dump:?}"
+        );
+        // A plain function has no receiver and must stay bare — otherwise this
+        // fix is indistinguishable from "prefix everything".
+        let plain = nodes.iter().find(|n| n.name == "Plain").unwrap();
+        assert_eq!(plain.qualified_name.as_deref(), Some("Plain"), "{dump:?}");
+        assert_eq!(plain.node_type, "function", "{dump:?}");
+        // The bare `name` is unchanged: by-name lookup must keep working.
+        assert_eq!(
+            nodes.iter().filter(|n| n.name == "Start").count(),
+            2,
+            "both methods keep the bare name `Start`; got: {dump:?}"
         );
     }
 

@@ -87,7 +87,7 @@ use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
 use imports::{
     extract_import_names, extract_python_from_import_names, extract_python_import_names,
 };
-use inherits::{extract_implements, extract_superclasses};
+use inherits::{extract_implements, extract_superclasses, is_heritage_decl};
 use java::extract_java_type_reference;
 use python::{
     extract_python_type_reference, extract_python_value_reference, infer_python_call_receiver_type,
@@ -1316,8 +1316,10 @@ fn walk_for_relations(
             extract_python_from_import_names(&node, source, results);
         }
 
-        // Class inheritance
-        "class_declaration" | "class_definition" | "class" => {
+        // Heritage-carrying declarations. See [`HERITAGE_DECL_KINDS`] — this arm
+        // used to list only the three class-shaped kinds, so a Java `interface`,
+        // a Kotlin `object`, a Swift `protocol` and the rest emitted NOTHING.
+        kind if is_heritage_decl(kind) => {
             let class_name = node
                 .child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string());
@@ -1464,7 +1466,17 @@ fn walk_for_relations(
         }
 
         // C# inheritance: class Dog : Animal, IWalkable
-        "base_list" if config.name == "csharp" => {
+        //
+        // NOT on an enum. C# spells an enum's UNDERLYING INTEGRAL TYPE with the
+        // same `base_list` syntax a class uses for its base type, so
+        // `enum Level : byte` produced `Level inherits byte` — a phantom edge
+        // bound to a real node, which this repo has already learned is worse
+        // than a missing one (it makes `byte` look inherited-from and pollutes
+        // every heritage traversal). Grammar-level distinction: the parent kind.
+        "base_list"
+            if config.name == "csharp"
+                && node.parent().map(|p| p.kind()) != Some("enum_declaration") =>
+        {
             // Get the class/struct name from the parent node
             let owner_name = node
                 .parent()

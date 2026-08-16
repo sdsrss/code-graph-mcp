@@ -3025,6 +3025,41 @@ fn write_cross_batch_fixture(root: &std::path::Path, filler_count: usize) {
     )
     .unwrap();
     fs::write(src.join("zzz_base.ts"), "export class Base {}\n").unwrap();
+    // Heritage axis (INDEX_VERSION 62, audit P1-3): every declaration kind that
+    // learned to emit inheritance edges gets a cross-batch pair too. A new axis
+    // that is only ever exercised inside ONE batch proves nothing about the
+    // deferred-resolution path, which is where this repo's edge losses live.
+    fs::write(
+        src.join("aaa_iface.java"),
+        "interface Shape extends Drawable { }\n",
+    )
+    .unwrap();
+    fs::write(src.join("zzz_drawable.java"), "interface Drawable { }\n").unwrap();
+    fs::write(
+        src.join("aaa_obj.kt"),
+        "object Registry : BaseRegistry { }\n",
+    )
+    .unwrap();
+    fs::write(src.join("zzz_registry.kt"), "open class BaseRegistry { }\n").unwrap();
+    fs::write(
+        src.join("aaa_level.dart"),
+        "enum Level implements Ordered { low }\n",
+    )
+    .unwrap();
+    fs::write(src.join("zzz_ordered.dart"), "abstract class Ordered { }\n").unwrap();
+    // Go receiver qualification (P1-4): the caller lives in the other batch, so
+    // the method's edge has to survive deferred resolution with its new
+    // `qualified_name` in place.
+    fs::write(
+        src.join("aaa_server.go"),
+        "package p\ntype Server struct{}\nfunc (s *Server) Start() error { return nil }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zzz_caller.go"),
+        "package p\nfunc Boot(s *Server) { s.Start() }\n",
+    )
+    .unwrap();
     // Sorted order puts aaa_* + mmm_* in batch 1 and zzz_* in batch 2 once the
     // total crosses BATCH_SIZE.
     for i in 0..filler_count {
@@ -3052,6 +3087,18 @@ fn test_cross_batch_relations_match_single_batch_control() {
         "src/zzz_trait.rs",
         "src/aaa_child.ts",
         "src/zzz_base.ts",
+        // Heritage axis, INDEX_VERSION 62. These MUST be listed here: the
+        // comparison below is restricted to `meaningful`, so a new fixture file
+        // that is not in this list contributes an empty-vs-empty diff and the
+        // axis reads as verified while never having been compared at all.
+        "src/aaa_iface.java",
+        "src/zzz_drawable.java",
+        "src/aaa_obj.kt",
+        "src/zzz_registry.kt",
+        "src/aaa_level.dart",
+        "src/zzz_ordered.dart",
+        "src/aaa_server.go",
+        "src/zzz_caller.go",
     ];
     let (multi_nodes, multi_edges) = graph_projection(&multi_db);
     let (control_nodes, control_edges) = graph_projection(&control_db);
@@ -3131,6 +3178,50 @@ fn test_cross_batch_relations_match_single_batch_control() {
                 "src/zzz_base.ts:Base"
             ),
             "{label}: imports of Base did not bind to the real node"
+        );
+
+        // Heritage axis (INDEX_VERSION 62): presence-first, for the same reason
+        // as the three above. Each of these declaration kinds emitted NOTHING
+        // before the fix, so without a positive assertion the equality check
+        // over the restricted projection would compare empty to empty and pass.
+        assert!(
+            has_edge(
+                edges,
+                "Shape",
+                crate::domain::REL_INHERITS,
+                "src/zzz_drawable.java:Drawable"
+            ),
+            "{label}: java `interface extends` edge missing across the batch boundary"
+        );
+        assert!(
+            has_edge(
+                edges,
+                "Registry",
+                crate::domain::REL_INHERITS,
+                "src/zzz_registry.kt:BaseRegistry"
+            ),
+            "{label}: kotlin `object :` edge missing across the batch boundary"
+        );
+        assert!(
+            has_edge(
+                edges,
+                "Level",
+                crate::domain::REL_IMPLEMENTS,
+                "src/zzz_ordered.dart:Ordered"
+            ),
+            "{label}: dart `enum implements` edge missing across the batch boundary"
+        );
+    }
+
+    // P1-4: the Go method keeps its receiver-qualified name on BOTH paths. A
+    // node-level assertion, not an edge one — the defect was that two types'
+    // same-named methods were one indistinguishable symbol.
+    for (nodes, label) in [(&multi_nodes, "multi"), (&control_nodes, "control")] {
+        assert!(
+            nodes
+                .iter()
+                .any(|(p, n, _)| p == "src/aaa_server.go" && n == "Start"),
+            "{label}: the Go method node is missing entirely"
         );
     }
 

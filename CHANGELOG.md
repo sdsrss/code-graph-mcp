@@ -2,10 +2,49 @@
 
 ## Unreleased
 
-Continuation of the 2026-08-16 audit remediation — §十 "中期" tier, starting with
-the architecture items. No behaviour change: this batch only moves code and adds a
-guard, so no `INDEX_VERSION` bump is owed (the extraction fingerprint moved solely
-because `index_files.rs` now imports `split_identifier` from its new home).
+Continuation of the 2026-08-16 audit remediation — the §十 "中期" tier.
+
+**Upgrade notes**
+
+- **Requires an index rebuild** (`INDEX_VERSION` 61 → 62, automatic on the next
+  server start, one-time). Existing indexes are missing every inheritance edge
+  listed under "heritage axis" below, carry unqualified Go method names, and hold
+  a phantom `enum inherits <integral type>` edge for each C# enum. The version
+  bump is the only rebuild trigger, so nothing else corrects them.
+
+### Fixed
+- **The heritage axis matched three hard-coded node kinds, so six languages
+  emitted ZERO inheritance edges for anything that is not spelled `class`.** A
+  Java `interface`/`enum`/`record`, a TypeScript `interface`, a PHP `interface`,
+  a Kotlin `object`, a Swift `protocol` and a Dart `enum` all carry heritage and
+  all produced nothing — nothing failed, the graph was simply incomplete, so
+  `find_dead_code` reported an interface's implementers as unused and every
+  heritage traversal under-reported. Declaration kinds now come from a table
+  (`HERITAGE_DECL_KINDS`) whose every row was read off a real parse, and three
+  heritage-child spellings no extractor read (`extends_interfaces`,
+  `extends_type_clause`, Dart's `interfaces`) are handled.
+
+  Measured on external corpora, not fixtures: **okio +14 `inherits`, gson +3
+  `implements`, moshi +1 — and 0 edges removed in all three.** Each new edge was
+  confirmed against the source (`public enum FieldNamingPolicy implements
+  FieldNamingStrategy`, `object NodeJsFileSystem : FileSystem()`, …).
+- **Go methods did not carry their receiver, so two types' same-named methods
+  were one indistinguishable symbol.** Go declares methods at file scope with the
+  owner in a receiver rather than by nesting, so `qualified_name` was always just
+  the bare name and `callgraph Start` silently merged the callers of
+  `Server.Start` and `Client.Start` — with the ambiguity folded out by the
+  default confidence floor, so the answer looked clean. Measured on gorilla/mux:
+  **17 bare method names were shared by more than one method before; 0 qualified
+  names are shared after**, with the edge set byte-identical (0 added, 0 removed)
+  — this is a naming fix, not a graph change.
+- **A C# `enum E : byte` emitted a phantom `E inherits byte`.** C# spells an
+  enum's underlying integral type with the same `base_list` syntax a class uses
+  for its base type. A phantom edge bound to a real node is worse than a missing
+  one; the arm is now gated on the parent declaration kind.
+
+The cross-batch differential fixture gained a pair for each newly-covered
+language, and the equality check is backed by positive presence assertions —
+without them a new axis compares empty to empty and reads as verified.
 
 ### Fixed
 - **`impact <Class>.<method> --file <path>` endorsed a class that does not exist.**

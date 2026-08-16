@@ -6295,3 +6295,190 @@ fn run(r: Result<fn(), i32>) {
         "a name bound by the arm pattern must still be excluded, got: {calls2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1-3 heritage axis: the (language, declaration-kind) parity table.
+//
+// The heritage arm matched exactly three node kinds —
+// `class_declaration | class_definition | class` — so every grammar that spells
+// a heritage-carrying declaration differently emitted ZERO inheritance edges,
+// silently. That is the "unguarded axis" shape: nothing failed, the graph was
+// simply incomplete, and `find_dead_code` then reported implementers of an
+// interface as unused because the edge that proves otherwise was never built.
+//
+// A table is the point: rows are (language, declaration kind), and a new row is
+// one line. Written RED-first against the real grammars — every node kind and
+// heritage-child kind below came from parsing these exact snippets, not from
+// reading a grammar README.
+// ---------------------------------------------------------------------------
+
+/// `(language, source, expected (source_name, target_name, relation) edges)`.
+#[allow(clippy::type_complexity)]
+fn heritage_cases() -> Vec<(
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str, &'static str)>,
+)> {
+    vec![
+        // Java: interface extends (inherits), enum/record implements.
+        (
+            "java",
+            "interface Shape extends Drawable, Sized { }",
+            vec![
+                ("Shape", "Drawable", REL_INHERITS),
+                ("Shape", "Sized", REL_INHERITS),
+            ],
+        ),
+        (
+            "java",
+            "enum Suit implements Comparable { HEARTS }",
+            vec![("Suit", "Comparable", REL_IMPLEMENTS)],
+        ),
+        (
+            "java",
+            "record Point(int x, int y) implements Serializable { }",
+            vec![("Point", "Serializable", REL_IMPLEMENTS)],
+        ),
+        // TypeScript: interface extends interface.
+        (
+            "typescript",
+            "interface Admin extends User, Auditable { }",
+            vec![
+                ("Admin", "User", REL_INHERITS),
+                ("Admin", "Auditable", REL_INHERITS),
+            ],
+        ),
+        // C# already had a `base_list` arm keyed on the node kind rather than on
+        // the declaration, so every C# declaration form was covered. Kept in the
+        // table as the WORKING row: it pins the `interface_by_prefix` split
+        // (`IRepo` → implements, `BaseRepo` → inherits), which is a convention,
+        // not a grammar fact, and would otherwise be free to drift.
+        (
+            "csharp",
+            "class Repo : BaseRepo, IRepo { }",
+            vec![
+                ("Repo", "BaseRepo", REL_INHERITS),
+                ("Repo", "IRepo", REL_IMPLEMENTS),
+            ],
+        ),
+        (
+            "csharp",
+            "interface IReadRepo : IRepo { }",
+            vec![("IReadRepo", "IRepo", REL_IMPLEMENTS)],
+        ),
+        // PHP: interface extends.
+        (
+            "php",
+            "<?php\ninterface Writer extends Stream { }",
+            vec![("Writer", "Stream", REL_INHERITS)],
+        ),
+        // Kotlin: `object X : Base()`.
+        (
+            "kotlin",
+            "object Registry : BaseRegistry { }",
+            vec![("Registry", "BaseRegistry", REL_INHERITS)],
+        ),
+        // Swift: `protocol P: Q`.
+        (
+            "swift",
+            "protocol Cache: Store { }",
+            vec![("Cache", "Store", REL_INHERITS)],
+        ),
+        // Dart: `implements` on a class parses to an `interfaces` child that
+        // neither heritage function read — so even the ALREADY-matched
+        // `class_definition` produced nothing for this spelling.
+        (
+            "dart",
+            "class FileStore implements Store { }",
+            vec![("FileStore", "Store", REL_IMPLEMENTS)],
+        ),
+        (
+            "dart",
+            "enum Level implements Comparable { low }",
+            vec![("Level", "Comparable", REL_IMPLEMENTS)],
+        ),
+    ]
+}
+
+#[test]
+fn heritage_parity_across_declaration_kinds() {
+    let mut missing = Vec::new();
+    for (lang, src, expected) in heritage_cases() {
+        let rels = match extract_relations(src, lang) {
+            Ok(r) => r,
+            Err(e) => {
+                missing.push(format!("{lang}: parse failed: {e}"));
+                continue;
+            }
+        };
+        for (from, to, rel) in expected {
+            let found = rels
+                .iter()
+                .any(|r| r.source_name == from && r.target_name == to && r.relation == rel);
+            if !found {
+                let got: Vec<String> = rels
+                    .iter()
+                    .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+                    .map(|r| format!("{} -{}-> {}", r.source_name, r.relation, r.target_name))
+                    .collect();
+                missing.push(format!(
+                    "{lang}: {from} -{rel}-> {to}  (got: {got:?})  src: {src:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "heritage edges missing for {} case(s):\n  {}",
+        missing.len(),
+        missing.join("\n  ")
+    );
+}
+
+/// Negative control for the table above: a heritage-carrying declaration KIND
+/// with no heritage clause must stay silent. Without this, "widen the match" is
+/// indistinguishable from "emit an edge for every declaration".
+#[test]
+fn heritage_declarations_without_a_clause_emit_nothing() {
+    for (lang, src) in [
+        ("java", "interface Bare { }"),
+        ("java", "enum Bare { A }"),
+        ("typescript", "interface Bare { }"),
+        ("csharp", "class Bare { }"),
+        ("csharp", "interface IBare { }"),
+        ("php", "<?php\ninterface Bare { }"),
+        ("kotlin", "object Bare { }"),
+        ("swift", "protocol Bare { }"),
+        ("dart", "class Bare { }"),
+        ("dart", "enum Bare { a }"),
+    ] {
+        let rels = extract_relations(src, lang).unwrap();
+        let heritage: Vec<String> = rels
+            .iter()
+            .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+            .map(|r| format!("{} -{}-> {}", r.source_name, r.relation, r.target_name))
+            .collect();
+        assert!(
+            heritage.is_empty(),
+            "{lang} {src:?} has no heritage clause but emitted {heritage:?}"
+        );
+    }
+}
+
+/// A C# `enum` names its UNDERLYING INTEGRAL TYPE with the same `base_list`
+/// syntax a class uses for its base type. Reading that as inheritance would
+/// invent `Level inherits byte` — a phantom edge bound to a real node, which
+/// this repo has already learned is worse than a missing one.
+#[test]
+fn csharp_enum_underlying_type_is_not_inheritance() {
+    let rels = extract_relations("enum Level : byte { Low }", "csharp").unwrap();
+    let heritage: Vec<String> = rels
+        .iter()
+        .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
+        .map(|r| format!("{} -{}-> {}", r.source_name, r.relation, r.target_name))
+        .collect();
+    assert!(
+        heritage.is_empty(),
+        "a C# enum's underlying type is not a parent; got {heritage:?}"
+    );
+}

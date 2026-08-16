@@ -8,6 +8,47 @@ use super::super::node_text;
 use super::ParsedRelation;
 use crate::domain::REL_IMPLEMENTS;
 
+/// Declaration node kinds that can carry heritage, across every grammar we
+/// parse. Rows, not an `|`-chain, because the axis was unguarded: the walk
+/// matched exactly `class_declaration | class_definition | class`, so a grammar
+/// that spells its declaration differently emitted ZERO inheritance edges and
+/// nothing failed — the graph was simply incomplete, and `find_dead_code` then
+/// reported an interface's implementers as unused (audit 2026-08-16 P1-3).
+///
+/// Every kind here was read off a real parse of the language in question (see
+/// `heritage_parity_across_declaration_kinds`), not off a grammar README.
+/// Adding a language means adding a row here AND a row to that table.
+///
+/// Deliberately NOT listed:
+///   * `struct_specifier` / `class_specifier` — C/C++ have their own arm below
+///     (`extract_cpp_inheritance`), which understands access specifiers.
+///   * `trait_declaration` (PHP) — a trait has no heritage clause; it is
+///     `use`d by a class, which is a different relation than extends/implements.
+///   * `struct_item` / `enum_item` (Rust) — Rust has no class inheritance at
+///     all; `impl Trait for Type` is handled as `implements` elsewhere.
+pub(super) const HERITAGE_DECL_KINDS: &[&str] = &[
+    // TS/JS/Java/PHP/C#/Kotlin/Swift/Dart all spell their class this way.
+    "class_declaration",
+    "class_definition",
+    "class",
+    // Java (extends interfaces), TypeScript (extends interfaces), PHP, C#.
+    "interface_declaration",
+    // Java (implements), PHP (implements), Dart (implements).
+    "enum_declaration",
+    // Java, C#.
+    "record_declaration",
+    // C#.
+    "struct_declaration",
+    // Kotlin: `object Registry : BaseRegistry`.
+    "object_declaration",
+    // Swift: `protocol Cache: Store`.
+    "protocol_declaration",
+];
+
+pub(super) fn is_heritage_decl(kind: &str) -> bool {
+    HERITAGE_DECL_KINDS.contains(&kind)
+}
+
 pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
     let mut parents = Vec::new();
     // Look for "extends" clause / superclass
@@ -34,6 +75,47 @@ pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Ve
                         }
                         if inner.kind() == "identifier" || inner.kind() == "type_identifier" {
                             parents.push(node_text(&inner, source).to_string());
+                        }
+                    }
+                }
+            }
+            // Java: `interface Shape extends Drawable, Sized`
+            // extends_interfaces -> type_list -> type_identifier
+            "extends_interfaces" => {
+                for k in 0..child.named_child_count() {
+                    if let Some(list) = child.named_child(k) {
+                        if list.kind() == "type_list" {
+                            for m in 0..list.named_child_count() {
+                                if let Some(t) = list.named_child(m) {
+                                    if matches!(t.kind(), "type_identifier" | "identifier") {
+                                        parents.push(node_text(&t, source).to_string());
+                                    }
+                                }
+                            }
+                        } else if matches!(list.kind(), "type_identifier" | "identifier") {
+                            parents.push(node_text(&list, source).to_string());
+                        }
+                    }
+                }
+            }
+            // TypeScript: `interface Admin extends User, Auditable`
+            // extends_type_clause -> type_identifier (direct children)
+            "extends_type_clause" => {
+                for k in 0..child.named_child_count() {
+                    if let Some(t) = child.named_child(k) {
+                        match t.kind() {
+                            "type_identifier" | "identifier" => {
+                                parents.push(node_text(&t, source).to_string());
+                            }
+                            // `interface A extends B<T>` — index the base name.
+                            "generic_type" => {
+                                if let Some(inner) = t.named_child(0) {
+                                    if matches!(inner.kind(), "type_identifier" | "identifier") {
+                                        parents.push(node_text(&inner, source).to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -215,6 +297,26 @@ pub(super) fn extract_implements(
                                     source_language: String::new(),
                                 });
                             }
+                        }
+                    }
+                }
+            }
+            // Dart: `class FileStore implements Store` / `enum Level implements C`
+            // interfaces -> type_identifier (direct children, no type_list)
+            "interfaces"
+                if child.named_child_count() > 0
+                    && child.named_child(0).map(|c| c.kind()) != Some("type_list") =>
+            {
+                for j in 0..child.named_child_count() {
+                    if let Some(t) = child.named_child(j) {
+                        if matches!(t.kind(), "type_identifier" | "identifier") {
+                            results.push(ParsedRelation {
+                                source_name: class_name.to_string(),
+                                target_name: node_text(&t, source).to_string(),
+                                relation: REL_IMPLEMENTS.into(),
+                                metadata: None,
+                                source_language: String::new(),
+                            });
                         }
                     }
                 }
