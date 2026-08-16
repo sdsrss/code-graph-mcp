@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.118.0 (2026-08-16)
 
 Continuation of the 2026-08-16 audit remediation — the §十 "中期" tier, then the
 §四 P2 tail.
@@ -55,6 +55,32 @@ close no gap and a guard was added instead.
   listed under "heritage axis" below, carry unqualified Go method names, and hold
   a phantom `enum inherits <integral type>` edge for each C# enum. The version
   bump is the only rebuild trigger, so nothing else corrects them.
+
+- **Three output shapes changed. If you script against them, read this.**
+  - `grep --json` now emits `{"error": "…"}` on its FAILURE legs (unsupported
+    flag, path outside the project, ripgrep missing, invalid pattern) instead of
+    the success-shaped `[]`. A genuine zero-match run still returns `[]` with
+    exit 1 — that part is unchanged. A consumer doing `JSON.parse(out).length`
+    now gets `undefined` on an error rather than `0`, which is the point: the
+    two were byte-identical before, so `--json 2>/dev/null` reported "no matches
+    in this repo" for a typo'd flag.
+  - `health-check --format <unknown>` now fails with exit 2 instead of silently
+    printing the human one-liner and exiting 0. A script asking for JSON and
+    getting prose with a success code had no way to tell.
+  - A clap argument error under `--json` now writes a JSON error object to
+    stdout (it previously wrote zero bytes and exited 2).
+  - `doctor`'s exit code no longer counts advisory rows — a binary deliberately
+    built without `embed-model`, or npm relics under a node version the tool
+    cannot reach, no longer pin it at 1 forever. If you gate automation on
+    `doctor && …`, it will now proceed in those states; genuinely broken checks
+    still exit 1.
+
+- **Reverting**: nothing here changes on-disk formats other than the index,
+  which is a rebuildable cache. To go back, pin the previous version
+  (`npm i -g @sdsrs/code-graph@0.117.0`, or `npx @sdsrs/code-graph@0.117.0`) and
+  run `code-graph-mcp rebuild-index --confirm` once; the older binary refuses a
+  newer schema by design, and this release does not move `SCHEMA_VERSION`
+  (still 10), so the downgrade is clean.
 
 ### Fixed
 - **The heritage axis matched three hard-coded node kinds, so six languages
