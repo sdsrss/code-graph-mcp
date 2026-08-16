@@ -228,9 +228,17 @@ pub(crate) fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Re
 
 /// Warn if another process holds the index lock. A running MCP server holds the
 /// flock for its whole lifetime, so a CLI incremental index now would race its
-/// writes. Best-effort and non-blocking — the run still proceeds (the incremental
-/// path shares one index.db through SQLite's own locking, so the worst case is
-/// contention, not loss); we only surface the hazard.
+/// writes. Best-effort and non-blocking — the run still proceeds; we only surface
+/// the hazard.
+///
+/// This used to say the worst case was "contention, not loss". It is not.
+/// SQLite's own locking keeps each statement atomic, but the two writers do not
+/// share the run-scoped state around them: a racing CLI run can delete node rows
+/// the server's in-flight batch still holds ids for, and the server's incremental
+/// then fails on a FOREIGN KEY constraint. Its recovery for that is
+/// `DELETE FROM files` plus a full re-index — the whole index is discarded and
+/// rebuilt from scratch, which on a large repo is minutes of degraded answers
+/// (2026-08-16 audit §四). The message below says so.
 ///
 /// `quiet` suppresses the stderr line ONLY. The probe itself always runs and the
 /// finding always reaches `tracing` (same split as `warn_parse_errors`): a flag
@@ -255,8 +263,9 @@ pub(crate) fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
         eprintln!(
             "[code-graph] Warning: another process (a running MCP server, or a \
              concurrent rebuild-index / reindex) holds the index lock at {}. \
-             Indexing now may race its writes — wait for it to finish, or stop the \
-             server, if results look inconsistent.",
+             Indexing now races its writes; if that trips a foreign-key error on \
+             the other side, its recovery is to discard the index and rebuild it \
+             from scratch. Wait for it to finish, or stop the server.",
             lock.display()
         );
     }

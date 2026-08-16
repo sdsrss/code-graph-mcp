@@ -1694,7 +1694,7 @@ fn test_index_stats_skipped_large_file() {
     // Create a normal file
     fs::write(project_dir.path().join("small.ts"), "function ok() {}").unwrap();
 
-    // Create a file exceeding MAX_FILE_SIZE (10MB)
+    // Create a file exceeding max_file_size() (1 MiB by default)
     let big_content = "a".repeat(11 * 1024 * 1024);
     fs::write(project_dir.path().join("huge.ts"), &big_content).unwrap();
 
@@ -1703,6 +1703,96 @@ fn test_index_stats_skipped_large_file() {
     assert_eq!(
         result.stats.files_skipped_size, 1,
         "should track the large file skip"
+    );
+}
+
+#[test]
+fn test_query_time_refresh_does_not_rehash_an_oversize_file() {
+    // P2 (2026-08-16 audit §四): `ensure_file_indexed` runs on the QUERY path —
+    // every result set that mentions a file reaches it. It used to hash the file
+    // before doing anything else, so a source over `max_file_size()` (1 MiB by
+    // default: a minified bundle, a generated table) was re-read in full on every
+    // `show`/`search`/`callgraph` that named it, to reach a pipeline that refuses
+    // to parse it anyway.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    let big = project_dir.path().join("huge.ts");
+    fs::write(&big, "a".repeat(2 * 1024 * 1024)).unwrap();
+    fs::write(project_dir.path().join("small.ts"), "function ok() {}").unwrap();
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(result.stats.files_skipped_size, 1, "precondition: skipped");
+
+    // Unchanged file: no work either way.
+    assert!(!ensure_file_indexed(&db, project_dir.path(), "huge.ts", None).unwrap());
+
+    // Change its CONTENT. Before the size gate this hashed 2 MiB, saw a mismatch
+    // and ran the whole pipeline for a file that yields zero symbols; now the
+    // stat-plus-lookup answers "nothing here to refresh" without a read.
+    fs::write(&big, "b".repeat(2 * 1024 * 1024)).unwrap();
+    assert!(
+        !ensure_file_indexed(&db, project_dir.path(), "huge.ts", None).unwrap(),
+        "a content change in a file the indexer will never parse must not \
+         re-run the pipeline on the query path"
+    );
+
+    // Negative control — the gate must be SIZE-scoped, not a blanket opt-out.
+    // Widening it to skip every file turns this red.
+    fs::write(
+        project_dir.path().join("small.ts"),
+        "function ok() {}\nfunction added() {}",
+    )
+    .unwrap();
+    assert!(
+        ensure_file_indexed(&db, project_dir.path(), "small.ts", None).unwrap(),
+        "an ordinary edited file must still refresh"
+    );
+}
+
+#[test]
+fn test_query_time_refresh_purges_symbols_of_a_file_that_grew_past_the_limit() {
+    // The other half of the size gate: it must NOT fire while the DB still holds
+    // symbols for the file. A file indexed under the limit that later grows past
+    // it has stale nodes, and the refresh is what removes them — an unconditional
+    // early return would leave them queryable forever.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    let path = project_dir.path().join("grower.ts");
+    fs::write(&path, "export function willVanish() {}").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let before: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE name = 'willVanish'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, 1, "precondition: the symbol is indexed");
+
+    // Grow past the limit, keeping the symbol's own text present in the file.
+    let mut grown = String::from("export function willVanish() {}\n// ");
+    grown.push_str(&"x".repeat(2 * 1024 * 1024));
+    fs::write(&path, grown).unwrap();
+
+    assert!(
+        ensure_file_indexed(&db, project_dir.path(), "grower.ts", None).unwrap(),
+        "a file that grew past the limit still has work to do: purge its symbols"
+    );
+    let after: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE name = 'willVanish'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, 0,
+        "symbols of a now-oversize file must be purged, not stranded"
     );
 }
 

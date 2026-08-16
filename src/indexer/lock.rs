@@ -251,10 +251,28 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
     }
 }
 
-/// Remove the index lock file from disk.
-/// On Unix, the flock is released automatically when the `_index_lock` File handle is dropped.
-pub(crate) fn release_index_lock(code_graph_dir: &Path) {
-    let _ = std::fs::remove_file(code_graph_dir.join("index.lock"));
+/// Release the index lock, platform-correctly.
+///
+/// **Unix: this is deliberately a no-op.** The flock lives on the open file
+/// description, so dropping the `File` handle already released it; the lock FILE
+/// must stay on disk. Removing it is not merely redundant, it breaks mutual
+/// exclusion: a concurrent holder's flock is pinned to the *inode*, so once the
+/// directory entry is gone the next opener creates a NEW inode, flocks that, and
+/// the two processes stop excluding each other — two primaries indexing one DB.
+/// The window is real and not microscopic: the CLI's `rebuild-index` /
+/// `reindex --from-snapshot` hold this same lock through an
+/// [`IndexLockGuard`], and a server shutting down mid-rebuild used to delete the
+/// CLI's lock file out from under it (2026-08-16 audit §四). This is the same
+/// invariant [`IndexLockGuard`]'s doc comment spells out — it lives in the
+/// function now so no caller can get it wrong by forgetting a `cfg`.
+///
+/// **Non-unix**: the lock IS the file's existence plus its PID content, so the
+/// file must go, or a dead PID strands every later instance in secondary mode.
+pub(crate) fn release_index_lock(_code_graph_dir: &Path) {
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::remove_file(_code_graph_dir.join("index.lock"));
+    }
 }
 
 /// A held index lock with a platform-correct release, for callers that take the
@@ -441,6 +459,41 @@ mod tests {
         assert_eq!(parse_tasklist_output(true, "", 4321), PidProbe::Dead);
         // A failed run decides nothing.
         assert_eq!(parse_tasklist_output(false, row, 4321), PidProbe::Unknown);
+    }
+
+    // P2 (2026-08-16 audit §四): server shutdown used to delete the lock FILE on
+    // Unix. Mutual exclusion there is inode-scoped, so an unlinked lock lets the
+    // next opener create a fresh inode and become a second primary — including
+    // while a CLI `rebuild-index` still holds the old one. The guard is a
+    // behavioural one (does the file survive), not a source-text one: reverting
+    // `release_index_lock` to the unconditional `remove_file` turns it red.
+    #[cfg(unix)]
+    #[test]
+    fn test_release_index_lock_keeps_the_file_on_unix() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        let guard = acquire_index_lock_guard(cg).expect("lock must be acquirable in a fresh dir");
+        let lock_path = cg.join("index.lock");
+        assert!(lock_path.exists(), "acquisition must create the lock file");
+
+        release_index_lock(cg);
+        assert!(
+            lock_path.exists(),
+            "on Unix the lock file must survive release — deleting it lets a \
+             concurrent holder's inode-scoped flock stop excluding new openers"
+        );
+
+        // Dropping the guard is the real Unix release: the file stays, and the
+        // probe reports it free, which is exactly how a later primary sees it.
+        drop(guard);
+        assert!(
+            lock_path.exists(),
+            "the guard's drop must not unlink either"
+        );
+        assert!(
+            !other_process_holds_index_lock(cg),
+            "a released-but-present lock file must read as free"
+        );
     }
 
     #[cfg(unix)]

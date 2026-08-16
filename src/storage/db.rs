@@ -111,6 +111,25 @@ impl Database {
             PRAGMA mmap_size = 0;
         ",
         )?;
+        // Future-schema refusal, same verdict the primary path gives. A secondary
+        // never migrates (the primary owns bootstrap), so without this check a
+        // mixed-version session — an updated binary indexing while the old one is
+        // still attached as a reader — surfaced whatever bare `no such column`
+        // the first query happened to hit. That is unactionable, and it is also
+        // invisible to the plugin statusline, which keys on the marker below to
+        // render "↻ updating" instead of "offline" (2026-08-16 audit §四).
+        let existing_version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or(0);
+        if existing_version > schema::SCHEMA_VERSION {
+            anyhow::bail!(
+                "Database schema version v{} is newer than supported v{}. Please update code-graph-mcp. [{}]",
+                existing_version,
+                schema::SCHEMA_VERSION,
+                crate::domain::SCHEMA_TOO_NEW_MARKER
+            );
+        }
+
         // Detect vec tables via sqlite_master so consumers know if vector
         // search is available without needing a separate probe.
         let vec_enabled: bool = conn
@@ -1195,6 +1214,28 @@ mod tests {
         assert!(
             msg.contains(crate::domain::SCHEMA_TOO_NEW_MARKER),
             "future-schema bail must carry the stable marker; got: {msg}"
+        );
+
+        // Sibling surface (2026-08-16 audit §四): the read-only open is what a
+        // SECONDARY server instance uses, i.e. exactly the process that meets a
+        // future schema during an update, and it used to sail past this check and
+        // fail later with a bare `no such column`. Same refusal, same marker.
+        let ro_err = Database::open_readonly(&db_path).map(|_| ()).unwrap_err();
+        let ro_msg = format!("{ro_err}");
+        assert!(
+            ro_msg.contains(crate::domain::SCHEMA_TOO_NEW_MARKER),
+            "open_readonly must refuse a future schema with the same marker; got: {ro_msg}"
+        );
+
+        // Negative control: the same reader on a CURRENT-schema DB must open.
+        // Without this, deleting the version check entirely would still leave the
+        // assertion above green if `open_readonly` merely failed for some other
+        // reason.
+        let ok_path = tmp.path().join("current.db");
+        drop(Database::open(&ok_path).unwrap());
+        assert!(
+            Database::open_readonly(&ok_path).is_ok(),
+            "a current-schema DB must still open read-only"
         );
     }
 

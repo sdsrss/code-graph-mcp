@@ -1853,11 +1853,20 @@ pub(super) fn index_files(
     // and the deferred pass re-binds them. Without this term those edges kept the
     // `extracted` column default, the top confidence tier, having never been
     // classified (audit 2026-08-16, the P2 riding with P0-1).
-    if !all_indexed.is_empty()
+    //
+    // Bound once, into a name, because the `<external>` reaper below needs the
+    // SAME predicate and used to carry a narrower copy (`all_indexed` /
+    // `delete_paths` only). That asymmetry was a live hole: the prune inside
+    // these post-passes is one of the two things that orphans a sentinel, and on
+    // a deferred-only or pending-only run it ran while the reaper did not — the
+    // orphan then stayed in the name-resolution pool, which is the exact
+    // incremental-vs-rebuild divergence audit 2026-08-02 P1-9 introduced the
+    // reaper to end (2026-08-16 audit §四, sibling of the P0-1 rider above).
+    let graph_changed = !all_indexed.is_empty()
         || !delete_paths.is_empty()
         || pending_resolved > 0
-        || deferred_edges > 0
-    {
+        || deferred_edges > 0;
+    if graph_changed {
         finalize_tick();
         // The post-passes below are the first big correlated-subquery joins over
         // the graph this run just wrote, and on a fresh index there is no
@@ -1886,8 +1895,10 @@ pub(super) fn index_files(
     // and deferred re-resolution can orphan them, and nothing else ever deleted
     // them — a lingering orphan stays in the name-resolution pool and makes an
     // incrementally-grown node set diverge from a fresh rebuild forever (audit
-    // 2026-08-02 P1-9).
-    if !all_indexed.is_empty() || !delete_paths.is_empty() {
+    // 2026-08-02 P1-9). Shares `graph_changed` with the post-passes above: the
+    // prune that runs there is one of the two orphan sources, so anything that
+    // lets the prune run must also let the reaper run.
+    if graph_changed {
         finalize_tick();
         let reaped = crate::storage::queries::reap_orphan_external_nodes(db.conn())?;
         if reaped > 0 {

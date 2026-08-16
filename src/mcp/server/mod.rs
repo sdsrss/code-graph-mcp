@@ -1868,7 +1868,20 @@ impl McpServer {
         drop(cache_guard); // Release lock during I/O
 
         let write_db = self.write_db();
-        match run_incremental_index_cached(&write_db, project_root, model, cache.as_ref(), None) {
+        let outcome =
+            run_incremental_index_cached(&write_db, project_root, model, cache.as_ref(), None);
+        // Release the promoted-DB handle BEFORE any of the bookkeeping locks
+        // below. `write_db()` may hold the `promoted_db` mutex (level 7 in this
+        // type's lock ordering) and every lock touched from here down —
+        // `dir_cache`/`last_index_stats` (3), `indexed` (2), the two caches (5) —
+        // sits ABOVE it in that order. Holding 7 while taking 5 is the ordering
+        // the doc comment exists to forbid; it survived because the stdio loop is
+        // single-threaded today, which is precisely the assumption the ordering is
+        // written to outlive (2026-08-16 audit §四). Nothing below needs the
+        // handle: the FK-recovery arm re-acquires it explicitly once the
+        // lower-order locks are released again.
+        drop(write_db);
+        match outcome {
             Ok((result, new_cache)) => {
                 if result.files_indexed > 0 {
                     // Invalidate caches when files actually changed
@@ -1894,8 +1907,14 @@ impl McpServer {
             Err(e) => {
                 if is_fk_constraint_error(&e) {
                     // DB state is inconsistent with in-memory caches (e.g., DB replaced
-                    // externally, stale node IDs from a previous session, or orphan rows
-                    // left by the failed incremental). Recovery must truncate first —
+                    // externally, stale node IDs from a previous session, orphan rows
+                    // left by the failed incremental, or — the cause this list used to
+                    // omit — a CLI `index`/`reindex` writing the same DB concurrently,
+                    // which `warn_if_index_locked` warns about but does not prevent).
+                    // Naming it matters: everything else here is a rare fault, while the
+                    // concurrent-CLI case is a routine user action whose price is the
+                    // wipe-and-rebuild below (2026-08-16 audit §四). Recovery must
+                    // truncate first —
                     // run_full_index does per-file upsert, not a global wipe, so orphan
                     // rows survive and re-trigger FK on the second attempt. Without this
                     // the fallback silently bubbles FK up to tool handlers (agent sees
@@ -1909,8 +1928,11 @@ impl McpServer {
                     *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
                     lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
                     // CASCADE nodes→edges→node_vectors via FK ON DELETE CASCADE.
-                    // `write_db` is still the live handle from above — re-entering
-                    // `self.write_db()` here would deadlock on the promoted-handle mutex.
+                    // The handle from above was released before the invalidations,
+                    // so re-acquiring here is correct (and required — the promoted
+                    // variant's mutex is not reentrant, so this must stay the only
+                    // live `write_db` for the rest of the arm).
+                    let write_db = self.write_db();
                     {
                         let tx = write_db.conn().unchecked_transaction()?;
                         tx.execute("DELETE FROM files", [])?;
@@ -1920,7 +1942,10 @@ impl McpServer {
                     let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
                         self.send_progress("indexing", current, total);
                     };
-                    match run_full_index(&write_db, project_root, model, Some(&progress_cb)) {
+                    let recovery =
+                        run_full_index(&write_db, project_root, model, Some(&progress_cb));
+                    drop(write_db); // same ordering rule as above
+                    match recovery {
                         Ok(result) => {
                             *lock_or_recover(&self.last_index_stats, "last_index_stats") =
                                 result.stats;
@@ -2619,6 +2644,10 @@ impl McpServer {
     /// Re-index result-set files whose on-disk hash no longer matches the index.
     fn reindex_stale_result_files(&self, root: &Path, paths: &[String]) -> ResultRefreshOutcome {
         let mut outcome = ResultRefreshOutcome::default();
+        // Scoped so the promoted-DB handle (lock level 7) is released before the
+        // cache invalidation below takes the two cache mutexes (level 5) — the
+        // sibling of the same ordering inversion fixed in
+        // `run_incremental_with_cache_restore` (2026-08-16 audit §四).
         let write_db = self.write_db();
         // Never let a concurrent writer (background embedding, another index run)
         // stall a tool call for the default 5s busy_timeout — fail fast and keep
@@ -2657,6 +2686,8 @@ impl McpServer {
                 Err(_) => outcome.failed += 1,
             }
         }
+        drop(_busy);
+        drop(write_db);
         if outcome.refreshed > 0 {
             *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
             lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();

@@ -132,18 +132,6 @@ pub fn run_full_index(
     )
 }
 
-/// Reindex a single file when its on-disk hash differs from the stored hash.
-/// No-op when the hashes match (or `rel_path` was never indexed in a way that
-/// would currently reindex it). Returns true when a reindex (or stale-row
-/// cleanup) actually fired.
-///
-/// Used by query-time freshness: when an MCP tool receives an explicit
-/// `file_path` argument, the agent is signaling "I just edited this; please
-/// answer against the current bytes." The 30s `last_incremental_check`
-/// debounce in the server is too coarse for tight Edit→search loops.
-///
-/// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
-/// dirty node IDs **before** re-indexing (cascade delete strips old edges),
 /// True when `rel_path` is a safe project-relative path: no absolute root and no
 /// leading `..` that climbs above the project. [`ensure_file_indexed`] keys the
 /// files table by this relative path, so anything else is meaningless as a key
@@ -169,6 +157,18 @@ pub(crate) fn is_safe_relative_path(rel_path: &str) -> bool {
     true
 }
 
+/// Reindex a single file when its on-disk hash differs from the stored hash.
+/// No-op when the hashes match (or `rel_path` was never indexed in a way that
+/// would currently reindex it). Returns true when a reindex (or stale-row
+/// cleanup) actually fired.
+///
+/// Used by query-time freshness: when an MCP tool receives an explicit
+/// `file_path` argument, the agent is signaling "I just edited this; please
+/// answer against the current bytes." The 30s `last_incremental_check`
+/// debounce in the server is too coarse for tight Edit→search loops.
+///
+/// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
+/// dirty node IDs **before** re-indexing (cascade delete strips old edges),
 /// then regenerate context strings + embeddings once the new nodes exist.
 pub fn ensure_file_indexed(
     db: &Database,
@@ -218,6 +218,48 @@ pub fn ensure_file_indexed(
     // Skip files we wouldn't index in the first place (binary / wrong language).
     if crate::utils::config::detect_language(rel_path).is_none() {
         return Ok(false);
+    }
+
+    // Size gate (2026-08-16 audit §四). Every branch below starts by hashing the
+    // whole file, and this function runs on the QUERY path — `refresh_files_if_stale`
+    // calls it for each file a result set touches. The indexer refuses to parse
+    // anything over `max_file_size()` (1 MiB by default, so a minified bundle or a
+    // generated source qualifies), which means for such a file the hash buys
+    // exactly one thing: nothing. It is re-read in full on every `show`, `search`
+    // and `callgraph` that mentions it.
+    //
+    // Not an unconditional early return, because one case still has work to do:
+    // a file that was UNDER the limit when it was indexed and has since grown past
+    // it still carries its old symbols, and they must be purged or they stay
+    // visible forever. So the gate fires only once the DB agrees the file is
+    // symbol-less, which is the steady state after the first refresh records it as
+    // skipped — turning a per-query full read into a per-query indexed lookup.
+    // Size gate (2026-08-16 audit §四). Every branch below starts by hashing the
+    // whole file, and this function runs on the QUERY path — `refresh_files_if_stale`
+    // calls it for each file a result set touches. The indexer refuses to parse
+    // anything over `max_file_size()` (1 MiB by default, so a minified bundle or a
+    // generated source qualifies), which means for such a file the hash buys
+    // exactly one thing: nothing. It is re-read in full on every `show`, `search`
+    // and `callgraph` that mentions it.
+    //
+    // Not an unconditional early return, because one case still has work to do:
+    // a file that was UNDER the limit when it was indexed and has since grown past
+    // it still carries its old symbols, and they must be purged or they stay
+    // visible forever. So the gate fires only once the DB agrees the file is
+    // symbol-less, which is the steady state after the first refresh records it as
+    // skipped — turning a per-query full read into a per-query indexed lookup.
+    if std::fs::metadata(&abs_path).is_ok_and(|m| m.len() > crate::domain::max_file_size()) {
+        let has_nodes = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM nodes WHERE file_id = (SELECT id FROM files WHERE path = ?1) LIMIT 1",
+                [rel_path],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !has_nodes {
+            return Ok(false);
+        }
     }
 
     let on_disk_hash = crate::indexer::merkle::hash_file(&abs_path)?;
