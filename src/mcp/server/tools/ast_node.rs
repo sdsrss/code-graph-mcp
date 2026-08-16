@@ -15,18 +15,10 @@ impl McpServer {
         // preempted by a freshness error) — enum-validate-at-entry. Used by the
         // include_impact caller traversal; min_confidence:"ambiguous" includes
         // every caller, default 'inferred' folds the ambiguous by-name fan-out.
-        let impact_conf_rank = {
-            let tier = match args["min_confidence"].as_str() {
-                None | Some("") => crate::domain::CONF_INFERRED,
-                Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                    anyhow!(
-                        "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                        c
-                    )
-                })?,
-            };
-            crate::domain::confidence_rank(tier)
-        };
+        let impact_conf_rank = crate::domain::confidence_rank(
+            crate::domain::parse_min_confidence(args["min_confidence"].as_str(), "min_confidence")?
+                .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR),
+        );
 
         // Normalize the caller's separator spelling ONCE, at entry, so the
         // freshness target and the index lookup key below are the same string
@@ -90,35 +82,35 @@ impl McpServer {
 
         // If only symbol_name provided (no file_path), resolve by name lookup
         if let (Some(sym), None) = (symbol_name, file_path) {
+            // Ambiguity verdict + response from the shared resolver (2026-08-16
+            // audit §四/§六). This site had its own copy of both, and the copy was
+            // not equivalent: it re-rendered the candidate JSON by hand (one of
+            // four shapes for one verdict, and the only one missing the `symbol`
+            // key), and — the part with teeth — it never filtered the
+            // `<external>` sentinel. That filter exists because IDX v53 started
+            // binding Rust `use std::…` to the sentinel, so in any repo doing
+            // `use std::mem::take` the project's own `fn take` read as ambiguous
+            // with `<external>` offered as the file to disambiguate BY. `callgraph`
+            // and `impact` were fixed then; `get_ast_node` was still exposed.
+            if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), sym)? {
+                return Ok(crate::resolve::ambiguity_response(sym, &cands));
+            }
             let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), sym)?;
             let non_test: Vec<_> = candidates
                 .iter()
+                .filter(|nf| crate::resolve::is_selectable_definition(&nf.file_path))
                 .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
                 .collect();
-            return match non_test.len() {
-                0 => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
-                1 => {
-                    let nid = non_test[0].node.id;
+            // `detect_ambiguity` already returned above for >1, so this is 0 or 1.
+            return match non_test.first() {
+                None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
+                Some(nf) => {
+                    let nid = nf.node.id;
                     let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, context_lines, compact, impact_conf_rank)?;
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;
                     }
                     Ok(out)
-                }
-                _ => {
-                    let suggestions: Vec<_> = non_test.iter().map(|nf| {
-                        json!({
-                            "name": nf.node.name,
-                            "file_path": &nf.file_path,
-                            "type": nf.node.node_type,
-                            "node_id": nf.node.id,
-                            "start_line": nf.node.start_line,
-                        })
-                    }).collect();
-                    Ok(json!({
-                        "error": format!("Ambiguous symbol '{}': {} matches found. Specify file_path or use node_id.", sym, suggestions.len()),
-                        "suggestions": suggestions,
-                    }))
                 }
             };
         }

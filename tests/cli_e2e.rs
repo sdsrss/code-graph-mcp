@@ -1155,6 +1155,88 @@ fn test_cli_search_json() {
     assert!(!v.as_array().unwrap().is_empty());
 }
 
+/// P2 (2026-08-16 audit §四): a clap PARSE error under `--json` left stdout at
+/// zero bytes with exit 2. clap prints to stderr and exits from inside the
+/// parser, so `main`'s Tier-3 `--json` error object — which covers every
+/// post-parse bail — never ran. A typo'd flag is the likeliest error there is,
+/// and it was the one shape a machine consumer could not parse.
+#[test]
+fn test_cli_json_error_object_on_flag_parse_failure() {
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &["search", "q", "--no-such-flag", "--json"]);
+    assert_eq!(code, 2, "a parse failure keeps clap's exit code");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be a JSON error object, got {stdout:?}: {e}"));
+    assert!(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("--no-such-flag")),
+        "the error object must name the offending flag: {v}"
+    );
+    assert!(
+        stderr.contains("--no-such-flag"),
+        "stderr keeps clap's human render: {stderr}"
+    );
+
+    // Without --json, stdout stays empty — this must not become an unconditional
+    // JSON emitter for human runs.
+    let (human_out, _, human_code) = run_cli(&project, &["search", "q", "--no-such-flag"]);
+    assert_eq!(human_code, 2);
+    assert!(
+        human_out.trim().is_empty(),
+        "human runs keep a bare stderr error: {human_out:?}"
+    );
+
+    // `--help` is an Err to clap but not a failure: stdout, exit 0, untouched.
+    let (help_out, _, help_code) = run_cli(&project, &["search", "--help"]);
+    assert_eq!(help_code, 0, "--help must stay exit 0");
+    assert!(
+        help_out.contains("Usage:") && !help_out.contains("\"error\""),
+        "--help must render help, not an error object: {help_out}"
+    );
+}
+
+/// P2 (2026-08-16 audit §四): `grep --json` printed the success-shaped `[]` on
+/// its ERROR legs, so under the `--json 2>/dev/null` shape the agent docs
+/// themselves suggest, an unsupported flag / an out-of-root path / a missing
+/// ripgrep / a bad pattern were byte-identical to "this repo has no matches".
+/// The exit code carried the entire distinction.
+#[test]
+fn test_cli_grep_json_errors_are_not_success_shaped() {
+    let project = setup_indexed_project();
+
+    for (args, needle) in [
+        (vec!["grep", "-v", "foo", "--json"], "unsupported flag"),
+        (vec!["grep", "foo", "/etc", "--json"], "within project root"),
+    ] {
+        let (stdout, _, code) = run_cli(&project, &args);
+        assert_eq!(code, 2, "{args:?} is an error, not a query result");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{args:?} must emit JSON, got {stdout:?}: {e}"));
+        assert!(
+            !v.is_array(),
+            "{args:?} must NOT use the success array shape: {v}"
+        );
+        assert!(
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|s| s.contains(needle)),
+            "{args:?} error object must explain the failure: {v}"
+        );
+    }
+
+    // Negative control — a genuine zero-match run keeps the bare `[]` (Tier-1
+    // empty contract). Without this, "always emit an object" would pass above
+    // while breaking every consumer of the success shape.
+    let (stdout, _, code) = run_cli(&project, &["grep", "zzz_no_such_token_zzz", "--json"]);
+    assert_eq!(code, 1, "no match is exit 1, not an error");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "a true zero-match run must keep the empty array"
+    );
+}
+
 #[test]
 fn test_cli_search_language_filter() {
     let project = setup_indexed_project();
@@ -1880,13 +1962,21 @@ fn test_cli_grep_unsupported_flag_clear_error() {
             "{bad}: must not leak cryptic rg error, got: {stderr}"
         );
     }
-    // --json keeps the empty-array contract even on this usage error.
+    // --json emits the TIER-3 error object here, not the empty array this used to
+    // assert. The three-tier contract (v0.99.1, [[feedback_cli_json_empty_contract]])
+    // reserves the success-shaped empty for tier 1 (a genuine zero-result run) and
+    // requires a self-describing `{"error": …}` for a miss/error — grep's error
+    // legs were the surface that migration missed, so this assertion had been
+    // pinning the pre-refinement rule (2026-08-16 audit §四).
     let (stdout, _, code) = run_cli(&project, &["grep", "-v", "validateToken", "--json"]);
     assert_eq!(code, 2);
-    assert_eq!(
-        stdout.trim(),
-        "[]",
-        "--json unsupported-flag bail must emit []"
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("--json bail must still be valid JSON");
+    assert!(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("unsupported flag")),
+        "--json unsupported-flag bail must emit a tier-3 error object: {v}"
     );
     // The `--` escape still lets a literal "-v" be searched (parity preserved).
     std::fs::write(project.path().join("DASHV.md"), "the -v flag here\n").unwrap();

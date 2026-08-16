@@ -179,17 +179,82 @@ pub fn normalize_dep_direction(input: &str) -> Option<&'static str> {
     }
 }
 
+/// Every relation a `--relation` / `relation` filter accepts, `all` excluded.
+///
+/// This is the vocabulary the filter offers, and it must equal the set of
+/// relations the graph can actually RETURN — an edge type that shows up in
+/// results but is rejected by the filter is a contract the user can see and
+/// cannot use. `exports` and `routes_to` were exactly that: real edge types,
+/// visible under `--relation all`, refused by name (2026-08-16 audit §四). The
+/// list exists as a constant, rather than as arms of the match below, so
+/// `relation_filter_vocab_covers_every_edge_type` can hold it against the `REL_*`
+/// constants and fail when a new edge type lands without one.
+pub const RELATION_FILTER_VOCAB: &[&str] = &[
+    REL_CALLS,
+    REL_IMPORTS,
+    REL_INHERITS,
+    REL_IMPLEMENTS,
+    REL_REFERENCES,
+    REL_EXPORTS,
+    REL_ROUTES_TO,
+];
+
+/// Human-readable form of [`RELATION_FILTER_VOCAB`] plus `all`, for help text and
+/// validation errors — kept derived so the six copies the audit found drifting
+/// cannot drift again.
+pub fn relation_filter_vocab_list() -> String {
+    format!("{}, all", RELATION_FILTER_VOCAB.join(", "))
+}
+
+/// [`relation_filter_vocab_list`] as a literal, for the places that need a `const`
+/// (clap `help =`, `println!` in `print_help`). `relation_filter_help_matches_vocab`
+/// pins it to the derived form, so the two cannot part ways.
+pub const RELATION_FILTER_HELP: &str =
+    "calls, imports, inherits, implements, references, exports, routes_to, all";
+
+/// Parse a `--min-confidence` / `min_confidence` value into a canonical tier.
+///
+/// `None` and `Some("")` both mean **not given**; the caller supplies whatever
+/// default it wants (a floor of `inferred` for callgraph/impact, no floor at all
+/// for `refs`, which must show every usage site). Empty-as-absent is not a
+/// nicety — it is how a shell spells an unset variable (`--min-confidence
+/// "$TIER"`), and it used to be read one way by `callgraph`/`impact` (silently
+/// the default) and the opposite way by `refs` (a hard error) for the very same
+/// input (2026-08-16 audit §四 architectural-redundancy cluster).
+///
+/// `flag_label` keeps each surface's own spelling in the message (`--min-confidence`
+/// for the CLI, `min_confidence` for MCP); everything after it is shared, which is
+/// what the six verbatim copies of this block were not.
+pub fn parse_min_confidence(
+    raw: Option<&str>,
+    flag_label: &str,
+) -> anyhow::Result<Option<&'static str>> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(c) => normalize_confidence(c).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{flag_label} must be one of: extracted, inferred, ambiguous (got '{c}')"
+            )
+        }),
+    }
+}
+
+/// Default caller-traversal confidence floor for the RISK-reporting surfaces
+/// (`callgraph`, `impact`, `show --impact`, MCP `get_call_graph`/`get_ast_node`).
+/// Folding the ambiguous by-name fan-out out of a risk number is the point of
+/// having a floor; `refs` deliberately has none.
+pub const DEFAULT_RISK_CONF_FLOOR: &str = CONF_INFERRED;
+
 /// Canonicalize a `--relation` / `relation` filter for find_references.
 pub fn normalize_relation(input: &str) -> Option<&'static str> {
-    match input.to_lowercase().as_str() {
-        "calls" => Some("calls"),
-        "imports" => Some("imports"),
-        "inherits" => Some("inherits"),
-        "implements" => Some("implements"),
-        "references" => Some("references"),
-        "all" => Some("all"),
-        _ => None,
+    let lower = input.to_lowercase();
+    if lower == "all" {
+        return Some("all");
     }
+    RELATION_FILTER_VOCAB
+        .iter()
+        .copied()
+        .find(|rel| *rel == lower)
 }
 
 // -- Index version --
@@ -1265,11 +1330,60 @@ mod tests {
             None,
             "callgraph vocab rejected"
         );
-        // relation: calls|imports|inherits|implements|references|all
+        // relation: RELATION_FILTER_VOCAB + all
         assert_eq!(normalize_relation("CALLS"), Some("calls"));
         assert_eq!(normalize_relation("Implements"), Some("implements"));
         assert_eq!(normalize_relation("all"), Some("all"));
         assert_eq!(normalize_relation("bogus"), None);
+        // Previously rejected despite being real edge types the graph returns.
+        assert_eq!(normalize_relation("exports"), Some("exports"));
+        assert_eq!(normalize_relation("routes_to"), Some("routes_to"));
+    }
+
+    /// P2 (2026-08-16 audit §四): the `--relation` / `relation` filter vocabulary
+    /// must equal the set of edge types the graph can RETURN. It did not —
+    /// `exports` and `routes_to` appeared in `--relation all` output and were
+    /// refused by name, so a user could see an edge kind and not filter for it.
+    ///
+    /// Guarding it against the `REL_*` constants makes the next new edge type
+    /// fail here instead of shipping a filter that silently omits it.
+    #[test]
+    fn relation_filter_vocab_covers_every_edge_type() {
+        let every_edge_type = [
+            REL_CALLS,
+            REL_INHERITS,
+            REL_IMPORTS,
+            REL_ROUTES_TO,
+            REL_IMPLEMENTS,
+            REL_EXPORTS,
+            REL_REFERENCES,
+        ];
+        for rel in every_edge_type {
+            assert!(
+                RELATION_FILTER_VOCAB.contains(&rel),
+                "edge type '{rel}' can appear in results but cannot be filtered for"
+            );
+            assert_eq!(
+                normalize_relation(rel),
+                Some(rel),
+                "'{rel}' must round-trip through the normalizer"
+            );
+        }
+        assert_eq!(
+            RELATION_FILTER_VOCAB.len(),
+            every_edge_type.len(),
+            "the filter must not offer a relation the graph never emits"
+        );
+        // `all` is the one accepted value that is NOT an edge type.
+        assert!(!RELATION_FILTER_VOCAB.contains(&"all"));
+    }
+
+    /// The `const` copy used where an expression is not allowed (clap `help =`,
+    /// `print_help`) must equal the derived list. Six hand-written copies of this
+    /// vocabulary had drifted; this is what keeps the last one honest.
+    #[test]
+    fn relation_filter_help_matches_vocab() {
+        assert_eq!(RELATION_FILTER_HELP, relation_filter_vocab_list());
     }
 
     /// `is_test_symbol` must classify Criterion bench files as harness so

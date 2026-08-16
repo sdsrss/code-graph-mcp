@@ -29,21 +29,19 @@ impl McpServer {
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
+        // Same default as `get_call_graph`'s symbol arm. This is the surviving
+        // sibling of the `min_confidence` defect described just below: another
+        // parameter the schema advertises that the route arm never read.
+        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         // Confidence floor (default 'inferred'): hide the ambiguous by-name fan-out
         // from both the call chain and the downstream list, matching get_call_graph.
         // route_path mode of get_call_graph reaches here, where min_confidence was
         // advertised on the schema but previously dropped (this handler ran rank-0
         // show-all). Validated at entry (enum-validate-at-entry) so a bad value
         // errors before any index work.
-        let min_conf_tier = match args["min_confidence"].as_str() {
-            None | Some("") => crate::domain::CONF_INFERRED,
-            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!(
-                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                    c
-                )
-            })?,
-        };
+        let min_conf_tier =
+            crate::domain::parse_min_confidence(args["min_confidence"].as_str(), "min_confidence")?
+                .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         if !should_skip_indexing(args) {
@@ -103,7 +101,22 @@ impl McpServer {
                 .nodes
                 .iter()
                 .filter(|n| n.depth > 0) // exclude root (the handler itself)
-                .filter(|n| !is_test_symbol(&n.name, &n.file_path))
+                // `is_test_node`, the canonical predicate — the AST `is_test` flag
+                // OR the name/path heuristic. This read the heuristic ALONE, so an
+                // inline `#[cfg(test)]` helper with a descriptive name (the exact
+                // case `CallGraphNode::is_test` was added to catch, per its own
+                // field doc) appeared in a route's PRODUCTION call chain. CLI
+                // `trace` has used `is_test_node` since v0.91.0; this was the
+                // unmigrated sibling (2026-08-16 audit §四).
+                //
+                // `include_tests` likewise: the flag is already declared on
+                // `get_call_graph`'s schema and already parsed by its symbol arm,
+                // and the whole `args` object reaches here — the route arm simply
+                // never read it, so the escape hatch the schema advertises did
+                // nothing in route mode.
+                .filter(|n| {
+                    include_tests || !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
+                })
                 .map(|n| {
                     json!({
                         "node_id": n.node_id,
@@ -313,6 +326,15 @@ impl McpServer {
             .as_str()
             .filter(|s| !s.trim().is_empty())
         {
+            // Ambiguity FIRST, through the shared resolver. Taking the first row
+            // meant `find_similar_code symbol_name:"new"` silently answered about
+            // ONE arbitrary definition out of five while `get_call_graph` on the
+            // same word reported the ambiguity — the CLI half of this pair had
+            // the identical defect (2026-08-16 audit §四). `node_id` above is the
+            // escape hatch the response points at.
+            if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), name)? {
+                return Ok(crate::resolve::ambiguity_response(name, &cands));
+            }
             match queries::get_first_node_id_by_name(self.db.conn(), name)? {
                 Some(id) => id,
                 None => return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", name)),

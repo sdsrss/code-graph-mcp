@@ -18,8 +18,7 @@ pub struct RefsArgs {
     // --relation stays an in-handler String validated at entry (before index open),
     // NOT a clap ValueEnum — so a bad --relation on a nonexistent symbol reports the
     // relation error (exit 1), not "symbol not found", and the message is preserved.
-    /// Filter: calls, imports, inherits, implements, references, all
-    #[arg(long)]
+    #[arg(long, help = crate::domain::RELATION_FILTER_HELP)]
     pub relation: Option<String>,
     // Validated in-handler (not a clap ValueEnum) so a bad value reports a clear
     // tier error before symbol resolution, consistent with --relation.
@@ -68,23 +67,16 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         Some(r) => match crate::domain::normalize_relation(r) {
             Some(rel) => Some(rel),
             None => anyhow::bail!(
-                "--relation must be one of: calls, imports, inherits, implements, references, all (got '{}')",
+                "--relation must be one of: {} (got '{}')",
+                crate::domain::relation_filter_vocab_list(),
                 r
             ),
         },
     };
     // Validate --min-confidence at entry (before index open), mirroring --relation,
     // so a typo'd tier errors loudly instead of silently passing all rows.
-    let min_confidence: Option<&'static str> = match args.min_confidence.as_deref() {
-        None => None,
-        Some(c) => match crate::domain::normalize_confidence(c) {
-            Some(tier) => Some(tier),
-            None => anyhow::bail!(
-                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                c
-            ),
-        },
-    };
+    let min_confidence: Option<&'static str> =
+        crate::domain::parse_min_confidence(args.min_confidence.as_deref(), "--min-confidence")?;
     let json_mode = args.json;
     let compact = args.compact;
     let node_id_arg: Option<i64> = args.node_id;
@@ -114,7 +106,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         let raw_symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
-                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements|references] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]"
+                format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
         let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
         let file_path = explicit_file.or(resolved_file.as_deref());
@@ -207,18 +199,14 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // return doesn't get dropped across the .as_str() borrow.
     let symbol = symbol.as_str();
 
-    use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_REFERENCES};
-    let relation_filter = match relation {
-        Some("calls") => Some(REL_CALLS),
-        Some("imports") => Some(REL_IMPORTS),
-        Some("inherits") => Some(REL_INHERITS),
-        Some("implements") => Some(REL_IMPLEMENTS),
-        Some("references") => Some(REL_REFERENCES),
+    // `relation` is already canonicalized by `normalize_relation` above, which
+    // only ever yields a `RELATION_FILTER_VOCAB` member or "all" — so this maps
+    // through the same vocabulary instead of re-listing it. The old hand-written
+    // arms were the second of the two places `exports`/`routes_to` had to be added
+    // and the reason adding them anywhere else would not have been enough.
+    let relation_filter: Option<&'static str> = match relation {
         Some("all") | None => None,
-        Some(other) => anyhow::bail!(
-            "Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all",
-            other
-        ),
+        Some(r) => crate::domain::normalize_relation(r).filter(|rel| *rel != "all"),
     };
 
     // Build the deduped reference set. Wrapped in a closure so a query-time

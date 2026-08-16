@@ -144,6 +144,97 @@ fn cli_surface() -> CliSurface {
     }
 }
 
+/// P2 (2026-08-16 audit §四): `--help`'s OPTIONS block claims `--json` covers
+/// "every subcommand except serve, doctor, adopt and unadopt". It previously
+/// claimed the opposite for the index commands ("not the index commands"), which
+/// was wrong — `incremental-index`, `rebuild-index` and `reindex` all emit a JSON
+/// envelope. A blanket claim in help text is only safe if something enforces it.
+#[test]
+fn every_clap_command_accepts_json() {
+    // `snapshot` is named as an exception in the help text: `snapshot inspect`
+    // prints JSON unconditionally, so a `--json` flag there would be a no-op.
+    // This test found that on its first run, against a claim written one edit
+    // earlier — which is exactly the drift the guard is for.
+    const NO_JSON_BY_DESIGN: &[&str] = &["snapshot"];
+    let missing: Vec<&str> = clap_commands()
+        .into_iter()
+        .filter(|(name, _)| !NO_JSON_BY_DESIGN.contains(name))
+        .filter(|(_, cmd)| {
+            let mut flags = HashSet::new();
+            collect_flags(cmd, &mut flags);
+            !flags.contains("--json")
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "--help says every subcommand but serve/doctor/adopt/unadopt takes --json; \
+         these clap commands do not: {missing:?}. Either add the flag or narrow the claim."
+    );
+    // The stated exceptions are the JS-dispatched ones, which own no clap Args at
+    // all — so the claim's exception list is exactly `js_commands()` plus `serve`.
+    let js: Vec<&str> = js_commands().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(
+        js,
+        vec!["doctor", "adopt", "unadopt"],
+        "the help text names these three by hand; a new JS command must be added there too"
+    );
+    // Negative control: the exception list must not be a place to hide a command
+    // that simply forgot the flag. `snapshot` earns it by printing JSON already.
+    let snapshot = clap_commands()
+        .into_iter()
+        .find(|(n, _)| *n == "snapshot")
+        .expect("snapshot must exist for its exception to mean anything");
+    assert!(
+        snapshot
+            .1
+            .get_subcommands()
+            .any(|s| s.get_name() == "inspect"),
+        "snapshot's --json exemption rests on `snapshot inspect` being JSON-only"
+    );
+}
+
+/// P2 (2026-08-16 audit §四): the unknown-subcommand typo suggester reads
+/// `cli::SUBCOMMANDS`, a hand-maintained list with nothing tying it to the
+/// commands that actually dispatch. It was missing `affected` and `tour`, so a
+/// typo of either got the generic "run --help" line instead of the fix — the
+/// unguarded-hardcoded-list shape this repo has been bitten by before.
+///
+/// `cli_surface()` is the authoritative set (it is transcribed from the `main.rs`
+/// dispatch and is itself the thing every doc check grounds against), so tying
+/// the typo table to it means adding a command can no longer half-land. `serve`
+/// is added explicitly: it dispatches but owns no `Args` struct.
+#[test]
+fn typo_table_covers_every_dispatchable_subcommand() {
+    let table: HashSet<&str> = cli::SUBCOMMANDS.iter().copied().collect();
+    let mut expected = cli_surface().names;
+    expected.insert("serve".to_string());
+
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|n| !table.contains(n.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "cli::SUBCOMMANDS (the typo suggester's whole world) is missing {missing:?}. \
+         A typo of these gets no suggestion."
+    );
+
+    // And the reverse direction, so the table cannot accumulate names that no
+    // longer dispatch — suggesting a dead command is worse than suggesting
+    // nothing. MCP tool aliases are exempt: they dispatch through `main.rs`
+    // alias arms, not through a clap `Args` struct of their own.
+    let alias_exempt = |n: &str| n.contains('_');
+    let stale: Vec<&&str> = table
+        .iter()
+        .filter(|n| !alias_exempt(n) && **n != "serve" && !expected.contains(**n))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "cli::SUBCOMMANDS suggests {stale:?}, which no longer dispatch"
+    );
+}
+
 /// Render the CLAUDE.md managed block for a project type by invoking the JS
 /// generator, exactly as `steering_block_drift_check` does — so the block is
 /// checked against the *live* clap surface, not just a Rust mirror.

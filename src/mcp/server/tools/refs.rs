@@ -43,7 +43,11 @@ impl McpServer {
         // like the other enum filters); the exhaustive match below maps the
         // canonical value to a filter constant. feedback-enum-validate-at-entry.
         let relation = crate::domain::normalize_relation(relation_raw).ok_or_else(|| {
-            anyhow!("Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all", relation_raw)
+            anyhow!(
+                "Unknown relation filter: '{}'. Valid: {}",
+                relation_raw,
+                crate::domain::RELATION_FILTER_HELP
+            )
         })?;
 
         // Validate min_confidence at entry too, for the same reason. No default
@@ -51,15 +55,8 @@ impl McpServer {
         // "show all tiers" — parity with CLI `refs --min-confidence`, which is
         // also floor-less (unlike callgraph/impact, where the floor exists to
         // keep an ambiguous fan-out out of a RISK number).
-        let min_confidence: Option<&'static str> = match args["min_confidence"].as_str() {
-            None => None,
-            Some(c) => Some(crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!(
-                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                    c
-                )
-            })?),
-        };
+        let min_confidence: Option<&'static str> =
+            crate::domain::parse_min_confidence(args["min_confidence"].as_str(), "min_confidence")?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -143,12 +140,10 @@ impl McpServer {
                     }
                     (ids, resolved_name)
                 }
-                FuzzyResolution::Ambiguous(suggestions) => {
-                    return Ok(json!({
-                        "symbol": symbol_name,
-                        "error": format!("Ambiguous symbol '{}': {} matches. Specify file_path or node_id to disambiguate.", symbol_name, suggestions.len()),
-                        "suggestions": suggestions,
-                    }));
+                FuzzyResolution::Ambiguous(cands) => {
+                    // Shape and wording from `resolve`, not hand-written here —
+                    // this was one of four divergent copies (audit §四/§六).
+                    return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
                 }
                 FuzzyResolution::NotFound => {
                     // resolve_fuzzy_name filters test/bench candidates upstream.
@@ -193,21 +188,25 @@ impl McpServer {
             }
         };
 
-        use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_REFERENCES};
         // Schema enum is ["calls", "imports", "inherits", "implements", "references", "all"].
         // Unknown values used to fall through to None (no filter), masking typos —
         // a caller passing relation:"call" silently got the same response as "all".
+        // Mapped through the shared vocabulary rather than re-listed: this arm set
+        // and the CLI's were the two places `exports`/`routes_to` were missing, so
+        // fixing one alone would have left the MCP surface rejecting edge types it
+        // returns (2026-08-16 audit §四).
         let relation_filter = match relation {
-            "calls" => Some(REL_CALLS),
-            "imports" => Some(REL_IMPORTS),
-            "inherits" => Some(REL_INHERITS),
-            "implements" => Some(REL_IMPLEMENTS),
-            "references" => Some(REL_REFERENCES),
             "all" => None,
-            _ => return Err(anyhow!(
-                "Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all",
-                relation
-            )),
+            r => match crate::domain::normalize_relation(r) {
+                Some(rel) if rel != "all" => Some(rel),
+                _ => {
+                    return Err(anyhow!(
+                        "Unknown relation filter: '{}'. Valid: {}",
+                        relation,
+                        crate::domain::RELATION_FILTER_HELP
+                    ))
+                }
+            },
         };
 
         // Collect references for all matching node IDs.

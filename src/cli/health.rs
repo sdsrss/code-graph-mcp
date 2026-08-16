@@ -204,6 +204,16 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
 /// `cmd_health_check` with the `--deep` toggle. Kept as a separate entry point so
 /// the existing two-argument signature (main.rs, tests) stays intact.
 pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> Result<()> {
+    // Entry validation, the idiom every other enum-bearing flag in this CLI already
+    // uses (`impact --change-type`, `--min-confidence`, the type filters). `--format`
+    // was the one that skipped it: `resolved_format()` hands the raw string through
+    // and only "json" is special-cased below, so `--format jsonn` printed the HUMAN
+    // one-liner and exited 0. A script asking for JSON and getting prose with a
+    // success code has no way to tell (2026-08-16 audit §四). The bail flows through
+    // main's Tier-3 catch, so `--json`-shaped callers still get an error OBJECT.
+    if !matches!(format, "oneline" | "json") {
+        anyhow::bail!("--format must be one of: oneline, json (got '{format}')");
+    }
     // JSON callers (doctor.js, scripts, MCP UIs) need a parseable response
     // even when the index is missing — bailing with a stderr-only anyhow error
     // forces them to grep messages instead of reading JSON fields.

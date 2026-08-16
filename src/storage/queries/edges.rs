@@ -36,6 +36,15 @@ pub struct IncomingReference {
     /// Edge resolution confidence (extracted | inferred | ambiguous) — see
     /// domain::CONF_*. Lets `refs` surface and filter low-confidence by-name edges.
     pub confidence: String,
+    /// The referencing node's authoritative AST test flag (`nodes.is_test`).
+    ///
+    /// Carried for the same reason `CallGraphNode` carries it: without it, the
+    /// only classifier a consumer has is the `is_test_symbol` name/path heuristic,
+    /// which misses an inline `#[cfg(test)]` helper with a descriptive name. That
+    /// is how `impact`'s value-reference count came to include test-only
+    /// references in a PRODUCTION signal (2026-08-16 audit §四). `refs` shows
+    /// every usage site by design and ignores this.
+    pub is_test: bool,
 }
 
 // --- Edge CRUD ---
@@ -300,14 +309,14 @@ pub fn get_incoming_references(
     relation_filter: Option<&str>,
 ) -> Result<Vec<IncomingReference>> {
     let sql = if relation_filter.is_some() {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
          WHERE e.target_id = ?1 AND e.relation = ?2
          ORDER BY f.path, n.start_line"
     } else {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
@@ -332,6 +341,7 @@ fn map_incoming_ref(row: &rusqlite::Row) -> rusqlite::Result<IncomingReference> 
         start_line: row.get(4)?,
         relation: row.get(5)?,
         confidence: row.get(6)?,
+        is_test: row.get::<_, i64>(7)? != 0,
     })
 }
 

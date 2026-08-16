@@ -92,6 +92,16 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
+        // Ambiguity FIRST, through the shared resolver — the same verdict
+        // `callgraph`/`impact`/`refs` give. `get_first_node_id_by_name` alone
+        // meant `similar new` silently answered about ONE arbitrary definition
+        // out of five while `callgraph new` reported the five-way ambiguity: same
+        // repo, same word, one surface guessing and not saying so. A silent wrong
+        // answer is the worst shape this CLI can produce (2026-08-16 audit §四).
+        // `--node-id` is the documented escape hatch and is handled above.
+        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+            emit_exact_ambiguity(symbol, &cands, json_mode);
+        }
         match queries::get_first_node_id_by_name(conn, symbol)? {
             Some(id) => (id, symbol.to_string()),
             None => {

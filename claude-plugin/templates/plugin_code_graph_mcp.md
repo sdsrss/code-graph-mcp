@@ -129,7 +129,7 @@ code-graph-mcp overview src/mcp/         # 模块总览
 code-graph-mcp callgraph SYMBOL          # 调用图
 code-graph-mcp impact SYMBOL             # 影响面（--change-type ∈ signature|behavior|remove，默认 behavior）
 code-graph-mcp show SYMBOL                # 节点详情
-code-graph-mcp refs SYMBOL --relation calls  # --relation ∈ calls|imports|inherits|implements|references|all
+code-graph-mcp refs SYMBOL --relation calls  # --relation ∈ calls|imports|inherits|implements|references|exports|routes_to|all
 code-graph-mcp refs SYMBOL --min-confidence extracted  # ∈ extracted|inferred|ambiguous；extracted=只看精确边（callgraph/impact/trace 同款）
 code-graph-mcp centrality                 # 架构咽喉（betweenness 桥节点；补 map 的 caller_count）
 code-graph-mcp cycles                     # 循环导入依赖（文件级 import 环 / SCC）

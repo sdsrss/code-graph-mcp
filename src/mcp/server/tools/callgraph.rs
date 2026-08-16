@@ -125,15 +125,9 @@ impl McpServer {
         // fan-out from the default response so Claude Code isn't fed phantom
         // call edges; min_confidence:"ambiguous" includes every edge. Validated
         // here so a bad value errors loudly rather than silently passing all.
-        let min_conf_tier = match args["min_confidence"].as_str() {
-            None | Some("") => crate::domain::CONF_INFERRED,
-            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!(
-                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                    c
-                )
-            })?,
-        };
+        let min_conf_tier =
+            crate::domain::parse_min_confidence(args["min_confidence"].as_str(), "min_confidence")?
+                .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         if !should_skip_indexing(args) {
@@ -188,14 +182,20 @@ impl McpServer {
                         include_tests,
                     );
                 }
-                FuzzyResolution::Ambiguous(suggestions) => {
+                FuzzyResolution::Ambiguous(cands) => {
+                    // Deliberately NOT `resolve::ambiguity_response`: this arm is
+                    // the "no exact match, here are near misses" case, not "one
+                    // exact name with several definitions", and it answers in the
+                    // tool's own empty-result envelope so a caller's result parser
+                    // still works. Only the candidate rendering is shared (audit
+                    // §四/§六 — the other three sites now use `ambiguity_response`).
                     return Ok(json!({
                         "function": function_name,
                         "direction": direction,
                         "callees": [],
                         "callers": [],
                         "suggestion": format!("No exact match for '{}'. Did you mean one of these?", function_name),
-                        "candidates": suggestions,
+                        "candidates": crate::resolve::candidates_to_json(&cands),
                     }));
                 }
                 FuzzyResolution::NotFound => {

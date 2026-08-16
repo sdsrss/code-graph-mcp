@@ -3161,6 +3161,47 @@ fn test_code_explorer_agent_references_only_live_tools() {
     );
 }
 
+/// P2 (2026-08-16 audit §四): the published `find_references` schema declares
+/// which `relation` values a client may send. It listed six while the graph emits
+/// seven, so `exports` and `routes_to` were visible in `relation:"all"` results
+/// and undeclared as filters — the declared-vs-honored gap, in the direction where
+/// the client is the one held back.
+///
+/// Pinned to `RELATION_FILTER_VOCAB`, the same list the CLI and the handler read,
+/// so a new edge type cannot land on two of the three surfaces.
+#[test]
+fn find_references_schema_enum_matches_the_relation_vocabulary() {
+    let registry = code_graph_mcp::mcp::tools::ToolRegistry::new();
+    let tools = registry.list_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "find_references")
+        .expect("find_references must be a live tool");
+    let declared: Vec<&str> = tool.input_schema["properties"]["relation"]["enum"]
+        .as_array()
+        .expect("relation must declare an enum")
+        .iter()
+        .map(|v| v.as_str().expect("enum values are strings"))
+        .collect();
+
+    for rel in code_graph_mcp::domain::RELATION_FILTER_VOCAB.iter() {
+        assert!(
+            declared.contains(rel),
+            "schema omits '{rel}', an edge type the handler accepts and the graph returns \
+             (declared: {declared:?})"
+        );
+    }
+    assert!(
+        declared.contains(&"all"),
+        "schema must keep the 'all' escape hatch: {declared:?}"
+    );
+    assert_eq!(
+        declared.len(),
+        code_graph_mcp::domain::RELATION_FILTER_VOCAB.len() + 1,
+        "schema must not declare a relation the handler rejects: {declared:?}"
+    );
+}
+
 /// v0.79.1 audit sibling-hole (the deferred half of HIGH #1): an inline Rust
 /// `#[cfg(test)]` unit test with a descriptive snake_case name in a `src/` file is
 /// `is_test=1` in the DB, but the `is_test_symbol` name/path heuristic MISSES it

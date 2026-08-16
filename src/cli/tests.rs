@@ -2411,3 +2411,64 @@ fn a_second_rebuild_refuses_while_the_first_holds_the_lock() {
         "the refusal must cover the concurrent-CLI case, not just the MCP server: {msg}"
     );
 }
+
+/// P2 (2026-08-16 audit §四): `show --impact` and `impact` report a RISK level for
+/// the same symbol, and they disagreed — `show` passed a literal confidence rank
+/// of 0 (keep the ambiguous by-name fan-out) while `impact` defaults to the
+/// `inferred` floor. Two risk levels for one symbol, and neither output carries a
+/// field that would explain it.
+///
+/// Pinning `show`'s constant to the shared default means the next change to the
+/// floor cannot move one surface without the other.
+#[test]
+fn impact_and_show_agree_on_the_default_confidence_floor() {
+    use crate::cli::commands::show::SHOW_IMPACT_MIN_CONF_RANK;
+    let impact_default = crate::domain::confidence_rank(
+        crate::domain::parse_min_confidence(None, "--min-confidence")
+            .unwrap()
+            .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR),
+    );
+    assert_eq!(
+        SHOW_IMPACT_MIN_CONF_RANK, impact_default,
+        "show --impact must use the same caller-traversal floor as `impact`"
+    );
+    // And the floor must actually exclude something, or the agreement is vacuous:
+    // rank 0 (ambiguous) would make both surfaces keep every by-name edge.
+    assert!(
+        impact_default > crate::domain::confidence_rank(crate::domain::CONF_AMBIGUOUS),
+        "the default floor must sit above `ambiguous`, or it filters nothing"
+    );
+}
+
+/// The `""` half of the same cluster: `--min-confidence ""` is how a shell spells
+/// an unset variable, and it used to be the default on `callgraph`/`impact` and a
+/// hard error on `refs` — same flag, same input, opposite outcomes. `parse_min_confidence`
+/// is now the single reading, and empty means absent everywhere.
+#[test]
+fn empty_min_confidence_reads_as_absent_on_every_surface() {
+    use crate::domain::parse_min_confidence;
+    assert_eq!(
+        parse_min_confidence(None, "--min-confidence").unwrap(),
+        None
+    );
+    assert_eq!(
+        parse_min_confidence(Some(""), "--min-confidence").unwrap(),
+        None,
+        "an empty value must mean 'not given', not an error"
+    );
+    assert_eq!(
+        parse_min_confidence(Some("extracted"), "--min-confidence").unwrap(),
+        Some(crate::domain::CONF_EXTRACTED)
+    );
+    // Still strict about real typos — this must not become an accept-everything.
+    let err = parse_min_confidence(Some("inferrd"), "--min-confidence").unwrap_err();
+    assert!(
+        err.to_string().contains("--min-confidence must be one of"),
+        "a typo must still fail, with the surface's own flag spelling: {err}"
+    );
+    let mcp_err = parse_min_confidence(Some("nope"), "min_confidence").unwrap_err();
+    assert!(
+        mcp_err.to_string().starts_with("min_confidence must be"),
+        "the MCP surface keeps its own spelling: {mcp_err}"
+    );
+}

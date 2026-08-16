@@ -68,7 +68,7 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
 /// `use std::mem::take` stopped resolving in `callgraph` / `impact` /
 /// `get_call_graph` — with `<external>` printed as the suggested fix.
 /// `bind_calls_to_imported_targets` already carried this guard in SQL.
-fn is_selectable_definition(file_path: &str) -> bool {
+pub fn is_selectable_definition(file_path: &str) -> bool {
     file_path != crate::domain::EXTERNAL_FILE_PATH
 }
 
@@ -133,6 +133,22 @@ pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) 
             ),
         }
     }
+}
+
+/// The MCP-side ambiguity RESPONSE, in one place.
+///
+/// Five sites emitted this and they had four different shapes and wordings
+/// ("N matches." / "N matches found." / a CLI-only variant …), even though
+/// [`ambiguity_message`] and [`candidates_to_json`] existed precisely so they
+/// would not (2026-08-16 audit §四 / §六). A caller comparing two tools' answers
+/// for the same symbol could not tell a wording difference from a verdict
+/// difference. `emit_exact_ambiguity` in `cli::symbols` is the CLI counterpart.
+pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Value {
+    serde_json::json!({
+        "symbol": name,
+        "error": ambiguity_message(name, cands, Surface::Mcp),
+        "suggestions": candidates_to_json(cands).into_iter().take(5).collect::<Vec<_>>(),
+    })
 }
 
 /// Outcome of fuzzy (substring-tolerant) name resolution.

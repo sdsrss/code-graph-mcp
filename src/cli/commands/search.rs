@@ -247,6 +247,16 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
 
     let mut stdout = std::io::stdout().lock();
 
+    // Emitted BEFORE the `--json` early return below, not after it. The notice
+    // used to sit at the end of the human-render path, so the one consumer that
+    // cannot infer the degradation from the output — a script reading a bare JSON
+    // array — was the one never told that these are the broader OR results rather
+    // than the AND match it asked for (2026-08-16 audit §四). stderr, so the
+    // stdout JSON stays a clean array.
+    if fts_result.or_fallback {
+        eprintln!("[code-graph] Note: AND match insufficient, showing OR results (broader match).");
+    }
+
     if json_mode {
         let results: Vec<serde_json::Value> = filtered_nodes
             .iter()
@@ -283,9 +293,6 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         }
     }
 
-    if fts_result.or_fallback {
-        eprintln!("[code-graph] Note: AND match insufficient, showing OR results (broader match).");
-    }
     if !json_mode {
         eprintln!("[code-graph] Tip: CLI search is FTS5-only. For vector+RRF hybrid recall use MCP semantic_code_search.");
     }

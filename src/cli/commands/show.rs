@@ -1,5 +1,18 @@
 use super::*;
 
+/// Caller-traversal confidence floor for `show --impact`.
+///
+/// Must equal the default `impact`/MCP `get_ast_node` use, and it did not: both
+/// call sites here passed a literal `0` (= keep ambiguous by-name callers), so
+/// the SAME symbol got one risk level from `show --impact` and a lower one from
+/// `impact`, with no field in either output explaining the difference
+/// (2026-08-16 audit §四). `inferred` is the documented default floor — folding
+/// the ambiguous fan-out out of a RISK number is the whole point of having one.
+/// `show` has no `--min-confidence` flag of its own, so this is a constant rather
+/// than a parsed tier; `impact_and_show_agree_on_the_default_confidence_floor`
+/// pins it to `cmd_impact`'s default.
+pub(crate) const SHOW_IMPACT_MIN_CONF_RANK: u8 = 1; // confidence_rank(CONF_INFERRED)
+
 /// CLI arguments for the `show` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(
@@ -287,7 +300,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
+                let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK).unwrap_or_default();
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
                 let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
@@ -374,7 +387,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 &node.name,
                 Some(fp.as_str()),
                 3,
-                0,
+                SHOW_IMPACT_MIN_CONF_RANK,
             )
             .unwrap_or_default();
             let is_function_like = crate::domain::is_function_node_type(&node.node_type);

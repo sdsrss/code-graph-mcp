@@ -251,9 +251,12 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
             .iter()
             .take_while(|a| a.as_str() != "--")
             .any(|a| a.as_str() == "--json");
-        if json {
-            println!("[]");
-        }
+        let unsupported = format!(
+            "unsupported flag: {bad}. Supported: -i -w -F -l -c -A -B -C -m -M -t -g \
+             (and no-op -n/-r/-R/-H). To search a literal flag-shaped string, put it \
+             after --: code-graph-mcp grep -- {bad}"
+        );
+        emit_grep_json_error(json, &unsupported);
         eprintln!(
             "[code-graph] unsupported flag: {bad}. Supported: -i -w -F -l -c -A -B -C -m -M -t -g \
              (and no-op -n/-r/-R/-H). To search a literal flag-shaped string, put it \
@@ -288,6 +291,25 @@ pub(crate) fn grep_exit(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     std::process::exit(code);
+}
+
+/// Emit grep's `--json` FAILURE shape: an error object, never the success-shaped
+/// empty array.
+///
+/// Every error leg used to print `[]`, which is byte-identical to a genuine
+/// zero-match run. Exit codes carried the whole distinction, so the very common
+/// `code-graph-mcp grep … --json 2>/dev/null` — a shape the agent-facing docs
+/// themselves suggest — reported "no matches in this repo" for an unsupported
+/// flag, a path outside the project, a missing ripgrep, or an invalid pattern
+/// (2026-08-16 audit §四). Object vs array is also what makes it detectable
+/// without reading the exit code: `JSON.parse(out).length` is `undefined`, not 0.
+///
+/// The genuine no-match legs keep the bare `[]` — that is the Tier-1 empty
+/// contract and it is correct there.
+fn emit_grep_json_error(json_mode: bool, message: &str) {
+    if json_mode {
+        println!("{}", serde_json::json!({ "error": message }));
+    }
 }
 
 /// GNU BRE inverts escaping for its operators: `\|` `\(` `\)` `\{` `\}` `\+`
@@ -438,9 +460,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // clap accepts an empty-string positional (e.g. an unset shell var expanding
     // to ""); preserve the non-empty guard + Usage string. Usage error → exit 2.
     if pattern.is_empty() {
-        if json_mode {
-            println!("[]");
-        }
+        emit_grep_json_error(
+            json_mode,
+            "no pattern given. Usage: code-graph-mcp grep <pattern> [paths...]",
+        );
         eprintln!("Usage: code-graph-mcp grep <pattern> [paths...] [-i] [-w] [-F] [-c] [-t TYPE] [-g GLOB] [-m N] [-M N] [--json]");
         grep_exit(2);
     }
@@ -488,9 +511,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // honest "No such file" / partial error instead of a bogus traversal
         // rejection (windows CI leg, first lit in v0.112.0).
         if !canonical.starts_with(&root_canonical) && !canonical.starts_with(project_root) {
-            if json_mode {
-                println!("[]");
-            }
+            emit_grep_json_error(
+                json_mode,
+                &format!("search path must be within project root: {path}"),
+            );
             eprintln!(
                 "[code-graph] search path must be within project root: {}",
                 path
@@ -731,10 +755,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         let output = match run_rg(batch) {
             Ok(output) => output,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if json_mode {
-                    println!("[]");
-                }
-                eprintln!("[code-graph] {}", rg_spawn_failure_message(project_root));
+                let msg = rg_spawn_failure_message(project_root);
+                emit_grep_json_error(json_mode, &msg);
+                eprintln!("[code-graph] {}", msg);
                 grep_exit(2);
             }
             Err(e) => return Err(e.into()),
@@ -780,17 +803,13 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             tracing::warn!("grep: flag-shaped pattern taken as pattern: {}", pattern);
         }
         if rg_output.stdout.is_empty() {
-            if json_mode {
-                println!("[]");
-            }
-            eprintln!(
-                "[code-graph] ripgrep error: {}",
-                if stderr.is_empty() {
-                    "invalid pattern or unreadable path"
-                } else {
-                    stderr
-                }
-            );
+            let detail = if stderr.is_empty() {
+                "invalid pattern or unreadable path"
+            } else {
+                stderr
+            };
+            emit_grep_json_error(json_mode, &format!("ripgrep error: {detail}"));
+            eprintln!("[code-graph] ripgrep error: {detail}");
             grep_exit(2);
         }
         eprintln!(

@@ -69,15 +69,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // Confidence floor: default 'inferred' hides the ambiguous by-name fan-out
     // (the known false-positive class) from the traversal; --min-confidence
     // ambiguous restores every edge. Validated at entry, mirroring `refs`.
-    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
-        None | Some("") => crate::domain::CONF_INFERRED,
-        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                c
-            )
-        })?,
-    };
+    let min_conf_tier: &'static str =
+        crate::domain::parse_min_confidence(args.min_confidence.as_deref(), "--min-confidence")?
+            .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;

@@ -284,8 +284,13 @@ pub(super) const COMPRESSION_TOKEN_THRESHOLD: usize = 2000;
 pub(super) enum FuzzyResolution {
     /// Exactly one candidate matched — use this name.
     Unique(String),
-    /// Multiple candidates — return suggestions to caller.
-    Ambiguous(Vec<serde_json::Value>),
+    /// Multiple candidates. Carries the CANDIDATES, not pre-rendered JSON: each
+    /// consumer needs a different envelope (an error object for the by-name
+    /// lookups, a "did you mean" empty-result envelope for `get_call_graph`), and
+    /// rendering early is what let four hand-written shapes accumulate for one
+    /// verdict (2026-08-16 audit §四/§六). Render with
+    /// `crate::resolve::ambiguity_response` or `candidates_to_json`.
+    Ambiguous(Vec<queries::NameCandidate>),
     /// No candidates found.
     NotFound,
 }
@@ -1578,9 +1583,7 @@ impl McpServer {
     pub(super) fn resolve_fuzzy_name(&self, name: &str) -> Result<FuzzyResolution> {
         Ok(match crate::resolve::resolve_fuzzy(self.db.conn(), name)? {
             crate::resolve::FuzzyResolution::Unique(n) => FuzzyResolution::Unique(n),
-            crate::resolve::FuzzyResolution::Ambiguous(cands) => {
-                FuzzyResolution::Ambiguous(crate::resolve::candidates_to_json(&cands))
-            }
+            crate::resolve::FuzzyResolution::Ambiguous(cands) => FuzzyResolution::Ambiguous(cands),
             crate::resolve::FuzzyResolution::NotFound => FuzzyResolution::NotFound,
         })
     }

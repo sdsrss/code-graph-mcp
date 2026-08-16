@@ -76,6 +76,39 @@ fn exit_zero_on_epipe(result: &Result<()>) {
     }
 }
 
+/// Parse one subcommand's arguments, honouring the `--json` empty contract on
+/// the FAILURE leg.
+///
+/// The plain `Args::parse_from(...)` this replaces hands a parse error straight
+/// to clap, which prints to stderr and calls `exit(2)` from inside the parser —
+/// before `main` ever produces a value, so the Tier-3 catch at the bottom of
+/// `main` never sees it. A `--json` consumer got zero bytes on stdout and a bare
+/// exit 2, on the most likely error there is: a typo'd flag (2026-08-16 audit
+/// §四, hit by 6+ commands).
+///
+/// `--help` / `--version` are also `Err` to clap but are not failures; they go
+/// to stdout with exit 0 and must stay untouched, which `use_stderr()` decides.
+fn parse_args_json_aware<T: Parser>(args: &[String]) -> T {
+    match T::try_parse_from(args.iter().skip(1)) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            if !e.use_stderr() {
+                e.exit(); // --help / --version: clap's own stdout render, exit 0
+            }
+            if args.iter().skip(2).any(|a| a == "--json") {
+                // Same shape as main's Tier-3 error object, so a consumer has one
+                // thing to parse whether the command failed at the flag or at the
+                // handler. stderr still gets clap's human-readable render below.
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": e.render().to_string().trim() })
+                );
+            }
+            e.exit()
+        }
+    }
+}
+
 fn main() -> Result<()> {
     install_stdout_epipe_panic_hook();
     let args: Vec<String> = std::env::args().collect();
@@ -115,7 +148,7 @@ fn main() -> Result<()> {
             // clap-migrated (audit #4): flags via clap; the git/index guard below
             // stays in main() (must precede indexing side effects, may skip entirely).
             let idx_args =
-                code_graph_mcp::cli::IncrementalIndexArgs::parse_from(args.iter().skip(1));
+                parse_args_json_aware::<code_graph_mcp::cli::IncrementalIndexArgs>(&args);
             let quiet = idx_args.quiet;
             let no_embed = idx_args.no_embed;
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
@@ -172,19 +205,19 @@ fn main() -> Result<()> {
         Some("rebuild-index") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let rebuild_args =
-                code_graph_mcp::cli::RebuildIndexArgs::parse_from(args.iter().skip(1));
+                parse_args_json_aware::<code_graph_mcp::cli::RebuildIndexArgs>(&args);
             code_graph_mcp::cli::cmd_rebuild_index(&project_root, rebuild_args)
         }
         Some("reindex") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let reindex_args = code_graph_mcp::cli::ReindexArgs::parse_from(args.iter().skip(1));
+            let reindex_args = parse_args_json_aware::<code_graph_mcp::cli::ReindexArgs>(&args);
             code_graph_mcp::cli::cmd_reindex(&project_root, reindex_args)
         }
         Some("health-check") => {
             // clap-migrated (audit #4): --json/--format duality normalized via the
             // HealthCheckArgs::resolved_format shim (--json wins, else --format,
             // else oneline), keeping cmd_health_check's `format: &str` contract.
-            let hc_args = code_graph_mcp::cli::HealthCheckArgs::parse_from(args.iter().skip(1));
+            let hc_args = parse_args_json_aware::<code_graph_mcp::cli::HealthCheckArgs>(&args);
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             code_graph_mcp::cli::cmd_health_check_opts(
                 &project_root,
@@ -207,101 +240,100 @@ fn main() -> Result<()> {
         // FTS5 only — MCP `semantic_code_search` adds vector+RRF fusion.
         Some("search" | "semantic_code_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let search_args = code_graph_mcp::cli::SearchArgs::parse_from(args.iter().skip(1));
+            let search_args = parse_args_json_aware::<code_graph_mcp::cli::SearchArgs>(&args);
             code_graph_mcp::cli::cmd_search(&project_root, search_args)
         }
         Some("ast-search" | "ast_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let ast_search_args =
-                code_graph_mcp::cli::AstSearchArgs::parse_from(args.iter().skip(1));
+                parse_args_json_aware::<code_graph_mcp::cli::AstSearchArgs>(&args);
             code_graph_mcp::cli::cmd_ast_search(&project_root, ast_search_args)
         }
         Some("callgraph" | "get_call_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let callgraph_args =
-                code_graph_mcp::cli::CallgraphArgs::parse_from(args.iter().skip(1));
+            let callgraph_args = parse_args_json_aware::<code_graph_mcp::cli::CallgraphArgs>(&args);
             code_graph_mcp::cli::cmd_callgraph(&project_root, callgraph_args)
         }
         Some("impact" | "impact_analysis") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let impact_args = code_graph_mcp::cli::ImpactArgs::parse_from(args.iter().skip(1));
+            let impact_args = parse_args_json_aware::<code_graph_mcp::cli::ImpactArgs>(&args);
             code_graph_mcp::cli::cmd_impact(&project_root, impact_args)
         }
         Some("map" | "project_map") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let map_args = code_graph_mcp::cli::MapArgs::parse_from(args.iter().skip(1));
+            let map_args = parse_args_json_aware::<code_graph_mcp::cli::MapArgs>(&args);
             code_graph_mcp::cli::cmd_map(&project_root, map_args)
         }
         Some("tour") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let tour_args = code_graph_mcp::cli::TourArgs::parse_from(args.iter().skip(1));
+            let tour_args = parse_args_json_aware::<code_graph_mcp::cli::TourArgs>(&args);
             code_graph_mcp::cli::cmd_tour(&project_root, tour_args)
         }
         Some("overview" | "module_overview") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let overview_args = code_graph_mcp::cli::OverviewArgs::parse_from(args.iter().skip(1));
+            let overview_args = parse_args_json_aware::<code_graph_mcp::cli::OverviewArgs>(&args);
             code_graph_mcp::cli::cmd_overview(&project_root, overview_args)
         }
         Some("show" | "get_ast_node") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let show_args = code_graph_mcp::cli::ShowArgs::parse_from(args.iter().skip(1));
+            let show_args = parse_args_json_aware::<code_graph_mcp::cli::ShowArgs>(&args);
             code_graph_mcp::cli::cmd_show(&project_root, show_args)
         }
         Some("trace" | "trace_http_chain") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let trace_args = code_graph_mcp::cli::TraceArgs::parse_from(args.iter().skip(1));
+            let trace_args = parse_args_json_aware::<code_graph_mcp::cli::TraceArgs>(&args);
             code_graph_mcp::cli::cmd_trace(&project_root, trace_args)
         }
         Some("deps" | "dependency_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let deps_args = code_graph_mcp::cli::DepsArgs::parse_from(args.iter().skip(1));
+            let deps_args = parse_args_json_aware::<code_graph_mcp::cli::DepsArgs>(&args);
             code_graph_mcp::cli::cmd_deps(&project_root, deps_args)
         }
         Some("similar" | "find_similar_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let similar_args = code_graph_mcp::cli::SimilarArgs::parse_from(args.iter().skip(1));
+            let similar_args = parse_args_json_aware::<code_graph_mcp::cli::SimilarArgs>(&args);
             code_graph_mcp::cli::cmd_similar(&project_root, similar_args)
         }
         Some("refs" | "find_references") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let refs_args = code_graph_mcp::cli::RefsArgs::parse_from(args.iter().skip(1));
+            let refs_args = parse_args_json_aware::<code_graph_mcp::cli::RefsArgs>(&args);
             code_graph_mcp::cli::cmd_refs(&project_root, refs_args)
         }
         Some("dead-code" | "find_dead_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let dead_code_args = code_graph_mcp::cli::DeadCodeArgs::parse_from(args.iter().skip(1));
+            let dead_code_args = parse_args_json_aware::<code_graph_mcp::cli::DeadCodeArgs>(&args);
             code_graph_mcp::cli::cmd_dead_code(&project_root, dead_code_args)
         }
         Some("affected") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let affected_args = code_graph_mcp::cli::AffectedArgs::parse_from(args.iter().skip(1));
+            let affected_args = parse_args_json_aware::<code_graph_mcp::cli::AffectedArgs>(&args);
             code_graph_mcp::cli::cmd_affected(&project_root, affected_args)
         }
         Some("centrality") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let centrality_args =
-                code_graph_mcp::cli::CentralityArgs::parse_from(args.iter().skip(1));
+                parse_args_json_aware::<code_graph_mcp::cli::CentralityArgs>(&args);
             code_graph_mcp::cli::cmd_centrality(&project_root, centrality_args)
         }
         Some("cycles") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let cycles_args = code_graph_mcp::cli::CyclesArgs::parse_from(args.iter().skip(1));
+            let cycles_args = parse_args_json_aware::<code_graph_mcp::cli::CyclesArgs>(&args);
             code_graph_mcp::cli::cmd_cycles(&project_root, cycles_args)
         }
         Some("surprising") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let surprising_args =
-                code_graph_mcp::cli::SurprisingArgs::parse_from(args.iter().skip(1));
+                parse_args_json_aware::<code_graph_mcp::cli::SurprisingArgs>(&args);
             code_graph_mcp::cli::cmd_surprising(&project_root, surprising_args)
         }
         Some("report") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let report_args = code_graph_mcp::cli::ReportArgs::parse_from(args.iter().skip(1));
+            let report_args = parse_args_json_aware::<code_graph_mcp::cli::ReportArgs>(&args);
             code_graph_mcp::cli::cmd_report(&project_root, report_args)
         }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
+            let bench_args = parse_args_json_aware::<code_graph_mcp::cli::BenchmarkArgs>(&args);
             code_graph_mcp::cli::cmd_benchmark(&project_root, bench_args)
         }
         Some("stats") => {
@@ -309,13 +341,12 @@ fn main() -> Result<()> {
             // clap-migrated (audit #4): parse this subcommand's args via clap,
             // then dispatch. skip(1) drops argv[0]; clap treats the next token
             // (the subcommand/alias name) as the binary-name slot and skips it.
-            let stats_args = code_graph_mcp::cli::StatsArgs::parse_from(args.iter().skip(1));
+            let stats_args = parse_args_json_aware::<code_graph_mcp::cli::StatsArgs>(&args);
             code_graph_mcp::cli::cmd_stats(&project_root, stats_args)
         }
         Some("outcome") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let outcome_args =
-                code_graph_mcp::outcome::OutcomeArgs::parse_from(args.iter().skip(1));
+            let outcome_args = parse_args_json_aware::<code_graph_mcp::outcome::OutcomeArgs>(&args);
             code_graph_mcp::outcome::cmd_outcome(&project_root, outcome_args)
         }
         Some("doctor") => {
@@ -385,7 +416,7 @@ fn main() -> Result<()> {
             // clap-migrated (audit #4): nested #[command(subcommand)] replaces the
             // hand-rolled args[2]/args[3] dispatch. clap owns the no-subcommand and
             // unknown-subcommand errors (exit 2). `inspect` stays project-root-free.
-            let snapshot_args = code_graph_mcp::cli::SnapshotArgs::parse_from(args.iter().skip(1));
+            let snapshot_args = parse_args_json_aware::<code_graph_mcp::cli::SnapshotArgs>(&args);
             match snapshot_args.command {
                 code_graph_mcp::cli::SnapshotCommand::Create(create_args) => {
                     let project_root = code_graph_mcp::cli::resolve_project_root()?;
@@ -398,7 +429,7 @@ fn main() -> Result<()> {
         }
         Some(other) => {
             eprintln!("Unknown subcommand: {}", other);
-            if let Some(suggestion) = suggest_subcommand(other) {
+            if let Some(suggestion) = code_graph_mcp::cli::suggest_subcommand(other) {
                 eprintln!("Did you mean '{}'?", suggestion);
             }
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
@@ -526,8 +557,13 @@ fn print_help() {
     println!("    snapshot inspect <file>");
     println!("                        Print snapshot metadata as JSON (accepts .db or .db.zst)\n");
     println!("OPTIONS:");
-    println!("    --json              JSON output (query/analysis commands; not the index");
-    println!("                        commands, doctor, adopt or unadopt)");
+    // Every clap subcommand carries --json, including the index commands the old
+    // wording excluded (they all emit an index-result envelope). Only the
+    // JS-dispatched trio and `serve` do not. `every_clap_command_accepts_json`
+    // (tests/doc_cli_alignment.rs) keeps this claim true (2026-08-16 audit §四).
+    println!("    --json              JSON output (every subcommand except serve, doctor,");
+    println!("                        adopt, unadopt and snapshot — snapshot inspect always");
+    println!("                        prints JSON)");
     println!(
         "    --compact           Compact output (search, callgraph, map, overview, deps, refs)"
     );
@@ -553,8 +589,12 @@ fn print_help() {
     println!("    --min-lines N       Min lines to report (dead-code; default: 3)");
     println!("    --ignore <prefix>   Exclude path prefix (dead-code; repeatable; default: claude-plugin/, benches/)");
     println!("    --no-ignore         Disable default --ignore prefixes (dead-code)");
-    println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");
-    println!("    --min-confidence <t> Min edge confidence: extracted|inferred|ambiguous (refs; default: all)");
+    println!(
+        "    --relation <type>   Filter: {} (refs)",
+        code_graph_mcp::domain::RELATION_FILTER_HELP
+    );
+    println!("    --min-confidence <t> Min edge confidence: extracted|inferred|ambiguous");
+    println!("                        (callgraph, impact: default inferred; refs: default all)");
     println!("    --last N            Limit to last N sessions (stats; default: all)");
     println!(
         "    --deep              Run PRAGMA quick_check regardless of index size (health-check)"
@@ -774,52 +814,6 @@ fn run_serve() -> Result<()> {
     Ok(())
 }
 
-const SUBCOMMANDS: &[&str] = &[
-    "serve",
-    "grep",
-    "search",
-    "ast-search",
-    "callgraph",
-    "impact",
-    "show",
-    "map",
-    "overview",
-    "deps",
-    "trace",
-    "similar",
-    "refs",
-    "dead-code",
-    "incremental-index",
-    "rebuild-index",
-    "reindex",
-    "health-check",
-    "doctor",
-    "centrality",
-    "cycles",
-    "surprising",
-    "report",
-    "benchmark",
-    "stats",
-    "outcome",
-    "adopt",
-    "unadopt",
-    "snapshot",
-    // MCP tool names accepted as aliases (see dispatch above). Listed here so
-    // typo-suggester picks the closer alias for inputs like "project_mapp".
-    "project_map",
-    "module_overview",
-    "get_ast_node",
-    "find_references",
-    "get_call_graph",
-    "impact_analysis",
-    "find_similar_code",
-    "dependency_graph",
-    "trace_http_chain",
-    "find_dead_code",
-    "ast_search",
-    "semantic_code_search",
-];
-
 /// Locate and exec a node script under claude-plugin/scripts/.
 /// Searches both dev (target/release/) and installed (npm package) layouts.
 ///
@@ -876,36 +870,6 @@ fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
     }
     eprintln!("Tip: set _FIND_BINARY_ROOT to the main npm pkg dir, or run directly: node claude-plugin/scripts/{}", script);
     std::process::exit(1);
-}
-
-fn suggest_subcommand(input: &str) -> Option<&'static str> {
-    let input_lower = input.to_lowercase();
-    let mut best: Option<(&str, usize)> = None;
-    for &cmd in SUBCOMMANDS {
-        let d = levenshtein_small(&input_lower, cmd);
-        let threshold = if cmd.len() <= 4 { 1 } else { 2 };
-        if d <= threshold && (best.is_none() || d < best.unwrap().1) {
-            best = Some((cmd, d));
-        }
-    }
-    best.map(|(cmd, _)| cmd)
-}
-
-fn levenshtein_small(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-    let mut prev = (0..=n).collect::<Vec<_>>();
-    let mut curr = vec![0; n + 1];
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[n]
 }
 
 #[cfg(test)]

@@ -57,15 +57,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // ambiguous by-name fan-out out of the risk count; --min-confidence ambiguous
     // counts every caller. The excluded count is disclosed below so a folded
     // ambiguous caller never silently under-states risk.
-    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
-        None | Some("") => crate::domain::CONF_INFERRED,
-        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                c
-            )
-        })?,
-    };
+    let min_conf_tier: &'static str =
+        crate::domain::parse_min_confidence(args.min_confidence.as_deref(), "--min-confidence")?
+            .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
@@ -275,7 +269,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             for r in
                 queries::get_incoming_references(conn, n.id, Some(crate::domain::REL_REFERENCES))?
             {
-                if !crate::domain::is_test_symbol(&r.name, &r.file_path) {
+                // `is_test_node`, not the name/path heuristic alone: this count
+                // feeds a PRODUCTION coupling signal, and an inline `#[cfg(test)]`
+                // reference used to land in it (2026-08-16 audit §四).
+                if !crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
                     seen.insert((r.name, r.file_path));
                 }
             }

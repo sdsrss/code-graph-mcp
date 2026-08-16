@@ -30,6 +30,97 @@ pub use paths::*;
 pub(crate) use symbols::*;
 pub use usage::*;
 
+/// Every name `main.rs`'s subcommand dispatch answers, including the MCP tool
+/// names accepted as aliases. Sole consumer is [`suggest_subcommand`].
+///
+/// Lives in the lib rather than `main.rs` so a test can check it against the
+/// authoritative command list. It was missing `affected` and `tour` — a typo of
+/// either got "Run 'code-graph-mcp --help'" instead of the fix, silently, because
+/// nothing tied the two lists together (2026-08-16 audit §四). The tie is now
+/// `typo_table_covers_every_dispatchable_subcommand` in
+/// `tests/doc_cli_alignment.rs`, which reads the same `clap_commands()` /
+/// `js_commands()` tables the doc alignment checks use.
+pub const SUBCOMMANDS: &[&str] = &[
+    "serve",
+    "grep",
+    "search",
+    "ast-search",
+    "callgraph",
+    "impact",
+    "show",
+    "map",
+    "tour",
+    "overview",
+    "deps",
+    "trace",
+    "similar",
+    "refs",
+    "dead-code",
+    "affected",
+    "incremental-index",
+    "rebuild-index",
+    "reindex",
+    "health-check",
+    "doctor",
+    "centrality",
+    "cycles",
+    "surprising",
+    "report",
+    "benchmark",
+    "stats",
+    "outcome",
+    "adopt",
+    "unadopt",
+    "snapshot",
+    // MCP tool names accepted as aliases (see the dispatch in main.rs). Listed
+    // here so the typo-suggester picks the closer alias for inputs like
+    // "project_mapp".
+    "project_map",
+    "module_overview",
+    "get_ast_node",
+    "find_references",
+    "get_call_graph",
+    "impact_analysis",
+    "find_similar_code",
+    "dependency_graph",
+    "trace_http_chain",
+    "find_dead_code",
+    "ast_search",
+    "semantic_code_search",
+];
+
+/// Nearest subcommand to a mistyped one, or `None` when nothing is close enough.
+/// Threshold tightens for short names so `map` doesn't absorb every 3-letter typo.
+pub fn suggest_subcommand(input: &str) -> Option<&'static str> {
+    let input_lower = input.to_lowercase();
+    let mut best: Option<(&str, usize)> = None;
+    for &cmd in SUBCOMMANDS {
+        let d = levenshtein_small(&input_lower, cmd);
+        let threshold = if cmd.len() <= 4 { 1 } else { 2 };
+        if d <= threshold && (best.is_none() || d < best.unwrap().1) {
+            best = Some((cmd, d));
+        }
+    }
+    best.map(|(cmd, _)| cmd)
+}
+
+fn levenshtein_small(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
 /// Minimal JSON-RPC loop that answers `initialize` / `tools/list` with an empty
 /// catalog and rejects everything else, WITHOUT opening a database, loading the
 /// embedding model, or creating `.code-graph/`. Mirrors the JS launcher's
