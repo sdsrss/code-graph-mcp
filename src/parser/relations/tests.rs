@@ -6482,3 +6482,162 @@ fn csharp_enum_underlying_type_is_not_inheritance() {
         "a C# enum's underlying type is not a parent; got {heritage:?}"
     );
 }
+
+/// Parity table for the CALLS axis: every language whose grammar has call
+/// syntax must emit a `calls` edge for the simplest possible call.
+///
+/// Why this exists instead of a table-driven rewrite of `walk_for_relations`
+/// (2026-08-16 audit §十.9). The case for table-driving that function was the
+/// heritage axis's outcome: a hard-coded node-kind list silently emitted ZERO
+/// inheritance edges for seven languages. So before repeating the refactor on
+/// the heaviest edge type in the repo, the same question was asked empirically
+/// — and the answer came back different. All sixteen call-bearing languages
+/// already emit the edge. There is no gap for table-driving to close here, so
+/// what it would buy is a guard, and a guard is what this is: same protection,
+/// no edge-set risk on the hottest path.
+///
+/// `walk_for_relations`'s dispatch comment lists the per-grammar call node kinds
+/// in prose and warns that "Missing arms = silently-dropped edges, not compile
+/// errors". This is that prose, executed.
+#[test]
+fn calls_axis_emits_an_edge_for_every_call_bearing_language() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "rust",
+            "fn helper_fn() {}\nfn caller_fn() { helper_fn(); }\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+        (
+            "typescript",
+            "function helperFn(): void {}\nfunction callerFn(): void { helperFn(); }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "tsx",
+            "function helperFn(): void {}\nfunction callerFn(): void { helperFn(); }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "javascript",
+            "function helperFn() {}\nfunction callerFn() { helperFn(); }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "go",
+            "package main\nfunc helperFn() {}\nfunc callerFn() { helperFn() }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "python",
+            "def helper_fn():\n    pass\n\ndef caller_fn():\n    helper_fn()\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+        (
+            "java",
+            "class A { void helperFn() {} void callerFn() { helperFn(); } }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "c",
+            "void helper_fn(void) {}\nvoid caller_fn(void) { helper_fn(); }\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+        (
+            "cpp",
+            "void helper_fn() {}\nvoid caller_fn() { helper_fn(); }\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+        (
+            "csharp",
+            "class A { void HelperFn() {} void CallerFn() { HelperFn(); } }\n",
+            "CallerFn",
+            "HelperFn",
+        ),
+        (
+            "kotlin",
+            "fun helperFn() {}\nfun callerFn() { helperFn() }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "ruby",
+            "def helper_fn\nend\n\ndef caller_fn\n  helper_fn\nend\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+        (
+            "php",
+            "<?php\nfunction helperFn() {}\nfunction callerFn() { helperFn(); }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "swift",
+            "func helperFn() {}\nfunc callerFn() { helperFn() }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "dart",
+            "void helperFn() {}\nvoid callerFn() { helperFn(); }\n",
+            "callerFn",
+            "helperFn",
+        ),
+        (
+            "bash",
+            "helper_fn() {\n  echo hi\n}\ncaller_fn() {\n  helper_fn\n}\n",
+            "caller_fn",
+            "helper_fn",
+        ),
+    ];
+    let mut missing: Vec<String> = Vec::new();
+    for (lang, code, src, tgt) in cases {
+        let rels = match extract_relations(code, lang) {
+            Ok(r) => r,
+            Err(e) => {
+                missing.push(format!("{lang}: parse error {e}"));
+                continue;
+            }
+        };
+        let calls: Vec<String> = rels
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .map(|r| format!("{}->{}", r.source_name, r.target_name))
+            .collect();
+        if !rels
+            .iter()
+            .any(|r| r.relation == "calls" && r.target_name == *tgt)
+        {
+            missing.push(format!("{lang}: NO calls edge to {tgt}; calls={calls:?}"));
+        } else if !rels.iter().any(|r| {
+            r.relation == "calls"
+                && r.target_name == *tgt
+                // `ends_with` because several languages QUALIFY the source, which
+                // is correct and deliberate: Java/C# emit `A.callerFn` for a
+                // method inside class `A`, and Go carries its receiver
+                // (`Server.Start`) since v0.117.0. An unqualified match would
+                // have failed those three for doing the right thing, while a
+                // bare `contains` would accept a wrong enclosing symbol.
+                && (r.source_name == *src || r.source_name.ends_with(&format!(".{src}")))
+        }) {
+            missing.push(format!(
+                "{lang}: calls edge present but its source is not {src} (nor a qualified \
+                 form ending in .{src}); calls={calls:?}"
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "CALLS AXIS GAPS:\n{}",
+        missing.join("\n")
+    );
+}
