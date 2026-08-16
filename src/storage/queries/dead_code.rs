@@ -147,8 +147,19 @@ pub fn find_dead_code(
         }
     }
 
-    if path_prefix.is_some() {
-        conditions.push("f.path LIKE :path_pattern ESCAPE '\\'".to_string());
+    // Anchored at a path-component boundary, matching [`unindexed_path_prefix`]
+    // exactly. A bare `LIKE 'src%'` also matched the SIBLING directory `src2/`,
+    // so `dead-code src` reported candidates from a directory the user never
+    // named — and because the empty-result probe already used the boundary form,
+    // the two halves of the same command disagreed about what "under this path"
+    // means (audit 2026-08-16 review Minor tail).
+    let path_norm = path_prefix
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
+    if path_norm.is_some() {
+        conditions
+            .push("(f.path = :path_exact OR f.path LIKE :path_pattern ESCAPE '\\')".to_string());
     }
 
     let where_clause = conditions.join(" AND ");
@@ -286,10 +297,9 @@ pub fn find_dead_code(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let path_pattern = path_prefix.map(|pp| {
-        let escaped = super::helpers::escape_like(pp);
-        format!("{}%", escaped)
-    });
+    let path_pattern = path_norm
+        .as_deref()
+        .map(|pp| format!("{}/%", super::helpers::escape_like(pp)));
 
     let mut params: Vec<(&str, &dyn rusqlite::types::ToSql)> = vec![
         (":min_lines", &min_lines),
@@ -323,6 +333,7 @@ pub fn find_dead_code(
     }
 
     if let Some(ref pattern) = path_pattern {
+        params.push((":path_exact", path_norm.as_ref().unwrap()));
         params.push((":path_pattern", pattern));
     }
 
@@ -883,6 +894,70 @@ mod tests {
         assert!(
             results_no_match.is_empty(),
             "path prefix 'lib/' should not match any"
+        );
+
+        // The filter is anchored at a path-component boundary. `LIKE 'src%'`
+        // also matched a SIBLING directory, so `dead-code src` answered with
+        // candidates from `src2/` — while the empty-result probe
+        // (`unindexed_path_prefix`) already used the boundary form, so the two
+        // halves of the same command disagreed about what "under this path"
+        // means (audit 2026-08-16 review Minor tail).
+        let sib_fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src2/sibling.rs".into(),
+                blake3_hash: "h_sib".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: sib_fid,
+                node_type: "function".into(),
+                name: "sibling_orphan".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 9,
+                code_content: "fn sibling_orphan() { }".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let results_boundary = find_dead_code(conn, Some("src"), None, false, 1, 100).unwrap();
+        let boundary_paths: Vec<&str> = results_boundary
+            .iter()
+            .map(|r| r.file_path.as_str())
+            .collect();
+        assert!(
+            boundary_paths.iter().all(|p| !p.starts_with("src2/")),
+            "path filter 'src' must not reach into the sibling directory 'src2/', got: {boundary_paths:?}"
+        );
+        assert!(
+            !results_boundary.is_empty(),
+            "path filter 'src' must still match the real src/ files"
+        );
+        // The sibling IS reachable under its own name (proves the fixture is live,
+        // so the assertion above is not vacuously true).
+        let results_sibling = find_dead_code(conn, Some("src2"), None, false, 1, 100).unwrap();
+        assert!(
+            results_sibling.iter().any(|r| r.name == "sibling_orphan"),
+            "the src2/ fixture must be findable under its own prefix"
+        );
+        // A prefix naming a FILE still matches that file exactly.
+        let results_file =
+            find_dead_code(conn, Some("src2/sibling.rs"), None, false, 1, 100).unwrap();
+        assert!(
+            results_file.iter().any(|r| r.name == "sibling_orphan"),
+            "an exact file path must still match"
         );
 
         // --- Test node_type filter ---

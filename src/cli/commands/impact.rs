@@ -109,9 +109,23 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // (audit 2026-08-16 P1-9).
     if let Some(fp) = explicit_file {
         let in_file = queries::get_nodes_by_file_path(conn, fp)?;
-        let present = in_file
-            .iter()
-            .any(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol));
+        // `--file` NARROWS, so a qualifier the user typed must survive it.
+        // `resolve_qualified_symbol` returns early when `--file` is present and
+        // hands back the bare name, so this check used to accept any same-named
+        // node in the file: `impact Gamma.run --file two.ts` matched `Alpha.run`
+        // and answered `"risk":"LOW"` exit 0 for a class that does not exist —
+        // the same safety-endorsement-for-a-typo shape P1-9 fixed for paths,
+        // still reachable through the qualifier (audit 2026-08-16 Minor tail).
+        let qualified_input = raw_symbol != symbol;
+        let present = if qualified_input {
+            in_file
+                .iter()
+                .any(|n| n.qualified_name.as_deref() == Some(raw_symbol))
+        } else {
+            in_file
+                .iter()
+                .any(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
+        };
         if !present {
             if json_mode {
                 // Same in-band miss contract as `show`: {error, symbol, …} +
@@ -134,8 +148,12 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::json!({
+                        // Echo what the user TYPED. Reporting the stripped
+                        // `symbol` for a qualified miss reads as if the bare
+                        // name were absent, when the file may well define it
+                        // under a different qualifier.
                         "error": "Symbol not found in file",
-                        "symbol": symbol,
+                        "symbol": raw_symbol,
                         "file": fp,
                         "candidates": candidates,
                     })
@@ -143,7 +161,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             }
             eprintln!(
                 "[code-graph] Symbol '{}' not found in file '{}'.",
-                symbol, fp
+                raw_symbol, fp
             );
             let defined_in: Vec<String> = symbol_nodes
                 .iter()
@@ -154,6 +172,20 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));
             }
             std::process::exit(1);
+        }
+        // The qualifier gates ENTRY but not the traversal: `get_callers_with_route_info`
+        // is name+file based, so when the file defines the bare name more than
+        // once the blast radius still covers every one of them. Say so rather
+        // than reporting a number that silently means "…and its namesakes".
+        if qualified_input {
+            let same_name = in_file.iter().filter(|n| n.name == symbol).count();
+            if same_name > 1 {
+                eprintln!(
+                    "[code-graph] Note: '{}' defines {} symbols named '{}'; the caller set below \
+                     covers all of them (the qualifier narrows the lookup, not the traversal).",
+                    fp, same_name, symbol
+                );
+            }
         }
     }
 

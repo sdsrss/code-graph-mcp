@@ -7,6 +7,33 @@ the architecture items. No behaviour change: this batch only moves code and adds
 guard, so no `INDEX_VERSION` bump is owed (the extraction fingerprint moved solely
 because `index_files.rs` now imports `split_identifier` from its new home).
 
+### Fixed
+- **`impact <Class>.<method> --file <path>` endorsed a class that does not exist.**
+  `--file` is a narrowing flag, but the resolver returns early when it is present
+  and hands the rest of the command the bare method name — so `impact Gamma.run
+  --file two.ts` matched `Alpha.run` living in the same file and answered
+  `{"risk":"LOW"}` exit 0. That is the same safety-endorsement-for-a-typo shape
+  P1-9 closed for wrong *paths*, still reachable through a wrong *qualifier*.
+  A qualified input is now checked against `qualified_name`, the miss echoes what
+  the user typed rather than the stripped name, and when the file legitimately
+  defines the bare name more than once the answer says so — the qualifier narrows
+  the lookup, not the caller traversal.
+- **`dead-code src` reached into the sibling directory `src2/`.** The report
+  filtered with an unanchored `f.path LIKE 'src%'` while the empty-result probe
+  (`unindexed_path_prefix`) used a `/`-boundary match, so the two halves of one
+  command disagreed about what "under this path" means. Both are boundary-anchored
+  now (`f.path = 'src' OR f.path LIKE 'src/%'`); an exact file path still matches.
+- **`ast_search` dropped a disclosure whenever two hints applied at once, and the
+  two surfaces dropped different ones.** Each surface assigned its `hint` field
+  from several independent `if` blocks, so the last one executed won: for a result
+  set that is both truncated and answered by the name-substring fallback (reachable
+  — the fallback path carries its own `truncated`), the CLI kept only the fallback
+  note and MCP kept only the truncation notice. Whichever surface dropped the
+  truncation notice let a cut answer read as complete. Both now build `hint` from
+  one ordered builder (`search::ast_query::hints`): why-it-is-empty, then the cut,
+  then provenance — surface-specific wording (`--limit 20` vs `` `limit` ``),
+  shared order. MCP's generic-fallback suggestion prepends instead of clobbering.
+
 ### Changed
 - **The two upward module dependencies the audit found are gone, and a table now
   forbids them coming back.** `cli` borrowed the index-lock infrastructure from

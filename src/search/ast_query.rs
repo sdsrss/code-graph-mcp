@@ -54,6 +54,82 @@ pub struct AstSearchOutcome {
     pub fallback_used: bool,
 }
 
+/// Every hint an `ast_search` answer owes its caller, most-actionable first.
+///
+/// Both surfaces used to assign their `hint` field from several independent
+/// `if` blocks, so the last statement executed won and the others vanished —
+/// and the two surfaces disagreed about which that was. For a result set that
+/// is BOTH truncated and answered by the name-substring fallback (reachable:
+/// the fallback path carries its own `truncated`), the CLI kept only the
+/// fallback note and MCP kept only the truncation notice, so the same query
+/// got a different single hint depending on who asked, and one surface always
+/// dropped the disclosure that stops "count: 20" being read as "20 matches
+/// exist" (audit 2026-08-16 review Minor tail).
+///
+/// Returning the ordered set — rather than picking a winner — is what makes
+/// "several things are true at once" expressible in a single string field.
+/// Callers join with a space; the leading sentence is the one that matters most.
+///
+/// Order: why-it-is-empty first (it explains the answer), then the truncation
+/// cut, then the provenance note.
+/// Which surface the hints are worded for. Only the *spelling* of the remedy
+/// differs (`--limit 20` on the CLI, `` `limit` `` for an MCP caller who passes
+/// arguments, not flags) — the ORDER is shared, because the order was the bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintStyle {
+    Cli,
+    Mcp,
+}
+
+impl HintStyle {
+    fn limit_remedy(self, limit: usize) -> String {
+        match self {
+            HintStyle::Cli => format!("--limit {limit} — raise --limit"),
+            HintStyle::Mcp => format!("limit={limit} — raise `limit`"),
+        }
+    }
+    fn broaden_remedy(self, rows: i64) -> String {
+        match self {
+            HintStyle::Cli => format!(
+                "The candidate pool was full ({rows} rows), so matches may exist below it. Narrow the query, raise --limit, or drop the query and enumerate with the filters alone."
+            ),
+            HintStyle::Mcp => format!(
+                "The candidate pool was full ({rows} rows), so matches may exist below it. Narrow the query, raise `limit`, or drop `query` and enumerate with the filters alone."
+            ),
+        }
+    }
+}
+
+pub fn hints(
+    outcome: &AstSearchOutcome,
+    query: Option<&str>,
+    limit: usize,
+    style: HintStyle,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if outcome.results.is_empty() && outcome.dropped_by_filter > 0 {
+        out.push(if outcome.pool_saturated {
+            style.broaden_remedy(outcome.fetch_count)
+        } else {
+            "The index has no symbol matching both the query and the filter. Broaden or clear the filter.".to_string()
+        });
+    }
+    if outcome.truncated {
+        let remedy = style.limit_remedy(limit);
+        out.push(match outcome.matched_total {
+            Some(total) => format!("{total} symbols matched but {remedy} to see the rest."),
+            None => format!("More symbols matched than {remedy} to see the rest."),
+        });
+    }
+    if outcome.fallback_used {
+        out.push(format!(
+            "FTS rank had no '{}' under the active filter; falling back to name-substring match.",
+            query.unwrap_or_default()
+        ));
+    }
+    out
+}
+
 impl AstSearchOutcome {
     fn empty(fts_empty: bool, fetch_count: i64) -> Self {
         Self {
@@ -378,5 +454,94 @@ mod tests {
         .unwrap();
         assert_eq!(out.results.len(), 2);
         assert!(out.truncated, "3 structs exist, 2 asked for");
+    }
+
+    /// Build an outcome with exactly the flags a case needs; `results` is only
+    /// read for emptiness, so a single placeholder row stands in for "non-empty".
+    fn outcome_with(truncated: bool, fallback_used: bool, dropped: usize) -> AstSearchOutcome {
+        let (db, _tmp) = drown_index(1, &["NodeAlpha"]);
+        let results = if dropped > 0 {
+            Vec::new()
+        } else {
+            crate::storage::queries::get_nodes_with_files_by_filters(
+                db.conn(),
+                Some(&["struct"]),
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap()
+        };
+        assert!(
+            dropped > 0 || !results.is_empty(),
+            "fixture must produce a row for the non-empty cases"
+        );
+        AstSearchOutcome {
+            results,
+            fts_empty: false,
+            dropped_by_filter: dropped,
+            matched_total: Some(9),
+            truncated,
+            pool_saturated: false,
+            fetch_count: 80,
+            fallback_used,
+        }
+    }
+
+    /// The regression: `truncated` AND `fallback_used` are both reachable (the
+    /// fallback path carries its own `truncated`), and each surface used to
+    /// assign `hint` from two independent `if` blocks — so one sentence was
+    /// silently dropped, and the CLI and MCP dropped DIFFERENT ones.
+    #[test]
+    fn truncation_and_fallback_hints_both_survive_in_order() {
+        for style in [HintStyle::Cli, HintStyle::Mcp] {
+            let out = outcome_with(true, true, 0);
+            let h = hints(&out, Some("node"), 5, style);
+            assert_eq!(h.len(), 2, "{style:?}: both hints are owed, got {h:?}");
+            assert!(
+                h[0].contains("9 symbols matched"),
+                "{style:?}: the truncation cut leads — it is what stops a cut answer \
+                 being read as complete; got {h:?}"
+            );
+            assert!(
+                h[1].contains("name-substring"),
+                "{style:?}: the provenance note follows; got {h:?}"
+            );
+        }
+    }
+
+    /// When the answer is empty because the filter rejected everything, that
+    /// explanation outranks the truncation notice (which would otherwise read as
+    /// "9 matched" on a zero-result answer).
+    #[test]
+    fn filter_emptied_explanation_outranks_the_truncation_notice() {
+        let out = outcome_with(true, false, 7);
+        let h = hints(&out, Some("node"), 5, HintStyle::Cli);
+        assert_eq!(h.len(), 2, "got {h:?}");
+        assert!(h[0].contains("Broaden or clear the filter"), "got {h:?}");
+        assert!(h[1].contains("9 symbols matched"), "got {h:?}");
+    }
+
+    /// Nothing to say when nothing happened — an unconditional hint would train
+    /// callers to ignore the field.
+    #[test]
+    fn a_complete_untruncated_answer_owes_no_hint() {
+        let out = outcome_with(false, false, 0);
+        assert!(hints(&out, Some("node"), 5, HintStyle::Cli).is_empty());
+        assert!(hints(&out, Some("node"), 5, HintStyle::Mcp).is_empty());
+    }
+
+    /// The two surfaces order hints identically but spell the remedy for their
+    /// own caller: a CLI user raises `--limit`, an MCP caller passes `limit`.
+    #[test]
+    fn hint_wording_is_surface_specific_but_order_is_not() {
+        let out = outcome_with(true, false, 0);
+        let cli = hints(&out, Some("node"), 5, HintStyle::Cli);
+        let mcp = hints(&out, Some("node"), 5, HintStyle::Mcp);
+        assert!(cli[0].contains("--limit 5"), "got {cli:?}");
+        assert!(mcp[0].contains("limit=5"), "got {mcp:?}");
+        assert!(!mcp[0].contains("--limit"), "got {mcp:?}");
+        assert_eq!(cli.len(), mcp.len());
     }
 }

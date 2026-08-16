@@ -91,51 +91,34 @@ impl McpServer {
             response["matched_total"] = json!(total);
         }
 
-        if outcome.fallback_used {
-            if let Some(q) = query {
-                response["hint"] = json!(format!(
-                    "FTS rank had no '{}' under the active filter; falling back to name-substring match.",
-                    q
-                ));
-            }
-        }
-
         // Truncation is a disclosure, not a nicety: "count: 20" is otherwise
         // indistinguishable from "20 matches exist" and the caller reports the
         // cut set as the complete answer. The remedy is to RAISE limit.
         if outcome.truncated {
             response["truncated"] = json!(true);
-            response["hint"] = json!(match outcome.matched_total {
-                Some(total) => format!(
-                    "{} symbols matched but limit={} — raise `limit` to see the rest.",
-                    total, limit
-                ),
-                None => format!(
-                    "More symbols matched than limit={} — raise `limit` to see the rest.",
-                    limit
-                ),
-            });
         }
 
         // Empty because the structural filters rejected everything: say what
-        // happened. When the candidate pool came back full, "nothing matched"
-        // is bounded by the pool rather than by the index, and telling the user
-        // to broaden the filter is the wrong remedy — the query is what needs
-        // narrowing, or the filters should run without a query at all.
+        // happened. The REMEDY for this (and for truncation, and for the
+        // name-substring fallback) comes from the shared ordered builder — this
+        // file used to assign `hint` from three separate blocks and keep only
+        // whichever ran last, disagreeing with the CLI twin about which that was.
         if items.is_empty() && outcome.dropped_by_filter > 0 {
             response["filtered_out"] = json!(outcome.dropped_by_filter);
             response["message"] = json!(format!(
                 "No results — {} candidate(s) matched the query but not the filter.",
                 outcome.dropped_by_filter
             ));
-            response["hint"] = json!(if outcome.pool_saturated {
-                format!(
-                    "The candidate pool was full ({} rows), so matches may exist below it. Narrow the query, raise `limit`, or drop `query` and enumerate with the filters alone.",
-                    outcome.fetch_count
-                )
-            } else {
-                "The index has no symbol matching both the query and the filter. Broaden or clear the filter.".to_string()
-            });
+        }
+
+        let hints = crate::search::ast_query::hints(
+            &outcome,
+            query,
+            limit,
+            crate::search::ast_query::HintStyle::Mcp,
+        );
+        if !hints.is_empty() {
+            response["hint"] = json!(hints.join(" "));
         }
 
         // Generic-fallback hint: when returns_filter has angle brackets and zero hits,
@@ -159,10 +142,17 @@ impl McpServer {
                     if !retry.is_empty() {
                         let n = retry.len();
                         let plural = if n == 1 { "" } else { "es" };
-                        response["hint"] = json!(format!(
+                        // PREPEND, don't overwrite: this is the most actionable
+                        // sentence ("did you mean X"), but the filter/truncation
+                        // remedies it used to clobber are still true.
+                        let suggestion = format!(
                             "No match for returns='{}'. Substring '{}' has {} match{} — try that.",
                             rf, inner, n, plural
-                        ));
+                        );
+                        response["hint"] = json!(match response["hint"].as_str() {
+                            Some(prior) if !prior.is_empty() => format!("{suggestion} {prior}"),
+                            _ => suggestion,
+                        });
                         let mut suggested = serde_json::Map::new();
                         suggested.insert("returns".to_string(), json!(inner));
                         if let Some(tf) = type_filter {

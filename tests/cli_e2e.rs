@@ -3372,6 +3372,67 @@ fn test_cli_impact_file_not_containing_symbol_errors() {
     assert!(ok.get("error").is_none(), "got: {ok}");
 }
 
+/// `--file` is a NARROWING flag, but combined with a qualified name it used to
+/// discard the qualifier entirely (`resolve_qualified_symbol` returns early on
+/// `explicit_file.is_some()`), so `impact Alpha.run --file x.ts` matched every
+/// `run` in that file — a WIDER set than the same command without `--file`,
+/// which resolves the qualified name to exactly one node. A name the file does
+/// not define under that qualifier must be a miss, not a same-named neighbour's
+/// answer (audit 2026-08-16 review Minor tail).
+#[test]
+fn test_cli_impact_file_honours_the_qualifier() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("two.ts"),
+        r#"
+export class Alpha {
+    run(): number { return 1; }
+}
+export class Beta {
+    run(): number { return 2; }
+}
+"#,
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // Sanity: the fixture really does define both qualified methods.
+    let (probe, _, _) = run_cli(&project, &["ast-search", "run", "--type", "fn", "--json"]);
+    assert!(
+        probe.contains("Alpha.run") && probe.contains("Beta.run"),
+        "fixture must produce two qualified `run` methods, got: {probe}"
+    );
+
+    // A qualifier the file does not define must MISS, even though a same-named
+    // method from another class lives there.
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "Gamma.run", "--file", "src/two.ts", "--json"],
+    );
+    assert_ne!(
+        code, 0,
+        "an undefined qualifier must not borrow a neighbour's answer: {stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json miss must stay parseable ({e}): {stdout}"));
+    assert!(v["error"].is_string(), "got: {v}");
+    assert!(v["risk"].is_null(), "a miss must not assert a risk: {v}");
+
+    // Control: a qualifier the file DOES define still analyses normally.
+    let (ok_out, _, ok_code) = run_cli(
+        &project,
+        &["impact", "Alpha.run", "--file", "src/two.ts", "--json"],
+    );
+    assert_eq!(ok_code, 0, "a real qualified symbol must succeed: {ok_out}");
+    let ok: serde_json::Value = serde_json::from_str(ok_out.trim()).unwrap();
+    assert!(ok["risk"].is_string(), "got: {ok}");
+}
+
 #[test]
 fn test_cli_impact_change_type_remove() {
     let project = setup_indexed_project();

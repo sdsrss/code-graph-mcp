@@ -204,6 +204,52 @@ fn test_repeated_indexing_is_idempotent() {
     );
 }
 
+/// Drift-guard: every name in `cli::usage::CG_QUERY_TOOLS` must be a tool
+/// `McpServer::dispatch_tool` actually answers.
+///
+/// The list drives the recommend→use funnel: a session counts as "converted" if
+/// it called one of these. A name that no tool emits can never match a
+/// usage.jsonl key, so it contributes nothing and nothing complains —
+/// `impact_analysis` sat there as dead configuration for ~100 releases after the
+/// tool was removed (audit 2026-08-16 review Minor tail). The failure mode is
+/// silent under-counting, which is exactly what this list exists to prevent.
+#[test]
+fn cg_query_tools_are_all_dispatchable() {
+    let dispatch = fs::read_to_string("src/mcp/server/mod.rs").unwrap();
+    let start = dispatch
+        .find("fn dispatch_tool(")
+        .expect("dispatch_tool moved — update this guard");
+    let region = &dispatch[start..];
+    let end = region
+        .find("\n    }\n")
+        .expect("could not find the end of dispatch_tool");
+    let region = &region[..end];
+
+    let arm = |name: &str| region.contains(&format!("\"{name}\""));
+
+    let missing: Vec<&str> = code_graph_mcp::cli::usage::CG_QUERY_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| !arm(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "CG_QUERY_TOOLS names {missing:?} have no arm in McpServer::dispatch_tool — they can never \
+         match a usage.jsonl key, so the recommend→use funnel silently under-counts. Remove them, \
+         or add the dispatch arm."
+    );
+    // Negative control: an all-green list proves nothing unless the scan can
+    // still miss something. A name no arm mentions must be reported.
+    assert!(
+        !arm("code_graph_no_such_tool"),
+        "the dispatch-arm scan matches anything — the guard above is vacuous"
+    );
+    assert!(
+        arm("find_dead_code"),
+        "the dispatch-arm scan matches nothing"
+    );
+}
+
 /// Strip line comments AND string-literal contents from one line of Rust, so the
 /// layering scanner below sees only real code.
 ///

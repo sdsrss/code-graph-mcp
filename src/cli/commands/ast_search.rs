@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::ast_query::HintStyle;
 
 /// CLI arguments for the `ast-search` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
@@ -125,15 +126,11 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             // The remedy depends on WHY it is empty. When the candidate pool
             // came back full, matches may exist below the cut and "broaden the
             // filter" is the wrong advice — the query is what needs narrowing
-            // (audit 2026-08-16 P1-8 measured that exact misdirection).
-            let remedy = if search.pool_saturated {
-                format!(
-                    "The candidate pool was full ({} rows), so matches may exist below it. Narrow the query, raise --limit, or drop the query and enumerate with the filters alone.",
-                    search.fetch_count
-                )
-            } else {
-                "The index has no symbol matching both the query and the filter. Broaden or clear the filter.".to_string()
-            };
+            // (audit 2026-08-16 P1-8 measured that exact misdirection). Built by
+            // the shared ordered builder so this surface and MCP cannot disagree
+            // about which hint survives when several apply.
+            let remedy =
+                crate::search::ast_query::hints(&search, query, limit, HintStyle::Cli).join(" ");
             if json_mode {
                 println!(
                     "{}",
@@ -194,13 +191,14 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
         }
         if search.truncated {
             envelope["truncated"] = serde_json::json!(true);
-            envelope["hint"] = serde_json::json!(truncation_hint(search.matched_total, limit));
         }
-        if search.fallback_used {
-            envelope["hint"] = serde_json::json!(format!(
-                "FTS rank had no '{}' under the active filter; falling back to name-substring match.",
-                query.unwrap_or_default()
-            ));
+        // ONE assignment site. The truncation notice and the fallback note used
+        // to be two independent `if` blocks writing the same key, so a result
+        // set that was both truncated and fallback-answered lost the truncation
+        // disclosure — the one that stops a cut answer being read as complete.
+        let hints = crate::search::ast_query::hints(&search, query, limit, HintStyle::Cli);
+        if !hints.is_empty() {
+            envelope["hint"] = serde_json::json!(hints.join(" "));
         }
         outcome.attach_partial(&mut envelope);
         writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -212,36 +210,13 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     }
     // "20 results" must not read as "20 matches exist" — name the cut and the
     // remedy (raise --limit), which is the opposite of the "broaden the filter"
-    // advice the under-fetching version gave (audit 2026-08-16 P1-8).
-    if search.truncated {
-        eprintln!(
-            "[code-graph] {}",
-            truncation_hint(search.matched_total, limit)
-        );
-    }
-    if search.fallback_used {
-        eprintln!(
-            "[code-graph] Note: FTS rank had no '{}' under the active filter; showing name-substring matches.",
-            query.unwrap_or_default()
-        );
+    // advice the under-fetching version gave (audit 2026-08-16 P1-8). Same
+    // ordered set the JSON envelope carries; the human path always printed both
+    // and it was the JSON path that dropped one.
+    for hint in crate::search::ast_query::hints(&search, query, limit, HintStyle::Cli) {
+        eprintln!("[code-graph] {hint}");
     }
     Ok(())
-}
-
-/// Wording for a result set cut by `--limit`. `matched_total` is `None` when the
-/// count is SQL-bounded (name-substring fallback / filter-only path), so the
-/// message states "more" instead of inventing a number.
-pub(crate) fn truncation_hint(matched_total: Option<usize>, limit: usize) -> String {
-    match matched_total {
-        Some(total) => format!(
-            "{} symbols matched but --limit {} was in effect — raise --limit to see the rest.",
-            total, limit
-        ),
-        None => format!(
-            "More symbols matched than --limit {} — raise --limit to see the rest.",
-            limit
-        ),
-    }
 }
 
 /// Normalize type filter shorthand: fn → function/method, class → class/struct, etc.

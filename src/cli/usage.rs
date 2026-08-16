@@ -105,8 +105,9 @@ impl UsageSummary {
 /// Code-understanding cg tools the DENY hook steers grep toward. Housekeeping
 /// tools (start/stop_watch, get_index_status, rebuild_index) are excluded so the
 /// funnel measures real "used cg instead of grep" substitution, not background
-/// bookkeeping. Kept in sync by hand with the `src/mcp/tools.rs` registry.
-pub(crate) const CG_QUERY_TOOLS: &[&str] = &[
+/// bookkeeping. Every entry must be dispatchable — `cg_query_tools_are_all_dispatchable`
+/// (tests/hardening.rs) fails the build if one is not.
+pub const CG_QUERY_TOOLS: &[&str] = &[
     "get_call_graph",
     "get_ast_node",
     "module_overview",
@@ -114,7 +115,11 @@ pub(crate) const CG_QUERY_TOOLS: &[&str] = &[
     "ast_search",
     "find_references",
     "project_map",
-    "impact_analysis",
+    // NOTE: entries here must be names `McpServer::dispatch_tool` actually
+    // answers — `cg_query_tools_are_all_dispatchable` (tests/hardening.rs)
+    // enforces it. `impact_analysis` sat here as dead configuration long after
+    // the tool stopped existing; it could never match a usage.jsonl key, so it
+    // silently contributed nothing to the funnel it is supposed to measure.
     "trace_http_chain",
     "dependency_graph",
     "find_similar_code",
