@@ -56,7 +56,8 @@ pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
 /// chose from its own spelling of the path. Lower-casing here would trade a
 /// rare mismatch for a systematic one.
 pub fn transcript_dir_on(target: &Path, home: &Path, windows: bool) -> PathBuf {
-    let spelled = crate::cli::normalize_path_display_on(&target.to_string_lossy(), windows);
+    let spelled =
+        crate::indexer::merkle::normalize_path_display_on(&target.to_string_lossy(), windows);
     home.join(".claude")
         .join("projects")
         .join(project_slug(&spelled))
@@ -377,7 +378,7 @@ fn cli_call_in_line(line: &str) -> Option<(&'static str, String)> {
         }
         if let Some(canon) = toks
             .get(i + 1)
-            .and_then(|s| crate::cli::canonical_query_cmd(s))
+            .and_then(|s| crate::utils::telemetry::canonical_query_cmd(s))
         {
             let query = toks[i + 2..]
                 .iter()
@@ -811,7 +812,7 @@ pub fn run_outcome(
 }
 
 pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<()> {
-    let home = crate::cli::home_dir().ok_or_else(|| {
+    let home = crate::utils::paths::home_dir().ok_or_else(|| {
         anyhow::anyhow!("Cannot determine home directory ($HOME / $USERPROFILE not set)")
     })?;
     let target = match &args.project {

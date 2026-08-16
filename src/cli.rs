@@ -7,17 +7,10 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 
 use crate::domain::{CODE_GRAPH_DIR, NO_METRICS_SENTINEL};
+use crate::indexer::merkle::normalize_path_display_on;
 use crate::storage::db::Database;
 use crate::storage::queries;
-
-/// `$HOME` (Unix) / `%USERPROFILE%` (Windows) without pulling the `dirs` crate,
-/// which lives behind the `embed-model` feature. `None` when unset → the walk is
-/// simply unbounded (degrades to the pre-home-bound behavior).
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
+use crate::utils::paths::home_dir;
 
 /// Resolve the project root from an explicit `cwd`. Mirrors the JS
 /// `resolveProjectRoot` (`claude-plugin/scripts/project-root.js`); keep the two
@@ -979,7 +972,7 @@ fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
 /// [`lock_index_for_replace`] instead — for them this is a refusal,
 /// not a warning.
 fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
-    if !crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+    if !crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) {
         return;
     }
     let lock = code_graph_dir.join("index.lock");
@@ -1039,7 +1032,7 @@ fn lock_index_for_replace(
     code_graph_dir: &Path,
     force: bool,
     quiet: bool,
-) -> Result<Option<crate::mcp::server::IndexLockGuard>> {
+) -> Result<Option<crate::indexer::lock::IndexLockGuard>> {
     let lock = code_graph_dir.join("index.lock");
     let refuse_or_force = |quiet: bool| -> Result<()> {
         if !force {
@@ -1069,7 +1062,7 @@ fn lock_index_for_replace(
         Ok(())
     };
 
-    if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+    if crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) {
         refuse_or_force(quiet)?;
         return Ok(None);
     }
@@ -1077,9 +1070,9 @@ fn lock_index_for_replace(
     // racing us. Losing this acquisition means someone took it in between, which
     // is the same situation as the probe above; anything else (open error) is a
     // non-answer and must not block the run.
-    match crate::mcp::server::acquire_index_lock_guard(code_graph_dir) {
+    match crate::indexer::lock::acquire_index_lock_guard(code_graph_dir) {
         Some(guard) => Ok(Some(guard)),
-        None if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) => {
+        None if crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) => {
             refuse_or_force(quiet)?;
             Ok(None)
         }
@@ -1921,32 +1914,6 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
     Ok(())
 }
 
-/// Canonical name for a CLI *query* subcommand (incl. MCP-name aliases), or
-/// None for housekeeping (serve/index/stats/doctor/...). Drives `record_cli_use`:
-/// only code-understanding queries count as funnel conversions.
-pub fn canonical_query_cmd(sub: &str) -> Option<&'static str> {
-    Some(match sub {
-        "grep" => "grep",
-        "search" | "semantic_code_search" => "search",
-        "ast-search" | "ast_search" => "ast-search",
-        "callgraph" | "get_call_graph" => "callgraph",
-        "impact" | "impact_analysis" => "impact",
-        "affected" => "affected",
-        "tour" => "tour",
-        "map" | "project_map" => "map",
-        "overview" | "module_overview" => "overview",
-        "show" | "get_ast_node" => "show",
-        "trace" | "trace_http_chain" => "trace",
-        "deps" | "dependency_graph" => "deps",
-        "similar" | "find_similar_code" => "similar",
-        "refs" | "find_references" => "refs",
-        "dead-code" | "find_dead_code" => "dead-code",
-        "centrality" => "centrality",
-        "file-impact" => "file-impact",
-        _ => return None,
-    })
-}
-
 /// Append a `{hook:"cli",action:"use",cmd}` line to recommendations.jsonl so the
 /// deny→use funnel can see model-initiated CLI conversions (the 2026-06-12 daagu
 /// night: 3 post-deny CLI calls, all invisible to the funnel). Mirrors the JS
@@ -1973,7 +1940,7 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
         return;
     }
     let line = serde_json::json!({
-        "ts": crate::mcp::metrics::iso8601_now(),
+        "ts": crate::utils::telemetry::iso8601_now(),
         "hook": "cli",
         "action": "use",
         "cmd": cmd,
@@ -1982,10 +1949,10 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
     // Bounded growth: recommendations.jsonl is append-only and (unlike
     // usage.jsonl) written per-event from both here and the JS PreToolUse hooks,
     // so rotate before appending. Same policy/constants as usage.jsonl.
-    crate::mcp::metrics::rotate_jsonl_if_over(
+    crate::utils::telemetry::rotate_jsonl_if_over(
         &rec_path,
-        crate::mcp::metrics::JSONL_ROTATE_MAX_BYTES,
-        crate::mcp::metrics::JSONL_ROTATE_KEEP_BYTES,
+        crate::utils::telemetry::JSONL_ROTATE_MAX_BYTES,
+        crate::utils::telemetry::JSONL_ROTATE_KEEP_BYTES,
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -4196,34 +4163,6 @@ struct GrepMatch {
 /// matched the indexed path).
 pub(crate) fn normalize_path_display(path: &str) -> String {
     normalize_path_display_on(path, cfg!(windows))
-}
-
-/// Testable core of [`normalize_path_display`]. `backslash_is_sep` says whether
-/// `\` is a path SEPARATOR on the target platform.
-///
-/// It must not be assumed: on Unix `\` is an ordinary filename character (only
-/// `/` and NUL are illegal), so rewriting it unconditionally would rename a
-/// legitimate `src/od\bc.rs` to `src/od/bc.rs` — printing a path that does not
-/// exist and, worse, producing a lookup key that misses the indexed one, since
-/// `indexer::merkle::normalize_rel_path` also rewrites separators only under
-/// `#[cfg(windows)]`. That is the very failure mode issue #34 was about, so the
-/// fix must not reintroduce it in the other direction.
-///
-/// The flag is a parameter rather than a `cfg!` so the Windows behaviour is
-/// exercised by the Linux and macOS CI legs too. That matters here: the three
-/// #34 defects were pure string handling that a `windows-latest` job already in
-/// the matrix never caught, because nothing asserted on path spellings at all.
-pub(crate) fn normalize_path_display_on(path: &str, backslash_is_sep: bool) -> String {
-    if !backslash_is_sep {
-        return path.to_string();
-    }
-    let stripped = path
-        .strip_prefix(r"\\?\UNC\")
-        .map(|rest| format!(r"\\{}", rest))
-        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string());
-    // Separator rewrite lives in ONE place crate-wide (the module that owns the
-    // index-key invariant); this function only adds the `\\?\` strip on top.
-    crate::indexer::merkle::normalize_rel_str_on(&stripped, backslash_is_sep)
 }
 
 /// Make an rg-reported path relative to the project root, in canonical
@@ -9215,7 +9154,7 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     // `cmd_incremental_index` probes the same lock, and flock is per open file
     // DESCRIPTION, so our own guard would answer "another process holds it" and
     // print a warning about ourselves.
-    let mut index_lock: Option<crate::mcp::server::IndexLockGuard> = None;
+    let mut index_lock: Option<crate::indexer::lock::IndexLockGuard> = None;
     if from_snapshot && cg_dir.exists() {
         // Same door as `rebuild-index`: unlinking index.db under a running
         // server strands its open fd on the deleted inode (audit P1-3). Taken
@@ -11352,7 +11291,7 @@ mod tests {
         let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "test fixture failed to take the index lock");
         assert!(
-            crate::mcp::server::other_process_holds_index_lock(&cg),
+            crate::indexer::lock::other_process_holds_index_lock(&cg),
             "fixture precondition: the probe must SEE the held lock, else every \
              assertion below passes vacuously"
         );
@@ -11484,7 +11423,7 @@ mod tests {
         let (project, lock) = locked_project();
         drop(lock); // release
         assert!(
-            !crate::mcp::server::other_process_holds_index_lock(
+            !crate::indexer::lock::other_process_holds_index_lock(
                 &project.path().join(CODE_GRAPH_DIR)
             ),
             "control precondition: the lock must read as free once released"
@@ -11514,7 +11453,7 @@ mod tests {
         drop(lock);
         let cg = project.path().join(CODE_GRAPH_DIR);
         assert!(
-            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            !crate::indexer::lock::other_process_holds_index_lock(&cg),
             "precondition: the lock must start free, else the claim below is unobservable"
         );
 
@@ -11524,14 +11463,14 @@ mod tests {
             "a free lock must be CLAIMED, not merely observed to be free"
         );
         assert!(
-            crate::mcp::server::other_process_holds_index_lock(&cg),
+            crate::indexer::lock::other_process_holds_index_lock(&cg),
             "while the guard is alive the lock must read as HELD — that is the whole \
              difference between excluding a concurrent rebuild and warning about a server"
         );
 
         drop(guard);
         assert!(
-            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            !crate::indexer::lock::other_process_holds_index_lock(&cg),
             "the guard must release on drop, or one rebuild would poison every later run"
         );
     }
@@ -11561,11 +11500,11 @@ mod tests {
         let cg = project.path().join(CODE_GRAPH_DIR);
         std::fs::create_dir_all(&cg).unwrap();
         assert!(
-            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            !crate::indexer::lock::other_process_holds_index_lock(&cg),
             "precondition: a fresh project has no lock"
         );
 
-        let guard = crate::mcp::server::acquire_index_lock_guard(&cg)
+        let guard = crate::indexer::lock::acquire_index_lock_guard(&cg)
             .expect("a free lock must be acquirable");
         assert!(
             cg.join("index.lock").exists(),
@@ -11574,14 +11513,14 @@ mod tests {
         );
         #[cfg(unix)]
         assert!(
-            crate::mcp::server::other_process_holds_index_lock(&cg),
+            crate::indexer::lock::other_process_holds_index_lock(&cg),
             "precondition: on unix the flock must read as held — a second open in \
              this same process conflicts, which is what the CLI gate relies on"
         );
         drop(guard);
 
         assert!(
-            !crate::mcp::server::other_process_holds_index_lock(&cg),
+            !crate::indexer::lock::other_process_holds_index_lock(&cg),
             "the lock must read as FREE after the guard drops, or one CLI rebuild \
              poisons every later run on this machine"
         );

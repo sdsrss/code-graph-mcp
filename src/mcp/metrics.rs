@@ -3,14 +3,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-/// Size threshold above which append-only telemetry JSONL files are rotated.
-/// Shared by usage.jsonl (`SessionMetrics::flush`) and recommendations.jsonl
-/// (`cli::record_cli_use`). MUST stay in sync with the JS PreToolUse writer
-/// `claude-plugin/scripts/recommendation-log.js` — recommendations.jsonl is
-/// written from both Rust and JS, so both sides must rotate identically.
-pub(crate) const JSONL_ROTATE_MAX_BYTES: u64 = 1_048_576; // 1 MB
-/// Bytes retained (file tail) when a telemetry JSONL file is rotated.
-pub(crate) const JSONL_ROTATE_KEEP_BYTES: usize = 524_288; // 512 KB
+use crate::utils::telemetry::{
+    iso8601_now, rotate_jsonl_if_over, JSONL_ROTATE_KEEP_BYTES, JSONL_ROTATE_MAX_BYTES,
+};
 
 /// Canonical error categories for tool invocations. Written to usage.jsonl
 /// under `tools.<name>.err_kinds` so post-hoc analysis can separate real bugs
@@ -407,76 +402,6 @@ pub(crate) fn count_recs_in_window(rec_content: &str, started_at: &str) -> RecWi
     c
 }
 
-/// Generate an ISO 8601 timestamp from SystemTime (no chrono dependency).
-/// pub(crate): also stamps CLI `use` records in `cli::record_cli_use`.
-pub(crate) fn iso8601_now() -> String {
-    use std::time::SystemTime;
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-
-    // Calculate date/time components from unix timestamp
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Days since epoch to year/month/day (civil_from_days algorithm)
-    let (year, month, day) = civil_from_days(days as i64);
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, minutes, seconds
-    )
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-/// Based on Howard Hinnant's civil_from_days algorithm.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-/// Best-effort size-based rotation for append-only telemetry JSONL files. If
-/// `path` is larger than `max_bytes`, rewrite it keeping ~the last `keep_bytes`,
-/// trimmed *forward* to the next line boundary so no partial line survives. All
-/// errors are logged and swallowed — telemetry rotation must never break or
-/// delay the caller. Mirrored in `claude-plugin/scripts/recommendation-log.js`
-/// (recommendations.jsonl is also written by the JS PreToolUse hooks).
-pub(crate) fn rotate_jsonl_if_over(path: &Path, max_bytes: u64, keep_bytes: usize) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    }; // missing → nothing to do
-    if meta.len() <= max_bytes {
-        return; // under threshold → leave it
-    }
-    let Ok(content) = std::fs::read(path) else {
-        return;
-    };
-    let start = content.len().saturating_sub(keep_bytes);
-    // Advance to the first newline at/after `start` so the kept region begins on
-    // a whole line (drop the partial line `start` may have landed inside).
-    let trim_start = content[start..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|pos| start + pos + 1)
-        .unwrap_or(start);
-    if let Err(e) = std::fs::write(path, &content[trim_start..]) {
-        tracing::warn!("Failed to rotate {}: {}", path.display(), e);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,43 +660,6 @@ not json
     }
 
     #[test]
-    fn test_rotate_jsonl_if_over_trims_to_line_boundary_and_noops_when_small() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("rec.jsonl");
-        // ~2MB of distinct whole lines so we can assert the boundary is clean.
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            let pad = "z".repeat(1000);
-            for i in 0..2000 {
-                writeln!(f, "{i:08}|{pad}").unwrap();
-            }
-        }
-        assert!(std::fs::metadata(&path).unwrap().len() > JSONL_ROTATE_MAX_BYTES);
-
-        rotate_jsonl_if_over(&path, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
-
-        let after = std::fs::metadata(&path).unwrap().len();
-        assert!(
-            after <= JSONL_ROTATE_KEEP_BYTES as u64,
-            "kept tail must be <= keep_bytes, got {after}"
-        );
-        // No partial first line: it begins with the 8-digit counter + '|'.
-        let content = std::fs::read_to_string(&path).unwrap();
-        let first = content.lines().next().unwrap();
-        assert_eq!(
-            &first[8..9],
-            "|",
-            "first surviving line must start on a whole-line boundary: {first:.16}"
-        );
-
-        // Under threshold → untouched.
-        let small = dir.path().join("small.jsonl");
-        std::fs::write(&small, "a\nb\n").unwrap();
-        rotate_jsonl_if_over(&small, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
-        assert_eq!(std::fs::read_to_string(&small).unwrap(), "a\nb\n");
-    }
-
-    #[test]
     fn build_record_tags_dogfood_when_flagged() {
         let mut m = SessionMetrics::new();
         m.record_tool_call("get_call_graph", 5, None, None);
@@ -784,19 +672,6 @@ not json
         let tagged = m.build_record("0.0.0", true);
         assert_eq!(tagged["dogfood"], serde_json::json!(true),
             "CODE_GRAPH_DOGFOOD sessions must be tagged so they can be filtered from adoption metrics");
-    }
-
-    #[test]
-    fn test_iso8601_format() {
-        let ts = iso8601_now();
-        // Should match YYYY-MM-DDTHH:MM:SSZ pattern
-        assert_eq!(ts.len(), 20);
-        assert_eq!(&ts[4..5], "-");
-        assert_eq!(&ts[7..8], "-");
-        assert_eq!(&ts[10..11], "T");
-        assert_eq!(&ts[13..14], ":");
-        assert_eq!(&ts[16..17], ":");
-        assert!(ts.ends_with('Z'));
     }
 
     #[test]

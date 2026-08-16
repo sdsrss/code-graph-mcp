@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+Continuation of the 2026-08-16 audit remediation — §十 "中期" tier, starting with
+the architecture items. No behaviour change: this batch only moves code and adds a
+guard, so no `INDEX_VERSION` bump is owed (the extraction fingerprint moved solely
+because `index_files.rs` now imports `split_identifier` from its new home).
+
+### Changed
+- **The two upward module dependencies the audit found are gone, and a table now
+  forbids them coming back.** `cli` borrowed the index-lock infrastructure from
+  `mcp::server` (~285 lines with nothing to do with the MCP protocol) and
+  `outcome` borrowed three generic helpers from `cli`; a third,
+  `storage → search`, had grown since the last audit. Relocated downward:
+  - `src/indexer/lock.rs` — `IndexLockGuard`, `acquire_index_lock_guard`,
+    `other_process_holds_index_lock`, `try_acquire_index_lock` and the non-Unix
+    PID-liveness probe, with their unit tests.
+  - `src/utils/telemetry.rs` — `iso8601_now`, `rotate_jsonl_if_over`, the
+    `JSONL_ROTATE_*` thresholds and `canonical_query_cmd` (shared funnel
+    vocabulary: the CLI writes those names, `outcome` parses them back).
+  - `src/utils/paths.rs` — `home_dir`.
+  - `src/utils/{tokenizer,acronyms}.rs` — moved out of `search/`, which did not
+    use them; the only consumers were `storage` and `indexer`.
+  - `indexer::merkle` — `normalize_path_display_on`, now beside the separator
+    rewrite it delegates to, so path spelling has one home.
+
+  Public paths change accordingly (`code_graph_mcp::cli::home_dir` →
+  `utils::paths::home_dir`, `cli::canonical_query_cmd` →
+  `utils::telemetry::canonical_query_cmd`, `mcp::server::other_process_holds_index_lock`
+  → `indexer::lock::other_process_holds_index_lock`, `search::tokenizer` →
+  `utils::tokenizer`). No CLI flag, MCP tool schema or on-disk format is affected.
+
+### Added
+- **`tests/hardening.rs` layering guard is now a 30-row forbidden-edge table**
+  instead of the single `storage → graph` assertion it had been since M9a. That
+  one edge stayed green while three others grew back unnoticed — a table makes the
+  next one fail a test rather than an audit. Two supporting details, both learned
+  the hard way in this change: the matcher strips string literals as well as
+  comments (a parser fixture embeds `"… crate::snapshot::create() …"` as test
+  data), and it anchors the module name at its end (a bare prefix match made
+  `use crate::clippy_helper::x;` an offender for the `cli` row — caught by the new
+  negative-control test, not by review). The guard is mutation-verified: injecting
+  `crate::graph::…` into `src/storage/db.rs` turns it red.
+
 ## v0.117.0 (2026-08-16)
 
 Remediation batch for the 2026-08-16 full audit (report kept locally — `docs/` is

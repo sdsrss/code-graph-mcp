@@ -114,6 +114,38 @@ pub(crate) fn normalize_rel_str_on(rel: &str, backslash_is_sep: bool) -> String 
     out
 }
 
+/// Testable core of `cli::normalize_path_display`. `backslash_is_sep` says whether
+/// `\` is a path SEPARATOR on the target platform.
+///
+/// It must not be assumed: on Unix `\` is an ordinary filename character (only
+/// `/` and NUL are illegal), so rewriting it unconditionally would rename a
+/// legitimate `src/od\bc.rs` to `src/od/bc.rs` — printing a path that does not
+/// exist and, worse, producing a lookup key that misses the indexed one, since
+/// [`normalize_rel_path`] also rewrites separators only under `#[cfg(windows)]`.
+/// That is the very failure mode issue #34 was about, so the fix must not
+/// reintroduce it in the other direction.
+///
+/// The flag is a parameter rather than a `cfg!` so the Windows behaviour is
+/// exercised by the Linux and macOS CI legs too. That matters here: the three
+/// #34 defects were pure string handling that a `windows-latest` job already in
+/// the matrix never caught, because nothing asserted on path spellings at all.
+///
+/// Lives beside [`normalize_rel_str_on`] (rather than in `cli`) because `outcome`
+/// needs the same display form and must not depend upward on `cli`
+/// (`tests/hardening.rs` forbidden-edge table).
+pub(crate) fn normalize_path_display_on(path: &str, backslash_is_sep: bool) -> String {
+    if !backslash_is_sep {
+        return path.to_string();
+    }
+    let stripped = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{}", rest))
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string());
+    // Separator rewrite lives in ONE place crate-wide (this module owns the
+    // index-key invariant); this function only adds the `\\?\` strip on top.
+    normalize_rel_str_on(&stripped, backslash_is_sep)
+}
+
 #[cfg(test)]
 mod normalize_tests {
     use super::*;

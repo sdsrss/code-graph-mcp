@@ -204,42 +204,231 @@ fn test_repeated_indexing_is_idempotent() {
     );
 }
 
-/// Layering drift-guard: the storage layer must never import from the graph
-/// layer — graph depends on storage, not the reverse. M9a moved the one
-/// offending orchestration (`get_callers_with_route_info`) up into
-/// `src/graph/routes.rs`. Re-introducing `use crate::graph` anywhere under
-/// src/storage/ recreates the cycle this test exists to forbid.
+/// Strip line comments AND string-literal contents from one line of Rust, so the
+/// layering scanner below sees only real code.
+///
+/// Both strips are load-bearing and were learned from live false positives:
+/// a doc comment naming `crate::graph::routes` explains where an orchestration
+/// moved TO, and `src/parser/relations/tests.rs` embeds fixture source such as
+/// `"fn caller() { crate::snapshot::create(); }"` — neither is an import. A
+/// single pass handles both so a `//` inside a string cannot truncate the line
+/// early and hide an offender behind it.
+fn code_only(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 2; // skip the escaped char, incl. an escaped quote
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break; // line comment (incl. `///` doc comments)
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// Does this line reference `crate::<module>` as real code?
+///
+/// The module name must END where it is written: a bare `starts_with` made
+/// `use crate::clippy_helper::x;` an offender for the `cli` row (caught by the
+/// negative control below, not by review).
+fn references_module(line: &str, module: &str) -> bool {
+    let code = code_only(line);
+    let t = code.trim_start();
+    // `crate::<module>::…` — a path INTO the module.
+    if t.contains(&format!("crate::{module}::")) {
+        return true;
+    }
+    // `use crate::<module>;` / `use crate::<module> as x;` — the module itself.
+    let Some(rest) = t.strip_prefix(&format!("use crate::{module}")) else {
+        return false;
+    };
+    matches!(rest.chars().next(), None | Some(';') | Some(' '))
+}
+
+/// Forbidden module-dependency edges — `(scanned path, module it must not reach, why)`.
+///
+/// The module graph is deliberately near-perfectly one-directional, and the 2026-08-16
+/// audit found the single-edge guard that used to live here (`storage → graph` only)
+/// had let three more upward edges grow back unnoticed: `cli → mcp::server` (borrowing
+/// index-lock infrastructure), `outcome → cli` (borrowing generic helpers) and
+/// `storage → search` (borrowing the tokenizer). All three were relocated downward —
+/// `indexer::lock`, `utils::{paths,telemetry}`, `utils::{tokenizer,acronyms}` — and the
+/// guard generalized to a table so the NEXT one fails a test instead of an audit.
+///
+/// Every row must be a genuinely dead edge at the time it is added; `cargo test` is
+/// the only thing that decides whether that is still true.
+const FORBIDDEN_EDGES: &[(&str, &str, &str)] = &[
+    // storage is a leaf above domain: graph/search/mcp/cli all depend on IT.
+    (
+        "src/storage",
+        "graph",
+        "graph depends on storage, not the reverse",
+    ),
+    (
+        "src/storage",
+        "search",
+        "query building must not reach up into the search layer (tokenizer/acronyms live in utils)",
+    ),
+    ("src/storage", "mcp", "storage is protocol-agnostic"),
+    ("src/storage", "cli", "storage is surface-agnostic"),
+    ("src/storage", "outcome", "storage is surface-agnostic"),
+    // The two published surfaces must not borrow from each other.
+    (
+        "src/cli.rs",
+        "mcp",
+        "CLI must not borrow MCP-server internals — shared index-lock infra lives in indexer::lock",
+    ),
+    (
+        "src/outcome.rs",
+        "cli",
+        "outcome must not borrow CLI internals — shared helpers live in utils",
+    ),
+    ("src/outcome.rs", "mcp", "outcome is surface-agnostic"),
+    // utils and domain are leaves: everything may depend on them, they on nothing.
+    ("src/utils", "cli", "utils is a leaf"),
+    ("src/utils", "mcp", "utils is a leaf"),
+    ("src/utils", "outcome", "utils is a leaf"),
+    ("src/utils", "storage", "utils is a leaf"),
+    ("src/utils", "graph", "utils is a leaf"),
+    ("src/utils", "search", "utils is a leaf"),
+    ("src/utils", "indexer", "utils is a leaf"),
+    ("src/domain.rs", "cli", "domain is the bottom layer"),
+    ("src/domain.rs", "mcp", "domain is the bottom layer"),
+    ("src/domain.rs", "storage", "domain is the bottom layer"),
+    ("src/domain.rs", "indexer", "domain is the bottom layer"),
+    // graph/indexer/parser sit below both surfaces.
+    ("src/graph", "mcp", "graph is protocol-agnostic"),
+    ("src/graph", "cli", "graph is surface-agnostic"),
+    ("src/graph", "outcome", "graph is surface-agnostic"),
+    ("src/indexer", "mcp", "indexer is protocol-agnostic"),
+    ("src/indexer", "cli", "indexer is surface-agnostic"),
+    ("src/indexer", "outcome", "indexer is surface-agnostic"),
+    (
+        "src/indexer",
+        "graph",
+        "graph reads the index, not the reverse",
+    ),
+    ("src/parser", "mcp", "parser is protocol-agnostic"),
+    ("src/parser", "cli", "parser is surface-agnostic"),
+    (
+        "src/parser",
+        "storage",
+        "parser produces records, it does not persist them",
+    ),
+    ("src/parser", "graph", "parser is below the graph layer"),
+    (
+        "src/parser",
+        "indexer",
+        "the indexer drives the parser, not the reverse",
+    ),
+];
+
+/// Layering drift-guard, table form. See [`FORBIDDEN_EDGES`].
 #[test]
-fn no_storage_module_imports_graph() {
+fn no_forbidden_module_dependency_edges() {
     use std::fs;
     use std::path::Path;
+
+    fn walk(path: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if path.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path.to_path_buf());
+            }
+            return;
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            walk(&entry.unwrap().path(), out);
+        }
+    }
+
     let mut offenders = Vec::new();
-    fn walk(dir: &Path, offenders: &mut Vec<String>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, offenders);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let src = fs::read_to_string(&path).unwrap();
-                for (i, line) in src.lines().enumerate() {
-                    // Strip line/doc comments so a comment MENTIONING crate::graph
-                    // (e.g. "orchestration lives in `crate::graph::routes`") is not
-                    // a false offender — only real code imports count.
-                    let code = line.split("//").next().unwrap_or("");
-                    let t = code.trim_start();
-                    if t.starts_with("use crate::graph") || t.contains("crate::graph::") {
-                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
-                    }
+    for (scanned, module, why) in FORBIDDEN_EDGES {
+        let root = Path::new(scanned);
+        assert!(
+            root.exists(),
+            "FORBIDDEN_EDGES names a path that no longer exists: {scanned} \
+             — the table is stale, not the code"
+        );
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        for file in files {
+            let src = fs::read_to_string(&file).unwrap();
+            for (i, line) in src.lines().enumerate() {
+                if references_module(line, module) {
+                    offenders.push(format!(
+                        "{} -> crate::{} ({}) at {}:{}: {}",
+                        scanned,
+                        module,
+                        why,
+                        file.display(),
+                        i + 1,
+                        line.trim()
+                    ));
                 }
             }
         }
     }
-    walk(Path::new("src/storage"), &mut offenders);
     assert!(
         offenders.is_empty(),
-        "storage must not import graph (cycle). Offenders:\n{}",
+        "forbidden module-dependency edge(s) re-introduced:\n{}",
         offenders.join("\n")
     );
+}
+
+/// Negative control for [`no_forbidden_module_dependency_edges`]: an all-green
+/// table proves nothing unless the detector can still see an offender. Without
+/// this, breaking `code_only` (say, stripping everything) would turn the guard
+/// permanently green and silent — the "guard matches the file, not the
+/// construct" class this repo has now hit three times.
+#[test]
+fn forbidden_edge_detector_actually_fires() {
+    // Real imports and real path uses are caught.
+    assert!(references_module("use crate::graph::routes::foo;", "graph"));
+    assert!(references_module("    use crate::mcp::server::X;", "mcp"));
+    assert!(references_module(
+        "    let g = crate::cli::home_dir();",
+        "cli"
+    ));
+    // Comments and string literals are not.
+    assert!(!references_module(
+        "/// orchestration lives in `crate::graph::routes`",
+        "graph"
+    ));
+    assert!(!references_module("// use crate::mcp::server::X;", "mcp"));
+    assert!(!references_module(
+        r#"    let code = "fn caller() { crate::snapshot::create(); }";"#,
+        "snapshot"
+    ));
+    // A `//` INSIDE a string must not truncate the line and hide what follows.
+    assert!(references_module(
+        r#"    let u = "http://x"; use crate::mcp::server::X;"#,
+        "mcp"
+    ));
+    // Unrelated modules are not matched, and a prefix is not a module.
+    assert!(!references_module(
+        "use crate::storage::db::Database;",
+        "graph"
+    ));
+    assert!(!references_module("use crate::clippy_helper::x;", "cli"));
 }
 
 /// Give `dir` a `.code-graph/index.db` (mirrors the private helper in

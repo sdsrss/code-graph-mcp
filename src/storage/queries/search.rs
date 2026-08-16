@@ -60,12 +60,12 @@ fn fts5_search_impl(
         .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
         .flat_map(|word| {
             // Split camelCase/snake_case identifiers into constituent words
-            let split = crate::search::tokenizer::split_identifier(word);
+            let split = crate::utils::tokenizer::split_identifier(word);
             let mut out: Vec<String> = split.split_whitespace().map(String::from).collect();
             // Acronym expansion: append full-form terms alongside the original token.
             // BTreeSet below handles dedup if original already expanded form.
             for token in split.split_whitespace() {
-                for exp in crate::search::acronyms::expand_acronym(token) {
+                for exp in crate::utils::acronyms::expand_acronym(token) {
                     out.push((*exp).to_string());
                 }
             }
@@ -301,7 +301,7 @@ pub fn find_functions_by_fuzzy_name(
     let escaped = escape_like(partial_name);
     let pattern = format!("%{}%", escaped);
 
-    let tokens_only = crate::search::tokenizer::split_identifier_tokens(partial_name);
+    let tokens_only = crate::utils::tokenizer::split_identifier_tokens(partial_name);
     let token_escaped = escape_like(&tokens_only);
     let token_pattern = format!("%{}%", token_escaped);
 
@@ -567,7 +567,7 @@ mod tests {
                 signature: None,
                 doc_comment: None,
                 context_string: None,
-                name_tokens: Some(crate::search::tokenizer::split_identifier(name)),
+                name_tokens: Some(crate::utils::tokenizer::split_identifier(name)),
                 return_type: None,
                 param_types: None,
                 is_test: false,

@@ -33,7 +33,6 @@ use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::hash_file;
 use crate::parser::relations::extract_relations_from_tree;
 use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree};
-use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::{
     delete_files_by_paths, delete_nodes_by_file, get_all_node_names_with_ids, get_edges_batch,
@@ -42,6 +41,7 @@ use crate::storage::queries::{
     NodeRecord, NodeResult,
 };
 use crate::utils::config::detect_language;
+use crate::utils::tokenizer::split_identifier;
 
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
