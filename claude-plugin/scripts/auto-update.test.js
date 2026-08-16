@@ -291,6 +291,7 @@ test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.
   const healed = await selfHealStaleBinary(latest, {
     state: {},
     needsUpdate: () => stale,
+    binaryPresent: () => true, // pin: the host's real binary cache must not steer this test
     download: async () => { downloaded = true; stale = false; return true; },
   });
   assert.equal(downloaded, true, 'stale binary must trigger a download');
@@ -301,6 +302,7 @@ test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.
   const noop = await selfHealStaleBinary(latest, {
     state: {},
     needsUpdate: () => false,
+    binaryPresent: () => true,
     download: async () => { touched = true; return true; },
   });
   assert.equal(touched, false, 'current binary must not download');
@@ -311,6 +313,7 @@ test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.
   const failed = await selfHealStaleBinary(latest, {
     state: {},
     needsUpdate: () => true,
+    binaryPresent: () => true, // STALE (present) — a missing binary would deliberately not record
     download: async () => false,
   });
   assert.equal(failed.healed, false);
