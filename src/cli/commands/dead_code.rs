@@ -15,8 +15,8 @@ pub struct DeadCodeArgs {
     // --node-type and --type are ONE arg (alias), so supplying both is a clap
     // duplicate-arg error (exit 2) — deliberately stricter than the old parser,
     // which silently honored --node-type and ignored --type (masking a bad --type).
-    /// Filter by node type: fn, class, struct, enum, trait, type, const, var (alias: --type)
-    #[arg(long = "node-type", alias = "type")]
+    #[arg(long = "node-type", alias = "type",
+          help = crate::domain::TYPE_FILTER_HELP_ARG)]
     pub node_type: Option<String>,
     /// Show test callers (hidden by default)
     #[arg(long)]

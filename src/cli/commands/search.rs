@@ -18,8 +18,7 @@ pub struct SearchArgs {
     /// Filter by language
     #[arg(long)]
     pub language: Option<String>,
-    /// Filter by node type: fn, class, struct, enum, trait, type, const, var
-    #[arg(long = "node-type")]
+    #[arg(long = "node-type", help = crate::domain::TYPE_FILTER_HELP_ARG)]
     pub node_type: Option<String>,
     // --limit and --top-k are the same arg (alias); supplying both is a clap
     // duplicate-arg error. clamp(1,100) stays in the handler; clap parse-errors
@@ -53,8 +52,9 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     if let Some(ntf) = node_type_filter {
         if crate::domain::normalize_type_filter(ntf).is_empty() {
             anyhow::bail!(
-                "Unknown node-type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
-                ntf
+                "Unknown node-type filter: '{}'. Valid: {}",
+                ntf,
+                crate::domain::TYPE_FILTER_HELP
             );
         }
     }

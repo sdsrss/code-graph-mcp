@@ -43,7 +43,8 @@ impl McpServer {
         if let Some(tf) = type_filter {
             if crate::domain::normalize_type_filter(tf).is_empty() {
                 return Err(anyhow!(
-                    "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                    "Unknown type filter: '{}'. Valid: {}",
+                    crate::domain::TYPE_FILTER_HELP,
                     tf
                 ));
             }

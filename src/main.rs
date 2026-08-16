@@ -570,7 +570,10 @@ fn print_help() {
     println!("    --limit N           Limit results (search/ast-search default: 20; centrality default: 15; similar default: 5, alias of --top-k)");
     println!("    --language <lang>   Filter by language (search)");
     println!("    --node-type <type>  Filter by node type (search)");
-    println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
+    println!(
+        "    --type <type>       Filter by node type: {}",
+        code_graph_mcp::domain::TYPE_FILTER_HELP
+    );
     println!("    --returns <type>    Filter by return type (ast-search)");
     println!("    --params <text>     Filter by parameter text (ast-search)");
     println!(

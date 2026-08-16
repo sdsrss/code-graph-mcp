@@ -984,6 +984,26 @@ pub fn default_dead_code_ignores() -> Vec<String> {
     vec!["claude-plugin/".to_string(), "benches/".to_string()]
 }
 
+/// The `--type` / `node_type` filter vocabulary, in the spelling users type.
+///
+/// `module` is in the list because [`normalize_type_filter`] accepts it — and
+/// eight of the nine help and error strings said otherwise, telling users a
+/// value was invalid while it worked (2026-08-16 audit §四). One source, so the
+/// message and the parser cannot disagree again.
+pub const TYPE_FILTER_VOCAB: &[&str] = &[
+    "fn", "class", "struct", "enum", "trait", "type", "const", "var", "module",
+];
+
+/// [`TYPE_FILTER_VOCAB`] as the literal every help/error string uses.
+/// `type_filter_help_matches_vocab` pins the two together.
+pub const TYPE_FILTER_HELP: &str = "fn, class, struct, enum, trait, type, const, var, module";
+
+/// [`TYPE_FILTER_HELP`] phrased for a clap `help =` attribute, which needs a
+/// `const` (a doc comment cannot be derived from one, and a doc comment is
+/// exactly where three of the stale copies lived).
+pub const TYPE_FILTER_HELP_ARG: &str =
+    "Filter by node type: fn, class, struct, enum, trait, type, const, var, module";
+
 // -- Node type normalization --
 /// Normalize shorthand type filter into canonical AST node types.
 /// Shared by CLI and MCP tool implementations.
@@ -1408,6 +1428,30 @@ mod tests {
         );
         // `all` is the one accepted value that is NOT an edge type.
         assert!(!RELATION_FILTER_VOCAB.contains(&"all"));
+    }
+
+    /// P2 (2026-08-16 audit §四): `normalize_type_filter` accepts `module`, and
+    /// eight of the NINE help/error strings omitted it — users were told a value
+    /// was invalid while it worked. The vocabulary is one constant now, and this
+    /// holds the parser to it in both directions.
+    #[test]
+    fn type_filter_help_matches_vocab() {
+        assert_eq!(TYPE_FILTER_HELP, TYPE_FILTER_VOCAB.join(", "));
+        assert!(
+            TYPE_FILTER_HELP_ARG.ends_with(TYPE_FILTER_HELP),
+            "the clap-attribute copy must carry the same list: {TYPE_FILTER_HELP_ARG}"
+        );
+        // Every advertised word must actually parse…
+        for word in TYPE_FILTER_VOCAB {
+            assert!(
+                !normalize_type_filter(word).is_empty(),
+                "'{word}' is advertised in help but rejected by the parser"
+            );
+        }
+        // …and `module` specifically, which is the one that was missing.
+        assert_eq!(normalize_type_filter("module"), vec!["module"]);
+        // Negative control: the list must not be an accept-everything.
+        assert!(normalize_type_filter("bogus").is_empty());
     }
 
     /// The `const` copy used where an expression is not allowed (clap `help =`,

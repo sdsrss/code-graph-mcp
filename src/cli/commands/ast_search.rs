@@ -10,8 +10,7 @@ use crate::search::ast_query::HintStyle;
 pub struct AstSearchArgs {
     /// Search query (optional if a --type/--returns/--params filter is given)
     pub query: Option<String>,
-    /// Filter by node type: fn, class, struct, enum, trait, type, const, var
-    #[arg(long = "type")]
+    #[arg(long = "type", help = crate::domain::TYPE_FILTER_HELP_ARG)]
     pub type_filter: Option<String>,
     /// Filter by return type
     #[arg(long)]
@@ -56,7 +55,8 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     if let Some(tf) = type_filter {
         if crate::domain::normalize_type_filter(tf).is_empty() {
             anyhow::bail!(
-                "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                "Unknown type filter: '{}'. Valid: {}",
+                crate::domain::TYPE_FILTER_HELP,
                 tf
             );
         }
@@ -224,8 +224,9 @@ pub(crate) fn normalize_type_filter(input: &str) -> Vec<&'static str> {
     let result = crate::domain::normalize_type_filter(input);
     if result.is_empty() {
         eprintln!(
-            "[code-graph] Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
-            input
+            "[code-graph] Unknown type filter: '{}'. Valid: {}",
+            input,
+            crate::domain::TYPE_FILTER_HELP
         );
     }
     result

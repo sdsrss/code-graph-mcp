@@ -92,7 +92,11 @@ pub(super) fn should_skip_indexing(args: &serde_json::Value) -> bool {
 pub(super) fn normalize_type_filter_mcp(input: &str) -> Vec<String> {
     let result = crate::domain::normalize_type_filter(input);
     if result.is_empty() {
-        tracing::warn!("Unknown node type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var, module", input);
+        tracing::warn!(
+            "Unknown node type filter: '{}'. Valid: {}",
+            input,
+            crate::domain::TYPE_FILTER_HELP
+        );
     }
     result.into_iter().map(String::from).collect()
 }
