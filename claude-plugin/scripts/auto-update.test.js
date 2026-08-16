@@ -434,6 +434,65 @@ test('a MISSING binary is exempt from the heal budget — recovery stays unbound
   assert.equal(healed.patch.binaryHealAttempts, 0);
 });
 
+test('a CORRUPT-but-present binary gets the same unbounded recovery as a missing one', async () => {
+  // Pre-tag review of the P1-14 fix: `binaryPresent` keyed on existsSync alone,
+  // so a truncated / non-executable / wrong-arch cached binary counted as
+  // "present" → bounded by the 5-attempt stale budget → parked forever, since
+  // isBinaryHealExhausted only re-arms when a NEW release ships (no time-based
+  // retry, unlike the shell suspension). The engine is just as dead as a
+  // missing one; every sibling predicate in this file already treats
+  // unreadable as needing replacement.
+  const latest = { version: '1.0.0', binaryUrl: 'https://example/bin' };
+  let downloads = 0;
+  let state = { binaryHealVersion: '1.0.0', binaryHealAttempts: MAX_UPDATE_ATTEMPTS };
+  for (let i = 0; i < 3; i++) {
+    const r = await selfHealStaleBinary(latest, {
+      state,
+      needsUpdate: () => true,
+      // present on disk, but unusable — exactly what the fixed default computes
+      binaryPresent: () => false,
+      download: async () => { downloads++; return false; },
+    });
+    state = { ...state, ...r.patch };
+  }
+  assert.equal(downloads, 3,
+    'a corrupt binary must keep retrying — it is as dead as a missing one');
+  assert.equal(state.binaryHealAttempts, MAX_UPDATE_ATTEMPTS,
+    'and those failures must not inflate the stale counter');
+});
+
+test('the DEFAULT binaryPresent treats an unreadable cached binary as absent', () => {
+  // Guards the default itself (an injection point can hide a wrong default).
+  // Runs in a child with a sandbox HOME so the real ~/.cache/code-graph is
+  // never touched: cachedBinaryPath() resolves from HOME.
+  const { execFileSync } = require('node:child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-corrupt-bin-'));
+  const out = execFileSync(process.execPath, ['-e', `
+    const fs = require('fs'); const path = require('path');
+    const { selfHealStaleBinary, cachedBinaryPath, MAX_UPDATE_ATTEMPTS } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const p = cachedBinaryPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, 'not-a-binary');       // present on disk, cannot run
+    fs.chmodSync(p, 0o755);
+    (async () => {
+      let downloads = 0;
+      let state = { binaryHealVersion: '1.0.0', binaryHealAttempts: MAX_UPDATE_ATTEMPTS };
+      for (let i = 0; i < 2; i++) {
+        const r = await selfHealStaleBinary({ version: '1.0.0', binaryUrl: 'https://example/bin' }, {
+          state,
+          needsUpdate: () => true,
+          download: async () => { downloads++; return false; },   // DEFAULT binaryPresent
+        });
+        state = { ...state, ...r.patch };
+      }
+      process.stdout.write(String(downloads));
+    })();
+  `], { env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+  fs.rmSync(home, { recursive: true, force: true });
+  assert.equal(out, '2',
+    'the default must classify an unreadable cached binary as absent (unbounded recovery), not park it as stale');
+});
+
 test('shouldCheck stops bypassing the throttle once the binary heal is exhausted', () => {
   const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
   const fresh = { lastCheck: minsAgo(10), latestVersion: '1.0.0', updateAvailable: false };

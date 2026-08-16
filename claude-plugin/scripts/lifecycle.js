@@ -467,22 +467,37 @@ function isPluginInactive(settings = readJson(settingsPath()) || {}) {
   return !hasInstalledPluginRecord();
 }
 
-function detachStatuslineIntegration(settings, { compositeDoomed = true } = {}) {
+function detachStatuslineIntegration(settings, { compositeDoomed = true, oneShot = false } = {}) {
   let settingsChanged = false;
 
-  // An unusable (not merely absent) registry means we cannot know whether a
-  // `_previous` or third-party entry exists — and every branch below that
-  // rewrites `settings.statusLine` depends on that answer. Deciding from an
-  // empty default would delete the user's statusline on a chmod/corruption
-  // hiccup (batch review of audit 2026-08-16 P1-12: the register path refused
-  // correctly while this detach path still destroyed the slot). Refuse the
-  // whole detach; the next statusline render retries once the file is usable.
+  // An unusable (not merely absent) registry means we may not WRITE it, and it
+  // may leave us unable to tell whether a `_previous` or third-party entry
+  // exists — which every branch below that rewrites `settings.statusLine`
+  // depends on (batch review of audit 2026-08-16 P1-12: the register path
+  // refused correctly while this detach path still destroyed the slot).
+  //
+  // Whether refusing is safe depends on the CALLER, so it is a parameter:
+  //   retryable (statusline render) — leave everything alone; the next frame
+  //     retries once the file is usable. Touching the slot on a bad read is
+  //     how the user's statusline got destroyed in the first place.
+  //   oneShot (uninstall) — the composite script dies with the plugin cache in
+  //     this same run, so leaving the slot pointing at it is PERMANENT
+  //     breakage with no plugin code left to repair it (pre-tag review). We
+  //     still must not write the registry, but the entries we already READ are
+  //     enough to choose the slot: `readRegistryForWrite` reads through to the
+  //     durable backup even while refusing, so a corrupt primary alone does
+  //     not lose `_previous`. When even that is unreadable the list is empty
+  //     and we clear the slot — Claude Code's default beats a dead path.
   const { registry, refuse, why } = readRegistryForWrite();
-  if (refuse) {
+  if (refuse && !oneShot) {
     warnRegistryUnusable('detach', why);
     return false;
   }
-  unregisterStatuslineProvider('code-graph');
+  if (refuse) {
+    warnRegistryUnusable('registry rewrite (the settings slot is still neutralized — uninstall cannot retry)', why);
+  } else {
+    unregisterStatuslineProvider('code-graph');
+  }
   const previous = registry.find(p => p.id === '_previous' && p.command);
   // Third-party providers registered through our registry (e.g. gsd). They
   // must not be silently orphaned: with the composite gone from settings
@@ -511,8 +526,9 @@ function detachStatuslineIntegration(settings, { compositeDoomed = true } = {}) 
   }
 
   // _previous only becomes removable once no third party still relies on the
-  // registry file (writeRegistry unlinks primary+backup when emptied).
-  if (thirdParty.length === 0) unregisterStatuslineProvider('_previous');
+  // registry file (writeRegistry unlinks primary+backup when emptied). Skipped
+  // entirely while refusing: that path may not write the registry at all.
+  if (!refuse && thirdParty.length === 0) unregisterStatuslineProvider('_previous');
   return settingsChanged;
 }
 
@@ -1202,7 +1218,10 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
 
   if (settings) {
     // 1. StatusLine: remove code-graph integration and restore prior statusline.
-    if (detachStatuslineIntegration(settings)) {
+    // `oneShot`: steps 6-7 below delete the plugin cache, taking
+    // statusline-composite.js with it, so this is the last chance to move the
+    // slot off a script that is about to stop existing (pre-tag review).
+    if (detachStatuslineIntegration(settings, { oneShot: true })) {
       settingsChanged = true;
     }
 

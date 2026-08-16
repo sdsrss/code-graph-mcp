@@ -201,7 +201,15 @@ fn fts5_search_impl(
                         return Ok(FtsResult {
                             nodes,
                             bm25_scores,
-                            or_fallback: false,
+                            // Reported as a widened match, because it IS one: part
+                            // of what the user typed was dropped to get here. That
+                            // applies CONF_OR_FALLBACK_PENALTY and prints the "AND
+                            // match insufficient" note, so a `db.migratoin` typo
+                            // reads as broad-and-uncertain instead of as a precise
+                            // hit (pre-tag review). A query whose fragments all
+                            // co-occur never reaches this branch — it returns from
+                            // the AND above with the penalty correctly absent.
+                            or_fallback: true,
                         });
                     }
                 }

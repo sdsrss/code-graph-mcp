@@ -753,7 +753,18 @@ async function downloadAndInstall(latest, {
  */
 async function selfHealStaleBinary(latest, {
   state = {}, needsUpdate = cachedBinaryNeedsUpdate, download = downloadBinary,
-  binaryPresent = () => fs.existsSync(cachedBinaryPath()),
+  // "Present" must mean USABLE, not merely on disk. A truncated, non-executable
+  // or wrong-arch cached binary leaves the MCP server exactly as dead as a
+  // missing one, and every sibling predicate here already treats unreadable as
+  // needing replacement (cachedBinaryNeedsUpdate, cachedBinaryStaleVsState).
+  // Keying on existsSync alone put a corrupt binary under the stale budget,
+  // which isBinaryHealExhausted only re-arms when a NEW release ships — so five
+  // quick failures parked the only recovery path permanently (pre-tag review of
+  // the P1-14 fix).
+  binaryPresent = () => {
+    const p = cachedBinaryPath();
+    return fs.existsSync(p) && readBinaryVersion(p) !== null;
+  },
 } = {}) {
   if (!latest || !needsUpdate(latest)) {
     // Healthy → clear any leftover counter so the next real staleness starts fresh.

@@ -504,6 +504,48 @@ test('uninstall REPORTS an unusable installed_plugins.json instead of skipping i
   assert.deepEqual(fs.readFileSync(installedPath), before, 'and the file itself is untouched');
 });
 
+test('uninstall neutralizes the statusline slot even when the registry refuses a write', (t) => {
+  // Pre-tag review of the detach-refusal fix: refusing is right for the
+  // statusline render (it retries next frame), but uninstall is ONE-SHOT and
+  // deletes statusline-composite.js in the same run. Treating the refusal as
+  // "nothing to change" left settings.statusLine pointing at a script that no
+  // longer exists, with no plugin code left to repair it — the user's status
+  // line is then permanently broken. Corrupt primary + healthy backup is the
+  // shape that regressed: the backup still knows `_previous`.
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+  fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+  fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+  fs.writeFileSync(registryPath, '{"providers": [ truncated\n');   // corrupt → refuse
+  writeJson(backupPath, [
+    { id: '_previous', command: 'echo the-users-own-statusline', needsStdin: true },
+    { id: 'code-graph', command: 'node /cache/statusline-composite.js', needsStdin: false },
+  ]);
+  const backupBefore = fs.readFileSync(backupPath);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, {
+    statusLine: { type: 'command', command: 'node ' + path.join(homeDir, '.cache', 'code-graph', 'statusline-composite.js') },
+  });
+
+  execFileSync(process.execPath, ['-e', `
+    const { uninstall } = require(${JSON.stringify(lifecyclePath)});
+    uninstall({ runNpm: () => true, scanGlobalPkgs: () => [] });
+  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  const slot = after.statusLine && after.statusLine.command;
+  assert.ok(!slot || !slot.includes('statusline-composite'),
+    `uninstall must not leave the slot pointing at the composite it just deleted, got: ${slot}`);
+  assert.equal(slot, 'echo the-users-own-statusline',
+    'the durable backup still holds _previous on a corrupt primary — restore it');
+  // The primary lives under the plugin cache, which uninstall deletes wholesale
+  // — so the byte-level "never rewritten" check belongs on the durable backup,
+  // the copy that outlives the cache and is the user's only recovery path.
+  assert.deepEqual(fs.readFileSync(backupPath), backupBefore,
+    'refusing means we never rewrite the registry — the durable backup must be byte-identical');
+});
+
 // ════════════════════════════════════════════════════════════════════
 // v0.32.0 — settings.json hook registration (replaces the v0.8.3 strip)
 // ════════════════════════════════════════════════════════════════════

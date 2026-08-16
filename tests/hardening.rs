@@ -1021,10 +1021,13 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
     // uses I had just pinned), which a parse regression halving the real count
     // would have sailed straight through.
     assert!(
-        checked >= 41,
-        "expected at least the 41 known `uses:` sites across the workflows, found \
-         {checked} — a parse change would make this guard vacuous. If a workflow \
-         or step was legitimately removed, lower this in the same commit."
+        checked >= 43,
+        "expected at least the 43 known `uses:` sites across the workflows and the \
+         shipped templates, found {checked} — a parse change would make this guard \
+         vacuous. The floor was 41 before the two template sites joined; leaving it \
+         there gave those two zero vacuity protection (a template edited into YAML \
+         flow style would drop the count to 42 and still pass). If a workflow or \
+         step was legitimately removed, lower this in the same commit."
     );
     assert!(
         unpinned.is_empty(),

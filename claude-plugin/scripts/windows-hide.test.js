@@ -349,9 +349,26 @@ test('killSignal SIGKILL is opted in at the statusline call sites, not defaulted
   assert.equal(hidden().killSignal, undefined,
     'a global SIGKILL default would orphan git/npm lock files on timeout');
   assert.equal(hidden({ killSignal: 'SIGKILL' }).killSignal, 'SIGKILL');
+  // Anchored to the OPTION OBJECT, not the file: a file-scoped match stays
+  // green when the line is commented out or drifts away from its call (proven
+  // in the pre-tag review). Each `timeout:` in these files must have a SIGKILL
+  // within the same options literal — i.e. before the object closes.
   for (const file of ['statusline-composite.js', 'statusline.js']) {
     const src = fs.readFileSync(path.join(__dirname, file), 'utf8');
-    assert.ok(/killSignal:\s*'SIGKILL'/.test(src),
-      `${file} runs untrusted/hang-prone children under a timeout and must pass killSignal: 'SIGKILL' (P1-17)`);
+    const uncommented = src.replace(/^\s*\/\/.*$/gm, '');
+    const timeouts = [...uncommented.matchAll(/timeout:\s*\d+/g)];
+    assert.ok(timeouts.length > 0,
+      `${file}: expected at least one timed spawn — this guard would be vacuous`);
+    for (const m of timeouts) {
+      // Options-literal window: from this `timeout:` to the first `}))` or `})`
+      // that closes the call, whichever comes first.
+      const rest = uncommented.slice(m.index);
+      const end = rest.search(/\}\s*\)/);
+      const window = end === -1 ? rest : rest.slice(0, end);
+      assert.ok(/killSignal:\s*'SIGKILL'/.test(window),
+        `${file}: the timed spawn at offset ${m.index} runs an untrusted or ` +
+        `hang-prone child without killSignal: 'SIGKILL' — Node sends SIGTERM and ` +
+        `then WAITS, so a deaf child makes the timeout unreachable (audit P1-17)`);
+    }
   }
 });

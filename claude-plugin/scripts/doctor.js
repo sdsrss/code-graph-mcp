@@ -215,6 +215,10 @@ function runHealthCheckCli(binary) {
   return execFileSync(binary, ['health-check', '--json'], hidden({
     cwd: process.cwd(),
     timeout: 5000,
+    // Same shape statusline.js hardened (audit P1-17): a wedged binary that
+    // ignores SIGTERM makes Node's timeout unreachable, so doctor — the tool
+    // you run BECAUSE something is wrong — would hang instead of diagnosing.
+    killSignal: 'SIGKILL',
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
   })).trim();
