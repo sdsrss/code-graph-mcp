@@ -49,6 +49,49 @@ test('runProvider forwards the stdin cwd to the provider as CODE_GRAPH_STATUSLIN
   assert.equal(out, 'CWD=/x/y');
 });
 
+// ── Timeout kill signal (P1-17) ────────────────────────────────────────────
+// `execFileSync(..., { timeout })` sends `killSignal` (default SIGTERM) and then
+// WAITS for the child to die. A provider that traps SIGTERM therefore never
+// returns: the statusline command hangs on every frame, every provider's segment
+// (ours included) disappears, and the zombies accumulate. SIGKILL cannot be
+// trapped, so the timeout stays a timeout.
+test('runProvider returns even when the provider ignores SIGTERM (timeout must KILL)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-composite-sigterm-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fixture = path.join(dir, 'deaf-provider.js');
+  fs.writeFileSync(fixture, [
+    "process.on('SIGTERM', () => {});",   // trap and ignore, exactly like a shell `trap '' TERM`
+    "process.on('SIGINT', () => {});",
+    "setInterval(() => {}, 1000);",       // stay alive forever
+  ].join('\n'));
+
+  const started = Date.now();
+  const out = runProvider(`node ${JSON.stringify(fixture)}`, false, '');
+  const elapsed = Date.now() - started;
+
+  assert.equal(out, null, 'a hung provider contributes no segment');
+  assert.ok(elapsed < 6000,
+    `runProvider must give up at its 3s timeout, not hang: took ${elapsed}ms`);
+}, { timeout: 20000 });
+
+test('a deaf provider does not take the other segments down with it', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-composite-mixed-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const deaf = path.join(dir, 'deaf.js');
+  fs.writeFileSync(deaf, "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);");
+  const ours = path.join(dir, 'ours.js');
+  fs.writeFileSync(ours, "process.stdout.write('code-graph: ok');");
+
+  const started = Date.now();
+  const dead = runProvider(`node ${JSON.stringify(deaf)}`, false, '');
+  const alive = runProvider(`node ${JSON.stringify(ours)}`, false, '');
+  const elapsed = Date.now() - started;
+
+  assert.equal(dead, null);
+  assert.equal(alive, 'code-graph: ok', 'our own segment must still render');
+  assert.ok(elapsed < 8000, `both providers together took ${elapsed}ms`);
+}, { timeout: 20000 });
+
 test('runProvider leaves CODE_GRAPH_STATUSLINE_CWD unset when stdin carries no cwd', (t) => {
   // Hermetic against an ambient var: with no stdin cwd, runProvider passes
   // process.env through unchanged, so a value inherited by the test runner would

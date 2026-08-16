@@ -393,6 +393,53 @@ pub fn validate_dead_code_type_filter(node_type: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Probe whether a path filter names ANY indexed file, for surfaces that must not
+/// answer "nothing here" about a directory they never looked in.
+///
+/// Returns the trimmed prefix when the filter matches nothing indexed, `None` when
+/// it matches something, when there is no filter, or when the scan itself failed —
+/// "nothing indexed here" is only ever claimed on a successful scan.
+///
+/// Lives next to [`dead_code_report`] because BOTH of its surfaces need it and only
+/// one had it: `cli::cmd_dead_code` probed and exited 1 while MCP
+/// `tool_find_dead_code` returned a clean empty report for the same input — a
+/// health certificate for a directory that was never examined, issued on the
+/// LLM-facing surface (audit 2026-08-16 P1-22). A shared callee is the only shape
+/// that keeps the two from drifting again.
+///
+/// Compared in Rust rather than with SQL `LIKE`: the prefix is user input, and a
+/// `_`/`%` in a filename would silently widen the match.
+///
+/// Two spellings must NOT be treated as a miss, and the CLI's first version of this
+/// probe failed both — turning `dead-code .` and `dead-code src/` on a clean repo
+/// into a hard error, the inverse of the bug it fixes:
+///   * `.` normalizes to `""` (whole project), and no stored path equals `""`;
+///   * a trailing slash from tab completion gives `src/`, and no stored path
+///     begins with `src//`.
+pub fn unindexed_path_prefix(conn: &Connection, path_filter: Option<&str>) -> Option<String> {
+    let prefix = path_filter
+        .map(|p| p.trim_end_matches('/'))
+        .filter(|p| !p.is_empty())?;
+    let scan = conn.prepare("SELECT path FROM files").and_then(|mut stmt| {
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+    });
+    match scan {
+        Ok(paths) => {
+            let matched = paths
+                .iter()
+                .any(|p| p == prefix || p.starts_with(&format!("{prefix}/")));
+            if matched {
+                None
+            } else {
+                Some(prefix.to_string())
+            }
+        }
+        // Only claim "nothing indexed here" when the scan succeeded.
+        Err(_) => None,
+    }
+}
+
 /// Compute the classified, ignore-filtered dead-code report + hidden-probe.
 /// `ignore_prefixes` are path-prefix exclusions (caller owns defaulting).
 pub fn dead_code_report(

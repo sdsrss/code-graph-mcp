@@ -89,6 +89,9 @@ function runProvider(command, needsStdin, stdin) {
 
     const out = execFileSync(argv[0], argv.slice(1), hidden({
       timeout: 3000,
+      // SIGKILL, not the SIGTERM default: a provider that traps SIGTERM makes
+      // Node's timeout unreachable and hangs every render (audit P1-17).
+      killSignal: 'SIGKILL',
       stdio: ['pipe', 'pipe', 'pipe'],
       input: needsStdin ? stdin : '',
       env,

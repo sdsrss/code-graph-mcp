@@ -609,7 +609,36 @@ function runSessionInit({ source } = {}) {
   // 上下文感知默认：插件模式下首次 SessionStart 自动安装（创建/注入 CLAUDE.md 块 +
   // .claude/ detail 文件），并清理旧 memory-dir 制品（升级自动迁移）。shipped 漂移
   // 时刷新。三种情况发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
-  const autoAdopt = isRelic ? { attempted: false, result: null } : maybeAutoAdopt({ scriptPath: __dirname });
+  // Adoption is OPTIONAL; the rest of this hook is not. It touches files the
+  // user owns (CLAUDE.md, .claude/) which can be unreadable, a directory, or on
+  // a read-only mount — and a throw here used to abort every remaining step
+  // (map injection, recent impact, consistency check, both hook canaries) with a
+  // raw stack trace (audit 2026-08-16 P1-16). adopt() now returns reasons rather
+  // than throwing; this is the belt to that suspenders, so a future unguarded
+  // read inside it cannot take the session down again.
+  let autoAdopt = { attempted: false, result: null };
+  if (!isRelic) {
+    try {
+      autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
+    } catch (e) {
+      autoAdopt = { attempted: true, reason: 'threw', result: null, error: (e && e.message) || String(e) };
+      process.stderr.write(
+        `[code-graph] Skipped CLAUDE.md adoption for this project (${(e && e.code) || (e && e.message) || 'unknown error'}).\n` +
+        '            Everything else in this session start continues normally.\n'
+      );
+    }
+  }
+  if (autoAdopt.result && autoAdopt.result.ok === false &&
+      (autoAdopt.result.reason === 'claude-md-unreadable' || autoAdopt.result.reason === 'claude-md-unwritable' ||
+       autoAdopt.result.reason === 'detail-unwritable')) {
+    // A refusal is not a silent no-op: the user's steering block is NOT
+    // installed/refreshed, and only this line says so.
+    process.stderr.write(
+      `[code-graph] Could not install the CLAUDE.md steering block (${autoAdopt.result.reason}: ` +
+      `${autoAdopt.result.error || 'unknown'}). Nothing was changed.\n` +
+      '            Opt out permanently: CODE_GRAPH_NO_AUTO_ADOPT=1\n'
+    );
+  }
   const migrated = autoAdopt.migrated || {};
   if (migrated.memoryIndexPruned || migrated.legacyDetailRemoved) {
     process.stderr.write(
@@ -889,5 +918,18 @@ if (require.main === module) {
       source = JSON.parse(fs.readFileSync(0, 'utf8')).source;
     }
   } catch { /* no/garbled stdin → treat as unknown source */ }
-  runSessionInit({ source });
+  // Hooks FAIL OPEN. This one had no wrapper at all, so anything unhandled
+  // anywhere in the sequence surfaced as a node stack trace plus a non-zero exit
+  // in the user's session start — for work that is entirely optional
+  // housekeeping (audit 2026-08-16 P1-16). One `[code-graph]` line, exit 0.
+  try {
+    runSessionInit({ source });
+  } catch (e) {
+    process.stderr.write(
+      `[code-graph] SessionStart hook error (${(e && e.code) || (e && e.name) || 'Error'}): ` +
+      `${(e && e.message) || String(e)}\n` +
+      '            The session continues; run `code-graph-mcp doctor` if this repeats.\n'
+    );
+    process.exit(0);
+  }
 }

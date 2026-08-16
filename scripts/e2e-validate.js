@@ -347,11 +347,13 @@ async function main() {
     (resp) => { assertToolContent(resp); }
   );
 
-  // 5.7 impact_analysis — `handle_message` is a hot entry point with many
-  //   callers; an empty result here means the call graph is broken.
-  await testToolCall("impact_analysis", "impact_analysis",
-    { symbol_name: "handle_message" },
-    (resp) => { assertNotEmptyResult(resp, "impact_analysis(handle_message)"); }
+  // 5.7 impact via get_ast_node — `handle_message` is a hot entry point with
+  //   many callers; an empty result here means the call graph is broken.
+  //   (`impact_analysis` was removed from the dispatcher; the live spelling is
+  //   get_ast_node include_impact.)
+  await testToolCall("get_ast_node impact", "get_ast_node",
+    { symbol_name: "handle_message", include_impact: true },
+    (resp) => { assertNotEmptyResult(resp, "get_ast_node(handle_message, include_impact)"); }
   );
 
   // 5.8 module_overview

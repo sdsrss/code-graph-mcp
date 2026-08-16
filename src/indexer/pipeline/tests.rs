@@ -3585,3 +3585,513 @@ fn test_delete_with_holder_also_deleted_does_not_dangle_on_fk() {
         "edge set diverged from fresh rebuild"
     );
 }
+
+/// Fixture for the oversize-purge dangling-TARGET guard (audit 2026-08-16 P0-1).
+///
+/// `aaa_caller.ts` holds every inbound edge class into `mid_target.ts` that the
+/// purge has to survive: `imports` (module-level), `inherits` (class), and
+/// `calls` (method body). `mid_target.ts` is the file that grows past
+/// `max_file_size` and gets its nodes purged with no reinsert.
+///
+/// The filler files sort AFTER the target on purpose. Node ids are minted in
+/// sorted-path order, so the target's ids sit in the MIDDLE of the range and
+/// SQLite can never hand them back on a later insert — with a two-file tree the
+/// freed rowids are the max and come straight back, landing a dangling id on a
+/// live row and hiding the defect (feedback_mutation_test_the_guard).
+fn oversize_purge_fixture(src: &std::path::Path) -> usize {
+    fs::create_dir_all(src).unwrap();
+    fs::write(
+        src.join("aaa_caller.ts"),
+        "import { helperX, BaseX } from './mid_target';\n\n\
+         export class Svc extends BaseX {\n  run() { return helperX(); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("mid_target.ts"),
+        "export function helperX(): number { return 1; }\nexport class BaseX {}\n",
+    )
+    .unwrap();
+    let filler = 50;
+    for i in 0..filler {
+        fs::write(
+            src.join(format!("zzz_fil_{i:04}.ts")),
+            format!("export function fil{i:04}(): number {{ return {i}; }}\n"),
+        )
+        .unwrap();
+    }
+    filler
+}
+
+/// The caller must really own all three inbound edge classes before the purge,
+/// or "the run did not abort" passes vacuously.
+fn assert_oversize_purge_precondition(db: &Database) {
+    let (_, edges) = graph_projection(db);
+    for (relation, target) in [
+        (crate::domain::REL_IMPORTS, "src/mid_target.ts:helperX"),
+        (crate::domain::REL_IMPORTS, "src/mid_target.ts:BaseX"),
+        (crate::domain::REL_INHERITS, "src/mid_target.ts:BaseX"),
+        (crate::domain::REL_CALLS, "src/mid_target.ts:helperX"),
+    ] {
+        assert!(
+            edges
+                .iter()
+                .any(|(sp, _, r, t, _)| sp == "src/aaa_caller.ts" && r == relation && t == target),
+            "precondition: aaa_caller.ts must hold {relation} → {target}, got {edges:?}"
+        );
+    }
+}
+
+/// Grow `path` past `max_file_size` while keeping it valid TypeScript, so the
+/// ONLY reason Phase 1a skips it is its size.
+fn grow_past_size_limit(path: &std::path::Path) {
+    let body = fs::read_to_string(path).unwrap();
+    let padding = "// ".to_string() + &"x".repeat(1_100_000) + "\n";
+    fs::write(path, format!("{padding}{body}")).unwrap();
+}
+
+#[test]
+fn test_oversize_purge_drops_its_nodes_from_the_name_map() {
+    // Audit 2026-08-16 P0-1. `global_name_map` is loaded ONCE before the batch
+    // loop and pruned per batch from `batch_parsed` — which holds only the files
+    // that PARSED. A file skipped for size still gets `delete_nodes_by_file`, so
+    // its ids stay in the map pointing at rows that no longer exist. The deferred
+    // pass then resolves the caller's requeued `imports` onto those dead ids and
+    // `FOREIGN KEY constraint failed` (787) aborts the WHOLE run — after the
+    // batch savepoint already committed the target's new hash, so compute_diff
+    // never offers the file again and the caller's edges are lost for good.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    oversize_purge_fixture(&src);
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_oversize_purge_precondition(&db);
+
+    grow_past_size_limit(&src.join("mid_target.ts"));
+    let result = run_incremental_index(&db, project_dir.path(), None, None).expect(
+        "purging an oversize file's nodes must also drop them from this run's name map \
+         (a deferred edge onto a dead id aborts the entire run on the edges FK 787)",
+    );
+    assert_eq!(
+        result.stats.files_skipped_size, 1,
+        "precondition: the grown file must be skipped for size, not indexed"
+    );
+
+    // Not aborting is necessary, not sufficient: the run could have survived by
+    // binding the caller to a phantom. Converge with a fresh rebuild of the same
+    // tree — which is the only definition of "correct" that does not depend on
+    // the arm the fix happened to take.
+    let control_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from a fresh rebuild of the oversize tree"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from a fresh rebuild of the oversize tree"
+    );
+}
+
+#[test]
+fn test_oversize_file_shrinking_back_restores_its_own_symbols() {
+    // The other end of the P0-1 window: the aborting run had ALREADY committed
+    // the target's new hash, so `compute_diff` never offered the file again and
+    // nothing about it could recover — not even after the file shrank back,
+    // because the run that would re-index it kept aborting on the same dead ids.
+    // With the map pruned, the shrink-back run completes and the file's own
+    // symbols return to exactly what a fresh rebuild produces.
+    //
+    // KNOWN GAP (not this fix, and not caused by the skipped-file path): the
+    // caller's `imports` edges stay bound to the `<external>` sentinels they
+    // were legitimately re-resolved onto while the target had no symbols. The
+    // caller's own content never changed, so nothing re-extracts it, and no
+    // channel re-binds a sentinel edge when the real symbol comes back — the
+    // same sequence on the DELETE path (remove the file, index, restore it,
+    // index) leaves the identical residue on HEAD without any skipped file
+    // involved. It also costs the `calls` edge, which DOES heal through
+    // `pending_unresolved_calls` and is then deleted again by
+    // `prune_import_contradicted_call_edges`, since the stale sentinel import
+    // binds the same name to a different node. Asserted here at the level this
+    // fix actually reaches — node convergence — rather than pinned as expected
+    // output at the edge level, which would cement the residue.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    oversize_purge_fixture(&src);
+    let original = fs::read_to_string(src.join("mid_target.ts")).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_oversize_purge_precondition(&db);
+
+    grow_past_size_limit(&src.join("mid_target.ts"));
+    run_incremental_index(&db, project_dir.path(), None, None)
+        .expect("oversize purge must not abort the run");
+    let (nodes, _) = graph_projection(&db);
+    assert!(
+        !nodes.iter().any(|(p, _, _)| p == "src/mid_target.ts"),
+        "precondition: the purged file must hold no symbols while it is oversize, got {nodes:?}"
+    );
+
+    fs::write(src.join("mid_target.ts"), &original).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None)
+        .expect("re-indexing the shrunk file must not abort the run");
+
+    let control_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, _) = graph_projection(&db);
+    let (full_nodes, _) = graph_projection(&control_db);
+    // Presence first: an empty projection would compare equal to an empty one.
+    for name in ["helperX", "BaseX"] {
+        assert!(
+            inc_nodes
+                .iter()
+                .any(|(p, n, _)| p == "src/mid_target.ts" && n == name),
+            "{name} must be back in the graph after the file shrank below the cap, \
+             got {inc_nodes:?}"
+        );
+    }
+    // Restricted to real project files: the `<external>` pseudo-file still holds
+    // the two sentinels the caller's stale imports keep alive (the KNOWN GAP
+    // above — `reap_orphan_external_nodes` only removes sentinels nothing points
+    // at). Every real file must match a fresh rebuild exactly.
+    let project_only = |nodes: &[(String, String, String)]| -> Vec<(String, String, String)> {
+        nodes
+            .iter()
+            .filter(|(p, _, _)| p != crate::domain::EXTERNAL_FILE_PATH)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        project_only(&inc_nodes),
+        project_only(&full_nodes),
+        "project node set diverged from fresh rebuild after the file shrank back"
+    );
+}
+
+/// Fixture for the cross-batch leg of the oversize purge. `aaa_target.ts` lands
+/// in batch 1, `zzz_caller.ts` in the last batch, so the caller resolves its
+/// relations from a `global_name_map` that an EARLIER batch purged — the
+/// batch-time face of P0-1, distinct from the deferred pass's.
+fn cross_batch_oversize_fixture(src: &std::path::Path) -> usize {
+    fs::create_dir_all(src).unwrap();
+    fs::write(
+        src.join("aaa_target.ts"),
+        "export function helperX(): number { return 1; }\nexport class BaseX {}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zzz_caller.ts"),
+        "import { helperX, BaseX } from './aaa_target';\n\n\
+         export class Svc extends BaseX {\n  run() { return helperX(); }\n}\n",
+    )
+    .unwrap();
+    let filler = super::index_files::BATCH_SIZE;
+    for i in 0..filler {
+        fs::write(
+            src.join(format!("mmm_{i:04}.ts")),
+            format!("export function fil{i:04}(): number {{ return {i}; }}\n"),
+        )
+        .unwrap();
+    }
+    filler
+}
+
+#[test]
+fn test_oversize_purge_in_an_earlier_batch_does_not_dangle_for_a_later_one() {
+    // Cross-batch leg of P0-1. The stale ids a skipped file leaves in
+    // `global_name_map` are read TWICE: by the deferred pass after the loop, and
+    // by every LATER batch when it seeds `name_to_ids` from the map (the
+    // `!batch_file_paths.contains(path)` filter at Phase 2). A single-batch
+    // corpus exercises only the first, so it is a null control for the second —
+    // this repo's edge work diffs across the batch boundary for exactly that
+    // reason (feedback_edge_exclusion_verify_by_index_diff). Here the caller
+    // sits in a later batch than the file that was purged, so its `imports` /
+    // `inherits` resolve against the dead ids at BATCH time.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    let filler = cross_batch_oversize_fixture(&src);
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let (_, edges) = graph_projection(&db);
+    assert!(
+        edges
+            .iter()
+            .any(|(sp, _, r, t, _)| sp == "src/zzz_caller.ts"
+                && r == crate::domain::REL_INHERITS
+                && t == "src/aaa_target.ts:BaseX"),
+        "precondition: the caller must inherit across the batch boundary, got {edges:?}"
+    );
+
+    // Grow the target past the cap AND touch every other file, so the whole tree
+    // is in the changed set and the caller lands in a batch after the purge.
+    grow_past_size_limit(&src.join("aaa_target.ts"));
+    for i in 0..filler {
+        fs::write(
+            src.join(format!("mmm_{i:04}.ts")),
+            format!("// touched\nexport function fil{i:04}(): number {{ return {i}; }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        src.join("zzz_caller.ts"),
+        "import { helperX, BaseX } from './aaa_target';\n\n// touched\n\
+         export class Svc extends BaseX {\n  run() { return helperX(); }\n}\n",
+    )
+    .unwrap();
+
+    let result = run_incremental_index(&db, project_dir.path(), None, None).expect(
+        "a later batch must not resolve against the ids an earlier batch's oversize purge \
+         freed (edges FK 787 aborts the entire run)",
+    );
+    assert_eq!(
+        result.stats.files_skipped_size, 1,
+        "precondition: the grown file must be skipped for size, not indexed"
+    );
+
+    let control_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from a fresh rebuild across the batch boundary"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from a fresh rebuild across the batch boundary"
+    );
+}
+
+#[test]
+fn test_deferred_only_run_still_classifies_edge_confidence() {
+    // The P2 that rides with P0-1. The confidence post-pass is gated on the run
+    // having done observable work, and the gate listed three producers:
+    // indexed files, deleted files, the pending sweep. Phase 2b-final is a
+    // fourth — it inserts cross-file by-name binds, exactly the shape Phase 2e
+    // downgrades off the `extracted` column default — and a run whose ONLY
+    // changed file is skipped for size hits none of the other three: nothing
+    // parsed, nothing deleted, and the sweep is itself gated on parsing. The
+    // purge still requeues that file's inbound `references`, the deferred pass
+    // re-binds them, and ungated they keep `extracted`, the TOP tier, having
+    // never been classified.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let a = project_dir.path().join("src/a");
+    let b = project_dir.path().join("src/b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    // Same-directory candidate wins the initial bind; the far one is what the
+    // requeued reference has left to bind to once the near one is purged.
+    fs::write(a.join("aaa_ref.ts"), "export const wired = handlerX;\n").unwrap();
+    fs::write(
+        a.join("mid_dup.ts"),
+        "export function handlerX(): number { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        b.join("zzz_alt.ts"),
+        "export function handlerX(): number { return 2; }\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let ref_confidences = |db: &Database| -> Vec<(String, String)> {
+        db.conn()
+            .prepare(
+                "SELECT tf.path, e.confidence FROM edges e
+                 JOIN nodes sn ON sn.id = e.source_id
+                 JOIN files sf ON sf.id = sn.file_id
+                 JOIN nodes tn ON tn.id = e.target_id
+                 JOIN files tf ON tf.id = tn.file_id
+                 WHERE e.relation = 'references' AND sf.path = 'src/a/aaa_ref.ts'
+                   AND tn.name = 'handlerX'
+                 ORDER BY tf.path",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        ref_confidences(&db),
+        vec![("src/a/mid_dup.ts".to_string(), "ambiguous".to_string())],
+        "precondition: the reference binds to the near candidate and is classified"
+    );
+
+    grow_past_size_limit(&a.join("mid_dup.ts"));
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 0,
+        "precondition: the only changed file must be skipped, so nothing is indexed"
+    );
+
+    // The requeued reference re-bound to the surviving candidate. That edge was
+    // written by the deferred pass and by nothing else, so its confidence is the
+    // whole observable difference the gate makes.
+    assert_eq!(
+        ref_confidences(&db),
+        vec![("src/b/zzz_alt.ts".to_string(), "inferred".to_string())],
+        "a deferred-pass edge on an otherwise idle run must still be classified, \
+         not left on the `extracted` column default"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Run-completion marker (audit 2026-08-16 P1-2).
+// ---------------------------------------------------------------------------
+
+fn run_marker(db: &Database) -> Option<String> {
+    crate::storage::queries::get_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+    )
+    .unwrap()
+}
+
+fn set_run_marker(db: &Database) {
+    crate::storage::queries::set_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+        "1",
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_index_run_marker_is_cleared_by_a_completed_run() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("a.ts"),
+        "export function alpha(): number { return 1; }\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        run_marker(&db),
+        None,
+        "a run that reached the deferred commit must leave no in-flight marker"
+    );
+
+    // An untouched tree is the NORMAL state after a crash — the user restarts and
+    // edits nothing. The diff is empty, so without the marker driving it there is
+    // no run left to rebuild the abandoned edges, ever.
+    set_run_marker(&db);
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 1,
+        "an interrupted marker must force a re-index even when nothing changed on disk"
+    );
+    assert_eq!(
+        run_marker(&db),
+        None,
+        "the recovery run completed, so it must clear the marker"
+    );
+}
+
+#[test]
+fn test_interrupted_run_marker_escalates_incremental_to_full_reindex() {
+    // Simulates the kill window: hashes committed, cross-file edges never
+    // written. The marker is the only thing that survives it, because
+    // `compute_diff` sees hashes that say every file is current.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("aaa_base.ts"), "export class Base {}\n").unwrap();
+    fs::write(
+        src.join("bbb_child.ts"),
+        "import { Base } from './aaa_base';\n\nexport class Child extends Base {}\n",
+    )
+    .unwrap();
+    fs::write(src.join("ccc_other.ts"), "export const other = 1;\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Destroy the cross-file edges the killed run would never have written, then
+    // leave its marker behind. Hashes stay put — that is the whole trap.
+    db.conn()
+        .execute(
+            "DELETE FROM edges WHERE relation IN ('inherits', 'imports')",
+            [],
+        )
+        .unwrap();
+    set_run_marker(&db);
+
+    // One unrelated file changes. The diff alone would re-index exactly that one.
+    fs::write(src.join("ccc_other.ts"), "export const other = 2;\n").unwrap();
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    assert_eq!(
+        result.files_indexed, 3,
+        "an interrupted marker must escalate the one-file diff to the whole tree"
+    );
+    assert_eq!(
+        run_marker(&db),
+        None,
+        "the escalated run completed, so it must clear the marker it inherited"
+    );
+
+    let (_, edges) = graph_projection(&db);
+    assert!(
+        edges.iter().any(|(sp, _, r, t, _)| sp == "src/bbb_child.ts"
+            && r == crate::domain::REL_INHERITS
+            && t == "src/aaa_base.ts:Base"),
+        "the re-index must restore the cross-file edge the interrupted run lost, got {edges:?}"
+    );
+}
+
+#[test]
+fn test_query_time_refresh_preserves_an_interrupted_run_marker() {
+    // `ensure_file_indexed` runs the same pipeline for ONE file on the query
+    // path. Letting it clear the marker would retire the crash evidence without
+    // doing the full re-index it exists to trigger — the next incremental would
+    // then run its ordinary diff and the abandoned edges would stay lost.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("a.ts"),
+        "export function alpha(): number { return 1; }\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    set_run_marker(&db);
+
+    fs::write(
+        src.join("a.ts"),
+        "export function alpha(): number { return 2; }\n",
+    )
+    .unwrap();
+    let refreshed = ensure_file_indexed(&db, project_dir.path(), "src/a.ts", None).unwrap();
+    assert!(
+        refreshed,
+        "precondition: the edited file must be re-indexed"
+    );
+    assert_eq!(
+        run_marker(&db).as_deref(),
+        Some("1"),
+        "a single-file query-time refresh must leave the interrupted-run marker standing"
+    );
+}

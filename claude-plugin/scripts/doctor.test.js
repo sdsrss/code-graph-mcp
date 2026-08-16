@@ -437,6 +437,96 @@ test('runRepairs: index-corrupt counts fixed only when the post-rebuild probe is
   assert.equal(rebuilds, 2, 'precondition: the spawn injection is live, not inert');
 });
 
+// ── P1-13: every emitted fixId must have a repair arm ───────────────────────
+//
+// `binary-broken` was emitted from two places and handled by none, so runRepairs
+// fell through `default: break` and doctor printed "1 issue(s) found. Fixing..."
+// followed by "0/1 addressed" with nothing at all in between — and exit 1. The
+// per-arm tests below cover the new arm; THIS test is the meta-guard the audit
+// asked for, so the next fixId cannot ship orphaned.
+//
+// Source-derived on purpose: exported sets would have to be kept in sync by
+// hand, which is the same failure mode one level up.
+function doctorSource() {
+  return fs.readFileSync(path.join(__dirname, 'doctor.js'), 'utf8');
+}
+
+function emittedFixIds(src) {
+  return new Set([...src.matchAll(/fixId:\s*'([a-z0-9-]+)'/g)].map((m) => m[1]));
+}
+
+function handledFixIds(src) {
+  const start = src.indexOf('function runRepairs(');
+  assert.ok(start > 0, 'runRepairs must still be a top-level function for this guard to see it');
+  // Its body ends at the first line that is exactly `}`. Not `\n}`: runRepairs'
+  // own destructured options default closes with `} = {}) {` at column 0, so the
+  // looser marker cut the body off at the signature and the scanner reported
+  // zero repair cases — which would have passed as "no orphans" if the positive
+  // control below had not caught it.
+  const end = src.indexOf('\n}\n', start);
+  assert.ok(end > start, 'could not find the end of runRepairs');
+  const body = src.slice(start, end);
+  return new Set([...body.matchAll(/case\s+'([a-z0-9-]+)':/g)].map((m) => m[1]));
+}
+
+test('every fixId doctor emits has a runRepairs case (meta-guard)', () => {
+  const src = doctorSource();
+  const emitted = emittedFixIds(src);
+  const handled = handledFixIds(src);
+
+  // Positive control: the scanner must actually be seeing both sides. A regex
+  // that silently matched nothing would report a clean sweep forever.
+  assert.ok(emitted.size >= 8, `expected the scanner to find the emitted fixIds, found ${emitted.size}`);
+  assert.ok(handled.size >= 6, `expected the scanner to find the repair cases, found ${handled.size}`);
+  assert.ok(emitted.has('binary-broken') && handled.has('index-empty'), 'sanity: known ids on both sides');
+
+  const orphans = [...emitted].filter((id) => !handled.has(id)).sort();
+  assert.deepEqual(orphans, [],
+    `these fixIds route to \`default: break\` — doctor promises "Fixing..." and does nothing: ${orphans.join(', ')}`);
+});
+
+test('runRepairs: binary-broken re-downloads and counts fixed only on a verified re-diagnosis', () => {
+  const { runRepairs } = require('./doctor');
+  const broken = [{ name: 'Binary version', status: 'error', detail: 'failed to read version', fixId: 'binary-broken' }];
+
+  let updates = 0;
+  const update = () => { updates++; };
+
+  assert.equal(runRepairs(broken, { devMode: () => false, runAutoUpdate: update, binaryUsable: () => true }), 1,
+    'update ran and the binary now answers --version + health-check → fixed');
+
+  assert.equal(runRepairs(broken, { devMode: () => false, runAutoUpdate: update, binaryUsable: () => false }), 0,
+    'the updater exits 0 for a dozen reasons — only the re-diagnosis may count a fix');
+
+  assert.equal(
+    runRepairs(broken, {
+      devMode: () => false,
+      runAutoUpdate: () => { throw new Error('no network'); },
+      binaryUsable: () => true,
+    }),
+    0, 'an update that threw must not count as fixed even when the probe would pass');
+
+  assert.equal(updates, 2, 'precondition: the update injection is live, not inert');
+});
+
+test('runRepairs: binary-broken in dev mode rebuilds from source instead of downloading', () => {
+  const { runRepairs } = require('./doctor');
+  const broken = [{ name: 'Schema', status: 'error', detail: 'health-check failed: Segmentation fault', fixId: 'binary-broken' }];
+
+  let downloaded = 0;
+  let built = null;
+  const fixed = runRepairs(broken, {
+    devMode: () => true,
+    runAutoUpdate: () => { downloaded++; },
+    buildBinary: (cmd) => { built = cmd; return true; },
+    binaryUsable: () => true,
+  });
+
+  assert.equal(downloaded, 0, 'a source checkout must not be "repaired" by downloading a release binary');
+  assert.match(String(built), /^cargo build --release/);
+  assert.equal(fixed, 1);
+});
+
 test('integrityResolved re-classifies with the SAME function the diagnosis used', () => {
   // If "resolved" were its own predicate it could drift from "not raised", and
   // doctor would count a repair that left the issue standing.

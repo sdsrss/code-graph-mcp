@@ -36,11 +36,27 @@ fn fts5_search_impl(
     limit: i64,
     exclude_tests: bool,
 ) -> Result<FtsResult> {
-    // Preprocess query: filter stopwords, split identifiers (camelCase/snake_case),
-    // expand domain acronyms (RRF → reciprocal rank fusion, etc.),
-    // then sanitize for FTS5. Porter stemming is handled by the FTS5 tokenizer.
-    let terms: Vec<String> = query
-        .split_whitespace()
+    // Preprocess query: split on term boundaries, filter stopwords, split
+    // identifiers (camelCase/snake_case), expand domain acronyms (RRF →
+    // reciprocal rank fusion, etc.), then sanitize for FTS5. Porter stemming is
+    // handled by the FTS5 tokenizer.
+    //
+    // Term boundary = anything outside [alphanumeric _]: whitespace AND
+    // punctuation. Punctuation used to be DELETED from each whitespace-word
+    // instead, which glued `db.execute` into the token `dbexecute` — a string
+    // that exists in no index, so every qualified-name query (`db.execute`,
+    // `domain::search_fetch_count`, `name:fts5_search`, `path/to/file`) was a
+    // hard zero, and the empty response blamed the user's spelling (audit
+    // 2026-08-16 P1-6). `_` stays a term character so snake_case identifiers
+    // survive as one token.
+    let is_term_char = |c: char| c.is_alphanumeric() || c == '_';
+    let raw_terms: Vec<&str> = query
+        .split(|c: char| !is_term_char(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let terms: Vec<String> = raw_terms
+        .iter()
+        .copied()
         .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
         .flat_map(|word| {
             // Split camelCase/snake_case identifiers into constituent words
@@ -58,12 +74,12 @@ fn fts5_search_impl(
         .collect::<std::collections::BTreeSet<_>>() // deduplicate (sorted for deterministic queries)
         .into_iter()
         .map(|word| {
-            // Strip FTS5 metacharacters to prevent query injection
-            // (operators: * ^ : + - ~ ( ) { } " can alter FTS5 semantics)
-            let sanitized: String = word
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            // Defense in depth: the split above already dropped every FTS5
+            // metacharacter (* ^ : + - ~ ( ) { } " alter FTS5 semantics), but
+            // identifier splitting and acronym expansion run in between, so
+            // re-assert the invariant the quoting at the MATCH site depends on:
+            // a term contains only [alphanumeric _].
+            let sanitized: String = word.chars().filter(|c| is_term_char(*c)).collect();
             sanitized
         })
         .filter(|w| w.len() >= 2)
@@ -129,14 +145,76 @@ fn fts5_search_impl(
         // search). Multi-word queries always get OR-fallback (user explicitly
         // listed terms; widening is the documented recall behavior).
         if pairs.is_empty() {
-            let original_word_count = query
+            // "One word" is counted on the USER's basis — whitespace tokens —
+            // not on the punctuation-split term basis: the user typed
+            // `--no-default-features` or `name:run_migration` as ONE token,
+            // and OR-widening over the fragments OUR splitter produced is
+            // noise by construction, exactly the flood this guard exists to
+            // stop (batch review of audit 2026-08-16 P1-6). Instead of the OR
+            // pass, a single-token multi-fragment query gets one RELAXED AND
+            // retry: fragments that exist nowhere in the index (`name` in a
+            // fixture without it, the `no` of a flag) are dropped and the AND
+            // re-runs over the survivors — still a co-occurrence query, so
+            // `name:run_migration` finds run_migration without `--flag`-shaped
+            // queries flooding unrelated hits. If nothing can be dropped or
+            // the relaxed AND still finds nothing, the answer is an honest
+            // empty. Multi-token queries keep the documented OR-fallback (the
+            // user listed the terms themselves).
+            let user_words = query
                 .split_whitespace()
-                .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
+                .filter(|w| {
+                    let s: String = w.chars().filter(|c| is_term_char(*c)).collect();
+                    !s.is_empty() && !FTS_STOP_WORDS.contains(&s.to_lowercase().as_str())
+                })
                 .count();
-            if original_word_count <= 1 {
-                let sanitized_original: String = query
+            let original_terms: Vec<&&str> = raw_terms
+                .iter()
+                .filter(|w| !FTS_STOP_WORDS.contains(&w.to_lowercase().as_str()))
+                .collect();
+            if user_words <= 1 && original_terms.len() > 1 {
+                let probe_sql = format!(
+                    "SELECT 1 FROM nodes_fts fts JOIN nodes n ON n.id = fts.rowid \
+                     WHERE nodes_fts MATCH ?1{} LIMIT 1",
+                    test_filter
+                );
+                let mut probe = conn.prepare(&probe_sql)?;
+                let surviving: Vec<&String> = terms
+                    .iter()
+                    .filter(|t| {
+                        probe
+                            .exists(rusqlite::params![format!("\"{}\"", t)])
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if !surviving.is_empty() && surviving.len() < terms.len() {
+                    let relaxed_query = surviving
+                        .iter()
+                        .map(|t| format!("\"{}\"", t))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows =
+                        stmt.query_map(rusqlite::params![relaxed_query, limit], map_row_with_bm25)?;
+                    let relaxed: Vec<(NodeResult, f64)> = rows.collect::<Result<Vec<_>, _>>()?;
+                    if !relaxed.is_empty() {
+                        let (nodes, bm25_scores): (Vec<_>, Vec<_>) = relaxed.into_iter().unzip();
+                        return Ok(FtsResult {
+                            nodes,
+                            bm25_scores,
+                            or_fallback: false,
+                        });
+                    }
+                }
+                return Ok(FtsResult {
+                    nodes: vec![],
+                    bm25_scores: vec![],
+                    or_fallback: false,
+                });
+            }
+            if user_words <= 1 && original_terms.len() == 1 {
+                let sanitized_original: String = original_terms[0]
                     .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '_')
+                    .filter(|c| is_term_char(*c))
                     .collect();
                 if sanitized_original.len() >= 2 {
                     let probe_sql = format!(
@@ -463,6 +541,218 @@ mod tests {
         assert_eq!(
             results[0].name, "a_cLongerName",
             "genuine literal prefix must outrank a wildcard-coincidental match, got {names:?}"
+        );
+    }
+
+    /// Insert a production function node with the given name/code into `fid`.
+    fn insert_fn(conn: &rusqlite::Connection, fid: i64, name: &str, line: i64, code: &str) {
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: name.into(),
+                qualified_name: None,
+                start_line: line,
+                end_line: line + 4,
+                code_content: code.into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: Some(crate::search::tokenizer::split_identifier(name)),
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+    }
+
+    fn qualified_name_fixture() -> (crate::storage::db::Database, tempfile::TempDir) {
+        let (db, tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "runner.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        insert_fn(
+            db.conn(),
+            fid,
+            "run_migration",
+            1,
+            "fn run_migration(db: &Db) { db.execute(\"PRAGMA foreign_keys=ON\"); }",
+        );
+        insert_fn(
+            db.conn(),
+            fid,
+            "search_fetch_count",
+            20,
+            "pub fn search_fetch_count(top_k: i64) -> i64 { top_k * 4 }",
+        );
+        insert_fn(
+            db.conn(),
+            fid,
+            "widen_pool",
+            40,
+            "fn widen_pool() { let n = domain::search_fetch_count(top_k); }",
+        );
+        // A decoy so a plain OR over the split tokens cannot be mistaken for a
+        // precise hit: it contains "execute" but never "db".
+        insert_fn(
+            db.conn(),
+            fid,
+            "execute_plan",
+            60,
+            "fn execute_plan() { plan.execute(); }",
+        );
+        (db, tmp)
+    }
+
+    /// Punctuation between word runs must SPLIT terms, not be deleted.
+    ///
+    /// Pre-fix the sanitizer kept only `[alnum_]` per whitespace-word, so
+    /// `db.execute` collapsed to the token `dbexecute`, which exists nowhere in
+    /// any index — a hard zero on the single most natural way to search for a
+    /// method call. Same for `::` and `:` separated queries (audit 2026-08-16
+    /// P1-6).
+    #[test]
+    fn test_fts5_qualified_name_query_splits_on_punctuation() {
+        let (db, _tmp) = qualified_name_fixture();
+
+        for query in [
+            "db.execute",
+            "domain::search_fetch_count",
+            "name:run_migration",
+        ] {
+            let hits = fts5_search(db.conn(), query, 10).unwrap().nodes;
+            assert!(
+                !hits.is_empty(),
+                "query {query:?} must not be a hard zero — punctuation is a term separator, not a character to delete"
+            );
+        }
+
+        // The concrete symbols each query names must actually come back.
+        let db_execute: Vec<String> = fts5_search(db.conn(), "db.execute", 10)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            db_execute.contains(&"run_migration".to_string()),
+            "db.execute must find the function whose body calls db.execute(), got {db_execute:?}"
+        );
+
+        let qualified: Vec<String> = fts5_search(db.conn(), "domain::search_fetch_count", 10)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            qualified.contains(&"search_fetch_count".to_string()),
+            "a `mod::symbol` query must find `symbol`, got {qualified:?}"
+        );
+    }
+
+    /// The sanitizer's security property survives the split: after term
+    /// extraction no token may carry an FTS5 operator/quote, so the `"token"`
+    /// quoting at the MATCH site stays well-formed. Every hostile input must
+    /// return Ok — an Err here means a crafted query reached the FTS5 parser.
+    #[test]
+    fn test_fts5_hostile_queries_stay_well_formed() {
+        let (db, _tmp) = qualified_name_fixture();
+        let hostile = [
+            "\" OR nodes_fts MATCH \"a",
+            "a\" AND \"b",
+            "NEAR(a b, 2)",
+            "a* OR b*",
+            "^start",
+            "col:value",
+            "a AND NOT b",
+            "(a OR b) AND c",
+            "{a b}",
+            "a-b-c",
+            "\"\"\"\"",
+            "'; DROP TABLE nodes; --",
+            "a+b~c",
+            "run_migration\" OR \"1",
+        ];
+        for q in hostile {
+            let out = fts5_search(db.conn(), q, 10);
+            assert!(
+                out.is_ok(),
+                "hostile query {q:?} must not reach the FTS5 parser as syntax: {:?}",
+                out.err()
+            );
+        }
+        // The injection attempt must not widen the result set beyond what the
+        // literal tokens justify: `"1` is not a term, so this is just the
+        // run_migration query.
+        let injected: Vec<String> = fts5_search(db.conn(), "run_migration\" OR \"1", 10)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            injected.iter().all(|n| n == "run_migration"),
+            "quote-injection must not pull in unrelated rows, got {injected:?}"
+        );
+    }
+
+    /// A single flag-shaped user token must not flood OR-fallback noise when
+    /// its punctuation-split fragments never co-occur (batch review of audit
+    /// 2026-08-16 P1-6: `--no-default-features` regressed from a clean empty
+    /// to a wall of unrelated hits). The relaxed-AND retry may drop fragments
+    /// absent from the index, but fragments that exist individually without
+    /// co-occurring stay an honest empty. The SAME fragments typed as separate
+    /// words are the user's own term list and keep the OR-fallback.
+    #[test]
+    fn test_single_flag_token_does_not_or_flood() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "flags.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        // "prune" and "vector" each exist, in different nodes; they never co-occur.
+        insert_fn(db.conn(), fid, "prune_edges", 1, "fn prune_edges() {}");
+        insert_fn(db.conn(), fid, "vector_scan", 20, "fn vector_scan() {}");
+
+        // One user token: relaxed AND over [prune, vector] finds no
+        // co-occurrence, and OR must NOT kick in.
+        let flag = fts5_search(db.conn(), "--prune-vector", 10).unwrap();
+        assert!(
+            flag.nodes.is_empty() && !flag.or_fallback,
+            "a single flag-shaped token whose fragments never co-occur must stay empty, got {:?}",
+            flag.nodes
+                .iter()
+                .map(|n| n.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Two user words: documented OR-fallback recall behavior.
+        let listed = fts5_search(db.conn(), "prune vector", 10).unwrap();
+        assert!(
+            listed.or_fallback && listed.nodes.len() == 2,
+            "user-listed words must keep OR-fallback, got or_fallback={} nodes={:?}",
+            listed.or_fallback,
+            listed
+                .nodes
+                .iter()
+                .map(|n| n.name.clone())
+                .collect::<Vec<_>>()
         );
     }
 

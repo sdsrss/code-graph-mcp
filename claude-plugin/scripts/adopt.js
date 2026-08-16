@@ -323,6 +323,42 @@ function escapeRegex(s) {
   return s.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&');
 }
 
+// Remove every match of `re` and heal ONLY the seam each removal leaves behind.
+//
+// The whole-file `out.replace(/\n{3,}/g, '\n\n')` this replaces was the last
+// unscoped edit in a function whose entire contract is "touch nothing but our
+// block". It rewrote the user's prose: blank-line runs inside fenced code blocks
+// collapsed, and because the collapse changed bytes even when no marker was
+// present, `unadopt` reported "De-blocked" for files that never held our block
+// — on every SessionStart, and across every registered project on uninstall
+// (audit 2026-08-16 P1-15).
+//
+// Seam rule: the blank lines that end up adjacent BECAUSE the block between them
+// was removed collapse to one blank line (the old behavior, now local); bytes
+// anywhere else are copied through untouched. A text containing no match is
+// returned identical, which is what makes "changed" mean "we removed something".
+function stripAndHealSeams(text, re) {
+  let out = '';
+  let cursor = 0;
+  re.lastIndex = 0;
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    if (m[0] === '') { re.lastIndex++; continue; }  // zero-width guard: never loop forever
+    out += text.slice(cursor, m.index);
+    cursor = m.index + m[0].length;
+    const before = /\n*$/.exec(out)[0].length;
+    const after = /^\n*/.exec(text.slice(cursor))[0].length;
+    if (before + after > 2) {
+      out = out.slice(0, out.length - before) + '\n\n';
+      // Skip the newlines we just absorbed. Safe for the scan: the skipped span
+      // is newlines only, and every pattern here starts at a line's first
+      // non-newline character.
+      cursor += after;
+      re.lastIndex = cursor;
+    }
+  }
+  return out + text.slice(cursor);
+}
+
 // Strip our sentinel block — well-formed first, then self-heal orphan begin/end.
 // Shared by adopt (so re-adopt rewrites a stale/malformed block) and unadopt.
 //
@@ -352,7 +388,7 @@ function stripSentinelBlock(text) {
     `${BEGIN_LINE}(?:(?!${SENTINEL_BEGIN_SRC})[\\s\\S])*?${END_LINE}\\n?`,
     'gm'
   );
-  let out = text.replace(wellFormed, '');
+  let out = stripAndHealSeams(text, wellFormed);
   // Orphan BEGIN with no matching END (truncation / partial edit): remove the
   // MARKER LINE ONLY, never the content after it.
   //
@@ -371,13 +407,17 @@ function stripSentinelBlock(text) {
   // line-anchored BEGIN *and* END, so a leftover fragment does not block
   // re-adoption — the next adopt writes a fresh, well-formed block.
   const orphanBegin = new RegExp(`${BEGIN_LINE}\\n?`, 'gm');
-  out = out.replace(orphanBegin, '');
-  // Orphan END line by itself — same rule, one line, nothing around it.
+  out = stripAndHealSeams(out, orphanBegin);
+  // Orphan END line by itself — same rule, one line, nothing around it. Written
+  // as the same line-anchored removal the other two passes use (the old
+  // split/filter/join spelling was a third predicate for "is this our END line",
+  // and every duplicated predicate in this file has drifted at least once).
   if (out.includes(SENTINEL_END)) {
-    out = out.split('\n').filter(l => l.trim() !== SENTINEL_END).join('\n');
+    out = stripAndHealSeams(out, new RegExp(`${END_LINE}\\n?`, 'gm'));
   }
-  // Collapse blank-line runs introduced by stripping mid-paragraph blocks.
-  return out.replace(/\n{3,}/g, '\n\n');
+  // NOTE: no whole-file newline collapse here. Each removal above healed its own
+  // seam; bytes the user wrote are returned exactly as they came in.
+  return out;
 }
 
 function platformGuard() {
@@ -402,32 +442,62 @@ function adoptedRegistryFile(home) {
   return path.join(home || os.homedir(), '.cache', 'code-graph', 'adopted-projects.json');
 }
 
-function readAdoptedProjects(home) {
+// Read the registry keeping WHY it failed — the same one bit lifecycle.js's
+// readJsonResult exists for. Only a genuinely ABSENT (or empty) file may be
+// treated as "nothing here, safe to create": everything else (EACCES, EISDIR,
+// truncated JSON, wrong shape) means the file EXISTS and holds entries we cannot
+// read. The old lenient reader returned `[]` for all of them and the next
+// recordAdopted persisted `[thisProject]` over it — dropping every other adopted
+// project, which is exactly the list `uninstall --unadopt-all` iterates, so
+// their managed CLAUDE.md blocks would be stranded (audit 2026-08-16 P1-12).
+function readAdoptedResult(home) {
+  let raw;
   try {
-    const list = JSON.parse(fs.readFileSync(adoptedRegistryFile(home), 'utf8'));
-    return Array.isArray(list) ? list.filter((p) => typeof p === 'string') : [];
-  } catch { return []; }
+    raw = fs.readFileSync(adoptedRegistryFile(home), 'utf8');
+  } catch (err) {
+    const missing = Boolean(err) && err.code === 'ENOENT';
+    return { list: [], missing, unusable: !missing };
+  }
+  if (raw.trim() === '') return { list: [], missing: true, unusable: false };
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return { list: [], missing: false, unusable: true };
+    return { list: parsed.filter((p) => typeof p === 'string'), missing: false, unusable: false };
+  } catch {
+    return { list: [], missing: false, unusable: true };
+  }
 }
 
+/** Read-side contract is unchanged: a list, never a throw. */
+function readAdoptedProjects(home) {
+  return readAdoptedResult(home).list;
+}
+
+/** @returns {boolean} true when the project is recorded (or already was). */
 function recordAdopted(projectDir, home) {
+  const res = readAdoptedResult(home);
+  if (res.unusable) return false;   // never rebuild over entries we cannot read
   try {
     const file = adoptedRegistryFile(home);
-    const list = readAdoptedProjects(home);
     const abs = path.resolve(projectDir);
-    if (list.includes(abs)) return;
+    if (res.list.includes(abs)) return true;
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeFileAtomic(file, JSON.stringify([...list, abs], null, 2) + '\n');
-  } catch { /* best-effort */ }
+    writeFileAtomic(file, JSON.stringify([...res.list, abs], null, 2) + '\n');
+    return true;
+  } catch { return false; }        // best-effort: registry loss only degrades guidance
 }
 
+/** @returns {boolean} true when the project is absent from the registry afterwards. */
 function removeAdopted(projectDir, home) {
+  const res = readAdoptedResult(home);
+  if (res.unusable) return false;
   try {
-    const list = readAdoptedProjects(home);
     const abs = path.resolve(projectDir);
-    const next = list.filter((p) => p !== abs);
-    if (next.length === list.length) return;
+    const next = res.list.filter((p) => p !== abs);
+    if (next.length === res.list.length) return true;
     writeFileAtomic(adoptedRegistryFile(home), JSON.stringify(next, null, 2) + '\n');
-  } catch { /* best-effort */ }
+    return true;
+  } catch { return false; }
 }
 
 function adopt({ cwd, templatePath, home } = {}) {
@@ -445,18 +515,40 @@ function adopt({ cwd, templatePath, home } = {}) {
     return { ok: false, reason: 'no-template', template: tpl };
   }
 
+  // Every filesystem touch below is on files the USER owns and may have made
+  // unreadable (a root-owned CLAUDE.md from a `sudo` session) or replaced with a
+  // directory. Those throw EACCES/EISDIR, and this function is called bare from
+  // maybeAutoAdopt → runSessionInit: one such file killed the whole SessionStart
+  // hook, so binary verification, index freshness and the hook self-test never
+  // ran (audit 2026-08-16 P1-16). Adoption is optional; the rest of the session
+  // is not. Every arm below returns a REASON instead of throwing.
+
   // 1. Install the detail doc at <cwd>/.claude/plugin_code_graph_mcp.md.
   // First line is the MANAGED_BY marker (HTML comment → invisible in rendered
   // markdown) so unadopt/needsRefresh can tell our generated copy from a user
   // file of the same name. needsRefresh strips it before the bytewise compare.
   const dDir = detailDir(effectiveCwd);
-  if (!fs.existsSync(dDir)) fs.mkdirSync(dDir, { recursive: true });
   const dPath = detailPath(effectiveCwd);
-  const desiredDetail = Buffer.concat([Buffer.from(`${MANAGED_BY}\n`), fs.readFileSync(tpl)]);
   let detailWritten = false;
-  if (!fs.existsSync(dPath) || !fs.readFileSync(dPath).equals(desiredDetail)) {
-    writeFileAtomic(dPath, desiredDetail);
-    detailWritten = true;
+  let desiredDetail;
+  try {
+    desiredDetail = Buffer.concat([Buffer.from(`${MANAGED_BY}\n`), fs.readFileSync(tpl)]);
+  } catch (e) {
+    return { ok: false, reason: 'no-template', template: tpl, error: e.code || String(e) };
+  }
+  try {
+    if (!fs.existsSync(dDir)) fs.mkdirSync(dDir, { recursive: true });
+    // readFileSync on the existing copy can throw for the same reasons as
+    // CLAUDE.md below; an unreadable one is "different from what we want", so
+    // fall through to the write and let THAT report the real failure.
+    let current = null;
+    try { current = fs.readFileSync(dPath); } catch { current = null; }
+    if (current === null || !current.equals(desiredDetail)) {
+      writeFileAtomic(dPath, desiredDetail);
+      detailWritten = true;
+    }
+  } catch (e) {
+    return { ok: false, reason: 'detail-unwritable', detailPath: dPath, error: e.code || String(e) };
   }
 
   // 2. Ensure the managed block in <cwd>/CLAUDE.md. Create-if-missing, else
@@ -465,19 +557,33 @@ function adopt({ cwd, templatePath, home } = {}) {
   const cPath = claudeMdPath(effectiveCwd);
   const block = buildBlock(detectProjectType(effectiveCwd));
   const exists = fs.existsSync(cPath);
-  const current = exists ? fs.readFileSync(cPath, 'utf8') : '';
+  let current = '';
+  if (exists) {
+    try {
+      current = fs.readFileSync(cPath, 'utf8');
+    } catch (e) {
+      // EACCES / EISDIR / EIO: the file is there and we cannot read it. Writing
+      // anyway would replace content we never saw, so this project simply cannot
+      // be adopted right now.
+      return { ok: false, reason: 'claude-md-unreadable', claudeMdPath: cPath, error: e.code || String(e) };
+    }
+  }
   if (current.includes(block)) {
-    recordAdopted(effectiveCwd, home);
-    return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: false, created: false, healed: false };
+    const registryRecorded = recordAdopted(effectiveCwd, home);
+    return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: false, created: false, healed: false, registryRecorded };
   }
   const cleaned = exists ? stripSentinelBlock(current) : '';
   const healed = exists && cleaned !== current;
   const base = cleaned.replace(/\n+$/, '');
   const prefix = base ? base + '\n\n' : '';
-  // followLink: read-modify-write of a file the user may have symlinked.
-  writeFileAtomic(cPath, prefix + block + '\n', { followLink: true });
-  recordAdopted(effectiveCwd, home);
-  return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: true, created: !exists, healed };
+  try {
+    // followLink: read-modify-write of a file the user may have symlinked.
+    writeFileAtomic(cPath, prefix + block + '\n', { followLink: true });
+  } catch (e) {
+    return { ok: false, reason: 'claude-md-unwritable', claudeMdPath: cPath, error: e.code || String(e) };
+  }
+  const registryRecorded = recordAdopted(effectiveCwd, home);
+  return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: true, created: !exists, healed, registryRecorded };
 }
 
 // "已 install" 判定：detail 文件在 + CLAUDE.md 内有我们的 sentinel 块（任意版本）。
@@ -487,7 +593,11 @@ function isAdopted({ cwd } = {}) {
   const cPath = claudeMdPath(effectiveCwd);
   const dPath = detailPath(effectiveCwd);
   if (!fs.existsSync(dPath) || !fs.existsSync(cPath)) return false;
-  const c = fs.readFileSync(cPath, 'utf8');
+  // Unreadable (EACCES) or a directory (EISDIR) → "not adopted here". A throw
+  // out of this predicate took SessionStart down with it (P1-16), and a file we
+  // cannot read cannot be proven to hold our block anyway.
+  let c;
+  try { c = fs.readFileSync(cPath, 'utf8'); } catch { return false; }
   // Line-anchored for the same reason stripSentinelBlock is: a user quoting the
   // markers in prose would otherwise read as adopted, and this gates the
   // idempotent auto-adopt — so the block would never actually be written.
@@ -507,8 +617,15 @@ function needsRefresh({ cwd, templatePath } = {}) {
     return false;
   }
   // Detail-doc body drift — strip the leading MANAGED_BY marker line first.
-  const shipped = fs.readFileSync(tpl);
-  const current = fs.readFileSync(dPath);
+  // Unreadable inputs → false: a refresh we cannot decide is one we must not
+  // attempt (and adopt() would refuse the write anyway). Never throws — this
+  // runs inside the SessionStart hook (P1-16).
+  let shipped;
+  let current;
+  try {
+    shipped = fs.readFileSync(tpl);
+    current = fs.readFileSync(dPath);
+  } catch { return false; }
   let body = current;
   const nl = current.indexOf(0x0a);
   // Equality on the trimmed line, matching the unadopt guard. `includes` here
@@ -523,7 +640,9 @@ function needsRefresh({ cwd, templatePath } = {}) {
   // needsRefresh always agree on the variant — including when a project gains a
   // web-framework dep and switches type bucket, or on a sentinel version bump.
   const block = buildBlock(detectProjectType(effectiveCwd));
-  return !fs.readFileSync(cPath, 'utf8').includes(block);
+  try {
+    return !fs.readFileSync(cPath, 'utf8').includes(block);
+  } catch { return false; }
 }
 
 // 检测脚本是否从 Claude Code 插件 cache 运行。
@@ -643,25 +762,45 @@ function unadopt({ cwd, home } = {}) {
       mine = h === MANAGED_BY
         || (h.startsWith(LEGACY_ADOPTED_BY) && h.endsWith('-->'));
     } catch { mine = false; }
-    if (mine) { fs.unlinkSync(dPath); fileRemoved = true; }
+    // The unlink itself can fail (read-only dir, EPERM) — an uninstall sweep
+    // must keep going for the remaining projects.
+    if (mine) {
+      try { fs.unlinkSync(dPath); fileRemoved = true; } catch { /* left behind, reported as not removed */ }
+    }
   }
 
   // CLAUDE.md — strip only our block. If nothing else remains, remove the file
   // we created; otherwise preserve the user's prose.
+  //
+  // Unreadable / a directory / an un-writable dir: report it and move on. This
+  // path runs over EVERY registered project from `uninstall --unadopt-all`, so
+  // one bad file used to abort the whole sweep with a raw stack trace (P1-16).
+  let claudeMdUnreadable = false;
+  let claudeMdUnwritable = false;
   if (fs.existsSync(cPath)) {
-    const before = fs.readFileSync(cPath, 'utf8');
-    const after = stripSentinelBlock(before);
-    if (after !== before) {
-      blockPruned = true;
-      // Only delete a file we could have created. A symlinked CLAUDE.md points
-      // at something the user owns (a shared team file, a dotfiles repo);
-      // unlinking it removes their link, and the "file we created" rationale
-      // does not apply. Write the stripped text through the link instead.
-      if (after.trim() === '' && !fs.lstatSync(cPath).isSymbolicLink()) {
-        fs.unlinkSync(cPath);
-        claudeMdRemoved = true;
-      } else {
-        writeFileAtomic(cPath, after, { followLink: true });
+    let before;
+    try {
+      before = fs.readFileSync(cPath, 'utf8');
+    } catch { claudeMdUnreadable = true; }
+    if (before !== undefined) {
+      const after = stripSentinelBlock(before);
+      if (after !== before) {
+        try {
+          // Only delete a file we could have created. A symlinked CLAUDE.md points
+          // at something the user owns (a shared team file, a dotfiles repo);
+          // unlinking it removes their link, and the "file we created" rationale
+          // does not apply. Write the stripped text through the link instead.
+          if (after.trim() === '' && !fs.lstatSync(cPath).isSymbolicLink()) {
+            fs.unlinkSync(cPath);
+            claudeMdRemoved = true;
+          } else {
+            writeFileAtomic(cPath, after, { followLink: true });
+          }
+          // Only after the write lands: `blockPruned` drives the "De-blocked"
+          // line, and claiming it for a write that threw is the same class of
+          // false success this batch keeps finding.
+          blockPruned = true;
+        } catch { claudeMdUnwritable = true; }
       }
     }
   }
@@ -669,8 +808,12 @@ function unadopt({ cwd, home } = {}) {
   // Also sweep any legacy memory-dir remnants (uninstall before auto-migration ran).
   const migrated = migrateLegacyMemoryDir({ cwd, home });
 
-  removeAdopted(effectiveCwd, home);
-  return { ok: true, fileRemoved, blockPruned, claudeMdRemoved, target: dPath, claudeMdPath: cPath, migrated };
+  const registryUpdated = removeAdopted(effectiveCwd, home);
+  return {
+    ok: true, fileRemoved, blockPruned, claudeMdRemoved,
+    claudeMdUnreadable, claudeMdUnwritable, registryUpdated,
+    target: dPath, claudeMdPath: cPath, migrated,
+  };
 }
 
 function formatResult(action, result) {
@@ -687,6 +830,18 @@ function formatResult(action, result) {
       }
       if (result.reason === 'no-template') {
         return `[code-graph] Template missing: ${result.template}`;
+      }
+      // Name the file and the OS error: "adopt failed: claude-md-unreadable" is
+      // not something a user can act on, and this is the arm a root-owned
+      // CLAUDE.md lands in.
+      if (result.reason === 'claude-md-unreadable' || result.reason === 'claude-md-unwritable') {
+        const what = result.reason === 'claude-md-unreadable' ? 'read' : 'write';
+        return `[code-graph] Cannot ${what} ${result.claudeMdPath} (${result.error || 'unknown error'}).\n` +
+               `  Nothing was changed. Fix its permissions (or move it aside) and re-run;\n` +
+               '  opt out entirely with CODE_GRAPH_NO_AUTO_ADOPT=1.';
+      }
+      if (result.reason === 'detail-unwritable') {
+        return `[code-graph] Cannot write ${result.detailPath} (${result.error || 'unknown error'}). Nothing was changed.`;
       }
       return `[code-graph] adopt failed: ${result.reason || 'unknown'}`;
     }
@@ -707,11 +862,16 @@ function formatResult(action, result) {
     if (result.claudeMdRemoved) lines.push(`[code-graph] Removed → ${result.claudeMdPath} (was code-graph-only)`);
     else if (result.blockPruned) lines.push(`[code-graph] De-blocked → ${result.claudeMdPath}`);
     if (result.fileRemoved) lines.push(`[code-graph] Removed → ${result.target}`);
+    if (result.claudeMdUnreadable || result.claudeMdUnwritable) {
+      lines.push(`[code-graph] Could not ${result.claudeMdUnreadable ? 'read' : 'write'} ${result.claudeMdPath} — ` +
+                 'the managed block (if any) is still there. Fix its permissions and re-run.');
+    }
     const m = result.migrated || {};
     if (m.memoryIndexPruned || m.legacyDetailRemoved) {
       lines.push('[code-graph] Cleaned legacy memory-dir artifacts.');
     }
     if (!result.blockPruned && !result.fileRemoved && !result.claudeMdRemoved &&
+        !result.claudeMdUnreadable && !result.claudeMdUnwritable &&
         !(m.memoryIndexPruned || m.legacyDetailRemoved)) {
       lines.push('[code-graph] Nothing to unadopt');
     }

@@ -761,18 +761,213 @@ test('adopt records the project in the registry; unadopt removes it', () => {
   } finally { sb.cleanup(); }
 });
 
-test('registry survives a corrupt file and never throws', () => {
+test('a corrupt registry never throws — and is never OVERWRITTEN (P1-12)', () => {
+  // This test used to assert the opposite: that adopt happily replaced the
+  // unreadable file with `[thisProject]`. That is the same read-modify-write
+  // destruction as the statusline registry — the list is the only record of
+  // which projects carry a managed CLAUDE.md block, and `uninstall
+  // --unadopt-all` is driven entirely by it. Losing the other entries leaves
+  // managed blocks stranded in every other repo, silently.
   const sb = makeSandbox();
   try {
     const { readAdoptedProjects, adoptedRegistryFile } = require('./adopt');
     const file = adoptedRegistryFile(sb.home);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, 'not-json');
+    const before = fs.readFileSync(file);
+
+    // The READ side still degrades to empty — callers must not crash.
     assert.deepStrictEqual(readAdoptedProjects(sb.home), []);
-    const r = adopt({ cwd: sb.cwd, home: sb.home }); // must not throw on corrupt registry
-    assert.strictEqual(r.ok, true);
-    assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
+
+    const r = adopt({ cwd: sb.cwd, home: sb.home }); // must not throw
+    assert.strictEqual(r.ok, true, 'adoption itself still succeeds — only the bookkeeping is skipped');
+    assert.deepStrictEqual(fs.readFileSync(file), before,
+      'the unreadable registry must be left byte-identical, not replaced');
+    assert.strictEqual(r.registryRecorded, false,
+      'and the result must say the project was NOT registered');
   } finally { sb.cleanup(); }
+});
+
+test('an UNREADABLE registry is not overwritten by adopt or unadopt', () => {
+  const sb = makeSandbox();
+  const { adoptedRegistryFile } = require('./adopt');
+  const file = adoptedRegistryFile(sb.home);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(['/some/other/project'], null, 2) + '\n');
+    const before = fs.readFileSync(file);
+    fs.chmodSync(file, 0o000);
+
+    assert.strictEqual(adopt({ cwd: sb.cwd, home: sb.home }).ok, true);
+    assert.strictEqual(unadopt({ cwd: sb.cwd, home: sb.home }).ok, true);
+
+    fs.chmodSync(file, 0o600);
+    assert.deepStrictEqual(fs.readFileSync(file), before,
+      'another project\'s registry entry must survive an unreadable-registry adopt/unadopt');
+  } finally {
+    try { fs.chmodSync(file, 0o600); } catch { /* gone */ }
+    sb.cleanup();
+  }
+});
+
+// ── P1-15: the newline collapse must not reach the user's prose ─────────────
+//
+// stripSentinelBlock ended with an unconditional `\n{3,} → \n\n` over the WHOLE
+// file. It runs on every SessionStart (via maybeAutoAdopt) and over every
+// registered project on uninstall, so a file that never contained our block was
+// still rewritten: blank lines inside fenced code blocks collapsed, and unadopt
+// reported "De-blocked" for a file it had merely reformatted.
+
+const FENCE_WITH_BLANKS = [
+  '# My notes',
+  '',
+  '```bash',
+  'first_command',
+  '',
+  '',
+  '',
+  'second_command_after_three_blank_lines',
+  '```',
+  '',
+  '',
+  '',
+  'Prose after a deliberate wide gap.',
+  '',
+].join('\n');
+
+test('unadopt on a file with NO block leaves it byte-identical (no reflow, no "De-blocked")', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, FENCE_WITH_BLANKS);
+    const before = fs.readFileSync(sb.claudeMd);
+
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+
+    assert.deepStrictEqual(fs.readFileSync(sb.claudeMd), before,
+      'a CLAUDE.md we never touched must come back byte-for-byte');
+    assert.strictEqual(res.blockPruned, false, 'nothing was pruned, so nothing may be reported as pruned');
+    assert.strictEqual(res.claudeMdRemoved, false);
+  } finally { sb.cleanup(); }
+});
+
+test('stripSentinelBlock leaves blank-line runs outside the block alone', () => {
+  const withBlock = FENCE_WITH_BLANKS + '\n' + buildBlock('generic') + '\n';
+  const out = stripSentinelBlock(withBlock);
+  assert.ok(!out.includes(SENTINEL_BEGIN), 'our block is gone');
+  assert.ok(out.includes('first_command\n\n\n\nsecond_command_after_three_blank_lines'),
+    'the three blank lines inside the user\'s bash fence must survive');
+  assert.ok(out.includes('```'), 'the fence itself survives');
+  // Nothing to collapse: no block was removed from inside the prose.
+  assert.strictEqual(stripSentinelBlock(FENCE_WITH_BLANKS), FENCE_WITH_BLANKS,
+    'a text with no block of ours is returned unchanged');
+});
+
+test('a block removed mid-file still heals ITS OWN seam (and only that seam)', () => {
+  const text = [
+    'Above.',
+    '',
+    buildBlock('generic'),
+    '',
+    'Below.',
+    '',
+    '',
+    '',
+    'Far below, after a wide gap the user wrote.',
+  ].join('\n');
+  const out = stripSentinelBlock(text);
+  assert.ok(!out.includes(SENTINEL_BEGIN));
+  assert.ok(out.includes('Above.\n\nBelow.'), `the seam must collapse to one blank line, got:\n${out}`);
+  assert.ok(out.includes('Below.\n\n\n\nFar below'), 'the user\'s wide gap elsewhere is untouched');
+});
+
+test('adopt preserves the user\'s existing prose byte-for-byte above the block', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, FENCE_WITH_BLANKS);
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('first_command\n\n\n\nsecond_command_after_three_blank_lines'),
+      'blank lines inside the user\'s fence must not be collapsed by an adopt');
+    assert.ok(after.includes(SENTINEL_BEGIN), 'and the block is installed');
+  } finally { sb.cleanup(); }
+});
+
+// ── P1-16: an unreadable / directory CLAUDE.md must not throw ───────────────
+//
+// adopt() read CLAUDE.md, the detail file and the template with bare
+// readFileSync. EACCES (a root-owned CLAUDE.md) or EISDIR (a directory of that
+// name) threw out of maybeAutoAdopt, out of runSessionInit, and killed the whole
+// SessionStart hook — binary verification, index freshness and the self-test all
+// silently stopped running.
+
+test('adopt on an UNREADABLE CLAUDE.md returns a status instead of throwing', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, '# mine\n');
+    fs.chmodSync(sb.claudeMd, 0o000);
+    const r = adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, 'claude-md-unreadable');
+  } finally {
+    try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
+    sb.cleanup();
+  }
+});
+
+test('adopt on a CLAUDE.md that is a DIRECTORY returns a status instead of throwing', () => {
+  const sb = makeSandbox();
+  try {
+    fs.mkdirSync(sb.claudeMd);
+    const r = adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, 'claude-md-unreadable');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt tolerates an unreadable CLAUDE.md (uninstall sweeps every project)', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, '# mine\n');
+    fs.chmodSync(sb.claudeMd, 0o000);
+    const r = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(r.ok, true, 'unadopt must complete its other steps');
+    assert.strictEqual(r.claudeMdUnreadable, true);
+    assert.strictEqual(r.blockPruned, false);
+  } finally {
+    try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
+    sb.cleanup();
+  }
+});
+
+test('isAdopted / needsRefresh return false (never throw) on an unreadable CLAUDE.md', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    fs.chmodSync(sb.claudeMd, 0o000);
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false);
+    assert.strictEqual(needsRefresh({ cwd: sb.cwd }), false);
+  } finally {
+    try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
+    sb.cleanup();
+  }
+});
+
+test('maybeAutoAdopt surfaces the unreadable CLAUDE.md instead of throwing', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, '# mine\n');
+    fs.chmodSync(sb.claudeMd, 0o000);
+    const r = maybeAutoAdopt({
+      cwd: sb.cwd, home: sb.home, env: {},
+      scriptPath: path.join(os.homedir(), '.claude', 'plugins', 'cache', 'x', 'scripts'),
+    });
+    assert.strictEqual(r.attempted, true);
+    assert.strictEqual(r.result.ok, false);
+    assert.strictEqual(r.result.reason, 'claude-md-unreadable');
+  } finally {
+    try { fs.chmodSync(sb.claudeMd, 0o600); } catch { /* ok */ }
+    sb.cleanup();
+  }
 });
 
 // ── unadopt must never delete the user's own prose ──────────────────────────

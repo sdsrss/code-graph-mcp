@@ -177,7 +177,11 @@ function shouldCheck(state, { force = false, binaryMissing = false, binaryStale 
   if (state.rateLimited) return elapsed >= RATE_LIMIT_INTERVAL_MS;
   if (binaryMissing) return true;
   if (!isUpdateSuspended(state)) {
-    if (binaryStale) return true;
+    // ...and only while that heal still has a retry budget. Once it is spent,
+    // the bypass re-fetched the API and re-entered the ~40MB download on every
+    // single session (P1-14) — the same reasoning that keeps `binaryStale` out
+    // of the suspended branch.
+    if (binaryStale && !isBinaryHealExhausted(state)) return true;
     if (force) return elapsed >= SESSION_START_MIN_GAP_MS;
   }
   const interval = state.updateAvailable === false ? UP_TO_DATE_RECHECK_MS : CHECK_INTERVAL_MS;
@@ -726,9 +730,71 @@ async function downloadAndInstall(latest, {
  * on the shell-matches-latest path. Extracted + injectable so the wiring itself is
  * regression-tested, not just the predicate. Returns true iff a download promoted.
  */
-async function selfHealStaleBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate, download = downloadBinary } = {}) {
-  if (!needsUpdate(latest)) return false;
-  return await download(latest);
+/**
+ * Replace a missing/stale cached binary — BOUNDED, per target version.
+ *
+ * This had no counter, so a promote that could not land (the Windows case named
+ * at promoteVerifiedBinary: the running MCP server holds the .exe, rename →
+ * EACCES) re-downloaded ~40MB on every session forever: the caller cleared
+ * `updateAttempts`/`suspendedAt` unconditionally right after calling this, and
+ * `shouldCheck`'s `binaryStale` arm bypasses the throttle (audit 2026-08-16
+ * P1-14; measured 8 calls → 8 downloads).
+ *
+ * Counted the same way as selfHealGlobalPkgs, including its hard-won rule:
+ * success is "the binary is no longer stale", NOT "download() returned true".
+ * A download whose promote silently failed used to reset the budget on every
+ * run, which is a cap that can never be reached.
+ *
+ * The counter is deliberately SEPARATE from `updateAttempts`: that one tracks
+ * the plugin-shell update, and the branch this runs in resets it because the
+ * shell IS current. Sharing it would have made each reset re-arm the other.
+ *
+ * @returns {{healed: boolean, patch: object}} patch is spread into the state save
+ */
+async function selfHealStaleBinary(latest, {
+  state = {}, needsUpdate = cachedBinaryNeedsUpdate, download = downloadBinary,
+  binaryPresent = () => fs.existsSync(cachedBinaryPath()),
+} = {}) {
+  if (!latest || !needsUpdate(latest)) {
+    // Healthy → clear any leftover counter so the next real staleness starts fresh.
+    return {
+      healed: false,
+      patch: state.binaryHealAttempts ? { binaryHealAttempts: 0, binaryHealVersion: null } : {},
+    };
+  }
+  // A MISSING binary is exempt from the attempt budget: with no engine at all
+  // the MCP server is dead, and `needsUpdate` returns true for "absent" too —
+  // letting the stale-heal counter absorb those failures would permanently
+  // park the only recovery path after five offline session starts (batch
+  // review of the P1-14 fix). The budget exists to stop re-downloading over a
+  // binary that RUNS but cannot be replaced (Windows EACCES-on-rename); a
+  // missing binary keeps the pre-P1-14 unbounded retry on purpose.
+  const missing = !binaryPresent();
+  const attempts = state.binaryHealVersion === latest.version ? (state.binaryHealAttempts || 0) : 0;
+  if (!missing && attempts >= MAX_UPDATE_ATTEMPTS) return { healed: false, patch: {} };
+  await download(latest);
+  // Re-read the disk, not the return value (see above).
+  const stillStale = needsUpdate(latest);
+  return {
+    healed: !stillStale,
+    patch: {
+      binaryHealVersion: latest.version,
+      binaryHealAttempts: !stillStale ? 0 : missing ? attempts : attempts + 1,
+    },
+  };
+}
+
+/**
+ * The stale-binary heal has spent its budget on the release we are tracking.
+ * Read by shouldCheck: with the heal parked, the `binaryStale` throttle bypass
+ * can accomplish nothing and would just re-fetch the API (and, worse, re-enter
+ * the download path) every session. Re-arms itself when `latestVersion` moves.
+ */
+function isBinaryHealExhausted(state) {
+  return Boolean(state)
+    && Boolean(state.binaryHealVersion)
+    && state.binaryHealVersion === state.latestVersion
+    && (state.binaryHealAttempts || 0) >= MAX_UPDATE_ATTEMPTS;
 }
 
 // ── Global npm package self-heal ───────────────────────────
@@ -1052,7 +1118,8 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     // OR stale (see selfHealStaleBinary). The shell version (manifest.version)
     // can match latest while the cached binary lags — this is exactly the wild
     // failure observed in the field (shell at v0.45, binary pinned at v0.16.6).
-    const selfHealedBinary = await selfHealStaleBinary(latest);
+    const binaryHeal = await selfHealStaleBinary(latest, { state });
+    const selfHealedBinary = binaryHeal.healed;
 
     // Same for the GLOBAL npm delivery surface (the `code-graph-mcp` CLI on
     // PATH + any explicitly-installed platform package): nothing else ever
@@ -1078,6 +1145,10 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       suspendedAt: null,
       rateLimited: false,
       binaryUpdated: selfHealedBinary || state.binaryUpdated,
+      // The shell-update counters above reset because the shell IS current.
+      // The BINARY heal keeps its own, un-reset budget — clearing it here is
+      // what made the stale-binary re-download unbounded (P1-14).
+      ...binaryHeal.patch,
       ...globalHeal,
     });
     return selfHealedBinary
@@ -1101,7 +1172,7 @@ module.exports = {
   PLUGIN_ASSET_NAME,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   getPlatformAssetName,
-  selfHealStaleBinary,
+  selfHealStaleBinary, isBinaryHealExhausted,
   selfHealGlobalPkgs, staleGlobalPkgs, globalPkgVersion, npmInstallGlobal,
   shouldHealGlobalsOnThrottle, inactiveNodeGlobalRelics,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,

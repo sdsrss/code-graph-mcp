@@ -1,7 +1,15 @@
 //! `ast_search` — structural enumeration with type/returns/params filters.
+//!
+//! The pipeline (filter-aware candidate pool, Rust-side column filtering,
+//! name-substring fallback) lives in [`crate::search::ast_query`] so this and
+//! the CLI twin (`cmd_ast_search`) cannot answer the same query differently —
+//! they did: the fallback existed here only (audit 2026-08-16 P1-8). This file
+//! owns the MCP response shape and hint wording.
+//!
 //! Generic-fallback hint kicks in when zero hits + returns_filter has angle brackets.
 
 use super::super::*;
+use crate::search::ast_query::{run as run_ast_search, AstSearchParams};
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_ast_search(
@@ -41,81 +49,23 @@ impl McpServer {
             }
         }
 
-        let results: Vec<queries::NodeWithFile> = if let Some(q) = query {
-            // FTS5 search + filter in Rust
-            let fts_result = queries::fts5_search(self.db.conn(), q, (limit * 4) as i64)?;
-            if fts_result.nodes.is_empty() {
-                return Ok(json!({ "results": [], "message": "No results found." }));
-            }
-            let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
-            let all = queries::get_nodes_with_files_by_ids(self.db.conn(), &node_ids)?;
-
-            // Preserve FTS5 rank order
-            let id_order: std::collections::HashMap<i64, usize> = node_ids
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (*id, i))
-                .collect();
-            let mut sorted = all;
-            sorted.sort_by_key(|nwf| id_order.get(&nwf.node.id).copied().unwrap_or(usize::MAX));
-
-            sorted
-                .into_iter()
-                .filter(|nwf| {
-                    let n = &nwf.node;
-                    // Skip <module>/<external> placeholders and test symbols, consistent
-                    // with semantic_code_search/find_similar_code (is_skippable_result).
-                    // ast_search previously leaked these into structural results.
-                    if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path) {
-                        return false;
-                    }
-                    if let Some(tf) = type_filter {
-                        let types = normalize_type_filter_mcp(tf);
-                        if !types.contains(&n.node_type) {
-                            return false;
-                        }
-                    }
-                    if let Some(rf) = returns_filter {
-                        match &n.return_type {
-                            Some(rt) => {
-                                if !rt.to_lowercase().contains(&rf.to_lowercase()) {
-                                    return false;
-                                }
-                            }
-                            None => return false,
-                        }
-                    }
-                    if let Some(pf) = params_filter {
-                        match &n.param_types {
-                            Some(pt) => {
-                                if !pt.to_lowercase().contains(&pf.to_lowercase()) {
-                                    return false;
-                                }
-                            }
-                            None => return false,
-                        }
-                    }
-                    true
-                })
-                .take(limit)
-                .collect()
-        } else {
-            // Filter-only: direct SQL
-            let normalized = type_filter.map(normalize_type_filter_mcp);
-            let type_refs: Option<Vec<&str>> = normalized
-                .as_ref()
-                .map(|v| v.iter().map(|s| s.as_str()).collect());
-            queries::get_nodes_with_files_by_filters(
-                self.db.conn(),
-                type_refs.as_deref(),
+        let outcome = run_ast_search(
+            self.db.conn(),
+            &AstSearchParams {
+                query,
+                type_filter,
                 returns_filter,
                 params_filter,
-                None,
                 limit,
-            )?
-        };
+            },
+        )?;
 
-        let items: Vec<serde_json::Value> = results
+        if outcome.fts_empty {
+            return Ok(json!({ "results": [], "count": 0, "message": "No results found." }));
+        }
+
+        let items: Vec<serde_json::Value> = outcome
+            .results
             .iter()
             .map(|nwf| {
                 let n = &nwf.node;
@@ -137,54 +87,55 @@ impl McpServer {
             "results": items,
             "count": items.len(),
         });
+        if let Some(total) = outcome.matched_total {
+            response["matched_total"] = json!(total);
+        }
 
-        // FTS-rank fallback: when query+type returns zero (FTS rank can drown
-        // structs/enums under function-name hits — e.g. query="Result" type=struct
-        // bottoms out because top FTS hits for "Result" are functions like
-        // `compress_results`), retry as SQL `name LIKE '%query%'` + type filter.
-        // Single-identifier queries only — multi-word/operator queries stay FTS-only
-        // since LIKE substring is not a useful fallback for them.
-        if items.is_empty() && type_filter.is_some() {
+        if outcome.fallback_used {
             if let Some(q) = query {
-                if is_identifier_like(q) {
-                    let normalized = type_filter.map(normalize_type_filter_mcp);
-                    let type_refs: Option<Vec<&str>> = normalized
-                        .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect());
-                    let retry = queries::get_nodes_with_files_by_filters(
-                        self.db.conn(),
-                        type_refs.as_deref(),
-                        returns_filter,
-                        params_filter,
-                        Some(q),
-                        limit,
-                    )?;
-                    if !retry.is_empty() {
-                        let retry_items: Vec<serde_json::Value> = retry
-                            .iter()
-                            .map(|nwf| {
-                                let n = &nwf.node;
-                                json!({
-                                    "node_id": n.id,
-                                    "name": n.qualified_name.as_deref().unwrap_or(&n.name),
-                                    "type": n.node_type,
-                                    "file_path": nwf.file_path,
-                                    "start_line": n.start_line,
-                                    "end_line": n.end_line,
-                                    "signature": n.signature,
-                                    "return_type": n.return_type,
-                                    "param_types": n.param_types,
-                                })
-                            })
-                            .collect();
-                        response["results"] = json!(retry_items);
-                        response["count"] = json!(retry_items.len());
-                        response["hint"] = json!(format!(
-                            "FTS rank had no '{}' under type filter; falling back to name-substring match.", q
-                        ));
-                    }
-                }
+                response["hint"] = json!(format!(
+                    "FTS rank had no '{}' under the active filter; falling back to name-substring match.",
+                    q
+                ));
             }
+        }
+
+        // Truncation is a disclosure, not a nicety: "count: 20" is otherwise
+        // indistinguishable from "20 matches exist" and the caller reports the
+        // cut set as the complete answer. The remedy is to RAISE limit.
+        if outcome.truncated {
+            response["truncated"] = json!(true);
+            response["hint"] = json!(match outcome.matched_total {
+                Some(total) => format!(
+                    "{} symbols matched but limit={} — raise `limit` to see the rest.",
+                    total, limit
+                ),
+                None => format!(
+                    "More symbols matched than limit={} — raise `limit` to see the rest.",
+                    limit
+                ),
+            });
+        }
+
+        // Empty because the structural filters rejected everything: say what
+        // happened. When the candidate pool came back full, "nothing matched"
+        // is bounded by the pool rather than by the index, and telling the user
+        // to broaden the filter is the wrong remedy — the query is what needs
+        // narrowing, or the filters should run without a query at all.
+        if items.is_empty() && outcome.dropped_by_filter > 0 {
+            response["filtered_out"] = json!(outcome.dropped_by_filter);
+            response["message"] = json!(format!(
+                "No results — {} candidate(s) matched the query but not the filter.",
+                outcome.dropped_by_filter
+            ));
+            response["hint"] = json!(if outcome.pool_saturated {
+                format!(
+                    "The candidate pool was full ({} rows), so matches may exist below it. Narrow the query, raise `limit`, or drop `query` and enumerate with the filters alone.",
+                    outcome.fetch_count
+                )
+            } else {
+                "The index has no symbol matching both the query and the filter. Broaden or clear the filter.".to_string()
+            });
         }
 
         // Generic-fallback hint: when returns_filter has angle brackets and zero hits,
@@ -233,28 +184,89 @@ impl McpServer {
     }
 }
 
-/// True when `s` looks like a single identifier (alphanumeric + underscore, no
-/// whitespace). Used to gate the name-substring fallback — multi-word queries
-/// like "function returning result" should not silently turn into LIKE patterns.
-fn is_identifier_like(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
-
 #[cfg(test)]
 mod tests {
-    use super::is_identifier_like;
+    use super::*;
 
+    /// Index where 40 `node_*` functions outrank 8 `Node*` structs in BM25, the
+    /// shape the audit measured on this repo (`ast-search node --type struct`
+    /// showed 3 of 39 matches at the default limit, 0 at limit 5).
+    fn drown_project() -> tempfile::TempDir {
+        let project = tempfile::TempDir::new().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut walk = String::new();
+        for i in 0..40 {
+            walk.push_str(&format!(
+                "pub fn node_walk_{i:02}(node: &NodeRef) -> u32 {{\n    let node_id = node.node_id();\n    let node_depth = node.node_depth();\n    node_id + node_depth + node_id\n}}\n"
+            ));
+        }
+        std::fs::write(src.join("walk.rs"), walk).unwrap();
+        let mut types = String::new();
+        for name in [
+            "NodeAlpha",
+            "NodeBravo",
+            "NodeCharlie",
+            "NodeDelta",
+            "NodeEcho",
+            "NodeFoxtrot",
+            "NodeGolf",
+            "NodeHotel",
+        ] {
+            types.push_str(&format!("pub struct {name} {{\n    pub id: u32,\n}}\n"));
+        }
+        std::fs::write(src.join("types.rs"), types).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub mod walk;\npub mod types;\n").unwrap();
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        project
+    }
+
+    fn indexed_server(project: &tempfile::TempDir) -> McpServer {
+        let server = McpServer::new_test_with_project(project.path());
+        crate::indexer::pipeline::run_full_index(&server.db, project.path(), None, None).unwrap();
+        server
+    }
+
+    /// A filtered query must not report zero while matches sit below a fixed
+    /// `limit * 4` cut, and a truncated answer must say it was truncated.
     #[test]
-    fn test_is_identifier_like() {
-        assert!(is_identifier_like("Result"));
-        assert!(is_identifier_like("FtsResult"));
-        assert!(is_identifier_like("snake_case"));
-        assert!(is_identifier_like("with42numbers"));
-        assert!(is_identifier_like("中文标识符"));
-        assert!(!is_identifier_like(""));
-        assert!(!is_identifier_like("two words"));
-        assert!(!is_identifier_like("Result<T>"));
-        assert!(!is_identifier_like("a:b"));
-        assert!(!is_identifier_like("path/to/file"));
+    fn type_filtered_query_returns_matches_and_discloses_truncation() {
+        let project = drown_project();
+        let server = indexed_server(&project);
+        let out = server
+            .tool_ast_search(&json!({
+                "query": "node",
+                "type": "struct",
+                "limit": 5,
+                "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["count"], 5,
+            "8 structs exist and 5 were asked for; got {out}"
+        );
+        assert_eq!(out["matched_total"], 8, "got {out}");
+        assert_eq!(out["truncated"], true, "got {out}");
+        assert!(
+            out["hint"].as_str().unwrap_or("").contains("limit"),
+            "the remedy is raising limit; got {out}"
+        );
+    }
+
+    /// Default limit: every one of the 8 matches fits, so nothing is truncated
+    /// and no hint is owed.
+    #[test]
+    fn type_filtered_query_at_default_limit_returns_every_match() {
+        let project = drown_project();
+        let server = indexed_server(&project);
+        let out = server
+            .tool_ast_search(&json!({"query": "node", "type": "struct", "skip_indexing": true}))
+            .unwrap();
+        assert_eq!(out["count"], 8, "all 8 Node* structs must come back: {out}");
+        assert!(out.get("truncated").is_none(), "nothing was cut: {out}");
     }
 }

@@ -777,6 +777,43 @@ pub(super) fn index_files(
     // Computed BEFORE Phase 0 because the delete path needs the same guard.
     let run_file_paths: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
 
+    // Run-completion marker (audit 2026-08-16 P1-2). Every cross-file relation
+    // this run cannot resolve at batch time lives in the in-memory `deferred`
+    // vector until the single savepoint after the batch loop. The per-batch
+    // savepoints, meanwhile, commit each file's NEW HASH as they go — so a run
+    // killed between the first batch commit and the deferred commit leaves the
+    // index claiming those files are indexed while their cross-file edges were
+    // never written, and `compute_diff` never offers them again. Nothing in the
+    // pipeline could observe that afterwards.
+    //
+    // Written BEFORE Phase 0 (which commits its deletions in its own savepoint)
+    // so no committed change of this run precedes the marker. Cleared right
+    // after the deferred commit, which is the point where the edges are durable;
+    // everything past it — context strings, the pending sweep, the global post
+    // passes — is recomputed by any later run that indexes anything, so an
+    // interruption there is not worth a full re-index.
+    //
+    // A no-op run writes nothing: watcher flushes reach here with an empty diff
+    // constantly, and two meta writes per tick would be pure churn.
+    //
+    // Known amplification, accepted deliberately: any `?` between the marker
+    // write and the post-deferred clear — a crash, but also an ordinary error
+    // like SQLITE_BUSY from a concurrent CLI writer during a one-file
+    // query-time refresh — leaves the marker durable, and the NEXT run
+    // escalates to a full re-index (plus a re-embed under `embed-model`). That
+    // is the conservative trade: an error mid-run means we cannot prove which
+    // cross-file edges were durably committed, and a wrongly-cheap answer here
+    // is the silent edge-loss class this marker exists to close. The escalated
+    // run clears the marker, so the cost is one full pass, not a loop.
+    let has_work = !files.is_empty() || !delete_paths.is_empty();
+    if has_work {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+            "1",
+        )?;
+    }
+
     // Phase 0: Delete removed files in own transaction.
     if !delete_paths.is_empty() {
         buffer_then_delete_files(db, delete_paths, &run_file_paths, &mut deferred)?;
@@ -827,6 +864,22 @@ pub(super) fn index_files(
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
 
+        // The paths this batch purges WITHOUT reinserting anything. They have to
+        // join `batch_file_paths` below, which is the set that both excludes a
+        // file's old ids from the per-batch resolution pool and prunes them out
+        // of `global_name_map` after the commit. Built from `batch_parsed` alone
+        // it covered only the files that PARSED, so a skipped file's ids stayed
+        // in the map pointing at rows that no longer exist — and the deferred
+        // pass resolved a requeued relation onto one, aborting the whole run on
+        // the edges FK (787) after the batch savepoint had already committed the
+        // file's new hash, which put the file permanently out of reach of
+        // `compute_diff` (audit 2026-08-16 P0-1).
+        let skipped_paths: Vec<String> = pre_parsed
+            .skipped
+            .iter()
+            .map(|sk| sk.rel_path.clone())
+            .collect();
+
         // Files we know the identity of but not the symbols (oversize /
         // unparsable): record the hash so they stop re-diffing forever, and
         // purge whatever symbols the index still claims for them — those are
@@ -869,8 +922,12 @@ pub(super) fn index_files(
         // --- Phase 2: Extract relations + insert edges ---
         // Build per-batch name_to_ids and node_id_to_path from the pre-loaded global map,
         // excluding files in the current batch (their old nodes were deleted in Phase 1b).
-        let batch_file_paths: HashSet<&str> =
+        let mut batch_file_paths: HashSet<&str> =
             batch_parsed.iter().map(|pf| pf.rel_path.as_str()).collect();
+        // Purged-but-not-reinserted files (see `skipped_paths`): their old ids
+        // must be excluded from this batch's pool and pruned from the global map
+        // exactly like a reindexed file's, or they resolve onto deleted rows.
+        batch_file_paths.extend(skipped_paths.iter().map(|p| p.as_str()));
 
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
@@ -1683,6 +1740,7 @@ pub(super) fn index_files(
     // Phase 2b-final: re-run resolution for relations deferred at batch time
     // (cross-batch targets — audit 2026-08-02 P0-1). Must run BEFORE Phase 3 so
     // context strings see the recovered edges.
+    let mut deferred_edges = 0usize;
     if !deferred.is_empty() {
         let deferred_count = deferred.len();
         let tx = db.savepoint("idx_deferred")?;
@@ -1694,6 +1752,7 @@ pub(super) fn index_files(
             &python_module_map,
         )?;
         tx.commit()?;
+        deferred_edges = d_edges;
         total_edges_created += d_edges;
         total_nodes_created += d_nodes;
         tracing::debug!(
@@ -1702,6 +1761,14 @@ pub(super) fn index_files(
             d_edges,
             d_nodes
         );
+    }
+
+    // Cross-file edges are durable from here on — clear the marker set above.
+    if has_work {
+        crate::storage::queries::delete_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+        )?;
     }
 
     // Finalizing heartbeat: every phase below is a full-graph pass with no
@@ -1777,7 +1844,20 @@ pub(super) fn index_files(
     // spilled remainder would drain on a batch whose own files are unchanged;
     // this term is what keeps those edges from holding a confidence they never
     // earned. Gating on the observable keeps the invariant local.
-    if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
+    //
+    // `deferred_edges > 0` states the same invariant for Phase 2b-final, which
+    // also inserts cross-file by-name binds. It is not implied by the other three:
+    // a run whose ONLY changed file was skipped for size or a parse failure
+    // indexes nothing (`all_indexed` empty), deletes nothing, and never reaches
+    // the pending sweep — yet its purge requeues that file's inbound relations,
+    // and the deferred pass re-binds them. Without this term those edges kept the
+    // `extracted` column default, the top confidence tier, having never been
+    // classified (audit 2026-08-16, the P2 riding with P0-1).
+    if !all_indexed.is_empty()
+        || !delete_paths.is_empty()
+        || pending_resolved > 0
+        || deferred_edges > 0
+    {
         finalize_tick();
         // The post-passes below are the first big correlated-subquery joins over
         // the graph this run just wrote, and on a fresh index there is no
@@ -2207,15 +2287,49 @@ fn resolve_deferred_relations(
         CalleeMeta,
     };
 
+    // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
+    // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
+    // was loaded before the batch loop and pruned per batch, and every
+    // `source_ids` was captured when its relation was buffered. Any bookkeeping
+    // miss on either side puts a deleted id in front of `insert_edge_cached`,
+    // where the edges FK aborts the savepoint and destroys the WHOLE run's
+    // cross-file edges — one bad id costing every good one. Screening both sides
+    // against the live node set turns that into a skipped edge plus a warning.
+    //
+    // This is containment, not recovery: the id is dropped, not re-queued. It is
+    // inert whenever the bookkeeping is right, which is what the warning is for —
+    // a nonzero count means a purge site is still missing its map removal, and
+    // that is a bug to fix at the purge site, not here.
+    //
+    // The scan is proportional to work already being done: the map walk below is
+    // already O(all nodes), and this is one index-only pass over the same rows.
+    let live_ids: HashSet<i64> = {
+        let mut stmt = db.conn().prepare("SELECT id FROM nodes")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<HashSet<i64>, _>>()?
+    };
+    let mut dead_map_ids = 0usize;
+
     let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
     let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
     let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
     for (name, entries) in global_name_map {
         for (id, path, language) in entries {
+            if !live_ids.contains(id) {
+                dead_map_ids += 1;
+                continue;
+            }
             name_to_ids.entry(name.clone()).or_default().push(*id);
             node_id_to_path.insert(*id, path.clone());
             node_id_to_language.insert(*id, language.clone());
         }
+    }
+    if dead_map_ids > 0 {
+        tracing::warn!(
+            "[index] Phase 2b-final: {} name-map entr(ies) referenced deleted nodes and were \
+             skipped — a node purge did not prune the run's name map",
+            dead_map_ids
+        );
     }
     for ids in name_to_ids.values_mut() {
         ids.sort();
@@ -2244,7 +2358,28 @@ fn resolve_deferred_relations(
             let same_lang = same_lang_of(&all, &d.language, &[]);
             refine_ambiguous_targets(&same_lang, &d.rel_path, &node_id_to_path)
         } else {
-            d.source_ids.clone()
+            // Source ids were captured when the relation was buffered, which for
+            // a requeue is before its holder's own purge. `restore_inbound_edges`
+            // and Phase 0 both guard against buffering an about-to-die id; this
+            // screen is what keeps a miss in either guard from aborting the run
+            // (see the `live_ids` note above).
+            let live: Vec<i64> = d
+                .source_ids
+                .iter()
+                .copied()
+                .filter(|id| live_ids.contains(id))
+                .collect();
+            if live.len() != d.source_ids.len() {
+                tracing::warn!(
+                    "[index] Phase 2b-final: dropped {} deleted source id(s) for {} {} → {} in {}",
+                    d.source_ids.len() - live.len(),
+                    d.language,
+                    d.relation,
+                    d.target_name,
+                    d.rel_path
+                );
+            }
+            live
         };
         if source_ids.is_empty() {
             continue;

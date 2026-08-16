@@ -14,7 +14,7 @@ const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { resolveProjectRoot } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
-const { emitPreToolAllowContext } = require('./hook-emit');
+const { emitPreToolContext } = require('./hook-emit');
 const { hidden } = require('./proc-opts');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
@@ -217,10 +217,18 @@ summary += formatCoveringTests(jsonResult.test_callers, editedFile);
 // fire with the count alone — the verdict must stay coherent either way.
 summary += `  → Before this edit: confirm each caller of ${symbol}() still holds with your change, or note why it is unaffected.\n`;
 
-// Compound-grep sibling sweep: deliver via the PreToolUse allow+additionalContext
-// envelope (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in the
-// debug log only and never reaches the model (CC docs v2026-06); additionalContext
-// is what actually surfaces the impact summary. Impact must stay PRE-edit (so the
-// reconciliation happens before the change), hence allow + additionalContext, not
-// a PostToolUse inject.
-process.stdout.write(emitPreToolAllowContext(summary) + '\n');
+// Deliver via the PERMISSION-NEUTRAL PreToolUse additionalContext envelope
+// (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in the debug
+// log only and never reaches the model (CC docs v2026-06); additionalContext is
+// what surfaces the impact summary, and it is delivered without any
+// permissionDecision — the tool's normal permission flow is untouched.
+//
+// It used to send `permissionDecision: 'allow'` alongside it. That is documented
+// as "skip the interactive permission prompt", so on a machine that prompts for
+// Edit this hook silently answered that prompt for the user, for every symbol
+// with >=1 caller outside the 2-minute cooldown (audit 2026-08-16 P0-2). Context
+// delivery is never worth a write consent: if a future CC requires a decision to
+// carry additionalContext, this summary goes quiet rather than elevating again.
+// Impact must stay PRE-edit (the reconciliation happens before the change), so a
+// PostToolUse inject is not an alternative here.
+process.stdout.write(emitPreToolContext(summary) + '\n');

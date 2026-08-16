@@ -16,7 +16,21 @@
 // (this plugin's own provider). Third parties should use stable ids like
 // "gsd", "claude-mem", etc.
 
-const { readRegistry, registerStatuslineProvider, unregisterStatuslineProvider } = require('./lifecycle');
+const {
+  readRegistry, readRegistryForWrite, registerStatuslineProvider, unregisterStatuslineProvider,
+} = require('./lifecycle');
+
+// A registry that EXISTS but cannot be read is a refusal, not a no-op: the
+// mutation functions leave it alone (they must — it holds the user's previous
+// statusline and other plugins' entries), which would otherwise surface here as
+// the cheerful "unchanged <id>" / "not-found <id>" at exit 0. A third-party
+// installer reading that exit code would believe it is wired in.
+function bailIfRegistryUnusable(action) {
+  const { refuse, why } = readRegistryForWrite();
+  if (!refuse) return;
+  process.stderr.write(`error: ${why} — nothing ${action}. Repair or move that file aside and retry.\n`);
+  process.exit(2);
+}
 
 function usage(code = 1) {
   process.stderr.write(
@@ -34,12 +48,14 @@ function runRegister(id, command, needsStdin) {
     process.exit(2);
   }
   if (!id || !command) usage();
+  bailIfRegistryUnusable('registered');
   const changed = registerStatuslineProvider(id, command, needsStdin);
   process.stdout.write(changed ? `registered ${id}\n` : `unchanged ${id}\n`);
 }
 
 function runUnregister(id) {
   if (!id) usage();
+  bailIfRegistryUnusable('unregistered');
   const changed = unregisterStatuslineProvider(id);
   process.stdout.write(changed ? `unregistered ${id}\n` : `not-found ${id}\n`);
 }

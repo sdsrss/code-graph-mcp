@@ -1610,3 +1610,111 @@ fn mcp_doubled_separator_in_file_path_does_not_duplicate_the_index() {
         .unwrap();
     assert_eq!(alphas, 1, "one source symbol must stay one node");
 }
+
+/// MCP `ast_search` and CLI `ast-search` must return the SAME SYMBOLS for the
+/// same query — data parity, not shape parity (shapes legitimately differ per
+/// surface).
+///
+/// They did not: both fetched a fixed `limit * 4` FTS rows and filtered in
+/// Rust, but only the MCP copy had a `name LIKE '%query%'` fallback for the
+/// "FTS rank drowned the type" case. On a type-filtered query whose matches
+/// ranked below the cut, MCP answered from the fallback while the CLI reported
+/// zero — opposite answers, same index (audit 2026-08-16 P1-8). Both now call
+/// `crate::search::ast_query::run`.
+#[test]
+fn mcp_and_cli_ast_search_agree_on_a_type_filtered_query() {
+    // 40 `node_*` functions outrank 8 `Node*` structs in BM25, so the structs
+    // sit below the old 20-row (limit 5 × 4) candidate cut.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut walk = String::new();
+    for i in 0..40 {
+        walk.push_str(&format!(
+            "pub fn node_walk_{i:02}(node: &NodeRef) -> u32 {{\n    let node_id = node.node_id();\n    let node_depth = node.node_depth();\n    node_id + node_depth + node_id\n}}\n"
+        ));
+    }
+    std::fs::write(src.join("walk.rs"), walk).unwrap();
+    let mut types = String::new();
+    for name in [
+        "NodeAlpha",
+        "NodeBravo",
+        "NodeCharlie",
+        "NodeDelta",
+        "NodeEcho",
+        "NodeFoxtrot",
+        "NodeGolf",
+        "NodeHotel",
+    ] {
+        types.push_str(&format!("pub struct {name} {{\n    pub id: u32,\n}}\n"));
+    }
+    std::fs::write(src.join("types.rs"), types).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod walk;\npub mod types;\n").unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let names_of = |v: &Value| -> Vec<String> {
+        let mut n: Vec<String> = v["results"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        n.sort();
+        n
+    };
+
+    let mut client = McpClient::spawn(project.path());
+    let mcp_body = extract_tool_payload(&client.call_tool(
+        "ast_search",
+        json!({"query": "node", "type": "struct", "limit": 5}),
+    ));
+    drop(client);
+
+    let out = Command::new(binary_path())
+        .current_dir(project.path())
+        .args([
+            "ast-search",
+            "node",
+            "--type",
+            "struct",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .output()
+        .expect("run cli");
+    let cli_body: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "cli --json must emit JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+
+    let mcp_names = names_of(&mcp_body);
+    let cli_names = names_of(&cli_body);
+    assert_eq!(
+        mcp_names.len(),
+        5,
+        "MCP must return 5 of the 8 matching structs: {mcp_body}"
+    );
+    assert_eq!(
+        mcp_names, cli_names,
+        "the two surfaces must name the same symbols.\nMCP: {mcp_body}\nCLI: {cli_body}"
+    );
+    // And both must disclose that the answer was cut, with the same count.
+    assert_eq!(
+        mcp_body["matched_total"], cli_body["matched_total"],
+        "matched_total must agree: MCP {mcp_body} CLI {cli_body}"
+    );
+    assert_eq!(mcp_body["truncated"], json!(true), "{mcp_body}");
+    assert_eq!(cli_body["truncated"], json!(true), "{cli_body}");
+}

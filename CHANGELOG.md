@@ -1,5 +1,164 @@
 # Changelog
 
+## Unreleased
+
+Remediation batch for the 2026-08-16 full audit (docs/AUDIT-REPORT-2026-08-16.md):
+both P0s and the immediate/short-term P1 tiers, plus the repairs an independent
+review of the batch itself turned up. **Requires an index rebuild**
+(`INDEX_VERSION` 60 → 61, automatic on next server start): existing indexes may
+carry the permanent edge loss the first fix closes.
+
+### Fixed
+- **P0-1: a file crossing the 1 MB / parse-timeout threshold aborted the whole
+  index run and permanently destroyed its inbound edges.** Skipped files had
+  their nodes purged but never left `global_name_map`, so the deferred pass
+  resolved requeued relations to dead ids and the FK abort rolled back every
+  other file's cross-file edges — while the batch commit had already stamped the
+  file's new hash, so nothing ever retried (incremental permanently ≠ rebuild).
+  Skipped files now prune the name map exactly like reindexed files, the
+  deferred pass screens both id sources against live nodes instead of letting
+  one dead id kill the savepoint, and a deferred-only run no longer skips
+  confidence classification. Reproduced with two files pre-fix (`FOREIGN KEY
+  constraint failed / 787`); regression fixtures carry ~50 filler files so
+  SQLite rowid reuse cannot mask a dangling reference.
+- **P0-2: the Edit-hook impact summary auto-approved the Edit it commented
+  on.** `pre-edit-guide` delivered its context with `permissionDecision:
+  'allow'`, which the hooks doc defines as "skip the interactive permission
+  prompt" — on machines that ask before Edit, the plugin silently granted the
+  write whenever the edited symbol had callers and the cooldown was cold. The
+  hook now emits `additionalContext` with no permission decision (the doc's
+  neutral path); read-only `pre-read-guide` keeps `allow`, and a drift test
+  pins the allowlist to exactly that one file.
+- **A killed or failed index run could leave file hashes durably current while
+  their cross-file edges were never committed.** Cross-file relations buffer in
+  memory until one deferred savepoint after the batch loop; a kill in between
+  lost them with no detector. Runs now set an `index_run_in_flight` meta marker
+  before the first commit and clear it after the deferred commit; a surviving
+  marker escalates the next incremental to a full re-index. Deliberate
+  amplification: an ordinary mid-run error also buys one full pass — the
+  conservative answer when edge durability cannot be proven.
+- **Snapshot install could silently resurrect the previous index.** `try_install`
+  renamed a complete DB over `index.db` without clearing the destination's
+  stale `-wal`/`-shm`, so SQLite replayed the old WAL over the fresh install
+  (`integrity_check` still `ok`); the two CLI callers compensated, the MCP
+  server path did not. The sidecar cleanup now lives inside `try_install`, so
+  all three callers inherit it.
+- **`affected` spent 14.7 s at its default depth to return the same answer the
+  1 s depth-6 run gave.** Both recursive CTEs (file closure and call graph)
+  guarded recursion with a per-path visited string — enumerating every simple
+  path, exponential in depth (a synthetic 66-node graph never finished at
+  depth 10). Both traversals are now an iterative BFS with a global visited
+  set; 18/18 CLI probes byte-identical against the pre-fix binary, with the
+  old CTEs kept verbatim as in-test differential oracles. `affected` default:
+  12.2 s → 0.01 s on this repo.
+- **`impact <symbol> --file <file-not-defining-it>` certified LOW risk, exit
+  0.** The existence check ignored the file filter and the ambiguity guard was
+  skipped whenever `--file` was given — a typo'd path produced a positive
+  safety claim on the one command the steering table says to run before
+  editing. Now errors with candidates + exit 1, matching its three siblings.
+- **`semantic_code_search` swallowed its own disclosures on the most common
+  response shape.** The confident-hybrid path returned a bare JSON array, which
+  cannot carry `ignored_arguments` (a misspelled parameter vanished silently)
+  or the `freshness` staleness note. Every path now answers the same
+  `{results, search_mode, vector_available, ...}` envelope the other arms
+  already used. **Consumers that assumed the bare-array shape must read
+  `.results`** — in-repo consumers already handled both.
+- **`search "db.execute"` (and every punctuation-joined query) was a hard
+  zero.** The FTS sanitizer deleted punctuation inside a word, gluing
+  `db.execute` into the nonexistent token `dbexecute`; the empty response then
+  blamed the user's spelling. Punctuation now splits terms. The batch review
+  caught the first version's regression — OR-fallback flooding garbage for
+  single flag-shaped tokens like `--no-default-features` — so a single-token
+  multi-fragment query gets one relaxed-AND retry (fragments absent from the
+  index are dropped) and otherwise stays an honest empty instead of OR noise.
+- **`semantic_code_search` silently threw away its candidate pool.** The
+  always-on module/external/test filter dropped up to 20 of 20 fetched
+  candidates with no counter, no pool compensation, and an empty answer that
+  suggested rebuilding the index. Triad drops are now counted, a widened
+  second fetch runs when the filter starved the pool, and the empty message
+  names what was actually filtered.
+- **`ast_search` showed 3 of 39 real matches at the default limit and told the
+  user to broaden the filter (the wrong remedy).** Both surfaces fetched a
+  fixed `limit*4` then filtered; the MCP side also had a fallback the CLI
+  lacked, so the two surfaces contradicted each other on the same query. One
+  shared core now serves both, pool-sized by the same filter-aware widening
+  semantic search uses, reporting `matched_total` + "raise the limit".
+- **MCP `find_references` mixed ambiguous by-name collisions into rename
+  audits with no way to tell.** It dropped the `confidence` tier the query
+  already returned and offered no `min_confidence`; both added (additive
+  schema change), with a `confidence_filtered` disclosure mirroring CLI
+  `refs`.
+- **MCP `find_dead_code` issued a clean bill of health for a path matching
+  nothing in the index.** The CLI probe was lifted into a shared helper both
+  surfaces call; the MCP tool now errors like its siblings instead of
+  reporting "no dead code" for a directory it never examined.
+- **The path-traversal guard test never called the guarded function.** It
+  re-implemented the check inline (a tautology about `std::fs::canonicalize`);
+  deleting the real guard left it green. Rewritten to drive `read_snippet`
+  through the real dispatch with an out-of-root node and a positive control;
+  mutation-verified red with the guard disabled.
+- **The release gate ran a strict subset of CI.** The tag path never executed
+  the `--no-default-features` test suite (what `cargo install` users build)
+  before an irreversible npm publish; added to the gate and to
+  `cache-warm.yml`'s warm job, with the drift guard extended to pin the new
+  step. The gate's missing macOS/Windows legs are now an explicitly documented
+  acceptance, not an accident.
+- **Statusline registry destruction on an unreadable file — both halves.** The
+  register path rebuilt the registry from `[]` when the file was unreadable
+  (EACCES/corrupt ≠ absent) and persisted the wipe over the primary AND the
+  durable backup, unrecoverably losing the user's previous statusline and any
+  third-party providers; and the review caught the surviving sibling: the
+  detach path made the same lenient read and deleted the user's `statusLine`
+  slot. Both now refuse to act on an unusable registry. Same sweep converted
+  `installed_plugins.json` and the adopted-projects registry off the lenient
+  reader.
+- **`doctor` emitted a repair id it had no repair for.** A broken binary — the
+  most common real failure — printed "1 issue(s) found. Fixing..." then
+  "0/1 addressed" with nothing in between. `binary-broken` now has a real arm
+  (dev checkouts rebuild from source, end users re-download via the verified
+  promote path), and a meta-guard asserts every emitted fixId has a handler.
+- **A failed binary self-heal re-downloaded ~40 MB every session, forever.**
+  The stale-binary path cleared its own throttle unconditionally and counted
+  nothing; it now has a per-version attempt budget — while a MISSING binary is
+  deliberately exempt (review catch: bounding the only recovery path would
+  park a dead install permanently after five offline session starts).
+- **`adopt`/`unadopt` rewrote user prose outside the managed block.** A
+  whole-file `\n{3,}` collapse reflowed blank lines inside users' code fences
+  on every SessionStart and reported "De-blocked" success on files that never
+  held our block. Seam-healing is now anchored to the block's own removal
+  site; untouched files come back byte-identical.
+- **An unreadable or directory-shaped CLAUDE.md silently killed the rest of
+  SessionStart.** `adopt()` threw uncaught (EACCES/EISDIR) with no top-level
+  catch, so binary verification, index freshness and the hook self-test never
+  ran. Adoption now reports instead of throwing, and `session-init` wraps its
+  run so a failure in any one step cannot dark the rest.
+- **One SIGTERM-trapping statusline provider hung the whole status line
+  forever.** Node's `timeout` sends SIGTERM and waits. The two statusline
+  call sites (third-party providers, health-check) now kill with SIGKILL —
+  scoped there deliberately rather than defaulted globally, since hard-killing
+  a timed-out `git pull` would orphan `.git/index.lock` and silently break
+  marketplace refreshes.
+- **`pr-impact-comment` reported a timed-out analysis as "covered".** A failed
+  or timed-out `affected` spawn took the same branch as "zero affected tests";
+  failures now render as their own "Not analyzed" section, and
+  `CODE_GRAPH_FAIL_ON_RISK` also fails on unanalyzed files (an unmeasured file
+  is unquantified risk).
+- **README/steering drift.** Removed five slash commands deleted ~109 releases
+  ago (`/understand` …), corrected schema v6→v10, the untestable "Rust 1.75+"
+  claim (lockfile v4 requires newer; CI pins 1.95.0), the auto-update cadence,
+  and the shipped steering template's claim that `impact_analysis` is still
+  callable (it returns Unknown tool). The shipped CI template's actions are
+  now SHA-pinned like the repo's own workflows, and the pin guard covers
+  templates so they cannot float again.
+
+### Added
+- `tests/index_version_guard.rs`: a fingerprint trip-wire over the extraction
+  and schema sources. Editing them without deciding about `INDEX_VERSION` /
+  `SCHEMA_VERSION` now fails with instructions; regenerating the baseline is a
+  visible act (the update run panics after writing, so a leftover env var
+  cannot silently re-baseline). Coverage is the main extraction surface plus
+  the file-selection seams — documented as a net, not a proof.
+
 ## v0.116.0 (2026-08-13)
 
 The six items the v0.115.0 post-release review left open, in the order it ranked

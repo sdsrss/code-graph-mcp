@@ -205,14 +205,101 @@ test('covering-tests: edit injection records test_targets for the forward funnel
 // Source-grep, same convention as the salience/pattern-sync guards (hook exits
 // on require: reads stdin, resolves the index).
 
-test('emit: impact summary is delivered via the PreToolUse allow+additionalContext envelope', () => {
+test('emit: impact summary is delivered via the PreToolUse additionalContext envelope', () => {
   const fs = require('node:fs');
   const path = require('node:path');
   const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
   assert.match(source, /require\(['"]\.\/hook-emit['"]\)/,
     'pre-edit-guide must use the shared hook-emit module (no inline envelope copy)');
-  assert.match(source, /emitPreToolAllowContext\(summary\)/,
+  assert.match(source, /emitPreToolContext\(summary\)/,
     'the impact summary must be carried inside additionalContext, not bare stdout');
+  assert.doesNotMatch(source, /emitPreToolAllowContext/,
+    'Edit is a WRITE tool: this hook must never carry permissionDecision:"allow"');
   assert.doesNotMatch(source, /process\.stdout\.write\(summary\)\s*;/,
     'the bare stdout summary emission (debug-log-only) must be removed');
+});
+
+// ── Subprocess-level envelope test (P0-2) ───────────────────
+// The guards above read the SOURCE. That is how a hook whose whole job is to
+// print one JSON line went four releases emitting `permissionDecision: 'allow'`
+// for Edit — a source grep proves which helper is called, never what the process
+// actually writes. This spawns the real hook and parses its real stdout.
+//
+// Two stubs make the run hermetic (an --require preload patches the child's
+// module cache BEFORE the hook's own requires destructure from it):
+//   - find-binary   → a path that never runs, so no real binary is exec'd
+//   - execFileSync  → a canned `impact --json` payload with 2 direct callers,
+//                     which is the exact condition that opens the emit path
+// HOME / TMPDIR / CLAUDE_CONFIG_DIR are redirected into the sandbox so the
+// cooldown flag and recommendation log never touch the live ~/.claude (§8).
+
+function runPreEditHook(t, { oldString = 'function processPayment(order) {', extraEnv = {} } = {}) {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { spawnSync } = require('node:child_process');
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-preedit-home-'));
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-preedit-proj-'));
+  // §8.V4: the creating test disposes of its own sandbox. Under Claude Code
+  // os.tmpdir() IS ~/.claude/tmp, where orphans accumulate invisibly.
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(proj, { recursive: true, force: true });
+  });
+  fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
+  fs.mkdirSync(path.join(home, 'tmp'), { recursive: true });
+
+  const preload = path.join(home, 'stub-preload.js');
+  fs.writeFileSync(preload, `
+    'use strict';
+    const cp = require('child_process');
+    cp.execFileSync = () => JSON.stringify({
+      direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
+      callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
+      test_callers: [],
+    });
+    const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
+    fb.findBinary = () => ${JSON.stringify(path.join(home, 'never-executed-binary'))};
+  `);
+
+  const editedFile = path.join(proj, 'src', 'payments.js');
+  const res = spawnSync(process.execPath, ['--require', preload, path.join(__dirname, 'pre-edit-guide.js')], {
+    cwd: proj,
+    encoding: 'utf8',
+    input: JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: editedFile, old_string: oldString, new_string: 'x' },
+    }),
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      TMPDIR: path.join(home, 'tmp'),
+      CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      ...extraEnv,
+    },
+  });
+  return { res, home, proj };
+}
+
+test('emit(subprocess): the real hook emits additionalContext and NEVER auto-allows the Edit', (t) => {
+  const { res } = runPreEditHook(t);
+  assert.equal(res.status, 0, `hook exited ${res.status}: ${res.stderr}`);
+  assert.notEqual(res.stdout.trim(), '',
+    'the stubbed impact payload (2 direct callers) must open the emit path — ' +
+    'an empty stdout here would make every assertion below vacuous');
+
+  const payload = JSON.parse(res.stdout.trim());
+  const out = payload.hookSpecificOutput;
+  assert.equal(out.hookEventName, 'PreToolUse');
+  assert.match(out.additionalContext, /code-graph:impact/,
+    'the impact summary must ride additionalContext');
+
+  // The P0: this hook fires on any symbol with >=1 caller, so an `allow` here
+  // silently answers the user's Edit permission prompt for them.
+  assert.ok(!('permissionDecision' in out),
+    `PreToolUse(Edit) must carry no permissionDecision; got ${JSON.stringify(out.permissionDecision)}`);
+  assert.doesNotMatch(res.stdout, /"allow"/);
 });

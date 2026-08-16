@@ -35,8 +35,12 @@ type: reference
 > - `module_overview include_deps=true` / `include_dead=true`
 > - `get_call_graph route_path="GET /api/x"`
 >
-> 旧名（`impact_analysis` 等）仍作为向后兼容 dispatcher 别名可调（raw JSON-RPC /
-> SDK 脚本场景），但 Claude Code 内强烈建议用上面的新 flag 形式。CLI 子命令
+> `impact_analysis` **已删除**——dispatcher 里没有这个 arm，按名调用返回
+> `Unknown tool`。改用 `get_ast_node include_impact=true`，或 CLI `impact`。
+> 其余旧名（`read_snippet` / `dependency_graph` / `find_similar_code` /
+> `find_dead_code` / `trace_http_chain` + alias `find_http_route`）仍是向后兼容
+> dispatcher 别名（raw JSON-RPC / SDK 脚本场景），但 Claude Code 内一律用上面的
+> 新 flag 形式。CLI 子命令
 > （`code-graph-mcp impact|similar|deps|dead-code|trace`）保持不变，给 Bash 工作流。
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
@@ -73,10 +77,14 @@ type: reference
 ### 旧名兼容 + CLI 速查（v0.18.4 fold 后）
 
 v0.18.4 把原"进阶 5"折叠进核心 7 的 flag。**Claude Code 内**首选上表的新 flag 形式。
-旧名（`impact_analysis` / `find_similar_code` / `dependency_graph` / `find_dead_code` /
-`trace_http_chain` + alias `find_http_route`）作为 dispatcher 向后兼容**仍可调用**
-（raw JSON-RPC / MCP SDK / 既有脚本不破），但 Claude Code 的 ToolSearch 仍然不为
-hidden 5 加载 schema —— 实操中走新 flag。CLI 子命令保持原样：
+
+可按名调用的只有这 7 个：`project_map` / `semantic_code_search` / `get_call_graph` /
+`get_ast_node` / `module_overview` / `ast_search` / `find_references`。
+`impact_analysis` **不在其列，已从 dispatcher 删除**——按名调用返回 `Unknown tool`。
+隐藏旧名 `read_snippet` / `dependency_graph` / `find_similar_code` / `find_dead_code` /
+`trace_http_chain`（+ alias `find_http_route`）仍有 dispatcher arm，raw JSON-RPC / MCP
+SDK / 既有脚本不破；但它们不在 `tools/list`，Claude Code 的 ToolSearch 不为其加载
+schema —— 实操中一律走新 flag。CLI 子命令保持原样：
 
 | 意图 | CLI（Bash 工作流） | 等价 MCP 新形式 |
 |------|--------------------|------------------|

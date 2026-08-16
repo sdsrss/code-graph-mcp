@@ -22,7 +22,7 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`). Context reordered to prioritize structural relations over code for better embedding quality
 - **Self-healing** — Automatic SQLite corruption recovery with rebuild. Startup repair for incomplete indexing (Phase 3 failures)
 - **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, Windsurf, and other MCP clients
-- **Claude Code Plugin** — First-class plugin with slash commands (`/understand`, `/trace`, `/impact`), agents, skills, auto-indexing hooks, StatusLine integration, and self-updating
+- **Claude Code Plugin** — First-class plugin with skills (`explore`, `index`), a `code-explorer` agent, auto-indexing hooks, StatusLine integration, and self-updating
 
 ## Why code-graph-mcp?
 
@@ -113,7 +113,7 @@ src/
 │   └── server/   # McpServer with IndexingState + CacheState sub-structs
 ├── parser/       # Tree-sitter parsing, relation extraction, LanguageConfig dispatch
 ├── indexer/      # 3-phase pipeline, Merkle tree, file watcher
-├── storage/      # SQLite schema (v6), CRUD, FTS5, migrations
+├── storage/      # SQLite schema (v10), CRUD, FTS5, migrations
 ├── graph/        # Recursive CTE call graph queries
 ├── search/       # RRF fusion search combining BM25 + vector
 ├── embedding/    # Candle embedding model (optional, masked mean pooling)
@@ -125,7 +125,7 @@ src/
 
 ### Option 1: Claude Code Plugin (Recommended)
 
-Install as a Claude Code plugin for the best experience — includes slash commands, agents, skills, auto-indexing hooks, StatusLine health display, and automatic updates:
+Install as a Claude Code plugin for the best experience — includes skills, the `code-explorer` agent, auto-indexing hooks, StatusLine health display, and automatic updates:
 
 ```bash
 # Step 1: Add the marketplace
@@ -137,11 +137,11 @@ Install as a Claude Code plugin for the best experience — includes slash comma
 
 What you get:
 - **MCP Server** — All code-graph tools available to Claude
-- **Slash Commands** — `/understand <module>`, `/trace <route>`, `/impact <symbol>`
+- **Skills** — `explore` (structure-first navigation before reading files) and `index` (health-check / re-index / full rebuild); see [Plugin Skills](#plugin-skills)
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
 - **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
 - **StatusLine** — Real-time health display (nodes, files, watch status) — compatible with other plugins' StatusLine via composite multiplexer
-- **Auto-update** — Checks for new versions every 6h, updates silently
+- **Auto-update** — Checks for a new version at session start (throttled to at most one check every 2 minutes). Between forced checks the re-check interval is 30 minutes after an "up to date" answer and 6 hours while an update is already pending. Updates install silently.
 
 #### Manual Update
 
@@ -306,17 +306,18 @@ Common options: `--json` (JSON output), `--compact` (compact output), `--limit N
 
 As of **v0.37.0** the CLI is [clap](https://docs.rs/clap)-based: **every subcommand has `--help`** for its full flag list (`code-graph-mcp <command> --help`), value flags accept both `--flag value` and `--flag=value`, and unknown flags or malformed arguments fail fast with a clear error and a non-zero exit code (`2`) instead of being silently ignored. For example, `trace` hides downstream middleware with `--no-middleware` (shown by default), and `snapshot` is a `create`/`inspect` subcommand pair.
 
-## Plugin Slash Commands
+## Plugin Skills
 
-Available when installed as a Claude Code plugin:
+Installing the plugin ships two skills that Claude loads on its own when the
+situation matches — there are no slash commands to remember:
 
-| Command | Description |
-|---------|-------------|
-| `/understand <module>` | Deep dive into a module or file's architecture and relationships |
-| `/trace <route>` | Trace a full HTTP request flow from route to data layer |
-| `/impact <symbol>` | Analyze the impact scope of changing a symbol before modifying it |
-| `/status` | Show code-graph index status and embedding progress |
-| `/rebuild` | Force a full code-graph index rebuild |
+| Skill | Loaded when | What it does |
+|-------|-------------|--------------|
+| `explore` | Starting work in unfamiliar code, or before editing a module | Routes the question to `overview` / `map` / `callgraph` / `search` / `impact` instead of reading files one at a time |
+| `index` | Search returns empty or stale results, or after a large restructuring | Walks `health-check`, incremental re-index, and full rebuild |
+
+Both are thin routers over the CLI subcommands documented above, so anything a
+skill does is also runnable by hand.
 
 ## Supported Languages (19)
 
@@ -438,7 +439,10 @@ Data is stored in `.code-graph/index.db` under the project root (auto-created, g
 
 ### Prerequisites
 
-- Rust 1.75+ (2021 edition)
+- Rust 1.95.0 (2021 edition) — the toolchain CI and the release build pin
+  (`dtolnay/rust-toolchain@1.95.0` in `.github/workflows/`). No older toolchain
+  is tested: `Cargo.lock` is lockfile **version 4**, which Cargo 1.75 cannot
+  read at all, and no `rust-version` floor is declared in `Cargo.toml`.
 - A C compiler (for bundled SQLite / sqlite-vec)
 
 ### Build

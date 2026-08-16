@@ -90,7 +90,7 @@ jobs:
       # surface without executing one of its tests (audit 2026-08-02). This is
       # the last check before an irreversible npm publish, so a silently empty
       # test class is exactly what it must not have. Mirrored in cache-warm.yml
-      # `warm-gate`, which runs the same test command.
+      # `warm-gate`, which installs ripgrep for the same reason.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
         run: |
           # Short-circuit keeps an apt mirror hiccup off this critical path
@@ -130,6 +130,36 @@ jobs:
 
       - name: Clippy (embed-model)
         run: cargo clippy --features embed-model --all-targets -- -D warnings
+
+      # ── Test coverage of this gate vs ci.yml (audit 2026-08-16 P1-18) ────────
+      # ci.yml runs `cargo test --no-default-features` on ubuntu + macos +
+      # windows AND `cargo test --features embed-model` on ubuntu. This gate ran
+      # only the embed-model leg, so BOTH axes were narrower than the branch CI
+      # that never fires on a tag:
+      #
+      #   - FEATURE axis (fixed below): `default = []` is what `cargo install`
+      #     users compile, and a regression reachable only in the FTS5-only
+      #     build — a `#[cfg(not(feature = "embed-model"))]` arm, a fallback that
+      #     only exists when vector search is absent — passed the last check
+      #     before an irreversible npm publish. The two steps below close it.
+      #
+      #   - OS axis (accepted, NOT fixed): macOS and Windows legs are
+      #     deliberately not added here. OS-specific regressions are caught by
+      #     ci.yml on the commit and, post-publish, by the three-OS smoke-verify
+      #     job below; the gate intentionally trades OS breadth for tag latency,
+      #     since adding two more cold (uncached) runners to the critical path
+      #     delays every release for a class of failure two other gates already
+      #     observe. Revisit if a Windows/macOS-only break ever reaches npm.
+      - name: Test (no default features)
+        # First, and without the embed feature: no candle to compile, so this
+        # fails fast, and its compiled deps are reused by the embed-model run
+        # below. Same cheap-first ordering as the clippy pair above.
+        #
+        # Cache note: cache-warm.yml's `warm-gate` runs this same command so the
+        # no-default test/bin targets restore warm from the `release-gate` cache
+        # (the two files' command sets are pinned together by
+        # tests/hardening.rs::release_and_cache_warm_workflows_do_not_drift).
+        run: cargo test --no-default-features
 
       - name: Test (embed-model)
         # Mirrors ci.yml's embed-check job: without this the spawned `serve`

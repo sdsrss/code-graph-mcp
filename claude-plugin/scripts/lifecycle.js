@@ -57,7 +57,15 @@ function pluginsCacheDir() { return path.join(claudeHome(), 'plugins', 'cache');
 // unparseable case and left the unreadable one behind — a `chmod 000`
 // settings.json was still destroyed, silently, with no backup. `err.code` is the
 // whole gate; do not widen it back to a bare `catch`.
-function readJsonResult(filePath) {
+// `accept` decides what counts as a USABLE parsed value. It defaults to the
+// settings shape (a plain object) but the statusline registry is a top-level
+// ARRAY, which the default predicate calls corrupt — so the registry gets
+// `accept: Array.isArray` rather than a second, drifting copy of this function.
+function isSettingsObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readJsonResult(filePath, { accept = isSettingsObject } = {}) {
   // Read BYTES, decode separately. `readFileSync(p, 'utf8')` replaces every
   // invalid byte with U+FFFD, and `raw` is what backupCorruptFile writes to the
   // `.corrupt-*` copy before the original is overwritten — so a settings.json
@@ -88,7 +96,7 @@ function readJsonResult(filePath) {
     const value = JSON.parse(raw.trim());
     // `null` / `"str"` / `[]` parse fine but are not a settings object; treating
     // them as "absent" would rebuild over them just the same.
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    if (!accept(value)) {
       return { value: null, missing: false, corrupt: true, raw: bytes };
     }
     // VALID JSON can still have been decoded lossily. `toString('utf8')`
@@ -247,9 +255,25 @@ function readManifest() {
   return readJson(MANIFEST_FILE) || { version: null, config: {} };
 }
 
+// Same tolerant shape as tryWriteSettings, and for the same reason: this is the
+// one write in install()/update() that could still throw. `~/.cache` on a
+// read-only mount, a root-owned cache dir left by a `sudo` run, or a full disk
+// turned a SessionStart into a raw ENOSPC/EACCES stack trace out of a hook whose
+// settings work had already SUCCEEDED (audit 2026-08-16 P1-16). Report it,
+// change nothing else, and let the caller decide.
+// @returns {Error|null} the write error, or null on success
 function writeManifest(manifest) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  writeJsonAtomic(MANIFEST_FILE, manifest);
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    writeJsonAtomic(MANIFEST_FILE, manifest);
+    return null;
+  } catch (err) {
+    console.error(
+      `[code-graph] cannot write ${MANIFEST_FILE} (${err.code || err.name}: ${err.message}). ` +
+      'Settings changes (if any) still applied; the next run will redo the version stamp.'
+    );
+    return err;
+  }
 }
 
 function getPluginVersion() {
@@ -325,17 +349,63 @@ function isOurComposite(settings) {
 // --- StatusLine Registry ---
 // Multiple providers can register. The composite script runs them all.
 
-function readRegistry() {
-  const primary = readJson(REGISTRY_FILE);
-  if (primary && Array.isArray(primary) && primary.length > 0) return primary;
+// Read the registry for a caller that may WRITE it back.
+//
+// The registry is USER DATA: `_previous` is the statusline they had before we
+// installed (the only record of it), and third-party providers registered
+// through us live beside it. The lenient reader collapsed "exists but
+// unreadable/corrupt" into the same `[]` as "absent", and the very next
+// writeRegistry() then persisted that empty list over the primary AND the
+// durable backup — one `chmod 000` (a stray sudo, a restrictive umask) and the
+// user's original statusline was unrecoverable, silently, from a call that
+// reported success (audit 2026-08-16 P1-12). Exactly the settings.json bug
+// readJsonResult was written for, on the file two functions below it.
+//
+// Returns `{ registry, refuse }`:
+//   registry — entries to work with (possibly empty)
+//   refuse   — a copy EXISTS and could not be read: write nothing, change nothing
+function readRegistryForWrite() {
+  const asArray = { accept: Array.isArray };
+  const primary = readJsonResult(REGISTRY_FILE, asArray);
+  if (primary.value && primary.value.length > 0) return { registry: primary.value, refuse: false };
+  if (primary.corrupt) {
+    // Fall through to the backup for READING (so callers still see the user's
+    // providers) but never write while the primary is unusable: an atomic
+    // rename replaces an unreadable file just fine, which is precisely how the
+    // data was lost.
+    const backup = readJsonResult(providersBackupFile(), asArray);
+    return {
+      registry: backup.value && backup.value.length > 0 ? backup.value : [],
+      refuse: true,
+      why: `${REGISTRY_FILE} exists but cannot be read as a provider list`,
+    };
+  }
   // Self-heal: primary missing or empty (e.g. user cleaned ~/.cache/code-graph/).
   // Durable backup in ~/.claude/ retains `_previous` + third-party providers.
-  const backup = readJson(providersBackupFile());
-  if (backup && Array.isArray(backup) && backup.length > 0) {
-    try { writeJsonAtomic(REGISTRY_FILE, backup); } catch { /* ok */ }
-    return backup;
+  const backup = readJsonResult(providersBackupFile(), asArray);
+  if (backup.value && backup.value.length > 0) {
+    try { writeJsonAtomic(REGISTRY_FILE, backup.value); } catch { /* ok */ }
+    return { registry: backup.value, refuse: false };
   }
-  return [];
+  if (backup.corrupt) {
+    return { registry: [], refuse: true, why: `${providersBackupFile()} exists but cannot be read as a provider list` };
+  }
+  return { registry: [], refuse: false };
+}
+
+function readRegistry() {
+  return readRegistryForWrite().registry;
+}
+
+// One place to say why a registry mutation did nothing. Stderr, not silence:
+// the caller returns `false`, which is indistinguishable from "already
+// registered" to everything upstream.
+function warnRegistryUnusable(action, why) {
+  console.error(
+    `[code-graph] ${why}. Skipping the statusline ${action} — rewriting it would ` +
+    'destroy your previous statusline and any third-party provider entries. ' +
+    'Repair or move the file aside and re-run.'
+  );
 }
 
 function writeRegistry(registry) {
@@ -351,7 +421,11 @@ function writeRegistry(registry) {
 }
 
 function registerStatuslineProvider(id, command, needsStdin) {
-  const registry = readRegistry();
+  const { registry, refuse, why } = readRegistryForWrite();
+  if (refuse) {
+    warnRegistryUnusable('registration', why);
+    return false;
+  }
   const idx = registry.findIndex(p => p.id === id);
   const entry = { id, command, needsStdin: !!needsStdin };
   if (idx >= 0) {
@@ -366,7 +440,11 @@ function registerStatuslineProvider(id, command, needsStdin) {
 }
 
 function unregisterStatuslineProvider(id) {
-  const registry = readRegistry();
+  const { registry, refuse, why } = readRegistryForWrite();
+  if (refuse) {
+    warnRegistryUnusable('removal', why);
+    return false;
+  }
   const filtered = registry.filter(p => p.id !== id);
   if (filtered.length === registry.length) return false;
   writeRegistry(filtered);
@@ -392,8 +470,19 @@ function isPluginInactive(settings = readJson(settingsPath()) || {}) {
 function detachStatuslineIntegration(settings, { compositeDoomed = true } = {}) {
   let settingsChanged = false;
 
+  // An unusable (not merely absent) registry means we cannot know whether a
+  // `_previous` or third-party entry exists — and every branch below that
+  // rewrites `settings.statusLine` depends on that answer. Deciding from an
+  // empty default would delete the user's statusline on a chmod/corruption
+  // hiccup (batch review of audit 2026-08-16 P1-12: the register path refused
+  // correctly while this detach path still destroyed the slot). Refuse the
+  // whole detach; the next statusline render retries once the file is usable.
+  const { registry, refuse, why } = readRegistryForWrite();
+  if (refuse) {
+    warnRegistryUnusable('detach', why);
+    return false;
+  }
   unregisterStatuslineProvider('code-graph');
-  const registry = readRegistry();
   const previous = registry.find(p => p.id === '_previous' && p.command);
   // Third-party providers registered through our registry (e.g. gsd). They
   // must not be silently orphaned: with the composite gone from settings
@@ -1061,13 +1150,17 @@ function install({ reclaimStatusline = false } = {}) {
   manifest.version = version;
   manifest.installedAt = manifest.installedAt || new Date().toISOString();
   manifest.updatedAt = new Date().toISOString();
-  writeManifest(manifest);
+  const manifestErr = writeManifest(manifest);
 
   return {
     version,
     settingsChanged,
     statusLineClaimed: manifest.config.statusLine,
     hooksRegistered,
+    // Unstamped manifest: the install DID land in settings.json, but the next
+    // run will not know it and will redo the work (idempotent). Surfaced so
+    // doctor/session-init can say so instead of implying a clean install.
+    manifestUnwritable: manifestErr ? (manifestErr.code || manifestErr.name) : undefined,
     // Non-null => the previous settings.json was REPLACED and lives here now.
     settingsRebuiltFrom: backedUpTo,
   };
@@ -1136,7 +1229,16 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
   }
 
   // 5. Remove all known IDs from installed_plugins.json
-  const installedPlugins = readJson(installedPluginsPath());
+  //
+  // Read-modify-write of Claude Code's OWN file. The write is already gated on a
+  // successful parse, so an unusable file is skipped rather than clobbered (the
+  // destructive `|| {}` shape never existed here) — but the skip was SILENT, and
+  // steps 6-7 below still delete the plugin cache. The user then keeps a plugin
+  // record pointing at a directory we removed, with `uninstall` reporting
+  // success. Say so instead (audit 2026-08-16 P1-12 sweep).
+  const installedRead = readJsonResult(installedPluginsPath());
+  const installedPlugins = installedRead.value;
+  let installedPluginsUnusable = false;
   if (installedPlugins && installedPlugins.plugins) {
     let ipChanged = false;
     for (const id of [PLUGIN_ID, ...OLD_PLUGIN_IDS]) {
@@ -1145,7 +1247,24 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
         ipChanged = true;
       }
     }
-    if (ipChanged) writeJsonAtomic(installedPluginsPath(), installedPlugins);
+    if (ipChanged) {
+      try {
+        writeJsonAtomic(installedPluginsPath(), installedPlugins);
+      } catch (err) {
+        installedPluginsUnusable = true;
+        console.error(
+          `[code-graph] cannot write ${installedPluginsPath()} (${err.code || err.name}). ` +
+          'Claude Code still lists this plugin — remove it with `/plugin uninstall code-graph-mcp`.'
+        );
+      }
+    }
+  } else if (!installedRead.missing) {
+    installedPluginsUnusable = true;
+    console.error(
+      `[code-graph] cannot read ${installedPluginsPath()} ` +
+      `(${installedRead.error ? installedRead.error.code || installedRead.error.message : 'not a JSON object'}). ` +
+      'Left untouched — Claude Code may still list this plugin; remove it with `/plugin uninstall code-graph-mcp`.'
+    );
   }
 
   // 5.5. Global npm packages + adoption inventory — read BEFORE step 6 wipes
@@ -1208,7 +1327,7 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
   }
 
-  return { settingsChanged, pluginInstalledGlobals, globalPkgsRemoved, globalPkgsRemaining, adoptedProjects, unadopted };
+  return { settingsChanged, pluginInstalledGlobals, globalPkgsRemoved, globalPkgsRemaining, adoptedProjects, unadopted, installedPluginsUnusable };
 }
 
 // --- Update (refresh config points) ---
@@ -1270,7 +1389,7 @@ function update() {
   // 6. Update manifest
   manifest.version = version;
   manifest.updatedAt = new Date().toISOString();
-  writeManifest(manifest);
+  const manifestErr = writeManifest(manifest);
 
   // 7. Clean up old cached versions (keep the newest few). NOTE: older cache
   //    dirs are NOT always inert — a running MCP server's launcher path
@@ -1280,7 +1399,10 @@ function update() {
   //    therefore skips any version still referenced by a live process cmdline.
   cleanupOldCacheVersions(5);
 
-  return { oldVersion, version, settingsChanged, hooksRegistered, settingsRebuiltFrom: backedUpTo };
+  return {
+    oldVersion, version, settingsChanged, hooksRegistered, settingsRebuiltFrom: backedUpTo,
+    manifestUnwritable: manifestErr ? (manifestErr.code || manifestErr.name) : undefined,
+  };
 }
 
 /**
@@ -1528,7 +1650,7 @@ module.exports = {
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   cleanupDisabledStatusline,
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
-  readRegistry, writeRegistry,
+  readRegistry, readRegistryForWrite, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
@@ -1540,7 +1662,7 @@ module.exports = {
   activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
-  registerStatuslineProvider, unregisterStatuslineProvider,
+  registerStatuslineProvider, unregisterStatuslineProvider, detachStatuslineIntegration,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, INSTALL_LOCK_FILE, SHELL_PKG,   // uninstall residue
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
   settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,

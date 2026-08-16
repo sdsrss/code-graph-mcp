@@ -142,6 +142,13 @@ jobs:
       - name: Clippy (embed-model)
         run: cargo clippy --features embed-model --all-targets -- -D warnings
 
+      - name: Test (no default features)
+        # Mirrors release.yml gate's new no-default test leg (audit 2026-08-16
+        # P1-18): the warm must run the same commands as the gate it primes, or
+        # the gate pays a cold compile for the no-default test/bin targets on
+        # every tag. Same cheap-first ordering as the gate.
+        run: cargo test --no-default-features
+
       - name: Test (embed-model)
         # Mirrors ci.yml's embed-check job: without this the spawned `serve`
         # integration tests background-fetch the ~90 MB model on a runner whose

@@ -187,6 +187,9 @@ try {
   // "slow health-check" into a rendered "offline"/"updating" instead of a blank.
   report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], hidden({
     timeout: 1500,
+    // Render hot path: a wedged binary ignoring SIGTERM must not outlive the
+    // budget (same reasoning as the composite's provider spawn, audit P1-17).
+    killSignal: 'SIGKILL',
     stdio: ['pipe', 'pipe', 'pipe'],
     // Run the binary FROM the resolved root so its own project-root resolution
     // lands on the same DB the gate above picked (a subdir cwd would otherwise

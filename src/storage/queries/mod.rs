@@ -12,6 +12,7 @@ mod edges;
 mod embedding_cache;
 mod files;
 mod imports;
+mod meta;
 mod nodes;
 mod project_map;
 pub(crate) mod routes;
@@ -19,8 +20,8 @@ mod search;
 mod vectors;
 
 pub use dead_code::{
-    dead_code_report, find_dead_code, validate_dead_code_type_filter, DeadCodeItem, DeadCodeReport,
-    DeadCodeResult,
+    dead_code_report, find_dead_code, unindexed_path_prefix, validate_dead_code_type_filter,
+    DeadCodeItem, DeadCodeReport, DeadCodeResult,
 };
 pub use edges::{
     age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls,
@@ -41,6 +42,7 @@ pub use files::{
 pub use imports::{
     all_file_import_edges, file_is_indexed, get_import_tree, get_reverse_dependents, FileDependency,
 };
+pub use meta::{delete_meta, get_meta, set_meta};
 #[cfg(test)]
 pub use nodes::update_context_string;
 pub use nodes::{

@@ -3,6 +3,14 @@ pub const SCHEMA_VERSION: i32 = 10;
 // Meta keys stored in the `meta` table (added in v7).
 pub const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
 pub const META_KEY_EMBEDDING_MODEL: &str = "embedding_model";
+/// Set before an index run's first batch commits and cleared once its
+/// cross-file edges are durable. Present at startup ⇒ the previous run was
+/// killed in between, so file hashes claim "indexed" for files whose edges were
+/// only ever in memory — the next incremental escalates to a full re-index
+/// (audit 2026-08-16 P1-2). No SCHEMA_VERSION bump: the `meta` table is v7 and
+/// an absent key reads as "no run in flight", which is correct for every index
+/// built before this key existed.
+pub const META_KEY_INDEX_RUN_IN_FLIGHT: &str = "index_run_in_flight";
 
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.

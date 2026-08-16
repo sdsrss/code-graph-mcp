@@ -46,6 +46,21 @@ impl McpServer {
             anyhow!("Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all", relation_raw)
         })?;
 
+        // Validate min_confidence at entry too, for the same reason. No default
+        // floor: a rename audit must see every usage site, so absent means
+        // "show all tiers" — parity with CLI `refs --min-confidence`, which is
+        // also floor-less (unlike callgraph/impact, where the floor exists to
+        // keep an ambiguous fan-out out of a RISK number).
+        let min_confidence: Option<&'static str> = match args["min_confidence"].as_str() {
+            None => None,
+            Some(c) => Some(crate::domain::normalize_confidence(c).ok_or_else(|| {
+                anyhow!(
+                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                    c
+                )
+            })?),
+        };
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             self.ensure_file_fresh_opt(file_path)?;
@@ -195,10 +210,24 @@ impl McpServer {
             )),
         };
 
-        // Collect references for all matching node IDs
+        // Collect references for all matching node IDs.
+        //
+        // Every ref carries its edge `confidence` tier. It was dropped here while
+        // the CLI twin printed it, so the surface an LLM uses for rename audits —
+        // the one place a by-name collision hurts most — could not tell an
+        // `extracted` same-file hit from an `ambiguous` by-name fan-out
+        // (audit 2026-08-16 P1-11).
+        //
+        // Dedup key is (name, file_path, relation) and does NOT include the
+        // target, so two edges from one source to DIFFERENT same-name targets
+        // collapse into one row. When their tiers differ, keep the LOWEST — the
+        // displayed confidence must not understate a hidden sibling's ambiguity
+        // (same rule as `cli::cmd_refs`).
         let mut all_refs: Vec<serde_json::Value> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashMap<(String, String, String), usize> =
+            std::collections::HashMap::new();
         let mut test_refs_filtered: usize = 0;
+        let mut confidence_filtered: usize = 0;
         for target_id in &target_ids {
             let refs =
                 queries::get_incoming_references(self.db.conn(), *target_id, relation_filter)?;
@@ -209,26 +238,46 @@ impl McpServer {
                     test_refs_filtered += 1;
                     continue;
                 }
-                // Deduplicate by (name, file_path, relation)
+                if let Some(min) = min_confidence {
+                    if crate::domain::confidence_rank(&r.confidence)
+                        < crate::domain::confidence_rank(min)
+                    {
+                        confidence_filtered += 1;
+                        continue;
+                    }
+                }
                 let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-                if seen.insert(key) {
-                    if compact {
-                        all_refs.push(json!({
-                            "name": r.name,
-                            "file_path": r.file_path,
-                            "start_line": r.start_line,
-                            "relation": r.relation,
-                            "node_id": r.node_id,
-                        }));
-                    } else {
-                        all_refs.push(json!({
-                            "name": r.name,
-                            "type": r.node_type,
-                            "file_path": r.file_path,
-                            "start_line": r.start_line,
-                            "relation": r.relation,
-                            "node_id": r.node_id,
-                        }));
+                match seen.get(&key) {
+                    Some(&idx) => {
+                        let kept = all_refs[idx]["confidence"].as_str().unwrap_or_default();
+                        if crate::domain::confidence_rank(&r.confidence)
+                            < crate::domain::confidence_rank(kept)
+                        {
+                            all_refs[idx]["confidence"] = json!(r.confidence);
+                        }
+                    }
+                    None => {
+                        seen.insert(key, all_refs.len());
+                        if compact {
+                            all_refs.push(json!({
+                                "name": r.name,
+                                "file_path": r.file_path,
+                                "start_line": r.start_line,
+                                "relation": r.relation,
+                                "confidence": r.confidence,
+                                "node_id": r.node_id,
+                            }));
+                        } else {
+                            all_refs.push(json!({
+                                "name": r.name,
+                                "type": r.node_type,
+                                "file_path": r.file_path,
+                                "start_line": r.start_line,
+                                "relation": r.relation,
+                                "confidence": r.confidence,
+                                "node_id": r.node_id,
+                            }));
+                        }
                     }
                 }
             }
@@ -286,6 +335,18 @@ impl McpServer {
                 obj.insert(
                     "test_references_filtered".to_string(),
                     json!(test_refs_filtered),
+                );
+            }
+        }
+        // Disclose what the floor removed, in-band — same rule as the CLI twin's
+        // `confidence_filtered` and the sibling tools' `ambiguous_edges_hidden` /
+        // `ambiguous_callers_excluded`: a filtered-down list must never read as a
+        // complete one.
+        if confidence_filtered > 0 {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert(
+                    "confidence_filtered".to_string(),
+                    json!(confidence_filtered),
                 );
             }
         }

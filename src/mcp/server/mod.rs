@@ -3299,13 +3299,15 @@ mod tests {
         );
     }
 
-    /// Extract the results array from a `semantic_code_search` response: a bare
-    /// array on the hybrid path, or a `{results, vector_available, ...}` object on
-    /// the FTS5-only path (these unit tests run with no embedding model loaded).
+    /// Extract the results array from a `semantic_code_search` response. Every
+    /// path — hybrid, FTS5-only degradation, empty, compressed — returns the same
+    /// `{results, …}` envelope (the bare-array happy path was removed so the
+    /// response can carry `ignored_arguments` / `freshness`; see
+    /// `finalize_search_results`).
     fn search_results(v: &serde_json::Value) -> Vec<serde_json::Value> {
-        v.as_array()
+        v.get("results")
+            .and_then(|r| r.as_array())
             .cloned()
-            .or_else(|| v.get("results").and_then(|r| r.as_array()).cloned())
             .unwrap_or_default()
     }
 
@@ -3500,6 +3502,57 @@ function handleLogin(req: Request) {
         assert!(
             result_alias_ok.get("ignored_arguments").is_none(),
             "`node_id` IS declared on get_ast_node: {result_alias_ok}"
+        );
+    }
+
+    /// `semantic_code_search` is the most-called tool and was the one whose
+    /// response could not carry the disclosure: its confident-hybrid path
+    /// returned a bare JSON array, and `note_ignored_arguments` /
+    /// `refresh_result_set` both attach through `as_object_mut()` (audit
+    /// 2026-08-16 P1-10). This drives the real dispatch and asserts the envelope
+    /// AND the disclosure.
+    ///
+    /// Scope note, so the coverage is not overstated: with no embedding model
+    /// loaded (every unit-test run, both feature sets) the tool takes the
+    /// FTS-only arm, which was already an object — this test would NOT have gone
+    /// red before the fix. The arm that WAS an array is unreachable without a
+    /// loaded model, so it is pinned one layer down, where it is observable:
+    /// `search::tests::every_response_shape_is_an_object_that_can_carry_disclosures`.
+    #[test]
+    fn test_semantic_search_response_is_an_envelope_that_carries_disclosures() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("a.ts"),
+            "export function alphaHandler() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({"query": "alphaHandler", "langauge": "typescript"}),
+        );
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        assert!(
+            result.is_object(),
+            "the response must be an object on every path, got: {result}"
+        );
+        assert!(
+            result["results"].is_array(),
+            "the result list must live under `results`, got: {result}"
+        );
+        assert_eq!(
+            result["ignored_arguments"],
+            json!(["langauge"]),
+            "a misspelled argument must be named back, got: {result}"
+        );
+
+        // Control: the same query without the typo carries no such key.
+        let req_ok = tool_call_json("semantic_code_search", json!({"query": "alphaHandler"}));
+        let result_ok = parse_tool_result(&server.handle_message(&req_ok).unwrap());
+        assert!(
+            result_ok.get("ignored_arguments").is_none(),
+            "a clean call must not carry the key, got: {result_ok}"
         );
     }
 
@@ -4116,11 +4169,9 @@ app.post('/api/login', handleLogin);
         );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        // Should succeed (bare array, FTS5-only object, or compressed mode) — not crash/OOM
+        // Should succeed (`{results, …}` envelope, or a compressed mode) — not crash/OOM.
         assert!(
-            result.is_array()
-                || result.get("results").is_some()
-                || result["mode"].as_str() == Some("compressed"),
+            result.get("results").is_some() || result["mode"].as_str() == Some("compressed"),
             "search with huge top_k should return valid results, got: {}",
             result
         );
@@ -4195,41 +4246,114 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// Drive the REAL `read_snippet` tool at a node whose indexed path escapes
+    /// the project root, and prove the escapee's bytes never reach the response.
+    ///
+    /// The previous version of this test re-implemented `root.join(p)
+    /// .canonicalize().starts_with(root)` inline and never called the tool, so it
+    /// asserted a property of `std::path` — deleting the guard in
+    /// `read_source_context` left it green (audit 2026-08-16 P1-19). False
+    /// coverage on a security guard is worse than none: it stops anyone from
+    /// writing the real thing.
+    ///
+    /// Mutation-verified: commenting out the `starts_with(&root_canonical)`
+    /// early-return in `McpServer::read_source_context` turns this test RED
+    /// (the secret file's contents come back in `code_content`).
+    ///
+    /// The traversal path is injected straight into the index because that is
+    /// the only way to reach the guard: `read_source_context` is fed the path
+    /// STORED for the node, never a caller argument, so a hostile/stale index
+    /// row (or a symlinked tree) is the realistic vector — and a caller-supplied
+    /// `../..` path fails the `get_nodes_by_file_path` lookup long before it.
     #[test]
     fn test_read_snippet_blocks_path_traversal() {
-        // Verify the canonicalize+starts_with guard prevents reading outside project root.
-        // Instead of fighting the server lifecycle, test the path logic directly:
-        // root.join("../../etc/passwd").canonicalize() should NOT starts_with(root).
-        let project_dir = TempDir::new().unwrap();
-        let root = project_dir.path().canonicalize().unwrap();
+        let base = TempDir::new().unwrap();
+        let project_dir = base.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let outside_dir = base.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(
+            outside_dir.join("secret.ts"),
+            "const SECRET_TOKEN = 'do-not-leak-this';\n",
+        )
+        .unwrap();
+        // Context line above the symbol: it exists ONLY on disk (not in the
+        // stored code_content), so the positive control below can prove
+        // read_source_context really ran rather than passing vacuously.
+        std::fs::write(
+            project_dir.join("safe.ts"),
+            "// CONTEXT_MARKER_ABOVE\nexport function ok(): number { return 1; }\n",
+        )
+        .unwrap();
 
-        // Simulate what tool_read_snippet does with a traversal path
-        let traversal_path = root.join("../../etc/passwd");
+        let server = McpServer::new_test_with_project(&project_dir);
+        server.ensure_indexed().unwrap();
 
-        // If the file exists on disk (e.g., /etc/passwd on Linux), canonicalize
-        // succeeds but starts_with check rejects it. If it doesn't exist,
-        // canonicalize fails — either way, content is never read.
-        match traversal_path.canonicalize() {
-            Ok(canonical) => {
-                assert!(
-                    !canonical.starts_with(&root),
-                    "canonical traversal path {:?} must not start with root {:?}",
-                    canonical,
-                    root
-                );
-            }
-            Err(_) => {
-                // File doesn't exist — canonicalize fails, read_snippet returns "Cannot resolve"
-                // This is the safe outcome on systems without /etc/passwd at that relative path
-            }
-        }
-
-        // Also test that a legitimate path DOES pass
-        std::fs::write(project_dir.path().join("safe.ts"), "function ok() {}").unwrap();
-        let safe_path = root.join("safe.ts").canonicalize().unwrap();
+        // Positive control FIRST: a legitimate in-root node reads from disk with
+        // its context lines. If this ever stops holding, the negative assertion
+        // below proves nothing.
+        let safe_id = queries::get_nodes_by_name(server.db().conn(), "ok").unwrap()[0].id;
+        let req = tool_call_json(
+            "read_snippet",
+            json!({"node_id": safe_id, "context_lines": 3}),
+        );
+        let safe_result = parse_tool_result(&server.handle_message(&req).unwrap());
         assert!(
-            safe_path.starts_with(&root),
-            "legitimate path should be within root"
+            safe_result["code_content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("CONTEXT_MARKER_ABOVE"),
+            "in-root read must serve on-disk context (else the guard test is vacuous): {safe_result}"
+        );
+
+        // Now an indexed node whose path escapes the root.
+        let file_id = upsert_file(
+            server.db().conn(),
+            &FileRecord {
+                path: "../outside/secret.ts".into(),
+                blake3_hash: "deadbeef".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
+        let escaped_id = queries::insert_node(
+            server.db().conn(),
+            &queries::NodeRecord {
+                file_id,
+                node_type: "const".into(),
+                name: "SECRET_TOKEN".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 1,
+                code_content: "<<stored placeholder>>".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+
+        let req = tool_call_json(
+            "read_snippet",
+            json!({"node_id": escaped_id, "context_lines": 3, "skip_indexing": true}),
+        );
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        let body = serde_json::to_string(&result).unwrap();
+        assert!(
+            !body.contains("do-not-leak-this"),
+            "a node indexed OUTSIDE the project root must never have its file read: {body}"
+        );
+        // The guard makes read_source_context return None, and the handler falls
+        // back to the stored content — the call still answers, it just answers
+        // from the index.
+        assert_eq!(
+            result["code_content"], "<<stored placeholder>>",
+            "blocked read must fall back to stored code_content: {result}"
         );
     }
 

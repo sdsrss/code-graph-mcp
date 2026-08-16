@@ -141,3 +141,87 @@ test('computeReview: returns null when binary unavailable', () => {
   const review = computeReview('/nonexistent/cg-binary-xyz', ['src/a.rs'], os.tmpdir());
   assert.strictEqual(review, null);
 });
+
+// Same contract as writeStubBinary, except the per-file analysis of
+// `failFile` dies (non-zero exit, no stdout) — what a spawn timeout, an
+// index lock, or a crashed binary looks like from here.
+function writeFlakyStubBinary(dir, failFile) {
+  const stub = path.join(dir, 'stub-cg-flaky.js');
+  fs.writeFileSync(stub, `#!/usr/bin/env node
+'use strict';
+const args = process.argv.slice(2);
+if (args.includes('--stdin')) {
+  process.stdout.write(JSON.stringify({
+    changed: ['src/a.rs', ${JSON.stringify(failFile)}],
+    tests: ['tests/a_test.rs'],
+    affected_files: [{path:'tests/a_test.rs',depth:1,is_test:true}],
+    not_indexed: [],
+  }));
+  process.exit(0);
+}
+const file = args[1];
+if (file === ${JSON.stringify(failFile)}) process.exit(3);
+process.stdout.write(JSON.stringify({ changed:[file], tests:['tests/a_test.rs'], affected_files:[], not_indexed:[] }));
+process.exit(0);
+`);
+  fs.chmodSync(stub, 0o755);
+  const shim = path.join(dir, 'cg-flaky');
+  fs.writeFileSync(shim, `#!/usr/bin/env bash\nexec node "${stub}" "$@"\n`);
+  fs.chmodSync(shim, 0o755);
+  return shim;
+}
+
+test('computeReview: a failed per-file analysis is reported as unanalyzed, never as covered', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-fail-'));
+  try {
+    const binary = writeFlakyStubBinary(dir, 'src/b.rs');
+    const review = computeReview(binary, ['src/a.rs', 'src/b.rs'], dir);
+    assert.ok(review, 'aggregate succeeded, so the review is still produced');
+    assert.deepStrictEqual(
+      review.unanalyzed, ['src/b.rs'],
+      'a file whose analysis failed must be disclosed, not silently dropped'
+    );
+    assert.deepStrictEqual(
+      review.uncovered, [],
+      'a failed analysis is not evidence of a missing test'
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('computeReview: a successful run reports no unanalyzed files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-ok-'));
+  try {
+    const review = computeReview(writeStubBinary(dir), ['src/a.rs', 'src/b.rs'], dir);
+    assert.deepStrictEqual(review.unanalyzed, []);
+    assert.deepStrictEqual(review.uncovered, ['src/b.rs']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('renderMarkdown: unanalyzed files get their own disclosure section', () => {
+  const md = renderMarkdown({
+    changed: ['src/a.rs', 'src/b.rs'],
+    not_indexed: [],
+    tests: ['tests/a_test.rs'],
+    blast_radius: 3,
+    top_affected: [{ path: 'src/c.rs', depth: 1 }],
+    uncovered: [],
+    unanalyzed: ['src/b.rs'],
+  });
+  assert.match(md, /Not analyzed \(1\)/);
+  assert.match(md, /- `src\/b\.rs`/);
+  // The wording must not let a reader take silence for coverage.
+  assert.match(md, /coverage is unknown/i);
+});
+
+test('renderMarkdown: tolerates a review object without unanalyzed', () => {
+  const md = renderMarkdown({
+    changed: ['src/a.rs'], not_indexed: [], tests: [], blast_radius: 0,
+    top_affected: [], uncovered: [],
+  });
+  assert.ok(md.startsWith(MARKER));
+  assert.doesNotMatch(md, /Not analyzed/);
+});

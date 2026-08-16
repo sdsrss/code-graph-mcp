@@ -479,6 +479,26 @@ impl McpServer {
         )?;
 
         if report.is_empty() {
+            // A `path` that matches no indexed file is zero coverage, not a
+            // clean bill of health — and this tool's entire output is an
+            // assertion of ABSENCE, on the surface an LLM reads. The CLI twin
+            // has probed and exited 1 since v0.91.0; the MCP half answered the
+            // same input with `{"results": [], "summary": "No dead code found
+            // …"}` (audit 2026-08-16 P1-22). Same callee both sides now, so the
+            // two cannot drift again. Reported as a tool error (the shape
+            // `find_references` / `get_ast_node` already use for "your filter
+            // names nothing in the index"), because a `warning` key inside an
+            // otherwise-clean report is exactly what gets skimmed past.
+            if let Some(prefix) =
+                crate::storage::queries::unindexed_path_prefix(self.db.conn(), path)
+            {
+                return Err(anyhow!(
+                    "No indexed files under path '{}' — this is zero coverage, not a clean result. \
+                     Check the path is relative to the project root (use module_overview or \
+                     project_map to see indexed paths), or index it first.",
+                    prefix
+                ));
+            }
             let mut summary = "No dead code found with the given filters.".to_string();
             if report.ignored_count > 0 {
                 summary.push_str(&format!(

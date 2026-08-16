@@ -514,3 +514,92 @@ fn create_no_sidecar_for_raw_db_output() {
         "raw .db output must not get a .blake3 sidecar"
     );
 }
+
+/// Leave a VALID, unmerged `-wal` next to `db` — the residue a partial cleanup
+/// (killed installer, crashed server) leaves behind. Returns the marker value
+/// written into that WAL and never checkpointed into the main file.
+fn strand_a_wal_beside(db: &std::path::Path) -> String {
+    let wal = std::path::PathBuf::from(format!("{}-wal", db.display()));
+    let saved = db.with_extension("saved-wal");
+    {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        // Enough pages that a replay is unmistakable in the destination file.
+        for i in 0..200 {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("stale_{i}"), "x".repeat(200)],
+            )
+            .unwrap();
+        }
+        assert!(
+            wal.exists(),
+            "precondition: writes must still be in the WAL"
+        );
+        std::fs::copy(&wal, &saved).unwrap();
+    } // close checkpoints and removes the -wal
+    std::fs::copy(&saved, &wal).unwrap();
+    std::fs::remove_file(&saved).unwrap();
+    "stale_0".to_string()
+}
+
+#[test]
+fn install_clears_a_stranded_destination_wal() {
+    // Audit 2026-08-16 P1-1. `try_install` renamed its finished partial over
+    // `index.db` while removing only ITS OWN sidecars, so a `-wal` stranded next
+    // to the destination survived the rename and SQLite replayed those pages into
+    // the brand-new file on the next open — silently reverting the snapshot to
+    // whatever the previous database contained, `integrity_check` still ok. Two
+    // of the three callers had grown their own pre-rename cleanup; the MCP server
+    // path (`McpServer::from_project_root` → `maybe_install_snapshot`) had not,
+    // which is what makes the callee the only place the guard belongs.
+    let fixture = init_git_fixture();
+    let zst = build_local_snapshot(&fixture);
+
+    let target_root = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(target_root.path())
+        .status()
+        .unwrap();
+    let cg = target_root.path().join(".code-graph");
+    std::fs::create_dir_all(&cg).unwrap();
+    let dest = cg.join("index.db");
+    let stale_key = strand_a_wal_beside(&dest);
+    let wal = cg.join("index.db-wal");
+    assert!(
+        wal.exists(),
+        "precondition: the destination must carry a stranded WAL before install"
+    );
+
+    let url = format!("file://{}", zst.display());
+    try_install(&url, target_root.path()).unwrap();
+
+    let db = crate::storage::db::Database::open(&dest).unwrap();
+    let conn = db.conn();
+    assert!(
+        read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_COMMIT)
+            .unwrap()
+            .is_some(),
+        "the installed snapshot's own meta must survive"
+    );
+    assert_eq!(
+        read_meta(conn, &stale_key).unwrap(),
+        None,
+        "a page from the pre-install database was replayed over the installed snapshot"
+    );
+    drop(db);
+    assert!(
+        !wal.exists(),
+        "install left the destination's stale -wal in place, to be replayed over the new DB"
+    );
+    assert!(
+        !cg.join("index.db-shm").exists(),
+        "install left the destination's stale -shm in place"
+    );
+}

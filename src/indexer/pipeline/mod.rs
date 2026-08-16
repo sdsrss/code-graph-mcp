@@ -241,7 +241,21 @@ pub fn ensure_file_indexed(
     let mut hashes: HashMap<String, String> = HashMap::new();
     hashes.insert(rel_path.to_string(), on_disk_hash);
     let files = vec![rel_path.to_string()];
+    // `index_files` clears the interrupted-run marker when it finishes, which is
+    // right for a run that covered the whole diff and wrong for this one: a
+    // single-file query-time refresh re-extracts one file's relations and leaves
+    // every other file the killed run abandoned exactly as it was. Clearing here
+    // would retire the evidence before the full re-index it exists to trigger, so
+    // a marker that was already set goes back (audit 2026-08-16 P1-2).
+    let was_interrupted = index_run_was_interrupted(db)?;
     index_files(db, project_root, &files, &hashes, model, &[], None)?;
+    if was_interrupted {
+        crate::storage::queries::set_meta(
+            db.conn(),
+            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+            "1",
+        )?;
+    }
 
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
@@ -266,7 +280,11 @@ pub fn run_incremental_index(
         .into_iter()
         .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
         .collect();
-    let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
+    let to_index = to_index_after_interrupt_check(
+        db,
+        [diff.new_files, diff.changed_files].concat(),
+        &current_hashes,
+    )?;
 
     let dirty_node_ids = if !to_index.is_empty() {
         collect_dirty_node_ids(db, &to_index)?
@@ -339,7 +357,14 @@ pub fn run_incremental_index_cached(
         .into_iter()
         .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
         .collect();
-    let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
+    // Same interrupted-run escalation as `run_incremental_index`. `current_hashes`
+    // is complete here too — the merge above carries forward the stored hash of
+    // every file in a directory the cache let us skip walking.
+    let to_index = to_index_after_interrupt_check(
+        db,
+        [diff.new_files, diff.changed_files].concat(),
+        &current_hashes,
+    )?;
 
     let dirty_node_ids = if !to_index.is_empty() {
         collect_dirty_node_ids(db, &to_index)?
@@ -378,6 +403,43 @@ pub fn run_incremental_index_cached(
     }
 
     Ok((result, new_cache))
+}
+
+/// True when a previous index run was killed after committing file hashes but
+/// before its cross-file edges reached the database (audit 2026-08-16 P1-2).
+///
+/// The killed run's hashes make `compute_diff` report those files as unchanged
+/// forever, so the missing edges have no other route back — the caller escalates
+/// its incremental to a full re-index, which re-extracts every relation. Reading
+/// an absent key as "clean" is what makes this safe on indexes built before the
+/// marker existed: they are no worse off than before, just not covered.
+fn index_run_was_interrupted(db: &Database) -> Result<bool> {
+    Ok(crate::storage::queries::get_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
+    )?
+    .is_some())
+}
+
+/// The file set an incremental run should process: its diff normally, or the
+/// whole tree when the previous run was interrupted. `index_files` re-sets and
+/// clears the marker itself, so the escalated run needs no extra bookkeeping.
+fn to_index_after_interrupt_check(
+    db: &Database,
+    diff_files: Vec<String>,
+    current_hashes: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    if !index_run_was_interrupted(db)? {
+        return Ok(diff_files);
+    }
+    tracing::warn!(
+        "[incremental] previous index run did not finish (cross-file edges were never \
+         committed while file hashes were) — re-indexing all {} file(s) instead of the \
+         {} the diff reports",
+        current_hashes.len(),
+        diff_files.len()
+    );
+    Ok(current_hashes.keys().cloned().collect())
 }
 
 /// Collect node IDs in OTHER files that have edges pointing to nodes in the changed files.

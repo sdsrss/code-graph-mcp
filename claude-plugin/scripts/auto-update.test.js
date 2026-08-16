@@ -287,28 +287,166 @@ test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.
 
   // Field failure mode: shell already at latest, binary pinned stale → MUST download.
   let downloaded = false;
+  let stale = true;
   const healed = await selfHealStaleBinary(latest, {
-    needsUpdate: () => true,
-    download: async () => { downloaded = true; return true; },
+    state: {},
+    needsUpdate: () => stale,
+    download: async () => { downloaded = true; stale = false; return true; },
   });
   assert.equal(downloaded, true, 'stale binary must trigger a download');
-  assert.equal(healed, true);
+  assert.equal(healed.healed, true);
 
   // Binary current → no download, no-op.
   let touched = false;
   const noop = await selfHealStaleBinary(latest, {
+    state: {},
     needsUpdate: () => false,
     download: async () => { touched = true; return true; },
   });
   assert.equal(touched, false, 'current binary must not download');
-  assert.equal(noop, false);
+  assert.equal(noop.healed, false);
 
-  // Download fails (no curl / network) → returns false so the next session retries.
+  // Download fails (no curl / network) → not healed, and the attempt is RECORDED
+  // (see the bounded-retry test below; an unrecorded failure retried forever).
   const failed = await selfHealStaleBinary(latest, {
+    state: {},
     needsUpdate: () => true,
     download: async () => false,
   });
-  assert.equal(failed, false);
+  assert.equal(failed.healed, false);
+  assert.equal(failed.patch.binaryHealAttempts, 1);
+  assert.equal(failed.patch.binaryHealVersion, '0.45.2');
+});
+
+// ── P1-14: the stale-binary self-heal must be BOUNDED ───────────────────────
+//
+// It had no counter at all, and the no-update branch that runs it also cleared
+// `updateAttempts`/`suspendedAt` unconditionally — while `shouldCheck`'s
+// `binaryStale` arm bypasses the throttle. A binary that cannot be promoted
+// (the Windows "server holds the .exe" EACCES the code names at :526) therefore
+// re-downloaded ~40MB on EVERY session, forever. Measured pre-fix with a stubbed
+// downloader: 8 calls → 8 downloads.
+
+test('selfHealStaleBinary stops after MAX_UPDATE_ATTEMPTS failures on the same version', async () => {
+  const latest = { version: '1.0.0', binaryUrl: 'https://example/bin' };
+  let downloads = 0;
+  let state = {};
+  for (let i = 0; i < 8; i++) {
+    const r = await selfHealStaleBinary(latest, {
+      state,
+      needsUpdate: () => true,                 // promote keeps failing → still stale
+      binaryPresent: () => true,               // STALE, not missing — the budget applies
+      download: async () => { downloads++; return false; },
+    });
+    state = { ...state, ...r.patch };
+  }
+  assert.equal(downloads, MAX_UPDATE_ATTEMPTS,
+    `8 sessions must cost at most ${MAX_UPDATE_ATTEMPTS} downloads, not 8`);
+  assert.equal(state.binaryHealAttempts, MAX_UPDATE_ATTEMPTS);
+});
+
+test('a download that "succeeds" but leaves the binary stale still counts as a failure', async () => {
+  // The Windows EACCES shape: curl+checksum fine, the rename onto the running
+  // .exe fails. Counting the exit code instead of re-reading the disk is how a
+  // capped retry budget never runs out (the same lesson as selfHealGlobalPkgs).
+  const latest = { version: '1.0.0', binaryUrl: 'https://example/bin' };
+  const r = await selfHealStaleBinary(latest, {
+    state: {},
+    needsUpdate: () => true,        // still stale AFTER the "successful" download
+    binaryPresent: () => true,
+    download: async () => true,
+  });
+  assert.equal(r.healed, false);
+  assert.equal(r.patch.binaryHealAttempts, 1);
+});
+
+test('a successful heal clears the counter; a new release re-arms it', async () => {
+  const v1 = { version: '1.0.0', binaryUrl: 'https://example/bin' };
+  const v2 = { version: '1.1.0', binaryUrl: 'https://example/bin2' };
+  const exhausted = { binaryHealVersion: '1.0.0', binaryHealAttempts: MAX_UPDATE_ATTEMPTS };
+
+  // Same target, budget spent → no download at all.
+  let downloads = 0;
+  const parked = await selfHealStaleBinary(v1, {
+    state: exhausted,
+    needsUpdate: () => true,
+    binaryPresent: () => true,
+    download: async () => { downloads++; return true; },
+  });
+  assert.equal(downloads, 0, 'a parked heal must not spend bandwidth');
+  assert.equal(parked.healed, false);
+
+  // A NEWER release moves the target → full budget again.
+  let stale = true;
+  const rearmed = await selfHealStaleBinary(v2, {
+    state: exhausted,
+    needsUpdate: () => stale,
+    binaryPresent: () => true,
+    download: async () => { downloads++; stale = false; return true; },
+  });
+  assert.equal(downloads, 1, 'a new release re-arms the heal');
+  assert.equal(rearmed.healed, true);
+  assert.equal(rearmed.patch.binaryHealAttempts, 0, 'success resets the counter');
+  assert.equal(rearmed.patch.binaryHealVersion, '1.1.0');
+
+  // And a binary that is current clears a leftover counter.
+  const clean = await selfHealStaleBinary(v1, {
+    state: exhausted,
+    needsUpdate: () => false,
+    download: async () => { downloads++; return true; },
+  });
+  assert.equal(clean.patch.binaryHealAttempts, 0);
+});
+
+test('a MISSING binary is exempt from the heal budget — recovery stays unbounded', async () => {
+  // Batch review of the P1-14 fix: `needsUpdate` is also true when the binary
+  // does not exist at all. Letting the stale-heal counter absorb those
+  // failures would park the ONLY recovery path after five offline session
+  // starts (captive portal, air-gapped week), with no time-based re-arm —
+  // the counter resets only when a NEWER release ships.
+  const latest = { version: '1.0.0', binaryUrl: 'https://example/bin' };
+  let downloads = 0;
+  let state = { binaryHealVersion: '1.0.0', binaryHealAttempts: MAX_UPDATE_ATTEMPTS };
+  for (let i = 0; i < 3; i++) {
+    const r = await selfHealStaleBinary(latest, {
+      state,
+      needsUpdate: () => true,
+      binaryPresent: () => false,           // no engine at all
+      download: async () => { downloads++; return false; },
+    });
+    state = { ...state, ...r.patch };
+  }
+  assert.equal(downloads, 3, 'a missing binary must keep retrying even past the stale budget');
+  assert.equal(state.binaryHealAttempts, MAX_UPDATE_ATTEMPTS,
+    'missing-binary failures must not inflate the stale counter');
+
+  // When the binary finally lands, the counter clears as usual.
+  const healed = await selfHealStaleBinary(latest, {
+    state,
+    needsUpdate: (() => { let calls = 0; return () => { calls += 1; return calls === 1; }; })(),
+    binaryPresent: () => false,
+    download: async () => true,
+  });
+  assert.equal(healed.healed, true);
+  assert.equal(healed.patch.binaryHealAttempts, 0);
+});
+
+test('shouldCheck stops bypassing the throttle once the binary heal is exhausted', () => {
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+  const fresh = { lastCheck: minsAgo(10), latestVersion: '1.0.0', updateAvailable: false };
+  assert.equal(shouldCheck(fresh, { binaryStale: true }), true,
+    'precondition: a stale binary normally bypasses the throttle');
+
+  const spent = { ...fresh, binaryHealVersion: '1.0.0', binaryHealAttempts: MAX_UPDATE_ATTEMPTS };
+  assert.equal(shouldCheck(spent, { binaryStale: true }), false,
+    'an exhausted heal must fall back to the ordinary interval — the bypass had nothing left to do');
+
+  // Re-armed by a newer release: the bypass is available again.
+  const newTarget = { ...spent, latestVersion: '1.1.0' };
+  assert.equal(shouldCheck(newTarget, { binaryStale: true }), true);
+
+  // A MISSING binary still outranks everything (no engine at all is worse).
+  assert.equal(shouldCheck(spent, { binaryMissing: true }), true);
 });
 
 test('parseLatestRelease selects the matching platform asset', () => {

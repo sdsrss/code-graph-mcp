@@ -124,11 +124,20 @@ function computeReview(binary, changedFiles, cwd) {
   // Per-file test-gap: a changed PRODUCTION (non-test) file is "uncovered" when
   // running `affected` on it alone surfaces zero test files. Run per-file so the
   // signal is attributable (the aggregate union can't be split back per file).
+  //
+  // `runAffected` returns null for BOTH "spawn failed / timed out / non-zero
+  // exit" and "unparseable output" — none of which say anything about test
+  // coverage. Those files go to `unanalyzed` and are disclosed. Folding them
+  // into the same else-branch as "has tests" made a 60s timeout render as a
+  // covered file: the most dangerous direction for a test-gap report to fail in.
   const uncovered = [];
+  const unanalyzed = [];
   for (const f of changed) {
     if (isTestPath(f)) continue;
     const single = runAffected(binary, ['affected', f, '--json'], cwd, '');
-    if (single && (single.tests || []).length === 0) {
+    if (!single) {
+      unanalyzed.push(f);
+    } else if ((single.tests || []).length === 0) {
       uncovered.push(f);
     }
   }
@@ -145,6 +154,7 @@ function computeReview(binary, changedFiles, cwd) {
     blast_radius: affectedFiles.length,
     top_affected: topAffected,
     uncovered: uncovered.sort(),
+    unanalyzed: unanalyzed.sort(),
   };
 }
 
@@ -174,6 +184,16 @@ function renderMarkdown(review) {
     lines.push(`### ⚠️ Test gaps (${review.uncovered.length})`);
     lines.push('Changed production files with no test in their reverse-dependency closure:');
     for (const p of review.uncovered) lines.push(`- \`${p}\``);
+    lines.push('');
+  }
+
+  // Absence of a result is not a result. These files are listed apart from the
+  // test gaps because the analysis never produced an answer for them.
+  const unanalyzed = review.unanalyzed || [];
+  if (unanalyzed.length > 0) {
+    lines.push(`### ❔ Not analyzed (${unanalyzed.length})`);
+    lines.push('The `affected` run for these files failed or timed out, so their test coverage is unknown:');
+    for (const p of unanalyzed) lines.push(`- \`${p}\``);
     lines.push('');
   }
 
@@ -265,9 +285,21 @@ function main(argv) {
     process.stdout.write(body + '\n');
   }
 
+  const unanalyzed = review.unanalyzed || [];
+  if (unanalyzed.length > 0) {
+    console.error(`[pr-impact] ${unanalyzed.length} changed file(s) could not be analyzed: ${unanalyzed.join(', ')}`);
+  }
+
   const failOnRisk = /^(1|true|yes)$/i.test(process.env.CODE_GRAPH_FAIL_ON_RISK || '');
   if (failOnRisk && review.uncovered.length > 0) {
     console.error(`[pr-impact] fail-on-risk: ${review.uncovered.length} changed file(s) have no covering test.`);
+    process.exit(1);
+  }
+  // A file the analyzer never answered for is unmeasured risk, not cleared
+  // risk: under an explicit fail-on-risk gate it blocks like a test gap does,
+  // with its own message so the two causes stay distinguishable in CI logs.
+  if (failOnRisk && unanalyzed.length > 0) {
+    console.error(`[pr-impact] fail-on-risk: ${unanalyzed.length} changed file(s) could not be analyzed.`);
     process.exit(1);
   }
 }

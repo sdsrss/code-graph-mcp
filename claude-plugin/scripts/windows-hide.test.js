@@ -332,8 +332,26 @@ test('every child_process call site in the shipped JS dirs sets windowsHide', ()
 test('proc-opts.hidden defaults windowsHide on and preserves caller options', () => {
   const { hidden } = require('./proc-opts');
   assert.equal(hidden().windowsHide, true);
-  assert.deepEqual(hidden({ cwd: '/x', timeout: 5 }), { windowsHide: true, cwd: '/x', timeout: 5 });
+  assert.deepEqual(hidden({ cwd: '/x', timeout: 5 }),
+    { windowsHide: true, cwd: '/x', timeout: 5 });
   // An explicit caller value wins — nothing in-tree needs it, but silently
   // overriding a deliberate `false` would be a surprise.
   assert.equal(hidden({ windowsHide: false }).windowsHide, false);
+});
+
+// killSignal is deliberately NOT a hidden() default: SIGKILL is right for the
+// untrusted/hang-prone statusline children (P1-17), but hard-killing a timed
+// `git pull` or npm child orphans their lock files (.git/index.lock) and
+// silently breaks every later marketplace refresh. The two statusline call
+// sites opt in explicitly; this pins both halves of that decision.
+test('killSignal SIGKILL is opted in at the statusline call sites, not defaulted globally', () => {
+  const { hidden } = require('./proc-opts');
+  assert.equal(hidden().killSignal, undefined,
+    'a global SIGKILL default would orphan git/npm lock files on timeout');
+  assert.equal(hidden({ killSignal: 'SIGKILL' }).killSignal, 'SIGKILL');
+  for (const file of ['statusline-composite.js', 'statusline.js']) {
+    const src = fs.readFileSync(path.join(__dirname, file), 'utf8');
+    assert.ok(/killSignal:\s*'SIGKILL'/.test(src),
+      `${file} runs untrusted/hang-prone children under a timeout and must pass killSignal: 'SIGKILL' (P1-17)`);
+  }
 });

@@ -676,6 +676,52 @@ function binaryVersionResolved({
   return Boolean(actual) && actual === pluginVersion();
 }
 
+/**
+ * Mirror of BOTH `binary-broken` diagnoses: the binary is on disk but does not
+ * run (runDiagnostics step 2, `--version` unreadable) or its health-check failed
+ * with no recoverable payload (healthRows' last arm). Re-asks the same two
+ * questions the diagnosis asked, so "resolved" cannot mean something weaker than
+ * "not raised". Cache dropped first: the promote happens in a CHILD process and
+ * find-binary memoizes.
+ */
+function binaryBrokenResolved({
+  find = findBinary, readVersion = readBinaryVersion, rows = healthRows,
+} = {}) {
+  clearBinaryCache();
+  const binary = find();
+  if (!binary) return false;
+  if (!readVersion(binary)) return false;
+  try {
+    return !rows(binary).some((r) => r.fixId === 'binary-broken');
+  } catch { return false; }
+}
+
+/**
+ * Build the binary in the source checkout. Injectable for the same reason
+ * rebuildIndexInPlace is: `execSync` is destructured at load, so a test that
+ * patches child_process afterwards would silently run a real 10-minute cargo
+ * build. Returns true on exit 0; throws what the build threw.
+ */
+function buildBinaryFromSource(cmd) {
+  execSync(cmd, hidden({
+    cwd: path.resolve(__dirname, '..', '..'),
+    stdio: 'inherit',
+    timeout: 600000,  // embed-model (Candle) builds exceed the old 5min
+  }));
+  clearBinaryCache();
+  return true;
+}
+
+/** Manual recovery for a binary we could not repair — the end of every failed arm. */
+function printBinaryRecovery() {
+  console.log('     Reinstall: npm install -g @sdsrs/code-graph');
+  console.log('     Or download the release asset for your platform:');
+  console.log('       https://github.com/sdsrss/code-graph-mcp/releases');
+  if (os.platform() === 'darwin') {
+    console.log('     macOS may also have quarantined it: xattr -d com.apple.quarantine <binary>');
+  }
+}
+
 /** Mirror of the `update-incomplete` diagnosis (runDiagnostics step 5). */
 function updateIncompleteResolved({ readStateFile = readUpdateState } = {}) {
   const state = readStateFile();
@@ -770,6 +816,8 @@ function runRepairs(results, {
   updateResolved = updateIncompleteResolved,
   integrityOk = integrityResolved,
   rebuildIndex = rebuildIndexInPlace,
+  binaryUsable = binaryBrokenResolved,
+  buildBinary = buildBinaryFromSource,
 } = {}) {
   const fixable = results.filter(r => r.fixId);
   if (fixable.length === 0) return 0;
@@ -847,6 +895,63 @@ function runRepairs(results, {
         } else {
           console.log('    Install: npm install -g @sdsrs/code-graph');
           console.log('    Or download from: https://github.com/sdsrss/code-graph-mcp/releases');
+        }
+        break;
+      }
+
+      case 'binary-broken': {
+        // The binary EXISTS but cannot run: a truncated or corrupted download, a
+        // wrong-arch asset, a missing libc, macOS quarantine, or a real crash.
+        // This fixId had no arm at all, so doctor printed "1 issue(s) found.
+        // Fixing..." and then "0/1 addressed" with nothing between the two
+        // (audit 2026-08-16 P1-13).
+        if (devMode()) {
+          // A source checkout is never repaired by downloading a release asset.
+          // Preserve the feature set for the same reason the binary-stale arm
+          // does — never silently downgrade a hybrid dev binary to FTS5-only.
+          const embed = detectEmbedModel(findBinary());
+          const buildCmd = devBuildCommand(embed === true);
+          console.log('\n  Binary is present but does not run — rebuilding from source...');
+          if (embed === null) {
+            console.log('    (could not probe the current feature set — building FTS5-only;');
+            console.log('     for semantic search rebuild with `cargo build --release --features embed-model`)');
+          }
+          console.log(`    → ${buildCmd}`);
+          try {
+            if (!buildBinary(buildCmd)) {
+              console.log('  ❌ Build failed');
+              break;
+            }
+          } catch {
+            console.log('  ❌ Build failed');
+            break;
+          }
+        } else {
+          console.log('\n  Binary is present but does not run — re-downloading it...');
+          try {
+            // The updater's stale-binary self-heal treats an unreadable
+            // `--version` as "replace it", so this reaches the verified
+            // download+promote path even without a newer release.
+            runAutoUpdate();
+          } catch {
+            console.log('  ❌ Update check failed');
+            printBinaryRecovery();
+            break;
+          }
+        }
+        // Exit 0 proves the command ran, not that the binary works. Ask it.
+        if (binaryUsable()) {
+          console.log('  ✅ Binary runs again');
+          fixed++;
+        } else {
+          console.log('  ❌ The binary still cannot run');
+          if (!devMode()) {
+            const why = autoUpdateNoOpReason();
+            if (why) console.log(`     Why the re-download may have done nothing: ${why}.`);
+            printBinaryRecovery();
+          } else {
+            console.log('     The build completed but the produced binary still fails --version/health-check.');
+          }
         }
         break;
       }
@@ -1048,7 +1153,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, autoUpdateNoOpReason };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

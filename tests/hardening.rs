@@ -831,6 +831,10 @@ fn release_and_cache_warm_workflows_do_not_drift() {
             "clippy on the feature set release binaries actually ship",
         ),
         (
+            "run: cargo test --no-default-features",
+            "the Rust test suite on the default (no-features) set — what `cargo install` users build (audit 2026-08-16 P1-18)",
+        ),
+        (
             "run: cargo test --features embed-model",
             "the Rust test suite",
         ),
@@ -965,11 +969,22 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
         .collect();
+    // The SHIPPED workflow templates too: they are installed into USERS' repos
+    // (with `contents: write`), where a floating tag is a supply-chain hole we
+    // hand to every adopter. They were pinned by hand in the 2026-08-16 batch;
+    // without this leg the next template edit can silently revert to `@v4`.
+    let tpl_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-plugin/templates");
+    files.extend(
+        fs::read_dir(&tpl_dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", tpl_dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml")),
+    );
     files.sort();
     assert!(
-        !files.is_empty(),
-        "no workflow files found under {} — this guard would pass vacuously",
-        dir.display()
+        files.len() > 5,
+        "workflow file discovery shrank to {} files — this guard would pass vacuously",
+        files.len()
     );
 
     for path in &files {

@@ -3308,6 +3308,70 @@ fn test_cli_impact_nonexistent() {
     );
 }
 
+/// `--file` naming a file that does NOT contain the symbol must be an error on
+/// every symbol-lookup command, and `impact` was the one of the four that
+/// answered anyway. It skipped the file when checking existence
+/// (`get_nodes_by_name` ignores the filter) and skipped the ambiguity guard
+/// because a filter was present, so the caller-query ran with a filter no
+/// definition matches: zero callers → `"risk":"LOW"`, exit 0. That is a safety
+/// endorsement for a typo'd path, on the command the docs put BEFORE an edit.
+/// Siblings `refs` / `show` / `callgraph` all exit 1 on the same input.
+#[test]
+fn test_cli_impact_file_not_containing_symbol_errors() {
+    let project = setup_indexed_project();
+
+    // JSON surface: tier-3 empty contract — an `error` object, not a clean
+    // low-risk answer. `utils.ts` is indexed but has no `validateToken`.
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "impact",
+            "validateToken",
+            "--file",
+            "src/utils.ts",
+            "--json",
+        ],
+    );
+    assert_ne!(
+        code, 0,
+        "a --file that does not contain the symbol must exit non-zero, got stdout: {stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json miss must stay parseable ({e}): {stdout}"));
+    assert!(
+        v["error"].is_string(),
+        "miss must carry an error string, got: {v}"
+    );
+    assert!(
+        v["risk"].is_null(),
+        "a miss must NOT assert a risk level, got: {v}"
+    );
+    assert_eq!(v["symbol"], "validateToken", "got: {v}");
+    assert_eq!(v["file"], "src/utils.ts", "got: {v}");
+
+    // Human surface: same verdict, and the message names the file.
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["impact", "validateToken", "--file", "src/utils.ts"],
+    );
+    assert_ne!(code, 0, "human mode must exit non-zero too");
+    assert!(
+        stderr.contains("not found in file") && stderr.contains("src/utils.ts"),
+        "stderr must name the file, got: {stderr}"
+    );
+
+    // Control: the SAME symbol with its real file still analyses normally, so
+    // the guard rejects only genuine misses.
+    let (stdout_ok, _, code_ok) = run_cli(
+        &project,
+        &["impact", "validateToken", "--file", "src/auth.ts", "--json"],
+    );
+    assert_eq!(code_ok, 0, "correct --file must still succeed: {stdout_ok}");
+    let ok: serde_json::Value = serde_json::from_str(stdout_ok.trim()).unwrap();
+    assert!(ok["risk"].is_string(), "got: {ok}");
+    assert!(ok.get("error").is_none(), "got: {ok}");
+}
+
 #[test]
 fn test_cli_impact_change_type_remove() {
     let project = setup_indexed_project();
@@ -5281,6 +5345,142 @@ fn test_cli_ast_search_no_query_no_filter_errors() {
     assert!(
         stderr.contains("Usage:") || stderr.contains("at least one filter"),
         "should explain query-or-filter requirement; got: {stderr:?}"
+    );
+}
+
+/// Fixture where the FTS rank for "node" is dominated by functions, so the
+/// `--type struct` survivors sit BELOW a small candidate cut: 40 `node_*`
+/// functions (each repeating the term) plus 8 `Node*` structs.
+///
+/// This is the shape the 2026-08-16 audit measured on this repo itself
+/// (`ast-search node --type struct` showed 3 of 39 real matches at the default
+/// limit, and 0 at `--limit 5` — with a hint telling the user to BROADEN the
+/// filter, which is the opposite of the remedy).
+pub fn setup_type_filter_drown_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let mut walk = String::new();
+    for i in 0..40 {
+        walk.push_str(&format!(
+            "pub fn node_walk_{i:02}(node: &NodeRef) -> u32 {{\n    \
+             let node_id = node.node_id();\n    \
+             let node_depth = node.node_depth();\n    \
+             node_id + node_depth + node_id\n}}\n"
+        ));
+    }
+    std::fs::write(src.join("walk.rs"), walk).unwrap();
+
+    let mut types = String::new();
+    for name in [
+        "NodeAlpha",
+        "NodeBravo",
+        "NodeCharlie",
+        "NodeDelta",
+        "NodeEcho",
+        "NodeFoxtrot",
+        "NodeGolf",
+        "NodeHotel",
+    ] {
+        types.push_str(&format!("pub struct {name} {{\n    pub id: u32,\n}}\n"));
+    }
+    std::fs::write(src.join("types.rs"), types).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod walk;\npub mod types;\n").unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    project
+}
+
+/// A filtered `ast-search` must size its candidate pool for the filter, not for
+/// `limit * 4`.
+///
+/// Pre-fix both surfaces fetched exactly `limit*4` FTS rows and filtered in
+/// Rust, so a filter whose survivors rank below that cut returned NOTHING while
+/// 8 matches sat in the index — and the empty response advised broadening the
+/// filter, which cannot help (audit 2026-08-16 P1-8).
+#[test]
+fn test_cli_ast_search_type_filter_widens_candidate_pool() {
+    let project = setup_type_filter_drown_project();
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "ast-search",
+            "node",
+            "--type",
+            "struct",
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "ast-search must exit 0; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("ast-search --json must emit JSON ({e}); got: {stdout}");
+    });
+    let count = v["count"].as_u64().unwrap_or(0);
+    assert_eq!(
+        count, 5,
+        "8 `Node*` structs exist and --limit 5 was asked for; the FTS candidate pool must be sized for the type filter. Got: {v}"
+    );
+    let names: Vec<String> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        names.iter().all(|n| n.contains("Node")),
+        "every result must be one of the Node* structs, got {names:?}"
+    );
+    assert!(
+        !stdout.contains("Broaden or clear the filter"),
+        "matches exist — the filter is not the problem; got: {stdout}"
+    );
+}
+
+/// When more symbols match than `--limit`, the response must say so. Otherwise
+/// "5 results" is indistinguishable from "5 matches exist", and the caller (an
+/// LLM) reports the truncated set as the complete answer.
+#[test]
+fn test_cli_ast_search_discloses_limit_truncation() {
+    let project = setup_type_filter_drown_project();
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "ast-search",
+            "node",
+            "--type",
+            "struct",
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        v["matched_total"].as_u64(),
+        Some(8),
+        "all 8 matching structs must be counted before truncation; got {v}"
+    );
+    assert!(
+        v["truncated"].as_bool().unwrap_or(false),
+        "the response must flag that matches were cut by --limit; got {v}"
+    );
+    assert!(
+        stderr.contains("--limit") || stdout.contains("--limit"),
+        "the remedy is to RAISE --limit, and it must be named; stdout={stdout} stderr={stderr}"
     );
 }
 

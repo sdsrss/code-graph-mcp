@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 use crate::domain::REL_CALLS;
 
@@ -207,9 +208,36 @@ pub fn get_call_graph_filtered(
     })
 }
 
-/// Returns `(nodes, limit_hit)`. `limit_hit` is true when the SQL query
-/// returned exactly `CALL_GRAPH_ROW_LIMIT` rows — more nodes may exist
-/// beyond the returned set.
+/// Max node ids bound into one frontier / metadata query. Keeps every
+/// `IN (...)` list well under SQLite's variable cap on a wide fan-out.
+const FRONTIER_CHUNK: usize = 400;
+
+/// Returns `(nodes, limit_hit)`. `limit_hit` is true when the traversal found at
+/// least `CALL_GRAPH_ROW_LIMIT` nodes — more nodes may exist beyond the
+/// returned set.
+///
+/// Traversal is a breadth-first walk driven from Rust, one SQL query per level,
+/// with a GLOBAL visited set. It replaces a `WITH RECURSIVE` CTE whose cycle
+/// guard was a per-path visited STRING
+/// (`(',' || cg.visited || ',') NOT LIKE '%,id,%'`). That guard only stops a
+/// path from revisiting its OWN nodes, so the CTE enumerated every simple path
+/// in the graph and deduplicated them afterwards with
+/// `ROW_NUMBER() … PARTITION BY node_id ORDER BY depth`. On a densely connected
+/// graph the path count is exponential in depth: a synthetic layered graph of
+/// 55 nodes / 250 edges took 22.8s at depth 10, and 66 nodes did not finish in
+/// two minutes.
+///
+/// The output is the same set: a node's shortest path is a simple path, so the
+/// CTE's `MIN(depth)` per node is exactly the BFS distance, and a node
+/// reachable within N steps by any walk is reachable within N steps by a simple
+/// path. What BFS drops is the redundant re-derivation of longer paths.
+///
+/// `parent_id` records one parent on a shortest path. The CTE's
+/// `ORDER BY cg.depth` had no tiebreaker, so among several shortest-path
+/// parents SQLite kept whichever row its queue produced first; BFS keeps the
+/// parent discovered first, with the frontier held in discovery order and each
+/// level's children ordered by `(parent discovery rank, node id)`. Same class of
+/// answer, now pinned by the code rather than by the query plan.
 fn query_direction(
     conn: &Connection,
     function_name: &str,
@@ -218,124 +246,213 @@ fn query_direction(
     direction: Direction,
     min_confidence_rank: u8,
 ) -> Result<(Vec<CallGraphNode>, bool)> {
-    let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap to prevent CTE blowup on highly connected graphs
+    let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap on traversal depth
                                                          // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
-    let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
     let file_path_param: Option<&str> = file_path;
+
+    // Seed. Never SEED on an `<external>` sentinel: it has no outgoing calls, so
+    // the traversal returns a one-node graph whose root prints as
+    // `HashMap (<external>)` — a call graph for a symbol that is not in the
+    // project. The by-name lookups in `queries/nodes.rs` carry the same
+    // exclusion. `ORDER BY n.id` fixes multi-seed order (same-named defs in
+    // several files) so depth-0 output does not depend on the query plan.
+    let mut frontier: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT n.id FROM nodes n
+             JOIN files f ON f.id = n.file_id
+             WHERE n.name = ?1 AND f.path <> '<external>'
+               AND (?2 IS NULL OR f.path = ?2)
+             ORDER BY n.id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![function_name, file_path_param], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if frontier.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+
+    // node_id → (depth, parent). Seeds are depth 0 with no parent.
+    let mut seen: HashMap<i64, (i32, Option<i64>)> =
+        frontier.iter().map(|id| (*id, (0, None))).collect();
 
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)
     // - callers: follow edges backward (target_id = current, source_id = next)
-    // Confidence gate (?5): only FOLLOW edges whose resolution-confidence rank
-    // is >= the requested floor. The CASE mirrors `domain::confidence_rank`
-    // (extracted=2, inferred=1, ambiguous/unknown=0) — a test pins the two in
-    // sync. Spliced into the recursive step's edge JOIN so a sub-threshold edge
-    // is pruned BEFORE it expands, which is what kills the ambiguous fan-out
-    // (one `.execute()` → 56 same-named defs) at the source instead of after.
-    let conf_gate =
-        "AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) >= ?5";
-    let (edge_join, next_node_join) = match direction {
-        Direction::Callees => (
-            format!("JOIN edges e ON e.source_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
-            "JOIN nodes t ON t.id = e.target_id",
-        ),
-        Direction::Callers => (
-            format!("JOIN edges e ON e.target_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
-            "JOIN nodes t ON t.id = e.source_id",
-        ),
+    let (from_col, to_col) = match direction {
+        Direction::Callees => ("source_id", "target_id"),
+        Direction::Callers => ("target_id", "source_id"),
     };
+    // Confidence gate: only FOLLOW edges whose resolution-confidence rank is >=
+    // the requested floor. The CASE mirrors `domain::confidence_rank`
+    // (extracted=2, inferred=1, ambiguous/unknown=0) — a test pins the two in
+    // sync. Applied to the frontier expansion so a sub-threshold edge is never
+    // walked, which is what kills the ambiguous fan-out (one `.execute()` → 56
+    // same-named defs) at the source instead of after. Placeholders here are
+    // POSITIONAL (`?`), because the frontier `IN (...)` list ahead of them is,
+    // and SQLite numbers a bare `?` one past the highest index seen so far —
+    // mixing `?1` into the same statement silently aliases parameter 1.
+    let conf_gate =
+        "AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) >= ?";
 
-    // The CTE tracks `parent_id` (the cg row that produced each new node) so
-    // the renderer can show real tree edges instead of inferring nesting from
-    // depth alone (which collapses sibling subtrees under the last depth-N
-    // entry). On dedup we keep the parent on the shortest path via
-    // ROW_NUMBER() ... ORDER BY depth.
-    //
+    let mut depth = 1;
+    while depth <= max_depth && !frontier.is_empty() {
+        // (child, rank of the parent that reached it) — lowest rank wins, so the
+        // recorded parent is the earliest-discovered one, and the next frontier
+        // inherits a deterministic order.
+        let mut discovered: Vec<(i64, usize, i64)> = Vec::new(); // (child, parent_rank, parent)
+        for (offset, chunk) in frontier.chunks(FRONTIER_CHUNK).enumerate() {
+            let base = offset * FRONTIER_CHUNK;
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            // The `nodes t` join mirrors the CTE's: an edge pointing at a row
+            // with no `nodes` entry is not expanded.
+            let sql = format!(
+                "SELECT e.{from_col}, e.{to_col}
+                 FROM edges e
+                 JOIN nodes t ON t.id = e.{to_col}
+                 WHERE e.{from_col} IN ({placeholders}) AND e.relation = ? {conf_gate}"
+            );
+            let rank_of: HashMap<i64, usize> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (*id, base + i))
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            let rank_param: i64 = min_confidence_rank as i64;
+            for id in chunk {
+                params.push(id as &dyn rusqlite::types::ToSql);
+            }
+            params.push(&REL_CALLS);
+            params.push(&rank_param);
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (parent, child) = row?;
+                if seen.contains_key(&child) {
+                    continue;
+                }
+                discovered.push((child, rank_of[&parent], parent));
+            }
+        }
+        // Order by (parent discovery rank, child id) and keep the first hit per
+        // child: that is the earliest-discovered parent, deterministically.
+        discovered.sort_unstable_by_key(|(child, rank, _)| (*rank, *child));
+        let mut next: Vec<i64> = Vec::new();
+        for (child, _, parent) in discovered {
+            if seen.contains_key(&child) {
+                continue;
+            }
+            seen.insert(child, (depth, Some(parent)));
+            next.push(child);
+        }
+        frontier = next;
+        depth += 1;
+    }
+
+    // Node metadata. The `files` INNER JOIN is the CTE's: a node with no file
+    // row is expanded during traversal but never emitted.
+    let ids: Vec<i64> = seen.keys().copied().collect();
+    let mut meta: HashMap<i64, (String, String, String, bool)> = HashMap::new();
+    for chunk in ids.chunks(FRONTIER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT n.id, n.name, n.type, f.path, n.is_test
+             FROM nodes n JOIN files f ON f.id = n.file_id
+             WHERE n.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, ty, path, is_test) = row?;
+            meta.insert(id, (name, ty, path, is_test));
+        }
+    }
+
     // Truncation ordering: when a hot function (e.g. `conn` in this repo with
     // 51 callers + 72 test) saturates CALL_GRAPH_ROW_LIMIT at depth=3, the
-    // pre-LIMIT sort is `depth ASC, caller_count DESC, node_id ASC` so
-    // high-connectivity subtrees survive the truncation. `caller_count DESC` keeps
-    // the most-relevant subtree; the `node_id ASC` tail is a UNIQUE tiebreaker so a
-    // band of equal-caller_count siblings truncates deterministically instead of
-    // dropping a query-plan-dependent subset (without it, alphabetical / id-order
-    // ties would silently drop an arbitrary part of the most-relevant band). The
-    // `caller_count` LEFT JOIN is a single non-correlated GROUP BY scan over edges
-    // (idx_edges_target_rel covers the predicate); rowcount is bounded by node
-    // count, not edge count.
-    let sql = format!(
-        "WITH RECURSIVE call_graph(node_id, name, type, depth, visited, parent_id) AS (
-            SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT), NULL
-            FROM nodes n
-            JOIN files f ON f.id = n.file_id
-            -- Never SEED on an `<external>` sentinel. It has no outgoing calls,
-            -- so the traversal returns a one-node graph whose root prints as
-            -- `HashMap (<external>)` — a call graph for a symbol that is not in
-            -- the project. The by-name lookups in `queries/nodes.rs` carry the
-            -- same exclusion; this CTE seeds itself and needed its own.
-            WHERE n.name = ?1 AND f.path <> '<external>'
-            {file_filter}
+    // pre-truncation sort is `depth ASC, caller_count DESC, node_id ASC` so
+    // high-connectivity subtrees survive. `caller_count DESC` keeps the most
+    // relevant subtree; the `node_id ASC` tail is a UNIQUE tiebreaker so a band
+    // of equal-caller_count siblings truncates deterministically instead of
+    // dropping a query-plan-dependent subset. Counting is one grouped scan over
+    // the inbound `calls` edges of the visited set (idx_edges_target_rel covers
+    // the predicate) — confidence-unfiltered, as in the CTE's `caller_counts`.
+    let mut caller_counts: HashMap<i64, i64> = HashMap::new();
+    for chunk in ids.chunks(FRONTIER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT target_id, COUNT(*) FROM edges
+             WHERE target_id IN ({placeholders}) AND relation = ?{rel}
+             GROUP BY target_id",
+            rel = chunk.len() + 1,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        params.push(&REL_CALLS);
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, n) = row?;
+            caller_counts.insert(id, n);
+        }
+    }
 
-            UNION ALL
+    let mut rows: Vec<(i32, i64, i64, CallGraphNode)> = Vec::new(); // (depth, -callers, id, node)
+    for (id, (node_depth, parent_id)) in seen {
+        let Some((name, node_type, file_path, is_test)) = meta.get(&id).cloned() else {
+            continue; // no `files` row → not emitted, same as the CTE's inner join
+        };
+        let callers = caller_counts.get(&id).copied().unwrap_or(0);
+        rows.push((
+            node_depth,
+            -callers,
+            id,
+            CallGraphNode {
+                node_id: id,
+                name,
+                node_type,
+                file_path,
+                depth: node_depth,
+                direction,
+                parent_id,
+                is_test,
+            },
+        ));
+    }
+    rows.sort_unstable_by_key(|(d, neg_callers, id, _)| (*d, *neg_callers, *id));
 
-            SELECT t.id, t.name, t.type, cg.depth + 1,
-                   cg.visited || ',' || CAST(t.id AS TEXT),
-                   cg.node_id
-            FROM call_graph cg
-            {edge_join}
-            {next_node_join}
-            WHERE cg.depth < ?3
-            AND (',' || cg.visited || ',') NOT LIKE '%,' || CAST(t.id AS TEXT) || ',%'
-        ),
-        caller_counts AS (
-            SELECT target_id AS node_id, COUNT(*) AS callers
-            FROM edges
-            WHERE relation = ?4
-            GROUP BY target_id
-        )
-        SELECT node_id, name, type, file_path, depth, parent_id, is_test FROM (
-            SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
-                   n.is_test AS is_test,
-                   COALESCE(cc.callers, 0) AS caller_count,
-                   ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
-            FROM call_graph cg
-            JOIN nodes n ON n.id = cg.node_id
-            JOIN files f ON f.id = n.file_id
-            LEFT JOIN caller_counts cc ON cc.node_id = cg.node_id
-        ) WHERE rn = 1
-        ORDER BY depth ASC, caller_count DESC, node_id ASC
-        LIMIT {row_limit}",
-        row_limit = CALL_GRAPH_ROW_LIMIT,
-    );
+    // The CTE applied `LIMIT CALL_GRAPH_ROW_LIMIT` to this same ordering, so the
+    // retained rows are identical; truncating in Rust keeps `limit_hit`
+    // meaning "the cap was reached", exactly as before.
+    let limit_hit = rows.len() >= CALL_GRAPH_ROW_LIMIT;
+    rows.truncate(CALL_GRAPH_ROW_LIMIT);
+    let results: Vec<CallGraphNode> = rows.into_iter().map(|(_, _, _, n)| n).collect();
 
-    let mut stmt = conn.prepare(&sql)?;
-
-    let map_row = move |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallGraphNode> {
-        Ok(CallGraphNode {
-            node_id: row.get(0)?,
-            name: row.get(1)?,
-            node_type: row.get(2)?,
-            file_path: row.get(3)?,
-            depth: row.get(4)?,
-            direction,
-            parent_id: row.get(5)?,
-            is_test: row.get(6)?,
-        })
-    };
-
-    let results: Vec<CallGraphNode> = stmt
-        .query_map(
-            rusqlite::params![
-                function_name,
-                file_path_param,
-                max_depth,
-                REL_CALLS,
-                min_confidence_rank as i64
-            ],
-            map_row,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let limit_hit = results.len() == CALL_GRAPH_ROW_LIMIT;
     Ok((results, limit_hit))
 }
 
@@ -464,6 +581,523 @@ mod tests {
     use crate::storage::db::Database;
     use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
     use tempfile::TempDir;
+
+    /// The pre-BFS recursive-CTE traversal, verbatim from the shipped v0.116.0
+    /// implementation, kept ONLY as a differential oracle for the tests below. Its
+    /// per-path `visited NOT LIKE` guard enumerates simple paths, so it is usable
+    /// only on the small fixtures here — that cost is exactly why production no
+    /// longer runs it.
+    fn legacy_query_direction_cte(
+        conn: &Connection,
+        function_name: &str,
+        max_depth: i32,
+        file_path: Option<&str>,
+        direction: Direction,
+        min_confidence_rank: u8,
+    ) -> Result<(Vec<CallGraphNode>, bool)> {
+        let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap to prevent CTE blowup on highly connected graphs
+                                                             // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
+        let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
+        let file_path_param: Option<&str> = file_path;
+
+        // In the recursive step:
+        // - callees: follow edges forward (source_id = current, target_id = next)
+        // - callers: follow edges backward (target_id = current, source_id = next)
+        // Confidence gate (?5): only FOLLOW edges whose resolution-confidence rank
+        // is >= the requested floor. The CASE mirrors `domain::confidence_rank`
+        // (extracted=2, inferred=1, ambiguous/unknown=0) — a test pins the two in
+        // sync. Spliced into the recursive step's edge JOIN so a sub-threshold edge
+        // is pruned BEFORE it expands, which is what kills the ambiguous fan-out
+        // (one `.execute()` → 56 same-named defs) at the source instead of after.
+        let conf_gate =
+            "AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) >= ?5";
+        let (edge_join, next_node_join) = match direction {
+            Direction::Callees => (
+                format!("JOIN edges e ON e.source_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
+                "JOIN nodes t ON t.id = e.target_id",
+            ),
+            Direction::Callers => (
+                format!("JOIN edges e ON e.target_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
+                "JOIN nodes t ON t.id = e.source_id",
+            ),
+        };
+
+        // The CTE tracks `parent_id` (the cg row that produced each new node) so
+        // the renderer can show real tree edges instead of inferring nesting from
+        // depth alone (which collapses sibling subtrees under the last depth-N
+        // entry). On dedup we keep the parent on the shortest path via
+        // ROW_NUMBER() ... ORDER BY depth.
+        //
+        // Truncation ordering: when a hot function (e.g. `conn` in this repo with
+        // 51 callers + 72 test) saturates CALL_GRAPH_ROW_LIMIT at depth=3, the
+        // pre-LIMIT sort is `depth ASC, caller_count DESC, node_id ASC` so
+        // high-connectivity subtrees survive the truncation. `caller_count DESC` keeps
+        // the most-relevant subtree; the `node_id ASC` tail is a UNIQUE tiebreaker so a
+        // band of equal-caller_count siblings truncates deterministically instead of
+        // dropping a query-plan-dependent subset (without it, alphabetical / id-order
+        // ties would silently drop an arbitrary part of the most-relevant band). The
+        // `caller_count` LEFT JOIN is a single non-correlated GROUP BY scan over edges
+        // (idx_edges_target_rel covers the predicate); rowcount is bounded by node
+        // count, not edge count.
+        let sql = format!(
+            "WITH RECURSIVE call_graph(node_id, name, type, depth, visited, parent_id) AS (
+                SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT), NULL
+                FROM nodes n
+                JOIN files f ON f.id = n.file_id
+                -- Never SEED on an `<external>` sentinel. It has no outgoing calls,
+                -- so the traversal returns a one-node graph whose root prints as
+                -- `HashMap (<external>)` — a call graph for a symbol that is not in
+                -- the project. The by-name lookups in `queries/nodes.rs` carry the
+                -- same exclusion; this CTE seeds itself and needed its own.
+                WHERE n.name = ?1 AND f.path <> '<external>'
+                {file_filter}
+
+                UNION ALL
+
+                SELECT t.id, t.name, t.type, cg.depth + 1,
+                       cg.visited || ',' || CAST(t.id AS TEXT),
+                       cg.node_id
+                FROM call_graph cg
+                {edge_join}
+                {next_node_join}
+                WHERE cg.depth < ?3
+                AND (',' || cg.visited || ',') NOT LIKE '%,' || CAST(t.id AS TEXT) || ',%'
+            ),
+            caller_counts AS (
+                SELECT target_id AS node_id, COUNT(*) AS callers
+                FROM edges
+                WHERE relation = ?4
+                GROUP BY target_id
+            )
+            SELECT node_id, name, type, file_path, depth, parent_id, is_test FROM (
+                SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
+                       n.is_test AS is_test,
+                       COALESCE(cc.callers, 0) AS caller_count,
+                       ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
+                FROM call_graph cg
+                JOIN nodes n ON n.id = cg.node_id
+                JOIN files f ON f.id = n.file_id
+                LEFT JOIN caller_counts cc ON cc.node_id = cg.node_id
+            ) WHERE rn = 1
+            ORDER BY depth ASC, caller_count DESC, node_id ASC
+            LIMIT {row_limit}",
+            row_limit = CALL_GRAPH_ROW_LIMIT,
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        let map_row = move |row: &rusqlite::Row<'_>| -> rusqlite::Result<CallGraphNode> {
+            Ok(CallGraphNode {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                node_type: row.get(2)?,
+                file_path: row.get(3)?,
+                depth: row.get(4)?,
+                direction,
+                parent_id: row.get(5)?,
+                is_test: row.get(6)?,
+            })
+        };
+
+        let results: Vec<CallGraphNode> = stmt
+            .query_map(
+                rusqlite::params![
+                    function_name,
+                    file_path_param,
+                    max_depth,
+                    REL_CALLS,
+                    min_confidence_rank as i64
+                ],
+                map_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let limit_hit = results.len() == CALL_GRAPH_ROW_LIMIT;
+        Ok((results, limit_hit))
+    }
+    /// Deterministic 32-bit LCG — fixture generation must be reproducible.
+    struct Lcg(u32);
+    impl Lcg {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 8) as usize % bound
+        }
+    }
+
+    /// `n` functions in one file plus `edges` pseudorandom `calls` edges. Dense
+    /// and cyclic on purpose: that is the shape whose simple-path count the old
+    /// CTE enumerated.
+    fn seeded_call_graph(conn: &Connection, n: usize, edges: usize, seed: u32) -> Vec<i64> {
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/g.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let ids: Vec<i64> = (0..n)
+            .map(|i| insert_node(conn, &node(&format!("fn{i}"), fid)).unwrap())
+            .collect();
+        let mut rng = Lcg(seed);
+        for _ in 0..edges {
+            let a = ids[rng.next(n)];
+            let b = ids[rng.next(n)];
+            if a != b {
+                // Duplicate (a,b) pairs are expected from the generator; the
+                // unique index rejects them and `insert_edge` reports Ok.
+                let _ = insert_edge(conn, a, b, REL_CALLS, None);
+            }
+        }
+        ids
+    }
+
+    /// Every result node's `parent_id` must be a real edge from a node one level
+    /// up — the property the CTE's `ROW_NUMBER … ORDER BY depth` provided and
+    /// that the BFS must keep. (`parent_id` itself is not compared against the
+    /// oracle row-for-row: with several shortest-path parents the CTE kept
+    /// whichever its queue emitted first, an unpinned choice.)
+    fn assert_parents_are_shortest_path_edges(
+        conn: &Connection,
+        results: &[CallGraphNode],
+        direction: Direction,
+    ) {
+        let depth_of: HashMap<i64, i32> = results.iter().map(|n| (n.node_id, n.depth)).collect();
+        for n in results {
+            match n.parent_id {
+                None => assert_eq!(n.depth, 0, "only seeds may have no parent"),
+                Some(p) => {
+                    assert_eq!(
+                        depth_of.get(&p),
+                        Some(&(n.depth - 1)),
+                        "parent of {} must sit one level up",
+                        n.node_id
+                    );
+                    let (s, t) = match direction {
+                        Direction::Callees => (p, n.node_id),
+                        Direction::Callers => (n.node_id, p),
+                    };
+                    let cnt: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM edges WHERE source_id=?1 AND target_id=?2 AND relation=?3",
+                            rusqlite::params![s, t, REL_CALLS],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert!(cnt > 0, "parent link {s}->{t} must be a real calls edge");
+                }
+            }
+        }
+    }
+
+    fn row_keys(nodes: &[CallGraphNode]) -> Vec<(i64, String, String, String, i32, bool)> {
+        nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.node_id,
+                    n.name.clone(),
+                    n.node_type.clone(),
+                    n.file_path.clone(),
+                    n.depth,
+                    n.is_test,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn traversal_matches_recursive_cte_oracle() {
+        for seed in [3u32, 8_675_309] {
+            let (db, _tmp) = test_db();
+            let conn = db.conn();
+            let ids = seeded_call_graph(conn, 14, 60, seed);
+            assert!(!ids.is_empty());
+            for depth in 1..=10 {
+                for dir in [Direction::Callees, Direction::Callers] {
+                    for i in 0..14 {
+                        let name = format!("fn{i}");
+                        let (bfs, bfs_limit) =
+                            query_direction(conn, &name, depth, None, dir, 0).unwrap();
+                        let (cte, cte_limit) =
+                            legacy_query_direction_cte(conn, &name, depth, None, dir, 0).unwrap();
+                        assert_eq!(
+                            row_keys(&bfs),
+                            row_keys(&cte),
+                            "seed={seed} name={name} dir={dir:?} depth={depth}: \
+                             BFS rows must equal the recursive-CTE oracle (order included)"
+                        );
+                        assert_eq!(bfs_limit, cte_limit, "limit_hit must agree");
+                        assert_parents_are_shortest_path_edges(conn, &bfs, dir);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn traversal_matches_oracle_under_a_confidence_floor() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = seeded_call_graph(conn, 12, 50, 424_242);
+        // Demote a third of the edges to `ambiguous` so the floor actually prunes.
+        let mut rng = Lcg(99);
+        for _ in 0..20 {
+            let a = ids[rng.next(ids.len())];
+            let b = ids[rng.next(ids.len())];
+            set_edge_confidence(conn, a, b, "ambiguous");
+        }
+        for rank in [0u8, 1, 2] {
+            for depth in 1..=10 {
+                for dir in [Direction::Callees, Direction::Callers] {
+                    for i in 0..12 {
+                        let name = format!("fn{i}");
+                        let (bfs, _) =
+                            query_direction(conn, &name, depth, None, dir, rank).unwrap();
+                        let (cte, _) =
+                            legacy_query_direction_cte(conn, &name, depth, None, dir, rank)
+                                .unwrap();
+                        assert_eq!(
+                            row_keys(&bfs),
+                            row_keys(&cte),
+                            "rank={rank} name={name} dir={dir:?} depth={depth}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_limit_truncation_matches_oracle() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/wide.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let root = insert_node(conn, &node("root", fid)).unwrap();
+        // 250 direct callees > CALL_GRAPH_ROW_LIMIT, so the cap fires. Each
+        // child gets a distinct number of inbound edges from the tail of the
+        // list, exercising the `caller_count DESC` leg of the truncation sort.
+        let kids: Vec<i64> = (0..250)
+            .map(|i| insert_node(conn, &node(&format!("kid{i}"), fid)).unwrap())
+            .collect();
+        for (i, k) in kids.iter().enumerate() {
+            insert_edge(conn, root, *k, REL_CALLS, None).unwrap();
+            if i % 3 == 0 {
+                insert_edge(conn, kids[(i + 1) % kids.len()], *k, REL_CALLS, None).unwrap();
+            }
+        }
+        let (bfs, bfs_limit) =
+            query_direction(conn, "root", 3, None, Direction::Callees, 0).unwrap();
+        let (cte, cte_limit) =
+            legacy_query_direction_cte(conn, "root", 3, None, Direction::Callees, 0).unwrap();
+        assert_eq!(bfs.len(), CALL_GRAPH_ROW_LIMIT);
+        assert!(bfs_limit && cte_limit, "both must report the cap was hit");
+        assert_eq!(
+            row_keys(&bfs),
+            row_keys(&cte),
+            "the truncated 200 rows and their order must be identical"
+        );
+    }
+
+    #[test]
+    fn dense_layered_graph_completes_at_max_depth() {
+        // The audit's blowup shape: 11 layers of 6, fully connected between
+        // adjacent layers (66 nodes / 360 edges). Simple paths from a layer-0
+        // node to layer 10 number 6^10 ≈ 6.0e7, so the per-path-visited CTE did
+        // not finish in two minutes; a global visited set walks 66 nodes.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/layered.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        const LAYERS: usize = 11;
+        const WIDTH: usize = 6;
+        let mut layers: Vec<Vec<i64>> = Vec::new();
+        for l in 0..LAYERS {
+            layers.push(
+                (0..WIDTH)
+                    .map(|w| insert_node(conn, &node(&format!("l{l}_w{w}"), fid)).unwrap())
+                    .collect(),
+            );
+        }
+        let mut edge_count = 0;
+        for l in 0..LAYERS - 1 {
+            for a in &layers[l] {
+                for b in &layers[l + 1] {
+                    insert_edge(conn, *a, *b, REL_CALLS, None).unwrap();
+                    edge_count += 1;
+                }
+            }
+        }
+        assert_eq!((LAYERS * WIDTH, edge_count), (66, 360));
+
+        let start = std::time::Instant::now();
+        let (nodes, _) = query_direction(conn, "l0_w0", 10, None, Direction::Callees, 0).unwrap();
+        let elapsed = start.elapsed();
+        // Every node in layers 1..10 is reachable, plus the seed.
+        assert_eq!(nodes.len(), 1 + WIDTH * (LAYERS - 1));
+        assert_eq!(nodes.iter().filter(|n| n.depth == 10).count(), WIDTH);
+        // Generous bound: the point is the difference between "milliseconds" and
+        // "does not terminate", not a microbenchmark.
+        assert!(
+            elapsed.as_secs() < 10,
+            "depth-10 traversal of a dense layered graph took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wide_frontier_spanning_chunks_matches_oracle() {
+        // Frontier wider than FRONTIER_CHUNK → several `IN (...)` queries per
+        // level, for expansion, node metadata and caller counts alike.
+        //
+        // Scope note: the 200-row cap means a node found by expanding the SECOND
+        // chunk at depth 2 cannot appear in the output at all (the 450-node
+        // depth-1 band fills the cap), so this test cannot discriminate broken
+        // second-chunk EXPANSION — its uncapped sibling
+        // `closure_spans_multiple_frontier_chunks_matching_oracle` in
+        // `storage::queries::imports` does. What it does discriminate is the
+        // metadata / caller-count stitching: the fixture gives the second
+        // chunk's nodes the highest caller counts, so they sort to the front of
+        // the band and a dropped chunk there is directly visible.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/wide2.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let root = insert_node(conn, &node("root", fid)).unwrap();
+        let wide = FRONTIER_CHUNK + 50;
+        let kids: Vec<i64> = (0..wide)
+            .map(|i| insert_node(conn, &node(&format!("kid{i}"), fid)).unwrap())
+            .collect();
+        for (i, k) in kids.iter().enumerate() {
+            insert_edge(conn, root, *k, REL_CALLS, None).unwrap();
+            // Second-chunk kids get extra inbound edges → caller_count 3 vs 1,
+            // so they head the depth-1 band and survive truncation.
+            if i >= FRONTIER_CHUNK {
+                insert_edge(conn, kids[0], *k, REL_CALLS, None).unwrap();
+                insert_edge(conn, kids[1], *k, REL_CALLS, None).unwrap();
+            }
+        }
+        let (bfs, bfs_limit) =
+            query_direction(conn, "root", 4, None, Direction::Callees, 0).unwrap();
+        let (cte, cte_limit) =
+            legacy_query_direction_cte(conn, "root", 4, None, Direction::Callees, 0).unwrap();
+        assert_eq!(row_keys(&bfs), row_keys(&cte));
+        assert_eq!((bfs_limit, cte_limit), (true, true));
+        assert_parents_are_shortest_path_edges(conn, &bfs, Direction::Callees);
+
+        // Skip the depth-0 seed; the depth-1 band starts right after it.
+        let head: Vec<&str> = bfs
+            .iter()
+            .skip(1)
+            .take(wide - FRONTIER_CHUNK)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            head.first().copied(),
+            Some("kid400"),
+            "the highest-caller_count band comes first"
+        );
+        assert!(
+            head.contains(&"kid449"),
+            "nodes whose metadata lives in the second chunk must still be emitted"
+        );
+    }
+
+    #[test]
+    fn diamond_parent_is_the_first_discoverer_and_matches_the_cte() {
+        // root→a, root→b, a→c, b→c: `c` has two shortest-path parents, so which
+        // one lands in `parent_id` is a choice. It is a VISIBLE choice — the CLI
+        // and MCP JSON both carry `parent_id` — so it is pinned here: the parent
+        // discovered first (a, reached before b at depth 1). Asserting against
+        // the CTE oracle in the same breath records that this reproduces what
+        // SQLite's recursive-CTE queue used to emit, which is what kept the
+        // rewrite byte-identical on real repositories.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/dia.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let root = insert_node(conn, &node("root", fid)).unwrap();
+        let a = insert_node(conn, &node("a", fid)).unwrap();
+        let b = insert_node(conn, &node("b", fid)).unwrap();
+        let c = insert_node(conn, &node("c", fid)).unwrap();
+        for (s, t) in [(root, a), (root, b), (a, c), (b, c)] {
+            insert_edge(conn, s, t, REL_CALLS, None).unwrap();
+        }
+        let (bfs, _) = query_direction(conn, "root", 5, None, Direction::Callees, 0).unwrap();
+        let (cte, _) =
+            legacy_query_direction_cte(conn, "root", 5, None, Direction::Callees, 0).unwrap();
+        let parent_of = |rows: &[CallGraphNode], id: i64| {
+            rows.iter().find(|n| n.node_id == id).unwrap().parent_id
+        };
+        assert_eq!(parent_of(&bfs, c), Some(a), "first discoverer wins");
+        assert_eq!(
+            parent_of(&cte, c),
+            Some(a),
+            "and that is what the CTE emitted"
+        );
+        assert_eq!(
+            bfs.iter().find(|n| n.node_id == c).unwrap().depth,
+            2,
+            "c is reported once, at its shortest depth"
+        );
+    }
+
+    #[test]
+    fn traversal_is_deterministic_across_runs() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        seeded_call_graph(conn, 14, 60, 1_234_567);
+        let first = get_call_graph(conn, "fn0", "both", 10, None).unwrap();
+        let key = |r: &CallGraphResult| {
+            r.nodes
+                .iter()
+                .map(|n| (n.node_id, n.depth, n.parent_id, n.direction.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let expected = key(&first);
+        for _ in 0..8 {
+            let again = get_call_graph(conn, "fn0", "both", 10, None).unwrap();
+            assert_eq!(
+                key(&again),
+                expected,
+                "repeated traversals must return identical rows in identical order"
+            );
+        }
+    }
 
     fn test_db() -> (Database, TempDir) {
         let tmp = TempDir::new().unwrap();

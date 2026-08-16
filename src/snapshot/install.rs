@@ -284,6 +284,33 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
         // open a TOCTOU window where a concurrent reader sees no file. The partial
         // is now a complete, closed DB; the last concurrent rename wins cleanly.
         let final_db = cg_dir.join("index.db");
+
+        // The DESTINATION's sidecars, not ours. rename(2) replaces index.db and
+        // nothing else, so a `-wal` stranded beside it by a killed writer outlives
+        // the swap and SQLite replays those pages into the file we just installed
+        // — reverting the snapshot to fragments of the database it replaced, with
+        // `integrity_check` still reporting ok (audit 2026-08-16 P1-1). Removing
+        // them here rather than in each caller is the point: two of the three call
+        // sites had grown their own copy of this and the MCP server path had not.
+        //
+        // Before the rename, not after: the old index.db is a complete database
+        // without its WAL tail and is about to be replaced anyway, whereas a gap
+        // on the other side would expose the NEW file to exactly the replay this
+        // removes. Best-effort — a sidecar we cannot delete (Windows share
+        // violation from a live reader) must not fail an otherwise good install,
+        // and the rename below is still strictly better than not installing.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = cg_dir.join(format!("index.db{suffix}"));
+            if sidecar.exists() {
+                if let Err(e) = std::fs::remove_file(&sidecar) {
+                    tracing::warn!(
+                        "[snapshot] could not remove stale {} before install: {e}",
+                        sidecar.display()
+                    );
+                }
+            }
+        }
+
         std::fs::rename(&db_partial, &final_db)?;
         let _ = std::fs::remove_file(&wal_partial);
         let _ = std::fs::remove_file(&shm_partial);

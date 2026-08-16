@@ -4727,125 +4727,42 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Two paths: filter-only (direct SQL) vs query+filter (FTS5 then filter).
-    // Wrapped in a closure so a query-time freshness resync can re-run it against
-    // the refreshed index; the bool reports the fts-empty case (distinct message).
-    // Third tuple slot: how many FTS candidates the STRUCTURAL filters
-    // (--type/--returns/--params) rejected — so an all-filtered empty result can
-    // disclose "candidates existed" in-band instead of a bare empty envelope
-    // (disclosure-gap class, roadmap 2026-07-18 §1.1). Skippable-triad drops are
-    // deliberately NOT counted: they are internal hygiene, not a user filter.
+    // Both paths (FTS5+filter, and filter-only SQL) live in the shared core the
+    // MCP `ast_search` tool also calls — the two used to be copies and had
+    // drifted (audit 2026-08-16 P1-8). Wrapped in a closure so a query-time
+    // freshness resync can re-run it against the refreshed index.
     let run_query =
-        |conn: &rusqlite::Connection| -> Result<(Vec<queries::NodeWithFile>, bool, usize)> {
-            let mut dropped_by_filter = 0usize;
-            let results_with_files: Vec<queries::NodeWithFile> = if let Some(query) = query {
-                // FTS5 search then filter in Rust
-                let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
-                if fts_result.nodes.is_empty() {
-                    return Ok((Vec::new(), true, 0));
-                }
-
-                let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
-                let all = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
-
-                // Preserve FTS5 rank order, then apply filters
-                let id_order: std::collections::HashMap<i64, usize> = node_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, id)| (*id, i))
-                    .collect();
-                let mut sorted = all;
-                sorted.sort_by_key(|nwf| id_order.get(&nwf.node.id).copied().unwrap_or(usize::MAX));
-
-                sorted
-                    .into_iter()
-                    .filter(|nwf| {
-                        let n = &nwf.node;
-                        // Skip <module>/<external> placeholders and test symbols, consistent
-                        // with `search`/`similar` (domain::is_skippable_result). ast-search
-                        // previously leaked these into structural results — an `<external>:0-0`
-                        // stub and `<module>` file nodes alongside real symbols.
-                        if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path)
-                        {
-                            return false;
-                        }
-                        if let Some(tf) = type_filter {
-                            let normalized = normalize_type_filter(tf);
-                            if !normalized.iter().any(|t| n.node_type == *t) {
-                                dropped_by_filter += 1;
-                                return false;
-                            }
-                        }
-                        if let Some(rf) = returns_filter {
-                            match &n.return_type {
-                                Some(rt) => {
-                                    if !rt.to_lowercase().contains(&rf.to_lowercase()) {
-                                        dropped_by_filter += 1;
-                                        return false;
-                                    }
-                                }
-                                None => {
-                                    dropped_by_filter += 1;
-                                    return false;
-                                }
-                            }
-                        }
-                        if let Some(pf) = params_filter {
-                            match &n.param_types {
-                                Some(pt) => {
-                                    if !pt.to_lowercase().contains(&pf.to_lowercase()) {
-                                        dropped_by_filter += 1;
-                                        return false;
-                                    }
-                                }
-                                None => {
-                                    dropped_by_filter += 1;
-                                    return false;
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .take(limit)
-                    .collect()
-            } else {
-                // Filter-only: direct SQL query
-                let normalized_types: Vec<&str>;
-                let type_refs = if let Some(tf) = type_filter {
-                    normalized_types = normalize_type_filter(tf).into_iter().collect();
-                    Some(normalized_types.as_slice())
-                } else {
-                    None
-                };
-                queries::get_nodes_with_files_by_filters(
-                    conn,
-                    type_refs,
+        |conn: &rusqlite::Connection| -> Result<crate::search::ast_query::AstSearchOutcome> {
+            crate::search::ast_query::run(
+                conn,
+                &crate::search::ast_query::AstSearchParams {
+                    query,
+                    type_filter,
                     returns_filter,
                     params_filter,
-                    None,
                     limit,
-                )?
-            };
-            Ok((results_with_files, false, dropped_by_filter))
+                },
+            )
         };
 
-    let (mut results_with_files, mut fts_empty, mut dropped_by_filter) = run_query(conn)?;
+    let mut search = run_query(conn)?;
     // Re-index any displayed file edited since indexing so start_line/end_line are
     // post-edit, then re-run once (shared resync with show/refs/…).
-    let files: Vec<String> = results_with_files
+    let files: Vec<String> = search
+        .results
         .iter()
         .map(|nwf| nwf.file_path.clone())
         .collect();
     let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
-        let (r, e, d) = run_query(conn)?;
-        results_with_files = r;
-        fts_empty = e;
-        dropped_by_filter = d;
+        search = run_query(conn)?;
     }
     outcome.disclose();
 
-    if fts_empty {
+    let results_with_files = &search.results;
+    let dropped_by_filter = search.dropped_by_filter;
+
+    if search.fts_empty {
         if json_mode {
             println!("{}", serde_json::json!({"results": [], "count": 0}));
         }
@@ -4868,6 +4785,18 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             .flatten()
             .collect::<Vec<_>>()
             .join(", ");
+            // The remedy depends on WHY it is empty. When the candidate pool
+            // came back full, matches may exist below the cut and "broaden the
+            // filter" is the wrong advice — the query is what needs narrowing
+            // (audit 2026-08-16 P1-8 measured that exact misdirection).
+            let remedy = if search.pool_saturated {
+                format!(
+                    "The candidate pool was full ({} rows), so matches may exist below it. Narrow the query, raise --limit, or drop the query and enumerate with the filters alone.",
+                    search.fetch_count
+                )
+            } else {
+                "The index has no symbol matching both the query and the filter. Broaden or clear the filter.".to_string()
+            };
             if json_mode {
                 println!(
                     "{}",
@@ -4876,17 +4805,19 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
                         "count": 0,
                         "filtered_out": dropped_by_filter,
                         "filter": filter_desc,
+                        "pool_saturated": search.pool_saturated,
+                        "hint": remedy,
                     })
                 );
             } else {
                 println!(
-                    "[code-graph] No results — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
-                    dropped_by_filter, filter_desc
+                    "[code-graph] No results — {} candidate(s) matched the query but were removed by the active filter ({}). {}",
+                    dropped_by_filter, filter_desc, remedy
                 );
             }
             eprintln!(
-                "[code-graph] No results matching filters — {} candidate(s) removed by ({}).",
-                dropped_by_filter, filter_desc
+                "[code-graph] No results matching filters — {} candidate(s) removed by ({}). {}",
+                dropped_by_filter, filter_desc, remedy
             );
         } else {
             if json_mode {
@@ -4916,20 +4847,64 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
                 })
             })
             .collect();
-        // Envelope matches MCP ast_search: {results, count}
+        // Envelope matches MCP ast_search: {results, count, matched_total, truncated}
         let mut envelope = serde_json::json!({
             "results": results,
             "count": results_with_files.len(),
         });
+        if let Some(total) = search.matched_total {
+            envelope["matched_total"] = serde_json::json!(total);
+        }
+        if search.truncated {
+            envelope["truncated"] = serde_json::json!(true);
+            envelope["hint"] = serde_json::json!(truncation_hint(search.matched_total, limit));
+        }
+        if search.fallback_used {
+            envelope["hint"] = serde_json::json!(format!(
+                "FTS rank had no '{}' under the active filter; falling back to name-substring match.",
+                query.unwrap_or_default()
+            ));
+        }
         outcome.attach_partial(&mut envelope);
         writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
         return Ok(());
     }
 
-    for nwf in &results_with_files {
+    for nwf in results_with_files {
         writeln!(stdout, "{}", format_node_compact(&nwf.node, &nwf.file_path))?;
     }
+    // "20 results" must not read as "20 matches exist" — name the cut and the
+    // remedy (raise --limit), which is the opposite of the "broaden the filter"
+    // advice the under-fetching version gave (audit 2026-08-16 P1-8).
+    if search.truncated {
+        eprintln!(
+            "[code-graph] {}",
+            truncation_hint(search.matched_total, limit)
+        );
+    }
+    if search.fallback_used {
+        eprintln!(
+            "[code-graph] Note: FTS rank had no '{}' under the active filter; showing name-substring matches.",
+            query.unwrap_or_default()
+        );
+    }
     Ok(())
+}
+
+/// Wording for a result set cut by `--limit`. `matched_total` is `None` when the
+/// count is SQL-bounded (name-substring fallback / filter-only path), so the
+/// message states "more" instead of inventing a number.
+fn truncation_hint(matched_total: Option<usize>, limit: usize) -> String {
+    match matched_total {
+        Some(total) => format!(
+            "{} symbols matched but --limit {} was in effect — raise --limit to see the rest.",
+            total, limit
+        ),
+        None => format!(
+            "More symbols matched than --limit {} — raise --limit to see the rest.",
+            limit
+        ),
+    }
 }
 
 /// Normalize type filter shorthand: fn → function/method, class → class/struct, etc.
@@ -5404,6 +5379,67 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             hint_symbol_maybe_unindexed(symbol);
         }
         std::process::exit(1);
+    }
+
+    // An explicit `--file` that holds no such definition is a MISS, not a
+    // filter that legitimately matches nothing. The existence check above uses
+    // `get_nodes_by_name`, which ignores the filter, so it passed on a
+    // definition in ANOTHER file; the ambiguity guard below is skipped whenever
+    // a filter is present; and the caller query then ran with a filter no
+    // definition satisfies — zero callers, `"risk":"LOW"`, exit 0. That is a
+    // safety endorsement handed to a typo'd path on the command the decision
+    // table puts BEFORE an edit. `refs` (`print_refs_notfound_json` +
+    // exit 1), `show` and `callgraph` already exit 1 on this exact input;
+    // impact was the fourth `--file` taker and the only one that answered
+    // (audit 2026-08-16 P1-9).
+    if let Some(fp) = explicit_file {
+        let in_file = queries::get_nodes_by_file_path(conn, fp)?;
+        let present = in_file
+            .iter()
+            .any(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol));
+        if !present {
+            if json_mode {
+                // Same in-band miss contract as `show`: {error, symbol, …} +
+                // exit 1, with the files that DO define the symbol so the
+                // caller can correct the path instead of re-querying.
+                let candidates: Vec<serde_json::Value> = symbol_nodes
+                    .iter()
+                    .take(5)
+                    .map(|n| {
+                        serde_json::json!({
+                            "name": n.name,
+                            "type": n.node_type,
+                            "file_path": queries::get_file_path(conn, n.file_id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": "Symbol not found in file",
+                        "symbol": symbol,
+                        "file": fp,
+                        "candidates": candidates,
+                    })
+                );
+            }
+            eprintln!(
+                "[code-graph] Symbol '{}' not found in file '{}'.",
+                symbol, fp
+            );
+            let defined_in: Vec<String> = symbol_nodes
+                .iter()
+                .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
+                .take(5)
+                .collect();
+            if !defined_in.is_empty() {
+                eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));
+            }
+            std::process::exit(1);
+        }
     }
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
@@ -8258,38 +8294,11 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // `--json 2>/dev/null` the old answer was indistinguishable from "this
         // directory genuinely has no dead code".
         //
-        // Compared in Rust rather than with SQL `LIKE`: the prefix is user
-        // input, and `_`/`%` in a filename would silently widen the match — the
-        // exact wildcard bug fixed in `prod_source_filter_and` this same batch.
-        //
-        // Two spellings must NOT reach the probe, and the first version of it
-        // failed both — turning `dead-code .` and `dead-code src/` on a clean
-        // repo from `[]`/exit 0 into a hard error, which is the inverse of the
-        // bug this is meant to fix and would break anything gating CI on the
-        // exit code the day the repo gets clean:
-        //   * `.` normalizes to `""` (whole project), and no stored path equals
-        //     `""` or begins with `/`;
-        //   * a trailing slash from tab completion gives `src/`, and no stored
-        //     path begins with `src//`.
-        // The original negative control used bare `src`, which is exactly the
-        // one spelling of the three that worked.
-        let probe = path_filter
-            .map(|p| p.trim_end_matches('/'))
-            .filter(|p| !p.is_empty());
-        let unindexed_prefix = probe.filter(|prefix| {
-            let scan = conn.prepare("SELECT path FROM files").and_then(|mut stmt| {
-                stmt.query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()
-            });
-            match scan {
-                // Only claim "nothing indexed here" when the scan succeeded.
-                Ok(paths) => !paths
-                    .iter()
-                    .any(|p| p == prefix || p.starts_with(&format!("{prefix}/"))),
-                Err(_) => false,
-            }
-        });
-        if let Some(prefix) = unindexed_prefix {
+        // The probe itself (incl. the `.` / trailing-slash spellings that must
+        // NOT count as a miss) now lives in `queries::unindexed_path_prefix`,
+        // shared with MCP `tool_find_dead_code` — which had no probe at all and
+        // answered the same input with a clean report (audit 2026-08-16 P1-22).
+        if let Some(prefix) = queries::unindexed_path_prefix(conn, path_filter) {
             if json_mode {
                 println!(
                     "{}",

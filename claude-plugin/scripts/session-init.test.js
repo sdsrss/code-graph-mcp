@@ -210,6 +210,96 @@ test('runSessionInit in a non-project cwd: global self-heal fires, zero project 
   assert.equal(fs.existsSync(path.join(bare, 'CLAUDE.md')), false, 'no adoption in non-project cwd');
 });
 
+// ── P1-16: SessionStart must fail OPEN ──────────────────────────────────────
+//
+// maybeAutoAdopt was called bare, and `runSessionInit()` at the bottom of this
+// file had no wrapper at all. An unreadable / directory CLAUDE.md therefore
+// threw EACCES/EISDIR out of the hook: everything AFTER adoption (project-map
+// injection, the recent-impact push, the consistency check, both hook-firing
+// canaries) silently stopped running, and the hook exited non-zero with a raw
+// node stack trace in the user's session.
+//
+// The stub makes adoption throw regardless of WHY — the point of a fail-open
+// wrapper is that it does not need to know the cause. adopt.js's own EACCES
+// tolerance is tested in adopt.test.js; this is the second layer.
+// §8.V4 disposal, second pass. The hook spawns a DETACHED background
+// `verify-hooks-fire` against the sandbox HOME, which re-creates
+// `~/.cache/code-graph` inside the directory the per-test `t.after` just
+// removed — measured as 4 surviving sandboxes under ~/.claude/tmp. A run-level
+// after-hook sweeps them once that child has exited.
+const SESSION_INIT_SANDBOXES = [];
+test.after(() => {
+  for (const dir of SESSION_INIT_SANDBOXES) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* already gone */ }
+  }
+});
+
+function runSessionInitHook(t, { adoptThrows = false, prefix = 'cg-si-failopen-' } = {}) {
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  SESSION_INIT_SANDBOXES.push(sb);
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const home = sb;
+  const cfg = path.join(sb, '.claude');
+  const proj = path.join(sb, 'proj');
+  fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+  fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
+  // Fresh hook-fire state so checkHookFiring does NOT spawn its detached
+  // background probe: that child outlives the test run and re-creates
+  // `<sandbox>/.cache/code-graph` after every cleanup hook has run, which is
+  // what left sandboxes behind in ~/.claude/tmp (§8.V4). Also makes the run
+  // hermetic — no background process touching the sandbox mid-assertion.
+  fs.mkdirSync(path.join(home, '.cache', 'code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.cache', 'code-graph', 'hook-fire-state.json'),
+    JSON.stringify({ ts: new Date().toISOString(), failures: [] }));
+  fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
+  // Seeds detectHookDark (runs LATE, after adoption): 3 edit events, no
+  // grep/read events → it must emit its "may be dark" warning on stderr.
+  fs.writeFileSync(path.join(proj, '.code-graph', 'recommendations.jsonl'),
+    ['{"hook":"edit"}', '{"hook":"edit"}', '{"hook":"edit"}', ''].join('\n'));
+
+  const args = [];
+  if (adoptThrows) {
+    const preload = path.join(sb, 'throwing-adopt.js');
+    fs.writeFileSync(preload, `
+      const adopt = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+      adopt.maybeAutoAdopt = () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); };
+    `);
+    args.push('--require', preload);
+  }
+  args.push(path.join(__dirname, 'session-init.js'));
+
+  const res = spawnSync(process.execPath, args, {
+    cwd: proj,
+    encoding: 'utf8',
+    input: JSON.stringify({ source: 'startup' }),
+    env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' },
+  });
+  return { res, proj, home };
+}
+
+test('SessionStart fails OPEN when adoption throws: exit 0, later steps still run', (t) => {
+  const { res } = runSessionInitHook(t, { adoptThrows: true });
+
+  assert.equal(res.status, 0,
+    `a SessionStart hook must never exit non-zero on a bad CLAUDE.md; stderr:\n${res.stderr}`);
+  assert.match(res.stderr, /may be dark/,
+    'detectHookDark runs AFTER adoption — its warning proves the rest of the sequence still executed');
+  assert.match(res.stderr, /\[code-graph\]/,
+    'the failure itself must be reported, not swallowed');
+  assert.doesNotMatch(res.stderr, /^\s*at .*session-init\.js/m,
+    'a raw node stack trace in the user\'s session is not a report');
+});
+
+test('the fail-open wrapper is scoped: a normal run still reaches the same late steps', (t) => {
+  // Negative control for the test above. If the wrapper (or the stub) were what
+  // produced the "may be dark" line, this run would prove nothing.
+  const { res } = runSessionInitHook(t, { adoptThrows: false, prefix: 'cg-si-normal-' });
+  assert.equal(res.status, 0);
+  assert.match(res.stderr, /may be dark/);
+});
+
 test('runSessionInit tears down cache + adoption on a genuine uninstall (order regression)', (t) => {
   // Subprocess isolation: lifecycle.js evaluates CACHE_DIR from os.homedir() at
   // MODULE LOAD, so HOME/CLAUDE_CONFIG_DIR must be set before require — only a

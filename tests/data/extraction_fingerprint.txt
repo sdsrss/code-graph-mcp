@@ -1,0 +1,12 @@
+# Accepted fingerprints for the extraction + schema sources.
+# Regenerate after a deliberate change:
+#   UPDATE_EXTRACTION_FINGERPRINT=1 cargo test -p code-graph-mcp --test index_version_guard
+# See tests/index_version_guard.rs for what each digest covers.
+# Do not hand-edit the hex — regenerate, so the recorded version is the
+# one that was actually in the tree when the digest was taken.
+
+extraction_fingerprint = 57dc2d1364a2c672b1374c1e6d7bffede872dc7057df8b1f3d0b223b207049f4
+extraction_recorded_at_index_version = 61
+
+schema_fingerprint = 2abb415c5c68bf56391a7f53c25f78af3eb0db8208af6f98faa5c97010af6e64
+schema_recorded_at_schema_version = 10

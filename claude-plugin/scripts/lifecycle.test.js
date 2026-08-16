@@ -317,6 +317,194 @@ test('statusline-chain CLI register/unregister/list + reserved-id guard', (t) =>
 });
 
 // ════════════════════════════════════════════════════════════════════
+// P1-12 — the statusline registry is a READ-MODIFY-WRITE of user data
+// ════════════════════════════════════════════════════════════════════
+// It holds `_previous` (the statusline the user had before we installed) and
+// every third-party provider that registered through us. readRegistry() used the
+// LENIENT reader, so "unreadable" and "absent" both became `[]` — and the very
+// next write persisted that empty list over BOTH the primary copy and the
+// durable backup. One unreadable file, and the user's original statusline is
+// unrecoverable. Same class as the settings.json fix two hundred lines above it.
+
+const REGISTRY_SEED = [
+  { id: '_previous', command: 'echo the-users-own-statusline', needsStdin: true },
+  { id: 'gsd', command: 'node /gsd.cjs', needsStdin: true },
+];
+
+function seedRegistryPair(homeDir, value = REGISTRY_SEED) {
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+  writeJson(registryPath, value);
+  writeJson(backupPath, value);
+  return { registryPath, backupPath };
+}
+
+function readBytes(p) {
+  const saved = fs.statSync(p).mode;
+  fs.chmodSync(p, 0o600);
+  const bytes = fs.readFileSync(p);
+  fs.chmodSync(p, saved);
+  return bytes;
+}
+
+test('registerStatuslineProvider refuses to rewrite an UNREADABLE registry (P1-12)', (t) => {
+  const homeDir = mkHome(t);
+  const { registryPath, backupPath } = seedRegistryPair(homeDir);
+  const before = { primary: fs.readFileSync(registryPath), backup: fs.readFileSync(backupPath) };
+
+  // EACCES on both copies — a stray `sudo`, a restrictive umask, a borrowed HOME.
+  fs.chmodSync(registryPath, 0o000);
+  fs.chmodSync(backupPath, 0o000);
+  t.after(() => { try { fs.chmodSync(registryPath, 0o600); fs.chmodSync(backupPath, 0o600); } catch { /* gone */ } });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.equal(out, 'false', 'an unusable registry must report "nothing registered", not success');
+  assert.deepEqual(readBytes(registryPath), before.primary,
+    'the primary registry must be byte-identical — the user\'s _previous + third-party entries are in it');
+  assert.deepEqual(readBytes(backupPath), before.backup,
+    'the durable backup is the ONLY recovery path; it must survive too');
+});
+
+test('unregisterStatuslineProvider refuses on an unreadable registry (uninstall path)', (t) => {
+  const homeDir = mkHome(t);
+  const { registryPath, backupPath } = seedRegistryPair(homeDir);
+  const before = { primary: fs.readFileSync(registryPath), backup: fs.readFileSync(backupPath) };
+  fs.chmodSync(registryPath, 0o000);
+  fs.chmodSync(backupPath, 0o000);
+  t.after(() => { try { fs.chmodSync(registryPath, 0o600); fs.chmodSync(backupPath, 0o600); } catch { /* gone */ } });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { unregisterStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(String(unregisterStatuslineProvider('code-graph')));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.equal(out, 'false');
+  assert.deepEqual(readBytes(registryPath), before.primary);
+  assert.deepEqual(readBytes(backupPath), before.backup);
+});
+
+test('detachStatuslineIntegration refuses on an unreadable registry instead of deleting the statusline slot (P1-12 sibling)', (t) => {
+  const homeDir = mkHome(t);
+  const { registryPath, backupPath } = seedRegistryPair(homeDir);
+  fs.chmodSync(registryPath, 0o000);
+  fs.chmodSync(backupPath, 0o000);
+  t.after(() => { try { fs.chmodSync(registryPath, 0o600); fs.chmodSync(backupPath, 0o600); } catch { /* gone */ } });
+
+  // The user's live statusline points at our composite; with the registry
+  // unreadable, detach cannot know `_previous` exists — it must leave the
+  // slot alone rather than fall into the delete branch.
+  const out = execFileSync(process.execPath, ['-e', `
+    const { detachStatuslineIntegration } = require(${JSON.stringify(lifecyclePath)});
+    const settings = { statusLine: { type: 'command', command: 'node ' + ${JSON.stringify(path.join(homeDir, '.cache', 'code-graph', 'statusline-composite.js'))} } };
+    const changed = detachStatuslineIntegration(settings);
+    process.stdout.write(JSON.stringify({ changed, hasSlot: !!settings.statusLine }));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.deepEqual(JSON.parse(out), { changed: false, hasSlot: true },
+    'an unreadable registry must refuse the detach — deleting statusLine here orphans the user\'s _previous forever');
+});
+
+test('a CORRUPT registry (valid JSON, wrong shape) is also refused, not overwritten', (t) => {
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
+  // Half-written / hand-edited: parses, but is not the array we own.
+  fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+  fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+  fs.writeFileSync(registryPath, '{"providers": [{"id":"gsd"}]}\n');
+  fs.writeFileSync(backupPath, '{"providers": [{"id":"gsd"}]}\n');
+  const before = { primary: fs.readFileSync(registryPath), backup: fs.readFileSync(backupPath) };
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.equal(out, 'false');
+  assert.deepEqual(fs.readFileSync(registryPath), before.primary);
+  assert.deepEqual(fs.readFileSync(backupPath), before.backup);
+});
+
+test('the refusal is scoped: a MISSING registry is still a normal fresh registration', (t) => {
+  // Negative control for the two tests above. If "refuse" leaked into the absent
+  // case, first-install would silently never register the code-graph provider and
+  // the statusline would be dark for everyone — a guard that broke the product.
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.equal(out, 'true');
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')),
+    [{ id: 'code-graph', command: 'node /new/statusline.js', needsStdin: false }]);
+});
+
+test('an unreadable PRIMARY still self-heals from a readable backup (no data loss either way)', (t) => {
+  const homeDir = mkHome(t);
+  const { registryPath, backupPath } = seedRegistryPair(homeDir);
+  const backupBefore = fs.readFileSync(backupPath);
+  fs.chmodSync(registryPath, 0o000);
+  t.after(() => { try { fs.chmodSync(registryPath, 0o600); } catch { /* gone */ } });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { registerStatuslineProvider, readRegistry } = require(${JSON.stringify(lifecyclePath)});
+    const ok = registerStatuslineProvider('code-graph', 'node /new/statusline.js', false);
+    process.stdout.write(JSON.stringify({ ok, ids: readRegistry().map(p => p.id) }));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  // The primary is unusable, so nothing may be written over it; the entries the
+  // backup still holds must NOT be reported as gone.
+  const res = JSON.parse(out);
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.ids, ['_previous', 'gsd'],
+    'the user\'s providers must still be visible via the durable backup');
+  assert.deepEqual(fs.readFileSync(backupPath), backupBefore, 'backup untouched');
+});
+
+test('the third-party statusline-chain CLI exits 2 on an unusable registry (no false success)', (t) => {
+  const homeDir = mkHome(t);
+  const { registryPath } = seedRegistryPair(homeDir);
+  fs.chmodSync(registryPath, 0o000);
+  t.after(() => { try { fs.chmodSync(registryPath, 0o600); } catch { /* gone */ } });
+  const chainPath = path.join(__dirname, 'statusline-chain.js');
+  const { spawnSync } = require('child_process');
+  const env = { ...process.env, HOME: homeDir };
+
+  for (const argv of [['register', 'gsd', 'node /gsd.cjs'], ['unregister', 'gsd']]) {
+    const r = spawnSync(process.execPath, [chainPath, ...argv], { env, encoding: 'utf8' });
+    assert.equal(r.status, 2, `${argv[0]} must fail loudly, not print "unchanged"/"not-found" at exit 0`);
+    assert.match(r.stderr, /cannot be read as a provider list/);
+    assert.doesNotMatch(r.stdout, /registered|unregistered|unchanged|not-found/);
+  }
+});
+
+test('uninstall REPORTS an unusable installed_plugins.json instead of skipping it silently', (t) => {
+  // The write here was always gated on a successful parse, so nothing was ever
+  // clobbered — but the silent skip left Claude Code listing a plugin whose
+  // cache directory the same run then deleted, while uninstall reported success.
+  const homeDir = mkHome(t);
+  const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
+  fs.mkdirSync(path.dirname(installedPath), { recursive: true });
+  fs.writeFileSync(installedPath, '{"plugins": {"code-graph-mcp@code-graph-mcp": [truncated\n');
+  const before = fs.readFileSync(installedPath);
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { uninstall } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(uninstall({ runNpm: () => true, scanGlobalPkgs: () => [] })));
+  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+
+  assert.equal(JSON.parse(out.toString()).installedPluginsUnusable, true);
+  assert.deepEqual(fs.readFileSync(installedPath), before, 'and the file itself is untouched');
+});
+
+// ════════════════════════════════════════════════════════════════════
 // v0.32.0 — settings.json hook registration (replaces the v0.8.3 strip)
 // ════════════════════════════════════════════════════════════════════
 

@@ -144,7 +144,8 @@ impl ToolRegistry {
                         "file_path": { "type": "string", "description": "Disambiguate same-name symbols across files" },
                         "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "references", "all"], "description": "Relation type filter (default 'all')" },
                         "include_tests": { "type": "boolean", "description": "Include references from test code (default true — tests are usage sites for rename audits). Set false to see production callers only." },
-                        "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+node_id only, no code or signature (saves tokens)" }
+                        "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to KEEP. Default: no floor — every reference is returned, each tagged with its own `confidence` ('extracted' = same-file precise, 'inferred' = import-resolved, 'ambiguous' = by-name fan-out that may point at a same-named symbol elsewhere). Pass 'inferred' to drop the ambiguous tier; `confidence_filtered` in the response counts what was dropped." },
+                        "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+confidence+node_id only, no code or signature (saves tokens)" }
                     }
                 }),
             },

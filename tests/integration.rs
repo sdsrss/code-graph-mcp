@@ -9,9 +9,10 @@ use code_graph_mcp::storage::queries::*;
 
 use common::{parse_tool_result, tool_call_json};
 
-/// `semantic_code_search` returns a bare array on the hybrid path, or a
-/// `{results, vector_available, ...}` object when the embedding model is not loaded
-/// (the case in CI / `--no-default-features`). Extract the results from either shape.
+/// `semantic_code_search` answers a `{results, search_mode, ...}` envelope on
+/// every path since the 2026-08-16 batch (the hybrid path was a bare array
+/// before, which silently dropped `ignored_arguments`/`freshness`). The
+/// array arm below is kept so this helper also reads pre-envelope captures.
 fn search_hits(v: &serde_json::Value) -> Vec<serde_json::Value> {
     v.as_array()
         .cloned()
@@ -1409,8 +1410,8 @@ fn test_skip_indexing_flag() {
     );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    // semantic_code_search returns a raw array on the hybrid path, or a
-    // {results, vector_available} object when FTS5-only (no model in CI).
+    // semantic_code_search answers the {results, ...} envelope on every path
+    // (2026-08-16 batch); search_hits unwraps it.
     assert!(
         !search_hits(&result).is_empty(),
         "should find hello after indexing"
@@ -1692,6 +1693,138 @@ fn test_module_overview_empty_path_errors() {
         serde_json::Value::Bool(true),
         "'.' should still be the match-all alias: {:?}",
         parsed
+    );
+}
+
+/// MCP `find_references` must publish the edge confidence tier and honour a
+/// `min_confidence` floor, like its CLI twin `refs`.
+///
+/// Rename audits are the single worst place to hide a by-name collision, and this
+/// was the one symbol surface that neither tagged nor filtered: `x.save()` with an
+/// untyped receiver produces `ambiguous` edges to EVERY `save` in the repo, and the
+/// tool returned them indistinguishable from an import-resolved hit
+/// (audit 2026-08-16 P1-11).
+#[test]
+fn test_find_references_reports_confidence_and_honours_min_confidence() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    // Two same-named methods + an untyped receiver: `run` binds to BOTH by name,
+    // so both edges land in the `ambiguous` tier.
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export class A { save(): number { return 1; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/b.ts"),
+        "export class B { save(): number { return 2; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.ts"),
+        "export function run(x: any): number { return x.save(); }\n",
+    )
+    .unwrap();
+    let server = common::init_server(&project);
+
+    // No floor (the default): every reference comes back, each tagged.
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name": "save", "file_path": "src/a.ts"}),
+    );
+    let result = parse_tool_result(&server.handle_message(&msg).unwrap());
+    let refs = result["references"].as_array().unwrap();
+    assert!(
+        !refs.is_empty(),
+        "should find the ambiguous caller: {result}"
+    );
+    for r in refs {
+        let c = r["confidence"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every reference must carry its confidence tier, got: {r}"));
+        assert!(
+            ["extracted", "inferred", "ambiguous"].contains(&c),
+            "unexpected tier '{c}' in {r}"
+        );
+    }
+    assert!(
+        refs.iter().any(|r| r["confidence"] == "ambiguous"),
+        "the untyped-receiver call must be reported as ambiguous: {result}"
+    );
+    assert!(
+        result.get("confidence_filtered").is_none(),
+        "no floor means nothing filtered: {result}"
+    );
+
+    // Floor at `inferred`: the ambiguous fan-out drops out AND the drop is disclosed.
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "save",
+            "file_path": "src/a.ts",
+            "min_confidence": "inferred",
+        }),
+    );
+    let filtered = parse_tool_result(&server.handle_message(&msg).unwrap());
+    assert!(
+        filtered["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["confidence"] != "ambiguous"),
+        "min_confidence=inferred must drop the ambiguous tier: {filtered}"
+    );
+    assert!(
+        filtered["confidence_filtered"].as_u64().unwrap_or(0) > 0,
+        "a filtered-down list must disclose the count, or it reads as complete: {filtered}"
+    );
+
+    // Compact mode keeps the tier — it is the field the caller judges a hit by.
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name": "save", "file_path": "src/a.ts", "compact": true}),
+    );
+    let compact = parse_tool_result(&server.handle_message(&msg).unwrap());
+    for r in compact["references"].as_array().unwrap() {
+        assert!(
+            r["confidence"].is_string(),
+            "compact must keep confidence, got: {r}"
+        );
+    }
+}
+
+/// Entry-validate the new enum, like `relation` above: a typo'd tier must name
+/// the valid set, not silently pass every row through.
+#[test]
+fn test_find_references_invalid_min_confidence_errors() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\nfunction run() { return helper(); }\n",
+    )
+    .unwrap();
+    let server = common::init_server(&project);
+
+    let msg = tool_call_json(
+        "find_references",
+        // NB: "high"/"low"/"exact" are documented ALIASES (domain::normalize_confidence),
+        // so a bogus value has to be genuinely bogus to test the gate.
+        serde_json::json!({"symbol_name": "helper", "min_confidence": "very_high"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "invalid min_confidence must error: {parsed:?}"
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("extracted") && text.contains("ambiguous"),
+        "the error must name the valid set; got: {text}"
     );
 }
 
@@ -2502,14 +2635,22 @@ fn test_ast_search_query_plus_type_fallback_to_name_like() {
         "CallGraphResult missing from fallback results: {:?}",
         names
     );
-    // Hint must explain the fallback so caller knows what happened
+    // Since the 2026-08-16 P1-8 fix the candidate pool is sized for the filter
+    // (domain::search_fetch_count), so on a fixture this size FTS itself returns
+    // the structs and the name-LIKE fallback is no longer needed to answer —
+    // asserting the fallback hint here would pin a path this input no longer
+    // takes. The fallback still exists for pools that genuinely saturate, and is
+    // pinned on its own mechanism (`fallback_used`) by
+    // search::ast_query::tests::name_substring_fallback_answers_a_saturated_pool.
+    // What matters to the caller is asserted instead: the answer is COMPLETE.
+    assert_eq!(
+        result["matched_total"].as_u64(),
+        Some(2),
+        "both matching structs must be counted, got: {result}"
+    );
     assert!(
-        result["hint"]
-            .as_str()
-            .map(|s| s.contains("name-substring"))
-            .unwrap_or(false),
-        "expected fallback hint, got: {:?}",
-        result["hint"]
+        result.get("truncated").is_none(),
+        "limit=10 fits 2 matches — nothing was cut, got: {result}"
     );
 }
 
@@ -2661,6 +2802,73 @@ pub fn make_them() {
                 "{tool} suggestion needs node_id: {s}"
             );
         }
+    }
+}
+
+/// MCP `find_dead_code` must not certify a directory it never looked in.
+///
+/// The tool's whole output is an assertion of ABSENCE, so a `path` matching no
+/// indexed file is zero coverage — yet it answered `{"results": [], "summary":
+/// "No dead code found …"}` + success, indistinguishable from a genuinely clean
+/// directory, on the surface an LLM consumes. The CLI twin has probed and exited
+/// 1 since v0.91.0; the MCP half never got the probe (audit 2026-08-16 P1-22).
+#[test]
+fn test_find_dead_code_bogus_path_is_not_a_clean_bill_of_health() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("src/lib.ts"),
+        "export function used(): number { return 1; }\nexport function run(): number { return used(); }\n",
+    )
+    .unwrap();
+    let server = common::init_server(&project);
+
+    // A well-formed, in-root path that names nothing indexed.
+    let msg = tool_call_json(
+        "find_dead_code",
+        serde_json::json!({"path": "src/does_not_exist"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "an unindexed path must be an error, not a clean report: {parsed:?}"
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("src/does_not_exist"),
+        "the error must name the path; got: {text}"
+    );
+    assert!(
+        !text.contains("No dead code found"),
+        "must not also claim cleanliness; got: {text}"
+    );
+
+    // Control 1: a path that DOES match indexed files answers normally, even
+    // when the answer is empty — otherwise the probe would turn every clean
+    // directory into an error (the inverse bug).
+    let msg = tool_call_json("find_dead_code", serde_json::json!({"path": "src"}));
+    let ok = parse_tool_result(&server.handle_message(&msg).unwrap());
+    assert!(
+        ok["results"].is_array(),
+        "an indexed path must still get a report: {ok}"
+    );
+    assert!(ok.get("error").is_none(), "got: {ok}");
+
+    // Control 2: the two spellings that mean "everything" must not trip the
+    // probe — no stored path equals "" or begins with "src//".
+    for spelling in ["", "src/"] {
+        let msg = tool_call_json("find_dead_code", serde_json::json!({"path": spelling}));
+        let parsed: serde_json::Value =
+            serde_json::from_str(server.handle_message(&msg).unwrap().as_ref().unwrap()).unwrap();
+        assert_ne!(
+            parsed["result"]["isError"],
+            serde_json::Value::Bool(true),
+            "path {spelling:?} means 'everything indexed', not a miss: {parsed:?}"
+        );
     }
 }
 
