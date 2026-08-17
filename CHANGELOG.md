@@ -1,5 +1,144 @@
 # Changelog
 
+## v0.119.0 (2026-08-17)
+
+> **Upgrade note — your index rebuilds once.** `INDEX_VERSION` moves 62 → 63
+> because doc-comment extraction changed, so the first `code-graph-mcp` run after
+> upgrading re-indexes the project from scratch (the usual one-time cost; queries
+> stay available throughout — structure lands first, embeddings backfill after,
+> and that backfill now prints progress instead of sitting silent). Nothing to
+> configure. To stay on the old graph, pin the previous version:
+> `npm install -g @sdsrs/code-graph@0.118.0`.
+>
+> One behavior change can break a script: `--type module` / `--node-type module`
+> now **exits 1** with a pointer to `map` / `overview` / `tour` instead of exiting
+> 0 with no results. It never matched a row on any surface — see below.
+
+End-to-end dogfood pass driven from a fresh user's path — index a polyglot repo,
+then run every subcommand and the MCP stdio surface against it — plus the edge
+shapes a real checkout has (no git, docs-only, monorepo with `.gitignore`,
+symlinks, CRLF, unicode and spaced paths, a 20k-symbol file, concurrent runs).
+
+**Filters that accepted a value and then could not honor it.** The `--type` /
+`node_type` vocabulary is one constant (`domain::TYPE_FILTER_VOCAB`), and a
+2026-08-16 guard already pinned "every advertised word parses" — which three of
+them did while resolving to node types no row carries:
+
+- `--type type` mapped to `type_alias`; the extractor writes `type` for a TS
+  `type X = …`. Every `ast-search --type type` / `search --node-type type` /
+  MCP `ast_search {type:"type"}` was a guaranteed zero-hit on an index holding
+  the aliases.
+- `--type var` mapped to `variable`, which nothing emits — a top-level
+  `export var`/`let` binding is stored as `constant`. Now maps to both.
+- `--type module` is no longer advertised: `is_skippable_result` (search /
+  ast-search / similar) and the dead-code SQL's `n.name != '<module>'` drop the
+  placeholders unconditionally, so it could only return nothing. It is rejected
+  with a pointer to `map` / `overview` / `tour`, which do list modules
+  (`domain::type_filter_note`). The MCP `ast_search` schema stopped advertising
+  it to the model too, and now derives that description from the constant.
+
+The guard now walks through to the extractor's own node-type list instead of
+stopping at "the parser accepted it".
+
+**Output that misread as two problems, or as a hang.**
+
+- The filter-emptied disclosure ("N candidate(s) matched … removed by the active
+  filter") went to stdout *and* stderr in human mode — one terminal, two copies,
+  in two different wordings. stderr now carries it only under `--json`, where
+  stdout is a machine envelope.
+- The embedding backfill ran with no output at all: on a large repo the CLI
+  printed its "Incremental index: N files updated" summary and then sat silent
+  for minutes, which is what a hang looks like. It now announces the backlog and
+  ticks every 3s once there are ≥500 nodes to embed.
+- `dead-code` disclosed the `--min-lines` cut only when the result set was empty,
+  so a report listing three candidates silently omitted every shorter one. Both
+  surfaces name the active threshold.
+- `similar` called the candidates past `--max-distance` "nearer", the opposite of
+  what the count measures.
+- `affected --depth 0` / `--depth 999` clamped in silence while `callgraph`
+  warned about the identical clamp.
+- `refs` and `callgraph` printed the internal `<module>` sentinel as if it were a
+  symbol in the user's file; human output now reads `(file top level)`. `--json`
+  and MCP keep the raw name.
+- Hot-function, centrality, report and impact counts said "1 callers" — the
+  `plural` helper exists for exactly this and four sites did not call it.
+
+**`--help` and usage lines that were not runnable commands.**
+
+- `parse_args_json_aware` handed clap `args.iter().skip(1)`, so the *subcommand*
+  token became clap's program name: every subcommand rendered
+  `Usage: search [OPTIONS] <QUERY>`, silently overriding the
+  `name = "code-graph-mcp <sub>"` all two dozen Args structs set. Same in
+  `parse_grep_args`.
+- `print_help` listed subcommand-local flags under a bare `OPTIONS:`, which reads
+  as "placeable before the subcommand" — and `code-graph-mcp --json search foo`
+  answered "Unknown subcommand: --json". The heading says where they go, and a
+  flag in the subcommand slot now gets told so (exit 2).
+
+**Machine contracts.** `snapshot inspect` always prints JSON and takes no
+`--json`, which excluded it from the tier-3 error leg: a corrupt or missing
+snapshot — the one thing the command exists to detect, from a script — answered
+with zero bytes on stdout. It now emits `{"error": …}` there. MCP `ast_search`
+also accepts `node_type` as an alias for `type` (its sibling
+`semantic_code_search` spells it that way), and no longer reports the argument as
+ignored in the same response that applied it.
+
+**`map` counted only four node-type buckets**, so a markdown-only or types-only
+module read as `0 symbols` in the project map while `overview <path>` listed its
+symbols. The census now includes everything outside the named buckets.
+
+### Doc comments were missing for most of the supported languages (INDEX_VERSION 63)
+
+`doc_comment` had no per-language guard, and the languages that DID work made the
+column look populated. Four independent gaps, found by sweeping every supported
+language against a real parse tree:
+
+- **TS/JS `export`.** A JSDoc block precedes `export function f(){}` as a whole,
+  so it is a sibling of the `export_statement`, while the sibling walk started at
+  the inner declaration and found the `export` keyword. Exported symbols were
+  undocumented; plain functions and class methods (unwrapped) kept their docs. In
+  TypeScript the exported symbols are the documented ones — and unlike a Python
+  docstring the block sits OUTSIDE the node, so `code_content` did not carry it
+  either: a phrase living only in a JSDoc was unreachable by every channel
+  (`search "issuer allowlist"` → no results). **Still open:** a comment above a
+  DECORATED export (`/** … */ @Component(…) export class X`, the Angular/NestJS
+  idiom) is separated from the declaration by the decorator node and remains
+  undocumented.
+- **Python.** Documents with a docstring, not a preceding comment, so the column
+  was empty for any def whose docstring was its only documentation. (A def with
+  an adjacent `#` comment always carried that comment, and still does — the
+  docstring now takes precedence over it, so a file-level copyright or
+  `# pylint:` header no longer lands in the `doc:` slot of the first function in
+  the file.) The docstring text is inside `code_content` so FTS still reached it,
+  but the embedding context builder ranks `doc:` above `code:` precisely because
+  code is what gets truncated at 512 tokens — a long function's docstring was the
+  first thing dropped from its vector.
+- **Dart.** Its grammar calls the `///` block `documentation_comment`, a spelling
+  the three-name allowlist did not carry, so every Dart symbol was undocumented.
+  The check is a `*_comment` suffix match now.
+- **Go `type`/`const` and Ruby methods.** Two more wrapper shapes: the extractor
+  sees Go's inner `type_spec` (whose only preceding sibling is the `type`
+  keyword) and Ruby's `method` inside a `body_statement`.
+
+A comment that TRAILS code (`func F() {} // note`, `class R # note`) is no longer
+read as the next declaration's documentation — widening the walk to wrappers had
+made Go's trailing comment the doc of the following `type`, and Ruby's
+`class X # note` the doc of that class's first method.
+
+Measured on a 95-file third-party TS/Vue checkout: documented symbols
+**264 → 335 (+71, +26.9%)**, with the edge set byte-identical at 36,671 rows —
+this changes `doc_comment` only. `test_doc_comment_parity_across_languages` pins
+the (language, declaration form) axis, and mutation testing confirms it fails
+per-row when either mechanism is reverted. INDEX_VERSION bumped to 63: existing
+indexes carry the empty column until they rebuild.
+
+Known gaps this does NOT close, found by the pre-tag review and left open
+deliberately: the decorated-export case above; MCP `project_map {compact: true}`
+still reports only `{path, files, functions}` per module, so a docs-only or
+types-only directory reads as `functions: 0` there even though the non-compact
+envelope now carries `other` (the compact whitelist already dropped `classes`,
+so this is the pre-existing trim, not a new gap).
+
 ## v0.118.0 (2026-08-16)
 
 Continuation of the 2026-08-16 audit remediation — the §十 "中期" tier, then the
