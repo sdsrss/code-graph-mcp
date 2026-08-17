@@ -808,7 +808,17 @@ function unadopt({ cwd, home } = {}) {
   // Also sweep any legacy memory-dir remnants (uninstall before auto-migration ran).
   const migrated = migrateLegacyMemoryDir({ cwd, home });
 
-  const registryUpdated = removeAdopted(effectiveCwd, home);
+  // Deregister ONLY what we actually cleaned. The registry is the sole record
+  // of which repos carry a managed block — `uninstall --unadopt-all` and the
+  // uninstall-time sweep are both driven by it — so dropping the entry for a
+  // project whose CLAUDE.md we could not rewrite (root-owned file, read-only
+  // mount, EPERM dir) strands that block with nothing left pointing at it.
+  // Harmless while the caller only ever passed the current cwd; load-bearing
+  // since the uninstall sweep walks the whole list, because an unconditional
+  // deregister empties the file and removeCacheResidue() only preserves a
+  // NON-EMPTY registry — so the failed project's record died with the cache.
+  const cleanupFailed = claudeMdUnwritable || claudeMdUnreadable;
+  const registryUpdated = cleanupFailed ? false : removeAdopted(effectiveCwd, home);
   return {
     ok: true, fileRemoved, blockPruned, claudeMdRemoved,
     claudeMdUnreadable, claudeMdUnwritable, registryUpdated,
@@ -889,7 +899,7 @@ if (require.main === module) {
 
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
-  readAdoptedProjects, recordAdopted, removeAdopted, adoptedRegistryFile,
+  readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
   claudeMdPath, detailDir, detailPath,

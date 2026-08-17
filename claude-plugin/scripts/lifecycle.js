@@ -601,12 +601,13 @@ function cleanupDisabledStatusline() {
   // our composite from settings.json, so Claude Code stops invoking us.
   let cacheRemoved = false;
   let unadopted = [];
+  let registryUnusable = false;
   if (uninstalled) {
-    unadopted = unadoptRegisteredProjects();
+    ({ unadopted, registryUnusable } = unadoptRegisteredProjects());
     cacheRemoved = removeCacheResidue();
   }
 
-  return { cleaned: true, settingsChanged, cacheRemoved, unadopted };
+  return { cleaned: true, settingsChanged, cacheRemoved, unadopted, registryUnusable };
 }
 
 /**
@@ -622,12 +623,20 @@ function cleanupDisabledStatusline() {
  */
 function unadoptRegisteredProjects() {
   const out = [];
-  let readAdoptedProjects, unadopt;
-  try { ({ readAdoptedProjects, unadopt } = require('./adopt')); }
-  catch { return out; } // POSIX-only helper unavailable — teardown continues
-  let projects = [];
-  try { projects = readAdoptedProjects() || []; } catch { return out; }
-  for (const project of projects) {
+  let readAdoptedResult, unadopt;
+  try { ({ readAdoptedResult, unadopt } = require('./adopt')); }
+  catch { return { unadopted: out, registryUnusable: false }; } // POSIX-only helper unavailable — teardown continues
+  // readAdoptedResult, NOT the lenient readAdoptedProjects(): that wrapper
+  // collapses "unreadable / truncated / wrong shape" into `[]`, which here is
+  // indistinguishable from "no projects to clean" — so a corrupt registry would
+  // silently sweep nothing AND still be deleted by removeCacheResidue() below,
+  // taking the only record of which repos carry a managed block with it. adopt.js
+  // documents the same bit for the same reason: only a genuinely ABSENT file may
+  // be read as empty.
+  let res;
+  try { res = readAdoptedResult(); } catch { return { unadopted: out, registryUnusable: true }; }
+  if (res && res.unusable) return { unadopted: out, registryUnusable: true };
+  for (const project of (res && res.list) || []) {
     try {
       const r = unadopt({ cwd: project });
       out.push({ project, cleaned: !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved)) });
@@ -635,7 +644,36 @@ function unadoptRegisteredProjects() {
       out.push({ project, cleaned: false, error: (e && e.message) || String(e) });
     }
   }
-  return out;
+  reportUnadoptSweep(out);
+  return { unadopted: out, registryUnusable: false };
+}
+
+/**
+ * Tell the user their repos were just edited. Everything else about this
+ * teardown is invisible by construction: it runs inside a statusline render,
+ * both callers `process.exit(0)` on `cleaned` and discard the return value, and
+ * Claude Code fires no uninstall hook — so without this line the first signal is
+ * unexplained `CLAUDE.md` diffs in `git status` across several repositories.
+ * stderr, because a statusline's stdout IS the status line.
+ */
+function reportUnadoptSweep(entries) {
+  try {
+    const cleaned = entries.filter((e) => e && e.cleaned).map((e) => e.project);
+    const failed = entries.filter((e) => e && !e.cleaned).map((e) => e.project);
+    if (!cleaned.length && !failed.length) return;
+    const lines = [];
+    if (cleaned.length) {
+      lines.push(`[code-graph] Plugin uninstalled — removed the managed CLAUDE.md block from ${cleaned.length} project(s):`);
+      for (const p of cleaned.slice(0, 10)) lines.push(`             ${p}`);
+      if (cleaned.length > 10) lines.push(`             …and ${cleaned.length - 10} more`);
+      lines.push('             Your own text outside the block was kept; .code-graph/ index dirs are untouched.');
+    }
+    if (failed.length) {
+      lines.push(`[code-graph] Could NOT clean ${failed.length} project(s) — remove the block by hand or run \`code-graph-mcp unadopt\` there:`);
+      for (const p of failed.slice(0, 10)) lines.push(`             ${p}`);
+    }
+    process.stderr.write(lines.join('\n') + '\n');
+  } catch { /* a notice must never be able to fail a teardown */ }
 }
 
 // --- Scope Conflict Detection ---
@@ -1716,9 +1754,20 @@ function removeCacheResidue() {
   try {
     registryPath = require('./adopt').adoptedRegistryFile();
     const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
-    const parsed = raw ? JSON.parse(raw.toString('utf8')) : null;
-    if (Array.isArray(parsed) && parsed.length) registry = raw;
-  } catch { /* POSIX-only helper, unreadable, or corrupt — nothing to preserve */ }
+    if (raw) {
+      let parsed = null;
+      let usable = true;
+      try { parsed = JSON.parse(raw.toString('utf8')); } catch { usable = false; }
+      // Preserve a NON-EMPTY list (projects still carry a block) and anything we
+      // could not READ as a list. The unusable case used to fall into the same
+      // "nothing to preserve" catch as a missing file — the strictly worse
+      // outcome, since a registry we cannot parse is the one whose contents we
+      // are least able to reconstruct, and the sweep above deliberately skips it
+      // rather than guessing. Only a genuinely EMPTY array strands nothing and
+      // is allowed to go with the cache dir.
+      if (!usable || !Array.isArray(parsed) || parsed.length) registry = raw;
+    }
+  } catch { /* POSIX-only helper or an unreadable path — nothing to preserve */ }
   try {
     fs.rmSync(CACHE_DIR, { recursive: true, force: true });
   } catch { return false; }

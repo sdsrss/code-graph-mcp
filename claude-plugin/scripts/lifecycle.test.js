@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 // `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
 //
@@ -74,7 +74,7 @@ test('cleanupDisabledStatusline restores previous statusline and removes registr
   // Disabled (not uninstalled) → settings are cleaned but the cache must
   // survive: the user may re-enable, and re-download costs ~40MB.
   assert.deepEqual(JSON.parse(out),
-    { cleaned: true, settingsChanged: true, cacheRemoved: false, unadopted: [] });
+    { cleaned: true, settingsChanged: true, cacheRemoved: false, unadopted: [], registryUnusable: false });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
@@ -111,7 +111,7 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
   // Genuine uninstall → the composite render is the ONLY plugin code that still
   // runs (CC stopped loading hooks.json), so it must also reclaim the cache.
   assert.deepEqual(JSON.parse(out),
-    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [] });
+    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [], registryUnusable: false });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
@@ -160,6 +160,100 @@ test('cleanupDisabledStatusline unadopts every registered project on a genuine u
   // Sentinel-guarded: the user's own prose is never collateral.
   assert.ok(fs.readFileSync(path.join(a, 'CLAUDE.md'), 'utf8').includes('hand-written project notes.'));
   assert.ok(fs.readFileSync(path.join(b, 'CLAUDE.md'), 'utf8').includes('keep me.'));
+});
+
+test('the uninstall sweep keeps the registry when a project could not be cleaned', (t) => {
+  // End-to-end shape of the adopt.js fix: one clean project, one whose CLAUDE.md
+  // cannot be rewritten. The failed one must still be named in a registry file
+  // that SURVIVES removeCacheResidue(), or the README teardown command has
+  // nothing left to find.
+  const homeDir = mkHome(t);
+  seedOrphanedComposite(homeDir);
+  const mk = (name) => {
+    const dir = path.join(homeDir, 'repos', name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'CLAUDE.md'),
+      `# ${name}\n\n<!-- code-graph-mcp:begin v2 -->\nblock\n<!-- code-graph-mcp:end -->\n`);
+    return dir;
+  };
+  const good = mk('good');
+  const bad = mk('bad');
+  fs.chmodSync(path.join(bad, 'CLAUDE.md'), 0o400);
+  fs.chmodSync(bad, 0o500); // no write bit → the atomic replace cannot land
+  const registry = path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json');
+  writeJson(registry, [good, bad]);
+
+  let out;
+  try {
+    out = JSON.parse(execFileSync(process.execPath, ['-e', `
+      const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+      process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
+    `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
+  } finally {
+    fs.chmodSync(bad, 0o700);
+  }
+
+  assert.deepEqual(out.unadopted.map((u) => u.cleaned), [true, false], 'one cleaned, one refused');
+  assert.ok(!fs.readFileSync(path.join(good, 'CLAUDE.md'), 'utf8').includes('code-graph-mcp:begin'));
+  assert.ok(fs.readFileSync(path.join(bad, 'CLAUDE.md'), 'utf8').includes('code-graph-mcp:begin'),
+    'precondition: the unwritable project still carries its block');
+  assert.equal(fs.existsSync(registry), true,
+    'the registry must survive: it still names a project carrying a managed block');
+  assert.deepEqual(JSON.parse(fs.readFileSync(registry, 'utf8')), [bad],
+    'and it must name exactly the project that was NOT cleaned');
+});
+
+test('an UNUSABLE registry stops the sweep and is preserved byte-for-byte', (t) => {
+  // readAdoptedProjects() collapses unreadable / truncated / wrong-shape into
+  // [], which is indistinguishable from "nothing to do" — so the sweep silently
+  // no-ops and removeCacheResidue() then deletes the very file that could have
+  // told the user which repos still carry a block. adopt.js documents at length
+  // that ONLY a genuinely absent file may be read as empty.
+  const homeDir = mkHome(t);
+  seedOrphanedComposite(homeDir);
+  const dir = path.join(homeDir, 'repos', 'delta');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'),
+    '# Delta\n\n<!-- code-graph-mcp:begin v2 -->\nblock\n<!-- code-graph-mcp:end -->\n');
+  const registry = path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json');
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
+  fs.writeFileSync(registry, '["' + dir + '"');   // truncated JSON
+  const before = fs.readFileSync(registry);
+
+  const out = JSON.parse(execFileSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
+  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
+
+  assert.equal(out.registryUnusable, true, 'the refusal must be reported, not silent');
+  assert.deepEqual(out.unadopted, []);
+  assert.equal(fs.existsSync(registry), true, 'an unusable registry must NOT be deleted');
+  assert.deepEqual(fs.readFileSync(registry), before, 'and must be left byte-identical');
+  assert.ok(fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8').includes('code-graph-mcp:begin'),
+    'nothing was swept, so the block is still there — and now still findable');
+});
+
+test('the uninstall sweep tells the user which projects it rewrote', (t) => {
+  // A multi-repo file rewrite the user never asked for and is never told about
+  // surfaces first as unexplained CLAUDE.md diffs in `git status`. The callers
+  // exit(0) right after, discarding the return value, so this line is the only
+  // channel.
+  const homeDir = mkHome(t);
+  seedOrphanedComposite(homeDir);
+  const dir = path.join(homeDir, 'repos', 'epsilon');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'),
+    '# E\n\n<!-- code-graph-mcp:begin v2 -->\nblock\n<!-- code-graph-mcp:end -->\n');
+  writeJson(path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json'), [dir]);
+
+  const res = spawnSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    cleanupDisabledStatusline();
+  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+
+  assert.match(res.stderr, /code-graph/, 'the notice is tagged like every other plugin line');
+  assert.match(res.stderr, /uninstall/i, 'it says WHY the files changed');
+  assert.ok(res.stderr.includes(dir), `it names the project it rewrote; got: ${res.stderr}`);
 });
 
 test('a temporary disable does NOT unadopt (the user may re-enable)', (t) => {
@@ -1234,7 +1328,7 @@ test('uninstall hands the statusLine slot to a surviving third-party provider', 
   `], { env: { ...process.env, HOME: homeDir } }).toString();
 
   assert.deepEqual(JSON.parse(out),
-    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [] });
+    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [], registryUnusable: false });
   const settings = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'));
   // Our composite dies with the uninstall — the slot must go to the third
   // party, NOT to _previous (which would silently drop gsd's segment).

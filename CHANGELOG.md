@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.120.1 (2026-08-17)
+
+> **Correction to the v0.120.0 upgrade note.** That note told you to pin
+> `@sdsrs/code-graph@0.119.0` to keep the old leave-it-behind uninstall
+> behavior. That does not work and never did: the teardown runs from the
+> plugin-cache scripts wired into `settings.json`, not from the npm global
+> package, so pinning npm changes nothing for a plugin user — and an npm-only
+> user never reaches this code path at all. There is no opt-out; what there is
+> instead is the notice below, so you can see exactly what was touched.
+
+Repairs found by an independent review of the v0.120.0 diff. The review
+completed before the tag was pushed; its report did not reach the author until
+after publish, so these ship as a patch rather than as part of v0.120.0.
+
+**The uninstall sweep deregistered projects it had failed to clean.**
+`unadopt()` called `removeAdopted()` unconditionally — after the "could not
+rewrite CLAUDE.md" flag was already set. On a project whose file cannot be
+written (root-owned from a stray `sudo`, a read-only mount, an EPERM directory)
+the managed block stayed put *and* the registry entry went away. Harmless while
+the only caller passed the current directory; load-bearing since v0.120.0, where
+the uninstall sweep walks the whole list: every failure emptied the registry a
+little more, and `removeCacheResidue()` only preserves a NON-EMPTY one, so the
+file died with the cache directory and `code-graph-mcp uninstall --unadopt-all`
+— the documented recovery — had nothing left to find. A project is now
+deregistered only when it was actually cleaned.
+
+**An unusable registry is no longer read as an empty one.** The sweep called
+`readAdoptedProjects()`, which collapses unreadable / truncated / wrong-shape
+into `[]` — indistinguishable from "nothing to do". A corrupt registry therefore
+swept nothing, said nothing, and was then deleted along with the cache. It now
+reads through `readAdoptedResult()`, skips the sweep on `unusable`, and
+`removeCacheResidue()` preserves the bytes: the file we can least reconstruct is
+exactly the one that must survive.
+
+**The sweep says what it did.** Rewriting `CLAUDE.md` across several
+repositories with no message meant the first sign was unexplained diffs in
+`git status`. It now prints one stderr notice naming the count and the paths it
+cleaned, plus any it could not, with the manual command for those. Both callers
+`process.exit(0)` immediately afterwards, so this line is the only channel there
+is.
+
 ## v0.120.0 (2026-08-17)
 
 > **Upgrade note — `/plugin uninstall` now cleans up after itself.** Uninstalling

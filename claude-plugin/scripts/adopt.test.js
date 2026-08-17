@@ -761,6 +761,49 @@ test('adopt records the project in the registry; unadopt removes it', () => {
   } finally { sb.cleanup(); }
 });
 
+test('unadopt KEEPS the registry entry when it could not strip the block', () => {
+  // The registry is the only record of which repos carry a managed block, and
+  // `uninstall --unadopt-all` is driven entirely by it. Deregistering a project
+  // whose CLAUDE.md we FAILED to rewrite (root-owned file, read-only mount,
+  // EPERM dir) strands the block with nothing left pointing at it.
+  //
+  // Latent until v0.120.0, then load-bearing: cleanupDisabledStatusline() now
+  // sweeps the whole registry on uninstall, so an unconditional deregister
+  // empties the file, removeCacheResidue()'s preservation branch (which only
+  // fires for a NON-EMPTY array) does not run, and the record dies with the
+  // cache dir. Pre-sweep the registry survived, so the README teardown could
+  // still find the stranded projects.
+  const sb = makeSandbox();
+  const { readAdoptedProjects } = require('./adopt');
+  const claudeMd = path.join(sb.cwd, 'CLAUDE.md');
+  try {
+    assert.strictEqual(adopt({ cwd: sb.cwd, home: sb.home }).ok, true);
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
+
+    // Make the rewrite fail the way a root-owned file does, without needing root.
+    fs.chmodSync(claudeMd, 0o400);
+    fs.chmodSync(sb.cwd, 0o500); // no write bit on the dir → atomic replace fails too
+
+    const r = unadopt({ cwd: sb.cwd, home: sb.home });
+    fs.chmodSync(sb.cwd, 0o700);
+    fs.chmodSync(claudeMd, 0o600);
+
+    assert.strictEqual(r.blockPruned, false, 'precondition: the block was NOT removed');
+    assert.ok(r.claudeMdUnwritable || r.claudeMdUnreadable,
+      'precondition: unadopt reported it could not rewrite CLAUDE.md');
+    assert.ok(fs.readFileSync(claudeMd, 'utf8').includes('code-graph-mcp:begin'),
+      'precondition: the managed block is still in the file');
+
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)],
+      'a project we could not clean must STAY registered, or nothing can find it later');
+    assert.strictEqual(r.registryUpdated, false,
+      'and the result must report that the registry was left alone');
+  } finally {
+    try { fs.chmodSync(sb.cwd, 0o700); } catch { /* already restored */ }
+    sb.cleanup();
+  }
+});
+
 test('a corrupt registry never throws — and is never OVERWRITTEN (P1-12)', () => {
   // This test used to assert the opposite: that adopt happily replaced the
   // unreadable file with `[thisProject]`. That is the same read-modify-write
