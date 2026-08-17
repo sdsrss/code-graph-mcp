@@ -73,7 +73,8 @@ test('cleanupDisabledStatusline restores previous statusline and removes registr
 
   // Disabled (not uninstalled) → settings are cleaned but the cache must
   // survive: the user may re-enable, and re-download costs ~40MB.
-  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: false });
+  assert.deepEqual(JSON.parse(out),
+    { cleaned: true, settingsChanged: true, cacheRemoved: false, unadopted: [] });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
@@ -109,11 +110,75 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
 
   // Genuine uninstall → the composite render is the ONLY plugin code that still
   // runs (CC stopped loading hooks.json), so it must also reclaim the cache.
-  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: true });
+  assert.deepEqual(JSON.parse(out),
+    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [] });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
   assert.equal(fs.existsSync(path.join(homeDir, '.cache', 'code-graph')), false);
+});
+
+test('cleanupDisabledStatusline unadopts every registered project on a genuine uninstall', (t) => {
+  // The block install's auto-adopt writes into each project's CLAUDE.md used to
+  // outlive `/plugin uninstall` forever: session-init.js owned the unadopt step
+  // and Claude Code stops loading this plugin's hooks.json the moment the
+  // install record is gone, so that branch never ran again. The composite
+  // statusline render is the reachable teardown — measured in a sandboxed HOME
+  // 2026-08-17: settings + the 129MB cache came off, the steering block did not.
+  const homeDir = mkHome(t);
+  seedOrphanedComposite(homeDir);
+
+  const mkProject = (name, extraProse) => {
+    const dir = path.join(homeDir, 'repos', name);
+    fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'CLAUDE.md'),
+      `${extraProse}\n\n<!-- code-graph-mcp:begin v2 -->\n## Code Graph\nuse the CLI\n<!-- code-graph-mcp:end -->\n`);
+    // First line must be the managed-by marker — unadopt refuses to unlink a
+    // same-named file the user wrote themselves.
+    fs.writeFileSync(path.join(dir, '.claude', 'plugin_code_graph_mcp.md'),
+      '<!-- managed-by: code-graph-mcp -->\n# generated detail\n');
+    return dir;
+  };
+  const a = mkProject('alpha', '# Alpha\n\nhand-written project notes.');
+  const b = mkProject('beta', '# Beta\n\nkeep me.');
+  writeJson(path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json'), [a, b]);
+
+  const out = JSON.parse(execFileSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString());
+
+  assert.equal(out.cacheRemoved, true);
+  assert.deepEqual(out.unadopted.map((u) => u.cleaned), [true, true], 'both projects cleaned');
+  for (const dir of [a, b]) {
+    const md = fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8');
+    assert.ok(!md.includes('code-graph-mcp:begin'), `${dir}: managed block stripped`);
+    assert.ok(!md.includes('use the CLI'), `${dir}: block body stripped`);
+    assert.equal(fs.existsSync(path.join(dir, '.claude', 'plugin_code_graph_mcp.md')), false,
+      `${dir}: generated detail doc removed`);
+  }
+  // Sentinel-guarded: the user's own prose is never collateral.
+  assert.ok(fs.readFileSync(path.join(a, 'CLAUDE.md'), 'utf8').includes('hand-written project notes.'));
+  assert.ok(fs.readFileSync(path.join(b, 'CLAUDE.md'), 'utf8').includes('keep me.'));
+});
+
+test('a temporary disable does NOT unadopt (the user may re-enable)', (t) => {
+  const homeDir = mkHome(t);
+  seedDisabledComposite(homeDir);
+  const dir = path.join(homeDir, 'repos', 'gamma');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'),
+    '# Gamma\n\n<!-- code-graph-mcp:begin v2 -->\nblock\n<!-- code-graph-mcp:end -->\n');
+  writeJson(path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json'), [dir]);
+
+  const out = JSON.parse(execFileSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString());
+
+  assert.deepEqual(out.unadopted, [], 'disable is reversible — adoption stays');
+  assert.equal(out.cacheRemoved, false);
+  assert.ok(fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8').includes('code-graph-mcp:begin'));
 });
 
 test('isPluginUninstalled distinguishes a genuine uninstall from a temporary disable', (t) => {
@@ -1168,7 +1233,8 @@ test('uninstall hands the statusLine slot to a surviving third-party provider', 
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
   `], { env: { ...process.env, HOME: homeDir } }).toString();
 
-  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: true });
+  assert.deepEqual(JSON.parse(out),
+    { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [] });
   const settings = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'));
   // Our composite dies with the uninstall — the slot must go to the third
   // party, NOT to _previous (which would silently drop gsd's segment).

@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.120.0 (2026-08-17)
+
+> **Upgrade note — `/plugin uninstall` now cleans up after itself.** Uninstalling
+> the plugin strips the managed `<!-- code-graph-mcp:begin -->` block from every
+> project's `CLAUDE.md` and deletes the generated
+> `.claude/plugin_code_graph_mcp.md`, instead of leaving both behind forever.
+> Your own prose outside the sentinel is untouched, and a `CLAUDE.md` that holds
+> nothing but our block is removed (the plugin created it). A temporary
+> **disable** in `/plugin` still changes nothing — the block, the 40MB binary
+> cache and the embedding model all survive, so re-enabling costs no download.
+> No index data is touched: `.code-graph/` stays. Nothing to configure; to keep
+> the old leave-it-behind behavior, pin the previous version:
+> `npm install -g @sdsrs/code-graph@0.119.0`.
+
+A sandbox lifecycle pass driven from a real user's path — a throwaway `HOME` +
+`CLAUDE_CONFIG_DIR`, the plugin laid out the way `/plugin marketplace add` and
+`/plugin install` lay it out, a JSON-RPC stdio client where Claude Code would be,
+and real network for the release binary, the embedding model and `npm install -g`.
+Install, auto-update, self-heal, disable, uninstall, reinstall, each verified by
+what was left on disk afterwards.
+
+**npm does not always hoist the platform binary, and we only looked where it
+sometimes is.** `npm install -g @sdsrs/code-graph` puts
+`@sdsrs/code-graph-<plat>-<arch>` in one of two places — hoisted next to the
+shell package, or nested inside it — and which one you get is an npm
+implementation detail (npm 12 nests; both layouts were live on one machine).
+`find-binary.js` probed only the hoisted spelling, so a **successful** install
+read as "npm install did not yield a binary". Two consequences, one of which
+outlived the session:
+
+- The launcher fell through to the GitHub release download and pulled ~41MB it
+  already had. Cold-start handover from the 0-tool stub to real tools: **17.7s →
+  3.0s** measured in the sandbox.
+- `recordGlobalInstall()` never fired, so `global-install-marker.json` was never
+  written — and that marker is the only thing that proves the plugin, not the
+  user, installed those global packages. Without it `code-graph-mcp uninstall`
+  refuses to remove them and `doctor` reports "no plugin-install marker;
+  uninstall leaves them", which is now "plugin-installed; … removes them".
+
+Discovery probes both layouts (global prefix and npx cache alike). The global
+package *inventory* deliberately still looks only at the top level: a nested
+optional dependency is the shell package's private business, and `npm install -g`
+/ `npm uninstall -g` on its name would create or orphan a top-level global the
+user never asked for.
+
+**The uninstall teardown was wired to the branch that no longer runs.** Unadopting
+a project lived in `session-init.js`'s inactive branch — whose own comment
+concedes that after a real `/plugin uninstall` "this SessionStart usually never
+runs again", because Claude Code stops loading the plugin's `hooks.json` the
+moment the install record disappears. What *does* still run is the composite
+statusline render, and it only cleaned `settings.json` plus `~/.cache/code-graph`.
+Measured with two adopted projects: 129MB of cache reclaimed, hooks and statusline
+gone — and both `CLAUDE.md` blocks still sitting there, steering Claude at a CLI
+that had just been deleted. `cleanupDisabledStatusline()` now sweeps the whole
+adopted-projects registry *before* wiping the cache the registry lives in, with
+per-project and overall error containment (it runs inside a statusline render,
+where a throw blanks the user's status bar).
+
+**Two messages that described the wrong situation.**
+
+- The first SessionStart after `/plugin install` said "Binary not found — MCP
+  server cannot start. Install: npm install -g @sdsrs/code-graph". A missing
+  binary is the *normal* first-session state — nothing ships the engine with the
+  plugin — and both automatic install paths are already running when that prints.
+  It now says it is fetching in the background; the manual instruction is kept
+  for `CODE_GRAPH_NO_AUTO_UPDATE=1`, where nothing else will fetch it.
+- `auto-update check` printed `Up to date (v<installed>)` when the GitHub fetch
+  had failed or another session held the install lock — telling a user who ran it
+  *because* they were stuck on an old version that the old version is current
+  (observed: "Up to date (v0.118.0)" with v0.119.0 published). Both paths now
+  return a reason and print "update status UNKNOWN" or "another session is
+  installing". The exit code stays 0: an unreachable GitHub is not a failure of
+  the command, and both the launcher and `doctor` spawn it.
+
+Two long-standing tests turn out to have been passing for the wrong reason. Both
+assert that discovery finds nothing, and both were only true because the probe
+missed a global install that was really there; `globalNodeModulesCandidates()`
+derives one root from `process.execPath`, which no env var can mask. They now
+skip with the offending path printed, so a developer machine cannot quietly
+report a green that a CI runner (no global install) still earns.
+
 ## v0.119.0 (2026-08-17)
 
 > **Upgrade note — your index rebuilds once.** `INDEX_VERSION` moves 62 → 63

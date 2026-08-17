@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const os = require('os');
-const { launchBackgroundAutoUpdate, isHighIntentSource, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact } = require('./session-init');
+const { launchBackgroundAutoUpdate, isHighIntentSource, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact, missingBinaryMessage } = require('./session-init');
 
 // Write an executable stub named `code-graph-mcp` that emits `json` to stdout on
 // `health-check` and exits with `exitCode`. Mirrors how the real binary behaves:
@@ -667,3 +667,22 @@ test('injectProjectMap map call carries CODE_GRAPH_INTERNAL (delivery, not a mod
   assert.match(src.slice(i, i + 420), /CODE_GRAPH_INTERNAL:\s*'1'/);
 });
 
+
+test('a missing binary on a fresh install reads as auto-install, not as a failed one', () => {
+  // The first session after `/plugin install` ALWAYS has no binary — nothing
+  // ships the ~40MB engine with the plugin — and runSessionInit launches the
+  // background download a few lines after this message. Measured in a sandboxed
+  // HOME 2026-08-17: the old text ('MCP server cannot start. Install: npm
+  // install -g @sdsrs/code-graph') was the first thing a new user saw, and the
+  // binary landed on its own 12s later.
+  const auto = missingBinaryMessage({});
+  assert.match(auto, /background/i);
+  assert.ok(!/cannot start/i.test(auto), 'no failure framing while the fetch is running');
+  assert.ok(!/npm install -g/.test(auto), 'no manual instruction the user does not need');
+
+  // Opted out of auto-update → nothing else will fetch it, so the manual
+  // instruction is the only correct answer.
+  const optedOut = missingBinaryMessage({ CODE_GRAPH_NO_AUTO_UPDATE: '1' });
+  assert.match(optedOut, /npm install -g @sdsrs\/code-graph/);
+  assert.match(optedOut, /CODE_GRAPH_NO_AUTO_UPDATE=1/);
+});

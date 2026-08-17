@@ -588,10 +588,54 @@ function cleanupDisabledStatusline() {
   // still run after `/plugin uninstall` — Claude Code stops loading the
   // plugin's hooks.json, so the SessionStart teardown in session-init.js never
   // fires post-uninstall. Without this, the ~40MB cached binary leaked forever.
+  //
+  // Adoption comes off in the SAME breath, and BEFORE the wipe: install's
+  // auto-adopt writes a managed block into every project's CLAUDE.md, and until
+  // now nothing reachable removed it. session-init.js owned that step, on the
+  // branch its own comment concedes "usually never runs again" after a real
+  // uninstall — so the block (steering Claude at a CLI that is being deleted two
+  // lines below) survived forever in every adopted repo. The registry that names
+  // those projects lives inside CACHE_DIR, which is exactly why this must run
+  // first: same capture-before-cleanup ordering the rest of this teardown
+  // already learned. This branch fires at most once — the write above removes
+  // our composite from settings.json, so Claude Code stops invoking us.
   let cacheRemoved = false;
-  if (uninstalled) cacheRemoved = removeCacheResidue();
+  let unadopted = [];
+  if (uninstalled) {
+    unadopted = unadoptRegisteredProjects();
+    cacheRemoved = removeCacheResidue();
+  }
 
-  return { cleaned: true, settingsChanged, cacheRemoved };
+  return { cleaned: true, settingsChanged, cacheRemoved, unadopted };
+}
+
+/**
+ * Strip the managed CLAUDE.md block + generated `.claude/plugin_code_graph_mcp.md`
+ * from every project in the adopted-projects registry. `unadopt` is
+ * sentinel-guarded, so user prose outside the managed block is preserved and a
+ * project that was already cleaned is a no-op.
+ *
+ * Fully swallowed per project AND overall: this runs inside a statusline render
+ * (statusline.js / statusline-composite.js call the caller at their top), where
+ * an uncaught throw blanks the user's status line — and an unreadable project
+ * must not cost the remaining ones their cleanup.
+ */
+function unadoptRegisteredProjects() {
+  const out = [];
+  let readAdoptedProjects, unadopt;
+  try { ({ readAdoptedProjects, unadopt } = require('./adopt')); }
+  catch { return out; } // POSIX-only helper unavailable — teardown continues
+  let projects = [];
+  try { projects = readAdoptedProjects() || []; } catch { return out; }
+  for (const project of projects) {
+    try {
+      const r = unadopt({ cwd: project });
+      out.push({ project, cleaned: !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved)) });
+    } catch (e) {
+      out.push({ project, cleaned: false, error: (e && e.message) || String(e) });
+    }
+  }
+  return out;
 }
 
 // --- Scope Conflict Detection ---
@@ -1690,7 +1734,7 @@ function removeCacheResidue() {
 module.exports = {
   install, uninstall, update, healthCheck, scanForBrokenPaths, checkScopeConflict,
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
-  cleanupDisabledStatusline,
+  cleanupDisabledStatusline, unadoptRegisteredProjects,
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
   readRegistry, readRegistryForWrite, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,

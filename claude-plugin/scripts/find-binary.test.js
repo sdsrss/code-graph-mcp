@@ -416,3 +416,32 @@ test('platformBinaryCandidates rejects truncated npm platform binaries (<1MB)', 
   const accepted = withPrefix(() => platformBinaryCandidates());
   assert.ok(accepted.includes(bin), 'plausibly-sized binary is a candidate');
 });
+
+test('platformBinaryCandidates finds the NESTED npm optionalDependency layout', (t) => {
+  // `npm install -g @sdsrs/code-graph` does not always hoist the platform
+  // optionalDependency to the global root: npm 12 leaves it under the shell
+  // package's own node_modules. Probing only the hoisted spelling made a
+  // SUCCESSFUL npm install read as "did not yield a binary", so the launcher
+  // re-downloaded ~41MB from GitHub AND skipped recordGlobalInstall() — which
+  // is the marker `uninstall` needs to know it owns those global packages.
+  // Observed live 2026-08-17 with npm 12.0.1 in a sandboxed HOME.
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-nested-'));
+  t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
+  const nestedDir = path.join(prefix, 'lib', 'node_modules', '@sdsrs', 'code-graph',
+    'node_modules', '@sdsrs', `code-graph-${process.platform}-${process.arch}`);
+  fs.mkdirSync(nestedDir, { recursive: true });
+  const bin = path.join(nestedDir, BINARY_NAME);
+  fs.writeFileSync(bin, Buffer.alloc(1_100_000));
+
+  const prev = process.env.NPM_CONFIG_PREFIX;
+  process.env.NPM_CONFIG_PREFIX = prefix;
+  let found;
+  try {
+    const { platformBinaryCandidates } = require('./find-binary');
+    found = platformBinaryCandidates();
+  } finally {
+    if (prev === undefined) delete process.env.NPM_CONFIG_PREFIX;
+    else process.env.NPM_CONFIG_PREFIX = prev;
+  }
+  assert.ok(found.includes(bin), `nested platform binary must be a candidate; got ${JSON.stringify(found)}`);
+});

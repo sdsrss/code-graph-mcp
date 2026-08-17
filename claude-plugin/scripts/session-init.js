@@ -407,6 +407,30 @@ function ensureIndexFresh() {
 }
 
 /**
+ * What to tell a user whose binary is missing. A missing binary is the NORMAL
+ * state of the first session after `/plugin install` — nothing ships the ~40MB
+ * engine with the plugin — and both automatic install paths are already
+ * running by the time the user reads this: launchBackgroundAutoUpdate() below
+ * (a missing binary bypasses the check throttle) and the MCP launcher's own
+ * install chain. Telling that user "MCP server cannot start. Install: npm
+ * install -g" reads as a failed install and sends them to fix something that
+ * is already fixing itself.
+ *
+ * The manual instruction is still the right answer when the user has opted out
+ * of auto-update, because then nothing else will fetch it. Pure so both arms
+ * are testable without a binary-less machine.
+ */
+function missingBinaryMessage(env = process.env) {
+  if (env.CODE_GRAPH_NO_AUTO_UPDATE === '1') {
+    return '[code-graph] Binary not found, and auto-download is off (CODE_GRAPH_NO_AUTO_UPDATE=1).\n' +
+           '            Install it yourself:  npm install -g @sdsrs/code-graph\n';
+  }
+  return '[code-graph] Binary not found — fetching it in the background (~40MB, first run only).\n' +
+         '            Tools appear as soon as it lands; no restart needed.\n' +
+         '            Still missing next session? Run `code-graph-mcp doctor`.\n';
+}
+
+/**
  * Verify binary is available and executable.
  * On macOS, detect Gatekeeper quarantine (common after npm/GitHub download).
  * Returns { available, binary, issue? }.
@@ -415,10 +439,7 @@ function verifyBinary() {
   const { findBinary } = require('./find-binary');
   const binary = findBinary();
   if (!binary) {
-    process.stderr.write(
-      '[code-graph] Binary not found — MCP server cannot start.\n' +
-      'Install: npm install -g @sdsrs/code-graph\n'
-    );
+    process.stderr.write(missingBinaryMessage());
     return { available: false, binary: null };
   }
 
@@ -527,6 +548,18 @@ function consistencyCheck(binary) {
   return issues;
 }
 
+/**
+ * Do two paths name the same project? The registry stores what `adopt` was
+ * given and `process.cwd()` is what the shell resolved, so a symlinked repo
+ * path (`/tmp` → `/private/tmp` on macOS) compares unequal as raw strings.
+ * realpath both, fall back to the resolved literal when a side no longer exists.
+ */
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+  return real(a) === real(b);
+}
+
 function runSessionInit({ source } = {}) {
   // GC the shared tmp dir before anything else, so it happens even on the
   // inactive / non-project early returns below — those sessions still wrote
@@ -543,7 +576,8 @@ function runSessionInit({ source } = {}) {
     // Third caller of the same unguarded teardown (statusline.js and
     // statusline-composite.js are the others): a read-only ~/.claude turns this
     // into an uncaught throw that takes down the whole SessionStart hook.
-    try { cleanupDisabledStatusline(); } catch { /* best-effort teardown */ }
+    let cleanup = null;
+    try { cleanup = cleanupDisabledStatusline(); } catch { /* best-effort teardown */ }
     // Genuine uninstall (not a temporary disable) leaves residue the settings-only
     // self-heal can't reach: ~/.cache/code-graph (the ~40MB binary + state) and the
     // current project's CLAUDE.md adoption block. CC fires no uninstall hook, AND it
@@ -570,9 +604,18 @@ function runSessionInit({ source } = {}) {
       // other projects is the preservation inside removeCacheResidue(); this
       // ordering is the belt to that pair of braces, and it is what keeps the
       // single-project case from depending on the preservation at all.
-      let unadopted = false;
+      //
+      // cleanupDisabledStatusline() now sweeps the WHOLE adopted-projects
+      // registry (it is the only teardown that still runs after a real
+      // uninstall), so this cwd is usually already clean by the time we get
+      // here. Fold that in rather than re-deriving it: with the work moved
+      // earlier, the local `unadopt` returns "nothing to clean" and reporting
+      // `unadopted:false` for a project whose block IS gone would be a false
+      // negative in the one field a caller could act on.
+      let unadopted = !!(cleanup && Array.isArray(cleanup.unadopted)
+        && cleanup.unadopted.some((u) => u && u.cleaned && samePath(u.project, process.cwd())));
       try {
-        if (!isNonProjectCwd(process.cwd())) {
+        if (!unadopted && !isNonProjectCwd(process.cwd())) {
           const r = unadopt({ cwd: process.cwd() });
           unadopted = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
         }
@@ -924,7 +967,7 @@ module.exports = {
   indexNeedsRevalidation,
   injectProjectMap,
   injectRecentImpact,
-  verifyBinary,
+  verifyBinary, missingBinaryMessage,
   consistencyCheck,
   runSessionInit,
   computeQuietHooks,

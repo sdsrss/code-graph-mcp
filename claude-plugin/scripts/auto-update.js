@@ -1063,7 +1063,12 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       // that set it, and kept polling GitHub on the ordinary interval while
       // already rate-limited. Dead code since the backoff was written.
       saveState({ ...readState(), installedVersion, lastCheck: new Date().toISOString() });
-      return null;
+      // NOT null: null is the CLI's "nothing to do" and it prints "Up to date
+      // (vX)". A failed fetch means the opposite — the update status is
+      // UNKNOWN — and a user running this because they are stuck on an old
+      // version was being told the old version is current (offline, captive
+      // portal, proxy, GitHub 5xx all land here).
+      return { noop: true, reason: 'fetch-failed', from: installedVersion };
     }
 
     // Compare versions
@@ -1079,7 +1084,9 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     // against our own parent.
     if (process.env.CODE_GRAPH_INSTALL_LOCK_HELD !== '1') {
       installLock = acquireLock(path.join(CACHE_DIR, 'install.lock'));
-      if (!installLock) return null;
+      // Reason, not null — same misreport as the fetch failure above: the
+      // holder is mid-update, so "Up to date (v<old>)" is exactly wrong.
+      if (!installLock) return { noop: true, reason: 'install-lock-held', from: installedVersion };
     }
 
     if (hasUpdate) {
@@ -1266,6 +1273,14 @@ if (require.main === module) {
         console.log(`Update available: v${result.to} (auto-install failed)`);
       } else if (result && result.binaryUpdated) {
         console.log(`Repaired binary cache (v${result.to})`);
+      } else if (result && result.noop && result.reason === 'fetch-failed') {
+        // Message only — the exit code stays 0 on purpose: an unreachable
+        // GitHub is not a failure of this command, and the launcher's install
+        // chain plus `doctor` both spawn it.
+        console.log(`Could not reach GitHub — update status UNKNOWN (still on v${result.from}). ` +
+          'Retried on the next session; run `code-graph-mcp doctor` if it persists.');
+      } else if (result && result.noop && result.reason === 'install-lock-held') {
+        console.log(`Another session is installing/updating right now — check skipped (on v${result.from}).`);
       } else if (!installMissing && isAutoUpdateDisabled()) {
         console.log('CODE_GRAPH_NO_AUTO_UPDATE=1 — auto-update skipped');
       } else if (!installMissing && isDevMode()) {

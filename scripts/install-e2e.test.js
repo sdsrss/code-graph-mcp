@@ -692,7 +692,26 @@ test('§2.7 bin/cli.js forwards help argument', () => {
   assert.ok(stdout.length > 50, 'Help output should be substantial');
 });
 
-test('§2.8 bin/cli.js shows install instructions when binary is missing', () => {
+test('§2.8 bin/cli.js shows install instructions when binary is missing', (t) => {
+  // This fixture redirects HOME and clears PATH, but discovery is NOT fully
+  // hermetic: globalNodeModulesCandidates() derives one root from
+  // process.execPath (the developer's real nvm prefix) and no env var can mask
+  // it. On a machine with a global `npm i -g @sdsrs/code-graph`, findBinary()
+  // correctly returns that binary, so "no binary" is unreachable here.
+  //
+  // It used to pass anyway — the probe missed npm's NESTED optionalDependency
+  // layout, which is the only layout npm 12 writes, so a global install that
+  // was really there read as absent. Fixing that (2026-08-17) turned this test
+  // from a false green into a real red. Skip loudly rather than assert a
+  // machine property: CI runners have no global install, so the guard stays
+  // live exactly where it is meaningful.
+  const { platformBinaryCandidates } = require(FIND_BINARY);
+  const hostGlobals = platformBinaryCandidates();
+  if (hostGlobals.length) {
+    t.skip(`host has a global platform package (${hostGlobals[0]}) that discovery legitimately finds; ` +
+      'the missing-binary path is not reachable on this machine');
+    return;
+  }
   const homeDir = mkHome();
   // Create a fake cli.js environment where no binary can be found
   const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-root-'));

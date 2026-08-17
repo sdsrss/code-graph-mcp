@@ -230,6 +230,36 @@ function isPlausibleReleaseBinary(candidate) {
   try { return fs.statSync(candidate).size > 1_000_000; } catch { return false; }
 }
 
+/**
+ * Both places npm may put the platform optionalDependency inside a
+ * `node_modules` root, most-likely first:
+ *
+ *   <root>/@sdsrs/code-graph-<plat>-<arch>/                        (hoisted)
+ *   <root>/@sdsrs/code-graph/node_modules/@sdsrs/code-graph-…/     (nested)
+ *
+ * Hoisting is an npm implementation detail, not a contract: npm 12 leaves the
+ * optionalDependency nested under the shell package on a plain
+ * `npm install -g @sdsrs/code-graph`, while older npm hoists it (both layouts
+ * were observed on one machine, 2026-08-17). Probing only the hoisted spelling
+ * made a SUCCESSFUL npm install read as "did not yield a binary": the launcher
+ * then re-downloaded ~41MB from GitHub, and — the part that outlives the
+ * session — never called `recordGlobalInstall()`, so `uninstall` had no marker
+ * proving the plugin owns those global packages and left them on PATH forever.
+ *
+ * Discovery only. The global-package INVENTORY scanners (staleGlobalPkgs,
+ * installedGlobalPkgs, doctor) stay top-level-on-purpose: a nested
+ * optionalDependency is the shell package's private dependency, so
+ * `npm install -g`/`npm uninstall -g` on its name would introduce or orphan a
+ * top-level global the user never asked for.
+ */
+function platformPkgBinaries(nodeModulesRoot) {
+  const pkg = `code-graph-${PLATFORM}-${ARCH}`;
+  return [
+    path.join(nodeModulesRoot, '@sdsrs', pkg, BINARY_NAME),
+    path.join(nodeModulesRoot, '@sdsrs', 'code-graph', 'node_modules', '@sdsrs', pkg, BINARY_NAME),
+  ];
+}
+
 function platformBinaryCandidates() {
   const out = [];
   // Fast path: standard module resolution.
@@ -239,10 +269,11 @@ function platformBinaryCandidates() {
     if (isNativeBinary(bin) && isPlausibleReleaseBinary(bin)) out.push(bin);
   } catch { /* not in node_modules walk-up */ }
 
-  // Slow path: explicit global node_modules probe.
+  // Slow path: explicit global node_modules probe, both npm layouts.
   for (const globalRoot of globalNodeModulesCandidates()) {
-    const bin = path.join(globalRoot, '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`, BINARY_NAME);
-    if (isNativeBinary(bin) && isPlausibleReleaseBinary(bin)) out.push(bin);
+    for (const bin of platformPkgBinaries(globalRoot)) {
+      if (isNativeBinary(bin) && isPlausibleReleaseBinary(bin)) out.push(bin);
+    }
   }
 
   return out;
@@ -363,9 +394,12 @@ function findBinaryUncached() {
   const npxDir = path.join(os.homedir(), '.npm', '_npx');
   try {
     for (const entry of fs.readdirSync(npxDir)) {
-      const platDir = path.join(npxDir, entry, 'node_modules', '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`);
-      const hit = gate.consider(path.join(platDir, BINARY_NAME));
-      if (hit) return hit;
+      // Same hoisted-or-nested question as the global prefix — an npx tree is
+      // just another node_modules root, and npm decides the layout there too.
+      for (const bin of platformPkgBinaries(path.join(npxDir, entry, 'node_modules'))) {
+        const hit = gate.consider(bin);
+        if (hit) return hit;
+      }
     }
   } catch { /* no npx cache */ }
 

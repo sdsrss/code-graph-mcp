@@ -1838,3 +1838,47 @@ test('downloadBinary fetches the binary with curl -f, like the sidecar (BIN-4)',
   // Same run proves the size floor now speaks (the fake curl writes 1 byte).
   assert.match(r.stderr, /1 bytes/, 'and the discard is explained on stderr');
 });
+
+test('an unreachable GitHub reports UNKNOWN, not "up to date"', (t) => {
+  // The CLI's final else prints `Up to date (v<manifest.version>)`, and both a
+  // failed fetch and a lock held by a concurrent session used to return the
+  // same bare `null` into it — so a user running this precisely BECAUSE they
+  // are stuck on an old version was told the old version is current. Observed
+  // 2026-08-17 in a sandboxed HOME: `check --force` printed
+  // "Up to date (v0.118.0)" while v0.119.0 was the published release.
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-unreach-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const cacheDir = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'install-manifest.json'),
+    JSON.stringify({ version: '1.0.0', config: {} }));
+
+  const script = `
+    const au = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    (async () => {
+      const result = await au.checkForUpdate({
+        installMissing: true, force: true,
+        requestJsonFn: async () => { throw new Error('ENETUNREACH'); },
+      });
+      process.stdout.write(JSON.stringify(result));
+    })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
+    encoding: 'utf8', timeout: 60000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+  const result = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.equal(result && result.noop, true, 'a failed fetch is a NOOP with a reason, not a bare null');
+  assert.equal(result.reason, 'fetch-failed');
+  assert.equal(result.from, '1.0.0');
+  // The CLI branches keyed off the reasons must exist — without them the value
+  // falls through to the `Up to date (v…)` else, which is the bug. Matched as
+  // independent tokens rather than one span, so reformatting the branch bodies
+  // cannot silently disarm this.
+  const cli = fs.readFileSync(path.join(__dirname, 'auto-update.js'), 'utf8');
+  assert.match(cli, /result\.reason === 'fetch-failed'/);
+  assert.match(cli, /update status UNKNOWN/);
+  assert.match(cli, /result\.reason === 'install-lock-held'/);
+});
