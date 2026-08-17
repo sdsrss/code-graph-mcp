@@ -682,6 +682,22 @@ fn mcp_find_dead_code_rejects_unknown_node_type() {
         "find_dead_code must reject unknown node_type; got: '{}'",
         text
     );
+    // Argument-order pin, matching the CLI sites: the MCP surface shipped the
+    // same swapped pair (v0.118.0 pre-tag review), and a prefix-only assertion
+    // could not see it.
+    assert!(
+        text.contains("'fucntion'"),
+        "the caller's bad value must be the quoted one; got: '{}'",
+        text
+    );
+    assert!(
+        text.contains(&format!(
+            "Valid: {}",
+            code_graph_mcp::domain::TYPE_FILTER_HELP
+        )),
+        "the vocabulary must follow `Valid:`; got: '{}'",
+        text
+    );
 }
 
 /// Regression: an "edit-only" session that issues NO code-graph tool call must

@@ -26,8 +26,10 @@ pub struct HealthCheckArgs {
 impl HealthCheckArgs {
     /// Collapse `--json`/`--format` into the handler's format string.
     /// `--json` takes precedence; absent both, defaults to "oneline".
-    /// Unrecognized `--format` values fall through to the handler's oneline branch
-    /// (preserved from the prior hand-parser: only "json" was special-cased).
+    /// Unrecognized `--format` values are REJECTED by the handler (`cmd_health_check_opts`
+    /// bails before doing any work). They used to fall through to the oneline branch,
+    /// carried over from the prior hand-parser, which meant a script asking for JSON
+    /// got prose and exit 0.
     pub fn resolved_format(&self) -> &str {
         if self.json {
             "json"

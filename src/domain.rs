@@ -374,10 +374,6 @@ pub const SEARCH_FILTER_FETCH_FLOOR: i64 = 100;
 /// skip are all post-fetch, so fetch a multiple of top_k rather than top_k+1.
 pub const SIMILAR_OVERFETCH: i64 = 3;
 
-/// Candidate-pool size for semantic_code_search. `filtered` = a language or node_type
-/// filter is active (widens the pool so the post-KNN filter cannot starve top_k). The
-/// unfiltered value is byte-identical to the historical `(top_k*4).max(20)`, so the
-/// retrieval benchmark — which passes no filter — is unchanged by the filtered branch.
 /// Minimum AND-arm hit count for an FTS query to keep its precise results
 /// instead of widening to OR.
 ///
@@ -398,6 +394,10 @@ pub const SIMILAR_OVERFETCH: i64 = 3;
 /// rather than widened away.
 pub const AND_MATCH_FLOOR: usize = 3;
 
+/// Candidate-pool size for semantic_code_search. `filtered` = a language or node_type
+/// filter is active (widens the pool so the post-KNN filter cannot starve top_k). The
+/// unfiltered value is byte-identical to the historical `(top_k*4).max(20)`, so the
+/// retrieval benchmark — which passes no filter — is unchanged by the filtered branch.
 pub fn search_fetch_count(top_k: i64, filtered: bool) -> i64 {
     if filtered {
         (top_k * SEARCH_FILTER_OVERFETCH).max(SEARCH_FILTER_FETCH_FLOOR)

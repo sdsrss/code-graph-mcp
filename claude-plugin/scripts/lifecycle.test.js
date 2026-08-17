@@ -251,12 +251,16 @@ test('readRegistry self-heals primary from durable backup after cache wipe', (t)
   const registryPath = path.join(cacheDir, 'statusline-registry.json');
   const backupPath = path.join(homeDir, '.claude', 'statusline-providers.json');
 
-  // Our own entry must name the composite THIS install registers, or the
-  // self-heal treats it as a leftover (see the stale case below). The fixture
-  // used a synthetic `node /cg.js`, which is not a shape the live scenario ever
-  // produces.
-  const { compositeCommand } = require('./lifecycle');
-  const liveComposite = compositeCommand();
+  // The row must carry the command the product ACTUALLY writes for `code-graph`:
+  // `codeGraphStatuslineCommand()` (statusline.js), which is what both
+  // `registerStatuslineProvider('code-graph', …)` call sites pass. Not
+  // `compositeCommand()` (statusline-composite.js) — that is only ever the value
+  // of `settings.statusLine.command`. A first version of this fixture used the
+  // composite and so tested the keep-branch on an input the product can never
+  // produce, hiding a filter that dropped the live install's own entry
+  // (v0.118.0 pre-tag review).
+  const { codeGraphStatuslineCommand } = require('./lifecycle');
+  const liveComposite = codeGraphStatuslineCommand();
 
   // Seed both files, then simulate user wiping ~/.cache/code-graph/
   writeJson(registryPath, [

@@ -45,9 +45,14 @@ function capContext(text) {
   if (Buffer.byteLength(s, 'utf8') <= MAX_INJECTED_BYTES) return s;
   const notice = `\n  … truncated at ${MAX_INJECTED_BYTES} bytes — re-run the CLI command above for the full result.\n`;
   const budget = MAX_INJECTED_BYTES - Buffer.byteLength(notice, 'utf8');
-  // Slice on a CHARACTER boundary that fits the byte budget, so a multi-byte
-  // codepoint is never cut in half (the payload carries file paths and symbol
-  // names, which can be non-ASCII).
+  // Slice on a UTF-16 code-unit boundary that fits the byte budget. This keeps
+  // the byte cap exact and never splits a 1-3 byte UTF-8 character (ASCII, Latin,
+  // CJK — what file paths and symbol names actually contain). It CAN split an
+  // astral-plane character (emoji, 2 code units) into a lone surrogate:
+  // `JSON.stringify` escapes that, so the envelope stays parseable and the model
+  // sees one replacement character at the cut. Saying so rather than claiming
+  // "never cut in half", which is what this comment used to claim (v0.118.0
+  // pre-tag review verified the emoji case).
   let end = s.length;
   while (end > 0 && Buffer.byteLength(s.slice(0, end), 'utf8') > budget) {
     end -= Math.max(1, Math.ceil((Buffer.byteLength(s.slice(0, end), 'utf8') - budget) / 4));

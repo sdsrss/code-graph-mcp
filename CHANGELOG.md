@@ -64,7 +64,7 @@ close no gap and a guard was added instead.
     now gets `undefined` on an error rather than `0`, which is the point: the
     two were byte-identical before, so `--json 2>/dev/null` reported "no matches
     in this repo" for a typo'd flag.
-  - `health-check --format <unknown>` now fails with exit 2 instead of silently
+  - `health-check --format <unknown>` now fails with exit 1 instead of silently
     printing the human one-liner and exiting 0. A script asking for JSON and
     getting prose with a success code had no way to tell.
   - A clap argument error under `--json` now writes a JSON error object to

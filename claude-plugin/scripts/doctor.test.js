@@ -967,7 +967,12 @@ test('autoUpdateNoOpReason names an EXHAUSTED binary self-heal', () => {
 test('every doctor row is repairable or explicitly advisory', () => {
   const src = fs.readFileSync(path.join(__dirname, 'doctor.js'), 'utf8');
 
-  // fixIds `runRepairs` can actually resolve — the `case '…':` labels inside it.
+  // fixIds `runRepairs` has a `case` for. Note this is weaker than "can actually
+  // resolve": an arm that only prints guidance (`schema-mismatch`) never does
+  // `fixed++` yet matches this pattern. Every such arm today is also
+  // `advisory: true`, so no live row slips through — but a future non-advisory row
+  // wired to a print-only arm would satisfy this guard and still pin the exit code
+  // at 1, which is the failure the guard is named for (v0.118.0 pre-tag review).
   const repairsBody = src.slice(src.indexOf('function runRepairs'), src.indexOf('function unresolvedCount'));
   const repairable = new Set([...repairsBody.matchAll(/case '([a-z-]+)':/g)].map(m => m[1]));
   assert.ok(repairable.size >= 8, `expected the repair switch to be found, got ${[...repairable]}`);

@@ -54,24 +54,6 @@ pub struct AstSearchOutcome {
     pub fallback_used: bool,
 }
 
-/// Every hint an `ast_search` answer owes its caller, most-actionable first.
-///
-/// Both surfaces used to assign their `hint` field from several independent
-/// `if` blocks, so the last statement executed won and the others vanished —
-/// and the two surfaces disagreed about which that was. For a result set that
-/// is BOTH truncated and answered by the name-substring fallback (reachable:
-/// the fallback path carries its own `truncated`), the CLI kept only the
-/// fallback note and MCP kept only the truncation notice, so the same query
-/// got a different single hint depending on who asked, and one surface always
-/// dropped the disclosure that stops "count: 20" being read as "20 matches
-/// exist" (audit 2026-08-16 review Minor tail).
-///
-/// Returning the ordered set — rather than picking a winner — is what makes
-/// "several things are true at once" expressible in a single string field.
-/// Callers join with a space; the leading sentence is the one that matters most.
-///
-/// Order: why-it-is-empty first (it explains the answer), then the truncation
-/// cut, then the provenance note.
 /// Which surface the hints are worded for. Only the *spelling* of the remedy
 /// differs (`--limit 20` on the CLI, `` `limit` `` for an MCP caller who passes
 /// arguments, not flags) — the ORDER is shared, because the order was the bug.
@@ -100,6 +82,24 @@ impl HintStyle {
     }
 }
 
+/// Every hint an `ast_search` answer owes its caller, most-actionable first.
+///
+/// Both surfaces used to assign their `hint` field from several independent
+/// `if` blocks, so the last statement executed won and the others vanished —
+/// and the two surfaces disagreed about which that was. For a result set that
+/// is BOTH truncated and answered by the name-substring fallback (reachable:
+/// the fallback path carries its own `truncated`), the CLI kept only the
+/// fallback note and MCP kept only the truncation notice, so the same query
+/// got a different single hint depending on who asked, and one surface always
+/// dropped the disclosure that stops "count: 20" being read as "20 matches
+/// exist" (audit 2026-08-16 review Minor tail).
+///
+/// Returning the ordered set — rather than picking a winner — is what makes
+/// "several things are true at once" expressible in a single string field.
+/// Callers join with a space; the leading sentence is the one that matters most.
+///
+/// Order: why-it-is-empty first (it explains the answer), then the truncation
+/// cut, then the provenance note.
 pub fn hints(
     outcome: &AstSearchOutcome,
     query: Option<&str>,

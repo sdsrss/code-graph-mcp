@@ -553,9 +553,20 @@ fn checker_rejects_fabricated_and_misattributed() {
 /// and the project `CLAUDE.md` — had drifted from `src/`. Neither listed `cli/`
 /// (31 files, the largest module), `snapshot/`, `outcome.rs` or `resolve.rs`.
 ///
-/// These blocks are steering surfaces: an agent reads the CLAUDE.md one to decide
-/// where to look, so a module missing from it is a module the agent does not know
-/// exists. Held against the real directory rather than against a transcription.
+/// Held against the real `src/` directory rather than against a transcription.
+///
+/// COVERAGE LIMIT, stated here because a skip line printed at runtime is captured
+/// by libtest and invisible under the `cargo test` CI runs: **CLAUDE.md is
+/// gitignored**, so in every automated run this test checks README.md ALONE. The
+/// CLAUDE.md leg only fires in a working tree that has the file.
+///
+/// That is a smaller hole than it sounds, and worth stating precisely rather than
+/// implying either more or less coverage than exists: the steering surfaces an
+/// agent actually consumes elsewhere — the adopt-generated managed block, the
+/// `.claude/…` detail doc and the MCP `instructions` string — are tracked and are
+/// guarded by `detail_doc_and_instructions_match_cli` in this same file. The
+/// repo's own CLAUDE.md is a local developer file; keeping its module map honest
+/// is a working-tree check by construction.
 #[test]
 fn module_layout_blocks_list_every_top_level_module() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -582,7 +593,7 @@ fn module_layout_blocks_list_every_top_level_module() {
     // A test that depends on an untracked file can only ever be environment-
     // dependent; the honest shape is to enforce it where it exists and say so
     // where it does not.
-    let mut checked = 0;
+    let mut checked_labels: Vec<&str> = Vec::new();
     for (label, path, required) in [
         ("README.md", root.join("README.md"), true),
         ("CLAUDE.md", root.join("CLAUDE.md"), false),
@@ -597,7 +608,7 @@ fn module_layout_blocks_list_every_top_level_module() {
             }
             Err(e) => panic!("{label}: {e}"),
         };
-        checked += 1;
+        checked_labels.push(label);
         // Only the fenced layout block, so a passing mention elsewhere in the
         // prose cannot stand in for a row in the map.
         let block = text
@@ -622,7 +633,14 @@ fn module_layout_blocks_list_every_top_level_module() {
              routing off this map) would not know they exist"
         );
     }
-    // The optional leg must never be able to hollow the whole test out: README is
-    // required, so at least one document is always really checked.
-    assert!(checked >= 1, "no layout block was checked at all");
+    // README is `required`, so it either incremented `checked` or panicked above —
+    // which makes a bare `checked >= 1` a tautology that can never go red. Assert
+    // the thing that actually matters instead: the REQUIRED document was among the
+    // ones checked. (The v0.118.0 pre-tag review caught the earlier version, and
+    // the commit message that introduced it credited the tautology with preventing
+    // hollowing — what really prevents it is README being tracked and required.)
+    assert!(
+        checked_labels.contains(&"README.md"),
+        "the required layout block was not checked; checked: {checked_labels:?}"
+    );
 }

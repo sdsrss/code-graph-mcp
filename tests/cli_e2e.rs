@@ -5135,6 +5135,21 @@ fn test_cli_dead_code_rejects_misspelled_type() {
         stderr.contains("Unknown type filter"),
         "stderr should name the bad type filter; got: {stderr:?}"
     );
+    // The OFFENDING value must be the quoted one, and the vocabulary must follow
+    // "Valid:". Asserting only the prefix let a swapped pair of format arguments
+    // ship a message that told the user the valid list was the invalid value —
+    // caught by the v0.118.0 pre-tag review, not by this test.
+    assert!(
+        stderr.contains("'fucntion'"),
+        "the user's bad value must be the quoted one; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Valid: {}",
+            code_graph_mcp::domain::TYPE_FILTER_HELP
+        )),
+        "the vocabulary must follow `Valid:`; got: {stderr:?}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection. The
@@ -5512,6 +5527,20 @@ fn test_cli_ast_search_invalid_type() {
     assert!(
         stderr.contains("Unknown type filter"),
         "should explain the typo; got: {stderr}"
+    );
+    // Argument-order pin. This is the site where the swap actually shipped:
+    // `ast-search --type <bogus>` printed the vocabulary in the quoted slot and
+    // the user's value after "Valid:" (v0.118.0 pre-tag review).
+    assert!(
+        stderr.contains("'INVALID_TYPE'"),
+        "the user's bad value must be the quoted one; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Valid: {}",
+            code_graph_mcp::domain::TYPE_FILTER_HELP
+        )),
+        "the vocabulary must follow `Valid:`; got: {stderr}"
     );
 }
 

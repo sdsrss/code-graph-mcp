@@ -56,8 +56,8 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
         if crate::domain::normalize_type_filter(tf).is_empty() {
             anyhow::bail!(
                 "Unknown type filter: '{}'. Valid: {}",
-                crate::domain::TYPE_FILTER_HELP,
-                tf
+                tf,
+                crate::domain::TYPE_FILTER_HELP
             );
         }
     }

@@ -395,7 +395,15 @@ function readRegistryForWrite() {
   // this backup exists, and nothing else would restore them.
   const backup = readJsonResult(providersBackupFile(), asArray);
   if (backup.value && backup.value.length > 0) {
-    const live = compositeCommand();
+    // `codeGraphStatuslineCommand()`, NOT `compositeCommand()`. The registry row
+    // for `code-graph` is written with the former (see the two
+    // `registerStatuslineProvider('code-graph', …)` call sites); the composite is
+    // only ever the value of `settings.statusLine.command`. Comparing against the
+    // composite made this filter drop the row unconditionally — the CURRENT
+    // install's own segment vanished after a cache wipe, which is worse than the
+    // stale-entry resurrection the filter exists to prevent (found by the
+    // v0.118.0 pre-tag review; CI could not see it).
+    const live = codeGraphStatuslineCommand();
     const healed = backup.value.filter(p => p && (p.id !== 'code-graph' || p.command === live));
     if (healed.length > 0) {
       try { writeJsonAtomic(REGISTRY_FILE, healed); } catch { /* ok */ }
@@ -1689,6 +1697,7 @@ module.exports = {
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
   surveyHookCoverage, compositeCommand, compositeSlotIsStale,          // v0.49.1 — version-aware self-heal
+  codeGraphStatuslineCommand,   // exported so a test asserts the row shape the product really writes
   hookCmdScript,                                                       // the ONE hook-command path parser (session-init reuses it)
   cacheDirVersion,                                                     // exported for the separator-agnostic test
 
