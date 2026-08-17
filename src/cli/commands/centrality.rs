@@ -83,8 +83,13 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     for c in &ranked {
         writeln!(
             stdout,
-            "  {:>8.1} ({:.3}) {} {} — {} callers ({})",
-            c.score, c.normalized, c.node_type, c.name, c.caller_count, c.file_path
+            "  {:>8.1} ({:.3}) {} {} — {} ({})",
+            c.score,
+            c.normalized,
+            c.node_type,
+            c.name,
+            plural(c.caller_count as i64, "caller"),
+            c.file_path
         )?;
     }
 

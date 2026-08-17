@@ -52,9 +52,10 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     if let Some(ntf) = node_type_filter {
         if crate::domain::normalize_type_filter(ntf).is_empty() {
             anyhow::bail!(
-                "Unknown node-type filter: '{}'. Valid: {}",
+                "Unknown node-type filter: '{}'. Valid: {}.{}",
                 ntf,
-                crate::domain::TYPE_FILTER_HELP
+                crate::domain::TYPE_FILTER_HELP,
+                crate::domain::type_filter_note(ntf)
             );
         }
     }
@@ -236,16 +237,21 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
                         "filter": filter_desc,
                     })
                 );
+                // Only the JSON path needs the prose on stderr: its stdout is a
+                // machine envelope. In human mode the `println!` below IS the
+                // message, and emitting it on both streams printed the same
+                // finding twice to one terminal — in two slightly different
+                // wordings, which reads as two separate problems.
+                eprintln!(
+                    "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
+                    query, dropped_by_filter, filter_desc
+                );
             } else {
                 println!(
-                    "[code-graph] No results for: {} — {} candidate(s) matched but were removed by the active filter ({}). Broaden or clear the filter.",
+                    "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
                     query, dropped_by_filter, filter_desc
                 );
             }
-            eprintln!(
-                "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
-                query, dropped_by_filter, filter_desc
-            );
         } else {
             if json_mode {
                 println!("[]");

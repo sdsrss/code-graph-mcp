@@ -89,7 +89,21 @@ fn exit_zero_on_epipe(result: &Result<()>) {
 /// `--help` / `--version` are also `Err` to clap but are not failures; they go
 /// to stdout with exit 0 and must stay untouched, which `use_stderr()` decides.
 fn parse_args_json_aware<T: Parser>(args: &[String]) -> T {
-    match T::try_parse_from(args.iter().skip(1)) {
+    // clap takes the FIRST element it is handed as the program name, and this
+    // used to hand it `args.iter().skip(1)` — so the SUBCOMMAND token became the
+    // program name and every `--help` / parse error rendered
+    // `Usage: search [OPTIONS] <QUERY>`. That line is not a runnable command, and
+    // it silently overrode the `name = "code-graph-mcp <sub>"` every Args struct
+    // sets — two dozen dead attributes. The hand-written `anyhow::bail!("Usage:
+    // code-graph-mcp search …")` strings in the same commands got it right, so
+    // the CLI disagreed with itself depending on which arm failed.
+    let mut argv: Vec<String> = Vec::with_capacity(args.len());
+    argv.push(match args.get(1) {
+        Some(sub) => format!("code-graph-mcp {sub}"),
+        None => "code-graph-mcp".to_string(),
+    });
+    argv.extend(args.iter().skip(2).cloned());
+    match T::try_parse_from(argv) {
         Ok(parsed) => parsed,
         Err(e) => {
             if !e.use_stderr() {
@@ -428,6 +442,21 @@ fn main() -> Result<()> {
             }
         }
         Some(other) => {
+            // A flag in the subcommand slot is the mistake `--help` invites by
+            // printing these under a bare "OPTIONS:" heading: they are parsed by
+            // the subcommand, so `code-graph-mcp --json search foo` lands here.
+            // "Unknown subcommand: --json" names the symptom and hides the cause;
+            // `suggest_subcommand` (edit distance over command names) cannot help
+            // with a leading `--` either.
+            if other.starts_with('-') {
+                eprintln!(
+                    "'{}' is a flag, not a subcommand — flags go AFTER the subcommand.",
+                    other
+                );
+                eprintln!("Try: code-graph-mcp <command> {}", other);
+                eprintln!("Run 'code-graph-mcp --help' for available commands.");
+                std::process::exit(2);
+            }
             eprintln!("Unknown subcommand: {}", other);
             if let Some(suggestion) = code_graph_mcp::cli::suggest_subcommand(other) {
                 eprintln!("Did you mean '{}'?", suggestion);
@@ -449,7 +478,14 @@ fn main() -> Result<()> {
     // emitting the error object would itself hit the closed pipe (and panic).
     exit_zero_on_epipe(&result);
     if let Err(e) = &result {
-        if args.iter().skip(2).any(|a| a == "--json") {
+        // `snapshot inspect` takes no `--json` because it ALWAYS prints JSON
+        // (see print_help), which put it outside this leg: verifying a
+        // downloaded release artifact — the command's entire purpose, and a
+        // scripted step — answered a corrupt or missing file with 0 bytes on
+        // stdout, i.e. the JSON parse failure this catch exists to prevent.
+        let always_json_stdout = args.get(1).map(|s| s.as_str()) == Some("snapshot")
+            && args.get(2).map(|s| s.as_str()) == Some("inspect");
+        if always_json_stdout || args.iter().skip(2).any(|a| a == "--json") {
             println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
         }
     }
@@ -556,7 +592,11 @@ fn print_help() {
     println!("                        when --out ends in .db.zst; otherwise writes raw .db");
     println!("    snapshot inspect <file>");
     println!("                        Print snapshot metadata as JSON (accepts .db or .db.zst)\n");
-    println!("OPTIONS:");
+    // "OPTIONS:" alone reads as *global* options, i.e. placeable before the
+    // subcommand — but every flag below is parsed by the subcommand, so
+    // `code-graph-mcp --json search foo` exits 1 with "Unknown subcommand:
+    // --json". Say where they go; the Some(other) arm below catches the mistake.
+    println!("OPTIONS (place AFTER the subcommand, e.g. `search foo --json`):");
     // Every clap subcommand carries --json, including the index commands the old
     // wording excluded (they all emit an index-result envelope). Only the
     // JS-dispatched trio and `serve` do not. `every_clap_command_accepts_json`

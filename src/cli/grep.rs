@@ -264,7 +264,18 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
         );
         grep_exit(2);
     }
-    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw.clone()));
+    // Element 0 is clap's program name. `raw` starts with the bare subcommand
+    // token, which rendered `Usage: grep <PATTERN>` — not a runnable command, and
+    // it overrode this struct's own `name = "code-graph-mcp grep"`. Only the copy
+    // handed to clap is renamed: `raw`'s indices drive the separator / flag
+    // scanning above.
+    let mut for_clap = raw.clone();
+    if for_clap.is_empty() {
+        for_clap.push("code-graph-mcp grep".to_string());
+    } else {
+        for_clap[0] = "code-graph-mcp grep".to_string();
+    }
+    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(for_clap));
     // True exactly when the pattern's own slot sits after the `--`. Search only
     // the tail: scanning from index 0 found the FIRST token equal to the pattern
     // string, which may be an earlier flag's VALUE. `grep -g '--quiet' -- --quiet`

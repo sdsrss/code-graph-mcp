@@ -334,7 +334,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         stdout,
                         "  [{}] {} {}{}",
                         r.relation,
-                        r.name,
+                        crate::domain::display_node_name(&r.name),
                         r.file_path,
                         tag(&r.confidence)
                     )?;
@@ -343,7 +343,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         stdout,
                         "  [{}] {} ({}:{}){}",
                         r.relation,
-                        r.name,
+                        crate::domain::display_node_name(&r.name),
                         r.file_path,
                         r.start_line,
                         tag(&r.confidence)

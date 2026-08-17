@@ -125,7 +125,13 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search text (optional if filters provided)" },
-                        "type": { "type": "string", "description": "Node type: fn, class, struct, enum, interface, type, const, var, module" },
+                        // Built from the shared vocabulary, not hand-listed: this
+                        // copy advertised `module` to the model long after every
+                        // surface began dropping module placeholders, so the tool
+                        // published a filter value that could only ever return
+                        // zero rows. `interface` stays named as the alias for
+                        // `trait` (both normalize to the same pair).
+                        "type": { "type": "string", "description": format!("Node type: {} (interface = trait)", crate::domain::TYPE_FILTER_HELP) },
                         "returns": { "type": "string", "description": "Return type substring filter" },
                         "params": { "type": "string", "description": "Parameter text substring filter" },
                         "limit": { "type": "number", "description": "Max results (default 20)" }

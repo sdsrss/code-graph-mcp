@@ -24,7 +24,17 @@ impl McpServer {
             .as_str()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
-        let type_filter = args["type"].as_str();
+        // `node_type` accepted as an alias: the sibling `semantic_code_search`
+        // (and CLI `search` / `dead-code`) spell this filter `node_type`, so a
+        // caller carrying that spelling over got "Either query or at least one
+        // filter … is required" — an error about a MISSING filter for a request
+        // that supplied one. The schema keeps advertising `type`; this only stops
+        // the near-miss from reading as an empty index.
+        let type_filter = args["type"]
+            .as_str()
+            .or_else(|| args["node_type"].as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
         let returns_filter = args["returns"].as_str();
         let params_filter = args["params"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
@@ -43,9 +53,10 @@ impl McpServer {
         if let Some(tf) = type_filter {
             if crate::domain::normalize_type_filter(tf).is_empty() {
                 return Err(anyhow!(
-                    "Unknown type filter: '{}'. Valid: {}",
+                    "Unknown type filter: '{}'. Valid: {}.{}",
                     tf,
-                    crate::domain::TYPE_FILTER_HELP
+                    crate::domain::TYPE_FILTER_HELP,
+                    crate::domain::type_filter_note(tf)
                 ));
             }
         }

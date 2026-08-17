@@ -138,8 +138,13 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     for h in hot.iter().take(top) {
         writeln!(
             stdout,
-            "  {:>4} callers  {} ({}) — {}",
-            h.caller_count, h.name, h.node_type, h.file
+            // Right-aligned to width 12 so the count column still lines up now
+            // that the noun varies ("1 caller" vs "12 callers").
+            "  {:>12}  {} ({}) — {}",
+            plural(h.caller_count as i64, "caller"),
+            h.name,
+            h.node_type,
+            h.file
         )?;
     }
 

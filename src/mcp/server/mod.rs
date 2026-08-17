@@ -62,8 +62,16 @@ const _: () = assert!(
 /// listing them here would be dead configuration. `test_no_new_undeclared_mcp_args`
 /// in tests/hardening.rs pins that whole set: adding a handler that reads a new
 /// undeclared key fails there until it is classified here.
-const HONORED_UNDECLARED_ARGS: &[(&str, &str)] =
-    &[("*", "skip_indexing"), ("get_call_graph", "function_name")];
+const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
+    ("*", "skip_indexing"),
+    ("get_call_graph", "function_name"),
+    // `ast_search` spells this filter `type`; its sibling `semantic_code_search`
+    // (and CLI `search` / `dead-code`) spell it `node_type`, so callers carry the
+    // wrong one over. The handler honors both (ast_search.rs) — without this
+    // entry the very response that applied the filter also announced it had
+    // ignored the argument.
+    ("ast_search", "node_type"),
+];
 
 use super::metrics::ErrKind;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};

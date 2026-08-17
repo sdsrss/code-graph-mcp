@@ -220,7 +220,20 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         report.orphan_count,
         report.exported_count
     )?;
-    writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)\n")?;
+    writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)")?;
+    // The `hidden_below_threshold` probe only runs when NOTHING is visible, so a
+    // non-empty report never disclosed that the default cut hides every symbol
+    // shorter than `--min-lines`. A one-line `export function f() { return 42 }`
+    // is exactly the shape of dead code a user wants listed, and it was silently
+    // absent from a report that read as complete. Naming the active threshold
+    // costs no query.
+    if min_lines > 1 {
+        writeln!(
+            stdout,
+            "(showing symbols \u{2265}{min_lines} lines — pass --min-lines 1 to include shorter ones)"
+        )?;
+    }
+    writeln!(stdout)?;
 
     let (orphans, exported_unused): (Vec<_>, Vec<_>) =
         report.items.iter().partition(|it| !it.is_exported);

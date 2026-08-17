@@ -193,6 +193,7 @@ mod tests {
             classes: 0,
             interfaces_traits: 0,
             constants: 0,
+            other: 0,
             languages: vec!["rust".to_string()],
             key_symbols: vec![],
         }

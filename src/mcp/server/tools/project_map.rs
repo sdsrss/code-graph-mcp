@@ -49,6 +49,13 @@ impl McpServer {
                     if m.constants > 0 {
                         obj["constants"] = json!(m.constants);
                     }
+                    // Symbols outside the four named buckets (TS `type` aliases,
+                    // markdown headings). Without this a docs- or types-only
+                    // module read as `functions: 0, classes: 0` — i.e. empty —
+                    // while module_overview listed its symbols.
+                    if m.other > 0 {
+                        obj["other"] = json!(m.other);
+                    }
                     if !m.languages.is_empty() {
                         obj["languages"] = json!(m.languages);
                     }

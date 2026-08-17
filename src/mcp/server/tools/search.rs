@@ -29,9 +29,10 @@ impl McpServer {
         if let Some(nt) = node_type_filter {
             if crate::domain::normalize_type_filter(nt).is_empty() {
                 return Err(anyhow!(
-                    "Unknown node_type filter: '{}'. Valid: {}",
+                    "Unknown node_type filter: '{}'. Valid: {}.{}",
                     nt,
-                    crate::domain::TYPE_FILTER_HELP
+                    crate::domain::TYPE_FILTER_HELP,
+                    crate::domain::type_filter_note(nt)
                 ));
             }
         }

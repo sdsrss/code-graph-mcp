@@ -63,6 +63,7 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
                 "classes": m.classes,
                 "interfaces_traits": m.interfaces_traits,
                 "constants": m.constants,
+                "other": m.other,
                 "languages": m.languages,
                 "key_symbols": m.key_symbols,
             })).collect::<Vec<_>>(),
@@ -104,8 +105,11 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
     for m in modules.iter().take(max_modules) {
         // Include constants: key_symbols can list exported consts (e.g. a TS
         // `export const db`), so leaving them out of the total made the header
-        // claim fewer symbols than the names printed right under it.
-        let total_symbols = m.functions + m.classes + m.interfaces_traits + m.constants;
+        // claim fewer symbols than the names printed right under it. `other`
+        // closes the same hole for every remaining type — a markdown-only module
+        // (headings) or a types-only module (TS `type` aliases) reported
+        // "0 symbols" here while `overview <path>` listed them.
+        let total_symbols = m.functions + m.classes + m.interfaces_traits + m.constants + m.other;
         write!(
             stdout,
             "{} ({}, {}",
@@ -161,14 +165,21 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
             if h.test_caller_count > 0 {
                 writeln!(
                     stdout,
-                    "  {} ({}) — {} callers + {} test ({})",
-                    h.name, h.node_type, h.caller_count, h.test_caller_count, h.file
+                    "  {} ({}) — {} + {} test ({})",
+                    h.name,
+                    h.node_type,
+                    plural(h.caller_count as i64, "caller"),
+                    h.test_caller_count,
+                    h.file
                 )?;
             } else {
                 writeln!(
                     stdout,
-                    "  {} ({}) — {} callers ({})",
-                    h.name, h.node_type, h.caller_count, h.file
+                    "  {} ({}) — {} ({})",
+                    h.name,
+                    h.node_type,
+                    plural(h.caller_count as i64, "caller"),
+                    h.file
                 )?;
             }
         }

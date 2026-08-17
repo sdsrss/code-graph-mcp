@@ -265,7 +265,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 62; // v62 (audit 2026-08-16 P1-3 + P1-4): the heritage axis stopped being three hard-coded node kinds. `class_declaration | class_definition | class` meant a Java `interface`/`enum`/`record`, a TypeScript `interface`, a PHP `interface`, a Kotlin `object`, a Swift `protocol` and a Dart `enum` emitted ZERO inheritance edges — nothing failed, the graph was simply incomplete, so `find_dead_code` reported an interface's implementers as unused and every heritage traversal under-reported. Declaration kinds now come from `HERITAGE_DECL_KINDS`, and three heritage-child spellings that no extractor read (`extends_interfaces`, `extends_type_clause`, Dart's `interfaces`) are handled. Two edge-set changes ride along: Go methods finally carry their receiver in `qualified_name` (`Server.Start`, so two types with a `Start` method stop being one indistinguishable symbol — P1-4), and a C# `enum E : byte` no longer emits the phantom `E inherits byte`, because C# spells an enum's underlying integral type with the same `base_list` syntax a class uses for its base. An index built before this is missing the new edges and still carries that phantom; only a rebuild fixes it. // v61 (audit 2026-08-16 P0-1): a file skipped for size or a parse failure now has its purged nodes pruned from the run's name map, so the deferred pass stops resolving onto ids the same run deleted. Any index built before this carries whatever that FK abort (787) destroyed: the aborting run had already committed the skipped file's new hash, so `compute_diff` never re-offered it and every cross-file edge the run had buffered — the caller's `imports`/`inherits`/`references` into it, plus every OTHER file's deferred relations, since one dead id rolls back the whole `idx_deferred` savepoint — was gone with no channel to rebuild it. Only a rebuild heals that, hence the bump. Also classifies confidence on a run whose only edge producer was the deferred pass (those edges used to keep the `extracted` column default). — v60 (post-v0.115.0 review NOTE-3): a Flask/Starlette `@app.route('/x')` with no `methods=` kwarg now stores the verb `GET` — the framework's own default (`methods` defaults to `["GET"]`, HEAD/OPTIONS auto-derived) — instead of the `ANY` wildcard. v25 introduced ANY to stop `trace 'GET /x'` missing the route under exact-equality matching, and v0.115.0 made ANY a matching wildcard, which fixed that false negative by buying a false positive: `trace 'DELETE /x'` claimed a handler that answers 405. Storing the real default is precise in both directions; HEAD/OPTIONS on a bare `@app.route` stay unmodelled (the metadata schema holds one verb, as it already does for `methods=['POST','PUT']` → POST). No extractor emits `ANY` any more; `route_method_matches` still accepts it as a wildcard for a future verb-agnostic framework. Old indexes carry the ANY rows and keep over-matching; bump to rebuild. — v59 (indexing audit 2026-08-02 P1-5): DELETING a file no longer silently destroys the non-`calls` edges pointing INTO it. Phase 0 buffered only `calls` before the cascade (`get_inbound_calls_for_pending` is hardcoded to that relation, because `pending_unresolved_calls` is a calls-only table), so an `imports`/`implements`/`inherits`/`references`/`exports`/`routes_to` edge from an UNCHANGED file was cascade-deleted with no recovery channel at all — and since the source file's hash still matched, no later run ever re-extracted it. A full rebuild of the same final tree kept the edge (re-resolved to an `<external>` sentinel once the target file was gone), so incremental and full diverged permanently and `deps`/`cycles`/`project_map` answered differently depending on how the index had been grown. Those edges are now requeued into the same post-batch deferred pass the edit path uses (`restore_inbound_edges`), which re-resolves them against the complete name map and mints the sentinel exactly where a rebuild would. Sources that are themselves in this run's changed set or in `delete_paths` are skipped, because their node ids are about to be invalidated and the deferred insert would abort the run on the edges FK (the failure `aaa238f` fixed on the edit path). Old incremental indexes are missing those edges; bump to rebuild. — v58 (audit 2026-08-02 P0-1/P1-2/P1-9): cross-batch resolution. On any tree larger than one batch (BATCH_SIZE 500 files), Phase 2 resolved every relation against a pool that could not contain LATER batches' nodes, so a fresh multi-batch index deterministically minted `<external>` phantoms for implements/imports whose real target sat batches ahead, and DROPPED inherits/exports/routes_to/references outright — and nothing ever healed it (only REL_CALLS had the pending buffer; rebuild reproduced the same wrong edges byte-for-byte). Measured: the same 4 files that produce 4 true edges alone produce 2 phantoms + 1 missing edge with 600 filler files. Now every relation that fails batch-time resolution is buffered in-memory and re-resolved once after the batch loop against the complete name map, mirroring the batch-time chain branch for branch; still-unresolved imports/implements mint their sentinel THERE, so a real later-batch node always beats a phantom. Also in v58: (a) a saved inbound edge whose by-name restore misses after its target file changed (symbol renamed/removed) is REQUEUED — calls into pending_unresolved_calls, everything else into the same deferred pass — instead of silently dropped, so an incremental rename now converges to the same graph a full rebuild produces; (b) `<external>` sentinel nodes with zero inbound edges are reaped at the end of every indexing run (they were never garbage-collected, lingered in the name-resolution pool, and made incremental node sets diverge from a fresh rebuild forever); (c) delete_paths are sorted+deduped at entry (HashMap-order first-wins). Old indexes carry the cross-batch phantoms/missing edges and orphaned sentinels; bump to rebuild. — v57 (audit batch 2026-07-29, part 3): `import mod, * as ns from './m'` emitted TWO identical module-level `imports` rows, one per binding, where each spelling alone emits one. They both survive because `idx_edges_unique` includes `metadata` on purpose (multiple route edges per file), so the differing `q` marker keeps both. The namespace marker wins: it also feeds ns_module_map for `ns.foo()` member calls, while the default marker deliberately feeds nothing else and is pure duplication once a namespace binding has claimed the edge. `deps` was never affected (it counts `COUNT(DISTINCT nb.id)`); edge totals and per-language relation stats were. Old indexes carry the doubled rows; bump to rebuild. NOT in v57, though an earlier draft of this batch had it: the rule that refused to guess a CONCATENATED include path (`require_once "config" . $env . ".php"` binding a real `config.php` the statement never includes). Two independent reviews each measured it as a NET LOSS of true edges on ordinary idioms — parenthesized operands, interpolated literals left of the last separator, `||` fallback chains, three-operand `__DIR__ . DIRECTORY_SEPARATOR . "file"` anchors — and both times the validating fixture happened to omit the shapes it broke. The phantom is real and still open; the extractor, which must answer with a single string, is the wrong layer to decide it. // v56 // Older entries (v56 and down) moved to CHANGELOG.md, which already carries the same per-version narrative and its rebuild notices. This one line was 33,598 bytes — 28% of src/domain.rs — and it is also a NODE in this project's own index, so every search over the repo carried it (2026-08-16 audit §四). What a reader debugging a live index needs is the last couple of bumps; the rest is release history and belongs with the releases.
+pub const INDEX_VERSION: i32 = 63; // v63 (E2E dogfood 2026-08-17): every EXPORTED TS/JS declaration was indexed with an EMPTY `doc_comment`. A JSDoc block precedes the whole `export function f(){}` statement, so it is a sibling of the `export_statement`, while `get_preceding_comment` walked the siblings of the inner `function_declaration` and found only the `export` keyword. Non-exported functions and class methods (unwrapped) kept their docs, which is why the column looked populated. In TypeScript the exported symbols are the documented ones, so the loss landed exactly where a concept query aims — and unlike a Python docstring, a JSDoc block sits OUTSIDE the node, so `code_content` did not carry it either: a phrase appearing only in a JSDoc (`search "issuer allowlist"`) was unreachable by any channel, and the embedding context string was built without it. `get_preceding_comment` now climbs `DOC_COMMENT_WRAPPERS`, bounded to 3 levels and only through a node that is its parent's first named child, so `const a = 1, b = 2` cannot hand the statement's doc to `b`. Sweeping the rest of the languages against real parse trees found three more wrappers hiding the same way — Go's `type_declaration` (the extractor sees the inner `type_spec`, whose only preceding sibling is the `type` keyword), Ruby's `body_statement` (a method's comment is a sibling of the class-body wrapper) and Dart's `method_signature` — plus Dart naming its `///` block `documentation_comment`, a spelling the three-name allowlist did not carry, so EVERY Dart symbol was undocumented. The comment test is now a `*_comment` suffix match. Python gained its own channel: it documents with a docstring, not a preceding comment, so `get_body_docstring` reads the first statement of a `function_definition`/`class_definition` body when it is a bare string (gated on those two kinds AND on the `string` literal kind, because a Rust `fn f() { "x"; }` also has a `block` body). Measured on a 95-file third-party TS/Vue checkout: documented symbols 264 → 335 (+71, +26.9%), with the edge set byte-identical at 36,671 rows — this changes `doc_comment` only. `test_doc_comment_parity_across_languages` now pins the (language, declaration form) axis that had no guard at all. Old indexes carry the empty column; only a rebuild fills it. // v62 (audit 2026-08-16 P1-3 + P1-4): the heritage axis stopped being three hard-coded node kinds. `class_declaration | class_definition | class` meant a Java `interface`/`enum`/`record`, a TypeScript `interface`, a PHP `interface`, a Kotlin `object`, a Swift `protocol` and a Dart `enum` emitted ZERO inheritance edges — nothing failed, the graph was simply incomplete, so `find_dead_code` reported an interface's implementers as unused and every heritage traversal under-reported. Declaration kinds now come from `HERITAGE_DECL_KINDS`, and three heritage-child spellings that no extractor read (`extends_interfaces`, `extends_type_clause`, Dart's `interfaces`) are handled. Two edge-set changes ride along: Go methods finally carry their receiver in `qualified_name` (`Server.Start`, so two types with a `Start` method stop being one indistinguishable symbol — P1-4), and a C# `enum E : byte` no longer emits the phantom `E inherits byte`, because C# spells an enum's underlying integral type with the same `base_list` syntax a class uses for its base. An index built before this is missing the new edges and still carries that phantom; only a rebuild fixes it. // v61 (audit 2026-08-16 P0-1): a file skipped for size or a parse failure now has its purged nodes pruned from the run's name map, so the deferred pass stops resolving onto ids the same run deleted. Any index built before this carries whatever that FK abort (787) destroyed: the aborting run had already committed the skipped file's new hash, so `compute_diff` never re-offered it and every cross-file edge the run had buffered — the caller's `imports`/`inherits`/`references` into it, plus every OTHER file's deferred relations, since one dead id rolls back the whole `idx_deferred` savepoint — was gone with no channel to rebuild it. Only a rebuild heals that, hence the bump. Also classifies confidence on a run whose only edge producer was the deferred pass (those edges used to keep the `extracted` column default). — v60 (post-v0.115.0 review NOTE-3): a Flask/Starlette `@app.route('/x')` with no `methods=` kwarg now stores the verb `GET` — the framework's own default (`methods` defaults to `["GET"]`, HEAD/OPTIONS auto-derived) — instead of the `ANY` wildcard. v25 introduced ANY to stop `trace 'GET /x'` missing the route under exact-equality matching, and v0.115.0 made ANY a matching wildcard, which fixed that false negative by buying a false positive: `trace 'DELETE /x'` claimed a handler that answers 405. Storing the real default is precise in both directions; HEAD/OPTIONS on a bare `@app.route` stay unmodelled (the metadata schema holds one verb, as it already does for `methods=['POST','PUT']` → POST). No extractor emits `ANY` any more; `route_method_matches` still accepts it as a wildcard for a future verb-agnostic framework. Old indexes carry the ANY rows and keep over-matching; bump to rebuild. — v59 (indexing audit 2026-08-02 P1-5): DELETING a file no longer silently destroys the non-`calls` edges pointing INTO it. Phase 0 buffered only `calls` before the cascade (`get_inbound_calls_for_pending` is hardcoded to that relation, because `pending_unresolved_calls` is a calls-only table), so an `imports`/`implements`/`inherits`/`references`/`exports`/`routes_to` edge from an UNCHANGED file was cascade-deleted with no recovery channel at all — and since the source file's hash still matched, no later run ever re-extracted it. A full rebuild of the same final tree kept the edge (re-resolved to an `<external>` sentinel once the target file was gone), so incremental and full diverged permanently and `deps`/`cycles`/`project_map` answered differently depending on how the index had been grown. Those edges are now requeued into the same post-batch deferred pass the edit path uses (`restore_inbound_edges`), which re-resolves them against the complete name map and mints the sentinel exactly where a rebuild would. Sources that are themselves in this run's changed set or in `delete_paths` are skipped, because their node ids are about to be invalidated and the deferred insert would abort the run on the edges FK (the failure `aaa238f` fixed on the edit path). Old incremental indexes are missing those edges; bump to rebuild. — v58 (audit 2026-08-02 P0-1/P1-2/P1-9): cross-batch resolution. On any tree larger than one batch (BATCH_SIZE 500 files), Phase 2 resolved every relation against a pool that could not contain LATER batches' nodes, so a fresh multi-batch index deterministically minted `<external>` phantoms for implements/imports whose real target sat batches ahead, and DROPPED inherits/exports/routes_to/references outright — and nothing ever healed it (only REL_CALLS had the pending buffer; rebuild reproduced the same wrong edges byte-for-byte). Measured: the same 4 files that produce 4 true edges alone produce 2 phantoms + 1 missing edge with 600 filler files. Now every relation that fails batch-time resolution is buffered in-memory and re-resolved once after the batch loop against the complete name map, mirroring the batch-time chain branch for branch; still-unresolved imports/implements mint their sentinel THERE, so a real later-batch node always beats a phantom. Also in v58: (a) a saved inbound edge whose by-name restore misses after its target file changed (symbol renamed/removed) is REQUEUED — calls into pending_unresolved_calls, everything else into the same deferred pass — instead of silently dropped, so an incremental rename now converges to the same graph a full rebuild produces; (b) `<external>` sentinel nodes with zero inbound edges are reaped at the end of every indexing run (they were never garbage-collected, lingered in the name-resolution pool, and made incremental node sets diverge from a fresh rebuild forever); (c) delete_paths are sorted+deduped at entry (HashMap-order first-wins). Old indexes carry the cross-batch phantoms/missing edges and orphaned sentinels; bump to rebuild. — v57 (audit batch 2026-07-29, part 3): `import mod, * as ns from './m'` emitted TWO identical module-level `imports` rows, one per binding, where each spelling alone emits one. They both survive because `idx_edges_unique` includes `metadata` on purpose (multiple route edges per file), so the differing `q` marker keeps both. The namespace marker wins: it also feeds ns_module_map for `ns.foo()` member calls, while the default marker deliberately feeds nothing else and is pure duplication once a namespace binding has claimed the edge. `deps` was never affected (it counts `COUNT(DISTINCT nb.id)`); edge totals and per-language relation stats were. Old indexes carry the doubled rows; bump to rebuild. NOT in v57, though an earlier draft of this batch had it: the rule that refused to guess a CONCATENATED include path (`require_once "config" . $env . ".php"` binding a real `config.php` the statement never includes). Two independent reviews each measured it as a NET LOSS of true edges on ordinary idioms — parenthesized operands, interpolated literals left of the last separator, `||` fallback chains, three-operand `__DIR__ . DIRECTORY_SEPARATOR . "file"` anchors — and both times the validating fixture happened to omit the shapes it broke. The phantom is real and still open; the extractor, which must answer with a single string, is the wrong layer to decide it. // v56 // Older entries (v56 and down) moved to CHANGELOG.md, which already carries the same per-version narrative and its rebuild notices. This one line was 33,598 bytes — 28% of src/domain.rs — and it is also a NODE in this project's own index, so every search over the repo carried it (2026-08-16 audit §四). What a reader debugging a live index needs is the last couple of bumps; the rest is release history and belongs with the releases.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before
@@ -591,6 +591,27 @@ pub fn is_skippable_result(
 /// offering one as a disambiguation candidate is strictly worse than offering
 /// nothing, because it turns a symbol that resolved into one that refuses to.
 pub const EXTERNAL_FILE_PATH: &str = "<external>";
+
+/// The synthetic per-file node's name: the scope a top-level statement belongs to
+/// when it sits in no function (imports, module-level calls — see the
+/// `<module>`-scope fallback in the relation extractors).
+pub const MODULE_NODE_NAME: &str = "<module>";
+
+/// A node name as a human should read it.
+///
+/// [`MODULE_NODE_NAME`] is an internal sentinel, and `refs` printed it verbatim:
+/// `[imports] <module> (src/api/server.ts:1)` asks the reader to know that the
+/// angle brackets are ours and not part of their code. The file path next to it
+/// already says which file; what the sentinel adds is "top level, not inside any
+/// function", so say that. Machine surfaces (`--json`, MCP) keep the raw name —
+/// consumers key off it.
+pub fn display_node_name(name: &str) -> &str {
+    if name == MODULE_NODE_NAME {
+        "(file top level)"
+    } else {
+        name
+    }
+}
 
 /// Classify a dead-code candidate as exported-but-unused (`true`) vs a true
 /// orphan (`false`). Exported = visible outside its module (public/`pub`, or an
@@ -986,23 +1007,42 @@ pub fn default_dead_code_ignores() -> Vec<String> {
 
 /// The `--type` / `node_type` filter vocabulary, in the spelling users type.
 ///
-/// `module` is in the list because [`normalize_type_filter`] accepts it — and
-/// eight of the nine help and error strings said otherwise, telling users a
-/// value was invalid while it worked (2026-08-16 audit §四). One source, so the
-/// message and the parser cannot disagree again.
+/// One source, so the help text and the parser cannot disagree (2026-08-16
+/// audit §四). `module` is deliberately absent: accepting a word is not the same
+/// as honoring it, and every surface taking this filter drops module
+/// placeholders unconditionally — see [`type_filter_note`].
 pub const TYPE_FILTER_VOCAB: &[&str] = &[
-    "fn", "class", "struct", "enum", "trait", "type", "const", "var", "module",
+    "fn", "class", "struct", "enum", "trait", "type", "const", "var",
 ];
 
 /// [`TYPE_FILTER_VOCAB`] as the literal every help/error string uses.
 /// `type_filter_help_matches_vocab` pins the two together.
-pub const TYPE_FILTER_HELP: &str = "fn, class, struct, enum, trait, type, const, var, module";
+pub const TYPE_FILTER_HELP: &str = "fn, class, struct, enum, trait, type, const, var";
 
 /// [`TYPE_FILTER_HELP`] phrased for a clap `help =` attribute, which needs a
 /// `const` (a doc comment cannot be derived from one, and a doc comment is
 /// exactly where three of the stale copies lived).
 pub const TYPE_FILTER_HELP_ARG: &str =
-    "Filter by node type: fn, class, struct, enum, trait, type, const, var, module";
+    "Filter by node type: fn, class, struct, enum, trait, type, const, var";
+
+/// A targeted suffix for the "unknown type filter" errors, for values a user
+/// plausibly types that name nodes the search surfaces exclude by construction.
+///
+/// `module` used to be advertised because [`normalize_type_filter`] accepted it,
+/// but no surface can ever return one: `is_skippable_result` drops
+/// `<module>`-named nodes for search / ast-search / similar, and the dead-code
+/// SQL pins `n.name != '<module>'`. "Accepted" read as "supported" and the user
+/// got a bare zero-hit instead of a pointer to the commands that do list
+/// modules. Empty string when there is nothing extra worth saying.
+pub fn type_filter_note(input: &str) -> &'static str {
+    match input.to_lowercase().as_str() {
+        "module" | "modules" | "file" | "files" | "dir" | "directory" => {
+            " Module/file placeholders are never search results — list modules with \
+             `map`, `overview <path>` or `tour` instead."
+        }
+        _ => "",
+    }
+}
 
 // -- Node type normalization --
 /// Normalize shorthand type filter into canonical AST node types.
@@ -1014,10 +1054,18 @@ pub fn normalize_type_filter(input: &str) -> Vec<&'static str> {
         "struct" => vec!["struct"],
         "enum" => vec!["enum"],
         "interface" | "iface" | "trait" => vec!["interface", "trait"],
-        "type" | "type_alias" => vec!["type_alias"],
+        // The extractor emits `type` for a TS/JS `type X = …` (treesitter.rs
+        // `type_alias_declaration`); the filter mapped to `type_alias`, which
+        // nothing ever writes, so `--type type` was a guaranteed zero-hit on an
+        // index that held the aliases. Both spellings stay listed so the mapping
+        // survives a future extractor that picks the longer name.
+        "type" | "type_alias" => vec!["type", "type_alias"],
         "const" | "constant" => vec!["constant"],
-        "var" | "variable" => vec!["variable"],
-        "module" => vec!["module"],
+        // No extractor emits `variable`: a top-level `export var`/`let`/`var`
+        // binding is stored as `constant` (treesitter.rs, "config constant"), so
+        // `var` resolved to a type with zero rows in every index. Kept in the
+        // vocabulary — the binding IS indexed — and pointed at what holds it.
+        "var" | "variable" => vec!["variable", "constant"],
         _ => vec![],
     }
 }
@@ -1430,10 +1478,40 @@ mod tests {
         assert!(!RELATION_FILTER_VOCAB.contains(&"all"));
     }
 
-    /// P2 (2026-08-16 audit §四): `normalize_type_filter` accepts `module`, and
-    /// eight of the NINE help/error strings omitted it — users were told a value
-    /// was invalid while it worked. The vocabulary is one constant now, and this
-    /// holds the parser to it in both directions.
+    /// Every node type the extractor writes into `nodes.type`.
+    ///
+    /// Regenerate with:
+    /// `grep -rhoE '(make_simple_node|node_type:)\s*\(?\s*"[a-z_0-9]+"' src/parser/ | grep -oE '"[a-z_]+"'`
+    /// plus the `Some("…") =>` arms in `treesitter.rs::classify_*`.
+    /// The `--type` vocabulary must only offer words that land here — accepting a
+    /// word the extractor never emits is a guaranteed zero-hit dressed up as a
+    /// supported filter.
+    const EXTRACTOR_NODE_TYPES: &[&str] = &[
+        "function",
+        "method",
+        "class",
+        "struct",
+        "enum",
+        "interface",
+        "trait",
+        "type",
+        "constant",
+        "module",
+        "external_module",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+    ];
+
+    /// P2 (2026-08-16 audit §四), reopened 2026-08-17: the first pass pinned
+    /// "every advertised word PARSES", which `module`, `type` and `var` all did
+    /// while resolving to node types no row ever carries (`module` is dropped by
+    /// `is_skippable_result` / the dead-code SQL; nothing writes `type_alias` or
+    /// `variable`). Acceptance was mistaken for support. The assertion now walks
+    /// through to the extractor's own vocabulary.
     #[test]
     fn type_filter_help_matches_vocab() {
         assert_eq!(TYPE_FILTER_HELP, TYPE_FILTER_VOCAB.join(", "));
@@ -1441,17 +1519,32 @@ mod tests {
             TYPE_FILTER_HELP_ARG.ends_with(TYPE_FILTER_HELP),
             "the clap-attribute copy must carry the same list: {TYPE_FILTER_HELP_ARG}"
         );
-        // Every advertised word must actually parse…
         for word in TYPE_FILTER_VOCAB {
+            let mapped = normalize_type_filter(word);
             assert!(
-                !normalize_type_filter(word).is_empty(),
+                !mapped.is_empty(),
                 "'{word}' is advertised in help but rejected by the parser"
             );
+            // …and at least one target must be a type the extractor emits.
+            assert!(
+                mapped.iter().any(|t| EXTRACTOR_NODE_TYPES.contains(t)),
+                "'{word}' maps to {mapped:?}, none of which the extractor ever writes — \
+                 the filter is advertised but can never match a row"
+            );
         }
-        // …and `module` specifically, which is the one that was missing.
-        assert_eq!(normalize_type_filter("module"), vec!["module"]);
-        // Negative control: the list must not be an accept-everything.
+        // `module` is rejected on purpose: the type exists but every surface
+        // taking this filter excludes the placeholder rows, so the answer is a
+        // pointer to `map`/`overview`/`tour`, not a zero-hit.
+        assert!(normalize_type_filter("module").is_empty());
+        assert!(!TYPE_FILTER_VOCAB.contains(&"module"));
+        assert!(
+            type_filter_note("module").contains("overview"),
+            "rejecting `module` must say where modules ARE listed"
+        );
+        // Negative control: the list must not be an accept-everything, and an
+        // ordinary typo must not pick up the module pointer.
         assert!(normalize_type_filter("bogus").is_empty());
+        assert_eq!(type_filter_note("bogus"), "");
     }
 
     /// The `const` copy used where an expression is not allowed (clap `help =`,

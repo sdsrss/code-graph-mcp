@@ -396,9 +396,10 @@ pub fn validate_dead_code_type_filter(node_type: Option<&str>) -> Result<()> {
     if let Some(tf) = node_type {
         if crate::domain::normalize_type_filter(tf).is_empty() {
             anyhow::bail!(
-                "Unknown type filter: '{}'. Valid: {}",
+                "Unknown type filter: '{}'. Valid: {}.{}",
                 tf,
-                crate::domain::TYPE_FILTER_HELP
+                crate::domain::TYPE_FILTER_HELP,
+                crate::domain::type_filter_note(tf)
             );
         }
     }

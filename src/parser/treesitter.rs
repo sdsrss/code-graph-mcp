@@ -266,7 +266,7 @@ fn extract_nodes(
                             code_content: truncate_code_content(node_text(&node, source))
                                 .into_owned(),
                             signature: sig_info.signature,
-                            doc_comment: get_preceding_comment(&node, source),
+                            doc_comment: get_doc_comment(&node, source),
                             return_type: sig_info.return_type,
                             param_types: sig_info.param_types,
                             is_test: node_is_test || is_gtest,
@@ -329,7 +329,11 @@ fn extract_nodes(
                     end_line: extent.end_position().row as u32 + 1,
                     code_content: truncate_code_content(node_text(&extent, source)).into_owned(),
                     signature: None,
-                    doc_comment: get_preceding_comment(&extent, source),
+                    // Same split as extract_function_node: docstring from the
+                    // class node itself, comment fallback from the decorated
+                    // extent.
+                    doc_comment: get_body_docstring(&node, source)
+                        .or_else(|| get_preceding_comment(&extent, source)),
                     return_type: None,
                     param_types: None,
                     is_test: node_is_test,
@@ -972,7 +976,7 @@ fn make_simple_node(
         end_line: node.end_position().row as u32 + 1,
         code_content: truncate_code_content(node_text(node, source)).into_owned(),
         signature: None,
-        doc_comment: get_preceding_comment(node, source),
+        doc_comment: get_doc_comment(node, source),
         return_type: None,
         param_types: None,
         is_test,
@@ -1052,7 +1056,12 @@ fn extract_function_node(
         end_line: extent.end_position().row as u32 + 1,
         code_content: truncate_code_content(node_text(&extent, source)).into_owned(),
         signature: sig_info.signature,
-        doc_comment: get_preceding_comment(&extent, source),
+        // Docstring first (see get_doc_comment); it comes from the inner `node`
+        // because a `decorated_definition` has no `body` field of its own. The
+        // comment fallback reads the EXTENT so a `# comment` above a DECORATED
+        // Python def is still found.
+        doc_comment: get_body_docstring(node, source)
+            .or_else(|| get_preceding_comment(&extent, source)),
         return_type: sig_info.return_type,
         param_types: sig_info.param_types,
         is_test: false,
@@ -1346,19 +1355,172 @@ fn get_child_by_field(node: &tree_sitter::Node, field: &str, source: &str) -> Op
         .map(|n| node_text(&n, source).to_string())
 }
 
+/// Wrapper nodes that sit BETWEEN a declaration and its doc comment.
+///
+/// A JSDoc block precedes the whole `export function f() {}` statement, so it is
+/// a sibling of the `export_statement` — not of the `function_declaration` the
+/// extractor hands us. The sibling walk therefore found nothing and every
+/// EXPORTED TS/JS symbol lost its documentation, while a plain `function f(){}`
+/// and a class method (neither wrapped) kept theirs. In real TS the exported
+/// symbols are the documented ones, so the column was empty exactly where it
+/// mattered, and `search "issuer allowlist"` — a phrase living only in a JSDoc —
+/// returned nothing at all (the block is outside the node, so `code_content`
+/// does not carry it either, unlike a Python docstring).
+/// Each entry was measured against a real parse tree, not guessed — the sweep
+/// that produced this list found Dart, Go and Ruby losing docs for three
+/// different wrapper shapes.
+const DOC_COMMENT_WRAPPERS: &[&str] = &[
+    // TS/JS: the JSDoc precedes `export function f(){}` as a whole.
+    "export_statement",
+    "lexical_declaration",
+    "variable_declaration",
+    "variable_declarator",
+    // Python: `@decorator` above a def/class.
+    "decorated_definition",
+    // Go: the comment is a sibling of `type_declaration`, while the extractor
+    // sees the inner `type_spec` (same for const/var groups).
+    "type_declaration",
+    "const_declaration",
+    "var_declaration",
+    // Ruby: a class body is a `body_statement`, so a method's comment is a
+    // sibling of that wrapper rather than of the `method` node.
+    "body_statement",
+    // Dart: `method_signature` wraps the `function_signature` the extractor reads.
+    "method_signature",
+];
+
+/// A Python docstring: the first statement of a `def`/`class` body, when it is a
+/// bare string literal.
+///
+/// Python does not put its documentation in a preceding comment, so
+/// `get_preceding_comment` found nothing and `doc_comment` was empty for every
+/// Python symbol. Less severe than the TS case — the docstring is INSIDE the
+/// node, so `code_content` carries it and FTS can still reach it — but the
+/// embedding context builder ranks `doc:` above `code:` precisely because code
+/// is what gets truncated at 512 tokens, so a long function's docstring was the
+/// first thing dropped from its vector.
+///
+/// Gated on the two Python declaration kinds rather than on "has a `block`
+/// child": Rust functions also have `block` bodies, and `fn f() { "x"; }` would
+/// otherwise be read as documented.
+fn get_body_docstring(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "function_definition" | "class_definition") {
+        return None;
+    }
+    let body = node.child_by_field_name("body")?;
+    if body.kind() != "block" {
+        return None;
+    }
+    let first = body.named_child(0)?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let literal = first.named_child(0)?;
+    if literal.kind() != "string" {
+        return None;
+    }
+    let text = node_text(&literal, source);
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_code_content(text).into_owned())
+}
+
+/// The documentation attached to a declaration, by whichever convention the
+/// language uses: a Python docstring, or a preceding comment block.
+///
+/// **Docstring first.** The first ordering tried the comment first, which meant a
+/// file-level `# Copyright …` / `# pylint: disable=…` header — adjacent to the
+/// first `def` in most real Python files — won over that function's actual
+/// docstring, so the new channel never fired exactly where it was needed
+/// (pre-tag review finding #1, reproduced). A docstring is authored
+/// documentation for THIS symbol; a preceding comment may be anything that
+/// happens to sit above it. Only the Python kinds have a docstring at all, so
+/// every other language keeps comment-only behavior unchanged.
+fn get_doc_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    get_body_docstring(node, source).or_else(|| get_preceding_comment(node, source))
+}
+
+/// Whether a comment starts its own line — nothing but whitespace to its left.
+///
+/// A comment TRAILING code (`func F() {} // note`, `class R # note`) documents
+/// the line it sits on, not whatever declaration follows it. The sibling walk
+/// cannot tell the two apart by kind, and widening the walk to wrappers made
+/// that visible: a Go trailing comment became the doc of the NEXT `type`, and a
+/// Ruby `class Inline # note` became the doc of the class's first method (both
+/// reported by the pre-tag review, both reproduced). `tree_sitter::Point::column`
+/// is a byte offset within the line, so the line prefix is exactly the bytes
+/// between `start_byte - column` and `start_byte`.
+fn comment_starts_its_own_line(node: &tree_sitter::Node, source: &str) -> bool {
+    let start = node.start_byte();
+    let col = node.start_position().column;
+    let Some(line_start) = start.checked_sub(col) else {
+        return true;
+    };
+    match source.get(line_start..start) {
+        Some(prefix) => prefix.chars().all(char::is_whitespace),
+        // Non-UTF8 boundary (should not happen: tree-sitter columns are byte
+        // offsets into the same &str). Keep the pre-existing accept.
+        None => true,
+    }
+}
+
 fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let mut comments = Vec::new();
-    let mut current = node.prev_sibling();
-    while let Some(prev) = current {
-        if prev.kind() == "comment"
-            || prev.kind() == "line_comment"
-            || prev.kind() == "block_comment"
-        {
-            comments.push(node_text(&prev, source).to_string());
-            current = prev.prev_sibling();
-        } else {
+    fn scan_siblings(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut comments = Vec::new();
+        let mut current = node.prev_sibling();
+        while let Some(prev) = current {
+            // Suffix match, not a three-name allowlist: Dart's grammar calls its
+            // `///` block `documentation_comment`, which the allowlist did not
+            // name, so EVERY Dart symbol carried an empty doc_comment. Any
+            // grammar that spells the concept `*_comment` is now covered without
+            // another silent per-language gap.
+            if prev.kind().ends_with("comment") {
+                if !comment_starts_its_own_line(&prev, source) {
+                    // Trailing comment: it belongs to the code on its own line.
+                    // Stop rather than skip — anything further back is separated
+                    // from this declaration by that code.
+                    break;
+                }
+                comments.push(node_text(&prev, source).to_string());
+                current = prev.prev_sibling();
+            } else {
+                break;
+            }
+        }
+        comments
+    }
+
+    let mut comments = scan_siblings(node, source);
+    // Climb out of the wrappers and retry, only through a node that is its
+    // parent's FIRST named child — in Go's `// GROUP_DOC\ntype ( Alpha …; Beta … )`
+    // the spec `Beta` is not first, and without that check the group's doc
+    // comment would document it too (`test_wrapper_climb_skips_later_group_members`).
+    //
+    // The 3-level bound is defence-in-depth, NOT a measured chain: the pre-tag
+    // review walked every call site and every supported grammar and found that a
+    // successful climb always takes exactly ONE level, because the extractor
+    // never starts deeper than one wrapper in (`extract_named_arrows` passes the
+    // `lexical_declaration` itself, not the declarator). An earlier version of
+    // this comment cited a declarator → lexical_declaration → export_statement
+    // chain — the code never walks it. The bound exists so a future
+    // deeper-starting call site cannot turn this into an unbounded walk; there
+    // is deliberately no test for it, because any fixture would have to feed a
+    // starting node the extractor does not produce.
+    let mut cursor = *node;
+    for _ in 0..3 {
+        if !comments.is_empty() {
             break;
         }
+        let Some(parent) = cursor.parent() else { break };
+        if !DOC_COMMENT_WRAPPERS.contains(&parent.kind()) {
+            break;
+        }
+        if parent.named_child(0).map(|c| c.id()) != Some(cursor.id()) {
+            break;
+        }
+        comments = scan_siblings(&parent, source);
+        cursor = parent;
     }
     if comments.is_empty() {
         None
@@ -2475,6 +2637,419 @@ const { notExported } = getObj();
             doc.ends_with("..."),
             "a truncated doc_comment must carry the same three-dot sentinel code_content uses, got tail {:?}",
             &doc[doc.len().saturating_sub(8)..]
+        );
+    }
+
+    /// INDEX_VERSION 63: a JSDoc block precedes `export function f(){}` as a
+    /// whole, so it is a sibling of the `export_statement` — the sibling walk
+    /// started at the inner declaration and found the `export` keyword instead.
+    /// Every EXPORTED TS/JS symbol therefore carried an empty `doc_comment`,
+    /// while the unwrapped forms (plain function, class method) carried theirs,
+    /// which is what made the column look populated. Unlike a Python docstring
+    /// the block is OUTSIDE the node, so `code_content` did not hold it either
+    /// and the text was unreachable by every channel.
+    #[test]
+    fn test_exported_ts_declarations_keep_their_jsdoc() {
+        let src = "\
+/** DOC_PLAIN */
+function plainFn(): void {}
+
+/** DOC_EXPORTED */
+export function exportedFn(): void {}
+
+/** DOC_CLASS */
+export class Cls {
+  /** DOC_METHOD */
+  method(): void {}
+}
+
+/** DOC_ARROW */
+export const arrowFn = (): void => {};
+
+/** DOC_DEFAULT */
+export default function defaultFn(): void {}
+";
+        let nodes = parse_code(src, "typescript").unwrap();
+        let doc_of = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("{name} must be extracted"))
+                .doc_comment
+                .clone()
+                .unwrap_or_default()
+        };
+        for (symbol, marker) in [
+            ("plainFn", "DOC_PLAIN"),
+            ("exportedFn", "DOC_EXPORTED"),
+            ("Cls", "DOC_CLASS"),
+            ("method", "DOC_METHOD"),
+            ("arrowFn", "DOC_ARROW"),
+            ("defaultFn", "DOC_DEFAULT"),
+        ] {
+            assert!(
+                doc_of(symbol).contains(marker),
+                "{symbol} lost its doc comment: expected {marker}, got {:?}",
+                doc_of(symbol)
+            );
+        }
+    }
+
+    /// Negative control for the wrapper climb: it must stop at the first
+    /// non-comment sibling, not keep walking until it finds SOME comment.
+    /// An undocumented `export` following a documented one is the shape that
+    /// would expose an unbounded climb — `second` must stay empty rather than
+    /// inherit the block that documents `first`.
+    #[test]
+    fn test_wrapper_climb_stops_at_the_previous_declaration() {
+        let src = "\
+/** DOC_FIRST */
+export function first(): void {}
+export function second(): void {}
+";
+        let nodes = parse_code(src, "typescript").unwrap();
+        let doc_of = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| n.doc_comment.clone().unwrap_or_default())
+                .unwrap_or_default()
+        };
+        assert!(
+            doc_of("first").contains("DOC_FIRST"),
+            "positive half: first must carry its own doc, got {:?}",
+            doc_of("first")
+        );
+        assert!(
+            doc_of("second").is_empty(),
+            "an undocumented export must not inherit the previous one's doc, got {:?}",
+            doc_of("second")
+        );
+    }
+
+    /// The climb makes `export` invisible to doc attribution — the exported and
+    /// local spellings of the same declaration must agree. Pinned as parity
+    /// rather than as an absolute, because one shared imprecision predates this
+    /// and is deliberately preserved: a multi-declarator statement hands its one
+    /// doc comment to EVERY declarator (`extract_named_arrows` reads the comment
+    /// from the `lexical_declaration`, which owns them all). Local `const a =
+    /// …, b = …` already behaved that way; making only the exported form
+    /// stricter would be a new divergence, not a fix.
+    #[test]
+    fn test_export_wrapper_does_not_change_doc_attribution() {
+        let src = "\
+/** DOC_LOCAL */
+const localA = () => {}, localB = () => {};
+
+/** DOC_EXPORT */
+export const expA = () => {}, expB = () => {};
+";
+        let nodes = parse_code(src, "typescript").unwrap();
+        let has_doc = |name: &str| -> bool {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| n.doc_comment.as_deref().unwrap_or("").contains("DOC_"))
+                .unwrap_or(false)
+        };
+        assert_eq!(
+            (has_doc("localA"), has_doc("localB")),
+            (has_doc("expA"), has_doc("expB")),
+            "exported and local declarations must attribute doc comments identically"
+        );
+        assert!(has_doc("expA"), "the exported form must carry a doc at all");
+    }
+
+    /// INDEX_VERSION 63: Python documents with a docstring, not a preceding
+    /// comment, so `doc_comment` was empty for every Python symbol. The text is
+    /// inside `code_content` (so FTS still reached it) but the embedding context
+    /// builder ranks `doc:` above `code:` exactly because code is what gets
+    /// truncated at 512 tokens — a long function's docstring was the first thing
+    /// dropped from its vector.
+    #[test]
+    fn test_python_docstrings_populate_doc_comment() {
+        let src = "\
+def documented(path):
+    \"\"\"DOC_FUNC reads the manifest.\"\"\"
+    return {}
+
+class Documented:
+    \"\"\"DOC_CLASS holds config.\"\"\"
+
+    def method(self):
+        \"\"\"DOC_METHOD does a thing.\"\"\"
+        return 1
+
+def undocumented(x):
+    return x
+";
+        let nodes = parse_code(src, "python").unwrap();
+        let doc_of = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("{name} must be extracted"))
+                .doc_comment
+                .clone()
+                .unwrap_or_default()
+        };
+        for (symbol, marker) in [
+            ("documented", "DOC_FUNC"),
+            ("Documented", "DOC_CLASS"),
+            ("method", "DOC_METHOD"),
+        ] {
+            assert!(
+                doc_of(symbol).contains(marker),
+                "{symbol} must carry its docstring: expected {marker}, got {:?}",
+                doc_of(symbol)
+            );
+        }
+        // Negative control: a body whose first statement is not a string must
+        // stay undocumented, rather than picking up the first literal it finds.
+        assert!(
+            doc_of("undocumented").is_empty(),
+            "a function without a docstring must have no doc_comment, got {:?}",
+            doc_of("undocumented")
+        );
+    }
+
+    /// A Rust `fn` also has a `block` body, so `fn f() { "x"; }` is the shape
+    /// that would be misread as documentation. Two independent guards stop it —
+    /// the Python-kind gate (`function_item` is not `function_definition`) and
+    /// the literal-kind check (Rust spells it `string_literal`, not `string`) —
+    /// and mutation testing confirmed this goes red only when BOTH are removed,
+    /// which is the honest description: it pins the pair, not either one.
+    #[test]
+    fn test_rust_leading_string_statement_is_not_a_docstring() {
+        let src = "pub fn noisy() { \"NOT_A_DOCSTRING\"; }\n";
+        let nodes = parse_code(src, "rust").unwrap();
+        let doc = nodes
+            .iter()
+            .find(|n| n.name == "noisy")
+            .expect("noisy must be extracted")
+            .doc_comment
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            !doc.contains("NOT_A_DOCSTRING"),
+            "a Rust string statement must not be read as a doc comment, got {doc:?}"
+        );
+    }
+
+    /// Doc-comment extraction had no per-language guard at all, and the sweep
+    /// that added this table found four silent gaps at once — TS `export`,
+    /// Python docstrings, Dart's `documentation_comment` spelling, and the
+    /// Go/Ruby wrapper nodes — each invisible because the languages that DID
+    /// work made the column look populated. The axis is (language, declaration
+    /// form); a new language or a new wrapper shape must add a row here.
+    #[test]
+    fn test_doc_comment_parity_across_languages() {
+        /// (language, source, [(symbol, marker it must carry)])
+        type DocCase = (
+            &'static str,
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: &[DocCase] = &[
+            (
+                "typescript",
+                "/** M_TS_C */\nexport class C {\n  /** M_TS_M */\n  m(): void {}\n}\n",
+                &[("C", "M_TS_C"), ("m", "M_TS_M")],
+            ),
+            (
+                "python",
+                "class P:\n    \"\"\"M_PY_C\"\"\"\n\n    def m(self):\n        \"\"\"M_PY_M\"\"\"\n        return 1\n",
+                &[("P", "M_PY_C"), ("m", "M_PY_M")],
+            ),
+            (
+                "rust",
+                "/// M_RS_S\npub struct S;\n\n/// M_RS_F\npub fn f() {}\n",
+                &[("S", "M_RS_S"), ("f", "M_RS_F")],
+            ),
+            (
+                "go",
+                "package p\n\n// M_GO_T\ntype T struct{}\n\n// M_GO_F\nfunc F() {}\n",
+                &[("T", "M_GO_T"), ("F", "M_GO_F")],
+            ),
+            (
+                "java",
+                "/** M_JV_C */\npublic class J {\n  /** M_JV_M */\n  public void m() {}\n}\n",
+                &[("J", "M_JV_C"), ("m", "M_JV_M")],
+            ),
+            (
+                "ruby",
+                "# M_RB_C\nclass R\n  # M_RB_M\n  def m\n    1\n  end\nend\n",
+                &[("R", "M_RB_C"), ("m", "M_RB_M")],
+            ),
+            (
+                "dart",
+                "/// M_DT_C\nclass D {\n  /// M_DT_M\n  void m() {}\n}\n",
+                &[("D", "M_DT_C"), ("m", "M_DT_M")],
+            ),
+            (
+                "php",
+                "<?php\n/** M_PHP_C */\nclass P {\n  /** M_PHP_M */\n  public function m() {}\n}\n",
+                &[("P", "M_PHP_C"), ("m", "M_PHP_M")],
+            ),
+            (
+                "csharp",
+                "/// M_CS_C\npublic class C {\n  /// M_CS_M\n  public void M() {}\n}\n",
+                &[("C", "M_CS_C"), ("M", "M_CS_M")],
+            ),
+            (
+                "kotlin",
+                "/** M_KT_C */\nclass K {\n  /** M_KT_M */\n  fun m() {}\n}\n",
+                &[("K", "M_KT_C"), ("m", "M_KT_M")],
+            ),
+            (
+                "swift",
+                "/// M_SW_C\nclass S {\n  /// M_SW_M\n  func m() {}\n}\n",
+                &[("S", "M_SW_C"), ("m", "M_SW_M")],
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (lang, src, expectations) in cases {
+            let nodes = match parse_code(src, lang) {
+                Ok(n) => n,
+                Err(e) => {
+                    missing.push(format!("{lang}: parse_code failed: {e}"));
+                    continue;
+                }
+            };
+            for (symbol, marker) in *expectations {
+                let doc = nodes
+                    .iter()
+                    .find(|n| n.name == *symbol)
+                    .and_then(|n| n.doc_comment.clone())
+                    .unwrap_or_default();
+                if !doc.contains(marker) {
+                    missing.push(format!("{lang}/{symbol}: expected {marker}, got {doc:?}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "doc_comment lost for {} case(s):\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// The wrapper climb's first-named-child check, pinned by the one shape the
+    /// pre-tag review found that actually exercises it: a Go grouped `type (…)`
+    /// declaration carries ONE doc comment above the group, and only the first
+    /// spec may claim it. Removing the check makes `Beta` claim it too.
+    #[test]
+    fn test_wrapper_climb_skips_later_group_members() {
+        let src = "package p\n\n// GROUP_DOC\ntype (\n\tAlpha struct{}\n\tBeta struct{}\n)\n";
+        let nodes = parse_code(src, "go").unwrap();
+        let doc_of = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("{name} must be extracted"))
+                .doc_comment
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(
+            doc_of("Alpha").contains("GROUP_DOC"),
+            "the first spec in the group carries the group's doc, got {:?}",
+            doc_of("Alpha")
+        );
+        assert!(
+            doc_of("Beta").is_empty(),
+            "a later spec must NOT inherit the group's doc comment, got {:?}",
+            doc_of("Beta")
+        );
+    }
+
+    /// A comment trailing code documents its own line, not the next declaration.
+    /// Widening the sibling walk to wrappers made this reachable: the Go case is
+    /// a regression that shipped in an earlier draft of this change, the Ruby one
+    /// put a `class X # note` comment on the class's first method.
+    #[test]
+    fn test_trailing_comment_is_not_a_doc_comment() {
+        let go = "package b\n\n// DOC_F is F.\nfunc F() {} // trailing on F\ntype AfterTrailing struct{}\n";
+        let nodes = parse_code(go, "go").unwrap();
+        let go_doc = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("{name} must be extracted"))
+                .doc_comment
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(
+            go_doc("F").contains("DOC_F"),
+            "positive half: an own-line comment is still a doc, got {:?}",
+            go_doc("F")
+        );
+        assert!(
+            go_doc("AfterTrailing").is_empty(),
+            "a trailing comment must not document the next declaration, got {:?}",
+            go_doc("AfterTrailing")
+        );
+
+        let ruby = "class Inline # trailing on the class line\n  def firstm\n    1\n  end\nend\n";
+        let rb = parse_code(ruby, "ruby").unwrap();
+        let rb_doc = rb
+            .iter()
+            .find(|n| n.name == "firstm")
+            .expect("firstm must be extracted")
+            .doc_comment
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            rb_doc.is_empty(),
+            "a comment trailing `class Inline` must not document its first method, got {rb_doc:?}"
+        );
+    }
+
+    /// A Python docstring must win over a preceding comment: a file-level
+    /// license or lint header sits adjacent to the first `def` in most real
+    /// files, and reading it as that function's documentation puts a copyright
+    /// notice in the `doc:` slot the embedding builder ranks above `code:`.
+    #[test]
+    fn test_python_docstring_beats_a_preceding_header_comment() {
+        let src = "\
+# Copyright 2020 Example Corp.
+# Licensed under the Apache License.
+
+def main():
+    \"\"\"DOC_RUNS_THE_THING.\"\"\"
+    return 1
+
+def undocumented():
+    return 2
+";
+        let nodes = parse_code(src, "python").unwrap();
+        let doc_of = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("{name} must be extracted"))
+                .doc_comment
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(
+            doc_of("main").contains("DOC_RUNS_THE_THING"),
+            "the docstring must win over the license header, got {:?}",
+            doc_of("main")
+        );
+        assert!(
+            !doc_of("main").contains("Copyright"),
+            "the license header must not survive into doc_comment, got {:?}",
+            doc_of("main")
+        );
+        // Negative control: with no docstring the comment channel still applies,
+        // so this is not "Python ignores comments now".
+        assert!(
+            doc_of("undocumented").is_empty(),
+            "a def with neither docstring nor adjacent comment stays empty, got {:?}",
+            doc_of("undocumented")
         );
     }
 

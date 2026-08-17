@@ -75,6 +75,22 @@ pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
     use crate::indexer::pipeline::embed_and_store_batch;
     if let Some(model) = EmbeddingModel::load()? {
         let mut total = 0usize;
+        // This loop is the longest phase of an index run by far — 64 nodes per
+        // batch through a CPU model — and it used to print NOTHING until it
+        // finished. The caller has already printed its "Incremental index: N
+        // files updated" summary by then, so a big repo showed a completed-looking
+        // line and then sat silent for minutes: indistinguishable from a hang, and
+        // the documented remedy for a hang is Ctrl-C. Announce the backlog and
+        // tick while it drains. Threshold + time-throttle so the common
+        // few-dozen-node run stays a one-liner.
+        const PROGRESS_MIN_NODES: i64 = 500;
+        const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+        let pending = queries::count_unembedded_nodes(db.conn()).unwrap_or(0);
+        let show_progress = !quiet && pending >= PROGRESS_MIN_NODES;
+        if show_progress {
+            eprintln!("Embedding {pending} nodes (structure is already queryable)...");
+        }
+        let mut last_tick = std::time::Instant::now();
         // Skip nodes that fail to embed this run. This loop only stops on an empty
         // result, so without excluding failures a single deterministically-un-embeddable
         // node (which stays `node_vectors IS NULL` and sorts first by caller-count) would
@@ -93,6 +109,10 @@ pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
             let chunk_len = chunk.len();
             let embedded_ids = wrap_index_busy(embed_and_store_batch(db, &model, &chunk))?;
             total += embedded_ids.len();
+            if show_progress && last_tick.elapsed() >= PROGRESS_EVERY {
+                eprintln!("  embedded {total}/{pending}...");
+                last_tick = std::time::Instant::now();
+            }
             if embedded_ids.len() < chunk_len {
                 let ok: std::collections::HashSet<i64> = embedded_ids.into_iter().collect();
                 for (id, _) in &chunk {

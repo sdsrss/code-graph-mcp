@@ -328,12 +328,12 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     }
     writeln!(
         stdout,
-        "  {} direct callers, {} total, {} files, {} routes ({} tests affected)",
+        "  {} direct, {} total, {}, {} ({} affected)",
         direct_callers,
-        prod_callers.len(),
-        impact.affected_files,
-        routes.len(),
-        impact.test_count
+        plural(prod_callers.len() as i64, "caller"),
+        plural(impact.affected_files as i64, "file"),
+        plural(routes.len() as i64, "route"),
+        plural(impact.test_count as i64, "test")
     )?;
     if ambiguous_callers_excluded > 0 {
         writeln!(

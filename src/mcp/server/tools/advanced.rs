@@ -570,6 +570,18 @@ impl McpServer {
         let mut all_items = orphan_items.clone();
         all_items.extend(exported_items.iter().cloned());
 
+        // The min_lines cut is named in the summary for the same reason the CLI
+        // names it: `hidden_below_threshold` is only probed when the result set is
+        // EMPTY, so a non-empty answer used to read as complete while every symbol
+        // shorter than the threshold was silently absent from it.
+        let threshold_note = if min_lines > 1 {
+            format!(
+                " Showing symbols >= {min_lines} lines; pass min_lines:1 to include shorter ones."
+            )
+        } else {
+            String::new()
+        };
+
         Ok(json!({
             "results": all_items,
             "orphan_count": report.orphan_count,
@@ -581,11 +593,11 @@ impl McpServer {
             // const/type uses are not edge-tracked, so a flagged symbol may still
             // be used — the caller should verify before treating it as dead.
             "summary": if report.ignored_count > 0 {
-                format!("Dead code: {} candidates ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them). Verify — receiver-method/cross-file uses aren't edge-tracked.",
-                    all_items.len(), report.orphan_count, report.exported_count, report.ignored_count)
+                format!("Dead code: {} candidates ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them). Verify — receiver-method/cross-file uses aren't edge-tracked.{}",
+                    all_items.len(), report.orphan_count, report.exported_count, report.ignored_count, threshold_note)
             } else {
-                format!("Dead code: {} candidates ({} orphan, {} exported-unused). Verify — receiver-method/cross-file uses aren't edge-tracked.",
-                    all_items.len(), report.orphan_count, report.exported_count)
+                format!("Dead code: {} candidates ({} orphan, {} exported-unused). Verify — receiver-method/cross-file uses aren't edge-tracked.{}",
+                    all_items.len(), report.orphan_count, report.exported_count, threshold_note)
             },
         }))
     }

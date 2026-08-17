@@ -215,7 +215,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         .count();
     if (similar.len() as i64) < top_k && cutoff_dropped > 0 {
         eprintln!(
-            "[code-graph] {} result(s) within max_distance={} (< top_k={}); {} nearer candidate(s) exceeded the cutoff. Raise --max-distance to widen.",
+            // "nearer candidate(s) exceeded the cutoff" said the opposite of the
+            // truth: `cutoff_dropped` counts candidates whose distance is GREATER
+            // than max_distance — the less-similar tail, not nearer ones.
+            "[code-graph] {} result(s) within max_distance={} (< top_k={}); {} less-similar candidate(s) were beyond the cutoff. Raise --max-distance to widen.",
             similar.len(), max_distance, top_k, cutoff_dropped
         );
     }

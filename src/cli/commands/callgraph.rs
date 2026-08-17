@@ -306,13 +306,18 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         if let Some(kids) = children.get(&(parent_id, direction)) {
             for n in kids {
                 let indent = "  ".repeat(n.depth as usize);
+                // `<module>` is our sentinel for "top level, no enclosing
+                // function" and it reached the tree verbatim: `← called by:
+                // <module> (users.test.ts) [module]` reads as a symbol the reader
+                // cannot find in their file. --json keeps the raw name.
+                let label = crate::domain::display_node_name(&n.name);
                 if compact {
-                    writeln!(out, "{}{} {} ({})", indent, arrow, n.name, n.file_path)?;
+                    writeln!(out, "{}{} {} ({})", indent, arrow, label, n.file_path)?;
                 } else {
                     writeln!(
                         out,
                         "{}{}: {} ({}) [{}]",
-                        indent, arrow_text, n.name, n.file_path, n.node_type
+                        indent, arrow_text, label, n.file_path, n.node_type
                     )?;
                 }
                 render_subtree(out, children, n.node_id, direction, compact)?;

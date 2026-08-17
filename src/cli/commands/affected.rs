@@ -26,6 +26,18 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     use std::io::Read;
 
     let depth = args.depth.clamp(1, 10);
+    // Disclose the clamp. `callgraph` already warns ("⚠ depth capped to 10
+    // (requested 999)") for the identical situation; here `--depth 999` printed
+    // "depth <= 10" and `--depth 0` printed "depth <= 1" with nothing to say the
+    // requested value had been overridden — a reader checking whether the blast
+    // radius really was exhaustive had to know the cap to spot it. stderr, so the
+    // `--json` envelope on stdout stays clean.
+    if depth != args.depth {
+        eprintln!(
+            "[code-graph] depth clamped to {} (requested {}) — valid range is 1..=10",
+            depth, args.depth
+        );
+    }
 
     // 1. Gather raw paths: positional + optional stdin. read_to_end + lossy UTF-8 so a
     //    non-UTF-8 path (legal on Linux) cannot break the --json envelope (F6).

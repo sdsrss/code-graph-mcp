@@ -55,9 +55,10 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     if let Some(tf) = type_filter {
         if crate::domain::normalize_type_filter(tf).is_empty() {
             anyhow::bail!(
-                "Unknown type filter: '{}'. Valid: {}",
+                "Unknown type filter: '{}'. Valid: {}.{}",
                 tf,
-                crate::domain::TYPE_FILTER_HELP
+                crate::domain::TYPE_FILTER_HELP,
+                crate::domain::type_filter_note(tf)
             );
         }
     }
@@ -143,16 +144,19 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
                         "hint": remedy,
                     })
                 );
+                // stderr prose only when stdout carries the machine envelope —
+                // in human mode the `println!` below is already the message, and
+                // both streams land on the same terminal (see cmd_search).
+                eprintln!(
+                    "[code-graph] No results matching filters — {} candidate(s) removed by ({}). {}",
+                    dropped_by_filter, filter_desc, remedy
+                );
             } else {
                 println!(
                     "[code-graph] No results — {} candidate(s) matched the query but were removed by the active filter ({}). {}",
                     dropped_by_filter, filter_desc, remedy
                 );
             }
-            eprintln!(
-                "[code-graph] No results matching filters — {} candidate(s) removed by ({}). {}",
-                dropped_by_filter, filter_desc, remedy
-            );
         } else {
             if json_mode {
                 println!("{}", serde_json::json!({"results": [], "count": 0}));
@@ -224,9 +228,10 @@ pub(crate) fn normalize_type_filter(input: &str) -> Vec<&'static str> {
     let result = crate::domain::normalize_type_filter(input);
     if result.is_empty() {
         eprintln!(
-            "[code-graph] Unknown type filter: '{}'. Valid: {}",
+            "[code-graph] Unknown type filter: '{}'. Valid: {}.{}",
             input,
-            crate::domain::TYPE_FILTER_HELP
+            crate::domain::TYPE_FILTER_HELP,
+            crate::domain::type_filter_note(input)
         );
     }
     result

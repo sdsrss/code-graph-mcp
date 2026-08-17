@@ -7286,6 +7286,47 @@ fn test_cli_ast_search_filter_emptied_discloses() {
 }
 
 #[test]
+fn test_cli_filter_emptied_disclosure_is_not_printed_twice() {
+    // The in-band (stdout) disclosure was added for `--json 2>/dev/null` consumers
+    // WITHOUT retiring the stderr copy, so a human at a terminal — where both
+    // streams land in the same scrollback — read the same finding twice, in two
+    // different wordings that look like two separate problems. Human mode: exactly
+    // one stream carries it. JSON mode: stdout is the envelope, so stderr keeps
+    // the prose (pinned by the sibling tests above).
+    let project = setup_indexed_project();
+
+    for args in [
+        vec!["search", "validateToken", "--language", "python"],
+        vec!["ast-search", "validateToken", "--returns", "zzznope"],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, &args);
+        assert_eq!(code, 0, "{args:?} must not error");
+        let on_stdout = stdout.contains("candidate(s)");
+        let on_stderr = stderr.contains("candidate(s)");
+        assert!(
+            on_stdout,
+            "{args:?}: human mode must disclose on stdout; got {stdout:?}"
+        );
+        assert!(
+            !on_stderr,
+            "{args:?}: the disclosure must not ALSO go to stderr in human mode — \
+             one terminal, two copies; got stderr {stderr:?}"
+        );
+    }
+
+    // JSON mode keeps the stderr prose: stdout is a machine envelope there.
+    let (_, j_stderr, j_code) = run_cli(
+        &project,
+        &["search", "validateToken", "--language", "python", "--json"],
+    );
+    assert_eq!(j_code, 0);
+    assert!(
+        j_stderr.contains("candidate(s)"),
+        "JSON mode still needs the prose on stderr; got {j_stderr:?}"
+    );
+}
+
+#[test]
 fn test_cli_dead_code_below_threshold_json_discloses() {
     // §1.2: the threshold-hidden empty case must be self-describing in JSON —
     // mirrors test_cli_dead_code_hints_at_symbols_below_min_lines (stderr) but
