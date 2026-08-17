@@ -364,6 +364,11 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `#[cfg(unix)]` tests below construct one, so on Windows this import
+    // is unused. That was a silent warning until this release added a `[lints]`
+    // table denying warnings crate-wide, which turned it into a hard `cargo check`
+    // failure on the windows leg — a platform this repo's dev box never compiles.
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     // L7: CLI rebuild/incremental warn before racing a running server. This guards the
