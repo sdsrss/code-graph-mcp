@@ -1,7 +1,36 @@
 use std::path::{Path, PathBuf};
 
 /// cg PULL tools whose results are relevance-ordered → rank is meaningful.
-pub const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search", "search_cli"];
+///
+/// MCP spellings ONLY. Each tool's CLI twin is derived in [`is_ranked_tool`]
+/// rather than listed here, because listing both spellings by hand is what broke
+/// this metric: the CLI event name is `<canonical>_cli`, and the canonical form
+/// of `ast_search` is the HYPHENATED `ast-search`, so the hand-written entry
+/// `ast_search` covered the MCP call and silently missed every
+/// `ast-search_cli` one — dropping them from the field-MRR denominator and
+/// throwing away their rank. A shrunken denominator still renders as a confident
+/// number, so nothing looked wrong (2026-08-02 audit §16).
+pub const RANKED_MCP_TOOLS: &[&str] = &["semantic_code_search", "ast_search"];
+
+/// Is this event name a ranked tool — in either surface's spelling?
+///
+/// CLI events are named `<canonical>_cli`, so a CLI name is ranked exactly when
+/// it canonicalizes to the same subcommand as one of [`RANKED_MCP_TOOLS`]. Both
+/// sides go through `canonical_query_cmd`, the one table that already maps MCP
+/// tool names and CLI subcommands onto a single canonical name, so the two
+/// spellings cannot drift apart again.
+pub fn is_ranked_tool(base: &str) -> bool {
+    use crate::utils::telemetry::canonical_query_cmd;
+    if RANKED_MCP_TOOLS.contains(&base) {
+        return true;
+    }
+    let Some(canon) = base.strip_suffix("_cli").and_then(canonical_query_cmd) else {
+        return false;
+    };
+    RANKED_MCP_TOOLS
+        .iter()
+        .any(|mcp| canonical_query_cmd(mcp) == Some(canon))
+}
 
 /// If `name` is a code-graph MCP tool_use name (`mcp__code-graph[-dev]__<tool>`),
 /// return the bare `<tool>` when it is one of the known cg query tools. The server
@@ -17,10 +46,6 @@ pub fn cg_pull_tool(name: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-pub fn is_ranked_tool(base: &str) -> bool {
-    RANKED_TOOLS.contains(&base)
 }
 
 /// Encode an absolute project path to its Claude Code transcript-dir slug:
@@ -58,9 +83,21 @@ pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
 pub fn transcript_dir_on(target: &Path, home: &Path, windows: bool) -> PathBuf {
     let spelled =
         crate::indexer::merkle::normalize_path_display_on(&target.to_string_lossy(), windows);
+    // A trailing separator is invisible to the user and fatal to the lookup:
+    // `--project /repo/` slugifies to `-repo-`, a directory Claude Code never
+    // created, and the command then answers `state: absent` with exit 0 — the
+    // silent-zero shape again, a typo's worth of difference between "no data" and
+    // "you asked wrong". Shell tab-completion supplies that slash for free.
+    // The root itself is not a trailing separator to strip; it IS the path.
+    let trimmed = spelled.trim_end_matches(['/', '\\']);
+    let key = if trimmed.is_empty() {
+        spelled.as_str()
+    } else {
+        trimmed
+    };
     home.join(".claude")
         .join("projects")
-        .join(project_slug(&spelled))
+        .join(project_slug(key))
 }
 
 /// True if `touched` (often absolute, from Read/Edit) ends with `returned` (often
@@ -267,8 +304,13 @@ pub enum Event {
         returned: Vec<ReturnedItem>,
         turn: usize,
     },
+    /// `turn` is the transcript line index the Read/Edit/Write came from, for the
+    /// same reason `CgCall` carries one: a touch batched into the SAME assistant
+    /// message as a call was decided before that call's result existed, so it
+    /// cannot be evidence the result was used.
     FileTouch {
         path: String,
+        turn: usize,
     },
     RawGrep,
     Other,
@@ -328,30 +370,43 @@ fn cli_call(cmd: &str) -> Option<(&'static str, String)> {
 
 /// Does this shell token name the code-graph binary?
 ///
-/// Matched against a command string as the agent typed it, so all four real
-/// spellings must be accepted. On Windows the plugin resolves an absolute path
-/// to `…\.cache\code-graph\bin\code-graph-mcp.exe`, which the previous
-/// `t.ends_with("/code-graph-mcp")` check missed on BOTH counts — the separator
-/// and the `.exe` suffix. Every such invocation then failed to register, so the
-/// conversion metric silently read zero on Windows and `doctor` reported the
-/// funnel DARK. Unlike the Rust side, the JS side (`find-binary.js`,
-/// `auto-update.js`) had `.exe` handling all along.
+/// Matched against a command string as the agent typed it, so every spelling a
+/// user can actually get must be accepted — and the ways to get one are not
+/// obvious from the Rust side:
+/// - **Two bin names.** `package.json` publishes BOTH `code-graph` and
+///   `code-graph-mcp`. The short alias is the one people type, and it used to be
+///   invisible here, so those calls never reached the conversion metric.
+/// - **Windows shims.** npm writes `.cmd` (and `.ps1`) wrappers beside the
+///   binary; `.bat` shows up in hand-written scripts. The plugin's own resolved
+///   path is `…\.cache\code-graph\bin\code-graph-mcp.exe`, which an earlier
+///   `t.ends_with("/code-graph-mcp")` check missed on BOTH counts — separator and
+///   suffix — leaving the funnel DARK on Windows. The JS side
+///   (`find-binary.js`, `auto-update.js`) had `.exe` handling all along.
+///
+/// Extensions are case-folded (`PATHEXT` is upper-case by default and cmd.exe
+/// echoes what it resolved); the stem comparison stays exact, because the binary
+/// name is lower-case on every platform we publish. Only extensions we actually
+/// ship as launchers are stripped — stripping any trailing `.foo` would make
+/// `code-graph-mcp.zip` read as an invocation.
 ///
 /// Accepting `\` on Unix too is deliberate: this parses a recorded command
 /// string whose originating platform is unknown, not a live filesystem path, so
 /// there is no Unix-filename ambiguity to preserve here.
 fn is_cg_binary_token(t: &str) -> bool {
-    const BIN: &str = "code-graph-mcp";
-    // `.EXE` too: PATHEXT is upper-case by default on Windows and cmd.exe echoes
-    // what it resolved, so a transcript can carry either spelling. Only the
-    // extension is case-folded — the stem comparison stays exact, because the
-    // binary name is lower-case on every platform we publish.
+    const BINS: [&str; 2] = ["code-graph-mcp", "code-graph"];
+    const LAUNCHER_EXTS: [&str; 4] = [".exe", ".cmd", ".bat", ".ps1"];
     let stem = t
         .rfind('.')
-        .filter(|i| t[*i..].eq_ignore_ascii_case(".exe"))
+        .filter(|i| {
+            LAUNCHER_EXTS
+                .iter()
+                .any(|ext| t[*i..].eq_ignore_ascii_case(ext))
+        })
         .map(|i| &t[..i])
         .unwrap_or(t);
-    stem == BIN || stem.ends_with(&format!("/{}", BIN)) || stem.ends_with(&format!("\\{}", BIN))
+    BINS.iter().any(|bin| {
+        stem == *bin || stem.ends_with(&format!("/{bin}")) || stem.ends_with(&format!("\\{bin}"))
+    })
 }
 
 fn cli_call_in_line(line: &str) -> Option<(&'static str, String)> {
@@ -500,6 +555,7 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                 if let Some(fp) = input.get("file_path").and_then(|x| x.as_str()) {
                     out.events.push(Event::FileTouch {
                         path: fp.to_string(),
+                        turn,
                     });
                 }
             } else if name == "Bash" {
@@ -555,7 +611,7 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
     let mut out = Vec::new();
     for (i, ev) in events.iter().enumerate() {
         match ev {
-            Event::FileTouch { path } => {
+            Event::FileTouch { path, .. } => {
                 touched_before.insert(path.clone());
             }
             Event::CgCall {
@@ -585,7 +641,15 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
                         // them. Only a call from a LATER turn ends attribution.
                         Event::CgCall { turn: t2, .. } if t2 != turn => break,
                         Event::CgCall { .. } => {}
-                        Event::FileTouch { path } => {
+                        // A touch from the SAME assistant message as the call was
+                        // issued before its result existed — the model batched them.
+                        // Crediting it inflated adoption and, because it always
+                        // landed in the d1 bucket, corrupted the very histogram used
+                        // to argue the attribution window is tight. Skipped entirely,
+                        // so it does not shift the distance of a later real adoption
+                        // either.
+                        Event::FileTouch { turn: t2, .. } if *t2 == *turn => {}
+                        Event::FileTouch { path, .. } => {
                             touches_seen += 1;
                             for it in &candidates {
                                 if paths_match(&it.file_path, path) {
@@ -637,6 +701,11 @@ pub struct OutcomeSummary {
     pub cg_calls: usize,
     pub unresolved: usize,
     pub unparseable: usize,
+    /// Transcript files in the directory that could not be READ at all (permissions,
+    /// a directory named `*.jsonl`, an I/O error). They used to be skipped in
+    /// silence, which shrank N while the run still printed `0/0 = 0%` as a finding
+    /// — a confident answer built on files nobody looked at. Set by `run_outcome`.
+    pub unreadable: usize,
     pub adopted: usize,
     pub adoption_rate: f64,
     pub ranked_calls: usize,
@@ -764,10 +833,18 @@ pub fn run_outcome(
     let mut transcripts = 0usize;
     let mut unresolved = 0usize;
     let mut unparseable = 0usize;
+    let mut unreadable = 0usize;
     let mut first_ts: Option<String> = None;
     let mut last_ts: Option<String> = None;
-    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let entries = std::fs::read_dir(dir).into_iter().flatten();
     for entry in entries {
+        // An entry we cannot even stat is counted rather than dropped: we do not
+        // know whether it was a transcript, and "might have been" is exactly what
+        // the caller needs to see before reading the percentage as complete.
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
@@ -780,6 +857,7 @@ pub fn run_outcome(
             }
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
+            unreadable += 1;
             continue;
         };
         let parsed = parse_transcript(&content);
@@ -808,6 +886,7 @@ pub fn run_outcome(
     summary.first_ts = first_ts;
     summary.last_ts = last_ts;
     summary.since_days = since_days;
+    summary.unreadable = unreadable;
     (summary, all_calls)
 }
 
@@ -879,6 +958,16 @@ fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
         "Transcripts: {}   resolved cg calls: {}   (unresolved {}, unparseable {})",
         s.transcripts, s.cg_calls, s.unresolved, s.unparseable
     );
+    if s.unreadable > 0 {
+        // Said separately and before the numbers, not tucked into the parenthetical
+        // above: every rate below is computed over the transcripts we COULD read, so
+        // the reader has to know some were missing before reading them.
+        println!(
+            "UNREAD: {} transcript file(s) in this directory could not be read \u{2014} \
+             every rate below excludes them",
+            s.unreadable
+        );
+    }
     if let (Some(f), Some(l)) = (&s.first_ts, &s.last_ts) {
         let since = s
             .since_days
@@ -955,6 +1044,7 @@ fn render_json(s: &OutcomeSummary, target: &std::path::Path) {
             "cg_calls": s.cg_calls,
             "unresolved": s.unresolved,
             "unparseable": s.unparseable,
+            "unreadable": s.unreadable,
             "adopted": s.adopted,
             "adoption_rate": (s.adoption_rate * 100.0).round() / 100.0,
             "ranked_calls": s.ranked_calls,
@@ -1185,7 +1275,9 @@ mod tests {
             }
             _ => panic!("expected CgCall"),
         }
-        assert!(matches!(&p.events[1], Event::FileTouch { path } if path == "/proj/src/auth.rs"));
+        assert!(
+            matches!(&p.events[1], Event::FileTouch { path, .. } if path == "/proj/src/auth.rs")
+        );
         assert_eq!(p.first_ts.as_deref(), Some("2026-06-29T10:00:00Z"));
         assert_eq!(p.last_ts.as_deref(), Some("2026-06-29T10:01:00Z"));
     }
@@ -1236,8 +1328,140 @@ mod tests {
         static NEXT_TURN: AtomicUsize = AtomicUsize::new(1000);
         cg_at(NEXT_TURN.fetch_add(1, Ordering::Relaxed), tool, files)
     }
+    /// A touch on its own turn — i.e. a turn AFTER whatever call precedes it, which
+    /// is what "the model acted on the result" looks like. Same-turn touches are a
+    /// different case and get [`touch_at`].
     fn touch(p: &str) -> Event {
-        Event::FileTouch { path: p.into() }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_TURN: AtomicUsize = AtomicUsize::new(5000);
+        touch_at(NEXT_TURN.fetch_add(1, Ordering::Relaxed), p)
+    }
+    fn touch_at(turn: usize, p: &str) -> Event {
+        Event::FileTouch {
+            path: p.into(),
+            turn,
+        }
+    }
+
+    // ── outcome metric five-pack (2026-08-02 audit §16) ──────────────────────
+
+    #[test]
+    fn cli_ast_search_is_a_ranked_tool() {
+        // `canonical_query_cmd("ast-search")` is the HYPHENATED "ast-search", so the
+        // CLI event is `ast-search_cli` while the hand-written ranked list carried
+        // the MCP spelling `ast_search`. Every CLI ast-search call therefore fell
+        // out of the field-MRR denominator AND lost its rank — silently, because a
+        // smaller denominator still renders as a confident number.
+        assert!(is_ranked_tool("ast-search_cli"), "CLI ast-search is ranked");
+        assert!(is_ranked_tool("search_cli"), "CLI search is ranked");
+        assert!(is_ranked_tool("ast_search"), "MCP ast_search is ranked");
+        assert!(is_ranked_tool("semantic_code_search"));
+        // Negative controls: structural tools have no meaningful rank.
+        assert!(!is_ranked_tool("callgraph_cli"));
+        assert!(!is_ranked_tool("grep_cli"));
+        assert!(!is_ranked_tool("get_call_graph"));
+    }
+
+    #[test]
+    fn same_turn_touch_is_not_adoption() {
+        // A Read batched in the SAME assistant message as the cg call was decided
+        // before its result existed. Counting it inflated adoption and piled into
+        // the d1 bucket, which is the bucket used to argue the window is tight.
+        let events = vec![
+            cg_at(7, "semantic_code_search", &[("src/a.rs", Some(0))]),
+            touch_at(7, "/proj/src/a.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(
+            !outs[0].adopted,
+            "a touch issued in the same message as the call cannot have used its result"
+        );
+        assert_eq!(outs[0].adoption_distance, None);
+
+        // The same touch one turn later IS adoption — the negative control that
+        // keeps the fix from simply switching adoption off.
+        let events = vec![
+            cg_at(7, "semantic_code_search", &[("src/a.rs", Some(0))]),
+            touch_at(8, "/proj/src/a.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adoption_distance, Some(1));
+    }
+
+    #[test]
+    fn cli_call_recognizes_both_published_bin_names_and_windows_shims() {
+        // package.json publishes TWO bins: `code-graph` and `code-graph-mcp`. On
+        // Windows npm writes `.cmd` / `.ps1` shims beside them. Only the bare
+        // `code-graph-mcp` (and `.exe`) was recognised, so every call through the
+        // short alias or a shim went uncounted — the same dark-metric shape the
+        // `.exe` fix closed.
+        for cmd in [
+            "code-graph callgraph Foo",
+            "code-graph-mcp callgraph Foo",
+            "code-graph.cmd callgraph Foo",
+            "code-graph-mcp.cmd callgraph Foo",
+            "code-graph-mcp.CMD callgraph Foo",
+            "code-graph-mcp.bat callgraph Foo",
+            "code-graph-mcp.ps1 callgraph Foo",
+            r"C:\Users\x\.cache\code-graph\bin\code-graph.cmd callgraph Foo",
+            "/usr/local/bin/code-graph callgraph Foo",
+        ] {
+            assert_eq!(
+                detect_cli_cg_call(cmd),
+                Some("callgraph"),
+                "must recognise: {cmd}"
+            );
+        }
+        // Negative controls: a different binary whose name merely ends in ours, and
+        // a shim spelling we do not publish.
+        assert_eq!(detect_cli_cg_call("my-code-graph callgraph Foo"), None);
+        assert_eq!(detect_cli_cg_call("code-graph-mcp.zip callgraph Foo"), None);
+        assert_eq!(detect_cli_cg_call("code-graphs callgraph Foo"), None);
+    }
+
+    #[test]
+    fn transcript_dir_ignores_a_trailing_separator() {
+        // `--project /repo/` slugified to `-repo-`, a directory Claude Code never
+        // created, and the command answered `state: absent` with exit 0 — a typo's
+        // worth of difference between "no data" and "you asked wrong".
+        let home = Path::new("/home/u");
+        for windows in [false, true] {
+            let want = transcript_dir_on(Path::new("/mnt/dev/repo"), home, windows);
+            assert_eq!(
+                transcript_dir_on(Path::new("/mnt/dev/repo/"), home, windows),
+                want,
+                "trailing / must not change the slug (windows={windows})"
+            );
+        }
+        assert_eq!(
+            transcript_dir_on(Path::new(r"D:\dev\repo\"), home, true),
+            transcript_dir_on(Path::new(r"D:\dev\repo"), home, true),
+            "trailing backslash must not change the slug on Windows"
+        );
+        // The root itself is not a trailing separator to strip — it is the path.
+        assert_eq!(
+            transcript_dir_on(Path::new("/"), home, false),
+            home.join(".claude").join("projects").join("-")
+        );
+    }
+
+    #[test]
+    fn unreadable_transcripts_are_counted_not_silently_skipped() {
+        // A transcript we cannot read used to `continue`, so N shrank and the run
+        // still printed `0/0 = 0%` as if it had looked at everything. A directory
+        // named `*.jsonl` reproduces the read failure on every platform without
+        // touching permissions.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("good.jsonl"), "").unwrap();
+        std::fs::create_dir(dir.path().join("bad.jsonl")).unwrap();
+
+        let (s, _) = run_outcome(dir.path(), None);
+        assert_eq!(s.transcripts, 1, "only the readable transcript is scored");
+        assert_eq!(
+            s.unreadable, 1,
+            "the unreadable one must be counted, not dropped"
+        );
     }
 
     #[test]
