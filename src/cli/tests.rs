@@ -2279,22 +2279,21 @@ fn lock_index_for_replace_claims_the_lock_it_reports_free() {
     );
 }
 
-/// Release is platform-asymmetric, and so is what "held" even LOOKS like.
-/// On unix the flock dies with the handle and the FILE is kept on purpose —
-/// deleting it would hand a concurrent holder's lock to a different inode.
-/// On Windows the file IS the lock, so the guard must delete it; a stranded
-/// dead-PID lock file would refuse every later rebuild and push every server
-/// start into secondary read-only mode.
+/// Acquire / held / release, asserted identically on both platforms.
 ///
-/// The probe cannot carry both arms. `other_process_holds_index_lock` answers
-/// "does ANOTHER process hold it", and its non-unix arm says so literally
-/// (`pid != std::process::id()`), so a lock this very process holds reads as
-/// free there — correctly. Only unix's flock conflicts with a second open in
-/// the same process. So the held-state precondition goes through the lock
-/// FILE, which both platforms create and which is the whole lock on non-unix;
-/// the probe is asserted on unix only. Keeping that precondition cfg-free is
-/// deliberate: the line the Windows arm depends on is then executed by every
-/// platform's CI, not just the one that cannot run here.
+/// It used to be platform-ASYMMETRIC, and the asymmetry was the bug. On unix
+/// the flock dies with the handle and the lock FILE is kept on purpose —
+/// deleting it would hand a concurrent holder's lock to a different inode. The
+/// Windows leg used to say the opposite: the file's existence WAS the lock, so
+/// the guard deleted it on drop, and `other_process_holds_index_lock` answered
+/// from a recorded PID it excluded when it matched our own — a lock this very
+/// process held read as free there. Both of those are gone: the Windows lock is
+/// now an exclusive open handle, so every assertion below holds verbatim on
+/// both platforms and none of them needs a `cfg`.
+///
+/// That is the point of this test. The Windows arm cannot run on the dev host,
+/// so the fewer of its lines that are `cfg`-gated away here, the more of it CI's
+/// windows leg actually executes.
 #[test]
 fn index_lock_guard_releases_on_drop_on_this_platform() {
     // Deliberately does NOT use `locked_project()` — that fixture is unix-only
@@ -2312,14 +2311,12 @@ fn index_lock_guard_releases_on_drop_on_this_platform() {
         .expect("a free lock must be acquirable");
     assert!(
         cg.join("index.lock").exists(),
-        "precondition: the guard must have created the lock file — on non-unix \
-             that file IS the lock, and the removal assertion below is vacuous without it"
+        "precondition: the guard must have created the lock file"
     );
-    #[cfg(unix)]
     assert!(
         crate::indexer::lock::other_process_holds_index_lock(&cg),
-        "precondition: on unix the flock must read as held — a second open in \
-             this same process conflicts, which is what the CLI gate relies on"
+        "a held lock must read as held — a second open in this same process \
+             conflicts on both platforms, which is what the CLI gate relies on"
     );
     drop(guard);
 
@@ -2328,16 +2325,10 @@ fn index_lock_guard_releases_on_drop_on_this_platform() {
         "the lock must read as FREE after the guard drops, or one CLI rebuild \
              poisons every later run on this machine"
     );
-    #[cfg(unix)]
     assert!(
         cg.join("index.lock").exists(),
-        "unix keeps the file (flock lives on the inode); removing it would \
-             break mutual exclusion with a concurrent holder"
-    );
-    #[cfg(not(unix))]
-    assert!(
-        !cg.join("index.lock").exists(),
-        "non-unix must remove the file — its existence IS the lock"
+        "the file is kept on both platforms; removing it would break mutual \
+             exclusion with a concurrent holder"
     );
 }
 

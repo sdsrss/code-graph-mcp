@@ -11,146 +11,66 @@
 
 use std::path::Path;
 
-/// Verdict of a best-effort liveness probe for the PID recorded in `index.lock`.
+/// Does this `io::Error` mean "somebody else is holding the lock file"?
 ///
-/// `Unknown` exists so a probe that could not run never has to lie: only a
-/// POSITIVE `Dead` releases another process's lock, so a spawn failure, a
-/// timeout or unparsable output all stay on the safe side of the
-/// no-dual-primary invariant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PidProbe {
-    Alive,
-    Dead,
-    Unknown,
-}
-
-/// Decide whether the PID recorded in an existing lock file must block this
-/// process from taking the lock.
+/// The Windows lock is an OPEN HANDLE, not a file that exists: an acquisition
+/// asks for write access, and the holder's share mode refuses it with
+/// `ERROR_SHARING_VIOLATION` (32) or, for a byte-range lock underneath us,
+/// `ERROR_LOCK_VIOLATION` (33). Those two codes are the only ones that mean
+/// "held". Everything else — a read-only directory, a path that does not exist,
+/// an exotic filesystem — is a NON-answer and must read as "not held", because
+/// [`other_process_holds_index_lock`]'s callers turn a `true` into a refusal
+/// (`lock_index_for_replace`) and must never refuse a rebuild that used to work
+/// merely because the lock file could not be opened at all.
 ///
-/// Deliberately platform-independent. The non-Unix lock path cannot be
-/// exercised on the dev/CI host, and its previous hard-coded "always alive"
-/// probe made the stale-lock reclaim at the call site unreachable: after one
-/// unclean exit on Windows every later server instance for that project stayed
-/// secondary forever (no indexing, no watcher, `rebuild_index` refusing) with
-/// no message telling the user to delete `.code-graph/index.lock`. Keeping the
-/// decision here — with the probe injected — makes both outcomes unit-testable
-/// on every platform.
+/// Deliberately platform-independent and taking the raw code rather than the
+/// error, so the decision this lock hinges on is unit-testable on the dev host —
+/// the same reason the PID-liveness decision this replaces was factored out.
+/// Rust maps neither code to a named `ErrorKind`, so the raw value is the tell.
 #[allow(dead_code)] // called only from the non-Unix lock path; tested everywhere
-pub(crate) fn lock_holder_blocks_acquire(
-    recorded_pid: u32,
-    my_pid: u32,
-    probe: impl FnOnce(u32) -> PidProbe,
-) -> bool {
-    // Our own PID in the file is a leftover from this process — never blocking.
-    if recorded_pid == my_pid {
-        return false;
-    }
-    probe(recorded_pid) != PidProbe::Dead
+pub(crate) fn is_lock_conflict(raw_os_error: Option<i32>) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        raw_os_error,
+        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+    )
 }
 
-/// Wall-clock budget for one liveness-probe subprocess. A hung probe must not
-/// stall server startup, and "took too long" is `Unknown`, i.e. conservative.
-#[allow(dead_code)]
-const PID_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Run `cmd` to completion, killing it if it outlives `timeout`.
+/// Open `index.lock` the way the non-Unix lock needs it: write access, shared
+/// for READ only.
 ///
-/// Returns `None` for every "cannot decide" case: spawn failure, timeout, or a
-/// broken wait. Assumes the command's output fits the OS pipe buffer (it is
-/// used for a single-row `tasklist` query); a command that fills the pipe would
-/// block before exiting and be reported as a timeout, which is still safe.
-#[allow(dead_code)]
-fn run_probe_command(
-    mut cmd: std::process::Command,
-    timeout: std::time::Duration,
-) -> Option<std::process::Output> {
-    use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(_) => return None,
-        }
-    }
-    child.wait_with_output().ok()
-}
-
-/// Interpret `tasklist /NH /FO CSV /FI "PID eq <pid>"` output.
+/// `FILE_SHARE_READ` and nothing else is what makes this a lock. A second
+/// opener asking for write access is refused while this handle lives, and the
+/// OS closes the handle when the process dies however it dies — which is why
+/// this design has no stale-lock state to reclaim, no PID to probe, and no
+/// window in which two processes can both decide the other one is gone.
+/// Read sharing stays on so the PID written into the file remains readable for
+/// diagnostics; a holder that shared nothing would hide its own identity from
+/// the tools meant to report it.
 ///
-/// A successful run listing a CSV row whose PID column matches is `Alive`. A
-/// successful run with no such row is `Dead` — we key on the ABSENCE of a row
-/// rather than on the "INFO: No tasks are running…" line, which is localized.
-/// Anything else is `Unknown`.
-#[allow(dead_code)]
-fn parse_tasklist_output(success: bool, stdout: &str, pid: u32) -> PidProbe {
-    if !success {
-        return PidProbe::Unknown;
-    }
-    for line in stdout.lines() {
-        // `"code-graph-mcp.exe","1234","Console","1","10,240 K"` — PID is field 2.
-        let mut fields = line.split("\",\"");
-        let (Some(_image), Some(pid_field)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        if pid_field
-            .trim()
-            .trim_matches('"')
-            .parse::<u32>()
-            .is_ok_and(|p| p == pid)
-        {
-            return PidProbe::Alive;
-        }
-    }
-    PidProbe::Dead
-}
-
-/// Best-effort process-liveness probe for the non-Unix lock path.
-///
-/// Compiled on every platform (dead on Unix) so the whole body except the
-/// two console-suppression lines type-checks on the dev host.
-#[allow(dead_code)]
-fn probe_pid_liveness(pid: u32) -> PidProbe {
-    let mut cmd = std::process::Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+/// `create` separates the two callers: acquisition creates (and truncates, so a
+/// crashed run's PID does not linger), while the probe must neither create nor
+/// modify — an absent lock file means nobody has ever locked here, i.e. free.
+#[cfg(not(unix))]
+fn open_lock_handle(lock_path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(create).truncate(create);
     #[cfg(windows)]
     {
-        // Without CREATE_NO_WINDOW every probe flashes a console window: the
-        // MCP server is launched by Claude Code with no console of its own, and
-        // Rust's Command (like Node's `windowsHide`) does not suppress it by
-        // default — the same class of defect as [[feedback_windows_child_flash]].
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        opts.share_mode(FILE_SHARE_READ);
     }
-    match run_probe_command(cmd, PID_PROBE_TIMEOUT) {
-        Some(out) => parse_tasklist_output(
-            out.status.success(),
-            &String::from_utf8_lossy(&out.stdout),
-            pid,
-        ),
-        None => PidProbe::Unknown,
-    }
-}
-
-/// Check if a process with the given PID is alive (used by non-Unix lock fallback).
-/// Unresolvable probes count as alive, keeping the no-dual-primary invariant.
-#[cfg(not(unix))]
-fn pid_is_alive(pid: u32) -> bool {
-    probe_pid_liveness(pid) != PidProbe::Dead
+    // A non-Unix, non-Windows target would compile the line above away and get a
+    // plain open — mutual exclusion silently gone. Fail loudly instead: there is
+    // no such target in the release matrix, and a lock that only pretends to
+    // exclude is worse than one that does not build.
+    #[cfg(not(windows))]
+    compile_error!(
+        "the non-Unix index lock relies on Win32 share modes; port it before building this target"
+    );
+    opts.open(lock_path)
 }
 
 /// Try to acquire the index lock (`.code-graph/index.lock`) using flock().
@@ -196,115 +116,83 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
     Some(file)
 }
 
-/// Non-unix fallback: PID-based lock with create_new atomicity.
+/// Non-unix (Windows) acquisition: the lock is an exclusive open HANDLE, the
+/// same shape as the Unix flock above.
+///
+/// This used to be a PID file — `create_new`, and on `AlreadyExists` read the
+/// recorded PID, probe it with `tasklist`, and delete the file if the holder
+/// looked dead. Two processes starting together both read the same dead PID,
+/// both decided to reclaim, and the second one's `remove_file` deleted the lock
+/// the first had just created: both then held "the lock" and indexed one DB as
+/// two primaries (2026-08-16 audit §五, "Windows 残锁 TOCTOU"). The delete was
+/// unconditional, so no amount of re-checking before it closed the window —
+/// there is no atomic "unlink only if this is still the file I inspected".
+///
+/// Handing mutual exclusion to the OS removes the race and its whole
+/// supporting cast: no liveness probe (the kernel drops the handle when the
+/// holder dies, however it dies), no stale lock to reclaim, and no
+/// permanent-secondary fault after an unclean exit. The PID is still written,
+/// now purely as diagnostics.
 #[cfg(not(unix))]
 pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     use std::io::Write;
 
     let lock_path = code_graph_dir.join("index.lock");
-    let my_pid = std::process::id();
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
+    match open_lock_handle(&lock_path, true) {
         Ok(mut f) => {
-            let _ = f.write_all(my_pid.to_string().as_bytes());
-            return Some(f);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            tracing::warn!(
-                "Could not write index lock: {} — running in secondary mode",
-                e
-            );
-            return None;
-        }
-    }
-
-    // Lock exists — check if holder is alive
-    if let Ok(content) = std::fs::read_to_string(&lock_path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            if lock_holder_blocks_acquire(pid, my_pid, probe_pid_liveness) {
-                tracing::info!("Another instance (PID {}) holds the index lock — running in secondary (read-only) mode", pid);
-                return None;
-            }
-            tracing::info!("Reclaiming stale index lock from PID {}", pid);
-            let _ = std::fs::remove_file(&lock_path);
-        }
-    }
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(my_pid.to_string().as_bytes());
+            let _ = f.write_all(std::process::id().to_string().as_bytes());
+            let _ = f.flush();
             Some(f)
         }
-        Err(_) => {
-            tracing::info!("Lost lock race during stale reclaim — running in secondary mode");
+        Err(e) if is_lock_conflict(e.raw_os_error()) => {
+            tracing::info!(
+                "Another instance holds the index lock — running in secondary (read-only) mode"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not open index lock: {} — running in secondary mode",
+                e
+            );
             None
         }
     }
 }
 
-/// Release the index lock, platform-correctly.
+/// Release the index lock. **A deliberate no-op on every platform**: the lock is
+/// the open handle, so dropping the `File` already released it, and the lock
+/// FILE must stay on disk.
 ///
-/// **Unix: this is deliberately a no-op.** The flock lives on the open file
-/// description, so dropping the `File` handle already released it; the lock FILE
-/// must stay on disk. Removing it is not merely redundant, it breaks mutual
-/// exclusion: a concurrent holder's flock is pinned to the *inode*, so once the
-/// directory entry is gone the next opener creates a NEW inode, flocks that, and
-/// the two processes stop excluding each other — two primaries indexing one DB.
-/// The window is real and not microscopic: the CLI's `rebuild-index` /
-/// `reindex --from-snapshot` hold this same lock through an
-/// [`IndexLockGuard`], and a server shutting down mid-rebuild used to delete the
-/// CLI's lock file out from under it (2026-08-16 audit §四). This is the same
-/// invariant [`IndexLockGuard`]'s doc comment spells out — it lives in the
-/// function now so no caller can get it wrong by forgetting a `cfg`.
+/// Unlinking it is not merely redundant, it breaks mutual exclusion, in the same
+/// way on both platforms for two different reasons. On Unix a concurrent
+/// holder's flock is pinned to the *inode*, so once the directory entry is gone
+/// the next opener creates a NEW inode, flocks that, and the two processes stop
+/// excluding each other — two primaries indexing one DB. A server shutting down
+/// mid-rebuild used to delete the CLI's lock file out from under it exactly this
+/// way (2026-08-16 audit §四). On Windows the delete used to be the *reclaim*
+/// step of the PID-file design, and deleting a file another process may have
+/// just created was that design's core race (see [`try_acquire_index_lock`]);
+/// with the handle-based lock there is nothing left to reclaim.
 ///
-/// **Non-unix**: the lock IS the file's existence plus its PID content, so the
-/// file must go, or a dead PID strands every later instance in secondary mode.
-pub(crate) fn release_index_lock(_code_graph_dir: &Path) {
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::remove_file(_code_graph_dir.join("index.lock"));
-    }
-}
+/// The window matters because the CLI's `rebuild-index` /
+/// `reindex --from-snapshot` hold this same lock through an [`IndexLockGuard`]
+/// while a server may be starting or stopping. Keeping the no-op here — rather
+/// than a `cfg` at each call site — is what stops the delete from growing back.
+pub(crate) fn release_index_lock(_code_graph_dir: &Path) {}
 
-/// A held index lock with a platform-correct release, for callers that take the
-/// lock for a bounded operation rather than for a whole process lifetime — the
-/// CLI's wholesale-replace commands (`rebuild-index`, `reindex --from-snapshot`).
+/// A held index lock for callers that take it for a bounded operation rather
+/// than for a whole process lifetime — the CLI's wholesale-replace commands
+/// (`rebuild-index`, `reindex --from-snapshot`).
 ///
-/// The two platforms release differently and getting it wrong is not symmetric:
-/// - **Unix**: the flock lives on the open file description, so dropping the
-///   handle releases it. The lock FILE is deliberately left in place; an
-///   unlocked `index.lock` reads as free, because
-///   [`other_process_holds_index_lock`] re-flocks it to decide. Deleting it here
-///   would be worse than useless — a concurrent holder's lock lives on the
-///   inode, so a later opener would create a NEW file and the two would stop
-///   excluding each other.
-/// - **Non-unix**: the lock IS the file's existence plus its PID content, so a
-///   guard that dropped only the handle would strand a lock file naming a dead
-///   PID. Until the OS reused that PID for nothing, every later `rebuild-index`
-///   would refuse and every server start would fall back to secondary
-///   read-only mode — the permanent-secondary fault class the 2026-08-02
-///   indexing audit logged, newly reachable from the CLI once it started taking
-///   this lock at all. So the file is removed on drop.
+/// Dropping the handle IS the release, on both platforms: Unix flock lives on
+/// the open file description, and the Windows lock is the exclusive open itself.
+/// There is deliberately no `Drop` impl beyond that — in particular the lock
+/// FILE is left in place. It used to be removed on the non-Unix leg, back when
+/// the lock was the file's existence plus a PID; see [`release_index_lock`] for
+/// why unlinking it breaks mutual exclusion on both platforms now.
 pub(crate) struct IndexLockGuard {
     _file: std::fs::File,
-    #[cfg(not(unix))]
-    code_graph_dir: std::path::PathBuf,
-}
-
-impl Drop for IndexLockGuard {
-    fn drop(&mut self) {
-        #[cfg(not(unix))]
-        release_index_lock(&self.code_graph_dir);
-    }
 }
 
 /// Take the index lock for a bounded operation. `None` means somebody else holds
@@ -312,11 +200,7 @@ impl Drop for IndexLockGuard {
 /// (see `lock_index_for_replace` in the CLI, which re-probes to tell them apart).
 pub(crate) fn acquire_index_lock_guard(code_graph_dir: &Path) -> Option<IndexLockGuard> {
     let file = try_acquire_index_lock(code_graph_dir)?;
-    Some(IndexLockGuard {
-        _file: file,
-        #[cfg(not(unix))]
-        code_graph_dir: code_graph_dir.to_path_buf(),
-    })
+    Some(IndexLockGuard { _file: file })
 }
 
 /// Non-destructively check whether ANOTHER process currently holds the index lock
@@ -347,28 +231,36 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     }
 }
 
-/// Non-unix fallback: the lock is PID-file based, so read the PID and check liveness.
+/// Non-unix (Windows) probe: mirror of the Unix one — try to take the lock, and
+/// let go at once if we got it.
+///
+/// Same shape, same three answers: an exclusive open that SUCCEEDS means nobody
+/// held it (the handle is dropped immediately, so the real acquisition path is
+/// never disturbed); a sharing violation means somebody does; anything else —
+/// including a lock file that does not exist, i.e. nobody has ever locked here —
+/// is "free", because a non-answer must never block a legitimate CLI run.
+///
+/// This replaces reading the recorded PID and probing it with `tasklist`, which
+/// answered from a file that a crashed process leaves behind indefinitely. It
+/// also closes a smaller hole in passing: the old code excluded our OWN pid, so
+/// a lock held by this very process read as free.
 #[cfg(not(unix))]
 pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
-    let lock_path = code_graph_dir.join("index.lock");
-    match std::fs::read_to_string(&lock_path) {
-        Ok(content) => content
-            .trim()
-            .parse::<u32>()
-            .map(|pid| pid != std::process::id() && pid_is_alive(pid))
-            .unwrap_or(false),
-        Err(_) => false,
+    // Deliberately do NOT create the file: its absence means no process has ever
+    // locked here.
+    match open_lock_handle(&code_graph_dir.join("index.lock"), false) {
+        Ok(_probe) => false,
+        Err(e) => is_lock_conflict(e.raw_os_error()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the `#[cfg(unix)]` tests below construct one, so on Windows this import
-    // is unused. That was a silent warning until this release added a `[lints]`
-    // table denying warnings crate-wide, which turned it into a hard `cargo check`
-    // failure on the windows leg — a platform this repo's dev box never compiles.
-    #[cfg(unix)]
+    // Unconditional now: the Windows tests below take temp dirs too. It used to be
+    // `#[cfg(unix)]` because only Unix tests constructed one, and the unused import
+    // became a hard `cargo check` failure on the windows leg once `[lints]` denied
+    // warnings crate-wide — a platform this repo's dev box never compiles.
     use tempfile::TempDir;
 
     // L7: CLI rebuild/incremental warn before racing a running server. This guards the
@@ -407,74 +299,114 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // P1-2: non-Unix lock liveness. The Windows lock path cannot run on this
-    // host, so the decision it hinges on is factored out and tested here.
+    // Non-Unix (Windows) lock. The OS mechanics can only run on Windows, so the
+    // behavioural tests below are `#[cfg(windows)]` and get their evidence from
+    // the CI windows leg; the DECISION they hinge on is factored out here and
+    // tested on every host, the same way the PID-liveness decision this replaces
+    // was.
     // ---------------------------------------------------------------------
 
     #[test]
-    fn test_lock_holder_dead_pid_releases_the_lock() {
-        // The regression this guards: `pid_is_alive` returned an unconditional
-        // `true` on non-Unix, so the "Reclaiming stale index lock" branch was
-        // dead code and a single unclean exit left EVERY later instance for that
-        // project secondary — no indexing, no watcher, rebuild_index refusing.
+    fn test_is_lock_conflict_only_the_two_sharing_codes() {
+        // 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION: somebody holds it.
+        assert!(is_lock_conflict(Some(32)), "a sharing violation means held");
+        assert!(is_lock_conflict(Some(33)), "a lock violation means held");
+        // Everything else is a NON-answer and must read as "not held".
+        // `lock_index_for_replace` turns `true` into a refusal, so widening this
+        // to "any error" would make a read-only directory or a missing file stop
+        // a rebuild that used to work.
         assert!(
-            !lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Dead),
-            "a positively-dead holder must not block acquisition"
+            !is_lock_conflict(Some(2)),
+            "ERROR_FILE_NOT_FOUND means nobody has ever locked here, not 'held'"
         );
-    }
-
-    #[test]
-    fn test_lock_holder_live_pid_blocks() {
         assert!(
-            lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Alive),
-            "a live holder must keep this instance secondary"
+            !is_lock_conflict(Some(5)),
+            "ERROR_ACCESS_DENIED is a non-answer (read-only dir), not 'held'"
         );
-    }
-
-    #[test]
-    fn test_lock_holder_undecidable_probe_stays_conservative() {
-        // Probe could not run (no tasklist, timeout, garbage output): we must not
-        // infer "dead" from "don't know", or two primaries index the same DB.
         assert!(
-            lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Unknown),
-            "an undecidable probe must block, preserving the no-dual-primary invariant"
+            !is_lock_conflict(None),
+            "an error with no OS code decides nothing"
         );
     }
 
+    // The TOCTOU this replaced (2026-08-16 audit §五): the PID-file design let a
+    // second process delete the lock file the first had just created, so both
+    // became primary. With the handle-based lock a second acquisition is refused
+    // by the OS while the first handle lives — no window, nothing to reclaim.
+    // Reverting `try_acquire_index_lock` to the create_new + remove_file form
+    // turns this red (the old code even reclaimed its OWN pid's lock).
+    #[cfg(windows)]
     #[test]
-    fn test_lock_holder_own_pid_never_blocks_and_skips_probe() {
+    fn test_second_acquire_is_refused_while_the_handle_lives() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        let first = try_acquire_index_lock(cg).expect("a fresh dir must be lockable");
         assert!(
-            !lock_holder_blocks_acquire(77, 77, |_| panic!("probe must not run for our own PID")),
-            "our own PID in the lock file is our leftover, never a blocker"
+            try_acquire_index_lock(cg).is_none(),
+            "a second acquisition must be refused while the first handle lives — \
+             this is the no-dual-primary invariant"
+        );
+        drop(first);
+        assert!(
+            try_acquire_index_lock(cg).is_some(),
+            "closing the handle must release the lock"
         );
     }
 
+    // The permanent-secondary fault the PID design had: a lock FILE left behind
+    // by a crashed process named a PID nobody could resolve, and every later
+    // instance stayed read-only. The file is no longer the lock, so a leftover is
+    // inert — the OS dropped the handle when that process died.
+    #[cfg(windows)]
     #[test]
-    fn test_parse_tasklist_output_verdicts() {
-        let row = "\"code-graph-mcp.exe\",\"4321\",\"Console\",\"1\",\"12,345 K\"\r\n";
-        assert_eq!(parse_tasklist_output(true, row, 4321), PidProbe::Alive);
-        // Row for a DIFFERENT pid must not be read as our holder being alive.
-        assert_eq!(parse_tasklist_output(true, row, 9999), PidProbe::Dead);
-        // tasklist prints a localized "no tasks match" line and still exits 0;
-        // we key on the absence of a CSV row, not on that English text.
-        assert_eq!(
-            parse_tasklist_output(true, "INFO: No tasks are running which match.\r\n", 4321),
-            PidProbe::Dead
+    fn test_leftover_lock_file_from_a_crashed_run_is_inert() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        std::fs::write(cg.join("index.lock"), "424242").unwrap();
+        assert!(
+            !other_process_holds_index_lock(cg),
+            "a lock file nobody has open must read as free"
         );
-        assert_eq!(parse_tasklist_output(true, "", 4321), PidProbe::Dead);
-        // A failed run decides nothing.
-        assert_eq!(parse_tasklist_output(false, row, 4321), PidProbe::Unknown);
+        assert!(
+            try_acquire_index_lock(cg).is_some(),
+            "a crashed run's leftover lock file must not strand this instance in secondary mode"
+        );
     }
 
-    // P2 (2026-08-16 audit §四): server shutdown used to delete the lock FILE on
-    // Unix. Mutual exclusion there is inode-scoped, so an unlinked lock lets the
-    // next opener create a fresh inode and become a second primary — including
-    // while a CLI `rebuild-index` still holds the old one. The guard is a
-    // behavioural one (does the file survive), not a source-text one: reverting
-    // `release_index_lock` to the unconditional `remove_file` turns it red.
-    #[cfg(unix)]
+    #[cfg(windows)]
     #[test]
-    fn test_release_index_lock_keeps_the_file_on_unix() {
+    fn test_other_process_holds_index_lock_tracks_the_handle() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        // No lock file → free, and the probe must not create one.
+        assert!(!other_process_holds_index_lock(cg));
+        assert!(
+            !cg.join("index.lock").exists(),
+            "the probe must not create the lock file"
+        );
+
+        let holder = try_acquire_index_lock(cg).expect("a fresh dir must be lockable");
+        assert!(
+            other_process_holds_index_lock(cg),
+            "a held handle must be detected"
+        );
+        drop(holder);
+        assert!(
+            !other_process_holds_index_lock(cg),
+            "a released lock must read as free"
+        );
+    }
+
+    // 2026-08-16 audit §四: server shutdown used to delete the lock FILE. On Unix
+    // mutual exclusion is inode-scoped, so an unlinked lock lets the next opener
+    // create a fresh inode and become a second primary — including while a CLI
+    // `rebuild-index` still holds the old one; on Windows the same delete was the
+    // reclaim step of the racy PID design. The guard is a behavioural one (does
+    // the file survive), not a source-text one: reverting `release_index_lock` to
+    // an unconditional `remove_file` turns it red. It runs on both platforms now
+    // that both release the same way.
+    #[test]
+    fn test_release_index_lock_keeps_the_file() {
         let dir = TempDir::new().unwrap();
         let cg = dir.path();
         let guard = acquire_index_lock_guard(cg).expect("lock must be acquirable in a fresh dir");
@@ -484,11 +416,11 @@ mod tests {
         release_index_lock(cg);
         assert!(
             lock_path.exists(),
-            "on Unix the lock file must survive release — deleting it lets a \
-             concurrent holder's inode-scoped flock stop excluding new openers"
+            "the lock file must survive release — deleting it lets a concurrent \
+             holder's handle stop excluding new openers"
         );
 
-        // Dropping the guard is the real Unix release; the file still stays.
+        // Dropping the guard is the real release; the file still stays.
         drop(guard);
         assert!(
             lock_path.exists(),
@@ -503,38 +435,5 @@ mod tests {
         // people to re-run rather than to read, which costs more than the extra
         // coverage was worth. The two assertions above are what the fix is about
         // and both are mutation-verified.
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_run_probe_command_collects_output_and_enforces_timeout() {
-        // The probe's process plumbing is platform-independent; only the
-        // console-suppression flag is Windows-only. Exercise both outcomes with
-        // stand-in commands so the timeout path isn't taken on faith.
-        let mut ok = std::process::Command::new("sh");
-        ok.args(["-c", "printf 'hello'"]);
-        let out = run_probe_command(ok, std::time::Duration::from_secs(5))
-            .expect("a fast command must produce output");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
-        assert!(out.status.success());
-
-        let mut slow = std::process::Command::new("sh");
-        slow.args(["-c", "sleep 30"]);
-        let started = std::time::Instant::now();
-        assert!(
-            run_probe_command(slow, std::time::Duration::from_millis(150)).is_none(),
-            "a probe that outlives its timeout must report 'cannot decide', not hang"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "the timeout must actually kill the child, not wait for it: {:?}",
-            started.elapsed()
-        );
-
-        let missing = std::process::Command::new("code-graph-no-such-probe-binary");
-        assert!(
-            run_probe_command(missing, std::time::Duration::from_secs(1)).is_none(),
-            "an unspawnable probe must report 'cannot decide'"
-        );
     }
 }
