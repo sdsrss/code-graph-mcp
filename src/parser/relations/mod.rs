@@ -320,11 +320,26 @@ mod ruby_bare_calls {
 /// Signature every additive `references` extractor shares.
 type ReferenceExtractor = fn(&tree_sitter::Node, &str, Option<&str>) -> Option<ParsedRelation>;
 
-/// Which language name a pass matches on. The two are NOT interchangeable and
-/// swapping one for the other silently changes coverage: `Raw` is the file's
-/// own language, where `typescript` and `tsx` are DIFFERENT strings, while
-/// `Family` is the dispatch name from [`LanguageConfig`], which folds `.tsx`
-/// into its family. Each pass below keeps whichever one it was written against.
+/// Which language name a pass matches on: `Raw` is the file's own language as
+/// `detect_language` returned it, `Family` the dispatch name on
+/// [`LanguageConfig`].
+///
+/// **The two select identically today, for every supported language.** An
+/// earlier version of this comment claimed `Family` "folds `.tsx` into its
+/// family" and that swapping the keys silently changes coverage; neither is
+/// true. `LanguageConfig::for_language` is an identity map over
+/// `SUPPORTED_LANGUAGES` — `"tsx"` maps to name `"tsx"`, not `"typescript"` —
+/// and it differs from the raw name only for a language the parser does not
+/// support at all, which by definition appears in no row's `langs` list.
+/// `lang_config::tests::every_supported_language_has_consistent_config` already
+/// asserts that round-trip, so the statement above is proven, not merely made.
+///
+/// The enum stays because it records which name each pass was written against,
+/// and because that guard turns a future real divergence into a failing test
+/// instead of a silent coverage change: the day `for_language` starts folding
+/// names, every row here must be re-read to decide which key it wants.
+/// Until then, do not reason about a row's `langs` list as if the family
+/// widened it — a pass that should cover `.tsx` has to list `"tsx"`.
 enum LangKey {
     Raw,
     Family,
@@ -390,9 +405,11 @@ const REFERENCE_PASSES: &[ReferencePass] = &[
     // TS/TSX type-position `type_identifier` (annotation, return type, generic
     // arg, field type). Self-excludes the type's own definition name and
     // heritage (extends/implements) types already covered by an
-    // inherits/implements edge. Keyed on the RAW language: JS has no type
-    // annotations so the kind never appears there anyway, but the `javascript`
-    // FAMILY would otherwise sweep value identifiers in non-type contexts.
+    // inherits/implements edge. JavaScript is out of scope for this pass and
+    // stays out because it is absent from `langs` — NOT, as this comment once
+    // said, because the raw key keeps a `javascript` family from sweeping in.
+    // Both keys select the same set (see [`LangKey`]), and `.tsx` is covered
+    // here only because `"tsx"` is listed explicitly.
     ReferencePass {
         key: LangKey::Raw,
         langs: &["typescript", "tsx"],

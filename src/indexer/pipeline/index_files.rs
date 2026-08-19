@@ -754,6 +754,21 @@ pub(super) fn index_files(
 
     // Relations that failed batch-time resolution; re-run after the batch loop
     // against the complete pool (see `DeferredRelation`).
+    //
+    // This is the one structure that grows for the whole run rather than per
+    // batch, so it looks like the place to put a size cap. It is not, and the
+    // measurement says why. A generated 10 000-file / 90 000-edge TypeScript
+    // corpus deferred 32 314 relations — about a third of all edges — and the
+    // whole indexing process peaked at 172 MB RSS; re-running with every import
+    // pointing BACKWARD instead of forward changed the deferral count by 7%
+    // (30 073), so the ratio is a property of batch-time resolution, not of how
+    // the corpus happens to be ordered. Growth is therefore proportional to
+    // edges, not unbounded in the runaway sense, and the persistent
+    // `pending_unresolved_calls` side's `attempts` limit is not the precedent it
+    // looks like: that evicts rows that can NEVER resolve, whereas every entry
+    // here resolves a few lines below. Capping this list would silently drop
+    // real edges at exactly the scale where a full rebuild is least likely to be
+    // re-run — the failure this pipeline has already been bitten by twice.
     let mut deferred: Vec<DeferredRelation> = Vec::new();
 
     // Same sort+dedup rationale as `files` above: `delete_paths` arrives from
