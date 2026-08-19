@@ -63,8 +63,13 @@ fn call_passes_wire_every_extractor() {
     let table = table_region(&src);
 
     let defined = scan_file_for_call_extractors(&calls_rs());
+    // The floor is the CURRENT count, not a round number below it: a scanner that
+    // silently stops matching the declaration style makes this guard vacuous, and
+    // a floor with slack absorbs exactly that failure. Adding an extractor means
+    // raising this by one, which is the point — it is a second place the addition
+    // has to be acknowledged.
     assert!(
-        defined.len() >= 10,
+        defined.len() >= 12,
         "the scanner found only {} call extractors — it has probably stopped matching \
          the declaration style, which would make this guard vacuous: {defined:?}",
         defined.len()

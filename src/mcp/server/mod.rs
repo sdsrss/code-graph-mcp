@@ -781,7 +781,13 @@ impl McpServer {
     /// session that saw deny/hint/bypass/cli-use traffic still writes, so the
     /// deny→use funnel denominator includes non-converting sessions (without
     /// this, 0% conversion was structurally unobservable).
-    /// Also releases the index lock if this instance is the primary.
+    ///
+    /// It also CALLS `release_index_lock`, which is a documented no-op on both
+    /// platforms — the lock is the open handle, so the real release is this
+    /// server's `File` dropping at process exit. The call and its `is_primary`
+    /// guard are kept as the statement of where release belongs; see
+    /// [`crate::indexer::lock::release_index_lock`] for why unlinking the lock
+    /// file instead would break mutual exclusion.
     pub fn flush_metrics(&self) {
         if let Some(ref root) = self.project_root {
             let metrics = lock_or_recover(&self.metrics, "metrics");

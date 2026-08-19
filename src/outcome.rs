@@ -836,7 +836,21 @@ pub fn run_outcome(
     let mut unreadable = 0usize;
     let mut first_ts: Option<String> = None;
     let mut last_ts: Option<String> = None;
-    let entries = std::fs::read_dir(dir).into_iter().flatten();
+    // A directory we cannot ENUMERATE is the same silent zero one level up: the
+    // caller's `dir.is_dir()` gate already passed, so an unreadable transcript
+    // directory (mode 000, a broken mount) would otherwise sail through to
+    // `Adoption: 0/0 = 0%` with no UNREAD line and `unreadable: 0` — a rate
+    // computed over nothing, presented as a rate computed over everything. One
+    // count, because we cannot know how many entries we did not see.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => {
+            let mut summary = aggregate(&[], 0, 0, 0, 0);
+            summary.unreadable = 1;
+            summary.since_days = since_days;
+            return (summary, Vec::new());
+        }
+    };
     for entry in entries {
         // An entry we cannot even stat is counted rather than dropped: we do not
         // know whether it was a transcript, and "might have been" is exactly what
@@ -1461,6 +1475,39 @@ mod tests {
         assert_eq!(
             s.unreadable, 1,
             "the unreadable one must be counted, not dropped"
+        );
+    }
+
+    /// The same silent zero one level up, found by the pre-tag review of the
+    /// per-file fix above: `read_dir` failing on the DIRECTORY was swallowed by
+    /// `.into_iter().flatten()`, so an unreadable transcript dir produced
+    /// `0/0 = 0%` with `unreadable: 0` and no disclosure — a rate over nothing
+    /// presented as a rate over everything. Sibling holes are this repo's top
+    /// bug class; fixing one arm and not the other is how they survive.
+    #[cfg(unix)]
+    #[test]
+    fn an_unenumerable_transcript_dir_is_disclosed_not_read_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let locked = dir.path().join("transcripts");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("a.jsonl"), "").unwrap();
+        let original = std::fs::metadata(&locked).unwrap().permissions();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (s, calls) = run_outcome(&locked, None);
+
+        // Restore before asserting so a failure still leaves a removable TempDir.
+        std::fs::set_permissions(&locked, original).unwrap();
+        assert_eq!(s.transcripts, 0);
+        assert!(calls.is_empty());
+        assert_eq!(
+            s.unreadable, 1,
+            "a directory we cannot enumerate must be disclosed, not read as empty"
         );
     }
 
