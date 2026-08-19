@@ -455,6 +455,23 @@ pub const CHARS_PER_TOKEN: usize = 3;
 pub const MAX_AST_DEPTH: usize = 64;
 pub const MAX_RELATION_DEPTH: usize = 256;
 
+/// Stack size for threads that run the index pipeline off the main thread.
+///
+/// `walk_for_relations` recurses once per AST level up to [`MAX_RELATION_DEPTH`],
+/// so a ~800-byte source file of nested parens (`((((…f(1)…))))`) is enough to
+/// drive it to the cap. Measured peak for that input: ~256–512 KiB under
+/// `[profile.release]`, but ~2–4 MiB unoptimized, because debug frames carry
+/// every spilled local of this function's very wide `match`.
+///
+/// `std::thread::spawn` gives 2 MiB by default, which the unoptimized figure
+/// exceeds. That matters more than a normal panic would: a stack overflow is
+/// `abort`, not unwind, so it walks straight past the serve loop's per-request
+/// `catch_unwind` (see the `panic = "abort"` note in Cargo.toml) and takes the
+/// whole long-lived stdio session with it. Sizing these threads explicitly
+/// makes the margin independent of the build profile instead of something the
+/// release optimizer happens to buy us.
+pub const INDEX_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 // -- Indexing limits (env-var overridable) --
 
 use std::sync::OnceLock;
