@@ -1465,6 +1465,34 @@ fn comment_starts_its_own_line(node: &tree_sitter::Node, source: &str) -> bool {
     }
 }
 
+/// A decorator / attribute / annotation that sits BETWEEN a declaration and its
+/// documentation comment, as its own sibling node.
+///
+/// Whether a language lands here is a property of its grammar, not of the
+/// decoration syntax: Java, Kotlin and Swift park annotations inside the
+/// declaration's `modifiers`, and C#/PHP inside an `attribute_list` field, so
+/// the comment stays the declaration's immediate previous sibling and those
+/// languages never needed anything. The three spellings below are the ones that
+/// do NOT — each measured against a real parse tree, the same way
+/// `DOC_COMMENT_WRAPPERS` was:
+///
+/// - `decorator` — TS/JS. `@Component({}) export class C {}` puts the decorator
+///   inside `export_statement` ahead of the declaration, and a member decorator
+///   (`@Get() findAll() {}`) sits directly between the comment and the method in
+///   `class_body`. This is the Angular/NestJS shape, i.e. most documented
+///   declarations in those codebases.
+/// - `attribute_item` — Rust. `#[derive(Debug)]` is a sibling, so a documented
+///   derived struct or an `#[inline]`/`#[test]` fn lost its `///` block.
+/// - `annotation` — Dart. `@override` is a top-level sibling of the signature.
+///
+/// Skipping is bounded to these kinds rather than "anything that is not a
+/// comment": stepping over an arbitrary node would let a comment reach across
+/// the declaration it actually documents
+/// (`test_decoration_skip_does_not_cross_a_declaration`).
+fn is_decoration(node: &tree_sitter::Node) -> bool {
+    matches!(node.kind(), "decorator" | "attribute_item" | "annotation")
+}
+
 fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
     fn scan_siblings(node: &tree_sitter::Node, source: &str) -> Vec<String> {
         let mut comments = Vec::new();
@@ -1483,6 +1511,10 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
                     break;
                 }
                 comments.push(node_text(&prev, source).to_string());
+                current = prev.prev_sibling();
+            } else if is_decoration(&prev) {
+                // Step over it: the comment documents the declaration the
+                // decoration is attached to, not the decoration.
                 current = prev.prev_sibling();
             } else {
                 break;
@@ -1516,7 +1548,17 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
         if !DOC_COMMENT_WRAPPERS.contains(&parent.kind()) {
             break;
         }
-        if parent.named_child(0).map(|c| c.id()) != Some(cursor.id()) {
+        // First MEANINGFUL named child, not literally the first: a decorated
+        // `export` (`@Component({}) export class C {}`) parses with the
+        // decorator as `export_statement`'s first named child, so a literal
+        // check refused the climb for exactly the Angular/NestJS shape. The
+        // check's purpose — keep a group's doc off its later members, e.g. Go's
+        // `type ( Alpha; Beta )` — is unaffected, since a `type_spec` is never a
+        // decoration.
+        let first_meaningful = (0..parent.named_child_count())
+            .filter_map(|i| parent.named_child(i))
+            .find(|c| !is_decoration(c));
+        if first_meaningful.map(|c| c.id()) != Some(cursor.id()) {
             break;
         }
         comments = scan_siblings(&parent, source);
@@ -2932,6 +2974,156 @@ def undocumented(x):
             "doc_comment lost for {} case(s):\n  {}",
             missing.len(),
             missing.join("\n  ")
+        );
+    }
+
+    /// Second axis of the same table: a declaration carrying a decorator,
+    /// attribute or annotation between it and its documentation.
+    ///
+    /// Split from the plain-form table above because the two axes fail
+    /// independently — every language here passes the plain form, and the
+    /// languages that pass this one do so for a reason that has nothing to do
+    /// with the extractor: their grammars park the annotation INSIDE the
+    /// declaration node (Java/Kotlin/Swift `modifiers`, C#/PHP `attribute_list`),
+    /// so the comment stays the immediate previous sibling. The four that failed
+    /// put it OUTSIDE, as a sibling of its own (`decorator`, `attribute_item`,
+    /// `annotation`) — which is the whole gap. Rows for the already-working
+    /// languages are kept so the table shows the entire axis rather than the
+    /// half that broke.
+    ///
+    /// Go and Ruby have no decoration syntax and so have no row.
+    #[test]
+    fn test_doc_comment_parity_for_decorated_declarations() {
+        type DocCase = (
+            &'static str,
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: &[DocCase] = &[
+            // Angular/NestJS shape: the decorator is a named child of
+            // `export_statement`, ahead of the declaration the extractor reads.
+            (
+                "typescript",
+                "/** M_TS_DC */\n@Component({})\nexport class C {}\n",
+                &[("C", "M_TS_DC")],
+            ),
+            (
+                "typescript",
+                "/** M_TS_DF */\n@Deco()\nexport function f() {}\n",
+                &[("f", "M_TS_DF")],
+            ),
+            // NestJS controller shape: comment and decorator are both siblings
+            // of the method inside `class_body`.
+            (
+                "typescript",
+                "class S {\n  /** M_TS_DM */\n  @Get()\n  findAll() {}\n}\n",
+                &[("findAll", "M_TS_DM")],
+            ),
+            (
+                "javascript",
+                "/** M_JS_DC */\n@deco\nexport class J {}\n",
+                &[("J", "M_JS_DC")],
+            ),
+            (
+                "rust",
+                "/// M_RS_DS\n#[derive(Debug)]\npub struct S;\n",
+                &[("S", "M_RS_DS")],
+            ),
+            (
+                "rust",
+                "impl T {\n    /// M_RS_DM\n    #[inline]\n    fn m(&self) {}\n}\n",
+                &[("m", "M_RS_DM")],
+            ),
+            (
+                "dart",
+                "/// M_DT_DF\n@override\nvoid f() {}\n",
+                &[("f", "M_DT_DF")],
+            ),
+            // Already working — the annotation lives inside the declaration node.
+            (
+                "python",
+                "# M_PY_DF\n@dec\ndef f():\n    pass\n",
+                &[("f", "M_PY_DF")],
+            ),
+            (
+                "java",
+                "class C {\n  /** M_JV_DM */\n  @Override\n  public void m() {}\n}\n",
+                &[("m", "M_JV_DM")],
+            ),
+            (
+                "kotlin",
+                "/** M_KT_DF */\n@Deprecated\nfun f() {}\n",
+                &[("f", "M_KT_DF")],
+            ),
+            (
+                "csharp",
+                "/// M_CS_DC\n[Obsolete]\npublic class C {}\n",
+                &[("C", "M_CS_DC")],
+            ),
+            (
+                "php",
+                "<?php\n/** M_PHP_DC */\n#[Attr]\nclass K {}\n",
+                &[("K", "M_PHP_DC")],
+            ),
+            (
+                "swift",
+                "/// M_SW_DF\n@objc func f() {}\n",
+                &[("f", "M_SW_DF")],
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (lang, src, expectations) in cases {
+            let nodes = match parse_code(src, lang) {
+                Ok(n) => n,
+                Err(e) => {
+                    missing.push(format!("{lang}: parse_code failed: {e}"));
+                    continue;
+                }
+            };
+            for (symbol, marker) in *expectations {
+                let doc = nodes
+                    .iter()
+                    .find(|n| n.name == *symbol)
+                    .and_then(|n| n.doc_comment.clone())
+                    .unwrap_or_default();
+                if !doc.contains(marker) {
+                    missing.push(format!("{lang}/{symbol}: expected {marker}, got {doc:?}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "doc_comment lost for {} decorated case(s):\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// Negative control for the decoration skip: stepping over an attribute must
+    /// not let a declaration reach past whatever sits behind it. Both shapes are
+    /// ones the skip could plausibly break — an attributed item following an
+    /// undocumented sibling, and one following a DOCUMENTED sibling whose
+    /// comment must stay with its own declaration.
+    #[test]
+    fn test_decoration_skip_does_not_cross_a_declaration() {
+        let src = "/// DOC_FOR_A\nfn a() {}\n#[derive(Debug)]\npub struct S;\n";
+        let nodes = parse_code(src, "rust").unwrap();
+        let doc_of = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .and_then(|n| n.doc_comment.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            doc_of("a").contains("DOC_FOR_A"),
+            "the documented function keeps its own doc, got {:?}",
+            doc_of("a")
+        );
+        assert!(
+            doc_of("S").is_empty(),
+            "an attributed struct must not inherit the previous declaration's doc, got {:?}",
+            doc_of("S")
         );
     }
 
