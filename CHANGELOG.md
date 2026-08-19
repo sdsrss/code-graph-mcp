@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.121.0 (2026-08-18)
+
+> **Upgrade note — the `outcome` numbers move, because they were wrong.** Five
+> defects in the retrieval-adoption metric are fixed here and three of them change
+> figures you have already seen: adoption goes DOWN (a file read in the SAME
+> assistant message as the query no longer counts as having adopted its result),
+> the field-MRR denominator goes UP (CLI `ast-search` calls now enter it at all),
+> and calls made through the short `code-graph` bin name or a Windows `.cmd` shim
+> now count where they were invisible. Numbers from before this release are not
+> comparable with numbers after it. Nothing to do — and **no index rebuild**:
+> INDEX_VERSION stays at 63.
+
+### The Windows index lock is a handle now, not a PID file
+
+The non-Unix lock was the lock FILE's existence plus a recorded PID. Acquisition
+`create_new`'d it, and on `AlreadyExists` read the PID, probed it with
+`tasklist`, and deleted the file if the holder looked dead. Two processes
+starting together both read the same dead PID, both decided to reclaim, and the
+second one's `remove_file` deleted the lock the first had just created: both then
+held "the lock" and indexed one database as two primaries. The delete was
+unconditional, so no amount of re-checking before it closed the window — there is
+no atomic "unlink only if this is still the file I inspected".
+
+Mutual exclusion is the OS's job now. The lock is an open handle with
+`share_mode(FILE_SHARE_READ)`: a second acquisition asks for write access, which
+that share mode refuses, and the kernel drops the handle when the holder dies
+however it dies. The race goes away with its whole supporting cast — no liveness
+probe, no stale lock to reclaim, and no permanent-secondary mode after an unclean
+exit, which until now meant a crashed server left every later instance for that
+project read-only (no indexing, no watcher, `rebuild-index` refusing) until
+someone deleted `.code-graph/index.lock` by hand. A leftover lock file is inert.
+
+`release_index_lock` is a no-op on both platforms now, for the same reason stated
+two ways: on Unix the flock lives on the inode, so unlinking hands the lock to a
+different inode; on Windows the delete WAS the racy reclaim step. Two smaller
+things fall out — a lock held by THIS process used to read as free on Windows
+(the probe compared PIDs), and the `tasklist` probe with its timeout plumbing and
+five tests is gone, having guarded a mechanism that no longer exists.
+
+### Five ways the adoption metric was lying
+
+Each of these kept the retrieval-adoption numbers plausible while wrong, which is
+the worst failure mode a metric has: a shrunken denominator still renders as a
+confident percentage.
+
+**CLI `ast-search` never entered the field-MRR denominator.** The ranked-tool
+list was hand-written in two spellings, and a CLI event is named
+`<canonical>_cli` — where the canonical form of `ast_search` is the HYPHENATED
+`ast-search`. The entry `ast_search` therefore covered the MCP call and missed
+every `ast-search_cli` one, dropping those calls from MRR and discarding their
+rank. The list now holds MCP spellings only and derives each CLI twin through
+`canonical_query_cmd`, the one table both surfaces already share.
+
+**A file touched in the same assistant message as the call counted as adoption.**
+The model batched them; the Read was decided before the result existed. It
+inflated adoption and, because such a touch is always the first one after the
+call, piled into the `d1` bucket — corrupting the very histogram used to argue
+the attribution window is tight. `FileTouch` now carries its turn, and a
+same-turn touch is skipped entirely.
+
+**Calls through the short bin name or a Windows shim were invisible.**
+`package.json` publishes TWO bins, `code-graph` and `code-graph-mcp`; npm writes
+`.cmd`/`.ps1` wrappers beside them on Windows. Only the long name and `.exe` were
+recognised, so `code-graph callgraph X` — the spelling people actually type —
+never reached the conversion metric.
+
+**`--project /repo/` answered `state: absent` with exit 0.** The trailing
+separator survives normalization and slugifies to a transcript directory Claude
+Code never created — a typo's worth of difference between "no data" and "you
+asked wrong", and shell tab-completion supplies that slash for free.
+
+**Transcripts that could not be read were skipped in silence.** N shrank and the
+run still printed its rates as findings. They are counted now and disclosed on
+their own line BEFORE the numbers, with an `unreadable` field in `--json` — and
+so is a transcript DIRECTORY that cannot be enumerated at all, the same silent
+zero one level up, which the pre-tag review caught still open after the per-file
+fix.
+
+### The `calls` axis is a table
+
+Twelve arms of `walk_for_relations`'s giant `match` moved into
+`src/parser/relations/calls.rs` as `CALL_PASSES`, one row per (language, node
+kind). That match is where this crate's top recurring bug class lives: one arm
+per language per relation, where a missing arm is not a compile error but an edge
+that is silently never emitted — and tree-sitter guarantees the arms, because no
+two grammars agree on what a call node is called (`call_expression` / `call` /
+`method_invocation` / `invocation_expression` / three PHP kinds sharing one arm /
+a Dart `selector` / a Bash `command`). As data the mapping is enumerable: a new
+language's absence is a visible empty slot, `call_passes_wire_every_extractor`
+fails on an extractor no row names, and `table_tests` rejects two rows claiming
+one (language, kind) slot — the duplicate a `match` would have refused to
+compile. `walk_for_relations` drops from 1,236 to 647 lines; the recursion and
+its scope/class/impl propagation stay exactly where they were.
+
+**This changes nothing about what gets extracted**, which is the whole claim and
+was verified rather than assumed: 4,732,129 relations over 48,539 files — this
+repo plus six third-party checkouts covering Go, Ruby, PHP, Java, C#, Dart,
+JavaScript, TypeScript, Python and Bash — are byte-for-byte identical before and
+after. Hence no INDEX_VERSION bump; the extraction fingerprint is re-recorded at
+63.
+
 ## v0.120.1 (2026-08-17)
 
 > **Correction to the v0.120.0 upgrade note.** That note told you to pin

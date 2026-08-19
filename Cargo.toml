@@ -1,6 +1,6 @@
 [package]
 name = "code-graph-mcp"
-version = "0.120.1"
+version = "0.121.0"
 edition = "2021"
 license = "MIT"
 # No `rust-version` is declared, deliberately. The obvious candidate is CI's
