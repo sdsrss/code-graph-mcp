@@ -72,11 +72,15 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
+      # Bounded for the same reason as the ripgrep step below — this is the other
+      # apt call in this repo's CI, and an unbounded `apt-get update` is what ran
+      # three workflows into a hand-kill on 2026-08-19.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          timeout 120 sudo apt-get update
+          timeout 120 sudo apt-get install -y gcc-aarch64-linux-gnu
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # Same flags as the release build so the cached dep artifacts are the
@@ -128,13 +132,23 @@ jobs:
       # grep regression on main would stay green here and only surface on the
       # tag. Runtime-only (rg is spawned, not linked), so it does not affect the
       # cached artifacts.
+      # Bounded and retried for the same reason as the gate it mirrors: on
+      # 2026-08-19 this workflow, ci.yml and release.yml all stalled on the same
+      # apt mirror at the same time. Three copies, one failure.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        timeout-minutes: 8
         run: |
-          # Short-circuit keeps an apt mirror hiccup off this critical path
-          # (ci.yml's step has the same guard).
           if command -v rg >/dev/null 2>&1; then rg --version; exit 0; fi
-          sudo apt-get update && sudo apt-get install -y ripgrep
-          rg --version
+          for attempt in 1 2 3; do
+            if timeout 120 sudo apt-get update && timeout 120 sudo apt-get install -y ripgrep; then
+              rg --version
+              exit 0
+            fi
+            echo "::warning::ripgrep install attempt ${attempt} failed or timed out; retrying"
+            sleep 5
+          done
+          echo "::error::apt could not install ripgrep after 3 attempts"
+          exit 1
 
       - name: Clippy (no default features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings

@@ -1537,3 +1537,92 @@ fn test_no_new_undeclared_mcp_args() {
          tool that publishes no schema. Update this pin once classified."
     );
 }
+
+/// Every `apt-get` call in CI must be bounded by a step-level `timeout-minutes`.
+///
+/// On 2026-08-19 an apt mirror stopped answering mid-`update` and THREE
+/// workflows stalled on it at once — `ci.yml`'s with-embed leg (40 min), the
+/// `release.yml` gate (29 min, with the v0.122.0 tag already pushed) and
+/// `cache-warm.yml` — each of which would have run to the 6-hour job ceiling
+/// had they not been killed by hand. The repo had already lost one run that way.
+///
+/// The presence check those steps carry (`command -v rg`) does NOT bound this:
+/// no GitHub runner ships ripgrep, as `ci.yml`'s own comment states, so on Linux
+/// the check always falls through to apt. Only the timeout bounds it, which is
+/// why this guard pins the timeout rather than the check.
+///
+/// Scans every workflow rather than a fixed list of steps: the same install was
+/// copy-pasted into four places, and the fifth copy is the one this catches.
+#[test]
+fn every_apt_step_in_ci_is_bounded_by_a_timeout() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut unbounded = Vec::new();
+    let mut scanned_steps = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_none_or(|e| e != "yml" && e != "yaml") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read workflow");
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Split into steps on the `- name:` / `- uses:` list markers, keeping
+        // each step's own body with it.
+        let mut step_start: Option<usize> = None;
+        let lines: Vec<&str> = src.lines().collect();
+        let mut steps: Vec<(usize, Vec<&str>)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("- name:") || t.starts_with("- uses:") {
+                if let Some(s) = step_start {
+                    steps.push((s, lines[s..i].to_vec()));
+                }
+                step_start = Some(i);
+            }
+        }
+        if let Some(s) = step_start {
+            steps.push((s, lines[s..].to_vec()));
+        }
+
+        for (start, body) in steps {
+            // Strip YAML comments before looking for the call: several of these
+            // steps carry a comment explaining WHY apt is bounded, and counting
+            // that as an apt call attributed the finding to whichever step the
+            // comment happened to trail.
+            let joined: String = body
+                .iter()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !joined.contains("apt-get") {
+                continue;
+            }
+            scanned_steps += 1;
+            if !joined.contains("timeout-minutes:") {
+                let label = body
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                unbounded.push(format!("{name}:{} {label}", start + 1));
+            }
+        }
+    }
+
+    assert!(
+        scanned_steps >= 4,
+        "found only {scanned_steps} apt step(s) — the scanner stopped matching the \
+         workflow layout, so this guard is passing vacuously"
+    );
+    assert!(
+        unbounded.is_empty(),
+        "these CI steps run apt-get with no step-level timeout-minutes, so a \
+         stalled mirror hangs the job to the 6-hour ceiling instead of failing \
+         fast: {unbounded:?}"
+    );
+}

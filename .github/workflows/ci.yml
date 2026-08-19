@@ -90,15 +90,37 @@ jobs:
       # flag rejection, cwd anchoring, error passthrough — reported green on all
       # three OSes while running nothing (audit 2026-08-02). Installing it is what
       # makes those tests exist in CI.
+      # `timeout-minutes` is the point of this step's shape, not decoration. On
+      # 2026-08-19 an apt mirror stopped answering mid-`update` and TWO jobs — a
+      # release gate and this workflow's with-embed leg — sat on it for 29 and 40
+      # minutes before being killed by hand; the repo had already lost one run to
+      # the 6h ceiling the same way. A step-level timeout turns that into a fast,
+      # rerunnable failure on every OS, and the Linux retry below makes the
+      # ordinary mirror hiccup self-healing. Failing loudly is deliberate: these
+      # tests self-skip when `rg` is missing, so a swallowed install error is 43
+      # tests silently not running, which is what this step exists to prevent.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
         shell: bash
+        timeout-minutes: 8
         run: |
           if command -v rg >/dev/null 2>&1; then
             echo "ripgrep already present: $(rg --version | head -1)"
             exit 0
           fi
+          # `timeout(1)` is GNU coreutils — Linux only. macOS and Windows are
+          # bounded by timeout-minutes above instead.
+          install_linux() {
+            for attempt in 1 2 3; do
+              if timeout 120 sudo apt-get update && timeout 120 sudo apt-get install -y ripgrep; then
+                return 0
+              fi
+              echo "::warning::ripgrep install attempt ${attempt} failed or timed out; retrying"
+              sleep 5
+            done
+            return 1
+          }
           case "$RUNNER_OS" in
-            Linux)   sudo apt-get update && sudo apt-get install -y ripgrep ;;
+            Linux)   install_linux || { echo "::error::apt could not install ripgrep after 3 attempts"; exit 1; } ;;
             macOS)   brew install ripgrep ;;
             Windows) choco install ripgrep -y ;;
             *)       echo "::error::unhandled RUNNER_OS '$RUNNER_OS' — add its ripgrep install here"; exit 1 ;;
@@ -170,8 +192,24 @@ jobs:
 
       # Same reason as the matrix job above: the 43 ripgrep-backed cli_e2e tests
       # self-skip when `rg` is absent, so this leg ran them as no-ops too.
+      #
+      # This copy had neither the presence check nor a bound, and it is the one
+      # that sat 40 minutes on a stalled apt mirror on 2026-08-19. Same shape as
+      # the matrix step now.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        timeout-minutes: 8
+        run: |
+          if command -v rg >/dev/null 2>&1; then rg --version; exit 0; fi
+          for attempt in 1 2 3; do
+            if timeout 120 sudo apt-get update && timeout 120 sudo apt-get install -y ripgrep; then
+              rg --version
+              exit 0
+            fi
+            echo "::warning::ripgrep install attempt ${attempt} failed or timed out; retrying"
+            sleep 5
+          done
+          echo "::error::apt could not install ripgrep after 3 attempts"
+          exit 1
 
       # --all-targets matches the no-embed leg (:92): without it the embed
       # feature's test and bench targets are never type-checked here.

@@ -92,12 +92,27 @@ jobs:
       # test class is exactly what it must not have. Mirrored in cache-warm.yml
       # `warm-gate`, which installs ripgrep for the same reason.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        timeout-minutes: 8
         run: |
-          # Short-circuit keeps an apt mirror hiccup off this critical path
-          # (ci.yml's step has the same guard).
+          # The short-circuit alone did NOT keep an apt hiccup off this path, as
+          # an earlier version of this comment claimed it would: no runner ships
+          # ripgrep (see ci.yml's note), so on Linux the check always falls
+          # through to apt, and on 2026-08-19 this gate sat 29 minutes on a
+          # stalled mirror before being killed by hand — with the v0.122.0 tag
+          # already pushed and nothing published, since every later job needs
+          # this one. The bound and the retry are what actually keep it off the
+          # critical path; the check only helps a runner that has `rg` already.
           if command -v rg >/dev/null 2>&1; then rg --version; exit 0; fi
-          sudo apt-get update && sudo apt-get install -y ripgrep
-          rg --version
+          for attempt in 1 2 3; do
+            if timeout 120 sudo apt-get update && timeout 120 sudo apt-get install -y ripgrep; then
+              rg --version
+              exit 0
+            fi
+            echo "::warning::ripgrep install attempt ${attempt} failed or timed out; retrying"
+            sleep 5
+          done
+          echo "::error::apt could not install ripgrep after 3 attempts"
+          exit 1
 
       # ci.yml has this same assertion, but ci.yml never runs on a tag — and the
       # mode reverted invisibly once already in the batch that added it (a
@@ -228,11 +243,15 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
+      # Bounded like every other apt call here: this one sits on the release
+      # critical path, where an unbounded stall costs a hand-killed run with the
+      # tag already pushed.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          timeout 120 sudo apt-get update
+          timeout 120 sudo apt-get install -y gcc-aarch64-linux-gnu
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # `--features embed-model` keeps npm/npx/plugin users on the full hybrid
