@@ -239,17 +239,33 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     };
     // Non-blocking probe: if we CAN take LOCK_EX, nobody holds it — unlock at once
     // so we never disturb the real primary-acquisition path. If we can't, it's held.
+    //
+    // EINTR is retried rather than answered. It means a signal arrived mid-call,
+    // i.e. we never learned anything, and this probe's non-answer reads as "free"
+    // — which for `lock_index_for_replace` means proceeding to replace an index a
+    // live server may be writing. A retry costs nothing and removes the one
+    // transient that could turn a held lock into a destructive go-ahead
+    // (pre-tag review, Minor #1). The bound is a formality: a non-blocking flock
+    // returns immediately, so it cannot be interrupted repeatedly.
+    //
     // SAFETY: `file` is an open File owned by this scope, so `as_raw_fd()` is a valid
-    // live fd; both flock calls act on that same fd before `file` is dropped.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return false;
-    }
+    // live fd; every flock call acts on that same fd before `file` is dropped.
+    let mut attempts = 0u8;
+    let err = loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return false;
+        }
+        let e = std::io::Error::last_os_error();
+        attempts += 1;
+        if e.raw_os_error() != Some(libc::EINTR) || attempts >= 5 {
+            break e;
+        }
+    };
     // Only EWOULDBLOCK means somebody holds it. Anything else is a non-answer,
     // and answering "held" would make lock_index_for_replace refuse the run —
     // the same asymmetry the non-Unix probe below deliberately avoids.
-    let err = std::io::Error::last_os_error();
     if is_flock_conflict(err.raw_os_error()) {
         true
     } else {

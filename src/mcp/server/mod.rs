@@ -926,6 +926,7 @@ impl McpServer {
         let spawn_fail_flag = Arc::clone(&self.indexing.startup_indexing);
         let spawn_fail_done = Arc::clone(&self.indexing.startup_indexing_done);
         let spawn_fail_progress = progress_file.clone();
+        let spawn_fail_error = Arc::clone(&self.indexing.startup_index_error);
 
         // Explicit stack size, not `thread::spawn`'s 2 MiB default: the relation
         // walker recurses to MAX_RELATION_DEPTH and a stack overflow here is an
@@ -1059,10 +1060,19 @@ impl McpServer {
 
         // A failed spawn drops the closure, so the IndexGuard that normally clears
         // `startup_indexing` and signals the done condvar never exists. Without this
-        // arm the flag stays set forever and every ensure_indexed() caller waits on
-        // an index run that will never happen.
+        // arm the flag stays set forever, `consume_startup_index_result` bails on it
+        // every time, and nothing downstream of indexing — the watcher, the embedding
+        // backfill — ever starts for the session. Each ensure_indexed() caller still
+        // returns after its bounded grace wait, so the session is degraded rather
+        // than hung.
+        //
+        // The error goes into the same slot a failed index run uses, so it reaches
+        // the MCP client instead of living only in stderr `tracing` where no client
+        // can see it (pre-tag review, Minor #2).
         if let Err(e) = spawned {
             tracing::error!("Failed to spawn background indexing thread: {}", e);
+            *lock_or_recover(&spawn_fail_error, "startup_error") =
+                Some(format!("could not start background indexing: {e}"));
             spawn_fail_flag.store(false, Ordering::Release);
             let (lock, cvar) = &*spawn_fail_done;
             *lock_or_recover(lock, "startup_indexing_done") = true;

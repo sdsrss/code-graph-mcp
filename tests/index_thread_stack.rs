@@ -77,12 +77,20 @@ fn startup_index_thread_declares_its_stack_size() {
             scanned += 1;
             let src = std::fs::read_to_string(&path).expect("read source file");
             if let Some(start) = src.find("fn spawn_startup_indexing") {
-                // Function body ends at the next item at the same indentation.
+                // Body ends at the next method declared at the same indentation.
+                // Matching on the visibility spelling would miss `pub(super) fn`
+                // and friends and run the region to EOF, which then trips the
+                // no-`thread::spawn` assertion on an unrelated method — a false
+                // red rather than a false green, but still noise.
                 let rest = &src[start..];
                 let end = rest[1..]
-                    .find("\n    fn ")
-                    .or_else(|| rest[1..].find("\n    pub fn "))
-                    .map(|i| i + 1)
+                    .match_indices("\n    ")
+                    .map(|(i, _)| i + 1)
+                    .find(|&i| {
+                        let line = rest[i..].lines().nth(1).unwrap_or("").trim_start();
+                        line.starts_with("fn ")
+                            || (line.starts_with("pub") && line.contains(" fn "))
+                    })
                     .unwrap_or(rest.len());
                 body = Some(rest[..end].to_string());
             }
@@ -94,9 +102,14 @@ fn startup_index_thread_declares_its_stack_size() {
         "fn spawn_startup_indexing not found under src/mcp/server — \
          the guard must be repointed at wherever the index thread is now spawned",
     );
+    // Match the CALL, not the constant's name: the spawn site is introduced by a
+    // comment that names the constant, so asserting on the bare identifier passed
+    // with `.stack_size(...)` deleted — the guard was vacuous until a mutation
+    // test caught it.
     assert!(
-        body.contains("INDEX_THREAD_STACK_SIZE"),
-        "spawn_startup_indexing must size its thread from domain::INDEX_THREAD_STACK_SIZE"
+        body.contains(".stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)"),
+        "spawn_startup_indexing must pass domain::INDEX_THREAD_STACK_SIZE to \
+         Builder::stack_size (naming the constant in a comment is not sizing the thread)"
     );
     assert!(
         !body.contains("std::thread::spawn("),

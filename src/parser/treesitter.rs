@@ -1493,6 +1493,21 @@ fn is_decoration(node: &tree_sitter::Node) -> bool {
     matches!(node.kind(), "decorator" | "attribute_item" | "annotation")
 }
 
+/// An INNER doc comment — Rust's `//!` and `/*!`, which document the module or
+/// crate that ENCLOSES them, never the item that follows.
+///
+/// The sibling walk cannot tell the two apart by node kind (both are
+/// `line_comment`), so a file opening with `//! What this module does` handed
+/// that text to its first declaration as if it were the declaration's own doc.
+/// Pre-existing — an undecorated `//! doc` + `pub struct S;` mis-attributed the
+/// same way before decorations were skipped — but stepping over `attribute_item`
+/// widened its reach to the `#[derive(…)]`-first files that are the common Rust
+/// layout, so it is fixed here rather than left to grow.
+fn is_inner_doc_comment(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("//!") || t.starts_with("/*!")
+}
+
 fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<String> {
     fn scan_siblings(node: &tree_sitter::Node, source: &str) -> Vec<String> {
         let mut comments = Vec::new();
@@ -1510,7 +1525,14 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
                     // from this declaration by that code.
                     break;
                 }
-                comments.push(node_text(&prev, source).to_string());
+                let text = node_text(&prev, source);
+                if is_inner_doc_comment(text) {
+                    // Documents the enclosing module, not this declaration. Stop
+                    // rather than skip: anything above a module header belongs to
+                    // the module too.
+                    break;
+                }
+                comments.push(text.to_string());
                 current = prev.prev_sibling();
             } else if is_decoration(&prev) {
                 // Step over it: the comment documents the declaration the
@@ -1528,6 +1550,16 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
     // parent's FIRST named child — in Go's `// GROUP_DOC\ntype ( Alpha …; Beta … )`
     // the spec `Beta` is not first, and without that check the group's doc
     // comment would document it too (`test_wrapper_climb_skips_later_group_members`).
+    //
+    // KNOWN HOLE, pre-dating this check and NOT closed by it: the first-named-child
+    // rule does not stop `/** DOC */ export const a = 1, b = 2;` from giving DOC to
+    // BOTH `a` and `b`, because `extract_named_arrows` hands this walk the
+    // `lexical_declaration`, so every declarator in the statement resolves to the
+    // one comment above it (measured; same for `export let` and for arrow-valued
+    // declarators). The v63 INDEX_VERSION note claims the check prevents exactly
+    // this, citing the UNEXPORTED `const a = 1, b = 2` — which is vacuous, since
+    // that form produces no nodes at all. Deciding which declarator owns a shared
+    // doc is a design call, not a bug fix, and is deliberately left open here.
     //
     // The 3-level bound is defence-in-depth, NOT a measured chain: the pre-tag
     // review walked every call site and every supported grammar and found that a
@@ -3096,6 +3128,47 @@ def undocumented(x):
             "doc_comment lost for {} decorated case(s):\n  {}",
             missing.len(),
             missing.join("\n  ")
+        );
+    }
+
+    /// A Rust `//!` block documents the module that CONTAINS it, so it must not
+    /// become the doc of the module's first declaration.
+    ///
+    /// Both arms matter and they fail for different reasons. The undecorated one
+    /// is the older bug — the sibling walk cannot tell `//!` from `///` by node
+    /// kind, both being `line_comment`. The decorated one is what made it worth
+    /// fixing now: stepping over `attribute_item` extended the mis-attribution to
+    /// `//!` header + `#[derive(…)]` + type, which is the ordinary Rust file
+    /// layout. The `///` arm is the positive control — the fix must not silence
+    /// real doc comments.
+    #[test]
+    fn test_inner_module_doc_is_not_a_declarations_doc() {
+        let doc_of = |src: &str| {
+            parse_code(src, "rust")
+                .unwrap()
+                .iter()
+                .find(|n| n.name == "S")
+                .and_then(|n| n.doc_comment.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            doc_of("//! module doc\npub struct S;\n").is_empty(),
+            "an inner doc comment must not document the next item, got {:?}",
+            doc_of("//! module doc\npub struct S;\n")
+        );
+        assert!(
+            doc_of("//! module doc\n#[derive(Debug)]\npub struct S;\n").is_empty(),
+            "the decoration skip must not carry an inner doc comment across, got {:?}",
+            doc_of("//! module doc\n#[derive(Debug)]\npub struct S;\n")
+        );
+        assert!(
+            doc_of("/*! block module doc */\npub struct S;\n").is_empty(),
+            "the block spelling of an inner doc must behave the same, got {:?}",
+            doc_of("/*! block module doc */\npub struct S;\n")
+        );
+        assert!(
+            doc_of("/// item doc\n#[derive(Debug)]\npub struct S;\n").contains("item doc"),
+            "a real outer doc comment must still reach its item"
         );
     }
 
