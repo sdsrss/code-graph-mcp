@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.122.1 (2026-08-19)
+
+> **Nothing changes for you.** This release carries no source change — the
+> binary is identical to v0.122.0 — and no index rebuild (INDEX_VERSION stays
+> 64). It exists to cut a release through the repaired pipeline described below.
+> If you are on v0.122.0 you can stay there.
+
+### CI: an apt call can no longer hang a job for six hours
+
+Cutting v0.122.0 ran into an apt mirror that stopped answering mid-`update`.
+Three workflows stalled on the same step simultaneously — the release gate (29
+minutes, with the tag already pushed and every later job blocked behind it), the
+`with-embed` test leg (40 minutes) and the cache-priming job — and all three had
+to be killed by hand. Nothing was published, because the gate is the first job
+and everything else waits on it; the release went out cleanly on a re-trigger of
+the same tag. This repository had already lost one run to the six-hour job
+ceiling the same way.
+
+The guard those steps carried was not guarding anything. Its comment said the
+`command -v rg` short-circuit "keeps an apt mirror hiccup off this critical
+path", but no GitHub runner ships ripgrep — a fact stated two comments further
+up in the same file — so on Linux the check always falls through to apt. It only
+ever helped a runner that already had it.
+
+Every apt call now carries a step-level timeout, and the Linux paths retry three
+times with a per-attempt bound so an ordinary hiccup heals itself. Failure still
+fails loudly rather than being swallowed: the grep-backed tests self-skip when
+ripgrep is missing, so ignoring an install error would trade a visible hang for
+43 tests quietly not running.
+
+The same install had been copy-pasted into four places and the cross-compiler
+install into two more, so a test now walks every workflow and fails on any apt
+step without a timeout. It found a sixth site on its first run — one on the
+release critical path that the manual sweep had missed.
+
 ## v0.122.0 (2026-08-19)
 
 > **Upgrade note — your index rebuilds once, and more of your symbols come back
