@@ -1,5 +1,8 @@
 use super::*;
-use crate::domain::{REL_EXPORTS, REL_REFERENCES, REL_ROUTES_TO};
+// REL_CALLS is imported here rather than inherited through `use super::*`: the
+// calls axis moved to `calls.rs`, so the parent no longer names it and a
+// non-test build would flag the parent's import unused.
+use crate::domain::{REL_CALLS, REL_EXPORTS, REL_REFERENCES, REL_ROUTES_TO};
 
 #[test]
 fn test_extract_php_include_imports() {

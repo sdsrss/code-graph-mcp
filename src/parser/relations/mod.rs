@@ -14,17 +14,25 @@
 //! - `rust`: Rust-specific `use` and `impl Trait for Type`
 //! - `dart`: Dart-specific imports and call expressions
 //!
+//! - `calls`: the `calls` axis as a table, one row per (language, node kind)
+//!
 //! `walk_for_relations` is the single recursive dispatcher that maps tree-sitter
-//! node kinds to the appropriate extractor. It must keep all language arms in
-//! one match because they share `current_scope` / `current_class` propagation
-//! (splitting it per-language would either duplicate the recursion or lose
-//! scope context across language-specific arms).
+//! node kinds to the appropriate extractor. The RECURSION must stay in one place
+//! — it is what propagates `current_scope` / `current_class` / `current_rust_impl`
+//! down the tree, and splitting it per language would either duplicate the walk
+//! or lose that context. The EXTRACTION does not have to: the `references` and
+//! `calls` axes are tables (`REFERENCE_PASSES`, `calls::CALL_PASSES`) whose
+//! extractors receive the resolved context, which makes those axes enumerable —
+//! a language missing from a table is a visible empty slot rather than an absent
+//! `if` nobody notices. The remaining `match` arms (imports, heritage, exports)
+//! are the axes not yet converted.
 
 use super::lang_config::LanguageConfig;
 use super::node_text;
-use crate::domain::{MAX_RELATION_DEPTH, REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS};
+use crate::domain::{MAX_RELATION_DEPTH, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS};
 use anyhow::Result;
 
+mod calls;
 mod cpp;
 mod dart;
 mod exports;
@@ -83,7 +91,7 @@ use cpp::{extract_cpp_inheritance, extract_cpp_value_reference};
 use dart::{extract_dart_call_from_selector, extract_dart_imports};
 use exports::{extract_cjs_exports, extract_export_names};
 use go::{extract_go_inheritance, extract_go_type_reference, extract_go_value_reference};
-use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
+use helpers::{extract_string_from_subtree, MAX_SUBTREE_DEPTH};
 use imports::{
     extract_import_names, extract_python_from_import_names, extract_python_import_names,
 };
@@ -632,501 +640,31 @@ fn walk_for_relations(
         }
     }
 
-    // Call-expression dispatch — adding a new language with a non-standard
-    // call node kind MUST add its own arm below. Tree-sitter grammars don't
-    // agree on a single name: JS/TS/Rust/Go/Java/C/C++/Kotlin/Swift/Dart use
-    // `call_expression` (the default arm), Python/Ruby use `call`, PHP splits
-    // into three node kinds, C# uses `invocation_expression`, Bash uses
-    // `command`. Missing arms = silently-dropped edges, not compile errors.
+    // The `calls` axis lives in a TABLE (`calls::CALL_PASSES`), not in arms of
+    // the match below. Tree-sitter grammars disagree on what a call node is
+    // called — `call_expression` / `call` / `method_invocation` /
+    // `invocation_expression` / three PHP kinds / a Dart `selector` / a Bash
+    // `command` — so the (language, node kind) → extractor mapping is data, and
+    // as data it is enumerable instead of being a run of `if`s where a missing
+    // language is an absent edge nobody notices. The table's kinds are disjoint
+    // from every arm left in the match, so running it here preserves the
+    // one-handler-per-node semantics it was carved out of.
+    calls::run_call_passes(
+        &calls::CallCtx {
+            node,
+            source,
+            language,
+            config,
+            active_scope,
+            current_rust_impl,
+        },
+        results,
+    );
+
+    // The axes not yet converted: imports, heritage, exports. Adding a language
+    // here still means adding an arm, and a missing one is a silently-dropped
+    // edge rather than a compile error.
     match kind {
-        // Call expressions
-        "call_expression" => {
-            // JS/TS CommonJS: require('./foo') / require('pkg') → IMPORTS edge.
-            // Mirrors the Ruby `require` handling above; target is the last path
-            // segment so node_modules imports become `<external>` sentinels and
-            // relative imports can match a file module node by name.
-            if matches!(config.name, "javascript" | "typescript" | "tsx")
-                && node
-                    .child_by_field_name("function")
-                    .map(|f| node_text(&f, source) == "require")
-                    .unwrap_or(false)
-            {
-                if let Some(args) = node.child_by_field_name("arguments") {
-                    if let Some(first) = args.named_child(0) {
-                        if let Some(path) = extract_string_from_subtree(&first, source) {
-                            // Normalize `node:fs` → `fs`; strip trailing JS extensions.
-                            let normalized = path.strip_prefix("node:").unwrap_or(&path);
-                            let segment = normalized
-                                .trim_end_matches(".js")
-                                .trim_end_matches(".ts")
-                                .trim_end_matches(".mjs")
-                                .trim_end_matches(".cjs")
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(normalized)
-                                .to_string();
-                            if !segment.is_empty() {
-                                results.push(ParsedRelation {
-                                    source_name: "<module>".into(),
-                                    target_name: segment,
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                    source_language: String::new(),
-                                });
-                            }
-
-                            // Destructured require: `const { foo, bar } = require('./x')`.
-                            // Emit a per-name import stamped with the full specifier so
-                            // js_modules resolution binds each name to the required file's
-                            // export (and Phase 2d-bind repoints calls made under the EXPORT
-                            // name) — the CommonJS analog of ES named imports. The last-segment
-                            // module import above is kept for module-level dep tracking.
-                            if let Some(decl) =
-                                node.parent().filter(|p| p.kind() == "variable_declarator")
-                            {
-                                if let Some(name_node) = decl.child_by_field_name("name") {
-                                    if name_node.kind() == "object_pattern" {
-                                        let metadata =
-                                            serde_json::json!({ "js_module": &path }).to_string();
-                                        for i in 0..name_node.named_child_count() {
-                                            if let Some(binding) = name_node.named_child(i) {
-                                                // Shorthand `{ foo }` → the binding name; renamed
-                                                // `{ foo: f }` (pair_pattern) → the KEY (export name),
-                                                // since that is what the required file exports.
-                                                // The import edge is correct either way, but Phase
-                                                // 2d-bind keys on the export name: a shorthand call
-                                                // (`foo()`, local == export) is repointed; a renamed
-                                                // local call (`f()`) is NOT (known long-tail limit —
-                                                // see feedback_import_aware_call_resolution).
-                                                let imported = match binding.kind() {
-                                                    "shorthand_property_identifier_pattern" => {
-                                                        Some(
-                                                            node_text(&binding, source).to_string(),
-                                                        )
-                                                    }
-                                                    "pair_pattern" => binding
-                                                        .child_by_field_name("key")
-                                                        .map(|k| node_text(&k, source).to_string()),
-                                                    _ => None,
-                                                };
-                                                if let Some(name) = imported {
-                                                    if !name.is_empty() {
-                                                        results.push(ParsedRelation {
-                                                            source_name: "<module>".into(),
-                                                            target_name: name,
-                                                            relation: REL_IMPORTS.into(),
-                                                            metadata: Some(metadata.clone()),
-                                                            source_language: String::new(),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if name_node.kind() == "identifier" {
-                                        // Namespace require: `const helper = require('./x')`.
-                                        // Emit a binding marker (var → specifier) so Phase 2
-                                        // resolves `helper.foo()` member calls to the required
-                                        // module file. Marker only — the variable itself is not
-                                        // a symbol, so Phase 2 must consume it without a name edge.
-                                        let var = node_text(&name_node, source).to_string();
-                                        if !var.is_empty() {
-                                            results.push(ParsedRelation {
-                                                source_name: "<module>".into(),
-                                                target_name: var,
-                                                relation: REL_IMPORTS.into(),
-                                                metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
-                                                source_language: String::new(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check for HTTP route registration patterns first. Vec: one axum
-            // `.route(path, get(a).post(b))` call registers several routes.
-            results.extend(extract_route_pattern(&node, source, language));
-
-            // Call relation extraction. For JS/TS/TSX + Kotlin/Swift, fall back to
-            // `<module>` when the call sits at file top level (imports, init code)
-            // or inside an anonymous callback (test/describe/it, Array.map, etc.)
-            // so same-file edges can still resolve — Kotlin and Swift both allow
-            // executable statements at file top level (`main`-less scripts, global
-            // `val x = compute()`). Rust/Go/C also route through this
-            // `call_expression` arm but are deliberately excluded: their top-level
-            // omission is intentional (no bare top-level call statements in Rust/Go;
-            // C calls only appear inside functions), so leaving them at `None`
-            // keeps their callgraphs clean.
-            let call_scope: Option<String> = match active_scope {
-                Some(s) => Some(s.to_string()),
-                None if matches!(
-                    config.name,
-                    "javascript" | "typescript" | "tsx" | "kotlin" | "swift"
-                ) =>
-                {
-                    Some("<module>".to_string())
-                }
-                None => None,
-            };
-            if let Some(scope) = call_scope {
-                if let Some((callee, mut qualifier)) =
-                    extract_callee(&node, source, language, current_rust_impl)
-                {
-                    // A BARE Rust callee whose name is a local binding of the
-                    // enclosing fn is a closure/fn-pointer call, not a call of the
-                    // same-named global fn — Rust's value namespace makes the
-                    // local win.
-                    //
-                    // "Bare" must be decided STRUCTURALLY (the `function` field is
-                    // an `identifier`), NOT from `CalleeQualifier::Bare`: that
-                    // variant is also `extract_rust_field`'s fallback arm for a
-                    // method call whose receiver is not self / a plain identifier /
-                    // a call. `ctx.db.conn()` has a `field_expression` receiver and
-                    // so reports Bare — gating on the enum dropped 14 real
-                    // `Database::conn` edges in this repo alone, every `cmd_*` that
-                    // writes `let conn = ctx.db.conn();`, because the method name
-                    // matched the local it is assigned to.
-                    let bare_call = node
-                        .child_by_field_name("function")
-                        .is_some_and(|f| f.kind() == "identifier");
-                    let shadowed = language == "rust"
-                        && bare_call
-                        && rust::shadowed_by_enclosing_local(&node, source, &callee);
-                    if !shadowed {
-                        // Fill SelfRecv/SelfType payload from current impl context.
-                        // The helper emits these with empty payload because it
-                        // doesn't know the enclosing impl's type; we know it here.
-                        let needs_payload = matches!(&qualifier,
-                            helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) if t.is_empty()
-                        );
-                        if needs_payload {
-                            match &mut qualifier {
-                                helpers::CalleeQualifier::SelfRecv(t)
-                                | helpers::CalleeQualifier::SelfType(t) => {
-                                    if let Some(impl_type) = current_rust_impl {
-                                        *t = impl_type.to_string();
-                                    } else {
-                                        // self/Self called outside an impl block — drop qualifier (Bare).
-                                        qualifier = helpers::CalleeQualifier::Bare;
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        let metadata = serialize_callee_qualifier(&qualifier);
-                        results.push(ParsedRelation {
-                            source_name: scope,
-                            target_name: callee,
-                            relation: REL_CALLS.into(),
-                            metadata,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Rust/Go: struct instantiation → calls edge (enables cross-file dead code tracking)
-        // e.g., `MyStruct { field: value }` or `MyStruct::new()` (calls already handled above)
-        "struct_expression" => {
-            if let Some(scope) = active_scope {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let struct_name = node_text(&name_node, source);
-                    // Strip path prefix: path::MyStruct → MyStruct
-                    let short_name = struct_name.rsplit("::").next().unwrap_or(struct_name);
-                    if !short_name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: short_name.to_string(),
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // JS/TS/TSX: `new Foo()` / `new ns.Foo()` constructor instantiation →
-        // calls edge to the class (constructor) name. A `new_expression`'s callee
-        // is its `constructor` field, which never reaches the `call_expression`
-        // arm above, so a class that is only instantiated (never called as a
-        // `Foo.method()`) had NO incoming calls edge — invisible to
-        // callgraph/impact. The JS value-reference pass emits a `references` edge
-        // only in value positions (call arg, binding RHS, return, ...), NOT for a
-        // `new` constructor slot (parent is `new_expression`), so such a class was
-        // also edgeless and false-flagged dead-code. Mirrors the Rust
-        // `struct_expression` arm. Generic args (`new Foo<T>()`) are a separate
-        // `type_arguments` field, but a `<...>` tail is stripped defensively.
-        // Member form `new ns.Foo()` yields callee `Foo` with a Receiver("ns")
-        // qualifier when the receiver is a simple identifier — consistent with how
-        // member `call_expression`s are handled. Scope mirrors the call arm
-        // (`<module>` fallback at file top level).
-        "new_expression" if matches!(config.name, "javascript" | "typescript" | "tsx") => {
-            let scope = active_scope
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "<module>".to_string());
-            if let Some(ctor) = node.child_by_field_name("constructor") {
-                let callee: Option<(String, helpers::CalleeQualifier)> = match ctor.kind() {
-                    "identifier" => {
-                        let raw = node_text(&ctor, source);
-                        let name = raw.split('<').next().unwrap_or(raw).trim();
-                        (!name.is_empty())
-                            .then(|| (name.to_string(), helpers::CalleeQualifier::Bare))
-                    }
-                    "member_expression" => ctor.child_by_field_name("property").and_then(|prop| {
-                        let raw = node_text(&prop, source);
-                        let name = raw.split('<').next().unwrap_or(raw).trim();
-                        if name.is_empty() {
-                            return None;
-                        }
-                        let qual = ctor
-                            .child_by_field_name("object")
-                            .filter(|o| o.kind() == "identifier")
-                            .map(|o| {
-                                helpers::CalleeQualifier::Receiver(
-                                    node_text(&o, source).to_string(),
-                                )
-                            })
-                            .unwrap_or(helpers::CalleeQualifier::Bare);
-                        Some((name.to_string(), qual))
-                    }),
-                    _ => None,
-                };
-                if let Some((name, qualifier)) = callee {
-                    results.push(ParsedRelation {
-                        source_name: scope,
-                        target_name: name,
-                        relation: REL_CALLS.into(),
-                        metadata: serialize_callee_qualifier(&qualifier),
-                        source_language: String::new(),
-                    });
-                }
-            }
-        }
-
-        // C#: `new Foo()` / `new Ns.Bar()` object creation → calls edge to the
-        // class (constructor) name. `object_creation_expression` is distinct from
-        // `invocation_expression` (handled below), and C# has no type-reference
-        // pass, so a class that is only instantiated had NO incoming edge and was
-        // false-flagged dead-code. Mirrors the JS `new_expression` arm; top-level
-        // `new` (C# 9 top-level program) attributes to `<module>` like the C#
-        // invocation arm. The class name is the `type` field: an `identifier`
-        // (`new Foo()`) or a `qualified_name` (`new Ns.Bar()` → its `name` field).
-        "object_creation_expression" if config.name == "csharp" => {
-            let scope = active_scope.unwrap_or("<module>");
-            if let Some(ty) = node.child_by_field_name("type") {
-                let raw = match ty.kind() {
-                    "qualified_name" => ty
-                        .child_by_field_name("name")
-                        .map(|n| node_text(&n, source)),
-                    _ => Some(node_text(&ty, source)),
-                };
-                if let Some(raw) = raw {
-                    let name = raw.split('<').next().unwrap_or(raw).trim();
-                    if !name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: name.to_string(),
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // PHP: `new Foo()` / `new Ns\Bar()` object creation → calls edge to the
-        // class (constructor) name. PHP has no type-reference pass, so a class only
-        // instantiated had NO incoming edge and was false-flagged dead-code.
-        // Mirrors the JS/C# arms. The type is a positional `name` or
-        // `qualified_name` child (no field); for a qualified name the class is the
-        // last `name` segment (namespace prefix lives under `namespace_name`).
-        // `new self()/static()/parent()` and `new $var()` are relative/dynamic —
-        // skipped (a `self`/`static`/`parent` edge is pure noise; a variable is not
-        // a class name).
-        "object_creation_expression" if config.name == "php" => {
-            let scope = active_scope.unwrap_or("<module>");
-            let type_node = (0..node.named_child_count())
-                .filter_map(|i| node.named_child(i))
-                .find(|c| matches!(c.kind(), "name" | "qualified_name"));
-            if let Some(ty) = type_node {
-                let name = if ty.kind() == "qualified_name" {
-                    (0..ty.named_child_count())
-                        .filter_map(|i| ty.named_child(i))
-                        .rfind(|c| c.kind() == "name")
-                        .map(|n| node_text(&n, source).to_string())
-                } else {
-                    Some(node_text(&ty, source).to_string())
-                };
-                if let Some(name) = name {
-                    if !name.is_empty() && !matches!(name.as_str(), "self" | "static" | "parent") {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: name,
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Python: tree-sitter-python uses `call` (not `call_expression`) for every
-        // function/method invocation. Without this branch all Python call edges
-        // are silently dropped — README documents Python as Full tier, and
-        // module_overview / impact_analysis / find_dead_code all rely on this
-        // edge. Routes and `from X import Y` already extracted via other arms.
-        "call" if config.name == "python" => {
-            // Top-level (module / class-body) calls attribute to `<module>`
-            // rather than being dropped — a function invoked only at import time
-            // (`app.run()`, a bare `main_entry()`) would otherwise have no
-            // incoming edge and be reported dead. Undefined callees (print,
-            // os.path.join, …) drop at Phase-2 same-language resolution, so this
-            // only adds edges to defined same-project functions. Mirrors the
-            // bash/js `<module>` fallback.
-            let scope = active_scope.unwrap_or("<module>");
-            if let Some(callee) = helpers::extract_callee_name(&node, source) {
-                // Receiver-type propagation (issue #32 cause 2): when the call is
-                // `recv.method()` and `recv`'s type is fixed by a single local
-                // `recv = ClassName(...)` constructor assignment, stamp
-                // `{"q":"rtype","v":"ClassName"}` so Phase-2 resolution binds it to
-                // `ClassName.method` (self_filter_candidates) instead of dropping
-                // the ambiguous by-name fan-out across every same-named method.
-                // Falls back to the bare, metadata-less form (unchanged behavior)
-                // whenever the type can't be proven — never emits a wrong-type edge.
-                let metadata = infer_python_call_receiver_type(&node, source)
-                    .map(|ty| serialize_rtype_metadata(&ty));
-                results.push(ParsedRelation {
-                    source_name: scope.to_string(),
-                    target_name: callee,
-                    relation: REL_CALLS.into(),
-                    metadata,
-                    source_language: String::new(),
-                });
-            }
-        }
-
-        // Ruby: `call` node kind for method calls (require, require_relative, and regular calls)
-        "call" if config.name == "ruby" => {
-            // Extract method name from the "method" field
-            if let Some(method_node) = node.child_by_field_name("method") {
-                let method_name = node_text(&method_node, source);
-                // require 'json' / require_relative 'helper'
-                if method_name == "require" || method_name == "require_relative" {
-                    if let Some(args) = node.child_by_field_name("arguments") {
-                        if let Some(first_arg) = args.named_child(0) {
-                            if let Some(string_val) =
-                                extract_string_from_subtree(&first_arg, source)
-                            {
-                                results.push(ParsedRelation {
-                                    source_name: active_scope.unwrap_or("<module>").to_string(),
-                                    target_name: string_val,
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                    source_language: String::new(),
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    // Regular method call. Top-level calls attribute to
-                    // `<module>` (same rationale as the python/bash arms) so a
-                    // top-level entry call isn't dropped; undefined callees drop
-                    // at Phase-2 same-language resolution.
-                    let scope = active_scope.unwrap_or("<module>");
-                    results.push(ParsedRelation {
-                        source_name: scope.to_string(),
-                        target_name: method_name.to_string(),
-                        relation: REL_CALLS.into(),
-                        metadata: None,
-                        source_language: String::new(),
-                    });
-                }
-            }
-        }
-
-        // Java: tree-sitter-java uses `method_invocation` (NOT `call_expression`)
-        // for every method call — `foo()`, `this.foo()`, `obj.foo()`, `Type.foo()`.
-        // The callee name is the `name` field; the optional `object` field is the
-        // receiver. Without this arm ALL Java call edges were silently dropped
-        // despite Java being documented Full tier — callgraph / impact_analysis /
-        // find_dead_code all depend on these edges. Bare callee name mirrors the
-        // Python/Ruby arms; downstream target resolution disambiguates same names.
-        "method_invocation" if config.name == "java" => {
-            if let Some(scope) = active_scope {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let callee = node_text(&name_node, source).to_string();
-                    if !callee.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: callee,
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // PHP: function_call_expression (doSomething()), member_call_expression ($this->move()),
-        // scoped_call_expression (User::all())
-        "function_call_expression" | "member_call_expression" | "scoped_call_expression"
-            if config.name == "php" =>
-        {
-            // Top-level calls (outside any function/method) attribute to `<module>`
-            // rather than being dropped, mirroring the python/ruby/bash arms — a
-            // function invoked only at the top level (`greetPhp();`) would otherwise
-            // have no incoming edge and be false-reported as dead. Undefined callees
-            // drop at Phase-2 same-language resolution.
-            {
-                let scope = active_scope.unwrap_or("<module>");
-                // All three PHP call types have a `name` child for the method/function name
-                // For scoped_call_expression, there are multiple `name` children; the second is the method
-                let callee = if kind == "scoped_call_expression" {
-                    // User::all() -> children: name("User"), "::", name("all"), arguments
-                    // The method name is the second `name` child
-                    let mut names = Vec::new();
-                    for i in 0..node.child_count() {
-                        if let Some(child) = node.child(i) {
-                            if child.kind() == "name" {
-                                names.push(node_text(&child, source).to_string());
-                            }
-                        }
-                    }
-                    names.pop() // Last name is the method
-                } else {
-                    // function_call_expression: name("doSomething"), arguments
-                    // member_call_expression: variable_name("$this"), "->", name("move"), arguments
-                    node.child_by_field_name("name")
-                        .or_else(|| {
-                            // Fallback: find the `name` node among children
-                            (0..node.child_count())
-                                .filter_map(|i| node.child(i))
-                                .find(|c| c.kind() == "name")
-                        })
-                        .map(|n| node_text(&n, source).to_string())
-                };
-                if let Some(name) = callee {
-                    if !name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: name,
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
         // PHP file includes: require / require_once / include / include_once
         // 'path/File.php' → IMPORTS to the bare file stem. Mirrors the C/C++
         // `#include` and JS `require` shape: strip the directory and the `.php`
@@ -1512,54 +1050,6 @@ fn walk_for_relations(
             }
         }
 
-        // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
-        "invocation_expression" if config.name == "csharp" => {
-            // Top-level statement calls (C# 9+ top-level programs) and calls in
-            // field initializers outside any method attribute to `<module>`
-            // rather than being dropped, mirroring the php/python/ruby arms — a
-            // function invoked only from a top-level statement would otherwise
-            // have no incoming edge and be false-reported as dead. Undefined
-            // callees drop at Phase-2 same-language resolution.
-            let scope = active_scope.unwrap_or("<module>");
-            if let Some(func) = node.named_child(0) {
-                let callee = match func.kind() {
-                    "identifier" => Some(node_text(&func, source).to_string()),
-                    "member_access_expression" => {
-                        // e.g. Console.WriteLine — extract "WriteLine"
-                        func.child_by_field_name("name")
-                            .map(|n| node_text(&n, source).to_string())
-                    }
-                    _ => None,
-                };
-                if let Some(name) = callee {
-                    if !name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: name,
-                            relation: REL_CALLS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Dart: a `selector` carrying an argument_part marks a call in ANY
-        // position (return / assignment / argument / binary expr / bare
-        // statement) — not just `expression_statement`. tree-sitter-dart has no
-        // single call_expression node, so the selector is the reliable marker;
-        // the callee is its preceding sibling. active_scope propagates down from
-        // the enclosing function_body, so deeply-nested calls still attribute.
-        "selector" if config.name == "dart" => {
-            // Library-level (top-level) calls attribute to `<module>` rather than
-            // being dropped, mirroring the php/python/ruby/C# arms — a top-level
-            // `main()`-free Dart script's calls would otherwise have no incoming
-            // edge. Undefined callees drop at Phase-2 same-language resolution.
-            let scope = active_scope.unwrap_or("<module>");
-            extract_dart_call_from_selector(&node, source, scope, results);
-        }
-
         // C/C++: `#include "foo.h"` → IMPORTS to "foo"
         //         `#include <stdio.h>` → IMPORTS to "stdio"
         // Header extension stripped so cross-file resolution can match the
@@ -1593,77 +1083,6 @@ fn walk_for_relations(
                             target_name: stem.to_string(),
                             relation: REL_IMPORTS.into(),
                             metadata,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Bash command invocation:
-        //   `source <file>` / `. <file>` → IMPORTS edge (mirrors JS require).
-        //   Otherwise: CALLS edge to command_name.
-        // External commands (cat, grep, ...) without a function_definition
-        // in any indexed shell file get dropped at Phase 2 same-language
-        // edge resolution (see feedback_edge_resolution_same_language).
-        "command" if config.name == "bash" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let raw = node_text(&name_node, source).trim();
-
-                if raw == "source" || raw == "." {
-                    // First non-command_name word/string sibling = the file path arg.
-                    let arg = (0..node.named_child_count())
-                        .filter_map(|i| node.named_child(i))
-                        .find(|n| matches!(n.kind(), "word" | "string" | "raw_string"));
-                    if let Some(arg_node) = arg {
-                        let text = node_text(&arg_node, source);
-                        let unquoted = text.trim_matches(|c| c == '"' || c == '\'');
-                        // Skip dynamic paths ($VAR, $(...), ${...}).
-                        if !unquoted.is_empty() && !unquoted.contains('$') {
-                            let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
-                            let stem = last.trim_end_matches(".sh").trim_end_matches(".bash");
-                            if !stem.is_empty() {
-                                results.push(ParsedRelation {
-                                    source_name: "<module>".into(),
-                                    target_name: stem.to_string(),
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                    source_language: String::new(),
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    // Top-level bash commands ARE the script's imperative
-                    // execution flow (unlike declarative-top-level langs like
-                    // Rust/Go), so attribute them to `<module>` instead of
-                    // dropping them — an entry-point function invoked only at
-                    // top level (`run_app "$@"`) would otherwise look dead.
-                    // External commands (cd, grep, …) with no same-language
-                    // function_definition drop at Phase-2 resolution, so this
-                    // doesn't pollute the callgraph. (Mirrors the JS/TS/TSX
-                    // top-level `<module>` fallback in the call_expression arm.)
-                    let scope = active_scope.unwrap_or("<module>");
-                    // Strip path prefix: ./foo, /usr/bin/foo, path/to/foo → foo
-                    let short = raw.rsplit('/').next().unwrap_or(raw);
-                    // Reject variable expansions ($VAR, ${VAR}), substitutions
-                    // ($(...), `...`), and concatenations (foo$VAR) — not statically
-                    // resolvable. Allow [a-zA-Z_.][a-zA-Z0-9_.-]* (covers `cat`,
-                    // `_helper`, `Backup_Files`, `script.sh`, `.bashrc`).
-                    let first_ok = short
-                        .chars()
-                        .next()
-                        .map(|c| c == '_' || c == '.' || c.is_ascii_alphabetic())
-                        .unwrap_or(false);
-                    let all_ok = short
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
-                    if first_ok && all_ok {
-                        results.push(ParsedRelation {
-                            source_name: scope.to_string(),
-                            target_name: short.to_string(),
-                            relation: REL_CALLS.into(),
-                            metadata: None,
                             source_language: String::new(),
                         });
                     }
