@@ -1,5 +1,103 @@
 # Changelog
 
+## v0.122.0 (2026-08-19)
+
+> **Upgrade note — your index rebuilds once, and more of your symbols come back
+> documented.** INDEX_VERSION moves 63 → 64 because `doc_comment` values change
+> for source you have already indexed: a declaration carrying a decorator,
+> attribute or annotation used to lose its documentation entirely. The rebuild is
+> automatic on first use. Measured on this repository's own Rust source, the
+> documented-symbol count went from 786 to 1100 (+39.9%) across an unchanged 2459
+> nodes, with all 6004 edges unchanged — comparing the two indexes' full
+> (source, target, relation) sets gives a symmetric difference of zero rows, so
+> nothing but `doc_comment` moved. Nothing else to do.
+
+### A decorator between a declaration and its doc comment no longer hides it
+
+Documentation lookup walks backwards from a declaration to the comment above it.
+That walk stopped at the first node that was not a comment, and the wrapper climb
+above it insisted the declaration be its parent's literally-first named child. So
+anything sitting in between — a decorator, an attribute, an annotation — cut the
+channel, and the symbol was indexed with no documentation at all.
+
+Which languages this hit is a property of their grammars rather than of their
+decoration syntax, which is why it stayed hidden: Java, Kotlin and Swift park
+annotations inside the declaration's own `modifiers`, C# and PHP inside an
+`attribute_list` field, and Python has a `decorated_definition` wrapper that was
+already handled. In all of those the comment stays the declaration's immediate
+previous sibling and nothing was ever wrong. The four that spell the decoration
+as a SIBLING all lost their docs:
+
+- **TypeScript and JavaScript** (`decorator`). `@Component({}) export class C {}`
+  puts the decorator inside the export statement ahead of the declaration, and
+  `@Get() findAll() {}` sits directly between the comment and the method. That is
+  the Angular and NestJS shape — in those codebases it is most of the documented
+  declarations in the project.
+- **Rust** (`attribute_item`). Every `#[derive]`d struct and every `#[inline]` or
+  `#[test]` function, this repository's own included.
+- **Dart** (`annotation`).
+
+Because a JSDoc or `///` block lives OUTSIDE the node, `code_content` does not
+carry it either — so a phrase that appeared only in the documentation of a
+decorated symbol was unreachable through every channel at once: no FTS hit, no
+vector, nothing to show in `get_ast_node`. Search for a concept that your team
+only ever wrote down in a docblock above `@Injectable()` and the answer was
+silence.
+
+One mis-attribution goes the other way in the same pass: a Rust `//!` or `/*!`
+block documents the module that contains it, and it was being handed to that
+module's first declaration as if the declaration had written it. That predates
+this release — the walk cannot tell `//!` from `///` by node kind — but stepping
+over attributes widened it to the `//!` header + `#[derive(…)]` + type layout
+that is ordinary Rust, so it is fixed here.
+
+The node shapes were read off real parse trees rather than inferred from the
+grammar documentation, which is also how two of them turned out NOT to be gaps
+after all. The parity table guarding this now has a second axis — 13 rows across the 10
+languages that have decoration syntax at all (Go and Ruby have none), keeping the
+already-working languages as controls so the table covers the whole axis instead
+of the half that broke.
+
+### The server no longer dies on a deeply nested source file
+
+`walk_for_relations` recurses once per AST level, so an 800-byte file of nested
+parentheses drives it to its depth cap. The thread the MCP server runs startup
+indexing on took `std::thread::spawn`'s 2 MiB default, and the peak for that
+input measures 2–4 MiB unoptimized against 256–512 KiB optimized. A stack
+overflow is an abort rather than a panic, so it walks straight past the serve
+loop's per-request `catch_unwind` and takes the whole session with it — which is
+what a development build did: the server died with SIGABRT and left the index at
+zero files. Release builds survived on a roughly fourfold margin, but that margin
+was something the optimizer happened to buy rather than anything the code asked
+for, and the walker's frame width changes whenever its dispatch is refactored.
+The thread is now sized explicitly and a test holds the size to the measurement.
+
+A failed thread spawn also used to strand the server: the guard that clears the
+"indexing in progress" flag and wakes waiters lives inside the closure, which a
+failed spawn drops, so the flag stayed set and every later query waited on an
+index run that would never start. That path now cleans up after itself.
+
+### Only a real conflict means the index lock is held (Unix)
+
+The non-Unix lock probe has always treated exactly one condition as "somebody
+holds this" and everything else as a non-answer, because callers turn a "held"
+into a refusal. The Unix probe never got that treatment: it read ANY `flock`
+failure as held. `flock` reports a genuine conflict as `EWOULDBLOCK` and nothing
+else does — its other failures are a signal arriving mid-call, the kernel running
+out of lock records, or a filesystem that does not implement `flock` at all,
+which some network and FUSE mounts do not. On any of those, `rebuild-index`
+refused to run and told you another process held a lock that nobody held.
+
+### `project_map` in compact mode stops calling populated modules empty
+
+The full module envelope grew an `other` count because a docs-only or types-only
+module read as `functions: 0, classes: 0` — empty — while `module_overview`
+listed its symbols perfectly well. Compact mode kept only path, files and
+functions, so it went on saying exactly that, and said it for any package that is
+entirely classes or constants too. Compact now carries the counts when they are
+non-zero, so a plain code module pays nothing and a directory full of classes
+stops looking like a directory worth skipping.
+
 ## v0.121.0 (2026-08-18)
 
 > **Upgrade note — the `outcome` numbers move, because they were wrong.** Five

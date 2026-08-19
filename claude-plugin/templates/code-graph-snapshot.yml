@@ -35,7 +35,7 @@ jobs:
           node-version: '20'
       - name: Build snapshot
         run: |
-          npx -y -p @sdsrs/code-graph@0.121.0 code-graph-mcp snapshot create --out snapshot.db
+          npx -y -p @sdsrs/code-graph@0.122.0 code-graph-mcp snapshot create --out snapshot.db
           zstd -9 snapshot.db -o snapshot.db.zst
           mv snapshot.db.zst "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
       - name: Upload to release
