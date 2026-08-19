@@ -246,12 +246,20 @@ jobs:
       # Bounded like every other apt call here: this one sits on the release
       # critical path, where an unbounded stall costs a hand-killed run with the
       # tag already pushed.
+      #
+      # The bound is the STEP timeout only — no inner `timeout` per command. The
+      # first version of this hardening wrapped both commands in `timeout 120`,
+      # copying the budget from the ripgrep step, and killed the v0.122.1 arm64
+      # build with exit 124: ripgrep is ~2 MB while this pulls a ~40 MB cross
+      # toolchain, and the mirror was serving it fine, just not in two minutes.
+      # An inner timeout only earns its place inside a retry loop, bounding each
+      # attempt; there is no retry here, so it added nothing but a way to fail.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: |
-          timeout 120 sudo apt-get update
-          timeout 120 sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # `--features embed-model` keeps npm/npx/plugin users on the full hybrid

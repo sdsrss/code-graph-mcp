@@ -74,13 +74,15 @@ jobs:
 
       # Bounded for the same reason as the ripgrep step below — this is the other
       # apt call in this repo's CI, and an unbounded `apt-get update` is what ran
-      # three workflows into a hand-kill on 2026-08-19.
+      # three workflows into a hand-kill on 2026-08-19. Step timeout only, no
+      # inner per-command `timeout`: see the twin in release.yml for why the
+      # ripgrep step's 120s budget does not transfer to a ~40 MB toolchain.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: |
-          timeout 120 sudo apt-get update
-          timeout 120 sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # Same flags as the release build so the cached dep artifacts are the
