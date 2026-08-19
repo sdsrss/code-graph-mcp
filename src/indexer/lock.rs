@@ -37,6 +37,25 @@ pub(crate) fn is_lock_conflict(raw_os_error: Option<i32>) -> bool {
     )
 }
 
+/// Unix twin of [`is_lock_conflict`], holding the same contract for `flock`:
+/// only a genuine conflict counts as "held", everything else is a NON-answer
+/// that must read as "not held".
+///
+/// `flock(LOCK_EX | LOCK_NB)` reports a conflict as `EWOULDBLOCK` (`EAGAIN`
+/// under a different name on both Linux and macOS) and nothing else does. Its
+/// other failures are all non-answers of one kind or another — `EINTR` (a
+/// signal arrived mid-call), `ENOLCK` (the kernel is out of lock records),
+/// `EOPNOTSUPP`/`ENOTSUP` (a filesystem that does not implement flock at all,
+/// which some network and FUSE mounts do not) — and reading any of them as
+/// "held" makes `lock_index_for_replace` refuse a rebuild, telling the user
+/// another process holds a lock that nobody holds.
+#[cfg(unix)]
+pub(crate) fn is_flock_conflict(raw_os_error: Option<i32>) -> bool {
+    // EAGAIN is the same value on every target Rust supports here, so matching
+    // EWOULDBLOCK alone covers both spellings.
+    matches!(raw_os_error, Some(e) if e == libc::EWOULDBLOCK)
+}
+
 /// Open `index.lock` the way the non-Unix lock needs it: write access, shared
 /// for READ only.
 ///
@@ -225,9 +244,21 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        false
-    } else {
+        return false;
+    }
+    // Only EWOULDBLOCK means somebody holds it. Anything else is a non-answer,
+    // and answering "held" would make lock_index_for_replace refuse the run —
+    // the same asymmetry the non-Unix probe below deliberately avoids.
+    let err = std::io::Error::last_os_error();
+    if is_flock_conflict(err.raw_os_error()) {
         true
+    } else {
+        tracing::warn!(
+            "could not probe the index lock at {}: {} — treating it as free",
+            lock_path.display(),
+            err
+        );
+        false
     }
 }
 
@@ -305,6 +336,41 @@ mod tests {
     // tested on every host, the same way the PID-liveness decision this replaces
     // was.
     // ---------------------------------------------------------------------
+
+    /// Unix half of the same decision. Kept beside the Windows one so the two
+    /// platforms' answers to "is this error "held"?" stay visibly identical in
+    /// shape: exactly one conflict code, everything else a non-answer.
+    #[cfg(unix)]
+    #[test]
+    fn test_is_flock_conflict_only_ewouldblock() {
+        assert!(
+            is_flock_conflict(Some(libc::EWOULDBLOCK)),
+            "EWOULDBLOCK is the only errno flock reports for a real conflict"
+        );
+        // Non-answers. `lock_index_for_replace` turns `true` into a refusal, so
+        // reading any of these as "held" refuses a rebuild and blames a process
+        // that does not exist.
+        assert!(
+            !is_flock_conflict(Some(libc::ENOLCK)),
+            "ENOLCK means the kernel ran out of lock records, not that it is held"
+        );
+        assert!(
+            !is_flock_conflict(Some(libc::EINTR)),
+            "EINTR means a signal arrived mid-call, not that it is held"
+        );
+        assert!(
+            !is_flock_conflict(Some(libc::EOPNOTSUPP)),
+            "a filesystem without flock support decides nothing"
+        );
+        assert!(
+            !is_flock_conflict(Some(libc::EBADF)),
+            "EBADF is our own bug, not a holder"
+        );
+        assert!(
+            !is_flock_conflict(None),
+            "an error with no OS code decides nothing"
+        );
+    }
 
     #[test]
     fn test_is_lock_conflict_only_the_two_sharing_codes() {
