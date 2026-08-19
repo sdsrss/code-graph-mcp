@@ -1,7 +1,40 @@
 //! `project_map` — modules / dependencies / entry points / hot functions.
-//! 60s TTL cache; compact mode strips classes/languages, keeps key_symbols for discoverability.
+//! 60s TTL cache; compact mode strips `languages`, keeps key_symbols for discoverability.
 
 use super::super::*;
+
+/// One module entry, trimmed for compact mode.
+///
+/// Split out of `tool_project_map` so the field set is unit-testable and so the
+/// `project_map_compact_forwards_every_module_key` drift guard has a region to
+/// scan — the same sibling-path drift this function exists to fix will otherwise
+/// recur the next time the full builder grows a key.
+///
+/// The symbol-count buckets are forwarded when non-zero rather than dropped. The
+/// full builder grew its `other` bucket precisely because a docs- or types-only
+/// module read as `functions: 0, classes: 0`, i.e. empty, while `module_overview`
+/// listed its symbols — and compact was still answering exactly that, for
+/// `other` and for every module that is entirely classes or constants. Being
+/// conditional, the cost lands only on modules that actually have them.
+fn compact_project_module(m: &serde_json::Value) -> serde_json::Value {
+    let mut obj = json!({
+        "path": m["path"],
+        "files": m["files"],
+        "functions": m["functions"],
+    });
+    for key in ["classes", "interfaces_traits", "constants", "other"] {
+        if m.get(key).and_then(|v| v.as_u64()).is_some_and(|n| n > 0) {
+            obj[key] = m[key].clone();
+        }
+    }
+    // Preserve key_symbols — essential for deciding what to explore next
+    if let Some(ks) = m.get("key_symbols") {
+        if ks.as_array().is_some_and(|a| !a.is_empty()) {
+            obj["key_symbols"] = ks.clone();
+        }
+    }
+    obj
+}
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_project_map(
@@ -145,27 +178,9 @@ impl McpServer {
         }
 
         if compact {
-            // Compact mode: drop languages/classes/interfaces, keep key_symbols for discoverability
             let compact_modules: Vec<serde_json::Value> = result["modules"]
                 .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|m| {
-                            let mut obj = json!({
-                                "path": m["path"],
-                                "files": m["files"],
-                                "functions": m["functions"],
-                            });
-                            // Preserve key_symbols — essential for deciding what to explore next
-                            if let Some(ks) = m.get("key_symbols") {
-                                if ks.is_array() && !ks.as_array().unwrap().is_empty() {
-                                    obj["key_symbols"] = ks.clone();
-                                }
-                            }
-                            obj
-                        })
-                        .collect()
-                })
+                .map(|arr| arr.iter().map(compact_project_module).collect())
                 .unwrap_or_default();
 
             let compact_deps: Vec<serde_json::Value> = result["module_dependencies"]
@@ -253,5 +268,77 @@ impl McpServer {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module whose symbols are all outside the `functions`/`classes` buckets
+    /// (TS type aliases, markdown headings) must not compact down to
+    /// `functions: 0` with nothing else — that reads as an empty module and
+    /// steers the caller away from a directory that is in fact full of symbols.
+    #[test]
+    fn compact_module_keeps_nonzero_symbol_buckets() {
+        let full = json!({
+            "path": "docs",
+            "files": 12,
+            "functions": 0,
+            "classes": 0,
+            "other": 143,
+            "languages": ["markdown"],
+        });
+        let compact = compact_project_module(&full);
+        assert_eq!(
+            compact["other"],
+            json!(143),
+            "a docs-only module must keep its `other` count in compact mode, got {compact}"
+        );
+        assert_eq!(compact["path"], json!("docs"));
+        assert_eq!(compact["files"], json!(12));
+    }
+
+    #[test]
+    fn compact_module_keeps_class_and_constant_counts() {
+        let full = json!({
+            "path": "src/models",
+            "files": 8,
+            "functions": 0,
+            "classes": 31,
+            "constants": 4,
+            "interfaces_traits": 2,
+        });
+        let compact = compact_project_module(&full);
+        for (key, want) in [("classes", 31), ("constants", 4), ("interfaces_traits", 2)] {
+            assert_eq!(
+                compact[key],
+                json!(want),
+                "compact must keep `{key}`, got {compact}"
+            );
+        }
+    }
+
+    /// The buckets are forwarded only when non-zero, so a plain code module pays
+    /// nothing for the fix — otherwise compact mode stops being compact.
+    #[test]
+    fn compact_module_omits_zero_and_dropped_fields() {
+        let full = json!({
+            "path": "src/util",
+            "files": 3,
+            "functions": 9,
+            "classes": 0,
+            "languages": ["rust"],
+        });
+        let compact = compact_project_module(&full);
+        assert!(
+            compact.get("classes").is_none(),
+            "a zero bucket must stay out of the compact payload, got {compact}"
+        );
+        assert!(
+            compact.get("languages").is_none(),
+            "`languages` is the one field compact deliberately drops, got {compact}"
+        );
+        assert_eq!(compact["functions"], json!(9));
     }
 }

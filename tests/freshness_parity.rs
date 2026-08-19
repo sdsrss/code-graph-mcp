@@ -207,6 +207,143 @@ fn compact_allowlist_covers_all_result_keys() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Same class, sibling surface: project_map's PER-MODULE key set.
+//
+// `module_overview` got the guard above after three recurrences; `project_map`
+// has the identical producer/compactor split and had none, so it drifted the
+// same way. The full builder grew an `other` bucket specifically because a docs-
+// or types-only module read as `functions: 0, classes: 0` — and compact still
+// answered exactly that, having dropped `other`, `classes` and `constants`.
+// ---------------------------------------------------------------------------
+
+/// Per-module keys compact drops on purpose. Keep this list short and reasoned:
+/// the point of the guard is that dropping a COUNT makes a populated module read
+/// as empty, which is a wrong answer, not a terse one.
+const PROJECT_MAP_MODULE_DELIBERATELY_DROPPED: &[&str] = &[
+    // A display nicety, not a signal for "is this module worth opening".
+    "languages",
+];
+
+/// The `modules_json` builder — the full per-module envelope.
+fn project_map_module_producer(src: &str) -> &str {
+    let start = src
+        .find("let modules_json")
+        .expect("`let modules_json` not found — repoint the project_map producer region");
+    let after = &src[start..];
+    let end = after
+        .find("let deps_json")
+        .expect("`let deps_json` not found — the producer region no longer ends where expected");
+    &after[..end]
+}
+
+/// Keys a json! literal or an `obj["k"] =` assignment introduces in `region`.
+fn module_envelope_keys(region: &str) -> Vec<String> {
+    let bytes: Vec<char> = region.chars().collect();
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != '"' {
+                j += 1;
+            }
+            let literal: String = bytes[start..j].iter().collect();
+            // A key is followed by `:` (json! literal) or `] =` (obj index).
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_whitespace() {
+                k += 1;
+            }
+            let is_json_key = bytes.get(k) == Some(&':');
+            let is_index_assign = bytes.get(k) == Some(&']')
+                && bytes[k + 1..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|c| *c == '=');
+            if (is_json_key || is_index_assign)
+                && !literal.is_empty()
+                && literal
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                keys.push(literal);
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Per-module producer keys the compact rebuild neither names nor drops on record.
+fn project_map_uncovered_module_keys(src: &str) -> Vec<String> {
+    let produced = module_envelope_keys(project_map_module_producer(src));
+    assert!(
+        produced.len() > 3,
+        "producer scan found only {produced:?} — the region anchors are wrong, \
+         not the code (a guard that reads nothing passes vacuously)"
+    );
+    let forwarder = fn_region(src, "compact_project_module");
+    let mut uncovered: Vec<String> = produced
+        .into_iter()
+        .filter(|k| {
+            !forwarder.contains(&format!("\"{k}\""))
+                && !PROJECT_MAP_MODULE_DELIBERATELY_DROPPED.contains(&k.as_str())
+        })
+        .collect();
+    uncovered.sort();
+    uncovered.dedup();
+    uncovered
+}
+
+#[test]
+fn project_map_compact_forwards_every_module_key() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+    let uncovered = project_map_uncovered_module_keys(&src);
+    assert!(
+        uncovered.is_empty(),
+        "the full project_map module envelope emits {uncovered:?}, which \
+         compact_project_module neither forwards nor drops on the record. A dropped COUNT \
+         makes a populated module read as `functions: 0` — forward it in {PROJECT_MAP_SRC}, \
+         or add it to PROJECT_MAP_MODULE_DELIBERATELY_DROPPED with a reason."
+    );
+}
+
+/// Permanent negative control, matching the envelope guard's below: a guard that
+/// cannot fire is worth nothing. Both key SOURCES in the producer are mutated,
+/// since a scanner that read only the `json!` literal — and not the conditional
+/// `obj["…"] =` assignments, where `other` and `constants` live — would still
+/// pass the positive test above.
+#[test]
+fn project_map_module_guard_detects_missing_key() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+
+    // (a) A key from the compact json! literal.
+    let broken = src.replace("\"functions\": m[\"functions\"],", "");
+    let uncovered = project_map_uncovered_module_keys(&broken);
+    assert!(
+        uncovered.iter().any(|k| k == "functions"),
+        "negative control (a) failed: dropping `functions` from the compact literal must \
+         surface it as uncovered, got {uncovered:?}"
+    );
+
+    // (b) A key that reaches the full envelope through a conditional assignment.
+    let broken = src.replace(
+        "for key in [\"classes\", \"interfaces_traits\", \"constants\", \"other\"] {",
+        "for key in [\"classes\", \"interfaces_traits\", \"constants\"] {",
+    );
+    let uncovered = project_map_uncovered_module_keys(&broken);
+    assert!(
+        uncovered.iter().any(|k| k == "other"),
+        "negative control (b) failed: dropping `other` from the forwarding list must \
+         surface it as uncovered, got {uncovered:?}"
+    );
+}
+
 /// Permanent negative control: prove the guard actually fires when a key is
 /// missing from the allowlist. Removing `"dead_code"` from the array in a working
 /// copy of the source must surface `dead_code` as uncovered.
