@@ -51,7 +51,10 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "get_call_graph".into(),
-                description: "Multi-hop call chain. Replaces N rounds of `grep \"X(\"` + Read. Pass route_path='GET /api/x' to trace HTTP handler → downstream (folds the old trace_http_chain).".into(),
+                // No "(folds the old trace_http_chain)" here: `tools/list` never
+                // advertises that name, so it is a call the client cannot offer.
+                // Guarded by `tool_descriptions_and_instructions_name_no_unlisted_tool`.
+                description: "Multi-hop call chain. Replaces N rounds of `grep \"X(\"` + Read. Pass route_path='GET /api/x' to trace HTTP handler → downstream.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {

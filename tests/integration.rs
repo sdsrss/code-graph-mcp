@@ -3544,3 +3544,92 @@ fn prompts_name_only_tools_the_client_can_actually_call() {
         );
     }
 }
+
+/// The sibling of the prompt guard above, for the two surfaces
+/// [`NON_LISTED_MCP_TOOLS`]'s own doc comment already claimed: "Anything the
+/// model READS (prompt text, tool descriptions, `instructions`) must name only
+/// LIVE_MCP_TOOLS".
+///
+/// Only the prompt half was ever enforced. The other two went unchecked for as
+/// long as the sentence has been there, and one had drifted: `get_call_graph`'s
+/// description carried "(folds the old trace_http_chain)", teaching the model
+/// a name `tools/list` does not advertise. A guard that names three surfaces
+/// and walks one is worse than a guard that names one, because the doc comment
+/// is then read as coverage.
+///
+/// This reads the SHIPPED responses rather than the source text: a description
+/// assembled at runtime, or an `instructions` field built by concatenation, is
+/// what the model actually sees, and scanning `tools.rs` for string literals
+/// would miss both.
+#[test]
+fn tool_descriptions_and_instructions_name_no_unlisted_tool() {
+    let project = TempDir::new().unwrap();
+    // A real source file: an empty directory yields the non-project stub, whose
+    // `tools/list` is empty — the check would pass by having nothing to check.
+    fs::write(
+        project.path().join("app.ts"),
+        "export function greet(name: string): string { return name; }\n",
+    )
+    .unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    let init = server
+        .handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+    let init: serde_json::Value = serde_json::from_str(&init).unwrap();
+    let instructions = init["result"]["instructions"].as_str().unwrap_or("");
+    assert!(
+        !instructions.is_empty(),
+        "precondition: the server ships an `instructions` field to check"
+    );
+
+    let list = server
+        .handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .unwrap()
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let tools = list["result"]["tools"].as_array().unwrap().clone();
+    assert_eq!(
+        tools.len(),
+        code_graph_mcp::mcp::tools::TOOL_COUNT,
+        "precondition: the full tool list is advertised, not the stub"
+    );
+
+    // Whole tool objects, not just `description`: an enum label or a parameter
+    // doc that names a folded tool teaches it just as well.
+    let mut surfaces: Vec<(String, String)> = vec![
+        ("instructions (as shipped here)".into(), instructions.into()),
+        // BOTH variants, by name rather than through the server: `initialize`
+        // returns one of them depending on CODE_GRAPH_QUIET_HOOKS, so a check
+        // that only reads the response covers whichever the ambient env happens
+        // to select and leaves the other permanently unguarded. The plugin sets
+        // that variable, so the quiet text is the one most users read.
+        (
+            "INSTRUCTIONS_QUIET".into(),
+            code_graph_mcp::mcp::server::INSTRUCTIONS_QUIET.into(),
+        ),
+        (
+            "INSTRUCTIONS_NOISY".into(),
+            code_graph_mcp::mcp::server::INSTRUCTIONS_NOISY.into(),
+        ),
+    ];
+    for t in &tools {
+        let name = t["name"].as_str().unwrap_or("?").to_string();
+        surfaces.push((format!("tool '{name}'"), serde_json::to_string(t).unwrap()));
+    }
+
+    for (label, text) in &surfaces {
+        for hidden in code_graph_mcp::domain::NON_LISTED_MCP_TOOLS {
+            assert!(
+                !text.contains(hidden),
+                "{label} names '{hidden}', which tools/list never advertised — the \
+                 client cannot offer it, so the model reads a call it cannot make. \
+                 Name the advertised form (a LIVE tool plus its flag), or drop the \
+                 reference if it is only history. Text: {text}"
+            );
+        }
+    }
+}

@@ -40,7 +40,17 @@ pub const LIVE_MCP_TOOLS: &[&str] = &[
 /// testing, while a prompt or a description that names one teaches the model a
 /// call it cannot make. Anything the model READS (prompt text, tool
 /// descriptions, `instructions`) must name only [`LIVE_MCP_TOOLS`] and their
-/// flags — see the guard in `tests/integration.rs`.
+/// flags.
+///
+/// Two guards in `tests/integration.rs` enforce that, one per surface:
+/// `prompts_name_only_tools_the_client_can_actually_call` walks every
+/// `prompts/get` response,
+/// and `tool_descriptions_and_instructions_name_no_unlisted_tool` walks the
+/// shipped `tools/list` objects plus BOTH `instructions` variants. Until the
+/// second one existed this comment named three surfaces and one was checked —
+/// and `get_call_graph`'s description had drifted to "(folds the old
+/// trace_http_chain)" in the meantime. A sentence like this one is read as
+/// coverage, so it may not outrun the tests.
 pub const NON_LISTED_MCP_TOOLS: &[&str] = &[
     "impact_analysis",
     "dependency_graph",

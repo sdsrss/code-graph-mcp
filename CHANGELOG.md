@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### `get_call_graph` no longer names a tool the client cannot call
+
+`NON_LISTED_MCP_TOOLS`'s doc comment has said for several releases that
+"anything the model READS (prompt text, tool descriptions, `instructions`) must
+name only LIVE_MCP_TOOLS". One of those three surfaces was checked. The other
+two were not, and one had drifted: `get_call_graph`'s `tools/list` description
+carried "(folds the old trace_http_chain)" — a name `tools/list` never
+advertises, so an MCP client cannot offer it and the model reads a call it
+cannot make. The parenthetical was history, not instruction, so it is simply
+gone.
+
+The new guard reads the SHIPPED responses, not the source: it walks every
+`tools/list` object whole (an enum label or a parameter doc teaches a name just
+as well as a description does) and both `instructions` variants BY NAME. That
+last part is the non-obvious half — `initialize` returns the quiet or the noisy
+text depending on `CODE_GRAPH_QUIET_HOOKS`, so a check that only reads the
+response covers whichever the ambient environment selects and leaves the other
+permanently unguarded. The plugin sets that variable, which makes the quiet text
+the one most users actually read; a first draft of this guard checked only the
+response and would have missed it. All three arms were verified by mutation.
+
+The doc comment now names both guards. A sentence claiming coverage is read as
+coverage, so it may not outrun the tests that provide it.
+
+Not measured: `tests/routing_bench.rs` needs an `ANTHROPIC_API_KEY` or
+`OPENROUTER_API_KEY`, and neither was available, so there is no before/after
+trigger-rate number for this description edit.
+
 ### The heritage and export axes are tables, finishing the walk conversion
 
 `walk_for_relations` had three of its five relation axes as tables and two as
