@@ -7458,6 +7458,88 @@ fn test_cli_cycles_truncation_discloses() {
     );
 }
 
+/// Audit 2026-08-22 P2-11: `callgraph` was the one read command with no
+/// query-time resync on either surface. What goes stale is not a line number —
+/// this command prints paths — but the caller SET: a call added since the last
+/// index is simply missing, and nothing says so.
+#[test]
+fn test_cli_callgraph_resyncs_the_caller_set_after_an_edit() {
+    let project = setup_indexed_project();
+    let (before, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "validateToken",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        !before.contains("handleRefresh"),
+        "baseline must not know the caller yet; got {before}"
+    );
+
+    // Add a NEW caller of validateToken to an already-indexed file.
+    let api = project.path().join("src/api.ts");
+    let content = std::fs::read_to_string(&api).unwrap();
+    std::fs::write(
+        &api,
+        format!(
+            "{content}\nexport function handleRefresh(req: Request) {{\n    return validateToken(req.headers.authorization);\n}}\n"
+        ),
+    )
+    .unwrap();
+
+    // Negative control FIRST, on the same edit: budget 0 disables the reindex,
+    // reproducing the pre-fix answer. Without this the assertion below could
+    // pass for some unrelated reason (a watcher, a debounce) rather than
+    // because the resync ran.
+    let (stale, _, code) = run_cli_env(
+        &project,
+        &[
+            "callgraph",
+            "validateToken",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        !stale.contains("handleRefresh"),
+        "budget 0 must reproduce the stale caller set; got {stale}"
+    );
+    let sv: serde_json::Value = serde_json::from_str(stale.trim()).unwrap();
+    assert_eq!(
+        sv["freshness_partial"], true,
+        "a skipped resync must be disclosed in-band, not only on stderr; got {stale}"
+    );
+
+    let (after, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "validateToken",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        after.contains("handleRefresh"),
+        "callgraph must answer against the refreshed index; got {after}"
+    );
+    let av: serde_json::Value = serde_json::from_str(after.trim()).unwrap();
+    assert!(
+        av.get("freshness_partial").is_none(),
+        "a fully-refreshed run must not carry the partial marker; got {after}"
+    );
+}
+
 #[test]
 fn test_cli_ast_search_freshness_partial_in_json() {
     // §1.4: a partial freshness resync was stderr-only — invisible under

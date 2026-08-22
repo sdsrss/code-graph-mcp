@@ -2740,6 +2740,17 @@ impl McpServer {
 /// Tools that return file/line data but take no `file_path` argument, so
 /// [`McpServer::ensure_file_fresh_opt`] cannot cover them (FRS-2).
 /// `find_http_route` is the alias of `trace_http_chain`.
+///
+/// `get_call_graph` and `find_references` were the two gaps (audit 2026-08-22
+/// P2-11): both DO accept a `file_path`, so they looked covered, but that
+/// argument is optional and disambiguates same-name symbols — the ordinary
+/// call passes a bare symbol name and reached
+/// [`McpServer::ensure_file_fresh_opt`]'s `None` early return. The answer they
+/// give is a set of OTHER files' symbols, so what goes stale after an edit is
+/// not the named file but the callers and references the query found. Listing
+/// them here refreshes by result set instead, which is what the result set
+/// needs; the two mechanisms overlap harmlessly when a `file_path` IS passed
+/// (the second pass finds that file already fresh).
 const RESULT_REFRESH_TOOLS: &[&str] = &[
     "semantic_code_search",
     "ast_search",
@@ -2747,6 +2758,8 @@ const RESULT_REFRESH_TOOLS: &[&str] = &[
     "find_similar_code",
     "trace_http_chain",
     "find_http_route",
+    "get_call_graph",
+    "find_references",
 ];
 
 /// Max files hashed for one result set before the rest is reported unchecked.
@@ -5103,6 +5116,73 @@ app.post('/api/login', handleLogin);
             payload.get("freshness").is_none(),
             "a fully refreshed result needs no staleness disclosure: {payload}"
         );
+    }
+
+    /// Audit 2026-08-22 P2-11. `get_call_graph` and `find_references` DO accept
+    /// a `file_path`, so they looked covered by `ensure_file_fresh_opt` — but
+    /// that argument is an optional disambiguator and the ordinary call passes a
+    /// bare symbol name, which hits the helper's `None` early return. What their
+    /// answer is made of is OTHER files' symbols, so what an edit invalidates is
+    /// the caller / reference SET, not the named file. Absent from
+    /// `RESULT_REFRESH_TOOLS`, a call added since the last index was simply
+    /// missing from the tree, with nothing saying so.
+    #[test]
+    fn test_result_set_refresh_covers_call_graph_and_references() {
+        fn callers_of(server: &McpServer, tool: &str) -> String {
+            let req = tool_call_json(
+                tool,
+                json!({ "symbol_name": "validateToken", "direction": "callers" }),
+            );
+            let resp = server.handle_message(&req).unwrap().unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        let project = TempDir::new().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.ts"),
+            "export function validateToken(t: string): boolean { return t.length > 0; }\n",
+        )
+        .unwrap();
+        let caller = src.join("caller.ts");
+        std::fs::write(
+            &caller,
+            "import { validateToken } from './target';\n             export function handleLogin(t: string) { return validateToken(t); }\n",
+        )
+        .unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        for tool in ["get_call_graph", "find_references"] {
+            assert!(
+                callers_of(&server, tool).contains("handleLogin"),
+                "precondition: {tool} sees the indexed caller"
+            );
+        }
+
+        close_other_freshness_paths(&mut server);
+        // A caller added AFTER the index — the "Edit then ask" sequence.
+        let content = std::fs::read_to_string(&caller).unwrap();
+        std::fs::write(
+            &caller,
+            format!(
+                "{content}export function handleRefresh(t: string) {{ return validateToken(t); }}\n"
+            ),
+        )
+        .unwrap();
+
+        for tool in ["get_call_graph", "find_references"] {
+            let payload = callers_of(&server, tool);
+            assert!(
+                payload.contains("handleRefresh"),
+                "{tool} must refresh the files its own result names, then re-run: {payload}"
+            );
+        }
     }
 
     #[test]

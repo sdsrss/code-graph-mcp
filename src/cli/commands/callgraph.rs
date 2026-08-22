@@ -89,14 +89,20 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         }
     }
 
-    let mut result = crate::graph::query::get_call_graph_filtered(
-        conn,
-        symbol,
-        direction,
-        depth,
-        file_filter,
-        min_conf_rank,
-    )?;
+    // Wrapped so a query-time freshness resync below can re-run it against the
+    // refreshed index (parity with refs/show/… via refresh_files_if_stale).
+    let run_query = |sym: &str| {
+        crate::graph::query::get_call_graph_filtered(
+            conn,
+            sym,
+            direction,
+            depth,
+            file_filter,
+            min_conf_rank,
+        )
+    };
+
+    let mut result = run_query(symbol)?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
@@ -107,14 +113,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
-                    result = crate::graph::query::get_call_graph_filtered(
-                        conn,
-                        &resolved,
-                        direction,
-                        depth,
-                        file_filter,
-                        min_conf_rank,
-                    )?;
+                    result = run_query(&resolved)?;
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
@@ -162,6 +161,21 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // `symbol.to_string()` above). Either way, `symbol` below is the correct
     // identifier to print in the "No call graph results" eprintln.
     let symbol = resolved_symbol.as_str();
+
+    // Query-time freshness (audit 2026-08-22 P2-11 — the one read command the
+    // wiring had skipped on BOTH surfaces). What goes stale here is not a line
+    // number, since this command prints paths: it is the caller/callee SET
+    // itself. A call added or removed since the last index makes the tree wrong
+    // in the direction that matters, and silently — so refresh the files the
+    // answer names and re-run against the refreshed index, then disclose
+    // whatever stayed stale.
+    let files: Vec<String> = result.nodes.iter().map(|n| n.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
+    if outcome.any_changed {
+        result = run_query(symbol)?;
+    }
+    outcome.disclose();
+
     if result.nodes.is_empty() {
         if json_mode {
             // In-band error (disclosure-gap class, roadmap 2026-07-18 §1.3):
@@ -252,6 +266,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         if result.suppressed_ambiguous > 0 {
             output["ambiguous_edges_hidden"] = serde_json::json!(result.suppressed_ambiguous);
         }
+        // The stderr note above is invisible under `--json 2>/dev/null`, and
+        // this envelope is object-shaped, so it can carry the marker (parity
+        // with ast-search/refs/trace/impact/report).
+        outcome.attach_partial(&mut output);
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
     }
