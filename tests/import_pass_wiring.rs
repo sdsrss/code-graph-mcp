@@ -39,16 +39,65 @@ fn imports_rs() -> PathBuf {
 /// covering things, which is the failure this whole file exists to prevent.
 /// Matching `&ImportCtx` rather than a parameter name means renaming `ctx`
 /// cannot blind it.
+///
+/// Scans the SIGNATURE, not the line. An earlier version required both tokens
+/// on one source line, which the current names happen to satisfy at 82 columns
+/// — but rustfmt wraps past 100, so an extractor with a longer name would have
+/// formatted across lines and become invisible to this scan, unwired and
+/// unreported. The `>= EXPECTED` floor below cannot catch that: it equals the
+/// current count exactly, so an uncounted extractor leaves the total unchanged.
 fn scan_file_for_import_extractors(path: &Path) -> Vec<String> {
-    let src = fs::read_to_string(path).expect("readable source file");
-    src.lines()
-        .filter(|line| line.contains("&ImportCtx"))
-        .filter_map(|line| {
-            let rest = line.strip_prefix("fn extract_")?;
-            let name_end = rest.find('(')?;
-            Some(format!("extract_{}", &rest[..name_end]))
-        })
-        .collect()
+    // Leading newline so a declaration at byte 0 is found by the same
+    // `\nfn extract_` anchor as every other one. imports.rs never starts with
+    // an extractor, so this only ever mattered for the negative control — which
+    // is exactly what a negative control is for: it caught this scanner's own
+    // off-by-one before the scanner could quietly under-report production code.
+    let src = format!(
+        "\n{}",
+        fs::read_to_string(path).expect("readable source file")
+    );
+    let mut out = Vec::new();
+    for (idx, _) in src.match_indices("\nfn extract_") {
+        let after = &src[idx + 1..];
+        // The signature runs to the opening brace of the body; a wrapped one
+        // spans several lines and the type sits on whichever of them rustfmt
+        // chose.
+        let Some(brace) = after.find('{') else {
+            continue;
+        };
+        let signature = &after[..brace];
+        if !signature.contains("&ImportCtx") {
+            continue;
+        }
+        let Some(rest) = signature.strip_prefix("fn extract_") else {
+            continue;
+        };
+        let Some(name_end) = rest.find('(') else {
+            continue;
+        };
+        out.push(format!("extract_{}", &rest[..name_end]));
+    }
+    out
+}
+
+/// Every language named by an IMPORT_PASSES row, derived from the table rather
+/// than listed here. A hardcoded list would go stale the moment a row is added
+/// — the same shape this file argues against for the extractor scan, and the
+/// one that lets a new language reach production with nothing ever having
+/// observed it emit an edge.
+fn languages_in_table(table: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, _) in table.match_indices("langs: &[") {
+        let after = &table[idx + "langs: &[".len()..];
+        let Some(end) = after.find(']') else { continue };
+        for piece in after[..end].split(',') {
+            let name = piece.trim().trim_matches('"');
+            if !name.is_empty() && !out.iter().any(|o: &String| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn table_region(src: &str) -> &str {
@@ -103,14 +152,24 @@ fn scanner_sees_a_planted_extractor() {
         &planted,
         "fn extract_klingon_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {}\n\
          // a nested helper must NOT be picked up:\n    \
-         fn extract_indented_helper(x: u8) {}\n",
+         fn extract_indented_helper(x: u8) {}\n\
+         // a WRAPPED signature must be picked up — rustfmt splits past 100 cols,\n\
+         // and the scan that missed this shape is the one this control replaces:\n\
+         fn extract_wrapped_import(\n    ctx: &ImportCtx,\n    results: &mut Vec<ParsedRelation>,\n) {}\n\
+         // a top-level extract_* that is NOT an axis extractor must be ignored:\n\
+         fn extract_sub_walker(node: &Node, out: &mut Vec<String>) {}\n",
     )
     .expect("write planted file");
 
     assert_eq!(
         scan_file_for_import_extractors(&planted),
-        vec!["extract_klingon_import".to_string()],
-        "the scanner must find a newly declared import extractor, and only top-level ones"
+        vec![
+            "extract_klingon_import".to_string(),
+            "extract_wrapped_import".to_string(),
+        ],
+        "the scanner must find newly declared import extractors in BOTH the one-line \
+         and the rustfmt-wrapped form, and must ignore an indented helper and a \
+         top-level extract_* that takes no &ImportCtx"
     );
 }
 
@@ -126,13 +185,18 @@ fn every_tabled_language_has_a_parity_row() {
     )
     .expect("parity table readable");
 
+    let langs = languages_in_table(table);
+    assert!(
+        langs.len() >= 8,
+        "the table-language scan found only {} entries — it has probably stopped \
+         matching the row style, which would make this guard vacuous: {langs:?}",
+        langs.len()
+    );
+
     let mut missing = Vec::new();
-    for lang in [
-        "php", "swift", "java", "dart", "kotlin", "csharp", "c", "cpp",
-    ] {
-        let quoted = format!("\"{lang}\"");
-        if table.contains(&quoted) && !parity.contains(&format!("lang: {quoted}")) {
-            missing.push(lang);
+    for lang in &langs {
+        if !parity.contains(&format!("lang: \"{lang}\"")) {
+            missing.push(lang.clone());
         }
     }
     assert!(

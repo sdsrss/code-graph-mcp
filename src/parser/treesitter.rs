@@ -2877,13 +2877,20 @@ export const expA = () => {}, expB = () => {};
     /// simply never reached that check.
     #[test]
     fn test_multi_declarator_doc_goes_to_the_first_only() {
-        let doc_of = |src: &str, name: &str| -> String {
+        // Returns None when the symbol was never extracted, Some("") when it was
+        // extracted with no doc. An earlier version collapsed both to "", so
+        // every "must not inherit the doc" assertion below would also have
+        // passed if the symbol stopped being indexed at all — a strictly worse
+        // bug satisfying the test for the fix.
+        let doc_of_opt = |src: &str, name: &str| -> Option<String> {
             parse_code(src, "typescript")
                 .unwrap()
                 .iter()
                 .find(|n| n.name == name)
-                .and_then(|n| n.doc_comment.clone())
-                .unwrap_or_default()
+                .map(|n| n.doc_comment.clone().unwrap_or_default())
+        };
+        let doc_of = |src: &str, name: &str| -> String {
+            doc_of_opt(src, name).unwrap_or_else(|| panic!("{name} was not extracted at all"))
         };
 
         // Constant-valued declarators (the exported-const extraction path).
@@ -2910,6 +2917,42 @@ export const expA = () => {}, expB = () => {};
         let lets = "/** DOC_L */\nexport let m = 1, n = 2;\n";
         assert!(doc_of(lets, "m").contains("DOC_L"));
         assert_eq!(doc_of(lets, "n"), "");
+
+        // The consequence of claiming by POSITION rather than by first EXTRACTED
+        // node: when the leading declarator produces no symbol, the statement's
+        // only description disappears from the index rather than sliding onto a
+        // later name. Two shapes reach it, both measured:
+        //
+        //   export const fx = function () {}, gy = () => {};
+        //     `fx` is excluded by the function-expression guard below, so only
+        //     `gy` is indexed — and DOC_FN plainly describes `fx`.
+        //   export let p, q = () => {};
+        //     `p` has no value at all and is skipped, leaving only `q`.
+        //
+        // Dropping the doc is the intended outcome: the symbol it describes is
+        // not in the index, so there is no correct home for it, and handing it
+        // to the next name would document the wrong thing. Pinned because
+        // nothing else would notice if a future change to the position rule
+        // started sliding it.
+        let fn_first = "/** DOC_FN */\nexport const fx = function () {}, gy = () => {};\n";
+        assert_eq!(
+            doc_of_opt(fn_first, "fx"),
+            None,
+            "a function-expression declarator is not indexed (pre-existing guard)"
+        );
+        assert_eq!(
+            doc_of_opt(fn_first, "gy"),
+            Some(String::new()),
+            "gy is indexed and must NOT inherit the doc written for fx"
+        );
+
+        let no_value_first = "/** DOC_NOVAL */\nexport let p, q = () => {};\n";
+        assert_eq!(doc_of_opt(no_value_first, "p"), None);
+        assert_eq!(
+            doc_of_opt(no_value_first, "q"),
+            Some(String::new()),
+            "a valueless leading declarator still consumes the doc"
+        );
 
         // Negative control: a SINGLE declarator must still get its doc — the fix
         // must not be "stop attributing docs to declarators at all", which every

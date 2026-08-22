@@ -44,8 +44,23 @@ const ROWS: &[Row] = &[
     Row {
         lang: "python",
         path: "a.py",
+        // `pkg.mod` is here because the extractor emits it, not because it
+        // should. `extract_python_from_import_names` sets `module_path` from the
+        // `module_name` FIELD first, which leaves `is_first_dotted_name` false,
+        // so the module's own `dotted_name` child falls into the
+        // imported-symbol branch and is emitted as one. The tell is the
+        // metadata: `import os` marks its row `is_module_import: true`, while
+        // this row carries no such marker, so nothing downstream can tell the
+        // module apart from a symbol actually named `pkg.mod`.
+        //
+        // PRE-EXISTING, and deliberately not fixed here — correcting it changes
+        // the edge set of every indexed Python project and so belongs with an
+        // INDEX_VERSION bump of its own, not inside a release cut for other
+        // reasons. Pinned rather than papered over: set equality is what
+        // surfaced it, and an `expect` that quietly omitted `pkg.mod` would have
+        // hidden it again.
         source: "import os\nfrom pkg.mod import Helper\n",
-        expect: &["os", "Helper"],
+        expect: &["os", "Helper", "pkg.mod"],
     },
     Row {
         lang: "java",
@@ -131,16 +146,33 @@ fn every_language_emits_its_import_targets() {
         got.sort();
         got.dedup();
 
-        for want in row.expect {
-            if !got.iter().any(|g| g == want) {
-                failures.push(format!(
-                    "{} ({}): missing import target {want:?}; got {got:?}",
-                    row.lang, row.path
-                ));
-            }
+        let mut want: Vec<String> = row.expect.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        want.dedup();
+
+        // SET EQUALITY, not containment. An earlier version asserted only that
+        // every expected target was present, which a phantom target rides
+        // through untouched — and a phantom bound to a real node is the failure
+        // this repository treats as worse than a missing edge, because nothing
+        // in the answer says it is wrong.
+        let missing: Vec<&String> = want.iter().filter(|w| !got.contains(w)).collect();
+        let extra: Vec<&String> = got.iter().filter(|g| !want.contains(g)).collect();
+
+        if !missing.is_empty() {
+            failures.push(format!(
+                "{} ({}): missing import target(s) {missing:?}; got {got:?}",
+                row.lang, row.path
+            ));
+        }
+        if !extra.is_empty() {
+            failures.push(format!(
+                "{} ({}): UNEXPECTED import target(s) {extra:?} — a phantom target binds a \
+                 real node and nothing downstream can tell it apart; got {got:?}",
+                row.lang, row.path
+            ));
         }
         // A language that emits NOTHING is the exact silent-drop this table
-        // exists to catch, so say it separately from a single missing target.
+        // exists to catch, so say it separately from a missing target.
         if got.is_empty() {
             failures.push(format!(
                 "{} ({}): emitted NO import edges at all — handler absent?",

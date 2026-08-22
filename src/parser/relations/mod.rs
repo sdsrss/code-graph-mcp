@@ -688,7 +688,7 @@ fn walk_for_relations(
     // the two kind sets are disjoint, so short-circuiting would only hide a
     // future overlap instead of letting the arm double-emit visibly. The child
     // recursion below runs either way — the walk's scope bookkeeping is shared.
-    let _fired = imports::run_import_passes(
+    imports::run_import_passes(
         &imports::ImportCtx {
             node,
             source,

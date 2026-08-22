@@ -160,12 +160,17 @@ pub(super) const IMPORT_PASSES: &[ImportPass] = &[
     },
 ];
 
-/// Run the first table row matching this node. Returns true when a row fired,
-/// so the caller can skip the kinds this table owns.
+/// Run the first table row matching this node.
 ///
 /// First-match-wins, not run-them-all: these rows were `match` arms, where one
-/// arm excludes the others.
-pub(super) fn run_import_passes(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) -> bool {
+/// arm excludes the others. The rows are disjoint today — and disjoint from the
+/// kinds still handled by the caller's `match` — so the stop is belt and
+/// braces; it is what keeps a future overlapping row from silently
+/// double-emitting. Returns nothing, like `calls::run_call_passes`: an earlier
+/// version handed back "did a row fire" for the caller to skip on, which the
+/// caller then deliberately discarded, leaving a documented contract no code
+/// honoured.
+pub(super) fn run_import_passes(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
     let kind = ctx.node.kind();
     for pass in IMPORT_PASSES {
         if !pass.kinds.contains(&kind) {
@@ -181,9 +186,8 @@ pub(super) fn run_import_passes(ctx: &ImportCtx, results: &mut Vec<ParsedRelatio
             }
         }
         (pass.extract)(ctx, results);
-        return true;
+        return;
     }
-    false
 }
 
 // ── extractors ───────────────────────────────────────────────────────────────
@@ -805,6 +809,71 @@ pub(super) fn extract_python_from_import_names(
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// These rows replaced `match` arms, where the compiler rejects a duplicate
+    /// arm. A table has no such check: a second row for the same (language,
+    /// kind) is simply unreachable, and the edges its extractor would have
+    /// emitted are silently absent — the exact failure mode the table exists to
+    /// remove. `import_declaration` is ALREADY claimed twice here (Swift and
+    /// Java, by disjoint languages), so a third claim reads as the established
+    /// pattern rather than as a mistake, which is precisely why this has to be
+    /// checked rather than eyeballed.
+    #[test]
+    fn no_two_rows_claim_the_same_language_and_kind() {
+        let mut claimed: Vec<(&str, &str)> = Vec::new();
+        for pass in IMPORT_PASSES {
+            for kind in pass.kinds {
+                // An ANY_LANG row claims the kind for every language, so any
+                // other row naming that kind is dead.
+                if pass.langs.is_empty() {
+                    let conflict = IMPORT_PASSES
+                        .iter()
+                        .filter(|p| p.kinds.contains(kind))
+                        .count();
+                    assert_eq!(
+                        conflict,
+                        1,
+                        "kind {kind:?} is claimed by an ANY_LANG row and by {} other row(s) — \
+                         those can never fire",
+                        conflict - 1
+                    );
+                    continue;
+                }
+                for lang in pass.langs {
+                    let slot = (*lang, *kind);
+                    assert!(
+                        !claimed.contains(&slot),
+                        "two IMPORT_PASSES rows claim {slot:?} — the second can never fire"
+                    );
+                    claimed.push(slot);
+                }
+            }
+        }
+    }
+
+    /// A row that matches nothing compiles fine and emits nothing forever.
+    #[test]
+    fn no_row_is_inert() {
+        for pass in IMPORT_PASSES {
+            assert!(
+                !pass.kinds.is_empty(),
+                "an IMPORT_PASSES row has no node kinds — it can never fire"
+            );
+            assert!(
+                pass.kinds.iter().all(|k| !k.is_empty()),
+                "an IMPORT_PASSES row has an empty node kind — it can never fire"
+            );
+            assert!(
+                pass.langs.iter().all(|l| !l.is_empty()),
+                "an IMPORT_PASSES row has an empty language name — that slot can never match"
+            );
         }
     }
 }
