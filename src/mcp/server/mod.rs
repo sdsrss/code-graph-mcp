@@ -18,6 +18,15 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 /// real clap surface. This string + the `.claude/plugin_code_graph_mcp.md` detail
 /// doc are the two steering "sync faces" that (unlike the CLAUDE.md managed block)
 /// have no generator↔mirror byte check — see [`project_claude_md_steering`].
+// Two self-contained seams lifted out of this file (audit 2026-08-22 P2-8),
+// which had grown to ~2,850 lines of production code spanning startup
+// indexing, cache invalidation, lock recovery, dispatch, and these. Both are
+// `impl McpServer` blocks in their own files: same type, same privacy scope,
+// no API change.
+mod backfill;
+mod freshness;
+use freshness::RESULT_REFRESH_TOOLS;
+
 pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`.";
 
 /// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
@@ -80,8 +89,8 @@ use crate::domain::CODE_GRAPH_DIR;
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::lock::{release_index_lock, try_acquire_index_lock};
 use crate::indexer::pipeline::{
-    embed_and_store_batch, remove_stale_indexing_status, run_full_index,
-    run_incremental_index_cached, IndexPhase, IndexStats, INDEXING_STATUS_FILE,
+    remove_stale_indexing_status, run_full_index, run_incremental_index_cached, IndexPhase,
+    IndexStats, INDEXING_STATUS_FILE,
 };
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
@@ -191,72 +200,6 @@ const EMBEDDING_WAIT_SECS: u64 = 0;
 pub(super) const PERIODIC_BACKFILL_SECS: u64 = 60;
 #[cfg(test)]
 pub(super) const PERIODIC_BACKFILL_SECS: u64 = 1;
-
-/// How many consecutive `Stalled` drains the periodic backfill driver tolerates at
-/// a given floor before it pins the floor and stops re-attempting. A stall is
-/// ambiguous — a transient model/device error (which a retry recovers) or genuinely
-/// un-embeddable residue (which would spin forever). A small budget lets the
-/// transient case self-heal while bounding wasted model reloads on real residue.
-const MAX_BACKFILL_STALL_RETRIES: u32 = 3;
-
-/// Why an unembedded-node backfill pass stopped — the signal the periodic driver
-/// needs to decide whether its "confirmed un-embeddable" floor may advance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackfillOutcome {
-    /// No embedding model on disk yet (download in flight, or FTS5-only env). The
-    /// pass embedded nothing, but that says NOTHING about node embeddability — the
-    /// floor must NOT advance, or every node strands until restart.
-    NoModel,
-    /// Every embeddable node now has a vector (the unembedded set emptied).
-    Drained,
-    /// A non-empty batch produced no new vectors. `progressed` distinguishes the two
-    /// causes the driver must treat differently:
-    /// - `true`: earlier batches this pass DID embed nodes, so the model is present and
-    ///   working — the remainder is genuine un-embeddable residue. Pin the floor now;
-    ///   no point retrying a proven-working model on content that can't embed.
-    /// - `false`: the very first batch stalled, so we can't tell a transient model/device
-    ///   error (a retry recovers) from residue. Bounded-retry before trusting it.
-    Stalled { progressed: bool },
-}
-
-/// Decide the periodic backfill driver's next `(floor, stall_retries)` from one
-/// drain attempt's [`BackfillOutcome`] and the freshly re-measured unembedded count.
-///
-/// `floor` = the count of nodes the driver has confirmed it cannot embed right now,
-/// so it stops re-attempting them. It advances ONLY on evidence a model-present drain
-/// ran and could make no further progress — never on a no-op caused by an absent
-/// model. Pure (no I/O) so the branch logic is unit-testable without a live server.
-fn apply_backfill_outcome(
-    floor: i64,
-    stall_retries: u32,
-    outcome: BackfillOutcome,
-    remeasured: i64,
-) -> (i64, u32) {
-    match outcome {
-        // Learned nothing — leave the floor low so the very next tick re-attempts;
-        // the drain fires for real the moment the model finishes downloading.
-        BackfillOutcome::NoModel => (floor, stall_retries),
-        // Embeddable set emptied. Reset to 0: any count observed later is fresh work
-        // that must be picked up, not residue to skip. Clears the retry budget too.
-        BackfillOutcome::Drained => (0, 0),
-        // Model proven working this pass — the remainder is genuine residue. Pin the
-        // floor to it immediately and reset the retry budget; retrying a working model
-        // on un-embeddable content would just churn.
-        BackfillOutcome::Stalled { progressed: true } => (remeasured, 0),
-        // Zero-progress stall (ambiguous: transient vs residue). Keep the floor low so
-        // the next tick re-attempts and a transient failure self-heals, until the retry
-        // budget is spent — then pin to the residue so we stop reloading the model to
-        // spin on nodes that truly cannot embed this session.
-        BackfillOutcome::Stalled { progressed: false } => {
-            let retries = stall_retries + 1;
-            if retries >= MAX_BACKFILL_STALL_RETRIES {
-                (remeasured, 0)
-            } else {
-                (floor, retries)
-            }
-        }
-    }
-}
 
 /// True if `e`'s anyhow cause chain contains a SQLite FOREIGN KEY constraint failure.
 /// Matches the FULL chain (`{:#}`), not just the outer `to_string()`: the incremental
@@ -1280,228 +1223,6 @@ impl McpServer {
         });
     }
 
-    /// Spawn the no-traffic embedding backfill driver (exactly once per process).
-    ///
-    /// The server only re-checks freshness and backfills on an MCP tool call
-    /// (`ensure_indexed`). A session that exercises code-graph purely through the
-    /// PreToolUse CLI hooks adds nodes via `ensure_file_indexed` (`model=None`) without
-    /// ever sending a tool call, and with the watcher off nothing embeds them — they
-    /// strand at <100% vector coverage until restart. This driver gives the primary
-    /// server a watcher- and traffic-independent path to drain that backlog.
-    ///
-    /// It re-runs the guarded backfill only when the unembedded count rises ABOVE the
-    /// residue the previous run left behind, so it never reloads the model to spin on
-    /// permanently un-embeddable nodes (empty-content symbols that keep a
-    /// `context_string` but yield no vector). An idle tick (no new work) is a single
-    /// cheap COUNT; only a tick that finds new work pays for a drain + a residue re-count.
-    fn spawn_periodic_backfill(&self) {
-        if !self.is_primary() {
-            return;
-        }
-        if self
-            .indexing
-            .periodic_backfill_started
-            .swap(true, Ordering::AcqRel)
-        {
-            return; // already spawned this session
-        }
-        // Gate only on vector storage — NOT on `self.embedding_model`, which stays None
-        // until a tool call lazily loads it (exactly the no-tool-call sessions this driver
-        // exists for). `run_unembedded_backfill` loads its own model and no-ops if absent,
-        // mirroring the startup-index backfill path.
-        if !self.db.vec_enabled() {
-            return;
-        }
-        let db_path = match &self.project_root {
-            Some(p) => p.join(CODE_GRAPH_DIR).join("index.db"),
-            None => return,
-        };
-        let flag = Arc::clone(&self.indexing.embedding_in_progress);
-        std::thread::spawn(move || {
-            // `floor` = unembedded count left after the last drain (the un-embeddable
-            // residue). Start at 0 so the first non-empty observation — including nodes
-            // stranded by a prior session — triggers one run that establishes the true
-            // floor. Re-opening the DB each tick (rather than holding a connection) keeps
-            // us correct across a rebuild-index atomic swap.
-            let mut floor: i64 = 0;
-            let mut stall_retries: u32 = 0;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(PERIODIC_BACKFILL_SECS));
-                // Open NON-destructively for the read-only count: the destructive
-                // `open_with_vec` revalidates and could WIPE the index on an
-                // INDEX_VERSION skew window (a downgraded sibling binary), and a poller
-                // doing that every tick forever is a standing hazard. sqlite-vec is
-                // registered process-globally regardless, so the vec0 `node_vectors`
-                // join still resolves. Re-opening each tick (vs holding a connection)
-                // keeps us correct across a rebuild-index atomic swap.
-                let unembedded = match Database::open_nondestructive(&db_path) {
-                    Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
-                    Err(_) => continue, // transient (e.g. mid-swap) — retry next tick
-                };
-                if unembedded <= floor {
-                    continue; // no embeddable work above the confirmed floor
-                }
-                // Embeddable work exists above the floor. Attempt a drain. The guard
-                // no-ops (None) if a tool-call/startup backfill is already draining — leave
-                // the floor untouched and retry next tick rather than trusting that other
-                // run's mid-drain count.
-                let Some(outcome) = Self::run_guarded_backfill(&db_path, &flag) else {
-                    continue;
-                };
-                // Re-measure the residue for the floor decision. `apply_backfill_outcome`
-                // only consumes this for the Stalled-pin branches; computing it
-                // unconditionally keeps the driver loop trivial (a 60s nondestructive read
-                // is negligible) and the decision logic pure + unit-testable.
-                //
-                // TOCTOU note (accepted, self-healing): this read happens AFTER the drain
-                // released the flag, so a node added in that sub-second window inflates
-                // `remeasured` and, on a pin, gets folded into the floor — stranding it
-                // until the count next rises above that floor (the next write) or restart.
-                // This only bites in the rare pin path (healthy installs always Drain, never
-                // pin) and resolves on the next file change. Do NOT "fix" it by pinning to a
-                // count captured before the drain — that reintroduces the original bug of
-                // pinning a stale-high floor.
-                let remeasured = match Database::open_nondestructive(&db_path) {
-                    Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
-                    Err(_) => floor,
-                };
-                let (new_floor, new_retries) =
-                    apply_backfill_outcome(floor, stall_retries, outcome, remeasured);
-                floor = new_floor;
-                stall_retries = new_retries;
-            }
-        });
-    }
-
-    /// Claim the `embedding_in_progress` flag and run [`Self::run_unembedded_backfill`]
-    /// to completion, releasing the flag on return — and on unwind, via the drop guard
-    /// (release builds use `panic = "abort"`, where a panic ends the process and resets
-    /// the in-memory flag regardless). No-ops if a backfill is already running. Blocks
-    /// the caller, so it must be
-    /// invoked on a background thread (the embedding thread, or the startup-index
-    /// thread once its own work is committed and the indexing flag is clear).
-    ///
-    /// Returns `Some(outcome)` if this call claimed the flag and ran the backfill, or
-    /// `None` if it no-op'd because another backfill already held it. The periodic driver
-    /// uses both the `None` (don't trust a residue re-measurement taken while a *different*
-    /// backfill is mid-drain) and the [`BackfillOutcome`] (don't advance the floor on a
-    /// model-absent no-op) to decide whether its floor may advance.
-    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) -> Option<BackfillOutcome> {
-        if in_progress.swap(true, Ordering::AcqRel) {
-            return None; // a backfill is already running
-        }
-        // Drop guard ensures the flag is always cleared, even on panic.
-        struct FlagGuard<'a>(&'a AtomicBool);
-        impl Drop for FlagGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _guard = FlagGuard(in_progress);
-        match Self::run_unembedded_backfill(db_path) {
-            Ok(outcome) => Some(outcome),
-            Err(e) => {
-                // A hard error (DB open / count query failed) embedded nothing — a
-                // zero-progress stall. Report it that way (not a clean drain) so the driver
-                // bounded-retries instead of pinning the floor on what may be a transient
-                // (e.g. mid-swap) failure.
-                tracing::warn!("[embed-bg] Failed: {}", e);
-                Some(BackfillOutcome::Stalled { progressed: false })
-            }
-        }
-    }
-
-    /// Embed every node that still lacks a vector, hot-path first, in batches.
-    /// Loads its own model + DB connection (EmbeddingModel is `!Send`, so it can't
-    /// cross the thread boundary) and no-ops when no model is available locally or
-    /// vec is disabled. Append-only writes — safe to run alongside a reader.
-    fn run_unembedded_backfill(db_path: &Path) -> Result<BackfillOutcome> {
-        let model = match EmbeddingModel::load()? {
-            Some(m) => m,
-            // Model not on disk yet (download in flight). Report NoModel so the periodic
-            // driver keeps its floor low and re-attempts once the download lands, instead
-            // of pinning the floor and stranding every node until restart.
-            None => return Ok(BackfillOutcome::NoModel),
-        };
-        let db = Database::open_with_vec(db_path)?;
-        if !db.vec_enabled() {
-            // Vectors disabled for the session — nothing is embeddable; treat as drained.
-            // Safe for the periodic driver despite `Drained` resetting the floor to 0:
-            // that driver only spawns when `self.db.vec_enabled()` is already true (and
-            // sqlite-vec is process-global), so it never reaches this branch in a loop —
-            // i.e. this can't cause a per-tick full-model-load spin.
-            return Ok(BackfillOutcome::Drained);
-        }
-
-        // Same-dim model-swap safety: if the embedding model's content fingerprint changed
-        // since these vectors/cache were written, they are stale (a same-dim weight change is
-        // invisible to the vec-table dim check). Clear both so every node re-embeds with the
-        // new model. Cheap once-per-run meta compare; best-effort — never block embedding.
-        #[cfg(feature = "embed-model")]
-        if let Err(e) =
-            queries::ensure_embedding_cache_valid(db.conn(), EmbeddingModel::MODEL_CONTENT_BLAKE3)
-        {
-            tracing::warn!("[embed-cache] validity check failed (continuing): {}", e);
-        }
-
-        const EMBED_BATCH: usize = 32;
-        let mut total_embedded = 0usize;
-        let t0 = std::time::Instant::now();
-        // Nodes that failed to embed THIS run (a deterministically un-embeddable
-        // context_string, or a transient per-node inference error in the sequential
-        // fallback). embed_and_store_batch returns the IDs that actually got a vector,
-        // so we learn failures directly; we exclude them from the next query so a poison
-        // node at the head of the caller-count ordering can't be re-fetched forever and
-        // starve the embeddable nodes behind it — we advance past it instead of stopping.
-        let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
-
-        loop {
-            let exclude: Vec<i64> = failed.iter().copied().collect();
-            let chunk = queries::get_unembedded_nodes_excluding(db.conn(), EMBED_BATCH, &exclude)?;
-            if chunk.is_empty() {
-                break;
-            }
-            let chunk_len = chunk.len();
-            // embed_and_store_batch reuses cached embeddings for unchanged content (a byte copy,
-            // no inference) and embeds the rest, managing its own transaction + cache writes.
-            let embedded_ids = embed_and_store_batch(&db, &model, &chunk)?;
-            total_embedded += embedded_ids.len();
-            if embedded_ids.len() < chunk_len {
-                let ok: std::collections::HashSet<i64> = embedded_ids.into_iter().collect();
-                for (id, _) in &chunk {
-                    if !ok.contains(id) {
-                        failed.insert(*id);
-                    }
-                }
-            }
-        }
-
-        if total_embedded > 0 {
-            tracing::info!(
-                "[embed-bg] Complete: {} nodes now embedded (some may be cache reuse) in {:.1}s",
-                total_embedded,
-                t0.elapsed().as_secs_f64()
-            );
-        }
-        if !failed.is_empty() {
-            tracing::warn!(
-                "[embed-bg] {} node(s) could not be embedded this run (skipped as residue)",
-                failed.len()
-            );
-        }
-        // No failures → every embeddable node now has a vector. Failures remain → genuine
-        // residue we advanced past (not starved on); `progressed` lets the periodic driver
-        // pin that residue immediately when the model is proven working this pass.
-        let outcome = if failed.is_empty() {
-            BackfillOutcome::Drained
-        } else {
-            BackfillOutcome::Stalled {
-                progressed: total_embedded > 0,
-            }
-        };
-        Ok(outcome)
-    }
-
     /// Spawn a background thread to download the embedding model if not available.
     /// On success, the model files are placed in the cache directory; lazy loading
     /// in tool_semantic_search will pick them up on the next call.
@@ -1829,60 +1550,6 @@ impl McpServer {
                     *last_check = std::time::Instant::now();
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Sync-reindex a single file when its on-disk hash differs from the stored
-    /// hash. Closes the post-Edit→pre-incremental-index staleness window for
-    /// MCP tools that take an explicit `file_path`.
-    ///
-    /// No-op when:
-    ///
-    /// - this instance is a read-only secondary (only the primary holds the write capability),
-    /// - `path` is `None` / empty / a directory-shaped path (caller doesn't know which file to refresh),
-    /// - the on-disk hash already matches the stored hash.
-    ///
-    /// Reindex caches are invalidated only when the call actually re-indexed.
-    pub(super) fn ensure_file_fresh_opt(&self, path: Option<&str>) -> Result<()> {
-        if !self.is_primary() {
-            return Ok(());
-        }
-        let Some(rel_path) = path else {
-            return Ok(());
-        };
-        // Belt-and-braces: every `tool_*` entry point now normalizes its path
-        // argument via `tools::normalize_path_arg` before calling here, so the
-        // freshness target and the subsequent index lookup key are the same
-        // string. This repeat is idempotent and keeps the leaf correct for any
-        // future caller that forgets. Normalizing BEFORE the trailing check also
-        // makes `src\` register as the directory it is.
-        let rel_path = crate::indexer::merkle::normalize_rel_str(rel_path);
-        if rel_path.is_empty() || rel_path.ends_with('/') {
-            return Ok(());
-        }
-        let rel_path = rel_path.as_str();
-        let Some(root) = self.project_root.as_deref() else {
-            return Ok(());
-        };
-
-        let did_reindex = {
-            let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
-            let write_db = self.write_db();
-            crate::indexer::pipeline::ensure_file_indexed(
-                &write_db,
-                root,
-                rel_path,
-                model_guard.as_ref(),
-            )?
-        };
-        if did_reindex {
-            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
-            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
-            tracing::debug!(
-                "[fresh] sync-reindexed {} on query-time freshness",
-                rel_path
-            );
         }
         Ok(())
     }
@@ -2621,207 +2288,6 @@ impl McpServer {
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }
-
-    /// FRS-2: re-index the files a result set points at, and re-run the tool if
-    /// any of them actually changed.
-    ///
-    /// Tools that take a `file_path` argument close the post-Edit window with
-    /// `ensure_file_fresh_opt`. The tools in [`RESULT_REFRESH_TOOLS`] have no
-    /// such argument: which files matter is only known once the query has run.
-    /// Watcher delivery is asynchronous, so a query issued immediately after an
-    /// Edit legitimately sees `drain_watcher_events() == false` and answers with
-    /// pre-edit line numbers — previously with no disclosure at all.
-    ///
-    /// Budget and failure policy deliberately mirror the CLI's
-    /// `refresh_files_if_stale`: at most [`crate::indexer::resync::RESYNC_BUDGET`] files per
-    /// call, a short `busy_timeout` so a concurrent writer can't stall the tool,
-    /// and stale data KEPT (never dropped) with a disclosure whenever the budget
-    /// or an error prevents the refresh.
-    fn refresh_result_set(
-        &self,
-        name: &str,
-        args: &serde_json::Value,
-        value: serde_json::Value,
-    ) -> serde_json::Value {
-        // Secondaries hold a read-only DB; nothing to refresh with.
-        if !self.is_primary() {
-            return value;
-        }
-        let Some(root) = self.project_root.clone() else {
-            return value;
-        };
-        let mut paths = Vec::new();
-        collect_result_paths(&value, &mut paths);
-        paths.sort_unstable();
-        paths.dedup();
-        // Bound the hashing cost on large result sets. Anything past the cap is
-        // left unchecked and said so — silently checking a prefix would be the
-        // same "false clean" the disclosure exists to avoid.
-        let unchecked = paths.len().saturating_sub(RESULT_REFRESH_SCAN_CAP);
-        paths.truncate(RESULT_REFRESH_SCAN_CAP);
-        if paths.is_empty() {
-            return value;
-        }
-
-        let outcome = self.reindex_stale_result_files(&root, &paths);
-        let mut value = if outcome.refreshed > 0 {
-            // Line numbers/snippets in the old result are now wrong; re-run once.
-            // A failing re-run keeps the first (stale) answer rather than turning
-            // a working query into an error — disclosed below.
-            match self.dispatch_tool(name, args) {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    tracing::warn!("[fresh] re-run of {} after refresh failed: {}", name, e);
-                    value
-                }
-            }
-        } else {
-            value
-        };
-
-        let stale_kept = outcome.failed + outcome.skipped_over_budget + unchecked;
-        if stale_kept > 0 {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "freshness".to_string(),
-                    json!({
-                        "refreshed": outcome.refreshed,
-                        "stale_kept": stale_kept,
-                        "note": "Some files in this result changed on disk and were not re-indexed \
-                                 (per-call budget or a busy database). Their line numbers and \
-                                 snippets may predate your last edit — re-run the query, or pass \
-                                 an explicit file_path tool for those files.",
-                    }),
-                );
-            }
-        }
-        value
-    }
-
-    /// Re-index result-set files whose on-disk hash no longer matches the index.
-    ///
-    /// The predicate, the budget policy and the batching all live in
-    /// [`crate::indexer::resync`] — this surface adds only the promoted write
-    /// handle, the busy-timeout guard, and the cache invalidation.
-    fn reindex_stale_result_files(&self, root: &Path, paths: &[String]) -> ResultRefreshOutcome {
-        let refreshed;
-        let resync;
-        {
-            // Scoped so the promoted-DB handle (lock level 7) is released before the
-            // cache invalidation below takes the two cache mutexes (level 5) — the
-            // sibling of the same ordering inversion fixed in
-            // `run_incremental_with_cache_restore` (2026-08-16 audit §四).
-            let write_db = self.write_db();
-            // Never let a concurrent writer (background embedding, another index run)
-            // stall a tool call for the default 5s busy_timeout — fail fast and keep
-            // the stale row. Restored on drop: this connection is long-lived, unlike
-            // the CLI's short process where the same PRAGMA is set and forgotten.
-            let _busy = BusyTimeoutGuard::apply(write_db.conn(), RESULT_REFRESH_BUSY_TIMEOUT_MS);
-            resync = crate::indexer::resync::resync_stale_files(
-                &write_db,
-                root,
-                paths,
-                self.result_refresh_budget,
-            );
-            refreshed = resync.refreshed;
-        }
-        if refreshed > 0 {
-            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
-            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
-        }
-        ResultRefreshOutcome {
-            refreshed: resync.refreshed,
-            failed: resync.failed,
-            skipped_over_budget: resync.skipped_over_budget,
-        }
-    }
-}
-
-/// Tools that return file/line data but take no `file_path` argument, so
-/// [`McpServer::ensure_file_fresh_opt`] cannot cover them (FRS-2).
-/// `find_http_route` is the alias of `trace_http_chain`.
-///
-/// `get_call_graph` and `find_references` were the two gaps (audit 2026-08-22
-/// P2-11): both DO accept a `file_path`, so they looked covered, but that
-/// argument is optional and disambiguates same-name symbols — the ordinary
-/// call passes a bare symbol name and reached
-/// [`McpServer::ensure_file_fresh_opt`]'s `None` early return. The answer they
-/// give is a set of OTHER files' symbols, so what goes stale after an edit is
-/// not the named file but the callers and references the query found. Listing
-/// them here refreshes by result set instead, which is what the result set
-/// needs; the two mechanisms overlap harmlessly when a `file_path` IS passed
-/// (the second pass finds that file already fresh).
-const RESULT_REFRESH_TOOLS: &[&str] = &[
-    "semantic_code_search",
-    "ast_search",
-    "project_map",
-    "find_similar_code",
-    "trace_http_chain",
-    "find_http_route",
-    "get_call_graph",
-    "find_references",
-];
-
-/// Max files hashed for one result set before the rest is reported unchecked.
-const RESULT_REFRESH_SCAN_CAP: usize = 32;
-/// Short busy_timeout for the refresh, so a concurrent writer cannot stall a
-/// tool call. Restored to the connection default afterwards.
-const RESULT_REFRESH_BUSY_TIMEOUT_MS: u32 = crate::indexer::resync::RESYNC_BUSY_TIMEOUT_MS;
-/// Connection default set by `Database::open` — what the guard restores.
-const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5000;
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResultRefreshOutcome {
-    pub(super) refreshed: usize,
-    pub(super) failed: usize,
-    pub(super) skipped_over_budget: usize,
-}
-
-/// Restores the connection's default `busy_timeout` when dropped.
-struct BusyTimeoutGuard<'a>(&'a rusqlite::Connection);
-
-impl<'a> BusyTimeoutGuard<'a> {
-    fn apply(conn: &'a rusqlite::Connection, ms: u32) -> Self {
-        let _ = conn.execute_batch(&format!("PRAGMA busy_timeout = {ms};"));
-        Self(conn)
-    }
-}
-
-impl Drop for BusyTimeoutGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .execute_batch(&format!("PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_MS};"));
-    }
-}
-
-/// Collect every file-ish path string in a tool result.
-///
-/// Keys mirror what the handlers emit: `file_path` (search / ast_search /
-/// similar / trace), `file` (project_map hotspots + entrypoints) and `path`
-/// (project_map modules — a directory, filtered out downstream by the
-/// "must already be an indexed file" rule).
-fn collect_result_paths(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                if matches!(k.as_str(), "file_path" | "file" | "path") {
-                    if let Some(s) = v.as_str() {
-                        if !s.is_empty() && !s.starts_with('<') {
-                            out.push(s.to_string());
-                        }
-                    }
-                }
-                collect_result_paths(v, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for v in items {
-                collect_result_paths(v, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 impl Drop for McpServer {
@@ -2869,11 +2335,21 @@ mod tests {
         // BOTH floor and retries untouched so the next tick re-attempts once the model
         // lands. `remeasured` is irrelevant here and must be ignored.
         assert_eq!(
-            apply_backfill_outcome(0, 0, BackfillOutcome::NoModel, 500),
+            super::backfill::apply_backfill_outcome(
+                0,
+                0,
+                super::backfill::BackfillOutcome::NoModel,
+                500
+            ),
             (0, 0)
         );
         assert_eq!(
-            apply_backfill_outcome(7, 2, BackfillOutcome::NoModel, 500),
+            super::backfill::apply_backfill_outcome(
+                7,
+                2,
+                super::backfill::BackfillOutcome::NoModel,
+                500
+            ),
             (7, 2)
         );
     }
@@ -2884,11 +2360,21 @@ mod tests {
         // treated as fresh work, and the stall-retry budget resets. `remeasured` is
         // ignored (a race-added node should be picked up next tick, not skipped).
         assert_eq!(
-            apply_backfill_outcome(0, 0, BackfillOutcome::Drained, 0),
+            super::backfill::apply_backfill_outcome(
+                0,
+                0,
+                super::backfill::BackfillOutcome::Drained,
+                0
+            ),
             (0, 0)
         );
         assert_eq!(
-            apply_backfill_outcome(42, 2, BackfillOutcome::Drained, 3),
+            super::backfill::apply_backfill_outcome(
+                42,
+                2,
+                super::backfill::BackfillOutcome::Drained,
+                3
+            ),
             (0, 0)
         );
     }
@@ -2898,18 +2384,18 @@ mod tests {
         // A zero-progress stall is ambiguous (transient vs un-embeddable). Below the retry
         // budget the floor stays low (so the next tick re-attempts and a transient failure
         // self-heals) while the retry counter climbs.
-        let stalled = BackfillOutcome::Stalled { progressed: false };
-        let (f1, r1) = apply_backfill_outcome(0, 0, stalled, 9);
+        let stalled = super::backfill::BackfillOutcome::Stalled { progressed: false };
+        let (f1, r1) = super::backfill::apply_backfill_outcome(0, 0, stalled, 9);
         assert_eq!(
             (f1, r1),
             (0, 1),
             "first stall: floor stays low, retry counted"
         );
-        let (f2, r2) = apply_backfill_outcome(f1, r1, stalled, 9);
+        let (f2, r2) = super::backfill::apply_backfill_outcome(f1, r1, stalled, 9);
         assert_eq!((f2, r2), (0, 2), "second stall: still retrying");
         // Budget spent (MAX = 3): pin the floor to the residue and reset retries so a
         // FUTURE rise above this floor still re-triggers a drain.
-        let (f3, r3) = apply_backfill_outcome(f2, r2, stalled, 9);
+        let (f3, r3) = super::backfill::apply_backfill_outcome(f2, r2, stalled, 9);
         assert_eq!(
             (f3, r3),
             (9, 0),
@@ -2922,10 +2408,16 @@ mod tests {
         // A stall AFTER embedding some nodes proves the model works, so the remainder is
         // genuine residue — pin the floor at once (no retry budget consumed) instead of
         // churning a proven-working model on un-embeddable content.
-        let progressed = BackfillOutcome::Stalled { progressed: true };
-        assert_eq!(apply_backfill_outcome(0, 0, progressed, 5), (5, 0));
+        let progressed = super::backfill::BackfillOutcome::Stalled { progressed: true };
+        assert_eq!(
+            super::backfill::apply_backfill_outcome(0, 0, progressed, 5),
+            (5, 0)
+        );
         // Even with retries already accrued, a progressed stall pins and resets them.
-        assert_eq!(apply_backfill_outcome(0, 2, progressed, 5), (5, 0));
+        assert_eq!(
+            super::backfill::apply_backfill_outcome(0, 2, progressed, 5),
+            (5, 0)
+        );
     }
 
     #[test]
@@ -5238,7 +4730,7 @@ app.post('/api/login', handleLogin);
             "external": [{"file_path": "<external>"}, {"file_path": ""}],
         });
         let mut paths = Vec::new();
-        collect_result_paths(&value, &mut paths);
+        super::freshness::collect_result_paths(&value, &mut paths);
         paths.sort_unstable();
         assert_eq!(
             paths,
