@@ -94,7 +94,18 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" },
+                        // No figure here, matching the five sibling `compact`
+                        // descriptions in this file. The old "~50%" was never
+                        // true of any implementation: measured on this repo (15
+                        // modules) compact is 4305 B against a full map of 5445
+                        // B — 20.9%. Reaching 50% would mean dropping BOTH
+                        // key_symbols (1098 B, kept deliberately so the map is
+                        // discoverable without a second round-trip) and part of
+                        // hot_functions (1033 B); dropping key_symbols alone
+                        // only reaches 41%. The ratio also moves with module
+                        // count and symbol density, so any number baked in here
+                        // is a claim that goes stale on the next repo.
+                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves tokens)" },
                         "include_centrality": { "type": "boolean", "description": "Include architectural chokepoints (betweenness centrality — functions on the most shortest call paths; high score = structural bridge). Default false." },
                         "centrality_limit": { "type": "number", "description": "With include_centrality: max ranked results (default 10)" }
                     },
