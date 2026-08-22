@@ -1116,12 +1116,33 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
     // lexical_declaration -> variable_declarator -> arrow_function
     // A single declaration may contain multiple arrow functions: const a = () => {}, b = () => {};
     let mut out = Vec::new();
+    // The doc comment sits above the STATEMENT, which owns every declarator, so
+    // reading it per-declarator gave `/** DOC */ export const a = 1, b = 2;` the
+    // same DOC for both names (INDEX_VERSION 65). Only the first declarator
+    // keeps it — the rule this file already applies to Go's `// GROUP_DOC\ntype
+    // ( Alpha …; Beta … )`, where the group's doc reaches `Alpha` and stops.
+    // Read once here rather than inside the loop: it is the statement's comment,
+    // not each declarator's, and computing it per-declarator is what made the
+    // shared attribution look intentional.
+    let statement_doc = get_preceding_comment(node, source);
+    let mut first_declarator_seen = false;
     for i in 0..node.named_child_count() {
         let child = match node.named_child(i) {
             Some(c) => c,
             None => continue,
         };
         if child.kind() == "variable_declarator" {
+            // Claimed by position in the statement, NOT by whether the emit
+            // below succeeds: a leading declarator that produces no node (a
+            // local non-arrow const, say) must still consume the doc, or the
+            // comment would slide onto whichever later name happens to be
+            // extracted first and document the wrong symbol.
+            let doc_comment = if first_declarator_seen {
+                None
+            } else {
+                first_declarator_seen = true;
+                statement_doc.clone()
+            };
             let name_node = match child.child_by_field_name("name") {
                 Some(n) => n,
                 None => continue,
@@ -1141,7 +1162,7 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                     end_line: child.end_position().row as u32 + 1,
                     code_content: truncate_code_content(node_text(&child, source)).into_owned(),
                     signature: sig_info.signature,
-                    doc_comment: get_preceding_comment(node, source),
+                    doc_comment,
                     return_type: sig_info.return_type,
                     param_types: sig_info.param_types,
                     is_test: false,
@@ -1189,7 +1210,10 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                         end_line: child.end_position().row as u32 + 1,
                         code_content: truncate_code_content(node_text(&child, source)).into_owned(),
                         signature: None,
-                        doc_comment: get_preceding_comment(node, source),
+                        // Every name bound by ONE destructuring declarator shares
+                        // its doc — the split is between declarators, not between
+                        // the names inside one.
+                        doc_comment: doc_comment.clone(),
                         return_type: None,
                         param_types: None,
                         is_test: false,
@@ -1551,15 +1575,17 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
     // the spec `Beta` is not first, and without that check the group's doc
     // comment would document it too (`test_wrapper_climb_skips_later_group_members`).
     //
-    // KNOWN HOLE, pre-dating this check and NOT closed by it: the first-named-child
-    // rule does not stop `/** DOC */ export const a = 1, b = 2;` from giving DOC to
-    // BOTH `a` and `b`, because `extract_named_arrows` hands this walk the
-    // `lexical_declaration`, so every declarator in the statement resolves to the
-    // one comment above it (measured; same for `export let` and for arrow-valued
-    // declarators). The v63 INDEX_VERSION note claims the check prevents exactly
-    // this, citing the UNEXPORTED `const a = 1, b = 2` — which is vacuous, since
-    // that form produces no nodes at all. Deciding which declarator owns a shared
-    // doc is a design call, not a bug fix, and is deliberately left open here.
+    // This check does NOT handle the multi-declarator case, and cannot: it sees
+    // the `lexical_declaration`, which is its parent's first named child no
+    // matter how many declarators hang off it, so `/** DOC */ export const a =
+    // 1, b = 2;` used to give DOC to both names. That is fixed one level up in
+    // `extract_named_arrows`, which now hands the statement's comment to the
+    // first declarator only (INDEX_VERSION 65) — the same outcome this check
+    // produces for Go's `type ( Alpha; Beta )`, reached by a different route
+    // because the declarators are not separate nodes at this level.
+    // (The v63 INDEX_VERSION note claimed this check already prevented it,
+    // citing the UNEXPORTED `const a = 1, b = 2`; that was vacuous — the
+    // unexported form produces no nodes at all.)
     //
     // The 3-level bound is defence-in-depth, NOT a measured chain: the pre-tag
     // review walked every call site and every supported grammar and found that a
@@ -2803,12 +2829,9 @@ export function second(): void {}
 
     /// The climb makes `export` invisible to doc attribution — the exported and
     /// local spellings of the same declaration must agree. Pinned as parity
-    /// rather than as an absolute, because one shared imprecision predates this
-    /// and is deliberately preserved: a multi-declarator statement hands its one
-    /// doc comment to EVERY declarator (`extract_named_arrows` reads the comment
-    /// from the `lexical_declaration`, which owns them all). Local `const a =
-    /// …, b = …` already behaved that way; making only the exported form
-    /// stricter would be a new divergence, not a fix.
+    /// rather than as an absolute: the two forms have to move together, and
+    /// since INDEX_VERSION 65 they do so under the first-declarator rule
+    /// (`test_multi_declarator_doc_goes_to_the_first_only`).
     #[test]
     fn test_export_wrapper_does_not_change_doc_attribution() {
         let src = "\
@@ -2832,6 +2855,82 @@ export const expA = () => {}, expB = () => {};
             "exported and local declarations must attribute doc comments identically"
         );
         assert!(has_doc("expA"), "the exported form must carry a doc at all");
+    }
+
+    /// INDEX_VERSION 65: `/** DOC */ export const a = 1, b = 2;` handed DOC to
+    /// BOTH names. `extract_named_arrows` reads the comment off the
+    /// `lexical_declaration`, which owns every declarator, so each one resolved
+    /// to the single comment above the statement.
+    ///
+    /// This is not a cosmetic mis-labelling. `doc_comment` is ranked ABOVE
+    /// `code:` in the embedding context builder precisely because it is the
+    /// densest description of a symbol, so a wrong doc makes `b` retrievable
+    /// under a description of `a` — a phantom bound to a real node, which this
+    /// codebase has repeatedly found to be worse than the missing edge or the
+    /// missing field it replaces.
+    ///
+    /// The rule chosen is the one the file already applies to the analogous
+    /// shape: Go's `// GROUP_DOC\ntype ( Alpha …; Beta … )` gives the doc to
+    /// `Alpha` and withholds it from `Beta`
+    /// (`test_wrapper_climb_skips_later_group_members`). A comma-separated JS
+    /// declaration is the same construct with different punctuation, and it
+    /// simply never reached that check.
+    #[test]
+    fn test_multi_declarator_doc_goes_to_the_first_only() {
+        let doc_of = |src: &str, name: &str| -> String {
+            parse_code(src, "typescript")
+                .unwrap()
+                .iter()
+                .find(|n| n.name == name)
+                .and_then(|n| n.doc_comment.clone())
+                .unwrap_or_default()
+        };
+
+        // Constant-valued declarators (the exported-const extraction path).
+        let consts = "/** DOC_A */\nexport const a = 1, b = 2;\n";
+        assert!(
+            doc_of(consts, "a").contains("DOC_A"),
+            "the first declarator keeps the doc, got {:?}",
+            doc_of(consts, "a")
+        );
+        assert_eq!(
+            doc_of(consts, "b"),
+            "",
+            "a later declarator must not inherit the statement's doc"
+        );
+
+        // Arrow-valued declarators (the other branch of extract_named_arrows —
+        // same `lexical_declaration`, different emit path, so it needs its own
+        // assertion rather than riding on the one above).
+        let arrows = "/** DOC_F */\nexport const f = () => {}, g = () => {};\n";
+        assert!(doc_of(arrows, "f").contains("DOC_F"));
+        assert_eq!(doc_of(arrows, "g"), "");
+
+        // `export let` takes the same path and must not be a survivor.
+        let lets = "/** DOC_L */\nexport let m = 1, n = 2;\n";
+        assert!(doc_of(lets, "m").contains("DOC_L"));
+        assert_eq!(doc_of(lets, "n"), "");
+
+        // Negative control: a SINGLE declarator must still get its doc — the fix
+        // must not be "stop attributing docs to declarators at all", which every
+        // assertion above would also pass.
+        let single = "/** DOC_S */\nexport const only = 1;\n";
+        assert!(
+            doc_of(single, "only").contains("DOC_S"),
+            "a lone declarator must keep its doc, got {:?}",
+            doc_of(single, "only")
+        );
+
+        // A destructuring declarator binds several names from ONE declarator, so
+        // there is no "later declarator" to withhold from — it is a different
+        // shape and deliberately unchanged here. Pinned so the next person sees
+        // it was considered, not missed.
+        let destructured = "/** DOC_D */\nexport const { host, port } = getConfig();\n";
+        assert!(doc_of(destructured, "host").contains("DOC_D"));
+        assert!(
+            doc_of(destructured, "port").contains("DOC_D"),
+            "one declarator's names share its doc; only MULTI-declarator statements split"
+        );
     }
 
     /// INDEX_VERSION 63: Python documents with a docstring, not a preceding
