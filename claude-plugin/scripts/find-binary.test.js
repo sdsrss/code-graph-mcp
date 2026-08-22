@@ -1,4 +1,14 @@
 'use strict';
+// `CLAUDE_CONFIG_DIR` is dropped before anything runs.
+//
+// The spawns below redirect HOME and pass `{...process.env}` through, and
+// `claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude` — so for a developer
+// who exports it (the documented multi-profile setup) the variable WINS over
+// the redirected HOME and these tests would write into the LIVE config. Same
+// neutralization the other suites do; the guard that caught its absence here is
+// `js_test_files_neutralize_claude_config_dir` in tests/hardening.rs.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
