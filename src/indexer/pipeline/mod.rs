@@ -167,22 +167,79 @@ pub(crate) fn is_safe_relative_path(rel_path: &str) -> bool {
 /// answer against the current bytes." The 30s `last_incremental_check`
 /// debounce in the server is too coarse for tight Edit→search loops.
 ///
-/// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
-/// dirty node IDs **before** re-indexing (cascade delete strips old edges),
-/// then regenerate context strings + embeddings once the new nodes exist.
+/// A thin composition of [`plan_file_refresh`] and [`apply_file_refreshes`] so
+/// this single-file entry point and the batched
+/// [`crate::indexer::resync::resync_stale_files`] cannot drift apart.
 pub fn ensure_file_indexed(
     db: &Database,
     project_root: &Path,
     rel_path: &str,
     model: Option<&EmbeddingModel>,
 ) -> Result<bool> {
+    match plan_file_refresh(db, project_root, rel_path, RefreshScope::IncludeNew)? {
+        FileRefresh::Fresh => Ok(false),
+        FileRefresh::DropStaleRow => {
+            apply_file_refreshes(db, project_root, &[rel_path.to_string()], &[], model)?;
+            Ok(true)
+        }
+        FileRefresh::Reindex(hash) => {
+            apply_file_refreshes(
+                db,
+                project_root,
+                &[],
+                &[(rel_path.to_string(), hash)],
+                model,
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// What a query-time refresh must do with one candidate path, decided without
+/// writing anything. Separated from the write so a caller with many candidates
+/// can classify them all, apply its budget, and then re-index the survivors in
+/// ONE batch — see [`crate::indexer::resync`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRefresh {
+    /// Nothing to do: unsafe path, pseudo-file, not indexable, never indexed,
+    /// or the bytes still match the index.
+    Fresh,
+    /// The file is gone from disk but still has an index row, which would keep
+    /// serving phantom nodes.
+    DropStaleRow,
+    /// Dirty. Payload is the on-disk hash, carried through to the indexer so
+    /// the file is not hashed a second time.
+    Reindex(String),
+}
+
+/// Which paths a refresh is allowed to touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshScope {
+    /// Refresh whatever the path names, indexing it even if it is new to the
+    /// index. What an explicit MCP `file_path` argument means: the agent named
+    /// this file, so answer against its current bytes.
+    IncludeNew,
+    /// Only refresh paths the index already knows. What a result-set resync
+    /// means: pulling a brand-new path in from a READ command would index
+    /// gitignored supplement files, widening the index past
+    /// `scan_directory`'s scope on nothing but a query.
+    IndexedOnly,
+}
+
+/// Classify one path for [`apply_file_refreshes`]. Read-only.
+pub fn plan_file_refresh(
+    db: &Database,
+    project_root: &Path,
+    rel_path: &str,
+    scope: RefreshScope,
+) -> Result<FileRefresh> {
     // Defense-in-depth: rel_path is a project-relative DB key by contract, but a
     // caller that forwards an unnormalized client path (absolute, or `..` climbing
     // out of the project) must not make us stat/hash/index a file outside
     // project_root. Treat such a path as "nothing to refresh" — consistent with
     // the not-indexable early returns below, not a hard error.
     if !is_safe_relative_path(rel_path) {
-        return Ok(false);
+        return Ok(FileRefresh::Fresh);
     }
     // `<external>` is a PSEUDO-file: the row that anchors sentinel nodes for
     // imports binding outside the project. It has no on-disk counterpart, so the
@@ -194,7 +251,7 @@ pub fn ensure_file_indexed(
     // open in a reader. A later incremental pass does not restore them, because
     // only a file whose CONTENT changed re-emits its import relations.
     if rel_path == crate::domain::EXTERNAL_FILE_PATH {
-        return Ok(false);
+        return Ok(FileRefresh::Fresh);
     }
     let abs_path = project_root.join(rel_path);
 
@@ -206,34 +263,18 @@ pub fn ensure_file_indexed(
                 row.get(0)
             })
             .ok();
-        if exists_in_db.is_some() {
-            let tx = db.conn().unchecked_transaction()?;
-            delete_files_by_paths(db.conn(), &[rel_path.to_string()])?;
-            tx.commit()?;
-            return Ok(true);
-        }
-        return Ok(false);
+        return Ok(if exists_in_db.is_some() {
+            FileRefresh::DropStaleRow
+        } else {
+            FileRefresh::Fresh
+        });
     }
 
     // Skip files we wouldn't index in the first place (binary / wrong language).
     if crate::utils::config::detect_language(rel_path).is_none() {
-        return Ok(false);
+        return Ok(FileRefresh::Fresh);
     }
 
-    // Size gate (2026-08-16 audit §四). Every branch below starts by hashing the
-    // whole file, and this function runs on the QUERY path — `refresh_files_if_stale`
-    // calls it for each file a result set touches. The indexer refuses to parse
-    // anything over `max_file_size()` (1 MiB by default, so a minified bundle or a
-    // generated source qualifies), which means for such a file the hash buys
-    // exactly one thing: nothing. It is re-read in full on every `show`, `search`
-    // and `callgraph` that mentions it.
-    //
-    // Not an unconditional early return, because one case still has work to do:
-    // a file that was UNDER the limit when it was indexed and has since grown past
-    // it still carries its old symbols, and they must be purged or they stay
-    // visible forever. So the gate fires only once the DB agrees the file is
-    // symbol-less, which is the steady state after the first refresh records it as
-    // skipped — turning a per-query full read into a per-query indexed lookup.
     // Size gate (2026-08-16 audit §四). Every branch below starts by hashing the
     // whole file, and this function runs on the QUERY path — `refresh_files_if_stale`
     // calls it for each file a result set touches. The indexer refuses to parse
@@ -258,11 +299,10 @@ pub fn ensure_file_indexed(
             )
             .is_ok();
         if !has_nodes {
-            return Ok(false);
+            return Ok(FileRefresh::Fresh);
         }
     }
 
-    let on_disk_hash = crate::indexer::merkle::hash_file(&abs_path)?;
     let stored_hash: Option<String> = db
         .conn()
         .query_row(
@@ -271,24 +311,62 @@ pub fn ensure_file_indexed(
             |row| row.get(0),
         )
         .ok();
-
-    if stored_hash.as_deref() == Some(&on_disk_hash) {
-        return Ok(false);
+    if stored_hash.is_none() && scope == RefreshScope::IndexedOnly {
+        return Ok(FileRefresh::Fresh);
     }
 
-    // Cross-file edges into this file's nodes need their context strings rebuilt
-    // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
-    let dirty_node_ids = collect_dirty_node_ids(db, std::slice::from_ref(&rel_path.to_string()))?;
+    // Hashed after the scope check, not before: for `IndexedOnly` an unknown
+    // path must cost a keyed lookup, not a full read of a file we would refuse
+    // to index anyway.
+    let on_disk_hash = crate::indexer::merkle::hash_file(&abs_path)?;
+    if stored_hash.as_deref() == Some(&on_disk_hash) {
+        return Ok(FileRefresh::Fresh);
+    }
+    Ok(FileRefresh::Reindex(on_disk_hash))
+}
 
-    let mut hashes: HashMap<String, String> = HashMap::new();
-    hashes.insert(rel_path.to_string(), on_disk_hash);
-    let files = vec![rel_path.to_string()];
+/// Carry out the plans [`plan_file_refresh`] produced, as ONE unit of indexer
+/// work: a single row-delete transaction and a single `index_files` call for
+/// however many files were dirty. Per-file calls used to pay a whole-graph
+/// `get_all_node_names_with_ids` plus the global edge post-passes EACH time,
+/// so a query touching the 8-file budget cost eight whole-graph sweeps
+/// (audit 2026-08-22 P1-3).
+///
+/// `reindex` pairs each path with the on-disk hash the plan already computed,
+/// so the bytes are hashed once per refresh, not twice.
+///
+/// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
+/// dirty node IDs **before** re-indexing (cascade delete strips old edges),
+/// then regenerate context strings + embeddings once the new nodes exist.
+pub fn apply_file_refreshes(
+    db: &Database,
+    project_root: &Path,
+    drop_rows: &[String],
+    reindex: &[(String, String)],
+    model: Option<&EmbeddingModel>,
+) -> Result<()> {
+    if !drop_rows.is_empty() {
+        let tx = db.conn().unchecked_transaction()?;
+        delete_files_by_paths(db.conn(), drop_rows)?;
+        tx.commit()?;
+    }
+    if reindex.is_empty() {
+        return Ok(());
+    }
+
+    let files: Vec<String> = reindex.iter().map(|(p, _)| p.clone()).collect();
+    let hashes: HashMap<String, String> = reindex.iter().cloned().collect();
+
+    // Cross-file edges into these files' nodes need their context strings rebuilt
+    // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
+    let dirty_node_ids = collect_dirty_node_ids(db, &files)?;
+
     // `index_files` clears the interrupted-run marker when it finishes, which is
     // right for a run that covered the whole diff and wrong for this one: a
-    // single-file query-time refresh re-extracts one file's relations and leaves
-    // every other file the killed run abandoned exactly as it was. Clearing here
-    // would retire the evidence before the full re-index it exists to trigger, so
-    // a marker that was already set goes back (audit 2026-08-16 P1-2).
+    // query-time refresh re-extracts the relations of the files it was handed and
+    // leaves every other file the killed run abandoned exactly as it was. Clearing
+    // here would retire the evidence before the full re-index it exists to
+    // trigger, so a marker that was already set goes back (audit 2026-08-16 P1-2).
     let was_interrupted = index_run_was_interrupted(db)?;
     index_files(db, project_root, &files, &hashes, model, &[], None)?;
     if was_interrupted {
@@ -302,7 +380,7 @@ pub fn ensure_file_indexed(
     if !dirty_node_ids.is_empty() {
         regenerate_context_strings(db, &dirty_node_ids, model)?;
     }
-    Ok(true)
+    Ok(())
 }
 
 pub fn run_incremental_index(

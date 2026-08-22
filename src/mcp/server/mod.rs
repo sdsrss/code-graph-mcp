@@ -441,7 +441,8 @@ pub struct McpServer {
     last_promotion_attempt: Mutex<std::time::Instant>,
     /// Freshness/debounce timings (see [`TimingConfig`]).
     pub(super) timing: TimingConfig,
-    /// Max files re-indexed per result-set refresh (see [`RESULT_REFRESH_BUDGET`]).
+    /// Max files re-indexed per result-set refresh (see
+    /// [`crate::indexer::resync::RESYNC_BUDGET`]).
     /// Overridable via `CODE_GRAPH_RESYNC_BUDGET`, the same knob the CLI resync uses.
     pub(super) result_refresh_budget: usize,
 }
@@ -565,7 +566,7 @@ impl McpServer {
             promoted_db: Mutex::new(None),
             last_promotion_attempt: Mutex::new(std::time::Instant::now()),
             timing: TimingConfig::default(),
-            result_refresh_budget: resync_budget_from_env(),
+            result_refresh_budget: crate::indexer::resync::resync_budget(),
         })
     }
 
@@ -735,7 +736,7 @@ impl McpServer {
             promoted_db: Mutex::new(None),
             last_promotion_attempt: Mutex::new(std::time::Instant::now()),
             timing: TimingConfig::for_tests(),
-            result_refresh_budget: RESULT_REFRESH_BUDGET,
+            result_refresh_budget: crate::indexer::resync::RESYNC_BUDGET,
         }
     }
 
@@ -766,7 +767,7 @@ impl McpServer {
             promoted_db: Mutex::new(None),
             last_promotion_attempt: Mutex::new(std::time::Instant::now()),
             timing: TimingConfig::for_tests(),
-            result_refresh_budget: RESULT_REFRESH_BUDGET,
+            result_refresh_budget: crate::indexer::resync::RESYNC_BUDGET,
         }
     }
 
@@ -2632,7 +2633,7 @@ impl McpServer {
     /// pre-edit line numbers — previously with no disclosure at all.
     ///
     /// Budget and failure policy deliberately mirror the CLI's
-    /// `refresh_files_if_stale`: at most [`RESULT_REFRESH_BUDGET`] files per
+    /// `refresh_files_if_stale`: at most [`crate::indexer::resync::RESYNC_BUDGET`] files per
     /// call, a short `busy_timeout` so a concurrent writer can't stall the tool,
     /// and stale data KEPT (never dropped) with a disclosure whenever the budget
     /// or an error prevents the refresh.
@@ -2698,57 +2699,41 @@ impl McpServer {
     }
 
     /// Re-index result-set files whose on-disk hash no longer matches the index.
+    ///
+    /// The predicate, the budget policy and the batching all live in
+    /// [`crate::indexer::resync`] — this surface adds only the promoted write
+    /// handle, the busy-timeout guard, and the cache invalidation.
     fn reindex_stale_result_files(&self, root: &Path, paths: &[String]) -> ResultRefreshOutcome {
-        let mut outcome = ResultRefreshOutcome::default();
-        // Scoped so the promoted-DB handle (lock level 7) is released before the
-        // cache invalidation below takes the two cache mutexes (level 5) — the
-        // sibling of the same ordering inversion fixed in
-        // `run_incremental_with_cache_restore` (2026-08-16 audit §四).
-        let write_db = self.write_db();
-        // Never let a concurrent writer (background embedding, another index run)
-        // stall a tool call for the default 5s busy_timeout — fail fast and keep
-        // the stale row. Restored on drop: this connection is long-lived, unlike
-        // the CLI's short process where the same PRAGMA is set and forgotten.
-        let _busy = BusyTimeoutGuard::apply(write_db.conn(), RESULT_REFRESH_BUSY_TIMEOUT_MS);
-        let mut budget = self.result_refresh_budget;
-        for f in paths {
-            // Only files already in the index are candidates — parity with the CLI
-            // path. It also makes non-file entries (project_map's module `path`
-            // values, `<external>` placeholders) harmless no-ops.
-            let stored: Option<String> = write_db
-                .conn()
-                .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| {
-                    r.get(0)
-                })
-                .ok();
-            let Some(stored_hash) = stored else { continue };
-            let abs = root.join(f);
-            if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str())
-            {
-                continue; // already fresh
-            }
-            if budget == 0 {
-                outcome.skipped_over_budget += 1;
-                continue;
-            }
-            match crate::indexer::pipeline::ensure_file_indexed(&write_db, root, f, None) {
-                Ok(true) => {
-                    outcome.refreshed += 1;
-                    budget -= 1;
-                }
-                // Hash differed but no node changed — nothing stale to re-query.
-                Ok(false) => {}
-                // SQLITE_BUSY / parse failure: keep the stale node, disclose it.
-                Err(_) => outcome.failed += 1,
-            }
+        let refreshed;
+        let resync;
+        {
+            // Scoped so the promoted-DB handle (lock level 7) is released before the
+            // cache invalidation below takes the two cache mutexes (level 5) — the
+            // sibling of the same ordering inversion fixed in
+            // `run_incremental_with_cache_restore` (2026-08-16 audit §四).
+            let write_db = self.write_db();
+            // Never let a concurrent writer (background embedding, another index run)
+            // stall a tool call for the default 5s busy_timeout — fail fast and keep
+            // the stale row. Restored on drop: this connection is long-lived, unlike
+            // the CLI's short process where the same PRAGMA is set and forgotten.
+            let _busy = BusyTimeoutGuard::apply(write_db.conn(), RESULT_REFRESH_BUSY_TIMEOUT_MS);
+            resync = crate::indexer::resync::resync_stale_files(
+                &write_db,
+                root,
+                paths,
+                self.result_refresh_budget,
+            );
+            refreshed = resync.refreshed;
         }
-        drop(_busy);
-        drop(write_db);
-        if outcome.refreshed > 0 {
+        if refreshed > 0 {
             *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
             lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
         }
-        outcome
+        ResultRefreshOutcome {
+            refreshed: resync.refreshed,
+            failed: resync.failed,
+            skipped_over_budget: resync.skipped_over_budget,
+        }
     }
 }
 
@@ -2764,22 +2749,11 @@ const RESULT_REFRESH_TOOLS: &[&str] = &[
     "find_http_route",
 ];
 
-/// Read the per-call refresh budget, honouring the same env override as the CLI
-/// resync path so both surfaces can be tuned together.
-fn resync_budget_from_env() -> usize {
-    std::env::var("CODE_GRAPH_RESYNC_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(RESULT_REFRESH_BUDGET)
-}
-
-/// Max files re-indexed for one result set (same budget as the CLI resync).
-const RESULT_REFRESH_BUDGET: usize = 8;
 /// Max files hashed for one result set before the rest is reported unchecked.
 const RESULT_REFRESH_SCAN_CAP: usize = 32;
 /// Short busy_timeout for the refresh, so a concurrent writer cannot stall a
 /// tool call. Restored to the connection default afterwards.
-const RESULT_REFRESH_BUSY_TIMEOUT_MS: u32 = 250;
+const RESULT_REFRESH_BUSY_TIMEOUT_MS: u32 = crate::indexer::resync::RESYNC_BUSY_TIMEOUT_MS;
 /// Connection default set by `Database::open` — what the guard restores.
 const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5000;
 

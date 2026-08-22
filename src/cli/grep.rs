@@ -1022,69 +1022,50 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // for the default 5s busy_timeout — fail fast and mark stale instead.
         let _ = c.db.conn().execute_batch("PRAGMA busy_timeout = 250;");
     }
-    // Lazy query-time freshness (parity with the MCP file_path tools'
+    // Query-time freshness (parity with the MCP file_path tools'
     // ensure_file_indexed, v0.18.0): before annotating from the index,
-    // hash-compare the file and re-index it when dirty — bounded by a sync
-    // budget so a repo-wide grep over many dirty files keeps its latency.
-    // Beyond budget (or on write contention) annotations carry [stale].
-    let sync_budget: usize = std::env::var("CODE_GRAPH_GREP_SYNC_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    let mut synced = 0usize;
-    let mut stale_count = 0usize;
-    let mut node_cache: std::collections::HashMap<String, (Vec<queries::NodeResult>, bool)> =
+    // hash-compare each file about to be annotated and re-index the dirty ones
+    // — bounded by a sync budget so a repo-wide grep over many dirty files
+    // keeps its latency. Beyond budget (or on write contention) annotations
+    // carry [stale].
+    //
+    // Done ONCE up front over the matched files rather than lazily per lookup:
+    // `matches` is already fully materialized and sorted above, so the file set
+    // is known, and one batched resync replaces up to `budget` separate
+    // whole-graph index passes (audit 2026-08-22 P1-3). It also puts this
+    // surface on the shared predicate instead of a third hand-written copy.
+    let mut stale_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref c) = ctx {
+        let annotated: Vec<String> = {
+            let mut v: Vec<String> = matches.iter().map(|m| m.file.clone()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let outcome = crate::indexer::resync::resync_stale_files(
+            &c.db,
+            &c.project_root,
+            &annotated,
+            // `CODE_GRAPH_GREP_SYNC_BUDGET` predates the unified knob and is
+            // still honoured; `CODE_GRAPH_RESYNC_BUDGET` is the shared one.
+            crate::indexer::resync::resync_budget_named("CODE_GRAPH_GREP_SYNC_BUDGET"),
+        );
+        stale_files = outcome.stale_paths;
+    }
+    let stale_count = stale_files.len();
+    let mut node_cache: std::collections::HashMap<String, Vec<queries::NodeResult>> =
         std::collections::HashMap::new();
     let mut lookup_container = |file: &str,
                                 line: u64|
      -> Option<(String, String, i64, i64, bool)> {
         let ctx = ctx.as_ref()?;
         if !node_cache.contains_key(file) {
-            let mut stale = false;
-            // Only files already in the index are sync candidates: indexing a
-            // brand-new path here could pull gitignored supplement files into
-            // the index, diverging from scan_directory's scope.
-            let stored: Option<String> = ctx
-                .db
-                .conn()
-                .query_row(
-                    "SELECT blake3_hash FROM files WHERE path = ?1",
-                    [file],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(stored_hash) = stored {
-                let abs = ctx.project_root.join(file);
-                let disk = crate::indexer::merkle::hash_file(&abs).ok();
-                if disk.as_deref() != Some(stored_hash.as_str()) {
-                    if synced < sync_budget {
-                        match crate::indexer::pipeline::ensure_file_indexed(
-                            &ctx.db,
-                            &ctx.project_root,
-                            file,
-                            None,
-                        ) {
-                            Ok(changed) => {
-                                if changed {
-                                    synced += 1;
-                                }
-                            }
-                            // SQLITE_BUSY / parse failure: annotate honestly.
-                            Err(_) => stale = true,
-                        }
-                    } else {
-                        stale = true;
-                    }
-                }
-            }
-            if stale {
-                stale_count += 1;
-            }
             let nodes = queries::get_nodes_by_file_path(ctx.db.conn(), file).unwrap_or_default();
-            node_cache.insert(file.to_string(), (nodes, stale));
+            node_cache.insert(file.to_string(), nodes);
         }
-        let (nodes, stale) = node_cache.get(file)?;
-        find_containing_node_in(nodes, line).map(|(t, n, s, e)| (t, n, s, e, *stale))
+        let nodes = node_cache.get(file)?;
+        let stale = stale_files.contains(file);
+        find_containing_node_in(nodes, line).map(|(t, n, s, e)| (t, n, s, e, stale))
     };
 
     // Output. EPIPE (reader hung up, e.g. `| head`) is not an error — finish

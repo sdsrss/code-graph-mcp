@@ -58,65 +58,33 @@ impl FreshOutcome {
 
 /// Query-time freshness resync shared by the read commands that print
 /// `start_line`/`end_line` straight from the index (`show`, `refs`, `overview`,
-/// `search`, `ast-search`, `trace`, `similar`, `impact`, `dead-code`). Semantics
-/// lifted from `cmd_show`'s original inline loop and the MCP tools'
-/// `ensure_file_fresh_opt`: for each DISPLAYED file (dedup + sorted), hash-compare
-/// against the index and re-index the dirty ones through `ensure_file_indexed` so
-/// their line numbers reflect the post-edit source.
+/// `search`, `ast-search`, `trace`, `similar`, `impact`, `dead-code`).
 ///
-/// Bounded (8-file reindex budget — overridable via `CODE_GRAPH_RESYNC_BUDGET`
-/// for tests — plus a 250ms busy_timeout) so a common name spanning many dirty
-/// files can't stall an interactive command; on write contention / parse failure
-/// the stale node is kept, exactly the pre-resync behavior, never worse. `paths`
-/// must be the POST-limit result set (what the command will print), not the whole
-/// index. Callers re-run their query when the outcome reports `any_changed`.
+/// A thin adapter over [`crate::indexer::resync::resync_stale_files`], which
+/// owns the predicate and the batching for every surface (CLI, `grep`, MCP).
+/// `paths` must be the POST-limit result set (what the command will print), not
+/// the whole index. Callers re-run their query when the outcome reports
+/// `any_changed`.
 pub(crate) fn refresh_files_if_stale(db: &Database, root: &Path, paths: &[String]) -> FreshOutcome {
-    let mut outcome = FreshOutcome::default();
-    let conn = db.conn();
     // Never let a concurrent writer (MCP watcher, another index run) stall an
     // interactive command for the default 5s busy_timeout — fail fast, keep stale.
-    let _ = conn.execute_batch("PRAGMA busy_timeout = 250;");
+    // Set and forgotten on purpose: unlike the MCP server's long-lived handle,
+    // this is a short-lived CLI process.
+    let _ = db.conn().execute_batch(&format!(
+        "PRAGMA busy_timeout = {};",
+        crate::indexer::resync::RESYNC_BUSY_TIMEOUT_MS
+    ));
 
-    let mut files: Vec<&str> = paths.iter().map(String::as_str).collect();
-    files.sort_unstable();
-    files.dedup();
-
-    let mut budget: usize = std::env::var("CODE_GRAPH_RESYNC_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-
-    for f in files {
-        // Only files already in the index are candidates (parity with cmd_grep):
-        // indexing a brand-new path here could pull gitignored supplement files
-        // into the index, diverging from scan_directory's scope.
-        let stored: Option<String> = conn
-            .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| {
-                r.get(0)
-            })
-            .ok();
-        let Some(stored_hash) = stored else { continue };
-        let abs = root.join(f);
-        if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str()) {
-            continue; // already fresh
-        }
-        // Dirty from here down.
-        if budget == 0 {
-            outcome.skipped_over_budget += 1;
-            continue;
-        }
-        match crate::indexer::pipeline::ensure_file_indexed(db, root, f, None) {
-            Ok(true) => {
-                outcome.any_changed = true;
-                outcome.refreshed += 1;
-                budget -= 1;
-            }
-            // Hash differed but the reindex reported no node change — nothing
-            // stale to re-query or disclose.
-            Ok(false) => {}
-            // SQLITE_BUSY / parse failure: keep the stale node, disclose below.
-            Err(_) => outcome.failed += 1,
-        }
+    let outcome = crate::indexer::resync::resync_stale_files(
+        db,
+        root,
+        paths,
+        crate::indexer::resync::resync_budget(),
+    );
+    FreshOutcome {
+        any_changed: outcome.any_changed(),
+        refreshed: outcome.refreshed,
+        skipped_over_budget: outcome.skipped_over_budget,
+        failed: outcome.failed,
     }
-    outcome
 }
