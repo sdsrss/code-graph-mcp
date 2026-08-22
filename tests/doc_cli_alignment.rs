@@ -689,10 +689,44 @@ fn readme_documents_every_env_var_the_code_reads() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            for marker in ["env::var(\"", "env::var_os(\"", "process.env.", "env."] {
+            for marker in [
+                "env::var(\"",
+                "env::var_os(\"",
+                "process.env.",
+                "env.",
+                // Bracket access. `process.env.X` and `process.env['X']` are the
+                // same read, and only the first was recognised.
+                "process.env['",
+                "process.env[\"",
+            ] {
                 let mut rest = text.as_str();
                 while let Some(i) = rest.find(marker) {
                     rest = &rest[i + marker.len()..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    if name.starts_with("CODE_GRAPH_") {
+                        out.insert(name);
+                    }
+                }
+            }
+            // A name that reaches `env::var` through a PARAMETER is invisible to
+            // the markers above: `resync_budget_named(name)` does the read, and
+            // the only place the string exists is its call site
+            // (`resync_budget_named("CODE_GRAPH_GREP_SYNC_BUDGET")` in
+            // `cli/grep.rs`). Any quoted `CODE_GRAPH_*` literal in production
+            // source is therefore collected too. Measured when added: this finds
+            // ZERO names the markers miss today — the one variable that reaches
+            // env::var indirectly is caught by accident, through an inline test
+            // in a file that is not named `tests.rs`. It is here to close the
+            // form, not to fix a present-day gap, and the accident is exactly
+            // why the form needed closing.
+            for quote in ['"', '\''] {
+                let needle = format!("{quote}CODE_GRAPH_");
+                let mut rest = text.as_str();
+                while let Some(i) = rest.find(&needle) {
+                    rest = &rest[i + 1..]; // past the quote; keep the name itself
                     let name: String = rest
                         .chars()
                         .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
