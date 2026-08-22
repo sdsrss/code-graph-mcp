@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### A query that finds one stale file: 7.2 s → 2.1 s
+
+Editing one file in a 2,385-file project made the next query take **7.2
+seconds**. With nothing stale it takes 5 ms — `resync_stale_files` returns
+before any indexing work when no file changed — so the whole cost lands on the
+one path where a user is waiting for an answer about the file they just edited.
+
+Timers inside `index_files` put 96% of it in three global post-passes:
+`bind_calls_to_imported_targets` (1.75 s), `prune_import_contradicted_call_edges`
+(2.88 s) and `classify_edge_confidence` (2.56 s). Each evaluates every edge in
+the index — 397,119 of them — and re-derives the caller file's imports as a
+correlated subquery per candidate. The prune spent 3.6 s to delete zero rows.
+
+Materializing those derivations once per pass, into indexed temp tables, turns
+each per-edge re-derivation into an index probe. Measured on that corpus:
+prune 3.97 s → 0.44 s, classify 2.71 s → 0.51 s, bind 2.59 s → 1.63 s, and the
+end-to-end one-stale-file query 7,191 ms → 2,138 ms. A full rebuild also drops
+from 27.2 s to 22.2 s. Nothing-stale queries stay at 4 ms.
+
+No semantics change: each materialized table is its subquery's own FROM clause
+verbatim. Verified rather than argued — both binaries indexed 2,385 files of
+third-party Python and this repository, and the full edge sets (source, target,
+relation, metadata AND confidence) came back byte-identical at 397,119 and
+10,842 rows. Because a large corpus can pass an equality check vacuously, each
+rewrite was also checked against a fixture where the pass actually fires: the
+prune deletes one edge either way, the bind inserts one edge either way, and
+classify's 397,119-row comparison spans a real distribution (218,950 ambiguous
+/ 110,778 inferred / 67,391 extracted). No INDEX_VERSION bump.
+
+Two things measured and NOT the cause, recorded so the next round does not
+re-suspect them: `collect_crate_root_names` (1.68 ms) and
+`build_python_module_map` (0.60 ms) together are 0.03% of the query — a
+shape-based reading of the code had named them as the likely cost. And writing
+less does not help: guarding `classify` to skip no-op updates saved 0.2 s of
+2.6 s, because the cost is evaluating rows, not writing them.
+
+The remaining 2.1 s is the same three passes still evaluating every edge, just
+faster per edge. Getting below that means scoping them to the files that
+changed plus the names whose counts moved, which is a correctness-sensitive
+change (an import in one file binds a call sourced in another) and stays open.
+
 ### A half-applied plugin update now says so
 
 `lifecycle.js` reads `installed_plugins.json` through the three-way read that

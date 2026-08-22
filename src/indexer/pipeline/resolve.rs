@@ -365,6 +365,46 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
 ///   edges resolve by proximity, agrees with the call and gains nothing here).
 ///
 /// Returns the number of edges inserted.
+/// Build a TEMP table of every `imports` edge as (caller file, imported name,
+/// imported target), indexed both ways.
+///
+/// The three global post-passes each asked this question per candidate edge, as
+/// a correlated subquery. That is the whole reason a one-file refresh costs what
+/// a rebuild's post-pass costs: the passes evaluate every edge in the index, and
+/// each evaluation re-derives the caller file's imports. Measured on a
+/// 2,385-file / 397,119-edge Python tree, the three passes were 1.75 s, 2.88 s
+/// and 2.56 s of a 7.4 s query — against 5 ms when nothing is stale, because
+/// `resync_stale_files` returns before any of this when no file changed.
+///
+/// Materializing the projection once turns each correlated re-derivation into
+/// an index probe. It changes no semantics: the projection is the subquery's own
+/// FROM clause verbatim. Each pass builds and drops its own copy rather than
+/// sharing one, so none of them acquires an invisible precondition on having
+/// been called after another.
+fn build_imports_temp(conn: &rusqlite::Connection, with_name: bool) -> Result<()> {
+    use crate::domain::REL_IMPORTS;
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_imports;")?;
+    conn.execute(
+        "CREATE TEMP TABLE cg_imports AS
+         SELECT mn.file_id AS fid, itn.name AS nm, ie.target_id AS tid
+         FROM edges ie
+         JOIN nodes mn  ON mn.id  = ie.source_id
+         JOIN nodes itn ON itn.id = ie.target_id
+         WHERE ie.relation = ?1",
+        rusqlite::params![REL_IMPORTS],
+    )?;
+    conn.execute_batch("CREATE INDEX cg_imports_fid_tid ON cg_imports(fid, tid);")?;
+    if with_name {
+        conn.execute_batch("CREATE INDEX cg_imports_fid_nm ON cg_imports(fid, nm);")?;
+    }
+    Ok(())
+}
+
+fn drop_imports_temp(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_imports;")?;
+    Ok(())
+}
+
 pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
 
@@ -383,41 +423,52 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
     // A bare call whose name is bound by a unique internal import in the
     // caller's file — and is NOT shadowed by a same-file definition of that
     // name — resolves to the imported node.
+    //
+    // The unique-import side is MATERIALIZED first (see `build_imports_temp` for
+    // why the three post-passes all do this). As an inline derived table it was
+    // re-derived while scanning every bare call edge in the index; as an indexed
+    // temp table the same join is a probe. The SELECT is the original verbatim —
+    // only where the rows come from changed.
+    let conn = db.conn();
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_unique_imports;")?;
+    conn.execute(
+        "CREATE TEMP TABLE cg_unique_imports AS
+         SELECT mn.file_id AS import_file, itn.name AS import_name,
+                MIN(itn.id) AS import_target_id
+         FROM edges ie
+         JOIN nodes mn  ON mn.id  = ie.source_id
+         JOIN nodes itn ON itn.id = ie.target_id
+         JOIN files itf ON itf.id = itn.file_id
+         WHERE ie.relation = ?1
+           AND itf.path <> '<external>'
+         GROUP BY mn.file_id, itn.name
+         HAVING COUNT(DISTINCT itn.id) = 1",
+        rusqlite::params![REL_IMPORTS],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX cg_unique_imports_k ON cg_unique_imports(import_file, import_name);",
+    )?;
     let inserted = {
-        let mut stmt = db.conn().prepare(
+        let mut stmt = conn.prepare(
             "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
-             SELECT DISTINCT c.source_id, it.import_target_id, ?2, NULL
-             FROM (
-                 SELECT e.source_id AS source_id, tn.name AS call_name,
-                        sn.file_id AS caller_file
-                 FROM edges e
-                 JOIN nodes sn ON sn.id = e.source_id
-                 JOIN nodes tn ON tn.id = e.target_id
-                 WHERE e.relation = ?1
-                   AND (e.metadata IS NULL OR e.metadata = '')
-             ) c
-             JOIN (
-                 SELECT mn.file_id AS import_file, itn.name AS import_name,
-                        MIN(itn.id) AS import_target_id
-                 FROM edges ie
-                 JOIN nodes mn  ON mn.id  = ie.source_id
-                 JOIN nodes itn ON itn.id = ie.target_id
-                 JOIN files itf ON itf.id = itn.file_id
-                 WHERE ie.relation = ?3
-                   AND itf.path <> '<external>'
-                 GROUP BY mn.file_id, itn.name
-                 HAVING COUNT(DISTINCT itn.id) = 1
-             ) it
-               ON it.import_file = c.caller_file
-              AND it.import_name = c.call_name
-             WHERE c.source_id <> it.import_target_id
+             SELECT DISTINCT e.source_id, it.import_target_id, ?2, NULL
+             FROM edges e
+             JOIN nodes sn ON sn.id = e.source_id
+             JOIN nodes tn ON tn.id = e.target_id
+             JOIN cg_unique_imports it
+               ON it.import_file = sn.file_id
+              AND it.import_name = tn.name
+             WHERE e.relation = ?1
+               AND (e.metadata IS NULL OR e.metadata = '')
+               AND e.source_id <> it.import_target_id
                AND NOT EXISTS (
                    SELECT 1 FROM nodes ln
-                   WHERE ln.file_id = c.caller_file AND ln.name = c.call_name
+                   WHERE ln.file_id = sn.file_id AND ln.name = tn.name
                )",
         )?;
-        stmt.execute(rusqlite::params![REL_CALLS, REL_CALLS, REL_IMPORTS])?
+        stmt.execute(rusqlite::params![REL_CALLS, REL_CALLS])?
     };
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_unique_imports;")?;
     Ok(inserted)
 }
 
@@ -449,8 +500,10 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
 ///
 /// Returns the number of edges removed.
 pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usize> {
-    use crate::domain::{REL_CALLS, REL_IMPORTS};
-    let removed = db.conn().execute(
+    use crate::domain::REL_CALLS;
+    let conn = db.conn();
+    build_imports_temp(conn, true)?;
+    let removed = conn.execute(
         "DELETE FROM edges WHERE id IN (
             SELECT e.id FROM edges e
             JOIN nodes sn ON sn.id = e.source_id
@@ -476,25 +529,21 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
               AND sn.code_content NOT LIKE '%...'
               -- caller's file imports the SAME name bound to a DIFFERENT node
               AND EXISTS (
-                  SELECT 1 FROM edges ie
-                  JOIN nodes mn  ON mn.id  = ie.source_id
-                  JOIN nodes itn ON itn.id = ie.target_id
-                  WHERE ie.relation = ?2
-                    AND mn.file_id = sn.file_id
-                    AND itn.name = tn.name
-                    AND ie.target_id <> e.target_id
+                  SELECT 1 FROM cg_imports i
+                  WHERE i.fid = sn.file_id
+                    AND i.nm = tn.name
+                    AND i.tid <> e.target_id
               )
               -- ... and does NOT import THIS target (so it is contradicted)
               AND NOT EXISTS (
-                  SELECT 1 FROM edges ie2
-                  JOIN nodes mn2 ON mn2.id = ie2.source_id
-                  WHERE ie2.relation = ?2
-                    AND mn2.file_id = sn.file_id
-                    AND ie2.target_id = e.target_id
+                  SELECT 1 FROM cg_imports i2
+                  WHERE i2.fid = sn.file_id
+                    AND i2.tid = e.target_id
               )
         )",
-        rusqlite::params![REL_CALLS, REL_IMPORTS],
+        rusqlite::params![REL_CALLS],
     )?;
+    drop_imports_temp(conn)?;
     Ok(removed)
 }
 
@@ -516,8 +565,21 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
 /// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
 /// back when it is removed). Returns the number of edges downgraded.
 pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
-    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
-    let downgraded = db.conn().execute(
+    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES};
+    let conn = db.conn();
+    build_imports_temp(conn, false)?;
+    // The same-name count is materialized for the same reason: as an inline
+    // derived table it was rebuilt (temp B-tree GROUP BY over every node) and
+    // then scanned as the driver, once per run.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_namecount;
+         CREATE TEMP TABLE cg_namecount AS
+           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           FROM nodes n JOIN files f ON f.id = n.file_id
+           GROUP BY n.name, f.language;
+         CREATE INDEX cg_namecount_k ON cg_namecount(nm, lang);",
+    )?;
+    let downgraded = conn.execute(
         "UPDATE edges
          SET confidence = CASE
                  WHEN namecount.cnt > 1
@@ -531,11 +593,9 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
                       -- defined in >=2 same-language files (process/handler/run/init).
                       -- Mirrors the corroboration test in prune_import_contradicted_call_edges.
                       AND NOT EXISTS (
-                          SELECT 1 FROM edges ie
-                          JOIN nodes imp_src ON imp_src.id = ie.source_id
-                          WHERE ie.relation = ?5
-                            AND imp_src.file_id = src.file_id
-                            AND ie.target_id = tgt.id
+                          SELECT 1 FROM cg_imports i
+                          WHERE i.fid = src.file_id
+                            AND i.tid = tgt.id
                       )
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
                       -- qualifier (self / stype / rtype / path). Those bind the call
@@ -549,10 +609,7 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
                       AND (json_extract(edges.metadata, '$.q') IS NULL
                            OR json_extract(edges.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
                  THEN ?3 ELSE ?4 END
-         FROM nodes AS src, nodes AS tgt, files AS tf,
-              (SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
-               FROM nodes n JOIN files f ON f.id = n.file_id
-               GROUP BY n.name, f.language) AS namecount
+         FROM nodes AS src, nodes AS tgt, files AS tf, cg_namecount AS namecount
          WHERE edges.source_id = src.id
            AND edges.target_id = tgt.id
            AND tf.id = tgt.file_id
@@ -560,7 +617,11 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
            AND edges.relation IN (?1, ?2)
            AND namecount.nm = tgt.name
            AND namecount.lang IS tf.language",
-        rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED, REL_IMPORTS],
+        rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED],
+    )?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_namecount;
+         DROP TABLE IF EXISTS temp.cg_imports;",
     )?;
     Ok(downgraded)
 }
