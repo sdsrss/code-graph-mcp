@@ -7,14 +7,24 @@
 
 use super::super::*;
 
+/// Per-result code_content cap used both in estimation and the actual result
+/// payload, so compression triggers reflect real output size. At module scope
+/// because the extracted result-building and compression helpers both need it
+/// and must not each carry their own copy (audit 2026-08-22 P2-15).
+const MAX_SEARCH_CODE_LEN: usize = 500;
+
+/// One scored search hit, between fusion and rendering.
+struct Candidate {
+    node: queries::NodeResult,
+    file_path: String,
+    adjusted_score: f64,
+}
+
 impl McpServer {
     pub(in crate::mcp::server) fn tool_semantic_search(
         &self,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        // Per-result code_content cap used both in estimation (below) and the
-        // actual result payload so compression triggers reflect real output size.
-        const MAX_SEARCH_CODE_LEN: usize = 500;
         let query = required_str(args, "query")?;
         let top_k = args["top_k"]
             .as_u64()
@@ -277,11 +287,6 @@ impl McpServer {
 
         // Phase 1: Collect all valid candidates with adjusted scores
         // Name match boost + size dampening counter BM25/vector bias toward large nodes
-        struct Candidate {
-            node: queries::NodeResult,
-            file_path: String,
-            adjusted_score: f64,
-        }
         let query_terms_lower: Vec<String> =
             meaningful_tokens.iter().map(|t| t.to_lowercase()).collect();
         // Verbatim identifier query (e.g. "run_serve") — used for exact-name rerank
@@ -435,49 +440,7 @@ impl McpServer {
         candidates.truncate(top_k as usize);
 
         // Phase 3: Build results
-        let mut results = Vec::new();
-        for c in &candidates {
-            let node = &c.node;
-            let score = c.adjusted_score;
-
-            if compact {
-                results.push(json!({
-                    "node_id": node.id,
-                    "name": node.name,
-                    "type": node.node_type,
-                    "file_path": c.file_path,
-                    "line": format!("{}-{}", node.start_line, node.end_line),
-                    "signature": node.signature,
-                    "relevance": score,
-                }));
-            } else {
-                let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
-                    let safe_end = node.code_content.floor_char_boundary(MAX_SEARCH_CODE_LEN);
-                    let truncated = &node.code_content[..node.code_content[..safe_end]
-                        .rfind('\n')
-                        .unwrap_or(safe_end)];
-                    format!(
-                        "{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
-                        truncated,
-                        node.end_line - node.start_line + 1
-                    )
-                } else {
-                    node.code_content.clone()
-                };
-                results.push(json!({
-                    "node_id": node.id,
-                    "name": node.name,
-                    "type": node.node_type,
-                    "file_path": c.file_path,
-                    "start_line": node.start_line,
-                    "end_line": node.end_line,
-                    "code_content": code,
-                    "signature": node.signature,
-                    "relevance": score,
-                }));
-            }
-        }
-
+        let results = build_search_results(&candidates, compact);
         // Record search metrics (before potential compression return)
         lock_or_recover(&self.metrics, "metrics").record_search(
             results.len(),
@@ -500,205 +463,26 @@ impl McpServer {
         });
 
         // Context Sandbox: compress only if results likely exceed token threshold.
-        // Skip compression when compact=true — compact results are already token-efficient
-        // (~85% smaller than full results) and contain fields (relevance, signature)
-        // that would be lost by compression.
-        //
-        // Estimation must mirror the actual result payload: code_content is capped at
-        // MAX_SEARCH_CODE_LEN per result, and context_string is NOT included in
-        // the output. Estimating from raw context_string massively overestimates and
-        // fires compression even for small top_k (e.g. 3) responses that would fit
-        // comfortably under the token budget.
-        //
-        // The formula lives in `compressor::estimate_result_tokens` so this gate
-        // and the compression LEVEL selector cannot drift apart — they did, and
-        // the selector was reading context_string until the 2026-07-27 audit.
-        use crate::sandbox::compressor::CompressedOutput;
-        let estimated_tokens: usize = if compact {
-            0
-        } else {
-            candidates
-                .iter()
-                .map(|c| {
-                    crate::sandbox::compressor::estimate_result_tokens(
-                        &c.node.code_content,
-                        MAX_SEARCH_CODE_LEN,
-                        c.node.signature.as_deref(),
-                        &c.node.name,
-                        &c.file_path,
-                    )
-                })
-                .sum()
-        };
-        if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
-            // Build node_results and file_paths only when compression is needed
-            // NodeResult is not Clone; rebuild the rows the compressor needs.
-            let node_results: Vec<queries::NodeResult> = candidates
-                .iter()
-                .map(|c| {
-                    let node = &c.node;
-                    queries::NodeResult {
-                        id: node.id,
-                        file_id: node.file_id,
-                        node_type: node.node_type.clone(),
-                        name: node.name.clone(),
-                        qualified_name: node.qualified_name.clone(),
-                        start_line: node.start_line,
-                        end_line: node.end_line,
-                        code_content: node.code_content.clone(),
-                        signature: node.signature.clone(),
-                        doc_comment: node.doc_comment.clone(),
-                        context_string: node.context_string.clone(),
-                        name_tokens: node.name_tokens.clone(),
-                        return_type: node.return_type.clone(),
-                        param_types: node.param_types.clone(),
-                        is_test: node.is_test,
-                    }
-                })
-                .collect();
-            let file_paths: Vec<String> = candidates.iter().map(|c| c.file_path.clone()).collect();
-            if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(
-                &node_results,
-                &file_paths,
-                COMPRESSION_TOKEN_THRESHOLD,
-                // Same number that opened this branch: the level selector used
-                // to re-derive its own from context_string, which is not part of
-                // the payload (audit 2026-07-27).
-                estimated_tokens,
-            )? {
-                let (mode, compact) = match compressed {
-                    CompressedOutput::Nodes(nodes) => {
-                        let items: Vec<serde_json::Value> = nodes
-                            .iter()
-                            .map(|c| {
-                                json!({
-                                    "node_id": c.node_id,
-                                    "file_path": c.file_path,
-                                    "summary": c.summary,
-                                })
-                            })
-                            .collect();
-                        ("compressed_nodes", items)
-                    }
-                    CompressedOutput::Files(groups) => {
-                        let items: Vec<serde_json::Value> = groups
-                            .iter()
-                            .map(|g| {
-                                json!({
-                                    "file_path": g.file_path,
-                                    "summary": g.summary,
-                                    "node_ids": g.node_ids,
-                                })
-                            })
-                            .collect();
-                        ("compressed_files", items)
-                    }
-                    CompressedOutput::Directories(groups) => {
-                        let items: Vec<serde_json::Value> = groups
-                            .iter()
-                            .map(|g| {
-                                json!({
-                                    "file_path": g.file_path,
-                                    "summary": g.summary,
-                                    "node_ids": g.node_ids,
-                                })
-                            })
-                            .collect();
-                        ("compressed_directories", items)
-                    }
-                };
-                // match_confidence (FTS/vector agreement + coverage) is always surfaced as a
-                // rough query-shape signal. The warning is separate and fires only when the
-                // ranking has no text anchor (see vector_only_no_anchor); `has_exact_name_match`
-                // (hoisted above) exempts precise single-identifier queries.
-                let mut out = json!({
-                    "mode": mode,
-                    "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
-                    "match_confidence": (match_confidence * 100.0).round() / 100.0,
-                    "search_mode": if vector_available { "hybrid" } else { "fts_only" },
-                    "vector_available": vector_available,
-                    "results": compact
-                });
-                if vector_only_no_anchor && !has_exact_name_match {
-                    if let Some(obj) = out.as_object_mut() {
-                        obj.insert("low_confidence_warning".into(), json!(VECTOR_ONLY_WARNING));
-                    }
-                }
-                return Ok(out);
-            }
-        } // end estimated_tokens check
+        if let Some(compressed) = try_compress_results(
+            &candidates,
+            compact,
+            match_confidence,
+            vector_available,
+            vector_only_no_anchor,
+            has_exact_name_match,
+        )? {
+            return Ok(compressed);
+        }
 
         if results.is_empty() {
-            // Filter-aware: if a language/node_type filter removed candidates that DID
-            // match the query, say so — the index has matches, just not of this
-            // language/type. (vec0 can't pre-filter, so this is a post-fetch drop.)
-            if filtered && dropped_by_filter > 0 {
-                return Ok(json!({
-                    "results": [],
-                    "message": "No matching symbols after filtering.",
-                    "dropped_by_filter": dropped_by_filter,
-                    "hint": format!(
-                        "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
-                        dropped_by_filter
-                    )
-                }));
-            }
-            // Same disclosure duty for the always-on filter: the query DID match,
-            // and every match was a `<module>`/`<external>` placeholder or a test
-            // symbol. Saying "check spelling / the index may need rebuilding"
-            // there is a false diagnosis — the index is fine and the spelling
-            // found rows (audit 2026-08-16 P1-7).
-            if skipped_noise_count > 0 {
-                return Ok(json!({
-                    "results": [],
-                    "message": format!(
-                        "No matching symbols — {} candidate(s) matched the query but are module/external placeholders or test symbols, which this tool always excludes.",
-                        skipped_noise_count
-                    ),
-                    "skipped_noise": skipped_noise_count,
-                    "hint": "Spelling and index freshness are not the problem. To reach test symbols use `find_references` with include_tests, or `code-graph-mcp grep`; for structural enumeration use `ast_search`.",
-                    "search_mode": if vector_available { "hybrid" } else { "fts_only" },
-                    "vector_available": vector_available
-                }));
-            }
-            // The text channel never ran (single characters, stop words), so
-            // "check spelling / the index may need rebuilding" below would be a
-            // false diagnosis of a search that did not happen (2026-08-16 audit
-            // §四). With no vector channel either, nothing was searched at all.
-            if let Some(reason) = fts_not_searched {
-                return Ok(json!({
-                    "results": [],
-                    "message": format!("Text search did not run: {reason}."),
-                    "not_searched": reason,
-                    "hint": if vector_available {
-                        "Only the vector channel ran, and it found nothing above threshold. Spelling and index freshness are not the problem — use a longer or more specific term."
-                    } else {
-                        "Nothing was searched for. Spelling and index freshness are not the problem — use a longer or more specific term."
-                    },
-                    "search_mode": if vector_available { "hybrid" } else { "fts_only" },
-                    "vector_available": vector_available
-                }));
-            }
-            let has_code_syntax = query.contains('(')
-                || query.contains(')')
-                || query.contains("->")
-                || query.contains("::")
-                || query.contains('<');
-            let has_non_ascii = !query.is_ascii();
-            let hint = if has_code_syntax {
-                "Query looks like code syntax. For structural queries, use ast_search with type/returns/params filters instead of text search."
-            } else if has_non_ascii {
-                "Try using English keywords — the search index is English-optimized. Also try broader terms or check spelling."
-            } else {
-                "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
-            };
-            return Ok(json!({
-                "results": [],
-                "message": "No matching symbols found.",
-                "hint": hint,
-                "search_mode": if vector_available { "hybrid" } else { "fts_only" },
-                "vector_available": vector_available
-            }));
+            return Ok(explain_empty_results(
+                query,
+                filtered,
+                dropped_by_filter,
+                skipped_noise_count,
+                fts_not_searched,
+                vector_available,
+            ));
         }
 
         // Shape the response: one object envelope on every path ({results, …}),
@@ -714,6 +498,284 @@ impl McpServer {
             vector_available,
         ))
     }
+}
+
+/// Phase 3 of `tool_semantic_search`: scored candidates into result rows.
+/// Extracted so the surrounding function's control flow — retry, compress,
+/// explain-empty, shape — is readable at all (audit 2026-08-22 P2-15). Pure.
+fn build_search_results(candidates: &[Candidate], compact: bool) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for c in candidates {
+        let node = &c.node;
+        let score = c.adjusted_score;
+
+        if compact {
+            results.push(json!({
+                "node_id": node.id,
+                "name": node.name,
+                "type": node.node_type,
+                "file_path": c.file_path,
+                "line": format!("{}-{}", node.start_line, node.end_line),
+                "signature": node.signature,
+                "relevance": score,
+            }));
+        } else {
+            let code = if node.code_content.len() > MAX_SEARCH_CODE_LEN {
+                let safe_end = node.code_content.floor_char_boundary(MAX_SEARCH_CODE_LEN);
+                let truncated = &node.code_content[..node.code_content[..safe_end]
+                    .rfind('\n')
+                    .unwrap_or(safe_end)];
+                format!(
+                    "{}\n// ... truncated ({} lines total, use get_ast_node for full code)",
+                    truncated,
+                    node.end_line - node.start_line + 1
+                )
+            } else {
+                node.code_content.clone()
+            };
+            results.push(json!({
+                "node_id": node.id,
+                "name": node.name,
+                "type": node.node_type,
+                "file_path": c.file_path,
+                "start_line": node.start_line,
+                "end_line": node.end_line,
+                "code_content": code,
+                "signature": node.signature,
+                "relevance": score,
+            }));
+        }
+    }
+
+    results
+}
+
+/// The Context Sandbox tail: when the payload would blow the token budget,
+/// return the compressed envelope instead. `None` means "small enough, keep the
+/// full results" (audit 2026-08-22 P2-15).
+#[allow(clippy::too_many_arguments)]
+fn try_compress_results(
+    candidates: &[Candidate],
+    compact: bool,
+    match_confidence: f64,
+    vector_available: bool,
+    vector_only_no_anchor: bool,
+    has_exact_name_match: bool,
+) -> Result<Option<serde_json::Value>> {
+    // Context Sandbox: compress only if results likely exceed token threshold.
+    // Skip compression when compact=true — compact results are already token-efficient
+    // (~85% smaller than full results) and contain fields (relevance, signature)
+    // that would be lost by compression.
+    //
+    // Estimation must mirror the actual result payload: code_content is capped at
+    // MAX_SEARCH_CODE_LEN per result, and context_string is NOT included in
+    // the output. Estimating from raw context_string massively overestimates and
+    // fires compression even for small top_k (e.g. 3) responses that would fit
+    // comfortably under the token budget.
+    //
+    // The formula lives in `compressor::estimate_result_tokens` so this gate
+    // and the compression LEVEL selector cannot drift apart — they did, and
+    // the selector was reading context_string until the 2026-07-27 audit.
+    use crate::sandbox::compressor::CompressedOutput;
+    let estimated_tokens: usize = if compact {
+        0
+    } else {
+        candidates
+            .iter()
+            .map(|c| {
+                crate::sandbox::compressor::estimate_result_tokens(
+                    &c.node.code_content,
+                    MAX_SEARCH_CODE_LEN,
+                    c.node.signature.as_deref(),
+                    &c.node.name,
+                    &c.file_path,
+                )
+            })
+            .sum()
+    };
+    if estimated_tokens > COMPRESSION_TOKEN_THRESHOLD {
+        // Build node_results and file_paths only when compression is needed
+        // NodeResult is not Clone; rebuild the rows the compressor needs.
+        let node_results: Vec<queries::NodeResult> = candidates
+            .iter()
+            .map(|c| {
+                let node = &c.node;
+                queries::NodeResult {
+                    id: node.id,
+                    file_id: node.file_id,
+                    node_type: node.node_type.clone(),
+                    name: node.name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    code_content: node.code_content.clone(),
+                    signature: node.signature.clone(),
+                    doc_comment: node.doc_comment.clone(),
+                    context_string: node.context_string.clone(),
+                    name_tokens: node.name_tokens.clone(),
+                    return_type: node.return_type.clone(),
+                    param_types: node.param_types.clone(),
+                    is_test: node.is_test,
+                }
+            })
+            .collect();
+        let file_paths: Vec<String> = candidates.iter().map(|c| c.file_path.clone()).collect();
+        if let Some(compressed) = crate::sandbox::compressor::compress_if_needed(
+            &node_results,
+            &file_paths,
+            COMPRESSION_TOKEN_THRESHOLD,
+            // Same number that opened this branch: the level selector used
+            // to re-derive its own from context_string, which is not part of
+            // the payload (audit 2026-07-27).
+            estimated_tokens,
+        )? {
+            let (mode, compact) = match compressed {
+                CompressedOutput::Nodes(nodes) => {
+                    let items: Vec<serde_json::Value> = nodes
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "node_id": c.node_id,
+                                "file_path": c.file_path,
+                                "summary": c.summary,
+                            })
+                        })
+                        .collect();
+                    ("compressed_nodes", items)
+                }
+                CompressedOutput::Files(groups) => {
+                    let items: Vec<serde_json::Value> = groups
+                        .iter()
+                        .map(|g| {
+                            json!({
+                                "file_path": g.file_path,
+                                "summary": g.summary,
+                                "node_ids": g.node_ids,
+                            })
+                        })
+                        .collect();
+                    ("compressed_files", items)
+                }
+                CompressedOutput::Directories(groups) => {
+                    let items: Vec<serde_json::Value> = groups
+                        .iter()
+                        .map(|g| {
+                            json!({
+                                "file_path": g.file_path,
+                                "summary": g.summary,
+                                "node_ids": g.node_ids,
+                            })
+                        })
+                        .collect();
+                    ("compressed_directories", items)
+                }
+            };
+            // match_confidence (FTS/vector agreement + coverage) is always surfaced as a
+            // rough query-shape signal. The warning is separate and fires only when the
+            // ranking has no text anchor (see vector_only_no_anchor); `has_exact_name_match`
+            // (hoisted above) exempts precise single-identifier queries.
+            let mut out = json!({
+                "mode": mode,
+                "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
+                "match_confidence": (match_confidence * 100.0).round() / 100.0,
+                "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+                "vector_available": vector_available,
+                "results": compact
+            });
+            if vector_only_no_anchor && !has_exact_name_match {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("low_confidence_warning".into(), json!(VECTOR_ONLY_WARNING));
+                }
+            }
+            return Ok(Some(out));
+        }
+    } // end estimated_tokens check
+    Ok(None)
+}
+
+/// Every "no results" answer this tool can give, and why each is a different
+/// sentence: an explicit filter dropped real matches, the always-on noise
+/// filter did, the text channel never ran, or the query genuinely missed.
+/// Extracted intact (audit 2026-08-22 P2-15) — the distinctions ARE the
+/// content, each having been a false diagnosis at some past release.
+fn explain_empty_results(
+    query: &str,
+    filtered: bool,
+    dropped_by_filter: usize,
+    skipped_noise_count: usize,
+    fts_not_searched: Option<&str>,
+    vector_available: bool,
+) -> serde_json::Value {
+    // Filter-aware: if a language/node_type filter removed candidates that DID
+    // match the query, say so — the index has matches, just not of this
+    // language/type. (vec0 can't pre-filter, so this is a post-fetch drop.)
+    if filtered && dropped_by_filter > 0 {
+        return json!({
+            "results": [],
+            "message": "No matching symbols after filtering.",
+            "dropped_by_filter": dropped_by_filter,
+            "hint": format!(
+                "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
+                dropped_by_filter
+            )
+        });
+    }
+    // Same disclosure duty for the always-on filter: the query DID match,
+    // and every match was a `<module>`/`<external>` placeholder or a test
+    // symbol. Saying "check spelling / the index may need rebuilding"
+    // there is a false diagnosis — the index is fine and the spelling
+    // found rows (audit 2026-08-16 P1-7).
+    if skipped_noise_count > 0 {
+        return json!({
+            "results": [],
+            "message": format!(
+                "No matching symbols — {} candidate(s) matched the query but are module/external placeholders or test symbols, which this tool always excludes.",
+                skipped_noise_count
+            ),
+            "skipped_noise": skipped_noise_count,
+            "hint": "Spelling and index freshness are not the problem. To reach test symbols use `find_references` with include_tests, or `code-graph-mcp grep`; for structural enumeration use `ast_search`.",
+            "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+            "vector_available": vector_available
+        });
+    }
+    // The text channel never ran (single characters, stop words), so
+    // "check spelling / the index may need rebuilding" below would be a
+    // false diagnosis of a search that did not happen (2026-08-16 audit
+    // §四). With no vector channel either, nothing was searched at all.
+    if let Some(reason) = fts_not_searched {
+        return json!({
+            "results": [],
+            "message": format!("Text search did not run: {reason}."),
+            "not_searched": reason,
+            "hint": if vector_available {
+                "Only the vector channel ran, and it found nothing above threshold. Spelling and index freshness are not the problem — use a longer or more specific term."
+            } else {
+                "Nothing was searched for. Spelling and index freshness are not the problem — use a longer or more specific term."
+            },
+            "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+            "vector_available": vector_available
+        });
+    }
+    let has_code_syntax = query.contains('(')
+        || query.contains(')')
+        || query.contains("->")
+        || query.contains("::")
+        || query.contains('<');
+    let has_non_ascii = !query.is_ascii();
+    let hint = if has_code_syntax {
+        "Query looks like code syntax. For structural queries, use ast_search with type/returns/params filters instead of text search."
+    } else if has_non_ascii {
+        "Try using English keywords — the search index is English-optimized. Also try broader terms or check spelling."
+    } else {
+        "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
+    };
+    json!({
+        "results": [],
+        "message": "No matching symbols found.",
+        "hint": hint,
+        "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+        "vector_available": vector_available
+    })
 }
 
 /// Notice attached when a semantic-search result set has NO text anchor — FTS

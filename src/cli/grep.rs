@@ -544,248 +544,27 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         search_paths.push(canonical);
     }
 
-    // Flags + pattern, WITHOUT the path operands: paths are appended per batch by
-    // `run_rg` below, because one argv cannot hold an unbounded supplement list
-    // (Windows caps a command line at ~32 KB — issue #34's `os error 206`).
-    let mut rg_args: Vec<std::ffi::OsString> = Vec::new();
-    macro_rules! rg_arg {
-        ($v:expr) => {
-            rg_args.push(std::ffi::OsString::from($v))
-        };
-    }
-    // Determinism note: ripgrep parallelizes the walk and emits files in
-    // worker-completion order, so the same grep shuffled every run (observed up to
-    // 8/8 distinct) — the determinism class fixed for the graph commands in v0.85.x.
-    // We do NOT use `rg --sort path`: it only orders WITHIN each traversal root and
-    // preserves the given order of top-level path args, so the supplement (explicit
-    // trailing file args, below) and multi-path input would stay unsorted; it also
-    // disables rg's parallelism and requires rg >= 11. Instead each mode below sorts
-    // the collected result set by path — a true global ascending order that keeps rg
-    // parallel and imposes no rg version floor.
-    if files_with_matches {
-        // -l: plain one-path-per-line output (rg stops at the first match per
-        // file); context flags are meaningless here, like grep, and ignored.
-        rg_arg!("-l");
-    } else if count_mode {
-        // -c: ripgrep --count prints `path:N` (matching LINES per file, listing
-        // only files with ≥1 match). The per-file --max-count cap is intentionally
-        // NOT applied so the count is exhaustive; context flags don't apply.
-        // --with-filename forces the `path:` prefix even for a single file (rg
-        // omits it otherwise, like `grep -c`), so the `path:N` parse is uniform.
-        rg_arg!("--count");
-        rg_arg!("--with-filename");
-    } else {
-        rg_arg!("--json");
-        rg_arg!("-n");
-        if let Some(n) = context {
-            rg_arg!(format!("--context={}", n));
-        }
-        if let Some(n) = after_context {
-            rg_arg!(format!("--after-context={}", n));
-        }
-        if let Some(n) = before_context {
-            rg_arg!(format!("--before-context={}", n));
-        }
-        if max_count > 0 {
-            rg_arg!(format!("--max-count={}", max_count));
-        }
-    }
-    if ignore_case {
-        rg_arg!("-i");
-    }
-    if word_regexp {
-        rg_arg!("-w");
-    }
-    if fixed_strings {
-        rg_arg!("-F");
-    }
-    // Scope filters (apply to every mode): --type by language, --glob by path.
-    // rg validates a --type name and errors (exit 2) on an unknown one, surfaced
-    // like any other rg error below.
-    if let Some(ref t) = file_type {
-        rg_arg!("--type");
-        rg_arg!(t);
-    }
-    for g in &glob {
-        rg_arg!("--glob");
-        rg_arg!(g);
-    }
-    // `--` so leading-dash patterns (e.g. searching for "--no-default-features")
-    // reach rg as the pattern instead of being parsed as flags.
-    rg_arg!("--");
-    rg_arg!(&pattern);
-
-    // Walk operands: the user's paths, or the whole root.
-    let mut walk_operands: Vec<std::ffi::OsString> = Vec::new();
-    if search_paths.is_empty() {
-        // root_canonical, not the raw root: rg echoes back the spelling it was
-        // handed, and the raw root can be an 8.3 short name on Windows while
-        // every explicit search path above is canonicalized long-form. One
-        // spelling for everything keeps the relativize below single-rooted for
-        // the common case (dual-root fallback covers the rest).
-        walk_operands.push(root_canonical.clone().into());
-    } else {
-        for p in &search_paths {
-            walk_operands.push(p.into());
-        }
-    }
-
-    // git-grep parity: append tracked files the rg walk misses as explicit
-    // args (explicit file args bypass rg's ignore rules). git ls-files
-    // pathspecs + rg --files args are both scoped to the user's paths, so the
-    // supplement honors path restrictions; files passed explicitly by the
-    // user appear in the walk output and dedup naturally.
-    // Bounds the number of extra rg spawns (each batch is one), not the argv
-    // length — that is `ARGV_PATH_BUDGET` below. Raised from 500 in v0.105.x:
-    // 500 was a proxy for the command-line limit and silently dropped tracked
-    // files (a "no matches" that had matches), which the batching makes
-    // unnecessary. Reaching this cap is still reported on stderr.
-    const SUPPLEMENT_CAP: usize = 20_000;
-    let mut supplement = tracked_files_missed_by_walk(project_root, &search_rels);
-    // rg does NOT apply --type/--glob to files passed explicitly on the command
-    // line, so the supplement (appended as explicit args below) would leak files
-    // the -t/-g filters should exclude. Re-apply the same filters here via
-    // ripgrep's own `ignore` crate matchers (rg-identical) before appending.
-    if file_type.is_some() || !glob.is_empty() {
-        let types = file_type.as_deref().and_then(|t| {
-            let mut b = ignore::types::TypesBuilder::new();
-            b.add_defaults();
-            b.select(t);
-            b.build().ok()
-        });
-        let overrides = if glob.is_empty() {
-            None
-        } else {
-            let mut b = ignore::overrides::OverrideBuilder::new(project_root);
-            let ok = glob.iter().all(|g| b.add(g).is_ok());
-            if ok {
-                b.build().ok()
-            } else {
-                None
-            }
-        };
-        supplement.retain(|rel| {
-            let p = Path::new(rel);
-            if let Some(t) = &types {
-                if t.matched(p, false).is_ignore() {
-                    return false;
-                }
-            }
-            if let Some(ov) = &overrides {
-                if ov.matched(p, false).is_ignore() {
-                    return false;
-                }
-            }
-            true
-        });
-    }
-    if supplement.len() > SUPPLEMENT_CAP {
-        eprintln!(
-            "[code-graph] {} tracked files outside the rg walk; searching the first {} only",
-            supplement.len(),
-            SUPPLEMENT_CAP
-        );
-        supplement.truncate(SUPPLEMENT_CAP);
-    }
-    // Supplement operands are RELATIVE (resolved by rg against `current_dir`,
-    // set to the project root below). Absolute ones cost the repeated root
-    // prefix on every entry — ~40 chars × 500 ≈ 20 KB of pure prefix on the
-    // reporter's layout — which is what pushed the argv past Windows' 32 KB
-    // limit. rg echoes the operand back verbatim, and `relativize_path`
-    // normalizes both spellings to the same root-relative form, so walk and
-    // supplement results still dedup against each other.
-    let supplement_operands: Vec<std::ffi::OsString> = supplement
-        .iter()
-        .filter(|rel| project_root.join(rel).is_file())
-        .map(std::ffi::OsString::from)
-        .collect();
-
-    // Windows caps a whole command line at 32,767 chars; POSIX ARG_MAX is
-    // ~2 MB. Budget the PATH operands conservatively under each, leaving room
-    // for the flags, the pattern, and the exe path.
-    //
-    // The accounting is `len + 1` per operand — one separator, no quoting. On
-    // Windows an operand containing a space is quoted by the runtime, costing 2
-    // more chars, so the true line is longer than the budget believes. The
-    // headroom absorbs it: 32,767 − 24,000 = 8,767 chars would need ~4,400
-    // space-bearing paths in a single batch to exhaust, and `SUPPLEMENT_CAP`
-    // stops at 500. Stated rather than fixed because a tighter budget is the
-    // wrong trade — it would split batches on every repo to cover a case the cap
-    // makes unreachable.
-    const ARGV_PATH_BUDGET: usize = if cfg!(windows) { 24_000 } else { 512_000 };
-    // Override exists so the batching path is testable without materializing a
-    // 32 KB argv, and as an escape hatch for a shell with a tighter limit.
-    let argv_budget = std::env::var("CODE_GRAPH_RG_ARGV_BUDGET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(ARGV_PATH_BUDGET);
-    let flags_len: usize = rg_args.iter().map(|a| a.len() + 1).sum();
-    let path_budget = argv_budget.saturating_sub(flags_len).max(1);
-
-    let run_rg = |paths: &[std::ffi::OsString]| -> std::io::Result<std::process::Output> {
-        let mut cmd = Command::new("rg");
-        cmd.current_dir(project_root);
-        cmd.args(&rg_args);
-        cmd.args(paths);
-        cmd.output()
-    };
-    // `current_dir` is part of the spawn: a missing working directory fails with
-    // the SAME ErrorKind::NotFound the missing-binary case does, so the error arm
-    // has to tell them apart before it names a cause. See
-    // `rg_spawn_failure_message`.
-
-    // Batch 1 is always the walk; the supplement follows in argv-sized chunks.
-    // Each batch is an independent rg run whose stdout is concatenated — every
-    // consumer below (rg --json records, `-l` lines, `-c` rows) is line- or
-    // record-oriented and already sorts + dedups the merged set globally.
-    let mut batches: Vec<&[std::ffi::OsString]> = vec![&walk_operands];
-    {
-        let mut start = 0usize;
-        while start < supplement_operands.len() {
-            let mut end = start;
-            let mut used = 0usize;
-            while end < supplement_operands.len() {
-                let next = supplement_operands[end].len() + 1;
-                if end > start && used + next > path_budget {
-                    break;
-                }
-                used += next;
-                end += 1;
-            }
-            batches.push(&supplement_operands[start..end]);
-            start = end;
-        }
-    }
-
-    let mut stdout_buf: Vec<u8> = Vec::new();
-    let mut stderr_buf: Vec<u8> = Vec::new();
-    // Merged exit code, worst-first: 2 (error) > 0 (matched) > 1 (no match).
-    let mut merged_code: i32 = 1;
-    for batch in batches {
-        let output = match run_rg(batch) {
-            Ok(output) => output,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let msg = rg_spawn_failure_message(project_root);
-                emit_grep_json_error(json_mode, &msg);
-                eprintln!("[code-graph] {}", msg);
-                grep_exit(2);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        stdout_buf.extend_from_slice(&output.stdout);
-        stderr_buf.extend_from_slice(&output.stderr);
-        merged_code = match output.status.code() {
-            Some(2) => 2,
-            Some(0) if merged_code != 2 => 0,
-            _ => merged_code,
-        };
-    }
-    let rg_output = RgRun {
-        stdout: stdout_buf,
-        stderr: stderr_buf,
-        code: merged_code,
-    };
+    let rg_output = run_ripgrep(
+        &RgInvocation {
+            pattern: pattern.as_str(),
+            ignore_case,
+            word_regexp,
+            fixed_strings,
+            count_mode,
+            files_with_matches,
+            file_type: file_type.as_deref(),
+            glob: &glob,
+            max_count,
+            context,
+            after_context,
+            before_context,
+            json_mode,
+        },
+        project_root,
+        &root_canonical,
+        &search_paths,
+        &search_rels,
+    )?;
 
     // ripgrep exit codes: 0 = matched, 1 = no match, 2 = error (invalid regex,
     // unreadable path). grep-parity: surface as exit 2 — a regex parse error
@@ -1190,6 +969,300 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         grep_exit(2);
     }
     Ok(())
+}
+
+/// Build ripgrep's argv and run it — once for the walk, then once per
+/// argv-sized batch of supplement paths. Extracted from `cmd_grep`
+/// (audit 2026-08-22 P2-15): 240 of its 767 lines were "construct a command
+/// line and merge N runs of it", which has nothing to do with the AST
+/// annotation and result rendering that follow it.
+///
+/// One argv cannot hold an unbounded supplement list — Windows caps a command
+/// line at ~32 KB (issue #34's `os error 206`) — so the flags are built once
+/// and the operands are appended per batch.
+/// Everything [`run_ripgrep`] needs from the parsed arguments. A struct rather
+/// than a dozen parameters, and borrowed rather than re-read from `GrepArgs`
+/// because `cmd_grep` destructures its arguments by value up front.
+struct RgInvocation<'a> {
+    pattern: &'a str,
+    ignore_case: bool,
+    word_regexp: bool,
+    fixed_strings: bool,
+    count_mode: bool,
+    files_with_matches: bool,
+    file_type: Option<&'a str>,
+    glob: &'a [String],
+    max_count: u64,
+    context: Option<u64>,
+    after_context: Option<u64>,
+    before_context: Option<u64>,
+    json_mode: bool,
+}
+
+fn run_ripgrep(
+    inv: &RgInvocation<'_>,
+    project_root: &Path,
+    root_canonical: &Path,
+    search_paths: &[std::path::PathBuf],
+    search_rels: &[String],
+) -> Result<RgRun> {
+    let &RgInvocation {
+        pattern,
+        ignore_case,
+        word_regexp,
+        fixed_strings,
+        count_mode,
+        files_with_matches,
+        file_type,
+        glob,
+        max_count,
+        context,
+        after_context,
+        before_context,
+        json_mode,
+    } = inv;
+    // Flags + pattern, WITHOUT the path operands: paths are appended per batch by
+    // `run_rg` below, because one argv cannot hold an unbounded supplement list
+    // (Windows caps a command line at ~32 KB — issue #34's `os error 206`).
+    let mut rg_args: Vec<std::ffi::OsString> = Vec::new();
+    macro_rules! rg_arg {
+        ($v:expr) => {
+            rg_args.push(std::ffi::OsString::from($v))
+        };
+    }
+    // Determinism note: ripgrep parallelizes the walk and emits files in
+    // worker-completion order, so the same grep shuffled every run (observed up to
+    // 8/8 distinct) — the determinism class fixed for the graph commands in v0.85.x.
+    // We do NOT use `rg --sort path`: it only orders WITHIN each traversal root and
+    // preserves the given order of top-level path args, so the supplement (explicit
+    // trailing file args, below) and multi-path input would stay unsorted; it also
+    // disables rg's parallelism and requires rg >= 11. Instead each mode below sorts
+    // the collected result set by path — a true global ascending order that keeps rg
+    // parallel and imposes no rg version floor.
+    if files_with_matches {
+        // -l: plain one-path-per-line output (rg stops at the first match per
+        // file); context flags are meaningless here, like grep, and ignored.
+        rg_arg!("-l");
+    } else if count_mode {
+        // -c: ripgrep --count prints `path:N` (matching LINES per file, listing
+        // only files with ≥1 match). The per-file --max-count cap is intentionally
+        // NOT applied so the count is exhaustive; context flags don't apply.
+        // --with-filename forces the `path:` prefix even for a single file (rg
+        // omits it otherwise, like `grep -c`), so the `path:N` parse is uniform.
+        rg_arg!("--count");
+        rg_arg!("--with-filename");
+    } else {
+        rg_arg!("--json");
+        rg_arg!("-n");
+        if let Some(n) = context {
+            rg_arg!(format!("--context={}", n));
+        }
+        if let Some(n) = after_context {
+            rg_arg!(format!("--after-context={}", n));
+        }
+        if let Some(n) = before_context {
+            rg_arg!(format!("--before-context={}", n));
+        }
+        if max_count > 0 {
+            rg_arg!(format!("--max-count={}", max_count));
+        }
+    }
+    if ignore_case {
+        rg_arg!("-i");
+    }
+    if word_regexp {
+        rg_arg!("-w");
+    }
+    if fixed_strings {
+        rg_arg!("-F");
+    }
+    // Scope filters (apply to every mode): --type by language, --glob by path.
+    // rg validates a --type name and errors (exit 2) on an unknown one, surfaced
+    // like any other rg error below.
+    if let Some(ref t) = file_type {
+        rg_arg!("--type");
+        rg_arg!(t);
+    }
+    for g in glob {
+        rg_arg!("--glob");
+        rg_arg!(g);
+    }
+    // `--` so leading-dash patterns (e.g. searching for "--no-default-features")
+    // reach rg as the pattern instead of being parsed as flags.
+    rg_arg!("--");
+    rg_arg!(&pattern);
+
+    // Walk operands: the user's paths, or the whole root.
+    let mut walk_operands: Vec<std::ffi::OsString> = Vec::new();
+    if search_paths.is_empty() {
+        // root_canonical, not the raw root: rg echoes back the spelling it was
+        // handed, and the raw root can be an 8.3 short name on Windows while
+        // every explicit search path above is canonicalized long-form. One
+        // spelling for everything keeps the relativize below single-rooted for
+        // the common case (dual-root fallback covers the rest).
+        walk_operands.push(root_canonical.to_path_buf().into());
+    } else {
+        for p in search_paths {
+            walk_operands.push(p.into());
+        }
+    }
+
+    // git-grep parity: append tracked files the rg walk misses as explicit
+    // args (explicit file args bypass rg's ignore rules). git ls-files
+    // pathspecs + rg --files args are both scoped to the user's paths, so the
+    // supplement honors path restrictions; files passed explicitly by the
+    // user appear in the walk output and dedup naturally.
+    // Bounds the number of extra rg spawns (each batch is one), not the argv
+    // length — that is `ARGV_PATH_BUDGET` below. Raised from 500 in v0.105.x:
+    // 500 was a proxy for the command-line limit and silently dropped tracked
+    // files (a "no matches" that had matches), which the batching makes
+    // unnecessary. Reaching this cap is still reported on stderr.
+    const SUPPLEMENT_CAP: usize = 20_000;
+    let mut supplement = tracked_files_missed_by_walk(project_root, search_rels);
+    // rg does NOT apply --type/--glob to files passed explicitly on the command
+    // line, so the supplement (appended as explicit args below) would leak files
+    // the -t/-g filters should exclude. Re-apply the same filters here via
+    // ripgrep's own `ignore` crate matchers (rg-identical) before appending.
+    if file_type.is_some() || !glob.is_empty() {
+        let types = file_type.and_then(|t| {
+            let mut b = ignore::types::TypesBuilder::new();
+            b.add_defaults();
+            b.select(t);
+            b.build().ok()
+        });
+        let overrides = if glob.is_empty() {
+            None
+        } else {
+            let mut b = ignore::overrides::OverrideBuilder::new(project_root);
+            let ok = glob.iter().all(|g| b.add(g).is_ok());
+            if ok {
+                b.build().ok()
+            } else {
+                None
+            }
+        };
+        supplement.retain(|rel| {
+            let p = Path::new(rel);
+            if let Some(t) = &types {
+                if t.matched(p, false).is_ignore() {
+                    return false;
+                }
+            }
+            if let Some(ov) = &overrides {
+                if ov.matched(p, false).is_ignore() {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    if supplement.len() > SUPPLEMENT_CAP {
+        eprintln!(
+            "[code-graph] {} tracked files outside the rg walk; searching the first {} only",
+            supplement.len(),
+            SUPPLEMENT_CAP
+        );
+        supplement.truncate(SUPPLEMENT_CAP);
+    }
+    // Supplement operands are RELATIVE (resolved by rg against `current_dir`,
+    // set to the project root below). Absolute ones cost the repeated root
+    // prefix on every entry — ~40 chars × 500 ≈ 20 KB of pure prefix on the
+    // reporter's layout — which is what pushed the argv past Windows' 32 KB
+    // limit. rg echoes the operand back verbatim, and `relativize_path`
+    // normalizes both spellings to the same root-relative form, so walk and
+    // supplement results still dedup against each other.
+    let supplement_operands: Vec<std::ffi::OsString> = supplement
+        .iter()
+        .filter(|rel| project_root.join(rel).is_file())
+        .map(std::ffi::OsString::from)
+        .collect();
+
+    // Windows caps a whole command line at 32,767 chars; POSIX ARG_MAX is
+    // ~2 MB. Budget the PATH operands conservatively under each, leaving room
+    // for the flags, the pattern, and the exe path.
+    //
+    // The accounting is `len + 1` per operand — one separator, no quoting. On
+    // Windows an operand containing a space is quoted by the runtime, costing 2
+    // more chars, so the true line is longer than the budget believes. The
+    // headroom absorbs it: 32,767 − 24,000 = 8,767 chars would need ~4,400
+    // space-bearing paths in a single batch to exhaust, and `SUPPLEMENT_CAP`
+    // stops at 500. Stated rather than fixed because a tighter budget is the
+    // wrong trade — it would split batches on every repo to cover a case the cap
+    // makes unreachable.
+    const ARGV_PATH_BUDGET: usize = if cfg!(windows) { 24_000 } else { 512_000 };
+    // Override exists so the batching path is testable without materializing a
+    // 32 KB argv, and as an escape hatch for a shell with a tighter limit.
+    let argv_budget = std::env::var("CODE_GRAPH_RG_ARGV_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(ARGV_PATH_BUDGET);
+    let flags_len: usize = rg_args.iter().map(|a| a.len() + 1).sum();
+    let path_budget = argv_budget.saturating_sub(flags_len).max(1);
+
+    let run_rg = |paths: &[std::ffi::OsString]| -> std::io::Result<std::process::Output> {
+        let mut cmd = Command::new("rg");
+        cmd.current_dir(project_root);
+        cmd.args(&rg_args);
+        cmd.args(paths);
+        cmd.output()
+    };
+    // `current_dir` is part of the spawn: a missing working directory fails with
+    // the SAME ErrorKind::NotFound the missing-binary case does, so the error arm
+    // has to tell them apart before it names a cause. See
+    // `rg_spawn_failure_message`.
+
+    // Batch 1 is always the walk; the supplement follows in argv-sized chunks.
+    // Each batch is an independent rg run whose stdout is concatenated — every
+    // consumer below (rg --json records, `-l` lines, `-c` rows) is line- or
+    // record-oriented and already sorts + dedups the merged set globally.
+    let mut batches: Vec<&[std::ffi::OsString]> = vec![&walk_operands];
+    {
+        let mut start = 0usize;
+        while start < supplement_operands.len() {
+            let mut end = start;
+            let mut used = 0usize;
+            while end < supplement_operands.len() {
+                let next = supplement_operands[end].len() + 1;
+                if end > start && used + next > path_budget {
+                    break;
+                }
+                used += next;
+                end += 1;
+            }
+            batches.push(&supplement_operands[start..end]);
+            start = end;
+        }
+    }
+
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    // Merged exit code, worst-first: 2 (error) > 0 (matched) > 1 (no match).
+    let mut merged_code: i32 = 1;
+    for batch in batches {
+        let output = match run_rg(batch) {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let msg = rg_spawn_failure_message(project_root);
+                emit_grep_json_error(json_mode, &msg);
+                eprintln!("[code-graph] {}", msg);
+                grep_exit(2);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        stdout_buf.extend_from_slice(&output.stdout);
+        stderr_buf.extend_from_slice(&output.stderr);
+        merged_code = match output.status.code() {
+            Some(2) => 2,
+            Some(0) if merged_code != 2 => 0,
+            _ => merged_code,
+        };
+    }
+    Ok(RgRun {
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        code: merged_code,
+    })
 }
 
 /// Merged result of the one-or-more ripgrep invocations a single `grep` runs

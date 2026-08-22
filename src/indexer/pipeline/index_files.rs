@@ -708,6 +708,789 @@ impl DeferredRelation {
     }
 }
 
+/// What [`resolve_batch_relations`] hands back to the batch loop.
+struct BatchRelations {
+    edges_created: usize,
+    /// `(source_module_node_id, module_name)` for imports that resolved to no
+    /// project file — the caller mints `<external>` sentinels for them.
+    external_python_imports: Vec<(i64, String)>,
+    /// `(source_id, target_name, relation)` likewise, for non-import targets.
+    unresolved_externals: Vec<(i64, String, String)>,
+}
+
+/// Phase 2 for ONE batch: extract every relation from the batch's parsed
+/// trees and insert the edges it can resolve, deferring the rest.
+///
+/// Extracted from `index_files` (audit 2026-08-22 P2-15), which was 1,242
+/// lines with this as 770 of them. It runs INSIDE the caller's batch savepoint
+/// and writes through `db`, so it is a step of that transaction, not a
+/// transaction of its own — moving it did not change where the commit is.
+///
+/// Returns the edge count plus the two unresolved-target lists the caller
+/// feeds to `mint_external_sentinels` immediately afterwards.
+#[allow(clippy::too_many_arguments)]
+fn resolve_batch_relations(
+    db: &Database,
+    batch_parsed: &[FileParsed],
+    batch_file_paths: &HashSet<&str>,
+    global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
+    python_module_map: &HashMap<String, Vec<String>>,
+    all_file_paths: &HashSet<String>,
+    deferred: &mut Vec<DeferredRelation>,
+) -> Result<BatchRelations> {
+    let mut edges_created = 0usize;
+    // --- Phase 2: Extract relations + insert edges ---
+    // These three pools are rebuilt from `global_name_map` on EVERY batch —
+    // O(nodes x batches) where the map itself is maintained incrementally.
+    // Carried as an open performance item across two audits (2026-08-16,
+    // 2026-08-22 P2-5) on the theory that it is a hotspot above ~500 files,
+    // which this repository's own 278-file single-batch tree cannot show.
+    //
+    // Measured, 2026-08-22, on 1,763 files of third-party Python (25,041
+    // nodes, four batches at BATCH_SIZE 500), timing this block alone:
+    //
+    //   batch 1  2.4ms   batch 2  5.4ms   batch 3  6.8ms   batch 4  8.7ms
+    //   total   23.2ms   of an 8,899ms full index  =  0.26%
+    //
+    // Linear per batch, exactly as the O() says, at ~0.35us per node. The
+    // shape is real; the constant is not worth incremental maintenance of
+    // three more structures in a pipeline whose bookkeeping misses have
+    // twice cost real edges. Deliberately left alone — reopen it with a
+    // measurement, not with the complexity argument.
+    let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
+    // Per-node language for same-language-preferred edge resolution (§ cross-lang collision).
+    let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
+
+    // Add current batch's newly inserted nodes
+    for pf in batch_parsed {
+        for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+            name_to_ids.entry(name.clone()).or_default().push(*id);
+            node_id_to_path.insert(*id, pf.rel_path.clone());
+            node_id_to_language.insert(*id, Some(pf.language.clone()));
+        }
+    }
+
+    // Add nodes from the global map, excluding those in current batch's files
+    // (their old nodes were deleted and replaced by new ones above)
+    for (name, entries) in global_name_map {
+        for (id, path, language) in entries {
+            if !batch_file_paths.contains(path.as_str()) {
+                name_to_ids.entry(name.clone()).or_default().push(*id);
+                node_id_to_path.insert(*id, path.clone());
+                node_id_to_language.insert(*id, language.clone());
+            }
+        }
+    }
+
+    for ids in name_to_ids.values_mut() {
+        ids.sort();
+        ids.dedup();
+    }
+
+    // Track unresolved external Python imports: (source_module_node_id, module_name)
+    let mut external_python_imports: Vec<(i64, String)> = Vec::new();
+    // Track unresolved external symbols for sentinel node creation:
+    // (source_id, target_name, relation) — e.g., implements edges to external traits
+    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+
+    for pf in batch_parsed {
+        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+
+        // Pre-scan this file's require-namespace bindings
+        // (`const m = require('./x')`, stamped `{"q":"ns_require",...}`) →
+        // resolved file path, so `m.foo()` member calls (CalleeMeta::Receiver)
+        // bind to the required module in the call-resolution pass below.
+        let mut ns_module_map: HashMap<String, String> = HashMap::new();
+        for rel in &relations {
+            if rel.relation != REL_IMPORTS {
+                continue;
+            }
+            if let Some(meta_str) = rel.metadata.as_deref() {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                    // ESM `import * as ns` (q:"ns_import", v51) binds member
+                    // calls exactly like the CJS require-namespace form.
+                    if matches!(
+                        meta.get("q").and_then(|v| v.as_str()),
+                        Some(crate::domain::IMPORT_Q_NS_REQUIRE)
+                            | Some(crate::domain::IMPORT_Q_NS_IMPORT)
+                    ) {
+                        if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                            if let Some(file) =
+                                resolve_js_specifier_path(spec, &pf.rel_path, all_file_paths)
+                            {
+                                ns_module_map.insert(rel.target_name.clone(), file);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for rel in &relations {
+            // Contract: extract_relations_from_tree stamps every relation with
+            // source_language equal to the language argument. The
+            // same-language resolution at line 811+ depends on it. Hard
+            // error instead of debug_assert so a parser regression fails
+            // loudly in release builds too (one string compare per
+            // relation is negligible against the SQL writes below).
+            if rel.source_language != pf.language {
+                anyhow::bail!(
+                    "ParsedRelation.source_language ({}) does not match file language ({}); \
+                     parser regressed the source_language contract",
+                    rel.source_language,
+                    pf.language
+                );
+            }
+
+            // Match the relation's enclosing scope (source_name) to a node.
+            // Class-based languages (Python/TS/JS/Java/Ruby) qualify a
+            // method's scope as `Class.method`, but the node's bare `name`
+            // is just `method` — so match qualified_name too, else every
+            // intra-class method-to-method edge is silently dropped.
+            // Bare-scope sources (Rust impl, Go receivers, free functions)
+            // still match on `name`.
+            // inherits/implements describe a TYPE's supertype, so their source
+            // must be a class/struct/interface/enum/trait — never a function or
+            // method that merely shares the type's name. A C++ inline constructor
+            // (`Widget(int){}`) produces a `method Widget` node alongside `class
+            // Widget`; without this both matched `source_name == "Widget"` and the
+            // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
+            // than whitelist type kinds) so no language's type node is missed.
+            let type_source_only = rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
+            let mut source_ids = (0..pf.node_ids.len())
+                .filter(|&i| {
+                    (pf.node_names[i] == rel.source_name
+                        || pf.node_qualified_names[i].as_deref() == Some(rel.source_name.as_str()))
+                        && (!type_source_only
+                            || !matches!(pf.node_types[i].as_str(), "function" | "method"))
+                })
+                .map(|i| pf.node_ids[i])
+                .collect::<Vec<_>>();
+
+            // Route handlers are commonly imported from a controller file —
+            // the canonical Express layout `import { getUser } from './ctrl';
+            // app.get('/x', getUser)`. The routes_to relation names the handler
+            // (== source == target), but the handler node lives in another
+            // file, so the same-file scan above finds nothing and the route
+            // edge (the handler self-edge carrying method/path) is silently
+            // dropped — trace/impact/find_http_route then see no route at all.
+            // Recover by resolving the handler name cross-file, same-language,
+            // exactly like a call target below (refine breaks any ambiguity by
+            // path locality). Only fires for routes_to with an unresolved
+            // same-file source; inline + same-file named handlers already match.
+            if rel.relation == REL_ROUTES_TO && source_ids.is_empty() {
+                let same_lang: Vec<i64> = name_to_ids
+                    .get(&rel.source_name)
+                    .map(|ids| {
+                        ids.iter()
+                            .copied()
+                            .filter(|id| {
+                                matches!(
+                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                    Some(l) if l == pf.language.as_str()
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                source_ids = refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
+                if source_ids.is_empty() {
+                    // Imported handler may sit in a later batch — the recovery
+                    // above can only see the pool visible NOW. Defer with empty
+                    // source_ids; the post-loop pass re-runs this recovery
+                    // against the whole tree.
+                    deferred.push(DeferredRelation::of(&[], rel, &pf.rel_path, &pf.language));
+                    continue;
+                }
+            }
+
+            // The five metadata-driven import forms below all key off the same
+            // JSON blob, and each used to parse it again — five `from_str`
+            // calls per import relation, four of them thrown away. Parse once.
+            // Order still decides: namespace/star, then Python module, then
+            // JS specifier, then PHP include, then C include, then the
+            // default name-based chain.
+            let import_meta: Option<serde_json::Value> = if rel.relation == REL_IMPORTS {
+                rel.metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str(m).ok())
+            } else {
+                None
+            };
+
+            // Module-level import markers (v51, roadmap §2.3): namespace
+            // bindings (`const m = require('./x')` q:"ns_require", `import *
+            // as ns from './x'` q:"ns_import") and star re-exports (`export *
+            // from './x'` q:"star_reexport") name no resolvable symbol, so
+            // default name resolution would mint a spurious `<external>` node
+            // (or, for star's `<module>` target, cross-link a random file).
+            // Instead bind them to the RESOLVED file's `<module>` node — the
+            // PHP-include/C-include pattern — so a namespace-only or
+            // star-barrel dependency is finally visible to deps/affected/
+            // cycles/map. Unresolvable specifier (external package) → no
+            // edge, same as before. Always `continue`: never fall through.
+            if let Some(meta) = import_meta.as_ref() {
+                if matches!(
+                    meta.get("q").and_then(|v| v.as_str()),
+                    Some(crate::domain::IMPORT_Q_NS_REQUIRE)
+                        | Some(crate::domain::IMPORT_Q_NS_IMPORT)
+                        | Some(crate::domain::IMPORT_Q_STAR_REEXPORT)
+                        | Some(crate::domain::IMPORT_Q_DEFAULT)
+                ) {
+                    let mut resolved = false;
+                    if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                        if let Some(file) =
+                            resolve_js_specifier_path(spec, &pf.rel_path, all_file_paths)
+                        {
+                            let module_targets =
+                                module_node_of(&name_to_ids, &node_id_to_path, &file);
+                            if !module_targets.is_empty() {
+                                resolved = true;
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &module_targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
+                            }
+                        }
+                    }
+                    if !resolved {
+                        // The specifier's file (or its <module> node) may sit
+                        // in a later batch — retry after the loop. A genuinely
+                        // external specifier fails there too and drops, same
+                        // as before.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                    }
+                    continue;
+                }
+            }
+
+            // Try Python module-constrained resolution for import edges
+            if let Some(meta) = import_meta.as_ref() {
+                if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
+                    let is_module_import = meta
+                        .get("is_module_import")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(module_files) =
+                        project_module_files(python_module, python_module_map)
+                    {
+                        // Internal module — try constrained resolution
+                        if let Some(module_targets) = resolve_python_module_targets(
+                            &module_files,
+                            is_module_import,
+                            &rel.target_name,
+                            &node_id_to_path,
+                            &name_to_ids,
+                        ) {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                        // Module found but symbol not visible IN THIS BATCH —
+                        // the module file may sit batches ahead. Defer; the
+                        // post-loop pass retries constrained resolution and
+                        // only then falls back exactly as this chain would.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    } else {
+                        // External module — track for virtual node creation.
+                        // For `from X import Y`, we track the module-level dependency (X),
+                        // not the individual symbol (Y), since we can't index external code.
+                        for &src_id in &source_ids {
+                            external_python_imports.push((src_id, python_module.to_string()));
+                        }
+                        continue; // No point in default resolution for external imports
+                    }
+                }
+            }
+
+            // Try JS/TS relative-specifier resolution for import edges. The
+            // parser stamps `{"js_module":"<specifier>"}` (imports.rs);
+            // resolve the specifier against the importer's path + extension
+            // probing to a concrete file so the import binds there instead
+            // of a path-proximity same-name guess. Combined with Phase
+            // 2d-bind, this also repoints the matching bare calls. Bare/
+            // external/unindexed specifiers return None → fall through to
+            // default name-based / `<external>` resolution (unchanged).
+            if let Some(meta) = import_meta.as_ref() {
+                if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                    if let Some(targets) = resolve_js_module_targets(
+                        js_module,
+                        &pf.rel_path,
+                        &rel.target_name,
+                        all_file_paths,
+                        &name_to_ids,
+                        &node_id_to_path,
+                    ) {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &targets,
+                            &rel.relation,
+                            rel.metadata.as_deref(),
+                            false,
+                        )?;
+                        continue;
+                    }
+                    // The specifier resolves to an INDEXED file whose nodes
+                    // are just not visible to this batch — falling through
+                    // to bare-name resolution here bound the WRONG same-name
+                    // symbol from another file cross-batch. Defer; the
+                    // post-loop pass retries the constrained resolution and
+                    // only then falls back exactly as this chain would.
+                    if resolve_js_specifier_path(js_module, &pf.rel_path, all_file_paths).is_some()
+                    {
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    // Genuinely unresolved (bare pkg / unindexed) —
+                    // fall through to default resolution below.
+                }
+            }
+
+            // PHP file includes: the parser stamps `{"php_include":"<path>"}`
+            // on the import edge (require/require_once/include 'lib.php').
+            // Resolve the path against the importer's directory + `.php`
+            // probing to a concrete file, then bind to that file's <module>
+            // node so deps/cycles/affected/project_map see the cross-file
+            // include dependency. Unindexed/vendored paths return None →
+            // fall through to default (`<external>`) resolution.
+            if let Some(meta) = import_meta.as_ref() {
+                if let Some(inc) = meta.get("php_include").and_then(|v| v.as_str()) {
+                    if let Some(file) = resolve_php_include_path(inc, &pf.rel_path, all_file_paths)
+                    {
+                        // Bind to the resolved file's <module> node.
+                        let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
+                        if !module_targets.is_empty() {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                        // File resolved but its <module> node sits in a later
+                        // batch — defer rather than fall to bare-name guessing.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    // Unindexed include → fall through to default.
+                }
+            }
+
+            // C/C++ file includes: the parser stamps `{"c_include":"<path>"}`
+            // on the import edge (`#include "widget.h"`). Resolve the path
+            // against the importer's directory (and repo root) to a concrete
+            // header, then bind to that file's <module> node so deps/cycles/
+            // affected/project_map see the local header dependency. System
+            // headers (`<stdio.h>`) / unindexed paths return None → fall
+            // through to default (`<external>`) resolution (M6).
+            if let Some(meta) = import_meta.as_ref() {
+                if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
+                    if let Some(file) = resolve_c_include_path(inc, &pf.rel_path, all_file_paths) {
+                        let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
+                        if !module_targets.is_empty() {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                        // Header resolved but its <module> node sits in a later
+                        // batch — defer rather than fall to bare-name guessing.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    // Unindexed include → fall through to default.
+                }
+            }
+
+            // Rust trait impl method-level edges: parser stamps
+            // `{"q":"impl_method","v":"<TypeName>"}` so we can restrict
+            // candidate target methods to those that actually belong to
+            // this impl block (qualified_name LIKE "<TypeName>.%"). Without
+            // this, N structs implementing the same trait in one file all
+            // fan their method edges onto every same-name method node.
+            if rel.relation == REL_IMPLEMENTS {
+                if let Some(ref meta_str) = rel.metadata {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                        if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method")
+                            && meta.get("v").and_then(|v| v.as_str()).is_some()
+                        {
+                            // The impl type's methods can span batches, so
+                            // both a non-empty filtered set and an empty one
+                            // are partial views here. Defer unconditionally;
+                            // the post-loop pass runs the identical
+                            // self_filter against the complete pool (a
+                            // genuinely external trait method still drops).
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Bare-name call qualifier (Rust): inspect metadata to
+            // skip / restrict candidate set before the existing fallback
+            // chain. See spec
+            // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
+            if rel.relation == REL_CALLS {
+                use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
+                match parse_callee_metadata(rel.metadata.as_deref()) {
+                    Some(CalleeMeta::Receiver(recv))
+                        if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
+                    {
+                        // Cycle 4: `m.foo()` where `const m = require('./x')` —
+                        // bind the method to the required module file. Only JS
+                        // produces a Receiver here (extract_callee captures a
+                        // simple-identifier receiver for the JS family). When recv
+                        // is NOT a require-namespace binding (`arr.map()`,
+                        // `res.send()`) or the method isn't in that file, fall
+                        // through to the default resolution below — identical to
+                        // the pre-Cycle-4 Bare path — by NOT continuing.
+                        if let Some(module_file) = ns_module_map.get(&recv) {
+                            let targets: Vec<i64> = name_to_ids
+                                .get(&rel.target_name)
+                                .map(|ids| {
+                                    ids.iter()
+                                        .copied()
+                                        .filter(|id| {
+                                            node_id_to_path
+                                                .get(id)
+                                                .map(|p| p == module_file)
+                                                .unwrap_or(false)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !targets.is_empty() {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
+                                continue;
+                            }
+                            // The namespace binding names a concrete file, but
+                            // that file's nodes may sit in a later batch —
+                            // falling through to bare-name resolution here
+                            // bound the WRONG same-name symbol cross-batch.
+                            // Defer with the resolved file as a constraint.
+                            let mut d =
+                                DeferredRelation::of(&source_ids, rel, &pf.rel_path, &pf.language);
+                            d.ns_file = Some(module_file.clone());
+                            deferred.push(d);
+                            continue;
+                        }
+                        // Not a namespace binding → fall through to default.
+                    }
+                    Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_)) => {
+                        // Receiver type is not statically inferable (`obj.method()`
+                        // where `obj`'s type is unknown). The blanket drop here
+                        // marked uniquely-named live methods (`file_exists`,
+                        // `validate`) as dead and hid their callers from
+                        // impact/callers. Recover ONLY the unambiguous case: a
+                        // single same-language METHOD with that name, not a
+                        // stdlib-noise name. A unique non-noise method cannot
+                        // fan out across unrelated modules — the exact inflation
+                        // the drop guarded against — so binding it is safe.
+                        // Anything ambiguous (0 or >1 method candidates) or a
+                        // noise name stays dropped (no buffer; re-scan won't help).
+                        if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
+                            continue;
+                        }
+                        let all = name_to_ids
+                            .get(&rel.target_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        let same_lang: Vec<i64> = all
+                            .iter()
+                            .filter(|id| {
+                                matches!(
+                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                    Some(l) if l == pf.language.as_str()
+                                )
+                            })
+                            .copied()
+                            .collect();
+                        // A receiver call can only target a method, never a
+                        // same-named free function — filter those out first.
+                        let methods = method_candidates(&same_lang, db)?;
+                        // Prefer a same-file method if present (strongest
+                        // locality signal); otherwise require a globally
+                        // unique method.
+                        let same_file_methods: Vec<i64> = methods
+                            .iter()
+                            .copied()
+                            .filter(|id| local_ids.contains(id))
+                            .collect();
+                        if same_file_methods.len() == 1 {
+                            // Strongest locality signal, and the same-file pool
+                            // is COMPLETE at batch time — safe to decide here.
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &[same_file_methods[0]],
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                        } else if same_file_methods.len() > 1 {
+                            // >1 same-file methods (two structs in one file each
+                            // defining this name) — intentionally ambiguous, the
+                            // receiver's type still can't pick between them.
+                            // Same-file pool is complete, so drop is final.
+                        } else {
+                            // No same-file method. The "globally unique method"
+                            // decision depends on the WHOLE pool, and this batch
+                            // cannot see later batches (a unique-in-view method
+                            // may have cross-batch twins, and a zero-in-view
+                            // name may exist one batch ahead — the old comment
+                            // "re-scan won't change it" was false there). Defer;
+                            // the post-loop pass applies the identical rule
+                            // against the complete pool.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                        }
+                        continue;
+                    }
+                    Some(CalleeMeta::SelfRecv(_)) | Some(CalleeMeta::SelfType(_)) => {
+                        // The impl type's methods can span batches, so even a
+                        // non-empty filtered set here is a PARTIAL view (and an
+                        // empty one proves nothing — the old "a re-scan will
+                        // yield the same answer" held only within one batch).
+                        // Defer unconditionally; the post-loop pass applies the
+                        // identical self_filter against the complete pool.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    Some(CalleeMeta::RecvType(_)) => {
+                        // Same partial-view argument as SelfRecv/SelfType
+                        // above; additionally this arm's EMPTY case falls
+                        // through to bare default resolution rather than
+                        // dropping, and that decision too needs the whole
+                        // pool. Defer unconditionally; the post-loop pass
+                        // replicates bind-precisely-or-fall-through.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    Some(CalleeMeta::Path(_)) => {
+                        // Path-qualified call (`Alpha::foo()`). The path filter
+                        // scans candidate FILE PATHS, which span batches, so
+                        // both its match set and its empty verdict are partial
+                        // views. Defer unconditionally; the post-loop pass
+                        // runs the identical filter + refine on the whole pool
+                        // (an external crate path still resolves to nothing
+                        // there and drops, as before).
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
+                    _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
+                }
+            }
+
+            // Statically-external import (Rust `use std::…`): skip the whole
+            // name-based chain and bind to the `<external>` sentinel. The
+            // trailing segment of a std path is a bare name like `swap` or
+            // `fs`, and letting it into the global pool is how it bound to a
+            // same-named project symbol. See `domain::IMPORT_EXTERNAL_META`
+            // for why an explicit sentinel edge beats emitting nothing.
+            if rel.relation == REL_IMPORTS
+                && crate::domain::is_external_import_meta(rel.metadata.as_deref())
+            {
+                for &src_id in &source_ids {
+                    unresolved_externals.push((
+                        src_id,
+                        rel.target_name.clone(),
+                        rel.relation.clone(),
+                    ));
+                }
+                continue;
+            }
+
+            // Default resolution: global name-based lookup with language-aware layering.
+            // Tier order: same-file → same-language → (calls: drop) / (other: global).
+            // Dropping calls without a same-language match prevents Rust `hasher.update()`
+            // binding to an unrelated JS `function update()` via bare-name collision.
+            let all_target_ids = name_to_ids
+                .get(&rel.target_name)
+                .cloned()
+                .unwrap_or_default();
+
+            let same_file_targets: Vec<i64> = all_target_ids
+                .iter()
+                .filter(|id| local_ids.contains(id))
+                .copied()
+                .collect();
+
+            let source_lang = pf.language.as_str();
+
+            // Same-file binds are decided HERE (a file's nodes are atomic
+            // within its batch, so that pool is complete); the cross-file
+            // noise drop is pool-independent. EVERY other cross-file
+            // name-based decision is deferred to the post-loop pass: a
+            // batch's view of same-language candidates is a PREFIX of the
+            // tree, and refining/uniqueness/fan-out decisions on a partial
+            // pool bound the wrong same-name symbol whenever the right one
+            // sat batches ahead (audit 2026-08-02 P0-1; measured on this
+            // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
+            // twins instead of the path-closest helpers.rs one).
+            let target_ids = if !same_file_targets.is_empty() {
+                same_file_targets
+            } else if rel.relation == REL_CALLS
+                && is_cross_file_call_noise(&rel.target_name, source_lang)
+            {
+                // Stdlib method names (new/default/from) — drop. Language-aware:
+                // the JS/TS family exempts non-ECMAScript names (insert/remove/
+                // contains) so user methods resolve; all else drops regardless
+                // of language (a Rust `hasher.update()` must not bind a JS fn).
+                continue;
+            } else if rel.relation == REL_CALLS {
+                // No same-file, no same-language candidate VISIBLE TO THIS
+                // BATCH. Defer — the target may sit in a later batch, and
+                // resolving it there uses the same rules as here (the
+                // pending sweep's binding rules are deliberately narrower,
+                // so buffering directly at this point made a multi-batch
+                // tree resolve differently from a single-batch one). The
+                // deferred pass buffers into pending_unresolved_calls only
+                // what is STILL unresolved after seeing the whole tree —
+                // preserving the cross-invocation channel that memory
+                // `feedback_incremental_edge_timing.md` documents (B's call
+                // to a `foo` that A only adds in a later indexing run).
+                deferred.push(DeferredRelation::of(
+                    &source_ids,
+                    rel,
+                    &pf.rel_path,
+                    &pf.language,
+                ));
+                continue;
+            } else if rel.relation == REL_REFERENCES {
+                // Bare-name value references (callbacks / fn pointers) share the
+                // cross-language collision risk of bare-name calls: short common
+                // names like `process` / `handler` / `run` exist in many
+                // languages. Without a same-file or same-language target, do NOT
+                // fall through to the global pool — a Rust `references → process`
+                // must never bind a JS `function process()`
+                // (feedback_edge_resolution_same_language). Precision over
+                // recall. Defer rather than drop: the same-language target may
+                // sit in a later batch (the old "full rebuild resolves" comment
+                // here was false above one batch — audit 2026-08-02 P0-1).
+                deferred.push(DeferredRelation::of(
+                    &source_ids,
+                    rel,
+                    &pf.rel_path,
+                    &pf.language,
+                ));
+                continue;
+            } else {
+                // Structural relations (imports / inherits / implements /
+                // exports / routes_to) with no same-file target: the
+                // same-language / language-FAMILY pool this arm used to
+                // bind against is a PARTIAL view (this batch + earlier
+                // ones), so decide in the deferred pass instead, where the
+                // identical family rules (see `resolve_deferred_relations`
+                // branch 7 — cross-LANGUAGE phantom protection unchanged)
+                // run against the complete pool. Still-unresolved
+                // implements/imports mint their `<external>` sentinel
+                // there; the rest drop.
+                deferred.push(DeferredRelation::of(
+                    &source_ids,
+                    rel,
+                    &pf.rel_path,
+                    &pf.language,
+                ));
+                continue;
+            };
+
+            {
+                edges_created += insert_relation_edges(
+                    db,
+                    &source_ids,
+                    &target_ids,
+                    &rel.relation,
+                    rel.metadata.as_deref(),
+                    rel.relation == REL_ROUTES_TO,
+                )?;
+            }
+        }
+    }
+    Ok(BatchRelations {
+        edges_created,
+        external_python_imports,
+        unresolved_externals,
+    })
+}
 pub(super) fn index_files(
     db: &Database,
     root: &Path,
@@ -944,777 +1727,26 @@ pub(super) fn index_files(
         total_nodes_created += inserted.nodes_created;
 
         // --- Phase 2: Extract relations + insert edges ---
-        // Build per-batch name_to_ids and node_id_to_path from the pre-loaded global map,
-        // excluding files in the current batch (their old nodes were deleted in Phase 1b).
+        // The batch's own files, whose OLD node ids were deleted in Phase 1b, so
+        // they must be excluded from the resolution pool below AND pruned from
+        // the global map after the commit. Purged-but-not-reinserted files
+        // (`skipped_paths`) count the same way, or they resolve onto deleted rows.
         let mut batch_file_paths: HashSet<&str> =
             batch_parsed.iter().map(|pf| pf.rel_path.as_str()).collect();
-        // Purged-but-not-reinserted files (see `skipped_paths`): their old ids
-        // must be excluded from this batch's pool and pruned from the global map
-        // exactly like a reindexed file's, or they resolve onto deleted rows.
         batch_file_paths.extend(skipped_paths.iter().map(|p| p.as_str()));
 
-        // These three pools are rebuilt from `global_name_map` on EVERY batch —
-        // O(nodes x batches) where the map itself is maintained incrementally.
-        // Carried as an open performance item across two audits (2026-08-16,
-        // 2026-08-22 P2-5) on the theory that it is a hotspot above ~500 files,
-        // which this repository's own 278-file single-batch tree cannot show.
-        //
-        // Measured, 2026-08-22, on 1,763 files of third-party Python (25,041
-        // nodes, four batches at BATCH_SIZE 500), timing this block alone:
-        //
-        //   batch 1  2.4ms   batch 2  5.4ms   batch 3  6.8ms   batch 4  8.7ms
-        //   total   23.2ms   of an 8,899ms full index  =  0.26%
-        //
-        // Linear per batch, exactly as the O() says, at ~0.35us per node. The
-        // shape is real; the constant is not worth incremental maintenance of
-        // three more structures in a pipeline whose bookkeeping misses have
-        // twice cost real edges. Deliberately left alone — reopen it with a
-        // measurement, not with the complexity argument.
-        let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
-        // Per-node language for same-language-preferred edge resolution (§ cross-lang collision).
-        let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
-
-        // Add current batch's newly inserted nodes
-        for pf in &batch_parsed {
-            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-                name_to_ids.entry(name.clone()).or_default().push(*id);
-                node_id_to_path.insert(*id, pf.rel_path.clone());
-                node_id_to_language.insert(*id, Some(pf.language.clone()));
-            }
-        }
-
-        // Add nodes from the global map, excluding those in current batch's files
-        // (their old nodes were deleted and replaced by new ones above)
-        for (name, entries) in &global_name_map {
-            for (id, path, language) in entries {
-                if !batch_file_paths.contains(path.as_str()) {
-                    name_to_ids.entry(name.clone()).or_default().push(*id);
-                    node_id_to_path.insert(*id, path.clone());
-                    node_id_to_language.insert(*id, language.clone());
-                }
-            }
-        }
-
-        for ids in name_to_ids.values_mut() {
-            ids.sort();
-            ids.dedup();
-        }
-
-        // Track unresolved external Python imports: (source_module_node_id, module_name)
-        let mut external_python_imports: Vec<(i64, String)> = Vec::new();
-        // Track unresolved external symbols for sentinel node creation:
-        // (source_id, target_name, relation) — e.g., implements edges to external traits
-        let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
-
-        for pf in &batch_parsed {
-            let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
-            let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
-
-            // Pre-scan this file's require-namespace bindings
-            // (`const m = require('./x')`, stamped `{"q":"ns_require",...}`) →
-            // resolved file path, so `m.foo()` member calls (CalleeMeta::Receiver)
-            // bind to the required module in the call-resolution pass below.
-            let mut ns_module_map: HashMap<String, String> = HashMap::new();
-            for rel in &relations {
-                if rel.relation != REL_IMPORTS {
-                    continue;
-                }
-                if let Some(meta_str) = rel.metadata.as_deref() {
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                        // ESM `import * as ns` (q:"ns_import", v51) binds member
-                        // calls exactly like the CJS require-namespace form.
-                        if matches!(
-                            meta.get("q").and_then(|v| v.as_str()),
-                            Some(crate::domain::IMPORT_Q_NS_REQUIRE)
-                                | Some(crate::domain::IMPORT_Q_NS_IMPORT)
-                        ) {
-                            if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
-                                if let Some(file) =
-                                    resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths)
-                                {
-                                    ns_module_map.insert(rel.target_name.clone(), file);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for rel in &relations {
-                // Contract: extract_relations_from_tree stamps every relation with
-                // source_language equal to the language argument. The
-                // same-language resolution at line 811+ depends on it. Hard
-                // error instead of debug_assert so a parser regression fails
-                // loudly in release builds too (one string compare per
-                // relation is negligible against the SQL writes below).
-                if rel.source_language != pf.language {
-                    anyhow::bail!(
-                        "ParsedRelation.source_language ({}) does not match file language ({}); \
-                         parser regressed the source_language contract",
-                        rel.source_language,
-                        pf.language
-                    );
-                }
-
-                // Match the relation's enclosing scope (source_name) to a node.
-                // Class-based languages (Python/TS/JS/Java/Ruby) qualify a
-                // method's scope as `Class.method`, but the node's bare `name`
-                // is just `method` — so match qualified_name too, else every
-                // intra-class method-to-method edge is silently dropped.
-                // Bare-scope sources (Rust impl, Go receivers, free functions)
-                // still match on `name`.
-                // inherits/implements describe a TYPE's supertype, so their source
-                // must be a class/struct/interface/enum/trait — never a function or
-                // method that merely shares the type's name. A C++ inline constructor
-                // (`Widget(int){}`) produces a `method Widget` node alongside `class
-                // Widget`; without this both matched `source_name == "Widget"` and the
-                // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
-                // than whitelist type kinds) so no language's type node is missed.
-                let type_source_only =
-                    rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
-                let mut source_ids = (0..pf.node_ids.len())
-                    .filter(|&i| {
-                        (pf.node_names[i] == rel.source_name
-                            || pf.node_qualified_names[i].as_deref()
-                                == Some(rel.source_name.as_str()))
-                            && (!type_source_only
-                                || !matches!(pf.node_types[i].as_str(), "function" | "method"))
-                    })
-                    .map(|i| pf.node_ids[i])
-                    .collect::<Vec<_>>();
-
-                // Route handlers are commonly imported from a controller file —
-                // the canonical Express layout `import { getUser } from './ctrl';
-                // app.get('/x', getUser)`. The routes_to relation names the handler
-                // (== source == target), but the handler node lives in another
-                // file, so the same-file scan above finds nothing and the route
-                // edge (the handler self-edge carrying method/path) is silently
-                // dropped — trace/impact/find_http_route then see no route at all.
-                // Recover by resolving the handler name cross-file, same-language,
-                // exactly like a call target below (refine breaks any ambiguity by
-                // path locality). Only fires for routes_to with an unresolved
-                // same-file source; inline + same-file named handlers already match.
-                if rel.relation == REL_ROUTES_TO && source_ids.is_empty() {
-                    let same_lang: Vec<i64> = name_to_ids
-                        .get(&rel.source_name)
-                        .map(|ids| {
-                            ids.iter()
-                                .copied()
-                                .filter(|id| {
-                                    matches!(
-                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                        Some(l) if l == pf.language.as_str()
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    source_ids =
-                        refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
-                    if source_ids.is_empty() {
-                        // Imported handler may sit in a later batch — the recovery
-                        // above can only see the pool visible NOW. Defer with empty
-                        // source_ids; the post-loop pass re-runs this recovery
-                        // against the whole tree.
-                        deferred.push(DeferredRelation::of(&[], rel, &pf.rel_path, &pf.language));
-                        continue;
-                    }
-                }
-
-                // The five metadata-driven import forms below all key off the same
-                // JSON blob, and each used to parse it again — five `from_str`
-                // calls per import relation, four of them thrown away. Parse once.
-                // Order still decides: namespace/star, then Python module, then
-                // JS specifier, then PHP include, then C include, then the
-                // default name-based chain.
-                let import_meta: Option<serde_json::Value> = if rel.relation == REL_IMPORTS {
-                    rel.metadata
-                        .as_deref()
-                        .and_then(|m| serde_json::from_str(m).ok())
-                } else {
-                    None
-                };
-
-                // Module-level import markers (v51, roadmap §2.3): namespace
-                // bindings (`const m = require('./x')` q:"ns_require", `import *
-                // as ns from './x'` q:"ns_import") and star re-exports (`export *
-                // from './x'` q:"star_reexport") name no resolvable symbol, so
-                // default name resolution would mint a spurious `<external>` node
-                // (or, for star's `<module>` target, cross-link a random file).
-                // Instead bind them to the RESOLVED file's `<module>` node — the
-                // PHP-include/C-include pattern — so a namespace-only or
-                // star-barrel dependency is finally visible to deps/affected/
-                // cycles/map. Unresolvable specifier (external package) → no
-                // edge, same as before. Always `continue`: never fall through.
-                if let Some(meta) = import_meta.as_ref() {
-                    if matches!(
-                        meta.get("q").and_then(|v| v.as_str()),
-                        Some(crate::domain::IMPORT_Q_NS_REQUIRE)
-                            | Some(crate::domain::IMPORT_Q_NS_IMPORT)
-                            | Some(crate::domain::IMPORT_Q_STAR_REEXPORT)
-                            | Some(crate::domain::IMPORT_Q_DEFAULT)
-                    ) {
-                        let mut resolved = false;
-                        if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
-                            if let Some(file) =
-                                resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths)
-                            {
-                                let module_targets =
-                                    module_node_of(&name_to_ids, &node_id_to_path, &file);
-                                if !module_targets.is_empty() {
-                                    resolved = true;
-                                    total_edges_created += insert_relation_edges(
-                                        db,
-                                        &source_ids,
-                                        &module_targets,
-                                        &rel.relation,
-                                        rel.metadata.as_deref(),
-                                        false,
-                                    )?;
-                                }
-                            }
-                        }
-                        if !resolved {
-                            // The specifier's file (or its <module> node) may sit
-                            // in a later batch — retry after the loop. A genuinely
-                            // external specifier fails there too and drops, same
-                            // as before.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                        }
-                        continue;
-                    }
-                }
-
-                // Try Python module-constrained resolution for import edges
-                if let Some(meta) = import_meta.as_ref() {
-                    if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str())
-                    {
-                        let is_module_import = meta
-                            .get("is_module_import")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if let Some(module_files) =
-                            project_module_files(python_module, &python_module_map)
-                        {
-                            // Internal module — try constrained resolution
-                            if let Some(module_targets) = resolve_python_module_targets(
-                                &module_files,
-                                is_module_import,
-                                &rel.target_name,
-                                &node_id_to_path,
-                                &name_to_ids,
-                            ) {
-                                total_edges_created += insert_relation_edges(
-                                    db,
-                                    &source_ids,
-                                    &module_targets,
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                    false,
-                                )?;
-                                continue;
-                            }
-                            // Module found but symbol not visible IN THIS BATCH —
-                            // the module file may sit batches ahead. Defer; the
-                            // post-loop pass retries constrained resolution and
-                            // only then falls back exactly as this chain would.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        } else {
-                            // External module — track for virtual node creation.
-                            // For `from X import Y`, we track the module-level dependency (X),
-                            // not the individual symbol (Y), since we can't index external code.
-                            for &src_id in &source_ids {
-                                external_python_imports.push((src_id, python_module.to_string()));
-                            }
-                            continue; // No point in default resolution for external imports
-                        }
-                    }
-                }
-
-                // Try JS/TS relative-specifier resolution for import edges. The
-                // parser stamps `{"js_module":"<specifier>"}` (imports.rs);
-                // resolve the specifier against the importer's path + extension
-                // probing to a concrete file so the import binds there instead
-                // of a path-proximity same-name guess. Combined with Phase
-                // 2d-bind, this also repoints the matching bare calls. Bare/
-                // external/unindexed specifiers return None → fall through to
-                // default name-based / `<external>` resolution (unchanged).
-                if let Some(meta) = import_meta.as_ref() {
-                    if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
-                        if let Some(targets) = resolve_js_module_targets(
-                            js_module,
-                            &pf.rel_path,
-                            &rel.target_name,
-                            &all_file_paths,
-                            &name_to_ids,
-                            &node_id_to_path,
-                        ) {
-                            total_edges_created += insert_relation_edges(
-                                db,
-                                &source_ids,
-                                &targets,
-                                &rel.relation,
-                                rel.metadata.as_deref(),
-                                false,
-                            )?;
-                            continue;
-                        }
-                        // The specifier resolves to an INDEXED file whose nodes
-                        // are just not visible to this batch — falling through
-                        // to bare-name resolution here bound the WRONG same-name
-                        // symbol from another file cross-batch. Defer; the
-                        // post-loop pass retries the constrained resolution and
-                        // only then falls back exactly as this chain would.
-                        if resolve_js_specifier_path(js_module, &pf.rel_path, &all_file_paths)
-                            .is_some()
-                        {
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        // Genuinely unresolved (bare pkg / unindexed) —
-                        // fall through to default resolution below.
-                    }
-                }
-
-                // PHP file includes: the parser stamps `{"php_include":"<path>"}`
-                // on the import edge (require/require_once/include 'lib.php').
-                // Resolve the path against the importer's directory + `.php`
-                // probing to a concrete file, then bind to that file's <module>
-                // node so deps/cycles/affected/project_map see the cross-file
-                // include dependency. Unindexed/vendored paths return None →
-                // fall through to default (`<external>`) resolution.
-                if let Some(meta) = import_meta.as_ref() {
-                    if let Some(inc) = meta.get("php_include").and_then(|v| v.as_str()) {
-                        if let Some(file) =
-                            resolve_php_include_path(inc, &pf.rel_path, &all_file_paths)
-                        {
-                            // Bind to the resolved file's <module> node.
-                            let module_targets =
-                                module_node_of(&name_to_ids, &node_id_to_path, &file);
-                            if !module_targets.is_empty() {
-                                total_edges_created += insert_relation_edges(
-                                    db,
-                                    &source_ids,
-                                    &module_targets,
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                    false,
-                                )?;
-                                continue;
-                            }
-                            // File resolved but its <module> node sits in a later
-                            // batch — defer rather than fall to bare-name guessing.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        // Unindexed include → fall through to default.
-                    }
-                }
-
-                // C/C++ file includes: the parser stamps `{"c_include":"<path>"}`
-                // on the import edge (`#include "widget.h"`). Resolve the path
-                // against the importer's directory (and repo root) to a concrete
-                // header, then bind to that file's <module> node so deps/cycles/
-                // affected/project_map see the local header dependency. System
-                // headers (`<stdio.h>`) / unindexed paths return None → fall
-                // through to default (`<external>`) resolution (M6).
-                if let Some(meta) = import_meta.as_ref() {
-                    if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
-                        if let Some(file) =
-                            resolve_c_include_path(inc, &pf.rel_path, &all_file_paths)
-                        {
-                            let module_targets =
-                                module_node_of(&name_to_ids, &node_id_to_path, &file);
-                            if !module_targets.is_empty() {
-                                total_edges_created += insert_relation_edges(
-                                    db,
-                                    &source_ids,
-                                    &module_targets,
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                    false,
-                                )?;
-                                continue;
-                            }
-                            // Header resolved but its <module> node sits in a later
-                            // batch — defer rather than fall to bare-name guessing.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        // Unindexed include → fall through to default.
-                    }
-                }
-
-                // Rust trait impl method-level edges: parser stamps
-                // `{"q":"impl_method","v":"<TypeName>"}` so we can restrict
-                // candidate target methods to those that actually belong to
-                // this impl block (qualified_name LIKE "<TypeName>.%"). Without
-                // this, N structs implementing the same trait in one file all
-                // fan their method edges onto every same-name method node.
-                if rel.relation == REL_IMPLEMENTS {
-                    if let Some(ref meta_str) = rel.metadata {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method")
-                                && meta.get("v").and_then(|v| v.as_str()).is_some()
-                            {
-                                // The impl type's methods can span batches, so
-                                // both a non-empty filtered set and an empty one
-                                // are partial views here. Defer unconditionally;
-                                // the post-loop pass runs the identical
-                                // self_filter against the complete pool (a
-                                // genuinely external trait method still drops).
-                                deferred.push(DeferredRelation::of(
-                                    &source_ids,
-                                    rel,
-                                    &pf.rel_path,
-                                    &pf.language,
-                                ));
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Bare-name call qualifier (Rust): inspect metadata to
-                // skip / restrict candidate set before the existing fallback
-                // chain. See spec
-                // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
-                if rel.relation == REL_CALLS {
-                    use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
-                    match parse_callee_metadata(rel.metadata.as_deref()) {
-                        Some(CalleeMeta::Receiver(recv))
-                            if matches!(
-                                pf.language.as_str(),
-                                "javascript" | "typescript" | "tsx"
-                            ) =>
-                        {
-                            // Cycle 4: `m.foo()` where `const m = require('./x')` —
-                            // bind the method to the required module file. Only JS
-                            // produces a Receiver here (extract_callee captures a
-                            // simple-identifier receiver for the JS family). When recv
-                            // is NOT a require-namespace binding (`arr.map()`,
-                            // `res.send()`) or the method isn't in that file, fall
-                            // through to the default resolution below — identical to
-                            // the pre-Cycle-4 Bare path — by NOT continuing.
-                            if let Some(module_file) = ns_module_map.get(&recv) {
-                                let targets: Vec<i64> = name_to_ids
-                                    .get(&rel.target_name)
-                                    .map(|ids| {
-                                        ids.iter()
-                                            .copied()
-                                            .filter(|id| {
-                                                node_id_to_path
-                                                    .get(id)
-                                                    .map(|p| p == module_file)
-                                                    .unwrap_or(false)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                if !targets.is_empty() {
-                                    total_edges_created += insert_relation_edges(
-                                        db,
-                                        &source_ids,
-                                        &targets,
-                                        &rel.relation,
-                                        rel.metadata.as_deref(),
-                                        false,
-                                    )?;
-                                    continue;
-                                }
-                                // The namespace binding names a concrete file, but
-                                // that file's nodes may sit in a later batch —
-                                // falling through to bare-name resolution here
-                                // bound the WRONG same-name symbol cross-batch.
-                                // Defer with the resolved file as a constraint.
-                                let mut d = DeferredRelation::of(
-                                    &source_ids,
-                                    rel,
-                                    &pf.rel_path,
-                                    &pf.language,
-                                );
-                                d.ns_file = Some(module_file.clone());
-                                deferred.push(d);
-                                continue;
-                            }
-                            // Not a namespace binding → fall through to default.
-                        }
-                        Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_)) => {
-                            // Receiver type is not statically inferable (`obj.method()`
-                            // where `obj`'s type is unknown). The blanket drop here
-                            // marked uniquely-named live methods (`file_exists`,
-                            // `validate`) as dead and hid their callers from
-                            // impact/callers. Recover ONLY the unambiguous case: a
-                            // single same-language METHOD with that name, not a
-                            // stdlib-noise name. A unique non-noise method cannot
-                            // fan out across unrelated modules — the exact inflation
-                            // the drop guarded against — so binding it is safe.
-                            // Anything ambiguous (0 or >1 method candidates) or a
-                            // noise name stays dropped (no buffer; re-scan won't help).
-                            if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
-                                continue;
-                            }
-                            let all = name_to_ids
-                                .get(&rel.target_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let same_lang: Vec<i64> = all
-                                .iter()
-                                .filter(|id| {
-                                    matches!(
-                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                        Some(l) if l == pf.language.as_str()
-                                    )
-                                })
-                                .copied()
-                                .collect();
-                            // A receiver call can only target a method, never a
-                            // same-named free function — filter those out first.
-                            let methods = method_candidates(&same_lang, db)?;
-                            // Prefer a same-file method if present (strongest
-                            // locality signal); otherwise require a globally
-                            // unique method.
-                            let same_file_methods: Vec<i64> = methods
-                                .iter()
-                                .copied()
-                                .filter(|id| local_ids.contains(id))
-                                .collect();
-                            if same_file_methods.len() == 1 {
-                                // Strongest locality signal, and the same-file pool
-                                // is COMPLETE at batch time — safe to decide here.
-                                total_edges_created += insert_relation_edges(
-                                    db,
-                                    &source_ids,
-                                    &[same_file_methods[0]],
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                    false,
-                                )?;
-                            } else if same_file_methods.len() > 1 {
-                                // >1 same-file methods (two structs in one file each
-                                // defining this name) — intentionally ambiguous, the
-                                // receiver's type still can't pick between them.
-                                // Same-file pool is complete, so drop is final.
-                            } else {
-                                // No same-file method. The "globally unique method"
-                                // decision depends on the WHOLE pool, and this batch
-                                // cannot see later batches (a unique-in-view method
-                                // may have cross-batch twins, and a zero-in-view
-                                // name may exist one batch ahead — the old comment
-                                // "re-scan won't change it" was false there). Defer;
-                                // the post-loop pass applies the identical rule
-                                // against the complete pool.
-                                deferred.push(DeferredRelation::of(
-                                    &source_ids,
-                                    rel,
-                                    &pf.rel_path,
-                                    &pf.language,
-                                ));
-                            }
-                            continue;
-                        }
-                        Some(CalleeMeta::SelfRecv(_)) | Some(CalleeMeta::SelfType(_)) => {
-                            // The impl type's methods can span batches, so even a
-                            // non-empty filtered set here is a PARTIAL view (and an
-                            // empty one proves nothing — the old "a re-scan will
-                            // yield the same answer" held only within one batch).
-                            // Defer unconditionally; the post-loop pass applies the
-                            // identical self_filter against the complete pool.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        Some(CalleeMeta::RecvType(_)) => {
-                            // Same partial-view argument as SelfRecv/SelfType
-                            // above; additionally this arm's EMPTY case falls
-                            // through to bare default resolution rather than
-                            // dropping, and that decision too needs the whole
-                            // pool. Defer unconditionally; the post-loop pass
-                            // replicates bind-precisely-or-fall-through.
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        Some(CalleeMeta::Path(_)) => {
-                            // Path-qualified call (`Alpha::foo()`). The path filter
-                            // scans candidate FILE PATHS, which span batches, so
-                            // both its match set and its empty verdict are partial
-                            // views. Defer unconditionally; the post-loop pass
-                            // runs the identical filter + refine on the whole pool
-                            // (an external crate path still resolves to nothing
-                            // there and drops, as before).
-                            deferred.push(DeferredRelation::of(
-                                &source_ids,
-                                rel,
-                                &pf.rel_path,
-                                &pf.language,
-                            ));
-                            continue;
-                        }
-                        _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
-                    }
-                }
-
-                // Statically-external import (Rust `use std::…`): skip the whole
-                // name-based chain and bind to the `<external>` sentinel. The
-                // trailing segment of a std path is a bare name like `swap` or
-                // `fs`, and letting it into the global pool is how it bound to a
-                // same-named project symbol. See `domain::IMPORT_EXTERNAL_META`
-                // for why an explicit sentinel edge beats emitting nothing.
-                if rel.relation == REL_IMPORTS
-                    && crate::domain::is_external_import_meta(rel.metadata.as_deref())
-                {
-                    for &src_id in &source_ids {
-                        unresolved_externals.push((
-                            src_id,
-                            rel.target_name.clone(),
-                            rel.relation.clone(),
-                        ));
-                    }
-                    continue;
-                }
-
-                // Default resolution: global name-based lookup with language-aware layering.
-                // Tier order: same-file → same-language → (calls: drop) / (other: global).
-                // Dropping calls without a same-language match prevents Rust `hasher.update()`
-                // binding to an unrelated JS `function update()` via bare-name collision.
-                let all_target_ids = name_to_ids
-                    .get(&rel.target_name)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let same_file_targets: Vec<i64> = all_target_ids
-                    .iter()
-                    .filter(|id| local_ids.contains(id))
-                    .copied()
-                    .collect();
-
-                let source_lang = pf.language.as_str();
-
-                // Same-file binds are decided HERE (a file's nodes are atomic
-                // within its batch, so that pool is complete); the cross-file
-                // noise drop is pool-independent. EVERY other cross-file
-                // name-based decision is deferred to the post-loop pass: a
-                // batch's view of same-language candidates is a PREFIX of the
-                // tree, and refining/uniqueness/fan-out decisions on a partial
-                // pool bound the wrong same-name symbol whenever the right one
-                // sat batches ahead (audit 2026-08-02 P0-1; measured on this
-                // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
-                // twins instead of the path-closest helpers.rs one).
-                let target_ids = if !same_file_targets.is_empty() {
-                    same_file_targets
-                } else if rel.relation == REL_CALLS
-                    && is_cross_file_call_noise(&rel.target_name, source_lang)
-                {
-                    // Stdlib method names (new/default/from) — drop. Language-aware:
-                    // the JS/TS family exempts non-ECMAScript names (insert/remove/
-                    // contains) so user methods resolve; all else drops regardless
-                    // of language (a Rust `hasher.update()` must not bind a JS fn).
-                    continue;
-                } else if rel.relation == REL_CALLS {
-                    // No same-file, no same-language candidate VISIBLE TO THIS
-                    // BATCH. Defer — the target may sit in a later batch, and
-                    // resolving it there uses the same rules as here (the
-                    // pending sweep's binding rules are deliberately narrower,
-                    // so buffering directly at this point made a multi-batch
-                    // tree resolve differently from a single-batch one). The
-                    // deferred pass buffers into pending_unresolved_calls only
-                    // what is STILL unresolved after seeing the whole tree —
-                    // preserving the cross-invocation channel that memory
-                    // `feedback_incremental_edge_timing.md` documents (B's call
-                    // to a `foo` that A only adds in a later indexing run).
-                    deferred.push(DeferredRelation::of(
-                        &source_ids,
-                        rel,
-                        &pf.rel_path,
-                        &pf.language,
-                    ));
-                    continue;
-                } else if rel.relation == REL_REFERENCES {
-                    // Bare-name value references (callbacks / fn pointers) share the
-                    // cross-language collision risk of bare-name calls: short common
-                    // names like `process` / `handler` / `run` exist in many
-                    // languages. Without a same-file or same-language target, do NOT
-                    // fall through to the global pool — a Rust `references → process`
-                    // must never bind a JS `function process()`
-                    // (feedback_edge_resolution_same_language). Precision over
-                    // recall. Defer rather than drop: the same-language target may
-                    // sit in a later batch (the old "full rebuild resolves" comment
-                    // here was false above one batch — audit 2026-08-02 P0-1).
-                    deferred.push(DeferredRelation::of(
-                        &source_ids,
-                        rel,
-                        &pf.rel_path,
-                        &pf.language,
-                    ));
-                    continue;
-                } else {
-                    // Structural relations (imports / inherits / implements /
-                    // exports / routes_to) with no same-file target: the
-                    // same-language / language-FAMILY pool this arm used to
-                    // bind against is a PARTIAL view (this batch + earlier
-                    // ones), so decide in the deferred pass instead, where the
-                    // identical family rules (see `resolve_deferred_relations`
-                    // branch 7 — cross-LANGUAGE phantom protection unchanged)
-                    // run against the complete pool. Still-unresolved
-                    // implements/imports mint their `<external>` sentinel
-                    // there; the rest drop.
-                    deferred.push(DeferredRelation::of(
-                        &source_ids,
-                        rel,
-                        &pf.rel_path,
-                        &pf.language,
-                    ));
-                    continue;
-                };
-
-                {
-                    total_edges_created += insert_relation_edges(
-                        db,
-                        &source_ids,
-                        &target_ids,
-                        &rel.relation,
-                        rel.metadata.as_deref(),
-                        rel.relation == REL_ROUTES_TO,
-                    )?;
-                }
-            }
-        }
+        let batch_relations = resolve_batch_relations(
+            db,
+            &batch_parsed,
+            &batch_file_paths,
+            &global_name_map,
+            &python_module_map,
+            &all_file_paths,
+            &mut deferred,
+        )?;
+        total_edges_created += batch_relations.edges_created;
+        let external_python_imports = batch_relations.external_python_imports;
+        let unresolved_externals = batch_relations.unresolved_externals;
 
         // Phases 2b / 2b-ext: mint the `<external>` sentinel nodes for this
         // batch's unresolved imports and trait targets, plus their edges.
