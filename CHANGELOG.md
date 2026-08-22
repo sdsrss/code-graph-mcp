@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.125.0 (2026-08-22)
 
 ### A query that finds one stale file: 7.2 s → 2.1 s
 
