@@ -58,6 +58,7 @@ const {
   isSilentMode,
   shouldCheck,
   resolveProxy,
+  requestJson,
   shouldHealGlobalsOnThrottle,
   inactiveNodeGlobalRelics,
 } = require('./auto-update');
@@ -1881,4 +1882,99 @@ test('an unreachable GitHub reports UNKNOWN, not "up to date"', (t) => {
   assert.match(cli, /result\.reason === 'fetch-failed'/);
   assert.match(cli, /update status UNKNOWN/);
   assert.match(cli, /result\.reason === 'install-lock-held'/);
+});
+
+// --- requestJson never-settles (audit 2026-08-22 P1-2) --------------------
+//
+// `req.setTimeout` is an INACTIVITY timer that lives on the socket: once the
+// socket is destroyed mid-body there is no `end`, no `error` on the request,
+// and the timer is gone with it. With only `data`/`end` wired on the response,
+// the promise never settled — the detached per-session `check` turned into a
+// zombie `node` process, and a foreground run hung the terminal.
+//
+// The stub replaces `https.request` so the shapes below are reachable without
+// a network or a TLS fixture; every assertion runs the REAL `requestJson`.
+function stubHttpsRequest(t, driveResponse) {
+  const https = require('https');
+  const { EventEmitter } = require('events');
+  const original = https.request;
+  // resolveProxy() reads the ambient env — a developer behind a proxy would
+  // otherwise take the CONNECT branch and never reach the stub.
+  const priorNoProxy = process.env.NO_PROXY;
+  process.env.NO_PROXY = '*';
+  t.after(() => {
+    https.request = original;
+    if (priorNoProxy === undefined) delete process.env.NO_PROXY;
+    else process.env.NO_PROXY = priorNoProxy;
+  });
+  https.request = (_url, _opts, onResponse) => {
+    const req = new EventEmitter();
+    req.setTimeout = () => {}; // dead with the socket — the whole point
+    req.destroy = () => {};
+    req.end = () => {
+      const res = new EventEmitter();
+      res.setEncoding = () => {};
+      res.statusCode = 200;
+      onResponse(res);
+      setImmediate(() => driveResponse(res));
+    };
+    return req;
+  };
+}
+
+// 'hung' rather than a real hang, so the pre-fix state is a readable failure
+// instead of a suite that never finishes.
+async function settleOrHang(promise, ms = 2000) {
+  let timer;
+  const outcome = await Promise.race([
+    promise.then(() => 'resolved', () => 'rejected'),
+    new Promise((r) => { timer = setTimeout(() => r('hung'), ms); }),
+  ]);
+  clearTimeout(timer);
+  return outcome;
+}
+
+test('requestJson rejects when the response errors mid-body', async (t) => {
+  stubHttpsRequest(t, (res) => {
+    res.emit('data', '{"tag_na');
+    res.emit('error', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+  });
+  assert.equal(
+    await settleOrHang(requestJson('https://api.github.com/x', 50)),
+    'rejected',
+    'a connection dropped mid-body must reject, not leave the promise pending forever',
+  );
+});
+
+test('requestJson rejects when the response aborts mid-body', async (t) => {
+  stubHttpsRequest(t, (res) => {
+    res.emit('data', '{"tag_na');
+    res.emit('aborted');
+  });
+  assert.equal(
+    await settleOrHang(requestJson('https://api.github.com/x', 50)),
+    'rejected',
+    "'aborted' (no 'error' on older Node) must reject too",
+  );
+});
+
+test('requestJson watchdog settles a response that goes silent', async (t) => {
+  // Nothing at all after the headers: no data, no end, no error, and the
+  // inactivity timer cannot fire. Only an overall deadline can settle this.
+  stubHttpsRequest(t, () => {});
+  assert.equal(
+    await settleOrHang(requestJson('https://api.github.com/x', 50)),
+    'rejected',
+    'a silent response must hit the overall watchdog instead of hanging the process',
+  );
+});
+
+test('requestJson still resolves a normal response (watchdog does not fire early)', async (t) => {
+  stubHttpsRequest(t, (res) => {
+    res.emit('data', '{"tag_name":"v1.0.0"}');
+    res.emit('end');
+  });
+  const out = await requestJson('https://api.github.com/x', 50);
+  assert.equal(out.statusCode, 200);
+  assert.equal(out.body, '{"tag_name":"v1.0.0"}');
 });

@@ -254,8 +254,51 @@ function resolveProxy(targetUrl, env = process.env) {
   return proxy && proxy.trim() ? proxy.trim() : null;
 }
 
+// Overall deadline for one metadata GET, as a multiple of the per-socket
+// inactivity budget. Deliberately looser than `timeoutMs`: that one is an
+// inactivity timer and must stay tight, while this one only has to stop a
+// request that can never finish, so a slow-but-progressing response must not
+// trip it.
+const FETCH_TOTAL_TIMEOUT_FACTOR = 4;
+
 function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    // Every path below settles through these. `req.setTimeout` is an
+    // INACTIVITY timer that lives on the socket, so a connection dropped
+    // mid-body emitted no `end`, no request `error` and no timeout — with only
+    // `data`/`end` wired on the response the promise stayed pending forever.
+    // The per-session detached `check` then accumulated zombie node processes,
+    // and a foreground run hung the terminal (audit 2026-08-22 P1-2). The
+    // response listeners close that shape directly; the watchdog is the
+    // backstop for any other never-settles shape. Both must be single-shot —
+    // `error` after a partial body would otherwise re-settle a settled
+    // promise — and both must clear the timer so it cannot hold the event
+    // loop open past a normal response.
+    let settled = false;
+    let watchdog = null;
+    const clearWatchdog = () => {
+      if (watchdog !== null) {
+        clearTimeout(watchdog);
+        watchdog = null;
+      }
+    };
+    const settleOk = (value) => {
+      if (settled) return;
+      settled = true;
+      clearWatchdog();
+      resolve(value);
+    };
+    const settleErr = (err) => {
+      if (settled) return;
+      settled = true;
+      clearWatchdog();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    watchdog = setTimeout(
+      () => settleErr(new Error('request watchdog timeout')),
+      timeoutMs * FETCH_TOTAL_TIMEOUT_FACTOR,
+    );
+
     const headers = {
       'Accept': 'application/vnd.github+json',
       'User-Agent': 'code-graph-auto-update/1.0',
@@ -264,12 +307,17 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
+      // A truncated body is not a usable answer — reject rather than hand
+      // back half a JSON document. 'aborted' covers the Node versions that
+      // do not surface the drop as a response 'error'.
+      res.on('aborted', () => settleErr(new Error('response aborted before end')));
+      res.on('error', settleErr);
       res.on('end', () => {
         if (!res.statusCode) {
-          reject(new Error('missing status code'));
+          settleErr(new Error('missing status code'));
           return;
         }
-        resolve({ statusCode: res.statusCode, body });
+        settleOk({ statusCode: res.statusCode, body });
       });
     };
 
@@ -280,7 +328,7 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
       // CONNECT to reach parity for users behind a corporate proxy.
       let pu, target;
       try { pu = new URL(proxy); target = new URL(url); }
-      catch { reject(new Error('invalid proxy or target URL')); return; }
+      catch { settleErr(new Error('invalid proxy or target URL')); return; }
       const connectHeaders = {};
       if (pu.username) {
         const cred = `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`;
@@ -296,25 +344,25 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
       connectReq.on('connect', (res, socket) => {
         if (res.statusCode !== 200) {
           socket.destroy();
-          reject(new Error(`proxy CONNECT failed: ${res.statusCode}`));
+          settleErr(new Error(`proxy CONNECT failed: ${res.statusCode}`));
           return;
         }
         const req = https.request(url, {
           method: 'GET', headers, socket, agent: false, servername: target.hostname,
         }, onResponse);
         req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
-        req.on('error', reject);
+        req.on('error', settleErr);
         req.end();
       });
       connectReq.setTimeout(timeoutMs, () => connectReq.destroy(new Error('proxy connect timeout')));
-      connectReq.on('error', reject);
+      connectReq.on('error', settleErr);
       connectReq.end();
       return;
     }
 
     const req = https.request(url, { method: 'GET', headers }, onResponse);
     req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
-    req.on('error', reject);
+    req.on('error', settleErr);
     req.end();
   });
 }
