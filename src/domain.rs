@@ -30,6 +30,31 @@ pub const LIVE_MCP_TOOLS: &[&str] = &[
     "find_references",
 ];
 
+/// Tool names the server still DISPATCHES but does not advertise in
+/// `tools/list`: the v0.18.4 folds, the management tools, and one legacy
+/// alias. They answer when called, which is why they are kept — but an MCP
+/// client only offers the model what `tools/list` returned, so from the
+/// model's side these names do not exist.
+///
+/// That asymmetry is the trap: server-side they work, so nothing errors in
+/// testing, while a prompt or a description that names one teaches the model a
+/// call it cannot make. Anything the model READS (prompt text, tool
+/// descriptions, `instructions`) must name only [`LIVE_MCP_TOOLS`] and their
+/// flags — see the guard in `tests/integration.rs`.
+pub const NON_LISTED_MCP_TOOLS: &[&str] = &[
+    "impact_analysis",
+    "dependency_graph",
+    "find_similar_code",
+    "find_dead_code",
+    "trace_http_chain",
+    "find_http_route",
+    "read_snippet",
+    "start_watch",
+    "stop_watch",
+    "get_index_status",
+    "rebuild_index",
+];
+
 // -- Relation types --
 pub const REL_CALLS: &str = "calls";
 pub const REL_INHERITS: &str = "inherits";

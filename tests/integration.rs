@@ -283,7 +283,9 @@ function greet(name: string): string {
     for (name, arg_name, arg_val, expected_text) in [
         ("impact-analysis", "symbol_name", "greet", "get_ast_node"),
         ("understand-module", "path", "app.ts", "module_overview"),
-        ("trace-request", "route", "/api/users", "trace_http_chain"),
+        // The advertised form, not the folded backend name: see
+        // `prompts_name_only_tools_the_client_can_actually_call`.
+        ("trace-request", "route", "/api/users", "get_call_graph"),
     ] {
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "prompts/get",
@@ -379,7 +381,7 @@ fn test_e2e_prompts_get_all() {
             "get_ast_node",
         ),
         ("understand-module", "path", "src/auth/", "module_overview"),
-        ("trace-request", "route", "/api/users", "trace_http_chain"),
+        ("trace-request", "route", "/api/users", "get_call_graph"),
     ];
 
     for (name, arg_name, arg_val, expected_substr) in cases {
@@ -3451,4 +3453,66 @@ public:
         .collect();
     assert_eq!(inherits, vec![("class".to_string(), "Shape".to_string())],
         "exactly one inherits edge from the class node (not the constructor method); got: {inherits:?}");
+}
+
+/// Prompt text is LLM-visible metadata: whatever it names, the model will try
+/// to call. A name the server dispatches but `tools/list` never advertised does
+/// not exist as far as an MCP client is concerned, so a prompt that teaches one
+/// hands the model a guaranteed dead end — and nothing errors server-side,
+/// which is why two of the three prompts carried one for several releases
+/// (audit 2026-08-22 P2-6; `impact_analysis` was the same defect one round
+/// earlier).
+#[test]
+fn prompts_name_only_tools_the_client_can_actually_call() {
+    let project = TempDir::new().unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    let list = server
+        .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#)
+        .unwrap()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let prompts = parsed["result"]["prompts"].as_array().unwrap().clone();
+    assert!(!prompts.is_empty(), "precondition: prompts exist");
+
+    for prompt in &prompts {
+        let name = prompt["name"].as_str().unwrap();
+        // Supply every declared argument so no placeholder swallows the text.
+        let mut args = serde_json::Map::new();
+        if let Some(decl) = prompt["arguments"].as_array() {
+            for a in decl {
+                args.insert(
+                    a["name"].as_str().unwrap().to_string(),
+                    serde_json::json!("X"),
+                );
+            }
+        }
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+            "params": { "name": name, "arguments": args }
+        })
+        .to_string();
+        let resp = server.handle_message(&msg).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+
+        for hidden in code_graph_mcp::domain::NON_LISTED_MCP_TOOLS {
+            assert!(
+                !text.contains(hidden),
+                "prompt '{name}' tells the model to use '{hidden}', which tools/list \
+                 never advertised — the client cannot call it. Teach the advertised \
+                 form instead (a LIVE tool plus its flag). Text: {text}"
+            );
+        }
+        // Not just "says nothing forbidden": a prompt that named no tool at all
+        // would pass the loop above while teaching nothing.
+        assert!(
+            code_graph_mcp::domain::LIVE_MCP_TOOLS
+                .iter()
+                .any(|live| text.contains(live)),
+            "prompt '{name}' names no advertised tool at all: {text}"
+        );
+    }
 }

@@ -2448,8 +2448,8 @@ impl McpServer {
                                 "type": "text",
                                 "text": format!(
                                     "Give me a deep understanding of the module at '{}'. \
-                                     Use module_overview to get exports and hot paths, \
-                                     then use dependency_graph to map what it depends on and what depends on it. \
+                                     Use module_overview with include_deps=true to get exports, hot paths, \
+                                     and what it depends on and what depends on it. \
                                      For the top 3 most-called exports, use get_call_graph to show their caller chain. \
                                      Present: purpose, public API, dependencies, dependents, and hot paths.",
                                     path
@@ -2473,11 +2473,11 @@ impl McpServer {
                                 "type": "text",
                                 "text": format!(
                                     "Trace the complete HTTP request flow for route '{}'. \
-                                     Use trace_http_chain to get the full chain from route to data layer. \
+                                     Use get_call_graph with route_path='{}' to get the full chain from route to data layer. \
                                      For each key node, use get_ast_node(node_id=N, context_lines=5) to show the implementation. \
                                      Map the flow: route → middleware → validation → business logic → data access → response. \
                                      Highlight error handling, auth checks, and database operations.",
-                                    route
+                                    route, route
                                 )
                             }
                         }]
