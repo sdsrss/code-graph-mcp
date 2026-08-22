@@ -723,25 +723,72 @@ pub(super) fn extract_python_import_names(
 /// Extract imports from Python `from X import Y, Z` statements.
 /// AST: import_from_statement -> dotted_name ("collections"), dotted_name ("OrderedDict"), dotted_name ("defaultdict")
 /// The first dotted_name is the module; the rest are imported names.
-/// Adds metadata `{"python_module": "X"}` for module-constrained resolution.
+/// Adds metadata `{"python_module": "X"}` for module-constrained resolution,
+/// and marks the module's own row `is_module_import: true` exactly as
+/// `import os` does.
+///
+/// That marker used to be missing (audit 2026-08-22 P2-4, recorded in v0.123.0's
+/// notes when set-equality parity rows surfaced it). The module is reached
+/// through the `module_name` FIELD first, which leaves `is_first_dotted_name`
+/// false, so the module's own `dotted_name` child fell through to the
+/// imported-symbol branch and was emitted as a symbol named `pkg.mod`. Nothing
+/// downstream could tell it from a real symbol of that name:
+/// `resolve_python_module_targets` looked up `pkg.mod` in the name pool, found
+/// nothing, and the module dependency `from X import Y` expresses — the
+/// dominant Python import form — never reached the graph. With the marker it
+/// binds to the `<module>` node of the resolved file, like `import X` always did.
+///
+/// Relative imports (`from . import x`, `from .rel import y`) are NOT affected:
+/// their `module_name` is a `relative_import` node, which reaches neither branch
+/// and emitted no module row before or after (probed against the pinned grammar,
+/// not assumed).
 pub(super) fn extract_python_from_import_names(
     node: &tree_sitter::Node,
     source: &str,
     results: &mut Vec<ParsedRelation>,
 ) {
     // Prefer tree-sitter field name for module (more robust than positional heuristic)
-    let mut module_path: Option<String> = node
-        .child_by_field_name("module_name")
-        .map(|m| node_text(&m, source).to_string());
+    let module_name_node = node.child_by_field_name("module_name");
+    let mut module_path: Option<String> = module_name_node
+        .as_ref()
+        .map(|m| node_text(m, source).to_string());
+    // Identity, not text: `from pkg.mod import mod` has a symbol child whose
+    // text equals part of the module path, and only the node itself is the module.
+    let module_node_id = module_name_node
+        .as_ref()
+        .filter(|m| m.kind() == "dotted_name")
+        .map(|m| m.id());
     let mut is_first_dotted_name = module_path.is_none();
+    let emit_module_row = |name: &str, results: &mut Vec<ParsedRelation>| {
+        if name.is_empty() {
+            return;
+        }
+        results.push(ParsedRelation {
+            source_name: "<module>".into(),
+            target_name: name.to_string(),
+            relation: REL_IMPORTS.into(),
+            metadata: Some(
+                serde_json::json!({ "python_module": name, "is_module_import": true }).to_string(),
+            ),
+            source_language: String::new(),
+        });
+    };
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
+            if Some(child.id()) == module_node_id {
+                emit_module_row(node_text(&child, source), results);
+                continue;
+            }
             match child.kind() {
                 "dotted_name" => {
                     if is_first_dotted_name {
-                        // First dotted_name is the module name — capture it for resolution
-                        module_path = Some(node_text(&child, source).to_string());
+                        // Grammar without a `module_name` field: the first
+                        // dotted_name is the module. Same row as the field path
+                        // above, so the two cannot disagree.
+                        let name = node_text(&child, source).to_string();
+                        module_path = Some(name.clone());
                         is_first_dotted_name = false;
+                        emit_module_row(&name, results);
                     } else {
                         // Subsequent dotted_names are imported symbols
                         let name = node_text(&child, source).to_string();

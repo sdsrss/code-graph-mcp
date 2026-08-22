@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-> **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 65 → 66
-> because Rust calls qualified with the crate's own package name now produce
-> edges they used to drop. The rebuild is automatic on first use.
+> **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 65 → 67:
+> Rust calls qualified with the crate's own package name now produce edges they
+> used to drop, and Python `from X import Y` now records its module dependency.
+> The rebuild is automatic on first use.
 
 Audit `docs/audit/audit-2026-08-22-01.md`, P1 items only.
 
@@ -31,6 +32,50 @@ files at and under the project root. Keyed on the real package names, so
 binding to a same-named local symbol. Measured on this repository's own tree:
 7,053 → 7,151 `calls` edges, no edge removed and no confidence changed, the
 same result at `BATCH_SIZE` 500 and 25; `dead-code src/` now finds nothing.
+
+### Python imports resolve the way Python resolves them
+
+`from pkg.mod import Helper` recorded `pkg.mod` as a plain symbol rather than a
+module: the module is reached through the `module_name` FIELD, which left the
+positional flag false, so the module's own node fell into the imported-symbol
+branch. Resolution then looked `pkg.mod` up in the symbol pool, found nothing,
+and the module dependency that `from X import Y` expresses — the dominant
+Python import form — never reached the graph at all.
+
+Marking that row exposed the larger problem underneath. The module map was keyed
+by path SUFFIX: `src/myapp/utils.py` answered to `src.myapp.utils`,
+`myapp.utils` AND `utils`, on the argument that over-connecting is the safer
+failure without `sys.path` context. Measured against 1,763 files of third-party
+Python, that argument does not survive contact — `import logging` bound to
+`accelerate/logging.py`, `import json` to `rich/json.py`, `import math` to
+`pygments/lexers/math.py`. 886 of 1,451 module bindings pointed at a real node
+the import does not name, and `deps`, `cycles` and `map` consumed every one of
+them as fact. Marking the module rows alone would have taken that to 1,729.
+
+The map is now keyed by IMPORT ROOT: a dotted path resolves relative to the
+project root plus every directory that is not itself a package. Inside a
+package, `import logging` means the standard library — PEP 328 has made that the
+only reading since Python 3 — while a `src/` layout, a `tests/` tree or a plain
+script directory still puts its own modules on the path. On the same corpus:
+
+| | module bindings | resolved to the named module | basename coincidences |
+|---|---|---|---|
+| before | 1,451 | 565 | 886 |
+| marker only | 4,364 | 2,635 | 1,729 |
+| now | 2,864 | 2,864 | 0 |
+
+(The 228 that do not anchor at the project root anchor at
+`setuptools/_vendor/`, which carries no `__init__.py` and so is a real import
+root — that is the vendoring mechanism working, not a miss.)
+
+528 call edges went with them, and their targets say what they were:
+`islice` → `anyio/itertools.py`, `log` → `accelerate/tracking.py`,
+`glob` → `setuptools/glob.py`. Those were confident answers pointing at the
+wrong function. What replaces them is a bare-name fan-out at `ambiguous`
+confidence, which the default floor hides — no answer instead of a wrong one.
+In this repository the whole change moves exactly 10 edges, all of them the
+benchmark scripts' `from eval_ranking import …` finally binding to
+`scripts/embedding_benchmark/eval_ranking.py`.
 
 ### The auto-updater no longer hangs when a connection dies mid-response
 

@@ -44,23 +44,22 @@ const ROWS: &[Row] = &[
     Row {
         lang: "python",
         path: "a.py",
-        // `pkg.mod` is here because the extractor emits it, not because it
-        // should. `extract_python_from_import_names` sets `module_path` from the
-        // `module_name` FIELD first, which leaves `is_first_dotted_name` false,
-        // so the module's own `dotted_name` child falls into the
-        // imported-symbol branch and is emitted as one. The tell is the
-        // metadata: `import os` marks its row `is_module_import: true`, while
-        // this row carries no such marker, so nothing downstream can tell the
-        // module apart from a symbol actually named `pkg.mod`.
-        //
-        // PRE-EXISTING, and deliberately not fixed here — correcting it changes
-        // the edge set of every indexed Python project and so belongs with an
-        // INDEX_VERSION bump of its own, not inside a release cut for other
-        // reasons. Pinned rather than papered over: set equality is what
-        // surfaced it, and an `expect` that quietly omitted `pkg.mod` would have
-        // hidden it again.
+        // `pkg.mod` is emitted as a MODULE row, not as a symbol named
+        // "pkg.mod" — the metadata marker is what separates the two, and it is
+        // asserted by `python_from_import_marks_the_module_row` below rather
+        // than by this table, which compares target names only.
         source: "import os\nfrom pkg.mod import Helper\n",
         expect: &["os", "Helper", "pkg.mod"],
+    },
+    Row {
+        lang: "python",
+        path: "rel.py",
+        // Relative imports name no absolute module, so no module row is
+        // emitted — the negative control for the marker fix. Without it, a
+        // version that emitted the `relative_import` text would produce a
+        // phantom module named "." or ".rel".
+        source: "from . import x\nfrom .rel import y\n",
+        expect: &["x", "y"],
     },
     Row {
         lang: "java",
@@ -201,5 +200,54 @@ fn java_wildcard_import_emits_no_target() {
     assert!(
         targets.is_empty(),
         "a wildcard import names no single symbol; got {targets:?}"
+    );
+}
+
+/// Audit 2026-08-22 P2-4. `from pkg.mod import Helper` records `pkg.mod`, and
+/// what makes that row a MODULE rather than a symbol is the
+/// `is_module_import` marker: `resolve_python_module_targets` branches on it to
+/// look up the `<module>` node of the resolved file instead of a symbol with
+/// that literal name. Without the marker the lookup found nothing and the
+/// module dependency of the dominant Python import form never reached the
+/// graph. The parity table above compares target NAMES, so only this test can
+/// see the difference.
+#[test]
+fn python_from_import_marks_the_module_row() {
+    fn meta_of(source: &str, target: &str) -> Option<serde_json::Value> {
+        extract_relations(source, "python")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.relation == REL_IMPORTS && r.target_name == target)
+            .and_then(|r| r.metadata)
+            .map(|m| serde_json::from_str(&m).unwrap())
+    }
+
+    let module_row = meta_of("from pkg.mod import Helper\n", "pkg.mod")
+        .expect("the module row must exist at all");
+    assert_eq!(
+        module_row["is_module_import"], true,
+        "the module row must be marked like `import os`'s is; got {module_row}"
+    );
+    assert_eq!(module_row["python_module"], "pkg.mod");
+
+    // The symbol row from the same statement must NOT be marked, or every
+    // imported name would resolve to its module's `<module>` node.
+    let symbol_row =
+        meta_of("from pkg.mod import Helper\n", "Helper").expect("the symbol row must exist");
+    assert!(
+        symbol_row.get("is_module_import").is_none(),
+        "an imported SYMBOL must not carry the module marker; got {symbol_row}"
+    );
+    assert_eq!(symbol_row["python_module"], "pkg.mod");
+
+    // `import os` is the shape whose marker this one was measured against.
+    let plain = meta_of("import os\n", "os").expect("plain import row must exist");
+    assert_eq!(plain["is_module_import"], true);
+
+    // Identity, not text: the module path and an imported name can coincide.
+    let same_name = meta_of("from pkg.mod import mod\n", "mod").expect("symbol row must exist");
+    assert!(
+        same_name.get("is_module_import").is_none(),
+        "`from pkg.mod import mod` — only the module NODE is the module; got {same_name}"
     );
 }

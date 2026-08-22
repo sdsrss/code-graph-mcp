@@ -49,7 +49,9 @@ use super::js_modules::{
     resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path,
     resolve_php_include_path,
 };
-use super::python_modules::{build_python_module_map, resolve_python_module_targets};
+use super::python_modules::{
+    build_python_module_map, project_module_files, resolve_python_module_targets,
+};
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
     refine_ambiguous_targets, resolve_pending_calls,
@@ -1179,13 +1181,14 @@ pub(super) fn index_files(
                             .get("is_module_import")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        if python_module_map.contains_key(python_module) {
+                        if let Some(module_files) =
+                            project_module_files(python_module, &python_module_map)
+                        {
                             // Internal module — try constrained resolution
                             if let Some(module_targets) = resolve_python_module_targets(
-                                python_module,
+                                &module_files,
                                 is_module_import,
                                 &rel.target_name,
-                                &python_module_map,
                                 &node_id_to_path,
                                 &name_to_ids,
                             ) {
@@ -2462,12 +2465,11 @@ fn resolve_deferred_relations(
                     .get("is_module_import")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if python_module_map.contains_key(python_module) {
+                if let Some(module_files) = project_module_files(python_module, python_module_map) {
                     if let Some(module_targets) = resolve_python_module_targets(
-                        python_module,
+                        &module_files,
                         is_module_import,
                         &d.target_name,
-                        python_module_map,
                         &node_id_to_path,
                         &name_to_ids,
                     ) {

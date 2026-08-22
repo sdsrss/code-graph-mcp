@@ -1525,11 +1525,23 @@ fn test_build_python_module_map() {
         .get("myapp.utils")
         .unwrap()
         .contains(&"myapp/utils.py".to_string()));
-    // Suffix path
+    // NOT the bare suffix: `myapp/` carries `__init__.py`, so it is a package,
+    // and `import utils` inside a package names the standard library — never
+    // the sibling (PEP 328, absolute imports by default). This assertion used
+    // to require the opposite, which is what let `import logging` bind to
+    // `accelerate/logging.py` across every indexed Python project
+    // (audit 2026-08-22 P2-4).
+    assert!(
+        !map.contains_key("utils"),
+        "a module inside a package must not be reachable by its bare name: {:?}",
+        map.get("utils")
+    );
+    // `src/myapp/` has no `__init__.py`, so it IS an import root and its own
+    // children keep their bare names — the `src/` layout this map exists for.
     assert!(map
-        .get("utils")
+        .get("models")
         .unwrap()
-        .contains(&"myapp/utils.py".to_string()));
+        .contains(&"src/myapp/models.py".to_string()));
     // __init__.py maps to package
     assert!(map
         .get("myapp")
