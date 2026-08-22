@@ -123,11 +123,24 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         let hint = "route extraction covers Express/Connect (JS/TS), Go net/http, Flask/FastAPI (Python), and axum (Rust); \
                     actix and Java web frameworks are not yet extracted";
         if json_mode {
+            // Tier 3 of the CLI JSON-empty contract (v0.99.1,
+            // feedback_cli_json_empty_contract): a miss keys on `error` beside a
+            // success-shaped empty array, exactly like `show --json`
+            // ({candidates, error, symbol}) and `callgraph --json`. This envelope
+            // keyed on `message` — a spelling no other CLI JSON surface uses — so
+            // a consumer switching on `error` read the miss as a clean success
+            // with zero handlers. `route` echoes the identifier under the SAME key
+            // the success envelope uses, so one shape reads both legs, and the
+            // framework-coverage limit moves out of the error text into `hint`
+            // (the established key for a remedy note, cf. ast_search.rs): it is a
+            // disclosure about the extractor, not a description of this miss.
             println!(
                 "{}",
                 serde_json::json!({
+                    "route": path,
                     "handlers": [],
-                    "message": format!("No routes matching: {} ({})", route_path, hint),
+                    "error": format!("No routes matching: {}", route_path),
+                    "hint": hint,
                 })
             );
         }

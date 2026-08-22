@@ -6947,6 +6947,43 @@ fn test_cli_json_empty_trace() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("trace --json must output valid JSON even on no-match");
     assert!(v.is_object(), "JSON trace error should output JSON object");
+    // The three-tier contract (v0.99.1, feedback_cli_json_empty_contract): a miss
+    // is tier 3, so it keys on `error` — the same shape `show --json` and
+    // `callgraph --json` emit ({empty array, error, echoed identifier}). This
+    // envelope keyed on `message` instead, a spelling no other CLI JSON surface
+    // uses, so a consumer switching on `error` read the miss as a SUCCESS with
+    // zero handlers (2026-08-02 audit tail).
+    assert!(
+        v.get("message").is_none(),
+        "`message` is not a key in this contract; got {v}"
+    );
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("No routes matching")),
+        "miss must key on `error`; got {v}"
+    );
+    assert!(
+        v["handlers"].is_array() && v["handlers"].as_array().unwrap().is_empty(),
+        "success-shaped empty array must survive alongside the error; got {v}"
+    );
+    // Echo the identifier like show (`symbol`) and callgraph (`symbol`) do, and
+    // keep the SAME key the success envelope uses, so one consumer shape reads
+    // both legs without parsing the human-facing string.
+    assert_eq!(
+        v["route"], "/api/nonexistent",
+        "miss envelope must echo the route it is about; got {v}"
+    );
+    // The framework-coverage limit is a disclosure, not part of the error text:
+    // an actix or Spring project HAS routes the extractor never sees, so a bare
+    // miss reads as "no such route" and misleads. `hint` is the established key
+    // for this (ast_search.rs).
+    assert!(
+        v["hint"]
+            .as_str()
+            .is_some_and(|s| s.contains("not yet extracted")),
+        "miss must disclose the extractor's framework coverage in `hint`; got {v}"
+    );
 }
 
 #[test]
