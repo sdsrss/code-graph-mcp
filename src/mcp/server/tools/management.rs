@@ -139,6 +139,24 @@ impl McpServer {
                     json!(stats.files_skipped_language),
                 );
             }
+            // The counterpart to `skipped_files.parse_error` above, and the more
+            // dangerous of the two: a file that failed to parse outright is
+            // skipped and visibly absent, but a file that parsed WITH syntax
+            // errors had its symbols salvaged by tree-sitter error recovery and
+            // sits in the index looking exactly like a clean one. The CLI has
+            // disclosed this count since the counter existed (index_ops.rs: the
+            // stderr summary and `--json` both carry it); the MCP surface had no
+            // way to say it, so an agent could not tell that a thin result set
+            // came from a broken file rather than from the code really being
+            // thin. Zero stays silent, like every counter around it —
+            // `last_index_stats` is per-process, so a server that started
+            // against a fresh index holds zeros it never earned.
+            if stats.files_with_parse_errors > 0 {
+                obj.insert(
+                    "files_with_parse_errors".into(),
+                    json!(stats.files_with_parse_errors),
+                );
+            }
             obj.insert(
                 "instance_mode".into(),
                 json!(if self.is_primary() {
@@ -271,6 +289,14 @@ impl McpServer {
             "files_indexed": result.files_indexed,
             "nodes_created": result.nodes_created,
             "edges_created": result.edges_created,
+            // Parity with the CLI's index envelope (emit_index_json), which has
+            // carried this since the counter existed. Emitted UNCONDITIONALLY,
+            // unlike the get_index_status copy: the rebuild ran in-band right
+            // here, so 0 genuinely means "this run hit no syntax errors" rather
+            // than "nobody indexed anything yet", and omitting it would leave the
+            // caller unable to tell a clean rebuild from a surface that cannot
+            // report.
+            "files_with_parse_errors": result.stats.files_with_parse_errors,
         }))
     }
 }

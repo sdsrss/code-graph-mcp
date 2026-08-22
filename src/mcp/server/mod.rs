@@ -3367,6 +3367,39 @@ function handleLogin(req: Request) {
         let result = parse_tool_result(&resp);
         assert_eq!(result["status"], "rebuilt");
         assert!(result["files_indexed"].as_i64().unwrap() >= 1);
+        // Parity with the CLI's `--json` index envelope (emit_index_json), which
+        // has always carried this counter. Unlike get_index_status — whose stats
+        // may be left over from no run at all — the rebuild just happened here,
+        // so a 0 is EARNED and must be stated rather than omitted: silence would
+        // be indistinguishable from "this surface cannot tell you".
+        assert_eq!(
+            result["files_with_parse_errors"], 0,
+            "a clean rebuild must report the count, not omit it: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_index_counts_files_with_parse_errors() {
+        // Non-vacuous half of the guard above: a file whose syntax is broken but
+        // still salvageable lands IN the index via tree-sitter error recovery,
+        // and the count is the only signal that its symbols may be partial.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("ok.ts"), "function a() {}").unwrap();
+        std::fs::write(
+            project_dir.path().join("broken.ts"),
+            "function b( { const x = ;\nfunction c() {}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let req = tool_call_json("rebuild_index", json!({"confirm": true}));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["status"], "rebuilt");
+        assert!(
+            result["files_with_parse_errors"].as_i64().unwrap() >= 1,
+            "a syntactically broken file must be counted: {result:?}"
+        );
     }
 
     #[test]
@@ -4293,6 +4326,47 @@ app.post('/api/login', handleLogin);
             result["model_available"].is_boolean(),
             "should have model_available: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn test_get_index_status_discloses_files_with_parse_errors() {
+        // A file that fails to parse OUTRIGHT is skipped and already disclosed
+        // under `skipped_files.parse_error`. This counter is the other one: the
+        // file parsed WITH syntax errors, tree-sitter error recovery salvaged
+        // what it could, and the partial symbols went into the index. Those
+        // files look indistinguishable from clean ones at query time, so the
+        // count is the only way a caller learns its results may be incomplete.
+        // The CLI has disclosed it since the counter existed (index_ops.rs, both
+        // the stderr summary and `--json`); the MCP surface never did.
+        let server = McpServer::new_test();
+
+        // Zero must stay SILENT, matching the `skipped_files` idiom right above
+        // it: `last_index_stats` reflects the last index run IN THIS PROCESS, so
+        // a server that started against an already-fresh index did no work and
+        // holds zeros. Emitting `0` there would assert "no parse errors" on
+        // evidence that says nothing at all.
+        let resp = server
+            .handle_message(&tool_call_json("get_index_status", json!({})))
+            .unwrap();
+        let clean = parse_tool_result(&resp);
+        assert!(
+            clean.get("files_with_parse_errors").is_none(),
+            "a run with no parse errors must not claim a count: {clean:?}"
+        );
+
+        server
+            .last_index_stats
+            .lock()
+            .unwrap()
+            .files_with_parse_errors = 3;
+        let resp = server
+            .handle_message(&tool_call_json("get_index_status", json!({})))
+            .unwrap();
+        let degraded = parse_tool_result(&resp);
+        assert_eq!(
+            degraded["files_with_parse_errors"], 3,
+            "salvaged-but-incomplete files must be disclosed: {degraded:?}"
         );
     }
 
