@@ -1208,6 +1208,20 @@ fn test_cli_grep_json_errors_are_not_success_shaped() {
     for (args, needle) in [
         (vec!["grep", "-v", "foo", "--json"], "unsupported flag"),
         (vec!["grep", "foo", "/etc", "--json"], "within project root"),
+        // The leg the first round of this fix missed: a path INSIDE the project
+        // that does not exist. ripgrep still emits its trailing summary line, so
+        // the run reaches the zero-match branch with `partial_error` set, and
+        // that branch printed `[]` before checking the flag — the success shape
+        // on a run that searched nothing. Only the exit code differed, which is
+        // precisely what this test exists to stop relying on.
+        (
+            vec!["grep", "foo", "no_such_dir_here", "--json"],
+            "ripgrep error",
+        ),
+        // Same leg by a different door: a flag-shaped token is deliberately read
+        // as the PATTERN (so `--no-default-features` is searchable), which makes
+        // the real pattern a path, which does not exist.
+        (vec!["grep", "--bogus-flag", "x", "--json"], "ripgrep error"),
     ] {
         let (stdout, _, code) = run_cli(&project, &args);
         assert_eq!(code, 2, "{args:?} is an error, not a query result");
@@ -1217,11 +1231,21 @@ fn test_cli_grep_json_errors_are_not_success_shaped() {
             !v.is_array(),
             "{args:?} must NOT use the success array shape: {v}"
         );
+        let msg = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or_else(|| panic!("{args:?} must carry an `error` string: {v}"));
         assert!(
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .is_some_and(|s| s.contains(needle)),
+            msg.contains(needle),
             "{args:?} error object must explain the failure: {v}"
+        );
+        // Not just the prefix: a message that stops at "ripgrep error:" names a
+        // category and withholds the cause, which reads as an explanation
+        // without being one.
+        assert!(
+            msg.trim_end().len() > needle.len() + 2,
+            "{args:?} error object must carry the underlying detail, not just \
+             the category: {v}"
         );
     }
 
@@ -4334,6 +4358,79 @@ fn test_cli_stats_unknown_flag_errors() {
             || stderr.contains("unrecognized"),
         "clap should name the unknown flag; got: {stderr:?}"
     );
+}
+
+/// `stats --json` is an OBJECT-envelope command, so the CLI JSON-empty contract
+/// (v0.99.1) requires the same shape on the empty path. It emitted three of
+/// eleven keys when `usage.jsonl` was missing — and only two, with no
+/// disclosure at all, when the file existed but held no sessions. A consumer
+/// reading `total_tool_calls` got a missing key on exactly the projects where
+/// it should read zero.
+///
+/// The expected key set is DERIVED from a populated run rather than written out
+/// here: a hand-maintained list is the thing that goes stale when
+/// `build_stats_json` gains a field, which is how the shape drifted in the
+/// first place.
+#[test]
+fn test_cli_stats_json_empty_keeps_the_populated_shape() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    let usage = cg.join("usage.jsonl");
+
+    // 1. Populated run → the reference key set.
+    std::fs::write(
+        &usage,
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    ).unwrap();
+    let (out, _, code) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(code, 0);
+    let full: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let mut expected: Vec<String> = full
+        .as_object()
+        .expect("stats --json is an object envelope")
+        .keys()
+        .cloned()
+        .collect();
+    expected.sort();
+    assert!(
+        expected.len() > 5,
+        "precondition: the populated envelope is rich enough for this to test \
+         anything; got {expected:?}"
+    );
+
+    for (label, prepare) in [
+        ("usage.jsonl missing", true),
+        ("usage.jsonl present but empty", false),
+    ] {
+        if prepare {
+            std::fs::remove_file(&usage).unwrap();
+        } else {
+            std::fs::write(&usage, "").unwrap();
+        }
+        let (out, _, code) = run_cli(&project, &["stats", "--json"]);
+        assert_eq!(code, 0, "{label}: an empty history is not an error");
+        let v: serde_json::Value = serde_json::from_str(out.trim())
+            .unwrap_or_else(|e| panic!("{label}: must emit JSON, got {out:?}: {e}"));
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: must stay an object: {v}"));
+        let mut got: Vec<String> = obj.keys().cloned().collect();
+        got.retain(|k| k != "note");
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "{label}: the empty envelope must carry every key the populated one \
+             does, so a consumer reads zeros instead of missing keys"
+        );
+        // Tier-3 disclosure: same shape, and it still says WHY it is all zeros.
+        assert!(
+            obj.get("note")
+                .and_then(|n| n.as_str())
+                .is_some_and(|s| s.contains("usage.jsonl")),
+            "{label}: must disclose why the numbers are empty: {v}"
+        );
+        assert_eq!(obj["sessions"], 0, "{label}: zero sessions, not absent");
+    }
 }
 
 // Dark-metric visibility: when usage data is present but recommendations.jsonl

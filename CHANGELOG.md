@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Two more `--json` legs stop wearing the success shape
+
+Both were carried as unverified notes from an earlier round. Reproduced against
+HEAD, both were real.
+
+`grep --json` emitted the success-shaped `[]` on the one error leg the previous
+round of this fix did not reach. `emit_grep_json_error` exists precisely so a
+failed run never looks like a zero-match run, and its own doc comment says
+"every error leg used to print `[]`" — but the zero-match branch printed `[]`
+BEFORE testing `partial_error`, so a path that does not exist inside the
+project, or a flag-shaped token that displaces the real pattern into the path
+slot, still produced `[]` with only the exit code to distinguish it. Under the
+`grep … --json 2>/dev/null` shape the agent-facing docs themselves suggest,
+that reads as "this repo has no matches" for a search that never ran. The check
+now runs first and the error carries ripgrep's own message; the genuine
+zero-match leg keeps its `[]`.
+
+`stats --json` is an object-envelope command, so the same contract requires the
+same shape when there is nothing to report. It emitted three of eleven keys
+when `usage.jsonl` was missing, and two — with no disclosure at all — when the
+file existed but held no sessions. A consumer reading `total_tool_calls` got a
+missing key on exactly the projects where it should read zero. Both legs now
+build the full envelope through `build_stats_json` and attach `note` alongside
+it, so the shape is a property of construction rather than a list somebody has
+to remember to extend.
+
+The new guard derives its expected key set from a populated run rather than
+listing the keys, since a hand-maintained list is what goes stale when
+`build_stats_json` gains a field. Both fixes are mutation-verified.
+
+Also corrected, from the same batch of notes: `stats --json` with an unknown
+flag was recorded as printing the clap error twice and leaving the output
+unparseable. It does not. The JSON error object goes to stdout and the
+human-readable render to stderr — the same split every other subcommand uses,
+and `--json` output stays parseable.
+
 ### `get_call_graph` no longer names a tool the client cannot call
 
 `NON_LISTED_MCP_TOOLS`'s doc comment has said for several releases that

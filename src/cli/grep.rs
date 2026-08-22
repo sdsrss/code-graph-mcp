@@ -748,15 +748,24 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         a.file == b.file && a.line == b.line && a.is_context == b.is_context && a.text == b.text
     });
     if matches.is_empty() {
-        if json_mode {
-            println!("[]");
-        }
         // rg --json emits a trailing summary line even with zero matches, so an
         // error-only run (e.g. the single named path is missing) has non-empty
         // stdout and reaches here with partial_error set — that's an error (2),
         // not a no-match (1), and its stderr was already surfaced above.
+        //
+        // This check has to come BEFORE the `[]`. It used to sit after it, so
+        // the one leg that reaches zero-match THROUGH an error still printed the
+        // success shape — the exact defect `emit_grep_json_error` was written to
+        // remove, surviving in the branch its author did not reach. A consumer
+        // running the documented `grep … --json 2>/dev/null` saw `[]` and read
+        // "this repo has no matches" for a search that never ran.
         if partial_error {
+            let detail = String::from_utf8_lossy(&rg_output.stderr);
+            emit_grep_json_error(json_mode, &format!("ripgrep error: {}", detail.trim()));
             grep_exit(2);
+        }
+        if json_mode {
+            println!("[]");
         }
         // Surface ripgrep errors (e.g., path not found) instead of a silent exit
         let stderr = String::from_utf8_lossy(&rg_output.stderr);

@@ -537,24 +537,20 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     let last_n = args.last;
 
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
-    if !usage_path.exists() {
-        if json_mode {
-            sout!(
-                "{}",
-                serde_json::json!({
-                    "sessions": 0,
-                    "tools": {},
-                    "note": format!("no usage data at {}", usage_path.display()),
-                })
-            );
-        } else {
-            eprintln!("No usage data yet at {}", usage_path.display());
-            eprintln!("Run an MCP session first (sessions flush metrics on EOF).");
-        }
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&usage_path)?;
+    // A missing file is read as empty rather than short-circuiting here. Both
+    // empty legs used to return their own hand-written envelope — three keys of
+    // eleven when the file was absent, two and no disclosure at all when it was
+    // present but sessionless — so `stats --json` broke the object-envelope half
+    // of the CLI JSON-empty contract on exactly the projects where a consumer
+    // most needs a zero to read. Sharing `build_stats_json` makes the shape a
+    // property of construction instead of a list somebody has to remember to
+    // extend (`test_cli_stats_json_empty_keeps_the_populated_shape`).
+    let usage_missing = !usage_path.exists();
+    let content = if usage_missing {
+        String::new()
+    } else {
+        std::fs::read_to_string(&usage_path)?
+    };
     let summary = aggregate_usage_jsonl(&content, last_n);
 
     // Conversion metric: cg tool calls vs PreToolUse recommendations. The JSONL
@@ -581,7 +577,25 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 
     if summary.sessions == 0 {
         if json_mode {
-            sout!("{}", serde_json::json!({"sessions": 0, "tools": {}}));
+            let mut v = build_stats_json(&summary, &recs, rec_state);
+            if let Some(obj) = v.as_object_mut() {
+                // Tier-3 disclosure rides ALONGSIDE the full shape, never
+                // instead of it: the zeros are real, and `note` says why they
+                // are zeros rather than leaving the caller to guess whether the
+                // feature is off, the file is missing, or nothing happened yet.
+                obj.insert(
+                    "note".to_string(),
+                    serde_json::json!(if usage_missing {
+                        format!("no usage data at {}", usage_path.display())
+                    } else {
+                        format!("no sessions recorded in {}", usage_path.display())
+                    }),
+                );
+            }
+            sout!("{}", v);
+        } else if usage_missing {
+            eprintln!("No usage data yet at {}", usage_path.display());
+            eprintln!("Run an MCP session first (sessions flush metrics on EOF).");
         } else {
             eprintln!("No sessions recorded.");
         }
