@@ -833,6 +833,85 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
     'version must not be advanced when the copy was skipped');
 });
 
+test('downloadAndInstall SAYS SO when installed_plugins.json cannot be repointed', async (t) => {
+  // The sibling `lifecycle.js` never got: that file's read-modify-write already
+  // uses the three-way read, this one used the lenient `readJson`, whose `null`
+  // covers ENOENT, EACCES and corrupt alike. On an unreadable-but-present file
+  // the `if (installed && ...)` guard skipped the repoint in silence — while the
+  // plugin copy HAD landed and install-manifest.json HAD been advanced. Claude
+  // Code then keeps launching the old install dir with state reading "up to
+  // date", which is the split-brain the binary-pin incident was made of.
+  //
+  // Nothing may be written here (the bytes are not ours to guess at); the whole
+  // fix is that the user is told, so `/plugin update` remains reachable.
+  const sandboxHome = mkDir(t, 'code-graph-dai-corrupt-');
+  const installedDir = path.join(sandboxHome, '.claude', 'plugins');
+  fs.mkdirSync(installedDir, { recursive: true });
+  const installedPath = path.join(installedDir, 'installed_plugins.json');
+  fs.writeFileSync(installedPath, '{ "plugins": { trailing, comma }');
+
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const errs = [];
+    const realError = console.error;
+    console.error = (...a) => { errs.push(a.join(' ')); };
+    const crypto = require('crypto');
+    const latest = {
+      version: '9.9.9',
+      tarballUrl: 'https://example/tar',
+      pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+      binaryUrl: null,
+    };
+    // Same stub shape as the happy-path test: the integrity gate wants a sidecar
+    // digest, and tar extracts via opts.cwd (the archive name stays relative so
+    // GNU tar on Windows does not read a drive letter as a remote host).
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'curl') {
+        const out = args[args.indexOf('-o') + 1];
+        if (out.endsWith('.sha256')) {
+          const archive = out.slice(0, -'.sha256'.length);
+          const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+          fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+        } else {
+          fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+        }
+      }
+      if (cmd === 'tar') {
+        const mDir = path.join(opts.cwd, 'claude-plugin', '.claude-plugin');
+        fs.mkdirSync(mDir, { recursive: true });
+        fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+      }
+    };
+    (async () => {
+      const result = await downloadAndInstall(latest, {
+        exec,
+        cmdExists: () => true,
+        refreshMarketplace: () => true,
+        downloadBin: async () => true,
+      });
+      console.error = realError;
+      console.log(JSON.stringify({ result, errs }));
+    })();
+  `;
+  const out = execGit(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: sandboxHome },
+    encoding: 'utf8',
+  });
+  const { result, errs } = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(result.pluginUpdated, true,
+    'precondition: the plugin copy must have landed, or the repoint is not even attempted');
+  assert.ok(
+    errs.some(e => e.includes('installed_plugins.json')),
+    `an unreadable installed_plugins.json must be reported, got: ${JSON.stringify(errs)}`);
+
+  // The corrupt bytes are left exactly as they were — we do not rebuild a file
+  // whose content we could not read.
+  assert.equal(fs.readFileSync(installedPath, 'utf8'), '{ "plugins": { trailing, comma }',
+    'a file we could not parse must not be rewritten');
+});
+
 // ── selfHealGlobalPkgs: keep global npm installs (CLI shim, platform relic) in step ──
 // The drift it pins: the `code-graph-mcp` CLI on PATH is the GLOBAL
 // @sdsrs/code-graph package, untouched by /plugin update or the binary

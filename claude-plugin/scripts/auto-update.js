@@ -785,17 +785,43 @@ async function downloadAndInstall(latest, {
     // fragile), pluginDst was never created. Advancing installPath/manifest to it anyway
     // pointed Claude Code at a nonexistent install dir while state read "up to date".
     if (pluginUpdated) {
-      // Update installed_plugins.json to point to new version
+      // Update installed_plugins.json to point to new version.
+      //
+      // Through the same three-way read the lifecycle.js site uses. The lenient
+      // `readJson` returns null for ENOENT, EACCES and unparseable alike, and
+      // the `if (installed && …)` guard below then skipped the repoint in
+      // SILENCE — while the plugin copy had landed and the manifest below is
+      // about to be advanced. Claude Code keeps launching the old install dir
+      // with state reading "up to date": the split-brain shape the binary-pin
+      // incident was made of, and one this file cannot fix by guessing at bytes
+      // it could not read. So it says so instead, which keeps `/plugin update`
+      // reachable as the manual way out.
       const installedPath = installedPluginsPath();
-      try {
-        const installed = readJson(installedPath);
+      const installedRead = readJsonResult(installedPath);
+      if (installedRead.corrupt || installedRead.lossy) {
+        console.error(
+          `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+          `could not be read (${installedRead.error && installedRead.error.code || 'unparseable'}) — ` +
+          'Claude Code still points at the previous version. Run `/plugin update` ' +
+          'or repair that file by hand.'
+        );
+      } else {
+        const installed = installedRead.value;
         if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {
           installed.plugins[PLUGIN_ID][0].installPath = pluginDst;
           installed.plugins[PLUGIN_ID][0].version = latest.version;
           installed.plugins[PLUGIN_ID][0].lastUpdated = new Date().toISOString();
-          writeJsonAtomic(installedPath, installed);
+          try {
+            writeJsonAtomic(installedPath, installed);
+          } catch (err) {
+            console.error(
+              `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+              `could not be written (${err.code || err.name}) — Claude Code still points ` +
+              'at the previous version. Run `/plugin update`.'
+            );
+          }
         }
-      } catch { /* not fatal */ }
+      }
 
       // Update install manifest
       try {

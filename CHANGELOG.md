@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A half-applied plugin update now says so
+
+`lifecycle.js` reads `installed_plugins.json` through the three-way read that
+tells ENOENT from unreadable. `auto-update.js` writes the same file and did
+not: it used the lenient `readJson`, whose `null` covers ENOENT, EACCES and
+unparseable alike, and the `if (installed && …)` guard then skipped the repoint
+in silence — after the plugin copy had landed and while the install manifest
+was about to be advanced to the new version.
+
+The result is a split-brain: Claude Code keeps launching the previous install
+directory while state reads "up to date", which is the shape the binary-pin
+incident was made of, with nothing on screen to connect the two. Nothing is
+written now either — bytes we could not read are not ours to guess at — but the
+user is told, so `/plugin update` stays reachable as the way out. The write
+failure, previously swallowed by a bare `catch`, reports the same way.
+
+The two remaining lenient reads in that file are read-only version lookups with
+no write-back, so they are not the same defect.
+
 ### Two more `--json` legs stop wearing the success shape
 
 Both were carried as unverified notes from an earlier round. Reproduced against
