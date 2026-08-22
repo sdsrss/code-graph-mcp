@@ -644,3 +644,89 @@ fn module_layout_blocks_list_every_top_level_module() {
         "the required layout block was not checked; checked: {checked_labels:?}"
     );
 }
+
+/// Every `CODE_GRAPH_*` environment variable the code READS must appear in the
+/// README's environment table.
+///
+/// Audit 2026-08-22 P2-14: of the variables in the tree, seven were documented.
+/// The rest — `NO_AUTO_ADOPT`, `NO_INJECT`, `RESYNC_BUDGET`, `PARSE_TIMEOUT_MS`,
+/// `MAX_FILE_SIZE` and more — were user-visible switches discoverable only by
+/// reading the source. Documenting them once fixes today; this keeps the next
+/// one from repeating it, which is the difference between a doc edit and a
+/// guard.
+#[test]
+fn readme_documents_every_env_var_the_code_reads() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    /// Collect `CODE_GRAPH_*` names from actual env READS, not from every
+    /// mention: `domain::CODE_GRAPH_DIR` is a Rust constant that happens to
+    /// share the prefix, and a table row for it would be a lie.
+    fn collect_reads(dir: &Path, out: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name == "target" || name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                collect_reads(&path, out);
+                continue;
+            }
+            let is_src = path.extension().and_then(|e| e.to_str());
+            if !matches!(is_src, Some("rs") | Some("js")) {
+                continue;
+            }
+            // Tests set variables they do not document, on purpose.
+            if name.ends_with(".test.js") || name == "tests.rs" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for marker in ["env::var(\"", "env::var_os(\"", "process.env.", "env."] {
+                let mut rest = text.as_str();
+                while let Some(i) = rest.find(marker) {
+                    rest = &rest[i + marker.len()..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    if name.starts_with("CODE_GRAPH_") {
+                        out.insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    collect_reads(&root.join("src"), &mut read);
+    collect_reads(&root.join("claude-plugin").join("scripts"), &mut read);
+    collect_reads(&root.join("scripts"), &mut read);
+    assert!(
+        read.len() > 20,
+        "the scanner found only {} variables — it stopped matching the source, \
+         which would make this guard vacuous",
+        read.len()
+    );
+
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md must exist");
+    let section = readme
+        .split_once("## Environment variables")
+        .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest).to_string())
+        .expect("README must have an `## Environment variables` section");
+
+    let missing: Vec<&String> = read.iter().filter(|v| !section.contains(*v)).collect();
+    assert!(
+        missing.is_empty(),
+        "README's environment table omits {missing:?} — a switch nobody can find \
+         is a switch that does not exist. Add a row (user-facing) or a row in the \
+         internal/test-only block."
+    );
+}

@@ -54,19 +54,27 @@ Every design decision — from token-aware compression to node_id-based snippet 
 
 ## Performance
 
-| Metric | Value |
-|--------|-------|
-| Indexing speed | **300+ files/second** (single-threaded, release build) |
-| Incremental re-index | **<250ms** no-change detection via BLAKE3 Merkle tree |
-| FTS search P50 / P99 | **<300us / <1ms** |
-| Database overhead | **~3.5MB** per 800 nodes |
-| Token savings | **5-20x fewer tokens** per code understanding task vs grep+read |
+Every row below is a line `code-graph-mcp benchmark` prints, measured on this
+repository (278 files, 5,065 nodes, 10,731 edges) with a release build. Run the
+same command on your own project — the numbers that matter are yours, and these
+scale with tree size and machine.
 
-Run `code-graph-mcp benchmark` on your own project to measure.
+| `benchmark` line | This repo, v0.123.0 |
+|--------|-------|
+| Full index | **~1.9s** (≈145 files/second, single-threaded) |
+| Incremental (noop) | **~30ms** no-change detection via BLAKE3 Merkle tree |
+| Query latency P50 / P99 | **~575us / ~1.9ms** |
+| DB size | **~21.8MB** (≈4.4MB per 1,000 nodes) |
+| Avg tokens/node | **~239** |
 
 ## Efficiency: code-graph vs Traditional Tools
 
-Real-world benchmarks comparing code-graph-mcp tools against traditional approaches (Grep + Read + Glob) on a 33-file Rust project (~537 AST nodes).
+How many TOOL CALLS each question takes, comparing code-graph-mcp against Grep
++ Read + Glob. These are call counts, not token measurements: the left column is
+the round trips the traditional approach needs before it can answer, the right
+column is the single call that answers it. Token cost follows call count only
+loosely — how much source lands in the context window depends on the files, so
+this table does not claim a token ratio.
 
 ### Tool Call Reduction
 
@@ -80,14 +88,25 @@ Real-world benchmarks comparing code-graph-mcp tools against traditional approac
 | File dependency mapping | 3-5 calls | 1 call (`module_overview` + `include_deps`) | **~75%** |
 | Similar code detection | N/A | 1 call (`get_ast_node` + `include_similar`) | **unique** |
 
-### Overall Session Efficiency
+### Session token savings
 
-| Metric | Without code-graph | With code-graph | Improvement |
-|--------|:------------------:|:---------------:|:-----------:|
-| Tool calls per navigation task | ~6 | ~1.2 | **~80% fewer** |
-| Source lines read into context | ~8,000 lines | ~400 lines (structured) | **~95% less** |
-| Navigation token cost | ~36K tokens | ~7K tokens | **~80% saved** |
-| Full session token savings | — | — | **40-60%** |
+`tests/effectiveness_bench.rs` is the only reproducible number here, and it is
+worth being precise about what it measures. For each of five navigation tasks it
+runs the real CLI on a fixture project and compares the response size in bytes
+against a **hand-set** `baseline_bytes` for the Grep+Read approach. Bytes stand
+in for tokens; the baselines are estimates committed once and held fixed, so its
+value is regression tracking over releases, not a measurement of your project.
+
+```bash
+cargo build --no-default-features
+cargo test --test effectiveness_bench --no-default-features -- --ignored --nocapture
+```
+
+On the fixture at v0.123.0 that prints `942 / 23000 = 0.04x`, and the test fails
+if the overall ratio ever exceeds 0.60. Earlier revisions of this README carried
+an "Overall Session Efficiency" table (~80% fewer calls, ~95% fewer lines read,
+40-60% session savings) whose first rows had no source at all; they are gone
+rather than dressed up.
 
 ### What code-graph Uniquely Enables
 
@@ -453,6 +472,59 @@ Uses SQLite with:
 - Merkle tree hashes for incremental change detection
 
 Data is stored in `.code-graph/index.db` under the project root (auto-created, gitignored).
+
+## Environment variables
+
+Every `CODE_GRAPH_*` variable the code reads, in one place — the alternative was
+reading the source to find out a switch existed. All of them are optional; the
+defaults are what you get by doing nothing.
+
+**Switches you may actually want**
+
+| Variable | Effect |
+|---|---|
+| `CODE_GRAPH_NO_AUTO_UPDATE=1` | Never check GitHub for a new release. |
+| `CODE_GRAPH_NO_AUTO_ADOPT=1` | Do not write the steering block into a project's `CLAUDE.md` on SessionStart. |
+| `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Keep hand edits to the generated steering block — it is otherwise refreshed to the current template. |
+| `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
+| `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
+| `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
+| `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
+| `CODE_GRAPH_NO_RECENT_IMPACT=1` | Skip the recent-impact section of the SessionStart briefing. |
+| `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
+| `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
+| `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
+| `CODE_GRAPH_MAX_FILE_SIZE=<bytes>` | Skip files larger than this (default 1 MiB). |
+| `CODE_GRAPH_MAX_CODE_LEN=<bytes>` | Truncate stored per-node source at this length. |
+| `CODE_GRAPH_PARSE_TIMEOUT_MS=<ms>` | Per-file parse timeout. |
+| `CODE_GRAPH_RESYNC_BUDGET=<n>` | Files a read command may re-index before answering (default 8). `CODE_GRAPH_GREP_SYNC_BUDGET` is the older name, still honoured by `grep`. |
+| `CODE_GRAPH_RG_ARGV_BUDGET=<bytes>` | Cap on the argv `grep` builds for ripgrep. |
+| `CODE_GRAPH_INTEGRITY_MAX_BYTES=<bytes>` | Index size above which `health-check` skips `PRAGMA quick_check`. |
+| `CODE_GRAPH_SNAPSHOT_TRUST_URL=1` | Install a snapshot from an arbitrary URL. **A snapshot is a database — treat it like running a script.** |
+| `CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1` | Install a snapshot whose origin does not match this repository. |
+| `CODE_GRAPH_SNAPSHOT_PIN=<digest>` | Accept exactly this snapshot digest (an alternative to the two switches above). |
+| `CODE_GRAPH_PROJECT_TYPE=<type>` | Override project-type detection for the steering block. |
+| `CODE_GRAPH_FAIL_ON_RISK=1` | Make the PR impact comment fail the check on HIGH risk (CI). |
+
+<details>
+<summary><b>Internal and test-only</b> — set by the plugin's own processes, or by the test suite. Setting them by hand is not supported.</summary>
+
+| Variable | Set by | Purpose |
+|---|---|---|
+| `CODE_GRAPH_STATUSLINE_CWD` | statusline-composite | Forwards Claude Code's authoritative cwd to each statusline provider. |
+| `CODE_GRAPH_INSTALL_LOCK_HELD` | launcher | Tells a child that the parent already holds the install lock, so it does not deadlock. |
+| `CODE_GRAPH_AUTO_UPDATE_SILENT` | session-init | Runs the update check without console output. |
+| `CODE_GRAPH_NO_ANSWER_IN_DENY` | lifecycle | Keeps `cg-answer` out of the deny path. |
+| `CODE_GRAPH_FORCE_PLUGIN_MCP` | launcher | Serve MCP even from a context that would otherwise decline. |
+| `CODE_GRAPH_FORCE_STATUSLINE` | `lifecycle install` | Reclaim the statusline slot from another provider. |
+| `CODE_GRAPH_INTERNAL` | this repo's own hooks | Marks a tool call as self-generated so it is excluded from adoption metrics. |
+| `CODE_GRAPH_DOGFOOD` | dev sessions | Tags MCP usage as dev self-test traffic. |
+| `CODE_GRAPH_DEV` | dev checkouts | Dev mode: changes binary resolution and disables auto-update. |
+| `CODE_GRAPH_EMIT_CONFIDENCE` | debugging | Emit per-result confidence from semantic search. |
+| `CODE_GRAPH_BIN` | `scripts/e2e-validate.js` | Binary under test. |
+| `CODE_GRAPH_AUTO_UPDATE_E2E=1` | release smoke test | Opts into the live auto-update E2E, skipped by default. |
+
+</details>
 
 ## Build from Source
 
