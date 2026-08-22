@@ -7,7 +7,7 @@ const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
-const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, readJsonResult, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
+const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, readJsonResult, backupCorruptFile, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
 const { clearCache: clearBinaryCache, globalNodeModulesCandidates, nvmNodeModulesDirs, PLATFORM_PKG, detectLibc } = require('./find-binary');
 const { readBinaryVersion, compareVersions, isDevMode } = require('./version-utils');
@@ -798,15 +798,56 @@ async function downloadAndInstall(latest, {
       // reachable as the manual way out.
       const installedPath = installedPluginsPath();
       const installedRead = readJsonResult(installedPath);
-      if (installedRead.corrupt || installedRead.lossy) {
+      // Whether the registry entry is STILL pointing at the old version when this
+      // block ends. It gates the manifest advance below, and that gate is the
+      // whole difference between a report and a fix: `checkForUpdate` reads
+      // `readManifest().version` as the authoritative installed version, so
+      // advancing it past a repoint that did not happen makes the next session
+      // compute "up to date" — the message below prints ONCE, into a SessionStart
+      // hook's stderr, and the split-brain then has nothing behind it. Left
+      // behind, the ordinary check interval retries the whole install and
+      // re-reports, and the repoint lands by itself the moment the file is
+      // repaired. `missing` is not blocked: no registry means nothing to repoint.
+      let repointBlocked = false;
+      if (installedRead.corrupt) {
+        // Value unusable — the bytes are not ours to guess at.
+        const why = installedRead.error
+          ? (installedRead.error.code || installedRead.error.message)
+          : 'it does not contain a JSON object';
         console.error(
           `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
-          `could not be read (${installedRead.error && installedRead.error.code || 'unparseable'}) — ` +
-          'Claude Code still points at the previous version. Run `/plugin update` ' +
-          'or repair that file by hand.'
+          `could not be read (${why}) — its entry for this plugin still points at the ` +
+          'previous version. Run `/plugin update` or repair that file by hand.'
         );
+        repointBlocked = true;
       } else {
-        const installed = installedRead.value;
+        let installed = installedRead.value;
+        // `lossy` is NOT `corrupt`: the value parsed and is usable, it is the
+        // BYTES that will not survive our rewrite (a cp1252 byte inside a path,
+        // see readJsonResult). lifecycle.js's readSettingsForWrite route applies
+        // here for the same reason — preserve the true bytes, then proceed, since
+        // refusing outright strands the install over a byte we can work around.
+        // Collapsing this into the corrupt arm also misreported it: a lossy result
+        // carries no `error`, so the message called a parseable file unparseable.
+        if (installed && installedRead.lossy) {
+          const backup = backupCorruptFile(installedPath, installedRead.raw);
+          if (backup) {
+            console.error(
+              `[code-graph] ${installedPath} contains bytes that are not valid UTF-8; ` +
+              `repointing it at ${latest.version} will replace them. Saved the original ` +
+              `to ${backup} first.`
+            );
+          } else {
+            console.error(
+              `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+              'contains bytes that are not valid UTF-8 and no backup copy could be made — ' +
+              'its entry for this plugin still points at the previous version. Rewriting it ' +
+              'would replace those bytes permanently. Run `/plugin update` after repairing it.'
+            );
+            installed = null;
+            repointBlocked = true;
+          }
+        }
         if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {
           installed.plugins[PLUGIN_ID][0].installPath = pluginDst;
           installed.plugins[PLUGIN_ID][0].version = latest.version;
@@ -816,20 +857,24 @@ async function downloadAndInstall(latest, {
           } catch (err) {
             console.error(
               `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
-              `could not be written (${err.code || err.name}) — Claude Code still points ` +
-              'at the previous version. Run `/plugin update`.'
+              `could not be written (${err.code || err.name}) — its entry for this plugin ` +
+              'still points at the previous version. Run `/plugin update`.'
             );
+            repointBlocked = true;
           }
         }
       }
 
-      // Update install manifest
-      try {
-        const manifest = readManifest();
-        manifest.version = latest.version;
-        manifest.updatedAt = new Date().toISOString();
-        writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
-      } catch { /* not fatal */ }
+      // Update install manifest — only when nothing is left pointing at the old
+      // version. See `repointBlocked` above: this value IS the update gate.
+      if (!repointBlocked) {
+        try {
+          const manifest = readManifest();
+          manifest.version = latest.version;
+          manifest.updatedAt = new Date().toISOString();
+          writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
+        } catch { /* not fatal */ }
+      }
 
       // Run the NEW lifecycle.js to update settings.json hooks with new paths.
       // Without this, settings.json hooks still point to the old version directory

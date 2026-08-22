@@ -62,6 +62,27 @@ failure, previously swallowed by a bare `catch`, reports the same way.
 The two remaining lenient reads in that file are read-only version lookups with
 no write-back, so they are not the same defect.
 
+Two follow-ups from the pre-tag review, both about the arm that refuses:
+
+The report was a **one-shot**. `checkForUpdate` treats `readManifest().version`
+as the authoritative installed version, and the manifest was advanced whether or
+not the repoint had landed — so the next session computed "up to date", never
+retried, and never printed again. One line of hook stderr was the entire notice.
+The manifest now advances only when nothing is left pointing at the old version,
+which puts the ordinary check interval behind the message: the install retries,
+the report recurs, and the repoint lands by itself once the file is repaired. An
+absent `installed_plugins.json` blocks nothing — there is no entry to repoint.
+
+And **`lossy` is not `corrupt`**. `readJsonResult` reports `lossy` for a file
+that parses fine but carries a byte that will not survive a rewrite — a cp1252
+byte in a path, the shape a non-ASCII Windows username leaves. It returns a
+usable value and no `error`, so folding it into the corrupt arm both refused a
+repoint that v0.124.0 performed and called the file "unparseable" while holding
+its parsed contents. It now takes `lifecycle.js`'s own preserve-then-proceed
+route: the original bytes are copied to a `.corrupt-<stamp>` sidecar, the repoint
+proceeds, and the message names the byte problem. If even the copy fails, the
+repoint is refused — destroying the bytes silently is the worse outcome.
+
 ### Two more `--json` legs stop wearing the success shape
 
 Both were carried as unverified notes from an earlier round. Reproduced against

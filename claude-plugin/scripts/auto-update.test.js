@@ -776,6 +776,98 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
   const dst = path.join(sandboxHome, '.claude', 'plugins', 'cache',
     'code-graph-mcp', 'code-graph-mcp', '9.9.9', '.claude-plugin', 'plugin.json');
   assert.equal(fs.existsSync(dst), true, 'plugin copied into sandbox plugins cache');
+  // Positive control for the repoint gate: with no installed_plugins.json there
+  // is nothing to repoint, so the manifest MUST still advance. Without this the
+  // gate could be blocked unconditionally and every "does not advance" assertion
+  // would keep passing.
+  assert.equal(
+    JSON.parse(fs.readFileSync(
+      path.join(sandboxHome, '.cache', 'code-graph', 'install-manifest.json'), 'utf8')).version,
+    '9.9.9',
+    'an absent registry blocks nothing — the manifest must record the new version');
+});
+
+test('downloadAndInstall repoints a healthy installed_plugins.json and advances the manifest', async (t) => {
+  // The main production arm, and the positive control the repoint gate needs on
+  // the side where a registry entry actually exists: a run that repoints must
+  // advance the manifest, or `checkForUpdate` re-downloads the same version
+  // forever. Mutating `repointBlocked` to a constant `true` turns this red.
+  const sandboxHome = mkDir(t, 'code-graph-dai-healthy-');
+  const installedDir = path.join(sandboxHome, '.claude', 'plugins');
+  fs.mkdirSync(installedDir, { recursive: true });
+  const installedPath = path.join(installedDir, 'installed_plugins.json');
+  fs.writeFileSync(installedPath, JSON.stringify({
+    plugins: {
+      'code-graph-mcp@code-graph-mcp': [
+        { installPath: '/old/install/path', version: '0.0.1' },
+      ],
+    },
+  }));
+
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const crypto = require('crypto');
+    const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const errs = [];
+    const realError = console.error;
+    console.error = (...a) => { errs.push(a.join(' ')); };
+    const latest = {
+      version: '9.9.9',
+      tarballUrl: 'https://example/tar',
+      pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+      binaryUrl: null,
+    };
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'curl') {
+        const out = args[args.indexOf('-o') + 1];
+        if (out.endsWith('.sha256')) {
+          const archive = out.slice(0, -'.sha256'.length);
+          const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+          fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+        } else {
+          fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+        }
+      }
+      if (cmd === 'tar') {
+        const mDir = path.join(opts.cwd, 'claude-plugin', '.claude-plugin');
+        fs.mkdirSync(mDir, { recursive: true });
+        fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+      }
+    };
+    (async () => {
+      const result = await downloadAndInstall(latest, {
+        exec,
+        cmdExists: () => true,
+        refreshMarketplace: () => true,
+        downloadBin: async () => true,
+      });
+      console.error = realError;
+      console.log(JSON.stringify({ result, errs }));
+    })();
+  `;
+  const out = execGit(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: sandboxHome },
+    encoding: 'utf8',
+  });
+  const { result, errs } = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(result.pluginUpdated, true, 'precondition: the plugin copy must have landed');
+
+  const rec = JSON.parse(fs.readFileSync(installedPath, 'utf8'))
+    .plugins['code-graph-mcp@code-graph-mcp'][0];
+  assert.equal(rec.version, '9.9.9', 'a healthy registry must be repointed');
+  assert.ok(rec.installPath.includes('9.9.9'), `installPath must move, got ${rec.installPath}`);
+  assert.equal(
+    JSON.parse(fs.readFileSync(
+      path.join(sandboxHome, '.cache', 'code-graph', 'install-manifest.json'), 'utf8')).version,
+    '9.9.9',
+    'a successful repoint must advance the manifest, or the update repeats forever');
+  assert.equal(
+    errs.filter(e => e.includes('installed_plugins.json')).length, 0,
+    `a healthy repoint must report nothing, got: ${JSON.stringify(errs)}`);
+  assert.equal(
+    fs.readdirSync(installedDir).filter(f => f.includes('.corrupt-')).length, 0,
+    'a well-formed UTF-8 registry must not be backed up');
 });
 
 test('downloadAndInstall does NOT repoint install state when the plugin copy is skipped (version drift)', async (t) => {
@@ -910,6 +1002,117 @@ test('downloadAndInstall SAYS SO when installed_plugins.json cannot be repointed
   // whose content we could not read.
   assert.equal(fs.readFileSync(installedPath, 'utf8'), '{ "plugins": { trailing, comma }',
     'a file we could not parse must not be rewritten');
+
+  // ...and the install manifest must NOT be advanced past a repoint that did not
+  // happen. `checkForUpdate` derives the whole update decision from
+  // `readManifest().version` — advancing it here makes the next session compute
+  // "up to date", so the warning above prints ONCE and the split-brain freezes
+  // with no path back. Leaving it behind means the ordinary check interval
+  // retries the install and re-reports, and the moment the user repairs the file
+  // the repoint lands on its own.
+  const manifestPath = path.join(sandboxHome, '.cache', 'code-graph', 'install-manifest.json');
+  const manifestVersion = fs.existsSync(manifestPath)
+    ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version
+    : null;
+  assert.notEqual(manifestVersion, '9.9.9',
+    'the manifest must not read "up to date" while installed_plugins.json still points at the old version');
+});
+
+test('downloadAndInstall repoints a NON-UTF-8 installed_plugins.json, preserving the original bytes', async (t) => {
+  // `lossy` is not `corrupt`: readJsonResult returns a USABLE value plus the true
+  // bytes, and lifecycle.js's own `readSettingsForWrite` route is preserve-then-
+  // proceed. Collapsing the two arms regressed this case against v0.124.0, where
+  // the lenient `readJson` repointed (destroying the bytes silently). Refusing
+  // outright strands the install instead — and reports `unparseable` about a file
+  // that parsed fine, since the lossy result carries no `error`.
+  const sandboxHome = mkDir(t, 'code-graph-dai-lossy-');
+  const installedDir = path.join(sandboxHome, '.claude', 'plugins');
+  fs.mkdirSync(installedDir, { recursive: true });
+  const installedPath = path.join(installedDir, 'installed_plugins.json');
+  // Valid JSON carrying one byte that is not valid UTF-8 (0xE9 — cp1252 'é' in a
+  // path, the shape a non-ASCII Windows username leaves behind). It parses; it
+  // just cannot survive a decode/re-encode round trip.
+  const originalBytes = Buffer.concat([
+    Buffer.from('{"plugins":{"code-graph-mcp@code-graph-mcp":[{"installPath":"/old/', 'utf8'),
+    Buffer.from([0xe9]),
+    Buffer.from('path","version":"0.0.1"}]}}', 'utf8'),
+  ]);
+  fs.writeFileSync(installedPath, originalBytes);
+
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const crypto = require('crypto');
+    const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const errs = [];
+    const realError = console.error;
+    console.error = (...a) => { errs.push(a.join(' ')); };
+    const latest = {
+      version: '9.9.9',
+      tarballUrl: 'https://example/tar',
+      pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+      binaryUrl: null,
+    };
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'curl') {
+        const out = args[args.indexOf('-o') + 1];
+        if (out.endsWith('.sha256')) {
+          const archive = out.slice(0, -'.sha256'.length);
+          const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+          fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+        } else {
+          fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+        }
+      }
+      if (cmd === 'tar') {
+        const mDir = path.join(opts.cwd, 'claude-plugin', '.claude-plugin');
+        fs.mkdirSync(mDir, { recursive: true });
+        fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+      }
+    };
+    (async () => {
+      const result = await downloadAndInstall(latest, {
+        exec,
+        cmdExists: () => true,
+        refreshMarketplace: () => true,
+        downloadBin: async () => true,
+      });
+      console.error = realError;
+      console.log(JSON.stringify({ result, errs }));
+    })();
+  `;
+  const out = execGit(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: sandboxHome },
+    encoding: 'utf8',
+  });
+  const { result, errs } = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(result.pluginUpdated, true,
+    'precondition: the plugin copy must have landed, or the repoint is not even attempted');
+
+  // The repoint HAPPENS — the value was usable.
+  const rec = JSON.parse(fs.readFileSync(installedPath, 'utf8'))
+    .plugins['code-graph-mcp@code-graph-mcp'][0];
+  assert.equal(rec.version, '9.9.9',
+    'a lossy-but-parseable installed_plugins.json must still be repointed');
+  assert.ok(rec.installPath.includes('9.9.9'),
+    `installPath must point at the new version dir, got ${rec.installPath}`);
+
+  // ...and the bytes it could not reproduce survive somewhere, byte-exact.
+  const backups = fs.readdirSync(installedDir)
+    .filter(f => f.startsWith('installed_plugins.json.corrupt-'));
+  assert.equal(backups.length, 1,
+    `the original bytes must be preserved before the rewrite, found: ${JSON.stringify(fs.readdirSync(installedDir))}`);
+  assert.ok(
+    fs.readFileSync(path.join(installedDir, backups[0])).equals(originalBytes),
+    'the backup must be byte-exact — a lossy transcription preserves nothing');
+
+  // The diagnosis names the real cause. `unparseable` is what the collapsed arm
+  // said, because the lossy result carries no `error` to read a code off.
+  const msg = errs.find(e => e.includes('installed_plugins.json')) || '';
+  assert.ok(msg.includes('not valid UTF-8'),
+    `the message must name the byte problem, got: ${JSON.stringify(errs)}`);
+  assert.ok(!msg.includes('unparseable'),
+    `a file that parsed fine must not be called unparseable, got: ${msg}`);
 });
 
 // ── selfHealGlobalPkgs: keep global npm installs (CLI shim, platform relic) in step ──

@@ -1817,6 +1817,7 @@ module.exports = {
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   cleanupDisabledStatusline, unadoptRegisteredProjects,
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
+  backupCorruptFile,                                                   // auto-update.js repoints installed_plugins.json and owes the same preserve-then-proceed route
   migrateOldPluginIds,                                                 // exported so its failure arms are testable (audit 2026-08-22 P2-10)
   readRegistry, readRegistryForWrite, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
