@@ -386,6 +386,59 @@ const FORBIDDEN_EDGES: &[(&str, &str, &str)] = &[
         "indexer",
         "the indexer drives the parser, not the reverse",
     ),
+    // ── The six module roots that were never a SCANNED side ───────────────
+    // Added 2026-08-22 (audit P2-7). The table only ever constrained eight of
+    // the fourteen module roots, so `mcp → cli` and `resolve → cli/mcp` — dead
+    // edges of exactly the class this table exists to catch — had no guard at
+    // all. Rows are the ones `cargo test` confirms are dead today; the three
+    // probed pairs that are LIVE (`resolve.rs → indexer`, `sandbox → storage`,
+    // `search → indexer`) are deliberately absent and noted below.
+    //
+    // mcp is a top surface, peer of cli.
+    (
+        "src/mcp",
+        "cli",
+        "the two published surfaces must not borrow from each other — shared resolution lives in resolve.rs, shared paths in utils",
+    ),
+    ("src/mcp", "outcome", "outcome reads transcripts, surfaces consume it through their own commands"),
+    // search sits below both surfaces, above storage.
+    ("src/search", "cli", "search is surface-agnostic"),
+    ("src/search", "mcp", "search is protocol-agnostic"),
+    ("src/search", "outcome", "search is surface-agnostic"),
+    ("src/search", "graph", "search ranks rows; graph traversal is a sibling layer"),
+    // snapshot packages an existing index; it is driven BY the surfaces.
+    ("src/snapshot", "cli", "snapshot is surface-agnostic"),
+    ("src/snapshot", "mcp", "snapshot is protocol-agnostic"),
+    ("src/snapshot", "outcome", "snapshot is surface-agnostic"),
+    ("src/snapshot", "search", "snapshot moves bytes, it does not query"),
+    ("src/snapshot", "graph", "snapshot moves bytes, it does not traverse"),
+    // sandbox is a pure text/token compressor.
+    ("src/sandbox", "cli", "sandbox is surface-agnostic"),
+    ("src/sandbox", "mcp", "sandbox is protocol-agnostic"),
+    ("src/sandbox", "outcome", "sandbox is surface-agnostic"),
+    ("src/sandbox", "indexer", "compression reads what it is handed, it does not index"),
+    // embedding owns the model and the context string; callers hand it rows.
+    ("src/embedding", "cli", "embedding is surface-agnostic"),
+    ("src/embedding", "mcp", "embedding is protocol-agnostic"),
+    ("src/embedding", "outcome", "embedding is surface-agnostic"),
+    ("src/embedding", "storage", "the indexer persists vectors; embedding only produces them"),
+    ("src/embedding", "indexer", "the indexer drives embedding, not the reverse"),
+    ("src/embedding", "search", "embedding produces vectors; ranking them is search's job"),
+    // resolve.rs is the shared symbol resolver BOTH surfaces read, so it must
+    // not know either of them — that is the whole point of hoisting it.
+    (
+        "src/resolve.rs",
+        "cli",
+        "resolve is what the surfaces share; reaching back into one of them re-splits the verdict",
+    ),
+    ("src/resolve.rs", "mcp", "resolve is protocol-agnostic"),
+    ("src/resolve.rs", "search", "resolve names symbols; ranking is a separate layer"),
+    ("src/resolve.rs", "graph", "resolve names symbols; traversal is a separate layer"),
+    // NOT rows, and why: `resolve.rs → indexer` (query-time freshness calls
+    // `ensure_file_indexed`), `search → indexer` (same), and
+    // `sandbox → storage` (reads node rows to compress) are all LIVE and
+    // downward. Listing a live edge here would make this test red on arrival,
+    // which is the one thing the table must never do.
 ];
 
 /// Layering drift-guard, table form. See [`FORBIDDEN_EDGES`].
