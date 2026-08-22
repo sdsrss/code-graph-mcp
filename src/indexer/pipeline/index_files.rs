@@ -953,6 +953,23 @@ pub(super) fn index_files(
         // exactly like a reindexed file's, or they resolve onto deleted rows.
         batch_file_paths.extend(skipped_paths.iter().map(|p| p.as_str()));
 
+        // These three pools are rebuilt from `global_name_map` on EVERY batch —
+        // O(nodes x batches) where the map itself is maintained incrementally.
+        // Carried as an open performance item across two audits (2026-08-16,
+        // 2026-08-22 P2-5) on the theory that it is a hotspot above ~500 files,
+        // which this repository's own 278-file single-batch tree cannot show.
+        //
+        // Measured, 2026-08-22, on 1,763 files of third-party Python (25,041
+        // nodes, four batches at BATCH_SIZE 500), timing this block alone:
+        //
+        //   batch 1  2.4ms   batch 2  5.4ms   batch 3  6.8ms   batch 4  8.7ms
+        //   total   23.2ms   of an 8,899ms full index  =  0.26%
+        //
+        // Linear per batch, exactly as the O() says, at ~0.35us per node. The
+        // shape is real; the constant is not worth incremental maintenance of
+        // three more structures in a pipeline whose bookkeeping misses have
+        // twice cost real edges. Deliberately left alone — reopen it with a
+        // measurement, not with the complexity argument.
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
         // Per-node language for same-language-preferred edge resolution (§ cross-lang collision).
