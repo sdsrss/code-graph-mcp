@@ -500,6 +500,67 @@ fn test_aggregate_recommendations_inject_skipped() {
 }
 
 #[test]
+fn test_inject_mode_buckets_split_delivered_from_skipped() {
+    // D#147: the skip path now records `mode` too, so a skipped inject is
+    // attributable to the mode that burned the attempt. That field must NOT
+    // leak into `inject_by_mode`: stats.rs prints it as "Inject payloads … by
+    // mode" and derives the callgraph SHARE from it, and a skipped inject
+    // delivered no payload — mixing the two silently redefines the lever
+    // metric and makes it non-comparable across versions.
+    //
+    // The gate is "not explicitly answered:false", not "answered:true":
+    // v0.75..v0.99.1 injects carry a `mode` but no `answered` field and were
+    // recorded ONLY on hits, so they are delivered and must stay counted.
+    let content = "\
+{\"ts\":\"t1\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"a\",\"mode\":\"callgraph\"}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"b\",\"fallthrough\":\"no-hits\",\"reason\":\"no-hits\",\"mode\":\"grep\"}
+{\"ts\":\"t3\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"c\",\"fallthrough\":\"unavailable\",\"reason\":\"unavailable\",\"mode\":\"grep\"}
+{\"ts\":\"t4\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"d\",\"fallthrough\":\"no-hits\",\"reason\":\"no-hits\",\"mode\":\"show\"}
+{\"ts\":\"t5\",\"hook\":\"grep\",\"action\":\"inject\",\"pattern\":\"e\",\"mode\":\"callgraph\"}
+{\"ts\":\"t6\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"f\",\"fallthrough\":\"no-binary\",\"reason\":\"no-binary\"}
+";
+    let s = aggregate_recommendations_jsonl(content);
+
+    // Delivered side: t1 (explicit true) + t5 (legacy, no `answered`). The three
+    // skips carrying a mode must be absent.
+    assert_eq!(
+        s.inject_by_mode.get("callgraph"),
+        Some(&2),
+        "t1 + t5 (legacy no-`answered` injects were delivered)"
+    );
+    assert_eq!(
+        s.inject_by_mode.get("grep"),
+        None,
+        "t2/t3 are skips — a skipped inject delivered no payload"
+    );
+    assert_eq!(s.inject_by_mode.get("show"), None, "t4 is a skip");
+    assert_eq!(s.inject_by_mode.values().sum::<u64>(), 2);
+
+    // Skipped side: the attribution D#147 asked for.
+    assert_eq!(s.inject_skipped_by_mode.get("grep"), Some(&2), "t2 + t3");
+    assert_eq!(s.inject_skipped_by_mode.get("show"), Some(&1), "t4");
+    assert_eq!(
+        s.inject_skipped_by_mode.get("callgraph"),
+        None,
+        "no skip carried callgraph"
+    );
+    // t6 is a pre-fix skip (no `mode`) → uncounted in the map but still a skip,
+    // so the map sums BELOW inject_skipped exactly like inject_by_mode does
+    // against by_action["inject"].
+    assert_eq!(s.inject_skipped, 4, "t2,t3,t4,t6");
+    assert_eq!(
+        s.inject_skipped_by_mode.values().sum::<u64>(),
+        3,
+        "t6 (no mode) is unattributable — the gap the map must not hide"
+    );
+    assert_eq!(
+        s.by_action.get("inject"),
+        Some(&6),
+        "all 6 are inject events"
+    );
+}
+
+#[test]
 fn test_aggregate_recommendations_counts_live_impact_separately() {
     // v0.63 — SessionStart live-context injections are a separate counter,
     // like observe/use: NOT in total/by_action, and they don't trip the

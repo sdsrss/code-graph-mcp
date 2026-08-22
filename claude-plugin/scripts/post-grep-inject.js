@@ -324,6 +324,13 @@ function runMain() {
       ...(pattern ? { pattern } : {}),
       fallthrough: answer.status,
       reason: answer.status,
+      // Attribute the skip to the mode that burned the attempt — the LAST mode
+      // tried, so a callgraph miss that fell through to grep is charged to grep,
+      // matching the fallback order above. Without this the aggregator files
+      // every skip under one '?' bucket and you can see THAT injects fail but
+      // not WHICH mode is failing (D#147). The Rust side keeps this out of
+      // `inject_by_mode` (delivered-only) — see src/cli/usage.rs.
+      mode: answeredMode,
     });
     return;
   }

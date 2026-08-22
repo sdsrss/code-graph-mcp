@@ -406,6 +406,38 @@ test('e2e: stub reports no hits → silent (no inject) but RECORDS the skip', ()
     assert.equal(rec.fallthrough, 'no-hits');
     assert.equal(rec.reason, 'no-hits');
     assert.equal(rec.pattern, uniq);
+    // D#147: the skip must name the mode that burned the attempt. Without it
+    // every skip aggregates under one unattributable bucket and the funnel can
+    // see THAT injects fail but not WHICH mode is failing. Here callgraph found
+    // no edges and the run fell through to the grep echo, which also missed.
+    assert.equal(rec.mode, 'grep', 'skip rec must record the mode that was tried');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: cg run fails → `unavailable` skip records mode too', () => {
+  // The second skip shape: a runtime failure, not "ran and found nothing".
+  // (`no-binary` is a third, reached only when findBinary() cannot LOCATE a
+  // binary — an unset _CG_ANSWER_BINARY, which a dev box with cg installed
+  // cannot force; pointing at a nonexistent path spawns and fails → unavailable.)
+  // It must be attributable exactly like the no-hits skip: unattributable rows
+  // are what made "13 of 74" unreadable in the 2026-08-19 telemetry.
+  const uniq = `PostUnavail${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('unused\\n');`);
+  const cmd = `echo go && grep "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, {
+      _CG_ANSWER_BINARY: path.join(fixture.dir, 'does-not-exist-cg'),
+    });
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', 'an unrunnable binary must inject nothing');
+    const recs = fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.answered, false);
+    assert.equal(rec.reason, 'unavailable');
+    assert.equal(rec.mode, 'grep', 'a failed run is still charged to the mode it tried');
   } finally {
     cleanupFixture(fixture, cmd);
   }

@@ -336,7 +336,25 @@ pub struct RecommendationSummary {
     /// lever is raising callgraph's share (widening its eligibility). Injects recorded
     /// without a `mode` (pre-v0.75) are absent from every bucket, so the map may sum to
     /// less than `by_action["inject"]`.
+    ///
+    /// DELIVERED ONLY. Skipped injects (`answered:false`) also carry a `mode`
+    /// since D#147, and they are counted in `inject_skipped_by_mode` instead —
+    /// folding them in here would silently redefine the callgraph SHARE that
+    /// `stats` prints from "of what cg delivered" to "of what cg attempted",
+    /// breaking comparability against every figure recorded before the split.
     pub inject_by_mode: std::collections::BTreeMap<String, u64>,
+    /// Per-mode breakdown of the injects that did NOT deliver — the `answered:false`
+    /// rows counted in `inject_skipped`, keyed by the mode that burned the attempt
+    /// (the LAST mode tried: callgraph → show/grep, mirroring the hook's own
+    /// fallback order). Without it the funnel can see THAT injects fail but not
+    /// WHICH mode is failing, which is the attribution the gate work needed
+    /// (measured 2026-08-19: 13 of 74 mem injects and 39 of 96 daagu injects were
+    /// skips aggregating under one unattributable bucket).
+    ///
+    /// Skips recorded before the fix carry no `mode` → absent from every bucket,
+    /// so this map may sum to less than `inject_skipped`. That gap is deliberate:
+    /// it keeps unattributable history visible instead of misfiling it.
+    pub inject_skipped_by_mode: std::collections::BTreeMap<String, u64>,
     /// Of `deny_answered` (cg delivered a grep answer in-place), how many were
     /// IMMEDIATELY followed by ANY grep/read event. Computed in append
     /// (chronological) order; a single-user-sequential approximation (truly
@@ -495,13 +513,24 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 // total/by_action via the generic map above.
                 // Sub-breakdown by payload mode (best-effort: pre-v0.75 injects have
                 // no `mode` → uncounted here, still counted in by_action["inject"]).
+                // Skips carry a mode too (D#147) and go to their OWN map: `inject_by_mode`
+                // feeds the delivered-payload mix and its callgraph share, which a
+                // failed attempt did not contribute to. The delivered test is
+                // "not explicitly false" so v0.75..v0.99.1 rows — a `mode`, no
+                // `answered`, recorded only on hits — keep counting as delivered.
+                let answered = v.get("answered").and_then(|x| x.as_bool());
                 if let Some(mode) = v.get("mode").and_then(|x| x.as_str()) {
-                    *s.inject_by_mode.entry(mode.to_string()).or_insert(0) += 1;
+                    let bucket = if answered == Some(false) {
+                        &mut s.inject_skipped_by_mode
+                    } else {
+                        &mut s.inject_by_mode
+                    };
+                    *bucket.entry(mode.to_string()).or_insert(0) += 1;
                 }
-                if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
+                if answered == Some(true) {
                     armed = true;
                     armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
-                } else if v.get("answered").and_then(|x| x.as_bool()) == Some(false) {
+                } else if answered == Some(false) {
                     // Explicit answered:false only — pre-v0.99.1 injects lack the
                     // field but were ALWAYS delivered (recorded only on hits).
                     s.inject_skipped += 1;

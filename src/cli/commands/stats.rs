@@ -245,6 +245,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         // Non-delivering injects (answered:false: no-hits/no-binary/unavailable) —
         // distinguishes "hook ran, nothing to say" from "hook dark" (§1.6).
         stats_json["recommendations"]["inject_skipped"] = serde_json::json!(recs.inject_skipped);
+        // Which mode burned the skipped attempts (D#147). Separate from
+        // inject_by_mode, which stays delivered-only — see usage.rs. May sum
+        // below inject_skipped: pre-fix skips carry no mode.
+        stats_json["recommendations"]["inject_skipped_by_mode"] = recs
+            .inject_skipped_by_mode
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into();
         sout!("{}", stats_json);
     } else {
         let mut versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
@@ -412,6 +421,33 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 };
                 sout!("Inject payloads: {} by mode ({}) — callgraph (cross-file, high-value) = {cg_pct}%",
                     inj_total, modes.join(", "));
+            }
+            // The other half of the attempt funnel (D#147): injects that RAN and
+            // delivered nothing, attributed to the mode that burned the attempt.
+            // Printed separately from the payload mix above precisely because it
+            // is not a payload — reading the two as one number is what made the
+            // skips unattributable in the first place.
+            if !recs.inject_skipped_by_mode.is_empty() {
+                let modes: Vec<String> = recs
+                    .inject_skipped_by_mode
+                    .iter()
+                    .map(|(k, v)| format!("{v} {k}"))
+                    .collect();
+                let attributed: u64 = recs.inject_skipped_by_mode.values().sum();
+                // Pre-fix skips carry no mode; say so rather than let the map
+                // read as the whole of inject_skipped.
+                let unattributed = recs.inject_skipped.saturating_sub(attributed);
+                let tail = if unattributed > 0 {
+                    format!(", {unattributed} unattributed (recorded before the mode split)")
+                } else {
+                    String::new()
+                };
+                sout!(
+                    "Inject skips: {} delivered nothing by mode ({}){}",
+                    attributed,
+                    modes.join(", "),
+                    tail
+                );
             }
             if recs.deny_answered + recs.deny_unanswered > 0 {
                 // answered:true denies satisfy the need in-place — read their
