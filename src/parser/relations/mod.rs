@@ -680,13 +680,13 @@ fn walk_for_relations(
     // axis where grammars disagree most about spelling — `import_declaration`
     // alone means two different shapes in Swift and Java — so the (language,
     // node kind) → extractor mapping is data, and a language missing from it is
-    // a visible empty slot rather than an absent arm. Returns true when a row
-    // fired; the kinds it owns are disjoint from every arm left below, so the
-    // early return is belt and braces against a future overlap.
+    // a visible empty slot rather than an absent arm.
     //
-    // The result is deliberately discarded rather than used to skip the match:
-    // the two kind sets are disjoint, so short-circuiting would only hide a
-    // future overlap instead of letting the arm double-emit visibly. The child
+    // It returns nothing, deliberately. An earlier version handed back "did a
+    // row fire" so this caller could skip the match below, and the caller threw
+    // it away — a documented contract no code honoured. The kinds the table owns
+    // are disjoint from every arm left below, so short-circuiting would only
+    // hide a future overlap instead of letting it double-emit visibly. The child
     // recursion below runs either way — the walk's scope bookkeeping is shared.
     imports::run_import_passes(
         &imports::ImportCtx {

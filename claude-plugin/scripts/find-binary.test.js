@@ -494,7 +494,12 @@ function runFindBinary(homeDir, times, cacheContents) {
   return { results: JSON.parse(out), cachePath };
 }
 
-test('repeated findBinary() calls in one process spawn --version at most once', (t) => {
+// Title says "bounded", not "once": upgrading a legacy bare-path entry costs
+// two spawns in the FIRST process (the freshness probe, then the re-verify that
+// writes the stamp). The point is that the count does not scale with the number
+// of calls, and that the next process spawns nothing at all — both asserted
+// below. An "at most once" title would be a claim the body does not make.
+test('repeated findBinary() calls in one process spawn --version a bounded number of times', (t) => {
   if (process.platform === 'win32') { t.skip('POSIX counting stub'); return; }
   const homeDir = mkDir(t, 'cgmcp-home-');
   const fake = buildCountingBinary(t, 'code-graph-mcp 9.9.9');

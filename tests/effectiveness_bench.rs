@@ -1,12 +1,14 @@
-//! Effectiveness benchmark — turns the README's "40-60% session token savings"
-//! vibe-claim into a regression-tracked number.
+//! Effectiveness benchmark — keeps the response-size win a regression-tracked
+//! number rather than an impression.
 //!
 //! For each navigation task in the corpus, runs the equivalent code-graph CLI
 //! command on a fixture project and compares the byte count of the response
 //! to a hardcoded `baseline_bytes` representing the historical Grep+Read
-//! approach. Both numbers are logged; the assertion fires only if the
-//! overall code-graph/baseline ratio exceeds the headline claim's worst-case
-//! (60% remaining = 0.60 ratio).
+//! approach. Both numbers are logged; the assertion fires only if the overall
+//! code-graph/baseline ratio exceeds 0.60 — i.e. if more than 60% of the
+//! baseline bytes survive. (The README once carried a "40-60% session token
+//! savings" headline this ceiling was named after; that line is gone, and the
+//! README now sources its numbers from this bench instead.)
 //!
 //! Bytes are a token proxy; for English / TS source they correlate ~1:3 with
 //! BPE tokens (byte ≈ 0.33 token), so a 50% byte reduction maps to a 50%

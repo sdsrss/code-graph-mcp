@@ -347,9 +347,6 @@ pub struct McpServer {
     pub(super) db: Database,
     pub(super) embedding_model: Mutex<Option<EmbeddingModel>>,
     pub(super) project_root: Option<PathBuf>,
-    /// Pre-computed canonical project root to avoid repeated `canonicalize()` syscalls.
-    #[allow(dead_code)]
-    pub(super) project_root_canonical: Option<PathBuf>,
     pub(super) indexed: Mutex<bool>,
     pub(super) watcher: Mutex<Option<WatcherState>>,
     pub(super) last_incremental_check: Mutex<std::time::Instant>,
@@ -486,12 +483,10 @@ impl McpServer {
 
         let embedding_model = EmbeddingModel::load()?;
         let db = Self::open_db_for_role(&db_path, is_primary)?;
-        let root_canonical = project_root.canonicalize().ok();
         Ok(Self {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(embedding_model),
-            project_root_canonical: root_canonical,
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -616,44 +611,6 @@ impl McpServer {
         }
     }
 
-    /// Attempt to install a snapshot for the current project root.
-    /// Used as a post-construction hook when `self.db` was already opened on
-    /// an empty database (e.g. unit tests or secondary-to-primary promotion).
-    /// Returns `true` if the snapshot was installed and the caller should
-    /// reopen `self.db` before using it.
-    ///
-    /// NOTE: in the normal startup path this is NOT called — snapshot install
-    /// happens in `maybe_install_snapshot` inside `from_project_root` BEFORE
-    /// `self.db` is opened, so the inode-swap issue never arises.
-    #[allow(dead_code)] // reserved for Task 11 (reindex --from-snapshot) and Task 12 (health-check)
-    pub(crate) fn try_install_snapshot(&self, project_root: &Path) -> bool {
-        let url = match crate::snapshot::resolve_snapshot_source(project_root) {
-            Some(u) => u,
-            None => {
-                self.send_log("info", "no snapshot source configured");
-                return false;
-            }
-        };
-        match crate::snapshot::try_install(&url, project_root) {
-            Ok(commit) => {
-                self.send_log(
-                    "info",
-                    &format!(
-                        "snapshot installed at commit {commit}, will run incremental drift-check"
-                    ),
-                );
-                true
-            }
-            Err(e) => {
-                self.send_log(
-                    "warn",
-                    &format!("snapshot install failed ({e}), running full index"),
-                );
-                false
-            }
-        }
-    }
-
     #[cfg(test)]
     pub fn new_test() -> Self {
         let db = Database::open(Path::new(":memory:")).unwrap();
@@ -661,7 +618,6 @@ impl McpServer {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(None),
-            project_root_canonical: None,
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
@@ -692,7 +648,6 @@ impl McpServer {
             registry: ToolRegistry::new(),
             db,
             embedding_model: Mutex::new(None),
-            project_root_canonical: project_root.canonicalize().ok(),
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),

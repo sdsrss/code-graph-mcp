@@ -175,6 +175,27 @@ test('truncateAtLine: single oversized line → hard cut', () => {
   assert.equal(Buffer.byteLength(text, 'utf8'), 10);
 });
 
+// The hard cut decoded its bytes as latin1, which maps every byte to its own
+// character — so a line of CJK came back as mojibake rather than as a shortened
+// line. A Chinese-language codebase sees this on any single oversized line.
+test('truncateAtLine: hard cut keeps CJK readable instead of mojibake', () => {
+  const line = '用户认证模块的实现细节'.repeat(20); // one line, no '\n' to cut at
+  const { text, truncated } = truncateAtLine(line, 40);
+  assert.equal(truncated, true);
+  assert.ok(
+    line.startsWith(text),
+    `hard cut must be a prefix of the input, not a re-decode of its bytes; got ${JSON.stringify(text)}`,
+  );
+  assert.ok(
+    !text.includes('�'),
+    'a cut landing mid-character must back off to a character boundary, not emit U+FFFD',
+  );
+  assert.ok(
+    Buffer.byteLength(text, 'utf8') <= 40,
+    'the cut must still respect the byte budget',
+  );
+});
+
 // ── v0.48 sanitizeSearchPath: glob args reach rg literally (no shell) ──
 
 test('sanitizeSearchPath: truncates at first glob segment (daagu denied command)', () => {

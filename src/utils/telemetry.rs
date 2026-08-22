@@ -42,7 +42,6 @@ pub fn canonical_query_cmd(sub: &str) -> Option<&'static str> {
         "refs" | "find_references" => "refs",
         "dead-code" | "find_dead_code" => "dead-code",
         "centrality" => "centrality",
-        "file-impact" => "file-impact",
         _ => return None,
     })
 }

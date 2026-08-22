@@ -493,6 +493,50 @@ fn no_forbidden_module_dependency_edges() {
     );
 }
 
+/// `FORBIDDEN_EDGES` is a hand-written list, and a list stops covering the tree
+/// the moment somebody adds a module root to `src/`. Six roots went unscanned
+/// until the 2026-08-22 sweep noticed; nothing would have noticed the seventh.
+///
+/// This turns that sweep into a guard by asking the FILESYSTEM what the roots
+/// are rather than restating them: a new `src/foo/` fails here until its
+/// dependency direction is stated in the table (state it as forbidden, or as an
+/// explicit exemption below with the reason).
+#[test]
+fn forbidden_edges_scans_every_module_root() {
+    let scanned: std::collections::HashSet<&str> =
+        FORBIDDEN_EDGES.iter().map(|(root, _, _)| *root).collect();
+
+    // The crate roots are not modules with an inbound direction to police —
+    // everything hangs off them by construction.
+    const CRATE_ROOTS: &[&str] = &["lib.rs", "main.rs"];
+
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir("src").expect("src/ must be readable from the crate root") {
+        let entry = entry.expect("readable dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if CRATE_ROOTS.contains(&name.as_str()) {
+            continue;
+        }
+        // A non-Rust file under src/ (fixtures, data) is not a module.
+        if entry.path().is_file() && !name.ends_with(".rs") {
+            continue;
+        }
+        let rel = format!("src/{name}");
+        if !scanned.contains(rel.as_str()) {
+            missing.push(rel);
+        }
+    }
+    missing.sort();
+
+    assert!(
+        missing.is_empty(),
+        "module root(s) under src/ that FORBIDDEN_EDGES never scans: {}\n\
+         Add a row naming what each must not depend on. An unscanned root is a \
+         silent gap, not an absence of rules — the table reads as complete.",
+        missing.join(", ")
+    );
+}
+
 /// Negative control for [`no_forbidden_module_dependency_edges`]: an all-green
 /// table proves nothing unless the detector can still see an offender. Without
 /// this, breaking `code_only` (say, stripping everything) would turn the guard

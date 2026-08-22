@@ -121,14 +121,38 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
     // valid, live fd for the duration of the call; flock has no other precondition.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        tracing::info!(
-            "Another instance holds the index lock — running in secondary (read-only) mode"
-        );
+        // Only EWOULDBLOCK means somebody actually holds it. Reporting every
+        // failure as a conflict accuses a holder that does not exist — on a
+        // network or FUSE mount without flock support (`EOPNOTSUPP`) the message
+        // sent the reader hunting for a second process for a filesystem
+        // limitation. `is_flock_conflict` already drew this line; this call site
+        // was not asking it.
+        //
+        // Behaviour is unchanged: either way we fall back to secondary mode,
+        // because a lock we could not take is a lock we do not hold. Only the
+        // diagnosis differs.
+        let err = std::io::Error::last_os_error();
+        if is_flock_conflict(err.raw_os_error()) {
+            tracing::info!(
+                "Another instance holds the index lock — running in secondary (read-only) mode"
+            );
+        } else {
+            tracing::warn!(
+                "Could not lock the index ({err}) — this filesystem may not support flock; \
+                 running in secondary (read-only) mode"
+            );
+        }
         return None;
     }
 
-    // Write our PID for diagnostics (not used for locking logic)
+    // Write our PID for diagnostics (not used for locking logic).
+    //
+    // Truncate first: the file is opened with `truncate(false)` so an existing
+    // lock file keeps its inode, and a shorter PID written over a longer one
+    // left the tail of the old number behind — PID 123456 followed by PID 999
+    // read back as `999456`, a process that may well exist and is not us.
     use std::io::Write;
+    let _ = file.set_len(0);
     let mut f = &file;
     let _ = f.write_all(std::process::id().to_string().as_bytes());
 
@@ -309,6 +333,30 @@ mod tests {
     // became a hard `cargo check` failure on the windows leg once `[lints]` denied
     // warnings crate-wide — a platform this repo's dev box never compiles.
     use tempfile::TempDir;
+
+    // The lock file is opened with `truncate(false)` — deliberately, since the
+    // flock lives on the inode — so the PID written for diagnostics landed ON
+    // TOP of whatever was there. A shorter PID over a longer one left the old
+    // number's tail: `123456` then `999` read back as `999456`, a PID that may
+    // well resolve to a live and entirely unrelated process.
+    #[cfg(unix)]
+    #[test]
+    fn test_pid_write_does_not_leave_the_previous_pid_tail() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        // A crashed run's leftover, deliberately longer than any PID we write.
+        std::fs::write(cg.join("index.lock"), "123456789012").unwrap();
+
+        let _held = try_acquire_index_lock(cg).expect("leftover file must not block acquisition");
+
+        let written = std::fs::read_to_string(cg.join("index.lock")).unwrap();
+        assert_eq!(
+            written,
+            std::process::id().to_string(),
+            "the lock file must hold exactly this PID — a tail from the previous \
+             writer makes the diagnostic name a process that is not the holder"
+        );
+    }
 
     // L7: CLI rebuild/incremental warn before racing a running server. This guards the
     // detector they rely on. flock is tied to the open file description, so a second

@@ -169,7 +169,8 @@ run posted a new comment instead of patching the old one.
 stack out of doctor's repair arms when `~/.claude` is unwritable, and
 `find-binary` no longer runs the binary to check its version on every
 cache hit — the cache entry carries the version and a file stamp, so a
-session-start that calls it four times spawns nothing.
+session-start that calls it four times spawns at most twice, and once the
+entry is stamped, not at all.
 
 **A full index reads each file once.** `scan_directory` hashed every file
 and the pipeline then read it again to parse it; on 1,763 files that was

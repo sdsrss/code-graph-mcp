@@ -61,7 +61,14 @@ function truncateAtLine(text, maxBytes) {
   if (lastNl > 0) {
     return { text: head.slice(0, lastNl), truncated: true };
   }
-  return { text: buf.subarray(0, maxBytes).toString('latin1'), truncated: true };
+  // Hard cut, when even the first line does not fit. Back the cut off to a
+  // UTF-8 character boundary instead of re-decoding the bytes: `latin1` maps
+  // each byte to its own character, so a CJK line came back as mojibake rather
+  // than as a shortened line, and `utf8` alone would leave a U+FFFD where the
+  // cut landed mid-character. A continuation byte is `10xxxxxx`.
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString('utf8'), truncated: true };
 }
 
 /**

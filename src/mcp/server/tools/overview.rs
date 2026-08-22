@@ -183,9 +183,17 @@ impl McpServer {
                 })
                 .collect();
 
-            // Compact summary for inactive symbols — just counts by type
-            let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> =
-                std::collections::HashMap::new();
+            // Compact summary for inactive symbols — just counts by type.
+            //
+            // BTreeMap, not HashMap: this array goes straight into an
+            // LLM-visible tool response, and `HashMap`'s iteration order is
+            // seeded per instance — the same binary over the same index emitted
+            // a different group order on every run. That makes a response
+            // irreproducible and taints any run-to-run diff. Ordering by type is
+            // structural here rather than a sort applied afterwards, so the
+            // property cannot be lost by an edit that forgets the sort.
+            let mut inactive_by_type: std::collections::BTreeMap<&str, Vec<&str>> =
+                std::collections::BTreeMap::new();
             for e in &inactive {
                 // Show `Class.method` for members so two same-named methods of different
                 // classes don't both surface as a bare, indistinguishable `render`.

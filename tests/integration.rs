@@ -458,6 +458,13 @@ export function login(email: string, pw: string) {
     }
     throw new Error('invalid');
 }
+
+// Uncalled, and a different node type from `login`, so `inactive_summary` has
+// two groups to order. With one group the ordering assertion below is
+// constructively true and guards nothing.
+export class SessionStore {
+    clear() { }
+}
 "#,
     )
     .unwrap();
@@ -537,6 +544,27 @@ export function login(email: string, pw: string) {
         all_inactive_names.contains(&"login"),
         "inactive_summary should contain login, got {:?}",
         all_inactive_names
+    );
+    // The group order must be deterministic. It was built by iterating a
+    // HashMap, so the same binary over the same index emitted a different order
+    // on every run — irreproducible LLM-visible output, and noise in any
+    // run-to-run comparison. A single run cannot observe randomness, so assert
+    // the invariant that makes it impossible: sorted by type.
+    let group_types: Vec<&str> = inactive.iter().filter_map(|g| g["type"].as_str()).collect();
+    // Non-vacuity: with fewer than two groups the ordering assertion below is
+    // constructively true and would survive any regression.
+    assert!(
+        group_types.len() >= 2,
+        "fixture must produce at least two inactive groups for the ordering \
+         assertion to mean anything; got {:?}",
+        group_types
+    );
+    let mut sorted_types = group_types.clone();
+    sorted_types.sort_unstable();
+    assert_eq!(
+        group_types, sorted_types,
+        "inactive_summary groups must be ordered by type, not by HashMap iteration order; got {:?}",
+        group_types
     );
 
     // hot_paths should include functions that have callers
