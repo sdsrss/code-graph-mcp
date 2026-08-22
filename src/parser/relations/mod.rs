@@ -29,7 +29,9 @@
 
 use super::lang_config::LanguageConfig;
 use super::node_text;
-use crate::domain::{MAX_RELATION_DEPTH, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS};
+#[cfg(test)]
+use crate::domain::REL_IMPORTS;
+use crate::domain::{MAX_RELATION_DEPTH, REL_IMPLEMENTS, REL_INHERITS};
 use anyhow::Result;
 
 mod calls;
@@ -88,13 +90,9 @@ fn serialize_impl_method_metadata(ty: &str) -> String {
 mod tests;
 
 use cpp::{extract_cpp_inheritance, extract_cpp_value_reference};
-use dart::{extract_dart_call_from_selector, extract_dart_imports};
+use dart::extract_dart_call_from_selector;
 use exports::{extract_cjs_exports, extract_export_names};
 use go::{extract_go_inheritance, extract_go_type_reference, extract_go_value_reference};
-use helpers::{extract_string_from_subtree, MAX_SUBTREE_DEPTH};
-use imports::{
-    extract_import_names, extract_python_from_import_names, extract_python_import_names,
-};
 use inherits::{extract_implements, extract_superclasses, is_heritage_decl};
 use java::extract_java_type_reference;
 use python::{
@@ -103,7 +101,7 @@ use python::{
 use routes::{extract_python_route, extract_route_pattern};
 use rust::{
     extract_rust_impl_trait, extract_rust_macro_token_call, extract_rust_path_reference,
-    extract_rust_type_reference, extract_rust_use_imports, extract_rust_value_reference,
+    extract_rust_type_reference, extract_rust_value_reference,
 };
 use typescript::{extract_js_value_reference, extract_ts_type_reference};
 
@@ -678,199 +676,37 @@ fn walk_for_relations(
         results,
     );
 
-    // The axes not yet converted: imports, heritage, exports. Adding a language
-    // here still means adding an arm, and a missing one is a silently-dropped
-    // edge rather than a compile error.
+    // The `imports` axis is a TABLE too (`imports::IMPORT_PASSES`). It is the
+    // axis where grammars disagree most about spelling — `import_declaration`
+    // alone means two different shapes in Swift and Java — so the (language,
+    // node kind) → extractor mapping is data, and a language missing from it is
+    // a visible empty slot rather than an absent arm. Returns true when a row
+    // fired; the kinds it owns are disjoint from every arm left below, so the
+    // early return is belt and braces against a future overlap.
+    //
+    // The result is deliberately discarded rather than used to skip the match:
+    // the two kind sets are disjoint, so short-circuiting would only hide a
+    // future overlap instead of letting the arm double-emit visibly. The child
+    // recursion below runs either way — the walk's scope bookkeeping is shared.
+    let _fired = imports::run_import_passes(
+        &imports::ImportCtx {
+            node,
+            source,
+            language,
+            config,
+            active_scope,
+        },
+        results,
+    );
+
+    // The axes not yet converted: heritage and exports. Their arms are not
+    // uniform the way the tabled ones are — heritage dispatches on the
+    // `is_heritage_decl` PREDICATE rather than a fixed kind list, and the C#
+    // `base_list` arm additionally inspects the PARENT node kind — so
+    // converting them means widening the row shape, not moving bodies. Adding a
+    // language here still means adding an arm, and a missing one is a
+    // silently-dropped edge rather than a compile error.
     match kind {
-        // PHP file includes: require / require_once / include / include_once
-        // 'path/File.php' → IMPORTS to the bare file stem. Mirrors the C/C++
-        // `#include` and JS `require` shape: strip the directory and the `.php`
-        // extension so Phase 2 can resolve the import to a concrete file node.
-        // Without this arm, PHP files got symbols + calls + `use` imports but no
-        // file-include edges, so deps/cycles/affected/project_map under-reported
-        // PHP cross-file dependencies (the AST node is a dedicated
-        // `*_expression`, never a function_call_expression, so no double-count).
-        "require_expression"
-        | "require_once_expression"
-        | "include_expression"
-        | "include_once_expression"
-            if config.name == "php" =>
-        {
-            if let Some(raw) = extract_string_from_subtree(&node, source) {
-                let stem = {
-                    let bare = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_str());
-                    bare.strip_suffix(".php").unwrap_or(bare).to_string()
-                };
-                if !stem.is_empty() {
-                    // Stamp the raw include path so Phase 2 can resolve it to the
-                    // concrete indexed file (require_once 'lib.php' → lib.php's
-                    // <module> node), mirroring the JS `js_module` specifier.
-                    // target_name stays the bare stem for the name-based fallback
-                    // when the path doesn't resolve to an indexed file.
-                    let metadata = Some(serde_json::json!({ "php_include": &raw }).to_string());
-                    results.push(ParsedRelation {
-                        source_name: "<module>".into(),
-                        target_name: stem,
-                        relation: REL_IMPORTS.into(),
-                        metadata,
-                        source_language: String::new(),
-                    });
-                }
-            }
-        }
-
-        // PHP: use App\Models\User;
-        // namespace_use_declaration -> namespace_use_clause -> qualified_name -> name (last segment)
-        "namespace_use_declaration" if config.name == "php" => {
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "namespace_use_clause" {
-                        // Get the last `name` segment from the qualified_name
-                        fn find_last_name(n: &tree_sitter::Node, source: &str) -> Option<String> {
-                            find_last_name_inner(n, source, 0)
-                        }
-                        fn find_last_name_inner(
-                            n: &tree_sitter::Node,
-                            source: &str,
-                            depth: usize,
-                        ) -> Option<String> {
-                            if depth > MAX_SUBTREE_DEPTH {
-                                return None;
-                            }
-                            let mut result = None;
-                            for i in 0..n.child_count() {
-                                if let Some(child) = n.child(i) {
-                                    if child.kind() == "name" {
-                                        result = Some(node_text(&child, source).to_string());
-                                    } else if child.kind() == "qualified_name"
-                                        || child.kind() == "namespace_name"
-                                    {
-                                        if let Some(inner) =
-                                            find_last_name_inner(&child, source, depth + 1)
-                                        {
-                                            result = Some(inner);
-                                        }
-                                    }
-                                }
-                            }
-                            result
-                        }
-                        if let Some(name) = find_last_name(&child, source) {
-                            if !name.is_empty() {
-                                results.push(ParsedRelation {
-                                    source_name: "<module>".into(),
-                                    target_name: name,
-                                    relation: REL_IMPORTS.into(),
-                                    metadata: None,
-                                    source_language: String::new(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Swift: import Foundation, import UIKit
-        // AST: import_declaration -> identifier -> simple_identifier
-        "import_declaration" if config.name == "swift" => {
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "identifier" {
-                        // identifier may contain simple_identifier children (dotted: Foundation.NSObject)
-                        // Use the full text as the import target
-                        let name = node_text(&child, source).to_string();
-                        if !name.is_empty() {
-                            results.push(ParsedRelation {
-                                source_name: "<module>".into(),
-                                target_name: name,
-                                relation: REL_IMPORTS.into(),
-                                metadata: None,
-                                source_language: String::new(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Java: import p.B; import java.util.List; import static x.Y.z;
-        // AST: import_declaration -> scoped_identifier(scope, name) | identifier,
-        //      optional trailing `.asterisk` for on-demand imports.
-        // Target = the LAST segment (the imported type / static member), mirroring
-        // Kotlin's qualified_identifier handling. A wildcard import (`java.util.*`)
-        // names no single symbol → skip (never emit the package segment or `*`).
-        "import_declaration" if config.name == "java" => {
-            let is_wildcard = (0..node.child_count())
-                .any(|i| node.child(i).is_some_and(|c| c.kind() == "asterisk"));
-            if !is_wildcard {
-                let target = node.named_child(0).and_then(|first| match first.kind() {
-                    "scoped_identifier" => first
-                        .child_by_field_name("name")
-                        .map(|n| node_text(&n, source).to_string()),
-                    "identifier" => Some(node_text(&first, source).to_string()),
-                    _ => None,
-                });
-                if let Some(name) = target {
-                    if !name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: "<module>".into(),
-                            target_name: name,
-                            relation: REL_IMPORTS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Dart: import 'dart:async'; import 'package:foo/bar.dart';
-        "import_or_export" if config.name == "dart" => {
-            extract_dart_imports(&node, source, results);
-        }
-
-        // Import statements
-        "import_statement" => {
-            if config.name == "python" {
-                extract_python_import_names(&node, source, results);
-            } else {
-                extract_import_names(&node, source, results);
-            }
-        }
-
-        // Kotlin: import kotlinx.coroutines.flow.Flow
-        // AST: import -> qualified_identifier -> identifier*
-        // Extract the last identifier segment as the import target
-        "import" if config.name == "kotlin" => {
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "qualified_identifier" {
-                        let count = child.named_child_count();
-                        if count > 0 {
-                            if let Some(last) = child.named_child(count - 1) {
-                                let name = node_text(&last, source).to_string();
-                                if !name.is_empty() && name != "*" {
-                                    results.push(ParsedRelation {
-                                        source_name: "<module>".into(),
-                                        target_name: name,
-                                        relation: REL_IMPORTS.into(),
-                                        metadata: None,
-                                        source_language: String::new(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Python: from X import Y
-        "import_from_statement" => {
-            extract_python_from_import_names(&node, source, results);
-        }
-
         // Heritage-carrying declarations. See [`HERITAGE_DECL_KINDS`] — this arm
         // used to list only the three class-shaped kinds, so a Java `interface`,
         // a Kotlin `object`, a Swift `protocol` and the rest emitted NOTHING.
@@ -959,30 +795,6 @@ fn walk_for_relations(
             }
         }
 
-        // Rust: use std::collections::HashMap;
-        // Also handles grouped imports: use std::collections::{HashMap, HashSet};
-        "use_declaration" => {
-            extract_rust_use_imports(&node, source, active_scope, results);
-        }
-
-        // Go: import "fmt" or import alias "fmt"
-        "import_spec" => {
-            if let Some(path_node) = node.child_by_field_name("path") {
-                let path_text = node_text(&path_node, source).trim_matches('"').to_string();
-                if let Some(pkg_name) = path_text.rsplit('/').next() {
-                    if !pkg_name.is_empty() {
-                        results.push(ParsedRelation {
-                            source_name: active_scope.unwrap_or("<module>").to_string(),
-                            target_name: pkg_name.to_string(),
-                            relation: REL_IMPORTS.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
         // Go: struct/interface embedding → inherits (method promotion / interface
         // composition — Go's idiomatic "is-a"). Gated on Go because `type_spec` is
         // a Go-grammar node; the guard keeps any other grammar's same-named node
@@ -997,26 +809,6 @@ fn walk_for_relations(
         "decorated_definition" => {
             if let Some(route_rel) = extract_python_route(&node, source) {
                 results.push(route_rel);
-            }
-        }
-
-        // C# using directives: using System; using System.Collections.Generic;
-        "using_directive" if config.name == "csharp" => {
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    if child.kind() == "qualified_name" || child.kind() == "identifier" {
-                        let name = node_text(&child, source).to_string();
-                        if !name.is_empty() && name != "using" {
-                            results.push(ParsedRelation {
-                                source_name: "<module>".into(),
-                                target_name: name,
-                                relation: REL_IMPORTS.into(),
-                                metadata: None,
-                                source_language: String::new(),
-                            });
-                        }
-                    }
-                }
             }
         }
 
@@ -1071,42 +863,6 @@ fn walk_for_relations(
         //         `#include <stdio.h>` → IMPORTS to "stdio"
         // Header extension stripped so cross-file resolution can match the
         // bare module name (mirrors JS require pattern).
-        "preproc_include" if matches!(config.name, "c" | "cpp") => {
-            let path_node = (0..node.named_child_count())
-                .filter_map(|i| node.named_child(i))
-                .find(|c| matches!(c.kind(), "string_literal" | "system_lib_string"));
-            if let Some(p) = path_node {
-                let raw = node_text(&p, source);
-                // string_literal text includes quotes; system_lib_string
-                // includes angle brackets. Trim both forms uniformly.
-                let unquoted = raw.trim_matches(|c| c == '"' || c == '<' || c == '>');
-                if !unquoted.is_empty() {
-                    let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
-                    let stem = last
-                        .trim_end_matches(".hpp")
-                        .trim_end_matches(".hxx")
-                        .trim_end_matches(".hh")
-                        .trim_end_matches(".h");
-                    if !stem.is_empty() {
-                        // Stamp the raw include path so Phase 2 can resolve it to
-                        // the concrete indexed header's <module> node (mirrors the
-                        // PHP `php_include` / JS `js_module` specifiers). target_name
-                        // stays the bare stem for the name-based fallback when the
-                        // path doesn't resolve to an indexed file (system headers).
-                        let metadata =
-                            Some(serde_json::json!({ "c_include": unquoted }).to_string());
-                        results.push(ParsedRelation {
-                            source_name: "<module>".into(),
-                            target_name: stem.to_string(),
-                            relation: REL_IMPORTS.into(),
-                            metadata,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
         _ => {}
     }
 

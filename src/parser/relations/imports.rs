@@ -1,13 +1,422 @@
-//! Generic and Python-specific import extraction.
+//! The `imports` axis, one table row per (language, node kind), plus the
+//! extractors it names.
+//!
 //! Generic side handles JS/TS/Java-style `import { Foo } from '...'` shapes
 //! by walking import_clause/import_specifier subtrees. Python side keeps its
 //! own paths because `from X import Y, Z` carries module-resolution metadata
 //! that other languages don't have.
+//!
+//! These were arms of `walk_for_relations`'s match, the shape this crate keeps
+//! getting bitten by: one arm per language per relation, where a missing arm is
+//! not a compile error but a silently absent edge. `imports` is the axis where
+//! every grammar spells the same idea differently — `import_declaration` (Swift,
+//! Java) / `import_statement` (JS/TS, Python) / `import` (Kotlin) /
+//! `import_spec` (Go) / `use_declaration` (Rust) / `using_directive` (C#) /
+//! `namespace_use_declaration` plus four `*_expression` include forms (PHP) /
+//! `preproc_include` (C/C++) / `import_or_export` (Dart) — so the mapping is
+//! data, and as data it is enumerable: a language missing from the table is a
+//! visible empty slot instead of an `if` nobody notices is gone.
+//!
+//! Sibling tables: `calls::CALL_PASSES`, `super::REFERENCE_PASSES`. The axes
+//! still living in the match are heritage and exports; their arms are not
+//! uniform in the way these are (heritage dispatches on the
+//! `is_heritage_decl` PREDICATE rather than a fixed kind list, and the C#
+//! `base_list` arm additionally inspects the PARENT node kind), so converting
+//! them means widening the row shape, not moving bodies.
 
+use super::super::lang_config::LanguageConfig;
 use super::super::node_text;
-use super::helpers::MAX_SUBTREE_DEPTH;
-use super::ParsedRelation;
+use super::helpers::{extract_string_from_subtree, MAX_SUBTREE_DEPTH};
+use super::{LangKey, ParsedRelation};
 use crate::domain::REL_IMPORTS;
+
+/// Everything an import extractor is allowed to see. Mirrors `calls::CallCtx`:
+/// the resolved context arrives as data so the extractor does not have to be a
+/// closure over `walk_for_relations`'s locals — which is what kept these
+/// bodies inside the walk in the first place.
+pub(super) struct ImportCtx<'a> {
+    pub node: tree_sitter::Node<'a>,
+    pub source: &'a str,
+    pub language: &'a str,
+    pub config: &'a LanguageConfig,
+    /// The enclosing symbol, when there is one. Only Rust `use` and Go
+    /// `import_spec` read it — both can appear inside a function body, and both
+    /// attribute the edge to that function rather than to `<module>`.
+    pub active_scope: Option<&'a str>,
+}
+
+impl ImportCtx<'_> {
+    /// The `<module>`-level source name every other extractor here uses.
+    fn module_import(&self, target: String, metadata: Option<String>) -> ParsedRelation {
+        ParsedRelation {
+            source_name: "<module>".into(),
+            target_name: target,
+            relation: REL_IMPORTS.into(),
+            metadata,
+            source_language: String::new(),
+        }
+    }
+}
+
+type ImportExtractor = fn(&ImportCtx, &mut Vec<ParsedRelation>);
+
+/// `langs` for a row whose node kind is itself the guard, because no other
+/// grammar spells that kind — same convention as `calls::ANY_LANG`, and the
+/// opposite of `REFERENCE_PASSES`, where an empty `langs` is an inert row.
+pub(super) const ANY_LANG: &[&str] = &[];
+
+pub(super) struct ImportPass {
+    /// Which language name to match on — see [`LangKey`]. Irrelevant for
+    /// [`ANY_LANG`] rows.
+    pub key: LangKey,
+    pub langs: &'static [&'static str],
+    pub kinds: &'static [&'static str],
+    pub extract: ImportExtractor,
+}
+
+/// The `imports` axis. Order is the original match order; first match wins.
+pub(super) const IMPORT_PASSES: &[ImportPass] = &[
+    // PHP file includes: require / require_once / include / include_once.
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["php"],
+        kinds: &[
+            "require_expression",
+            "require_once_expression",
+            "include_expression",
+            "include_once_expression",
+        ],
+        extract: extract_php_include,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["php"],
+        kinds: &["namespace_use_declaration"],
+        extract: extract_php_use,
+    },
+    // `import_declaration` is claimed by two grammars that mean different
+    // shapes by it — this is exactly the collision the table makes visible.
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["swift"],
+        kinds: &["import_declaration"],
+        extract: extract_swift_import,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["java"],
+        kinds: &["import_declaration"],
+        extract: extract_java_import,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["dart"],
+        kinds: &["import_or_export"],
+        extract: extract_dart_import,
+    },
+    // JS/TS and Python share the kind; the split stays inside the extractor,
+    // matching the CALL_PASSES convention for a kind no grammar disputes.
+    ImportPass {
+        key: LangKey::Family,
+        langs: ANY_LANG,
+        kinds: &["import_statement"],
+        extract: extract_import_statement,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["kotlin"],
+        kinds: &["import"],
+        extract: extract_kotlin_import,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: ANY_LANG,
+        kinds: &["import_from_statement"],
+        extract: extract_python_from_import,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: ANY_LANG,
+        kinds: &["use_declaration"],
+        extract: extract_rust_use,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: ANY_LANG,
+        kinds: &["import_spec"],
+        extract: extract_go_import_spec,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["csharp"],
+        kinds: &["using_directive"],
+        extract: extract_csharp_using,
+    },
+    ImportPass {
+        key: LangKey::Family,
+        langs: &["c", "cpp"],
+        kinds: &["preproc_include"],
+        extract: extract_c_include,
+    },
+];
+
+/// Run the first table row matching this node. Returns true when a row fired,
+/// so the caller can skip the kinds this table owns.
+///
+/// First-match-wins, not run-them-all: these rows were `match` arms, where one
+/// arm excludes the others.
+pub(super) fn run_import_passes(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) -> bool {
+    let kind = ctx.node.kind();
+    for pass in IMPORT_PASSES {
+        if !pass.kinds.contains(&kind) {
+            continue;
+        }
+        if !pass.langs.is_empty() {
+            let lang = match pass.key {
+                LangKey::Raw => ctx.language,
+                LangKey::Family => ctx.config.name,
+            };
+            if !pass.langs.contains(&lang) {
+                continue;
+            }
+        }
+        (pass.extract)(ctx, results);
+        return true;
+    }
+    false
+}
+
+// ── extractors ───────────────────────────────────────────────────────────────
+
+/// PHP `require 'path/File.php'` → IMPORTS to the bare file stem. Mirrors the
+/// C/C++ `#include` and JS `require` shape: strip the directory and the `.php`
+/// extension so Phase 2 can resolve the import to a concrete file node. Without
+/// it PHP files got symbols + calls + `use` imports but no file-include edges,
+/// so deps/cycles/affected/project_map under-reported PHP cross-file
+/// dependencies. The AST node is a dedicated `*_expression`, never a
+/// `function_call_expression`, so there is no double-count with the calls axis.
+fn extract_php_include(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    let Some(raw) = extract_string_from_subtree(&ctx.node, ctx.source) else {
+        return;
+    };
+    let stem = {
+        let bare = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_str());
+        bare.strip_suffix(".php").unwrap_or(bare).to_string()
+    };
+    if stem.is_empty() {
+        return;
+    }
+    // Stamp the raw include path so Phase 2 can resolve it to the concrete
+    // indexed file (require_once 'lib.php' → lib.php's <module> node),
+    // mirroring the JS `js_module` specifier. target_name stays the bare stem
+    // for the name-based fallback when the path doesn't resolve.
+    let metadata = Some(serde_json::json!({ "php_include": &raw }).to_string());
+    results.push(ctx.module_import(stem, metadata));
+}
+
+/// PHP `use App\Models\User;`
+/// namespace_use_declaration → namespace_use_clause → qualified_name → name.
+fn extract_php_use(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    fn find_last_name(n: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+        if depth > MAX_SUBTREE_DEPTH {
+            return None;
+        }
+        let mut result = None;
+        for i in 0..n.child_count() {
+            if let Some(child) = n.child(i) {
+                if child.kind() == "name" {
+                    result = Some(node_text(&child, source).to_string());
+                } else if matches!(child.kind(), "qualified_name" | "namespace_name") {
+                    if let Some(inner) = find_last_name(&child, source, depth + 1) {
+                        result = Some(inner);
+                    }
+                }
+            }
+        }
+        result
+    }
+    for i in 0..ctx.node.named_child_count() {
+        let Some(child) = ctx.node.named_child(i) else {
+            continue;
+        };
+        if child.kind() != "namespace_use_clause" {
+            continue;
+        }
+        if let Some(name) = find_last_name(&child, ctx.source, 0) {
+            if !name.is_empty() {
+                results.push(ctx.module_import(name, None));
+            }
+        }
+    }
+}
+
+/// Swift `import Foundation`. The `identifier` may itself contain
+/// simple_identifier children (dotted: `Foundation.NSObject`); the full text is
+/// the import target.
+fn extract_swift_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    for i in 0..ctx.node.named_child_count() {
+        let Some(child) = ctx.node.named_child(i) else {
+            continue;
+        };
+        if child.kind() != "identifier" {
+            continue;
+        }
+        let name = node_text(&child, ctx.source).to_string();
+        if !name.is_empty() {
+            results.push(ctx.module_import(name, None));
+        }
+    }
+}
+
+/// Java `import p.B; import java.util.List; import static x.Y.z;`
+/// AST: import_declaration → scoped_identifier(scope, name) | identifier, with
+/// an optional trailing `.asterisk` for on-demand imports. Target = the LAST
+/// segment (the imported type / static member), mirroring Kotlin. A wildcard
+/// import names no single symbol → skip (never emit the package segment or `*`).
+fn extract_java_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    let is_wildcard = (0..ctx.node.child_count())
+        .any(|i| ctx.node.child(i).is_some_and(|c| c.kind() == "asterisk"));
+    if is_wildcard {
+        return;
+    }
+    let target = ctx
+        .node
+        .named_child(0)
+        .and_then(|first| match first.kind() {
+            "scoped_identifier" => first
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, ctx.source).to_string()),
+            "identifier" => Some(node_text(&first, ctx.source).to_string()),
+            _ => None,
+        });
+    if let Some(name) = target {
+        if !name.is_empty() {
+            results.push(ctx.module_import(name, None));
+        }
+    }
+}
+
+/// Dart `import 'dart:async'; import 'package:foo/bar.dart';`
+fn extract_dart_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    super::dart::extract_dart_imports(&ctx.node, ctx.source, results);
+}
+
+/// JS/TS `import … from '…'` and Python `import X`. One kind, two grammars that
+/// agree on the spelling and disagree on the payload, so the split is here
+/// rather than in two table rows with an open-ended "everything else" language
+/// list.
+fn extract_import_statement(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    if ctx.config.name == "python" {
+        extract_python_import_names(&ctx.node, ctx.source, results);
+    } else {
+        extract_import_names(&ctx.node, ctx.source, results);
+    }
+}
+
+/// Kotlin `import kotlinx.coroutines.flow.Flow`
+/// AST: import → qualified_identifier → identifier*; the last segment is the
+/// target.
+fn extract_kotlin_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    for i in 0..ctx.node.named_child_count() {
+        let Some(child) = ctx.node.named_child(i) else {
+            continue;
+        };
+        if child.kind() != "qualified_identifier" {
+            continue;
+        }
+        let count = child.named_child_count();
+        if count == 0 {
+            continue;
+        }
+        if let Some(last) = child.named_child(count - 1) {
+            let name = node_text(&last, ctx.source).to_string();
+            if !name.is_empty() && name != "*" {
+                results.push(ctx.module_import(name, None));
+            }
+        }
+    }
+}
+
+/// Python `from X import Y`.
+fn extract_python_from_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    extract_python_from_import_names(&ctx.node, ctx.source, results);
+}
+
+/// Rust `use std::collections::HashMap;`, including the grouped form
+/// `use std::collections::{HashMap, HashSet};`.
+fn extract_rust_use(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    super::rust::extract_rust_use_imports(&ctx.node, ctx.source, ctx.active_scope, results);
+}
+
+/// Go `import "fmt"` / `import alias "fmt"`. Attributed to the enclosing scope
+/// when there is one, unlike every other row here.
+fn extract_go_import_spec(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    let Some(path_node) = ctx.node.child_by_field_name("path") else {
+        return;
+    };
+    let path_text = node_text(&path_node, ctx.source)
+        .trim_matches('"')
+        .to_string();
+    let Some(pkg_name) = path_text.rsplit('/').next() else {
+        return;
+    };
+    if pkg_name.is_empty() {
+        return;
+    }
+    results.push(ParsedRelation {
+        source_name: ctx.active_scope.unwrap_or("<module>").to_string(),
+        target_name: pkg_name.to_string(),
+        relation: REL_IMPORTS.into(),
+        metadata: None,
+        source_language: String::new(),
+    });
+}
+
+/// C# `using System; using System.Collections.Generic;`
+fn extract_csharp_using(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    for i in 0..ctx.node.named_child_count() {
+        let Some(child) = ctx.node.named_child(i) else {
+            continue;
+        };
+        if !matches!(child.kind(), "qualified_name" | "identifier") {
+            continue;
+        }
+        let name = node_text(&child, ctx.source).to_string();
+        if !name.is_empty() && name != "using" {
+            results.push(ctx.module_import(name, None));
+        }
+    }
+}
+
+/// C/C++ `#include "foo/bar.h"` / `#include <vector>`.
+fn extract_c_include(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
+    let path_node = (0..ctx.node.named_child_count())
+        .filter_map(|i| ctx.node.named_child(i))
+        .find(|c| matches!(c.kind(), "string_literal" | "system_lib_string"));
+    let Some(p) = path_node else { return };
+    let raw = node_text(&p, ctx.source);
+    // string_literal text includes quotes; system_lib_string includes angle
+    // brackets. Trim both forms uniformly.
+    let unquoted = raw.trim_matches(|c| c == '"' || c == '<' || c == '>');
+    if unquoted.is_empty() {
+        return;
+    }
+    let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
+    let stem = last
+        .trim_end_matches(".hpp")
+        .trim_end_matches(".hxx")
+        .trim_end_matches(".hh")
+        .trim_end_matches(".h");
+    if stem.is_empty() {
+        return;
+    }
+    // Stamp the raw include path so Phase 2 can resolve it to the concrete
+    // indexed header's <module> node (mirrors the PHP `php_include` / JS
+    // `js_module` specifiers). target_name stays the bare stem for the
+    // name-based fallback when the path doesn't resolve (system headers).
+    let metadata = Some(serde_json::json!({ "c_include": unquoted }).to_string());
+    results.push(ctx.module_import(stem.to_string(), metadata));
+}
 
 pub(super) fn extract_import_names(
     node: &tree_sitter::Node,
