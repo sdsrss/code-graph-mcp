@@ -119,13 +119,21 @@ pub fn run_full_index(
     model: Option<&EmbeddingModel>,
     progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
-    let current_hashes = scan_directory(project_root)?;
-    let files: Vec<String> = current_hashes.keys().cloned().collect();
+    // Walk only — no pre-hashing. A full index diffs against nothing, and the
+    // pipeline reads each file's bytes to parse it anyway, so hashing here made
+    // every file a double full read (audit 2026-08-22 P2-16). `pre_parse_batch`
+    // computes the hash from the bytes it already holds when the caller supplies
+    // none; only files it never reads (over the size gate) pay a read to be
+    // hashed, which is what they cost before too.
+    let files: Vec<String> = crate::indexer::merkle::walk_indexable_files(project_root)?
+        .into_iter()
+        .map(|(rel, _abs)| rel)
+        .collect();
     index_files(
         db,
         project_root,
         &files,
-        &current_hashes,
+        &HashMap::new(),
         model,
         &[],
         progress,

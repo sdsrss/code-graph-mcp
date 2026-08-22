@@ -312,6 +312,17 @@ fn warn_skipped_symlinks(skipped: &[String]) {
 }
 
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
+    Ok(hash_files_parallel(&walk_indexable_files(root)?))
+}
+
+/// The walk WITHOUT the hashing — every eligible `(relative, absolute)` pair.
+///
+/// A full index does not need pre-computed hashes: nothing is being diffed
+/// against, and the pipeline reads each file's bytes anyway to parse it. Hashing
+/// here first meant every file was read twice end to end (audit 2026-08-22
+/// P2-16). The incremental path still calls [`scan_directory`], where the hash
+/// IS the point — it is what `compute_diff` compares.
+pub fn walk_indexable_files(root: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
     // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
         .hidden(true) // skip hidden files
@@ -356,7 +367,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     }
     warn_skipped_symlinks(&skipped_symlinks);
 
-    Ok(hash_files_parallel(&file_paths))
+    Ok(file_paths)
 }
 
 /// Hash a list of (relative_path, absolute_path) pairs in parallel using rayon.

@@ -212,14 +212,19 @@ fn pre_parse_batch(
             // Resolve the hash up front so an oversize file can still be
             // RECORDED (we know exactly which bytes we are declining to parse).
             // Falls back to hashing only when the caller did not supply one.
-            let known_hash = match hashes.get(rel_path.as_str()) {
-                Some(h) => Some(h.clone()),
-                None => hash_file(&abs_path).ok(),
-            };
+            // A caller with hashes already in hand (the incremental paths, the
+            // query-time refresh) supplies them; a full index does not, and for
+            // those the hash comes from the bytes read below rather than from a
+            // second full read of the same file (audit 2026-08-22 P2-16).
+            let provided_hash = hashes.get(rel_path.as_str()).cloned();
             if let Some(ref meta) = file_meta {
                 if meta.len() > max_file_size() {
                     tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
                     counters.size.fetch_add(1, AtomicOrdering::Relaxed);
+                    // This branch never reads the file, so an unsupplied hash
+                    // still costs one read — unchanged from before, and it
+                    // applies only to files we refuse to parse.
+                    let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
                     return match known_hash {
                         Some(hash) => PreParseOutcome::Skipped(SkippedFile {
                             rel_path: rel_path.clone(),
@@ -252,14 +257,10 @@ fn pre_parse_batch(
                 language = "cpp";
             }
 
-            let hash = match known_hash {
-                Some(h) => h,
-                None => {
-                    tracing::warn!("Skipping file (hash error): {}", rel_path);
-                    counters.hash.fetch_add(1, AtomicOrdering::Relaxed);
-                    return PreParseOutcome::Nothing;
-                }
-            };
+            // `read_to_string` succeeded, so these bytes ARE the file's bytes —
+            // `hash_file` streams the same content through the same hasher.
+            let hash = provided_hash
+                .unwrap_or_else(|| blake3::hash(source.as_bytes()).to_hex().to_string());
 
             let tree = match parse_tree(&source, language) {
                 Ok(t) => t,
