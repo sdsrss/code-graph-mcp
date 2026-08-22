@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.124.0 (2026-08-22)
 
 > **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 65 → 67:
 > Rust calls qualified with the crate's own package name now produce edges they
