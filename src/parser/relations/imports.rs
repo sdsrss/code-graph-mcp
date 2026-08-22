@@ -17,12 +17,8 @@
 //! data, and as data it is enumerable: a language missing from the table is a
 //! visible empty slot instead of an `if` nobody notices is gone.
 //!
-//! Sibling tables: `calls::CALL_PASSES`, `super::REFERENCE_PASSES`. The axes
-//! still living in the match are heritage and exports; their arms are not
-//! uniform in the way these are (heritage dispatches on the
-//! `is_heritage_decl` PREDICATE rather than a fixed kind list, and the C#
-//! `base_list` arm additionally inspects the PARENT node kind), so converting
-//! them means widening the row shape, not moving bodies.
+//! Sibling tables: `calls::CALL_PASSES`, `inherits::HERITAGE_PASSES`,
+//! `exports::EXPORT_PASSES`, `super::REFERENCE_PASSES`.
 
 use super::super::lang_config::LanguageConfig;
 use super::super::node_text;

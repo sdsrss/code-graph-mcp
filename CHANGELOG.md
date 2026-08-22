@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### The heritage and export axes are tables, finishing the walk conversion
+
+`walk_for_relations` had three of its five relation axes as tables and two as
+hand-written `match` arms. The arms' own comment named the cost: "adding a
+language here still means adding an arm, and a missing one is a
+silently-dropped edge rather than a compile error" — the exact shape that
+produced the v0.83.0 per-language gaps and the 2026-08-16 heritage gaps, where
+a Java `interface`, a Kotlin `object` and a Swift `protocol` emitted no
+inheritance edges at all and nothing failed.
+
+Two things were said to block the conversion, and only one was real. Heritage
+was described as dispatching on the `is_heritage_decl` PREDICATE rather than a
+fixed kind list — but that predicate was `HERITAGE_DECL_KINDS.contains`, a kind
+list wearing a function, so the row just points at the same const. The C#
+`base_list` arm inspecting its PARENT node kind is real, and it is why
+`HeritagePass` carries `not_under`: one field, not a new dispatch mechanism. It
+is what keeps `enum Level : byte` from emitting `Level inherits byte`.
+
+The conversion changes one semantic that has to be paid for rather than
+assumed. A `match` is first-match-wins, and the C++/Rust/Go/C# arms depended on
+it — `HERITAGE_DECL_KINDS` deliberately omits `class_specifier` precisely
+because the C++ arm sat later in the same match. The tables run EVERY matching
+row, so `no_node_kind_reaches_two_heritage_or_export_rows` now asserts what
+`match` used to enforce: two rows may share a node kind only when their
+language gates cannot both admit the same language. All three of its rejection
+paths were verified by mutation (an ANY_LANG overlap, a raw-vs-family key
+mismatch, and two same-key rows sharing a language).
+
+Verified as edge-neutral rather than argued to be: both binaries indexed this
+repository (36,547 files — Rust `impl_item`, JS/TS ESM and CommonJS exports)
+and 2,385 files of third-party Python (the `class_definition` heritage row),
+and the full edge sets — source, target, relation, metadata and confidence —
+came back byte-identical, 10,834 and 397,119 rows. Go `type_spec` and C#
+`base_list` have no corpus on this machine; they are covered by the existing
+unit tests, including the `enum Level : byte` negative control for `not_under`.
+No INDEX_VERSION bump: extraction output does not move.
+
+The `routes` axis keeps one arm in the walk — Python's `decorated_definition`,
+because Flask/FastAPI spell a route as a decorator while Express and axum spell
+it as a call and arrive through `CALL_PASSES`. A one-row table is a shape
+without evidence for it.
+
 ### A Python package's non-package subdirectories are no longer import roots
 
 `import_roots` decided whether a directory was importable-from by asking

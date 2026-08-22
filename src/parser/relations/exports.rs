@@ -1,13 +1,104 @@
-//! TypeScript/JavaScript export-statement extraction.
-//! Captures `export function`, `export class`, `export interface`,
-//! `export type`, `export enum`, `export abstract class`, and
-//! `export const|let` declarations as REL_EXPORTS edges off `<module>`,
-//! plus `export { X } from './mod'` re-exports (barrel/index files) as
-//! REL_IMPORTS dependency edges.
+//! The `exports` axis, one table row per (language, node kind), plus the
+//! extractors it names.
+//!
+//! TypeScript/JavaScript export-statement extraction. Captures
+//! `export function`, `export class`, `export interface`, `export type`,
+//! `export enum`, `export abstract class`, and `export const|let` declarations
+//! as REL_EXPORTS edges off `<module>`, plus `export { X } from './mod'`
+//! re-exports (barrel/index files) as REL_IMPORTS dependency edges, plus the
+//! CommonJS forms.
+//!
+//! Sibling tables: `calls::CALL_PASSES`, `imports::IMPORT_PASSES`,
+//! `inherits::HERITAGE_PASSES`, `super::REFERENCE_PASSES`. This axis is the
+//! smallest of them — two rows — but it was carved out of the same
+//! first-match-wins match for the same reason: a language missing from a table
+//! is a visible empty slot, while a missing `match` arm is an absent edge
+//! nobody notices.
 
+use super::super::lang_config::LanguageConfig;
 use super::super::node_text;
-use super::ParsedRelation;
+use super::{LangKey, ParsedRelation};
 use crate::domain::{REL_EXPORTS, REL_IMPORTS};
+
+/// Everything an export extractor is allowed to see. Mirrors
+/// `inherits::HeritageCtx`; neither row needs the enclosing scope, because an
+/// export edge is always attributed to `<module>`.
+pub(super) struct ExportCtx<'a> {
+    pub node: tree_sitter::Node<'a>,
+    pub source: &'a str,
+    /// Carried for [`LangKey::Raw`] rows. No row uses one today; the field
+    /// exists so that adding one resolves against the raw language rather than
+    /// silently against the family, which is the "declared but not honored"
+    /// failure this repo keeps paying for.
+    pub language: &'a str,
+    pub config: &'a LanguageConfig,
+}
+
+type ExportExtractor = fn(&ExportCtx, &mut Vec<ParsedRelation>);
+
+/// `langs` for a row whose node kind is itself the guard — same convention as
+/// `calls::ANY_LANG`.
+pub(super) const ANY_LANG: &[&str] = &[];
+
+pub(super) struct ExportPass {
+    /// Which language name to match on — see [`LangKey`]. Irrelevant for
+    /// [`ANY_LANG`] rows.
+    pub key: LangKey,
+    pub langs: &'static [&'static str],
+    pub kinds: &'static [&'static str],
+    pub extract: ExportExtractor,
+}
+
+/// The `exports` axis. Order is the original match order.
+pub(super) const EXPORT_PASSES: &[ExportPass] = &[
+    // ESM. `export_statement` is spelled by no grammar but JS/TS/TSX, so the
+    // kind is its own guard.
+    ExportPass {
+        key: LangKey::Family,
+        langs: ANY_LANG,
+        kinds: &["export_statement"],
+        extract: run_export_names,
+    },
+    // CommonJS (`module.exports = { f }`, `exports.f = g`). The ESM row has no
+    // counterpart for them, so dead-code classified an unused CJS export as an
+    // ORPHAN — "nothing references this" — while the identical ESM code came
+    // back EXPORTED_UNUSED. `assignment_expression` IS spelled by other
+    // grammars, hence the language gate.
+    ExportPass {
+        key: LangKey::Family,
+        langs: &["javascript", "typescript", "tsx"],
+        kinds: &["assignment_expression"],
+        extract: run_cjs_exports,
+    },
+];
+
+/// Run every [`EXPORT_PASSES`] row that matches this node.
+pub(super) fn run_export_passes(ctx: &ExportCtx, results: &mut Vec<ParsedRelation>) {
+    let kind = ctx.node.kind();
+    for pass in EXPORT_PASSES {
+        if !pass.kinds.contains(&kind) {
+            continue;
+        }
+        if !pass.langs.is_empty() {
+            let lang = match pass.key {
+                LangKey::Raw => ctx.language,
+                LangKey::Family => ctx.config.name,
+            };
+            if !pass.langs.contains(&lang) {
+                continue;
+            }
+        }
+        (pass.extract)(ctx, results);
+    }
+}
+
+fn run_export_names(ctx: &ExportCtx, results: &mut Vec<ParsedRelation>) {
+    extract_export_names(&ctx.node, ctx.source, results);
+}
+
+fn run_cjs_exports(ctx: &ExportCtx, results: &mut Vec<ParsedRelation>) {
+    extract_cjs_exports(&ctx.node, ctx.source, results);
+}
 
 pub(super) fn extract_export_names(
     node: &tree_sitter::Node,

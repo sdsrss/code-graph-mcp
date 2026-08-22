@@ -20,18 +20,29 @@
 //! node kinds to the appropriate extractor. The RECURSION must stay in one place
 //! — it is what propagates `current_scope` / `current_class` / `current_rust_impl`
 //! down the tree, and splitting it per language would either duplicate the walk
-//! or lose that context. The EXTRACTION does not have to: the `references` and
-//! `calls` axes are tables (`REFERENCE_PASSES`, `calls::CALL_PASSES`) whose
-//! extractors receive the resolved context, which makes those axes enumerable —
-//! a language missing from a table is a visible empty slot rather than an absent
-//! `if` nobody notices. The remaining `match` arms (imports, heritage, exports)
-//! are the axes not yet converted.
+//! or lose that context. The EXTRACTION does not have to, and no longer does:
+//! every relation axis is a table whose extractors receive the resolved context
+//! as data — `REFERENCE_PASSES`, `calls::CALL_PASSES`, `imports::IMPORT_PASSES`,
+//! `inherits::HERITAGE_PASSES`, `exports::EXPORT_PASSES`. That makes each axis
+//! enumerable: a language missing from a table is a visible empty slot rather
+//! than an absent `if` nobody notices, which is the failure that produced the
+//! v0.83.0 per-language gaps and the 2026-08-16 heritage gaps.
+//!
+//! One arm is left in the `match`: the Python `decorated_definition` route,
+//! the sole walk-resident member of the `routes` axis (Express and axum routes
+//! are calls, so they arrive through `CALL_PASSES`). A one-row table is a shape
+//! without evidence; it becomes one when a second decorator-spelled framework
+//! arrives.
+//!
+//! The tables run EVERY matching row, where the `match` they replaced ran at
+//! most one. `super::tests::no_node_kind_reaches_two_heritage_or_export_rows`
+//! is what keeps that equivalent.
 
 use super::lang_config::LanguageConfig;
 use super::node_text;
+use crate::domain::MAX_RELATION_DEPTH;
 #[cfg(test)]
 use crate::domain::REL_IMPORTS;
-use crate::domain::{MAX_RELATION_DEPTH, REL_IMPLEMENTS, REL_INHERITS};
 use anyhow::Result;
 
 mod calls;
@@ -89,19 +100,17 @@ fn serialize_impl_method_metadata(ty: &str) -> String {
 #[cfg(test)]
 mod tests;
 
-use cpp::{extract_cpp_inheritance, extract_cpp_value_reference};
+use cpp::extract_cpp_value_reference;
 use dart::extract_dart_call_from_selector;
-use exports::{extract_cjs_exports, extract_export_names};
-use go::{extract_go_inheritance, extract_go_type_reference, extract_go_value_reference};
-use inherits::{extract_implements, extract_superclasses, is_heritage_decl};
+use go::{extract_go_type_reference, extract_go_value_reference};
 use java::extract_java_type_reference;
 use python::{
     extract_python_type_reference, extract_python_value_reference, infer_python_call_receiver_type,
 };
 use routes::{extract_python_route, extract_route_pattern};
 use rust::{
-    extract_rust_impl_trait, extract_rust_macro_token_call, extract_rust_path_reference,
-    extract_rust_type_reference, extract_rust_value_reference,
+    extract_rust_macro_token_call, extract_rust_path_reference, extract_rust_type_reference,
+    extract_rust_value_reference,
 };
 use typescript::{extract_js_value_reference, extract_ts_type_reference};
 
@@ -699,171 +708,45 @@ fn walk_for_relations(
         results,
     );
 
-    // The axes not yet converted: heritage and exports. Their arms are not
-    // uniform the way the tabled ones are — heritage dispatches on the
-    // `is_heritage_decl` PREDICATE rather than a fixed kind list, and the C#
-    // `base_list` arm additionally inspects the PARENT node kind — so
-    // converting them means widening the row shape, not moving bodies. Adding a
-    // language here still means adding an arm, and a missing one is a
-    // silently-dropped edge rather than a compile error.
-    match kind {
-        // Heritage-carrying declarations. See [`HERITAGE_DECL_KINDS`] — this arm
-        // used to list only the three class-shaped kinds, so a Java `interface`,
-        // a Kotlin `object`, a Swift `protocol` and the rest emitted NOTHING.
-        kind if is_heritage_decl(kind) => {
-            let class_name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(&n, source).to_string());
+    // The `heritage` axis (`inherits` + `implements`) is a TABLE too
+    // (`inherits::HERITAGE_PASSES`). Its row shape carries one field the other
+    // tables do not — `not_under`, the parent-kind veto that keeps a C#
+    // `enum Level : byte` from emitting `Level inherits byte` — because that
+    // arm was the only genuinely non-uniform one. The other stated blocker,
+    // "heritage dispatches on a PREDICATE", was not one: `is_heritage_decl` was
+    // `HERITAGE_DECL_KINDS.contains`, so the row simply points at that const.
+    inherits::run_heritage_passes(
+        &inherits::HeritageCtx {
+            node,
+            source,
+            language,
+            config,
+            active_scope,
+        },
+        results,
+    );
 
-            if let Some(ref cls) = class_name {
-                // Check for extends/superclass (supports multiple inheritance)
-                for parent in extract_superclasses(&node, source) {
-                    results.push(ParsedRelation {
-                        source_name: cls.clone(),
-                        target_name: parent,
-                        relation: REL_INHERITS.into(),
-                        metadata: None,
-                        source_language: String::new(),
-                    });
-                }
+    // The `exports` axis is a TABLE (`exports::EXPORT_PASSES`) — two rows, ESM
+    // and CommonJS.
+    exports::run_export_passes(
+        &exports::ExportCtx {
+            node,
+            source,
+            language,
+            config,
+        },
+        results,
+    );
 
-                // Check for implements (TS/JS/Java)
-                extract_implements(&node, source, cls, results);
-            }
+    // The last axis still living in the walk is `routes`, and only its Python
+    // arm: Flask/FastAPI spell a route registration as a DECORATOR, so it hangs
+    // off `decorated_definition`, while Express and axum spell it as a call and
+    // are reached through `CALL_PASSES`. One arm for one language is not a table
+    // yet — it is a row waiting for a second language to justify the shape.
+    if kind == "decorated_definition" {
+        if let Some(route_rel) = extract_python_route(&node, source) {
+            results.push(route_rel);
         }
-
-        // C++: base classes → inherits (C++ has no separate interface concept, so
-        // every base — public/private/protected — is an inherits parent). C
-        // structs and plain C++ aggregates have no base_class_clause → nothing
-        // emitted, so no language gate is needed.
-        "class_specifier" | "struct_specifier" => {
-            for rel in extract_cpp_inheritance(&node, source) {
-                results.push(rel);
-            }
-        }
-
-        // Export statements (TS/JS)
-        "export_statement" => {
-            extract_export_names(&node, source, results);
-        }
-
-        // CommonJS exports (`module.exports = { f }`, `exports.f = g`). The ESM
-        // arm above has no counterpart for them, so dead-code classified an
-        // unused CJS export as an ORPHAN — "nothing references this" — while the
-        // identical ESM code came back EXPORTED_UNUSED.
-        "assignment_expression" if matches!(config.name, "javascript" | "typescript" | "tsx") => {
-            extract_cjs_exports(&node, source, results);
-        }
-
-        // Rust: impl Trait for Type → implements edge (type-level + method-level)
-        "impl_item" => {
-            if let Some(impl_rel) = extract_rust_impl_trait(&node, source) {
-                let type_name = impl_rel.source_name.clone();
-                results.push(impl_rel);
-                // For each method in the trait impl block, emit a method-level
-                // implements edge: TypeName → method_name. This ensures dead code
-                // detection sees incoming implements edges on trait methods.
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.named_child_count() {
-                        if let Some(child) = body.named_child(i) {
-                            if child.kind() == "function_item" {
-                                if let Some(name_node) = child.child_by_field_name("name") {
-                                    let method_name = node_text(&name_node, source);
-                                    if !method_name.is_empty() {
-                                        // Stamp impl_type so Phase 2 can filter
-                                        // method candidates by qualified_name. Without
-                                        // it, a file with N structs each implementing
-                                        // the same trait fans every impl's method
-                                        // edge to all N same-named method nodes —
-                                        // every struct appears to implement every
-                                        // other struct's methods.
-                                        results.push(ParsedRelation {
-                                            source_name: type_name.clone(),
-                                            target_name: method_name.to_string(),
-                                            relation: REL_IMPLEMENTS.into(),
-                                            metadata: Some(serialize_impl_method_metadata(
-                                                &type_name,
-                                            )),
-                                            source_language: String::new(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Go: struct/interface embedding → inherits (method promotion / interface
-        // composition — Go's idiomatic "is-a"). Gated on Go because `type_spec` is
-        // a Go-grammar node; the guard keeps any other grammar's same-named node
-        // from being misread.
-        "type_spec" if language == "go" => {
-            for rel in extract_go_inheritance(&node, source) {
-                results.push(rel);
-            }
-        }
-
-        // Python decorated definitions (for Flask/FastAPI route decorators)
-        "decorated_definition" => {
-            if let Some(route_rel) = extract_python_route(&node, source) {
-                results.push(route_rel);
-            }
-        }
-
-        // C# inheritance: class Dog : Animal, IWalkable
-        //
-        // NOT on an enum. C# spells an enum's UNDERLYING INTEGRAL TYPE with the
-        // same `base_list` syntax a class uses for its base type, so
-        // `enum Level : byte` produced `Level inherits byte` — a phantom edge
-        // bound to a real node, which this repo has already learned is worse
-        // than a missing one (it makes `byte` look inherited-from and pollutes
-        // every heritage traversal). Grammar-level distinction: the parent kind.
-        "base_list"
-            if config.name == "csharp"
-                && node.parent().map(|p| p.kind()) != Some("enum_declaration") =>
-        {
-            // Get the class/struct name from the parent node
-            let owner_name = node
-                .parent()
-                .and_then(|p| p.child_by_field_name("name"))
-                .map(|n| node_text(&n, source).to_string());
-            let owner = owner_name.as_deref().or(active_scope).unwrap_or("<module>");
-            for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i) {
-                    let base_name = node_text(&child, source).to_string();
-                    if !base_name.is_empty() {
-                        let rel = if config.interface_by_prefix
-                            && base_name.starts_with('I')
-                            && base_name.len() > 1
-                            && base_name
-                                .chars()
-                                .nth(1)
-                                .map(|c| c.is_uppercase())
-                                .unwrap_or(false)
-                        {
-                            REL_IMPLEMENTS
-                        } else {
-                            REL_INHERITS
-                        };
-                        results.push(ParsedRelation {
-                            source_name: owner.to_string(),
-                            target_name: base_name,
-                            relation: rel.into(),
-                            metadata: None,
-                            source_language: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // C/C++: `#include "foo.h"` → IMPORTS to "foo"
-        //         `#include <stdio.h>` → IMPORTS to "stdio"
-        // Header extension stripped so cross-file resolution can match the
-        // bare module name (mirrors JS require pattern).
-        _ => {}
     }
 
     // Determine class context for children: when entering a class body,

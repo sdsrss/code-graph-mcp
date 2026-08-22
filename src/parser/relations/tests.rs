@@ -1,8 +1,95 @@
 use super::*;
-// REL_CALLS is imported here rather than inherited through `use super::*`: the
-// calls axis moved to `calls.rs`, so the parent no longer names it and a
-// non-test build would flag the parent's import unused.
-use crate::domain::{REL_CALLS, REL_EXPORTS, REL_REFERENCES, REL_ROUTES_TO};
+// These are imported here rather than inherited through `use super::*`: each
+// axis that moved out of the walk into its own table module took its relation
+// constants with it, so the parent no longer names them and a non-test build
+// would flag the parent's import unused. REL_CALLS left with `calls.rs`;
+// REL_INHERITS/REL_IMPLEMENTS left with `inherits.rs`.
+use crate::domain::{
+    REL_CALLS, REL_EXPORTS, REL_IMPLEMENTS, REL_INHERITS, REL_REFERENCES, REL_ROUTES_TO,
+};
+
+/// The heritage and export axes were arms of a `match`, which is
+/// FIRST-MATCH-WINS: a node kind reached at most one of them, and the C++ /
+/// Rust / Go / C# rows relied on that — `HERITAGE_DECL_KINDS` deliberately
+/// omits `class_specifier`/`struct_specifier` precisely because the C++ arm
+/// sat later in the same match.
+///
+/// The tables run EVERY matching row. That is equivalent only while no node can
+/// reach two rows, and `match` is no longer there to enforce it, so the
+/// invariant has to be asserted. A future row that overlaps an existing one
+/// would otherwise DOUBLE-EMIT its edges — silently, since duplicate rows
+/// differing in nothing collapse at the unique index and duplicates that differ
+/// in `metadata` do not.
+#[test]
+fn no_node_kind_reaches_two_heritage_or_export_rows() {
+    #[derive(Clone, Copy)]
+    struct Row {
+        label: &'static str,
+        kinds: &'static [&'static str],
+        raw_key: bool,
+        langs: &'static [&'static str],
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for p in super::inherits::HERITAGE_PASSES {
+        rows.push(Row {
+            label: "heritage",
+            kinds: p.kinds,
+            raw_key: matches!(p.key, LangKey::Raw),
+            langs: p.langs,
+        });
+    }
+    for p in super::exports::EXPORT_PASSES {
+        rows.push(Row {
+            label: "export",
+            kinds: p.kinds,
+            raw_key: matches!(p.key, LangKey::Raw),
+            langs: p.langs,
+        });
+    }
+
+    for (i, a) in rows.iter().enumerate() {
+        for b in rows.iter().skip(i + 1) {
+            let shared: Vec<&str> = a
+                .kinds
+                .iter()
+                .filter(|k| b.kinds.contains(k))
+                .copied()
+                .collect();
+            if shared.is_empty() {
+                continue;
+            }
+            // Both claim a kind. The only way that is safe is a language gate
+            // that cannot admit the same language twice.
+            assert!(
+                !a.langs.is_empty() && !b.langs.is_empty(),
+                "{} and {} rows both claim {shared:?}, and one is ANY_LANG — every \
+                 node of that kind would reach both",
+                a.label,
+                b.label
+            );
+            assert_eq!(
+                a.raw_key, b.raw_key,
+                "{} and {} rows both claim {shared:?} but key off different name \
+                 spaces (raw vs family), so their gates cannot be compared — one \
+                 language could satisfy both",
+                a.label, b.label
+            );
+            let overlap: Vec<&str> = a
+                .langs
+                .iter()
+                .filter(|l| b.langs.contains(l))
+                .copied()
+                .collect();
+            assert!(
+                overlap.is_empty(),
+                "{} and {} rows both claim {shared:?} for language(s) {overlap:?} — \
+                 that node would reach both rows and emit its edges twice",
+                a.label,
+                b.label
+            );
+        }
+    }
+}
 
 #[test]
 fn test_extract_php_include_imports() {
