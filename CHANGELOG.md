@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### A Python package's non-package subdirectories are no longer import roots
+
+`import_roots` decided whether a directory was importable-from by asking
+whether that directory itself held an `__init__.py`. It never asked whether an
+ANCESTOR did. Since PEP 420 made `__init__.py` optional, a package routinely
+contains subdirectories without one — vendored trees, test-data trees, example
+dirs — and every one of them became a top-level import root, so any module
+inside it answered to its bare name.
+
+That is the phantom class v0.124.0's sibling fix was written to remove,
+rebuilt one level down: a phantom bound to a real node, which nothing in the
+answer marks as wrong. Measured by indexing 2,385 files of third-party Python
+with both binaries and diffing the edge sets: `import random` bound to
+`numpy/typing/tests/data/pass/random.py` from 15 files across PIL, pandas,
+pyarrow and numpy's own tests, and `from numba.extending import
+register_jitable` bound to `numpy/random/_examples/numba/extending.py`. 17
+`imports` edges removed — the 15 module bindings plus 2 symbol edges that
+existed only because the module had resolved to a project file — and 15
+re-bound to `<external>`, which is where the same statement spelled `from
+typing import IO` already goes. `calls`, `inherits` and `references` were
+byte-identical, so the change is confined to the axis it was aimed at.
+
+The rule is now stated the way Python states it: a directory is
+importable-from only when neither it nor any ancestor is a package. `src/` above
+a `src/myapp/` package stays a root, which is what keeps `from db import save`
+in a `src/` layout working; the ancestor test only ever removes roots that sit
+INSIDE a package tree, where you are reached by dotted path.
+
+INDEX_VERSION 67 → 68: existing indexes carry the phantoms until they rebuild.
+
+### The pre-grep e2e cleanup had been deleting nothing
+
+`cleanupFixture` in `pre-grep-guide.test.js` removed
+`.code-graph-bash-<commandHash>`. The cooldown flag gained a `<cwdHash>-`
+segment when cooldowns became project-scoped, and this line did not follow, so
+it addressed a name production had stopped writing. A miss is indistinguishable
+from "already gone" through `unlinkSync` plus a swallowing catch, so nothing
+ever reported it: the comment promised "remove so reruns stay deterministic"
+and bought none of it, and every e2e run left its flag in the real
+`cgTmpDir()` until `pruneCgTmp`'s 24-hour sweep collected it.
+
+Cleanup now matches on the command-hash TAIL, which is independent of both the
+cwd and the prefix spelling, and a new test asserts the flag exists before
+cleanup and is gone after — restoring the old derivation turns it red.
+
+This also settles one open question about the `pre-grep-guide` cooldown flake
+(D#156) in the negative: the leading hypothesis was a sibling test's cleanup
+deleting this test's flag under parallel load, and a cleanup that deleted
+nothing cannot have done that. The flake's mechanism remains unidentified.
+
 ### The statusline shell route now belongs to `_previous` alone
 
 v0.124.0 sent any registry command containing a shell metacharacter through

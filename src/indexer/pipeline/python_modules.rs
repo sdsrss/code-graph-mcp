@@ -25,10 +25,19 @@
 use std::collections::{HashMap, HashSet};
 
 /// Directories Python would import from: the project root, plus every
-/// directory with no `__init__.py`. A package directory is deliberately NOT a
-/// root — that is the whole difference between `src/db.py` (importable as `db`
-/// when `src/` is a plain directory) and `accelerate/logging.py` (never
-/// importable as `logging`, because `accelerate/` is a package).
+/// directory that is neither a package nor inside one. A package directory is
+/// deliberately NOT a root — that is the whole difference between `src/db.py`
+/// (importable as `db` when `src/` is a plain directory) and
+/// `accelerate/logging.py` (never importable as `logging`, because
+/// `accelerate/` is a package).
+///
+/// "Inside one" carries the same weight as "is one". `__init__.py` has been
+/// optional since PEP 420, so packages routinely hold subdirectories without it
+/// — vendored trees, asset dirs, plugin folders. Testing only the directory
+/// itself made every one of those a top-level root and rebuilt the exact
+/// phantom the package rule removed (`import logging` →
+/// `mypkg/vendored/logging.py`). Inside a package tree you are reached by
+/// dotted path, never by sitting on `sys.path`.
 fn import_roots(python_paths: &HashSet<String>) -> HashSet<String> {
     let packages: HashSet<&str> = python_paths
         .iter()
@@ -36,14 +45,24 @@ fn import_roots(python_paths: &HashSet<String>) -> HashSet<String> {
         .collect();
     let mut roots: HashSet<String> = HashSet::new();
     roots.insert(String::new()); // the project root is always importable-from
+    let mut chain: Vec<&str> = Vec::new();
     for path in python_paths {
-        // Every ancestor directory of every module file is a candidate.
+        // Every ancestor directory of every module file is a candidate, but the
+        // chain has to be walked ROOT-FIRST: the first package on it ends the
+        // roots, and a package's own parent (`src/` above `src/myapp/`) is
+        // still a root, so an upward walk cannot decide `d` before its
+        // ancestors are known.
+        chain.clear();
         let mut dir = path.rsplit_once('/').map(|(d, _)| d);
         while let Some(d) = dir {
-            if !packages.contains(d) {
-                roots.insert(d.to_string());
-            }
+            chain.push(d);
             dir = d.rsplit_once('/').map(|(parent, _)| parent);
+        }
+        for d in chain.iter().rev() {
+            if packages.contains(d) {
+                break;
+            }
+            roots.insert((*d).to_string());
         }
     }
     roots
@@ -166,6 +185,36 @@ mod tests {
         assert_eq!(
             project_module_files("accelerate.logging", &m),
             Some(vec!["accelerate/logging.py".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_plain_directory_inside_a_package_is_not_an_import_root() {
+        // PEP 420 made `__init__.py` optional, so a package routinely contains
+        // subdirectories without one — vendored trees, data/asset dirs, plugin
+        // folders. Checking only the directory ITSELF for `__init__.py` made
+        // every such subdirectory a top-level import root, which is the same
+        // phantom class the package rule above removed: `import logging` bound
+        // to `mypkg/vendored/logging.py`.
+        //
+        // A directory is importable-from only when NO ancestor of it is a
+        // package either — inside a package tree you are reached by dotted
+        // path, never by being on `sys.path`.
+        let m = map_of(&[
+            "mypkg/__init__.py",
+            "mypkg/app.py",
+            "mypkg/vendored/logging.py",
+            "mypkg/vendored/deep/json.py",
+        ]);
+        assert_eq!(project_module_files("logging", &m), None);
+        assert_eq!(project_module_files("json", &m), None);
+        assert_eq!(project_module_files("deep.json", &m), None);
+        assert_eq!(project_module_files("vendored.logging", &m), None);
+        // The dotted path from the project root still resolves — that is the
+        // spelling an actual `sys.path` entry at the project root would use.
+        assert_eq!(
+            project_module_files("mypkg.vendored.logging", &m),
+            Some(vec!["mypkg/vendored/logging.py".to_string()])
         );
     }
 

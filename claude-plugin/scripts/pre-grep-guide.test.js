@@ -1155,13 +1155,54 @@ function runHook(cmd, fixture, cwdOverride) {
   return res;
 }
 
+// The command-hash tail of a cooldown flag. The flag's full name is
+// `.code-graph-bash-<cwdHash>-<commandHash>` (pre-grep-guide.js `flagPath`), and
+// this helper deliberately matches on the TAIL alone: the hook keys the flag on
+// the RESOLVED project root, which need not equal the fixture path byte for
+// byte, and matching the prefix would re-create the bug below.
+function cooldownFlagTail(cmd) {
+  return `-${commandHash(cmd)}`;
+}
+
 function cleanupFixture(fixture, cmd) {
   fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
-  // cooldown flag for this command lives in cgTmpDir — remove so reruns stay deterministic
-  try {
-    fsE2e.unlinkSync(pathE2e.join(cgTmpDir(), `.code-graph-bash-${commandHash(cmd)}`));
-  } catch { /* ok */ }
+  // Cooldown flags for this command live in cgTmpDir — remove so reruns stay
+  // deterministic. This deleted NOTHING from the day the flag became
+  // project-scoped: it spelled the name `.code-graph-bash-<commandHash>` while
+  // production writes `.code-graph-bash-<cwdHash>-<commandHash>`, and the
+  // try/catch swallowed the ENOENT, so the "reruns stay deterministic" the
+  // comment promised was never bought and every e2e run left a flag behind
+  // (reaped only by pruneCgTmp's 24h sweep). Matching the tail is what makes
+  // this independent of both the cwd and the prefix spelling; the guard test
+  // `cleanupFixture actually removes the cooldown flag` keeps it honest.
+  const tail = cooldownFlagTail(cmd);
+  let entries;
+  try { entries = fsE2e.readdirSync(cgTmpDir()); } catch { return; }
+  for (const name of entries) {
+    if (!name.endsWith(tail)) continue;
+    try { fsE2e.unlinkSync(pathE2e.join(cgTmpDir(), name)); } catch { /* raced */ }
+  }
 }
+
+test('e2e: cleanupFixture actually removes the cooldown flag the hook wrote', () => {
+  // A negative control for the test harness itself. The previous cleanup
+  // matched a name production had stopped writing, and because a miss is
+  // indistinguishable from "already gone" through unlinkSync + catch, nothing
+  // ever reported it. This asserts the flag EXISTS first, so the check cannot
+  // pass vacuously against a hook that wrote no flag at all.
+  const uniq = `StubClean${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  const tail = cooldownFlagTail(cmd);
+  const flags = () => fsE2e.readdirSync(cgTmpDir()).filter(f => f.endsWith(tail));
+  try {
+    runHook(cmd, fixture);
+    assert.equal(flags().length, 1, 'the hook marks exactly one cooldown flag for this command');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+  assert.deepEqual(flags(), [], 'cleanupFixture leaves no cooldown flag behind');
+});
 
 test('e2e: denied grep with stub hits → deny JSON embeds the answer + records answered:true', () => {
   const uniq = `StubHit${Date.now()}`;
