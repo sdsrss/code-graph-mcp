@@ -33,6 +33,25 @@ binding to a same-named local symbol. Measured on this repository's own tree:
 7,053 → 7,151 `calls` edges, no edge removed and no confidence changed, the
 same result at `BATCH_SIZE` 500 and 25; `dead-code src/` now finds nothing.
 
+The strip is a fallback, not a rewrite: the qualifier as written gets the first
+say, and the crate-root reading applies only to a chain that matches nothing.
+Stripping unconditionally would cost more than it bought, because a package name
+is often also an ordinary directory name — `core`, `utils`, `parser`, `config`
+in any Cargo workspace. `utils::helper::go()` in a package named `utils` would
+degrade from `utils/helper`, which matches one directory, to `helper`, which
+matches every `helper/` in the tree: one correct edge becoming two `inferred`
+edges whose metadata still read `v:"utils::helper"`, a path only one of the two
+targets has.
+
+And a root with nothing after it — `my_crate::run()` — leaves no path constraint
+at all. A path qualifier is exempt from the ambiguous-confidence downgrade, on
+the premise that it binds by module path rather than by a bare-name guess; on
+that branch the premise is false, so a two-way ambiguity would ship as two
+`inferred` edges, one of them a phantom bound to a real node and sitting above
+the default confidence floor where `dead-code`, `impact` and `callgraph` read it
+as fact. A single candidate is still an unambiguous answer and resolves; several
+candidates now drop. No answer beats a wrong one.
+
 ### Python imports resolve the way Python resolves them
 
 `from pkg.mod import Helper` recorded `pkg.mod` as a plain symbol rather than a
@@ -91,6 +110,17 @@ The response now rejects on `error` and on `aborted`, and an overall watchdog
 failed by it) backstops any other never-settles shape. Both settle paths are
 single-shot and clear the timer, so a normal response cannot be re-settled by a
 late event or hold the event loop open.
+
+Settling the promise turned out to be only half of it. An undestroyed request is
+an active handle: the caller's `await` returns while the socket stays open, the
+event loop still has a reason to live, and the detached check stays resident —
+the same zombie process, reached through the other half of the problem. Every
+handle that can outlive the promise (the request, and in the proxy branch the
+CONNECT request plus the tunnelled socket, which outlives it) is now torn down
+when the promise rejects. The watchdog timer is `unref`'d for the same reason:
+if the request constructor throws outright on a malformed URL, the timer alone
+would have held the process up for the full overall budget — twelve seconds at
+the shipped setting.
 
 ### One query-time freshness resync instead of three copies of it
 

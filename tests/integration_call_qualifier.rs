@@ -1199,3 +1199,123 @@ fn path_qualifier_strips_own_crate_name() {
         other_callers
     );
 }
+
+/// Regression (pre-tag review of the strip above): stripping the crate root can
+/// leave NOTHING behind. `my_crate::run()` is the whole qualifier, so the strip
+/// produced an empty chain, fell through the `segments.is_empty()` guard and
+/// returned the FULL same-name candidate set unfiltered — while `q="path"`
+/// exempts the edge from the ambiguous downgrade (`classify_edge_confidence`)
+/// on the premise that a path qualifier binds structurally. For this branch
+/// that premise is false: nothing is left to bind with. A two-way ambiguity
+/// shipped as two `inferred` edges, one of them a phantom bound to a real node,
+/// sitting ABOVE the default confidence floor where dead-code / impact /
+/// callgraph consume it as fact.
+///
+/// Measured on this fixture before the fix: `demo::run()` produced edges to
+/// BOTH `src/lib.rs:run` and `src/server.rs:run`, both `inferred`.
+#[test]
+fn bare_crate_root_qualifier_does_not_fan_out_to_same_name_siblings() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(root, "src/lib.rs", "pub fn run() { }\npub mod server;\n");
+    write(root, "src/server.rs", "pub fn run() { }\n");
+    write(root, "src/main.rs", "fn main() { demo::run(); }\n");
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    // The qualifier `demo` carries no module path, so it cannot choose between
+    // two same-named `run`s. No answer is the honest outcome; the one thing it
+    // must not do is publish both as `inferred`.
+    assert!(
+        callers_of(&db, "run").is_empty(),
+        "`demo::run()` cannot choose between two same-named targets — it must \
+         drop rather than emit an edge to each at `inferred`; got: {:?}",
+        callers_of(&db, "run")
+    );
+}
+
+/// Negative control for the test above: the drop must be driven by the
+/// AMBIGUITY, not by the bare crate root itself. With exactly one `run` in the
+/// project there is nothing to choose between, and `demo::run()` must still
+/// resolve — otherwise the fix above has over-corrected into the missing-edge
+/// bug that `path_qualifier_strips_own_crate_name` exists to prevent.
+#[test]
+fn bare_crate_root_qualifier_still_resolves_a_unique_target() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(root, "src/lib.rs", "pub fn run() { }\n");
+    write(root, "src/main.rs", "fn main() { demo::run(); }\n");
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "run");
+    assert!(
+        callers.iter().any(|c| c == "main"),
+        "`demo::run()` with a single `run` in the project must still resolve; got: {:?}",
+        callers
+    );
+}
+
+/// Regression (pre-tag review): the strip was UNCONDITIONAL, so a package whose
+/// name is also an ordinary directory name lost the qualifier's only
+/// discriminating segment. `utils::helper::go()` in a package named `utils`
+/// degraded from the chain `utils/helper` — which matches exactly one
+/// directory — to `helper`, which matches every `helper/` in the tree.
+///
+/// This one is a strict REGRESSION, not merely a missed improvement: measured
+/// on this fixture, the pre-strip code produced ONE correct edge, and the strip
+/// turned it into two `inferred` edges whose metadata still reads
+/// `v:"utils::helper"` — a path only one of the two targets has. Cargo
+/// workspaces make this ordinary: `core`, `utils`, `parser` and `config` are
+/// both package names and module-directory names.
+#[test]
+fn crate_root_strip_does_not_fire_when_the_chain_as_written_matches() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"utils\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(root, "src/utils/helper/mod.rs", "pub fn go() { }\n");
+    write(root, "src/thirdparty/helper/mod.rs", "pub fn go() { }\n");
+    write(root, "src/main.rs", "fn main() { utils::helper::go(); }\n");
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert!(
+        callers_of_in_file(&db, "go", "src/utils/helper/mod.rs")
+            .iter()
+            .any(|c| c == "main"),
+        "the chain as written (`utils/helper`) matches this file and must win"
+    );
+    assert!(
+        callers_of_in_file(&db, "go", "src/thirdparty/helper/mod.rs").is_empty(),
+        "stripping `utils` degrades the chain to `helper`, which matches every \
+         `helper/` in the tree — the strip must not fire when the qualifier as \
+         written already resolves; got: {:?}",
+        callers_of_in_file(&db, "go", "src/thirdparty/helper/mod.rs")
+    );
+}

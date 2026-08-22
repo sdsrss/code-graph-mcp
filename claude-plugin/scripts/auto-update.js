@@ -276,6 +276,18 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
     // loop open past a normal response.
     let settled = false;
     let watchdog = null;
+    // Settling the promise is only half of it. An undestroyed request is an
+    // ACTIVE HANDLE: the caller's `await` returns while the socket stays open,
+    // the event loop has a reason to live, and the detached per-session `check`
+    // remains resident — the same zombie process, reached by the other half of
+    // the problem. Every handle that can outlive the promise registers here.
+    const handles = [];
+    const teardown = () => {
+      while (handles.length > 0) {
+        const h = handles.pop();
+        try { h.destroy(); } catch { /* already gone */ }
+      }
+    };
     const clearWatchdog = () => {
       if (watchdog !== null) {
         clearTimeout(watchdog);
@@ -292,12 +304,20 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
       if (settled) return;
       settled = true;
       clearWatchdog();
+      teardown();
       reject(err instanceof Error ? err : new Error(String(err)));
     };
     watchdog = setTimeout(
       () => settleErr(new Error('request watchdog timeout')),
       timeoutMs * FETCH_TOTAL_TIMEOUT_FACTOR,
     );
+    // The timer is a handle too. If `https.request` throws synchronously (a
+    // malformed URL), the executor's throw rejects the promise without ever
+    // reaching `clearWatchdog`, and the timer alone holds the process open for
+    // the whole `timeoutMs * FETCH_TOTAL_TIMEOUT_FACTOR` — 12s at the production
+    // budget. Unref'd it still fires while a request is in flight (the socket
+    // keeps the loop alive), but it can no longer be the ONLY reason to stay up.
+    watchdog.unref();
 
     const headers = {
       'Accept': 'application/vnd.github+json',
@@ -347,13 +367,18 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
           settleErr(new Error(`proxy CONNECT failed: ${res.statusCode}`));
           return;
         }
+        // The tunnelled socket outlives connectReq, so it needs its own entry:
+        // destroying the CONNECT request does not close the tunnel under it.
+        handles.push(socket);
         const req = https.request(url, {
           method: 'GET', headers, socket, agent: false, servername: target.hostname,
         }, onResponse);
+        handles.push(req);
         req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
         req.on('error', settleErr);
         req.end();
       });
+      handles.push(connectReq);
       connectReq.setTimeout(timeoutMs, () => connectReq.destroy(new Error('proxy connect timeout')));
       connectReq.on('error', settleErr);
       connectReq.end();
@@ -361,6 +386,7 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
     }
 
     const req = https.request(url, { method: 'GET', headers }, onResponse);
+    handles.push(req);
     req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
     req.on('error', settleErr);
     req.end();

@@ -666,16 +666,60 @@ pub(super) fn path_filter_candidates(
     db: &crate::storage::db::Database,
     crate_roots: &HashSet<String>,
 ) -> anyhow::Result<Vec<i64>> {
-    // An own-crate root with nothing after it (`my_crate::f()`) leaves no path
-    // constraint at all — same verdict the parser reaches for `crate::f()`,
-    // which it hands over as a bare callee.
-    let segments = match segments.split_first() {
-        Some((first, rest)) if crate_roots.contains(first.as_str()) => rest,
-        _ => segments,
-    };
     if candidates.is_empty() || segments.is_empty() {
         return Ok(candidates.to_vec());
     }
+
+    // The qualifier AS WRITTEN gets the first say. Stripping unconditionally
+    // was a regression: a package whose name is also an ordinary directory name
+    // (`core`, `utils`, `parser`, `config` — routine in a Cargo workspace) lost
+    // the chain's only discriminating segment, so `utils::helper::go()` degraded
+    // from `utils/helper`, which matches one directory, to `helper`, which
+    // matches every `helper/` in the tree. Measured: one correct edge became two
+    // `inferred` edges whose metadata still read `v:"utils::helper"`.
+    let kept = filter_by_segment_chain(segments, candidates, node_id_to_path, db)?;
+    if !kept.is_empty() {
+        return Ok(kept);
+    }
+
+    // Only a chain that matches NOTHING gets the own-crate-root reading. This is
+    // the `my_crate::cli::cmd_grep()` case: the leading segment names the crate
+    // root rather than a directory, so `my_crate/cli` matches no path and the
+    // whole class of `bin` → `lib` edges dropped (audit 2026-08-22 P1-1).
+    let Some((first, rest)) = segments.split_first() else {
+        return Ok(kept);
+    };
+    if !crate_roots.contains(first.as_str()) {
+        return Ok(kept); // empty — a foreign crate path, caller drops the edge
+    }
+    if rest.is_empty() {
+        // `my_crate::f()` — the root IS the whole qualifier, so nothing is left
+        // to constrain the path with. Returning every same-name candidate here
+        // published one true edge and N-1 phantoms, all at `inferred`: the
+        // `path` qualifier is exempt from the ambiguous downgrade
+        // (`classify_edge_confidence`) on the premise that it binds
+        // structurally, and on this branch that premise is false. A single
+        // candidate is still an unambiguous answer; several are not, and no
+        // answer beats a wrong one above the confidence floor.
+        return Ok(if candidates.len() == 1 {
+            candidates.to_vec()
+        } else {
+            Vec::new()
+        });
+    }
+    filter_by_segment_chain(rest, candidates, node_id_to_path, db)
+}
+
+/// Keep the candidates whose file path or `qualified_name` carries `segments`
+/// as a contiguous chain. Split out of [`path_filter_candidates`] so the
+/// qualifier can be tried twice: once as written, once with an own-crate root
+/// removed.
+fn filter_by_segment_chain(
+    segments: &[String],
+    candidates: &[i64],
+    node_id_to_path: &std::collections::HashMap<i64, String>,
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
     let path_chain = segments.join("/");
     let qn_chain = segments.join(".");
 

@@ -1907,10 +1907,14 @@ function stubHttpsRequest(t, driveResponse) {
     if (priorNoProxy === undefined) delete process.env.NO_PROXY;
     else process.env.NO_PROXY = priorNoProxy;
   });
+  // Records teardown instead of swallowing it. A `destroy` stubbed to a no-op
+  // makes a MISSING teardown indistinguishable from a present one, which is how
+  // the leak below survived the first round of these tests.
+  const destroyed = [];
   https.request = (_url, _opts, onResponse) => {
     const req = new EventEmitter();
     req.setTimeout = () => {}; // dead with the socket — the whole point
-    req.destroy = () => {};
+    req.destroy = () => { destroyed.push('req'); };
     req.end = () => {
       const res = new EventEmitter();
       res.setEncoding = () => {};
@@ -1920,6 +1924,7 @@ function stubHttpsRequest(t, driveResponse) {
     };
     return req;
   };
+  return destroyed;
 }
 
 // 'hung' rather than a real hang, so the pre-fix state is a readable failure
@@ -1977,4 +1982,64 @@ test('requestJson still resolves a normal response (watchdog does not fire early
   const out = await requestJson('https://api.github.com/x', 50);
   assert.equal(out.statusCode, 200);
   assert.equal(out.body, '{"tag_name":"v1.0.0"}');
+});
+
+// Settling the PROMISE is only half the fix. The request stays in flight, and
+// an open socket is an active handle: the detached `check` keeps the event loop
+// alive and stays resident — the same zombie process the promise fix set out to
+// remove, reached through the other half of the problem.
+test('requestJson tears the request down when the watchdog fires', async (t) => {
+  const destroyed = stubHttpsRequest(t, () => {}); // silent response
+  assert.equal(await settleOrHang(requestJson('https://api.github.com/x', 50)), 'rejected');
+  assert.deepEqual(
+    destroyed, ['req'],
+    'the watchdog must destroy the in-flight request, not just reject the promise — '
+    + 'an undestroyed socket holds the event loop open and the process never exits',
+  );
+});
+
+test('requestJson tears the request down when the response dies mid-body', async (t) => {
+  const destroyed = stubHttpsRequest(t, (res) => {
+    res.emit('data', '{"tag_na');
+    res.emit('aborted');
+  });
+  assert.equal(await settleOrHang(requestJson('https://api.github.com/x', 50)), 'rejected');
+  assert.deepEqual(destroyed, ['req'], 'an aborted response must also release its handle');
+});
+
+// The watchdog timer itself is an active handle. If `https.request` throws
+// synchronously the executor's throw rejects the promise without ever reaching
+// `clearWatchdog`, so the timer alone holds the process open for the full
+// `timeoutMs * FETCH_TOTAL_TIMEOUT_FACTOR` — 12s at the production budget.
+// Asserted on a real child process, because "does the process exit" is not
+// observable from inside the process under test.
+test('a synchronously-thrown request does not hold the process open', (t) => {
+  const { execFileSync } = require('node:child_process');
+  // HOME/TMPDIR redirected like every other spawn in this suite. Requiring
+  // auto-update.js in a child with the ambient environment lets it touch the
+  // developer's real state directory, and a sibling suite's cooldown e2e reads
+  // the same files — measured: an unsandboxed spawn here turned
+  // pre-grep-guide's cooldown test red while passing in isolation.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-exit-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const script = `
+    const { requestJson } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    requestJson('http://not a url', 3000).catch(() => {});
+  `;
+  const started = Date.now();
+  execFileSync(process.execPath, ['-e', script], {
+    env: {
+      ...cleanGitEnv(),
+      HOME: home, USERPROFILE: home,
+      TMPDIR: home, TMP: home, TEMP: home,
+      CODE_GRAPH_AUTO_UPDATE_SILENT: '1',
+    },
+    timeout: 5000,
+    stdio: 'pipe',
+  });
+  const elapsed = Date.now() - started;
+  assert.ok(
+    elapsed < 3000,
+    `process must exit once the promise rejects, not linger on the watchdog timer (took ${elapsed}ms)`,
+  );
 });
