@@ -7,7 +7,7 @@
 > used to drop, and Python `from X import Y` now records its module dependency.
 > The rebuild is automatic on first use.
 
-Audit `docs/audit/audit-2026-08-22-01.md`, P1 items only.
+Audit `docs/audit/audit-2026-08-22-01.md`: all P1 and all P2 items.
 
 ### `mycrate::module::f()` calls no longer drop on the floor
 
@@ -107,6 +107,57 @@ the file the caller had just hashed and then paid a whole-graph name-map load
 plus the global edge post-passes. A query touching the eight-file budget cost
 eight whole-graph sweeps. The dirty set is now classified once and re-indexed in
 a single batch. No output shape changes.
+
+### Smaller fixes from the same audit
+
+**Freshness reached the last two read paths.** `callgraph` had no
+query-time resync on either surface, and MCP's `get_call_graph` /
+`find_references` had a subtler version: both accept a `file_path`, so
+they looked covered, but that argument is an optional disambiguator and
+the ordinary call passes a bare symbol name. What goes stale there is not
+a line number — it is the caller set, and a call added since the last
+index was simply missing.
+
+**Two prompts named tools the client cannot call.** `understand-module`
+pointed at `dependency_graph` and `trace-request` at `trace_http_chain`.
+Both still dispatch server-side, but neither appears in `tools/list`, and
+a client only offers the model what that list returned. They now teach
+`module_overview include_deps` and `get_call_graph route_path`, and a
+guard walks every prompt to keep it that way.
+
+**The statusline no longer loses a quoted `_previous` command.** Provider
+commands were split with a regex that understood one double-quoted word
+after the executable; a path containing a space was torn apart and the
+segment vanished silently — the one thing the `_previous` slot exists to
+prevent. Commands with shell constructs now go through `sh -c`.
+
+**A PR past 100 comments stops collecting sticky comments.** `gh api
+--paginate` emits one JSON document per page; the parse threw and every CI
+run posted a new comment instead of patching the old one.
+
+**Plugin housekeeping.** `migrateOldPluginIds` no longer throws a bare
+stack out of doctor's repair arms when `~/.claude` is unwritable, and
+`find-binary` no longer runs the binary to check its version on every
+cache hit — the cache entry carries the version and a file stamp, so a
+session-start that calls it four times spawns nothing.
+
+**A full index reads each file once.** `scan_directory` hashed every file
+and the pipeline then read it again to parse it; on 1,763 files that was
+7,781 read syscalls where 3,535 suffice. Wall clock is unchanged — the
+files were in page cache and parsing dominates — so this is I/O, not speed.
+
+**Documentation says where its numbers come from.** The Performance table
+now lists exactly what `code-graph-mcp benchmark` prints, measured on this
+repository; two unsourced efficiency claims are gone and the third names
+the test that produces it. All 35 `CODE_GRAPH_*` environment variables are
+documented, with a test that fails when a new one is not.
+
+**Long functions and one long file split**, with no behaviour change:
+`index_files` 1,242 → 516 lines, `cmd_grep` 767 → 528,
+`tool_semantic_search` 705 → 477, `cmd_stats` 500 → 64, and the MCP
+server's `mod.rs` gives up its freshness and backfill halves to their own
+files. Each verified by comparing real output — byte-identical CLI output,
+byte-identical MCP responses, and identical edge sets over two corpora.
 
 ## v0.123.0 (2026-08-22)
 
