@@ -1,5 +1,139 @@
 # Changelog
 
+## v0.123.0 (2026-08-22)
+
+> **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 64 → 65
+> because `doc_comment` values change for source you have already indexed: a
+> comma-separated declaration used to hand its one documentation comment to
+> every name it declared. The rebuild is automatic on first use. The shape is
+> uncommon — a regex sweep of an external 2,900-file TypeScript/JavaScript
+> corpus found zero occurrences — so most projects will see the rebuild and no
+> content change. Nothing else to do.
+
+### A shared documentation comment now belongs to the first declarator only
+
+`/** DOC */ export const a = 1, b = 2;` gave DOC to both `a` and `b`. The
+comment sits above the *statement*, which owns every declarator, so each name
+resolved to the same block. The same held for `export let` and for
+arrow-valued declarators.
+
+This is not cosmetic mislabelling. `doc_comment` outranks `code:` when the
+embedding context for a symbol is built, precisely because it is the densest
+description a symbol has. A duplicated comment therefore made `b` retrievable
+under a description of `a` — a phantom bound to a real node, which is worse
+than a missing field, because nothing in the answer tells you it is wrong.
+
+The rule now applied is the one this codebase already used for the same
+construct in another language: Go's `// GROUP_DOC` above `type ( Alpha …; Beta
+… )` documents `Alpha` and stops there. A comma-separated JavaScript
+declaration is that construct with different punctuation, and it never reached
+the check — the statement is its parent's first named child however many
+declarators hang off it, so the check passes and cannot discriminate between
+them.
+
+The doc is claimed by position rather than by whether the leading declarator
+produces an indexed symbol, so a first declarator that emits nothing cannot
+slide the comment onto a later name. Names bound by a single destructuring
+declarator (`export const { host, port } = getConfig()`) still share that
+declarator's comment: the split is between declarators, not within one.
+
+### `trace --json` reports a miss the way every other command does
+
+A route that matched nothing emitted `{"handlers": [], "message": "…"}`. Every
+other JSON surface in the CLI follows a three-tier rule where a miss carries a
+self-describing `error` beside the empty collection — `show --json` returns
+`{"candidates": [], "error": "Symbol not found", "symbol": …}` and `callgraph
+--json` the same with its own identifier. A consumer that branched on `error`,
+as the documented contract tells it to, read a no-match as a clean success with
+zero handlers.
+
+The envelope now emits `{route, handlers: [], error, hint}`. `route` is the
+same key the success leg carries, so one shape reads both. The framework
+coverage limit moved out of the error text into `hint`: it is a disclosure
+about the extractor, not a description of this particular miss, and folding it
+into the error made a coverage gap read as "no such route". An actix or Spring
+project has real routes this extractor never sees.
+
+### The MCP server can finally say that a file parsed with syntax errors
+
+`get_index_status` already reported files the indexer *skipped*, including the
+ones that failed to parse outright. The other counter was missing from this
+surface entirely: a file that parses *with* syntax errors keeps whatever
+tree-sitter's error recovery salvaged, and those partial symbols sit in the
+index looking exactly like symbols from a clean file. That is the more
+misleading of the two — a skipped file is visibly absent, while a half-parsed
+one answers queries with a thin result set and no way to tell
+thin-because-broken from thin-because-that-is-the-code.
+
+The CLI has disclosed this since the counter existed, on both legs. Nothing
+under the MCP server said it at all, so an agent driving the server was the one
+caller that could not find out. Both surfaces that report indexing now carry
+it, with deliberately different rules about zero: `rebuild_index` states it
+unconditionally, because the rebuild ran in-band and a zero is earned;
+`get_index_status` states it only when non-zero, because its statistics are
+per-process and a server that started against an already-fresh index holds
+zeros it never earned.
+
+### Skipped context injections name the mode that spent the attempt
+
+The PostToolUse hook that offers a structural answer alongside a grep records
+the attempts it does not deliver. Those records carried the reason but not the
+mode, so the funnel could see *that* injections were failing without seeing
+*which* mode was failing — the attribution the work needed most.
+
+The record now names the mode it tried, charged to the last one attempted, so a
+call-graph miss that fell through to the grep echo is charged to the echo.
+`stats` reports the two mixes separately: the payload mix keeps its meaning as
+what was delivered, and skips get their own breakdown. Folding them together
+would have quietly redefined the delivered-payload share into an attempted
+share.
+
+### `project_map`'s compact mode no longer advertises a number it never met
+
+The `compact` option claimed it saved about half the tokens. Measured on this
+repository, the full map is 5,445 bytes and the compact one 4,305 — 20.9%. No
+implementation ever matched the advertised figure, and reaching it is not a
+tuning question: compact spends 1,098 bytes on key symbols and 1,033 on hot
+functions, so dropping the symbols alone lands at 41%. Those symbol names are
+kept on purpose, because a map without them costs the caller a second request
+to become useful.
+
+The five sibling options in the same schema all say plainly that they save
+tokens, without a figure. This one now matches them. Writing the measured 20.9%
+in its place was the alternative and was rejected: the ratio moves with module
+count and symbol density, so any figure would be a claim that goes stale on the
+next repository.
+
+### Internal: the import axis is a table
+
+Relation extraction dispatched two of its four axes from tables and the rest
+from a long `match`. `imports` is the axis where grammars disagree most about
+spelling — `import_declaration` alone means two different shapes in Swift and
+Java — and a run of match arms is a shape where a missing language is not a
+compile error but an edge that silently never appears. Twelve table rows now
+carry that mapping, with two guards: one asserting each language actually
+emits its import targets, one asserting no extractor exists without a row
+naming it.
+
+No behaviour change, and verified as such rather than asserted: every relation
+extracted from 2,927 external Python/TypeScript/JavaScript/Go/Java files was
+compared before and after, metadata included — 397,088 rows, byte-identical.
+Heritage and exports stay as match arms; their dispatch is not uniform in the
+same way, and converting them is a different change.
+
+An independent review before this tag found no correctness defects in the six
+commits and seven places where a guard was weaker than it read — a duplicate
+table row would not have failed anything, the coverage check listed its
+languages by hand, the extractor scan would have missed a signature rustfmt
+wrapped, and the parity rows could not see a phantom target. All seven are
+closed. Tightening the parity rows to set equality immediately surfaced one
+pre-existing oddity worth naming here even though it is not fixed in this
+release: `from pkg.mod import Helper` in Python records `pkg.mod` itself
+alongside `Helper`, without the `is_module_import` marker that `import os`
+carries, so nothing downstream can tell that module from a symbol of the same
+name. Correcting it changes the edge set of every indexed Python project, so it
+belongs with an index-version bump of its own rather than inside this one.
+
 ## v0.122.1 (2026-08-19)
 
 > **Nothing changes for you.** This release carries no source change — the
