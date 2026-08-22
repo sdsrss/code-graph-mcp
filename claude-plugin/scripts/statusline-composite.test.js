@@ -159,15 +159,24 @@ test('parseCommand refuses to guess at an unterminated quote', () => {
 
 test('needsShell fires on constructs execFileSync cannot run, not on paths', () => {
   if (process.platform === 'win32') return; // no `sh` there; direct path only
-  assert.equal(needsShell('foo | cut -c1-40'), true);
-  assert.equal(needsShell('a && b'), true);
-  assert.equal(needsShell('echo $(date)'), true);
-  assert.equal(needsShell('x > /tmp/y'), true);
+  assert.equal(needsShell('foo | cut -c1-40', '_previous'), true);
+  assert.equal(needsShell('a && b', '_previous'), true);
+  assert.equal(needsShell('echo $(date)', '_previous'), true);
+  assert.equal(needsShell('x > /tmp/y', '_previous'), true);
   // Ordinary commands and paths must stay on the direct-exec path, which is
   // where the timeout's SIGKILL definitely reaches the provider itself.
-  assert.equal(needsShell('node "/path with space/x.js"'), false);
-  assert.equal(needsShell('C:\\Users\\me\\line.exe'), false);
-  assert.equal(needsShell('~/bin/line.sh --flag'), false);
+  assert.equal(needsShell('node "/path with space/x.js"', '_previous'), false);
+  assert.equal(needsShell('C:\\Users\\me\\line.exe', '_previous'), false);
+  assert.equal(needsShell('~/bin/line.sh --flag', '_previous'), false);
+});
+
+test('needsShell is gated on _previous, the only entry a shell ever ran', () => {
+  if (process.platform === 'win32') return;
+  // Same string, same metacharacters — the entry it belongs to is what decides.
+  assert.equal(needsShell('foo | cut -c1-40', '_previous'), true);
+  assert.equal(needsShell('foo | cut -c1-40', 'code-graph'), false);
+  assert.equal(needsShell('foo | cut -c1-40', 'some-third-party'), false);
+  assert.equal(needsShell('foo | cut -c1-40', undefined), false);
 });
 
 test('runProvider runs a provider whose path contains a space', (t) => {
@@ -183,5 +192,44 @@ test('runProvider runs a provider whose path contains a space', (t) => {
 test('runProvider runs a piped provider command', (t) => {
   if (process.platform === 'win32') { t.skip('no /bin/sh'); return; }
   // Before, this was split into ['echo','hello','|','tr',…] and threw ENOENT.
-  assert.equal(runProvider('echo hello | tr a-z A-Z', false, ''), 'HELLO');
+  // `_previous` is the only entry whose ground truth is shell semantics.
+  assert.equal(runProvider('echo hello | tr a-z A-Z', false, '', '_previous'), 'HELLO');
+});
+
+// The shell route belongs to `_previous` ALONE, because `_previous` is the only
+// entry that was ever handed to a shell — it IS the user's `statusLine.command`,
+// which Claude Code runs through one. The other two classes were built by us:
+// `codeGraphCommand()` composes `node "<__dirname>/statusline.js"`, and
+// third-party entries arrive through `statusline-chain.js register`, whose only
+// executor has ever been `execFileSync`. Routing those through a shell imposes
+// semantics they never had — and the casualty is our own segment, since we are
+// the ones whose command embeds an install path.
+test('a generated command is not reinterpreted by a shell', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX shell route'); return; }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-statusline-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // `$` is legal in a directory name and survives double quotes in argv — but a
+  // shell expands `$work` to nothing inside them.
+  const odd = path.join(dir, 'dev$work');
+  fs.mkdirSync(odd);
+  const fixture = path.join(odd, 'line.js');
+  fs.writeFileSync(fixture, "process.stdout.write('SEGMENT');");
+
+  assert.equal(
+    runProvider(`node "${fixture}"`, false, '', 'code-graph'),
+    'SEGMENT',
+    'a command we generated must run as written; a shell would expand $work away',
+  );
+  assert.equal(
+    runProvider(`node "${fixture}"`, false, '', 'some-third-party'),
+    'SEGMENT',
+    'a registered third-party command was never a shell string either',
+  );
+  // The default, for any caller that does not say which entry this is, must be
+  // the conservative one.
+  assert.equal(
+    runProvider(`node "${fixture}"`, false, ''),
+    'SEGMENT',
+    'no id means no shell — only a known `_previous` earns shell semantics',
+  );
 });

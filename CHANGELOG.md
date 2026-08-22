@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### The statusline shell route now belongs to `_previous` alone
+
+v0.124.0 sent any registry command containing a shell metacharacter through
+`sh -c`. That is right for `_previous` — it IS the user's `statusLine.command`,
+which Claude Code runs through a shell — and wrong for the other two classes,
+which we build ourselves: `codeGraphCommand()` composes
+`node "<plugin-dir>/statusline.js"`, and third-party entries arrive through
+`statusline-chain.js register`, whose only executor has ever been
+`execFileSync`. Neither was ever a shell string, so handing them to one imposes
+semantics they never had.
+
+Our own segment is the casualty. Measured with the plugin under a directory
+named `dev$work`: the generated `node "…/dev$work/statusline.js"` returned a
+segment before, and `null` at v0.124.0 — a shell expands `$work` to nothing
+even inside the double quotes, the exec fails, and the catch swallows it. The
+trigger is narrow (inside double quotes only `$` and a backtick break; `&`,
+`;`, `|`, `(`, `)`, `<`, `>` are all literal there), which is why it took an
+install path with a `$` in it to show up.
+
+Confining the shell to `_previous` also confines the tradeoff that came with
+it: through `sh -c` the timeout's SIGKILL reaches the shell rather than a
+grandchild that traps signals, and now only the entry that cannot work without
+a shell pays that price.
+
+### Determinism, honest diagnostics, three dead symbols
+
+`module_overview`'s `inactive_summary` was grouped through a `HashMap`, so the
+same binary over the same index emitted a different group order on every run —
+irreproducible LLM-visible output. It is a `BTreeMap` now, so the order is
+structural rather than a sort that can be forgotten.
+
+The index lock reported every `flock` failure as "another instance holds the
+index lock", so a filesystem without flock support sent the reader hunting for
+a process that does not exist; and the PID written for diagnostics landed on
+top of the previous one without truncating, so `123456` followed by `999` read
+back as `999456`. Both paths still fall back to secondary mode — only the
+diagnosis changes.
+
+`cg-answer`'s hard truncation decoded its bytes as latin1, one character per
+byte, so a single oversized line of CJK came back as mojibake instead of a
+shortened line. It now backs the cut off to a UTF-8 character boundary.
+
+Removed `try_install_snapshot`, the `"file-impact"` telemetry arm, and
+`project_root_canonical` — all three reserved by an `#[allow(dead_code)]` for
+work that landed elsewhere. `FORBIDDEN_EDGES` gained a completeness check that
+asks the filesystem what the module roots are, so the next `src/` addition
+fails loudly instead of going unscanned.
+
 ## v0.124.0 (2026-08-22)
 
 > **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 65 → 67:

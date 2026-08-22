@@ -42,7 +42,7 @@ function run(stdin) {
   const registry = readRegistry();
   if (registry.length === 0) {
     // Fallback: no registry, run code-graph only
-    const cg = runProvider(codeGraphCommand(), false, stdin);
+    const cg = runProvider(codeGraphCommand(), false, stdin, 'code-graph');
     if (cg) process.stdout.write(cg);
     return;
   }
@@ -57,7 +57,7 @@ function run(stdin) {
 
   const outputs = [];
   for (const provider of sorted) {
-    const out = runProvider(provider.command, provider.needsStdin, stdin);
+    const out = runProvider(provider.command, provider.needsStdin, stdin, provider.id);
     if (out) outputs.push(out);
   }
   if (outputs.length > 0) {
@@ -65,26 +65,41 @@ function run(stdin) {
   }
 }
 
-/// True when the command needs a shell to mean what it says. Claude Code runs
-/// `statusLine.command` through one, so a captured `_previous` legitimately
-/// contains pipelines — and a pipeline cannot run through `execFileSync` under
-/// any splitting, so today it produces ENOENT and a silently missing segment.
+/// True when the command needs a shell to mean what it says.
+///
+/// Gated on the entry being `_previous`, and that gate is the whole point.
+/// `_previous` IS the user's `statusLine.command`, which Claude Code runs
+/// through a shell — so a captured pipeline is legitimate there, and a pipeline
+/// cannot run through `execFileSync` under any splitting: it produces ENOENT and
+/// a silently missing segment.
+///
+/// The other two registry classes were never shell strings. `codeGraphCommand()`
+/// composes `node "<__dirname>/statusline.js"`, and third-party entries arrive
+/// through `statusline-chain.js register`, whose only executor has ever been
+/// `execFileSync`. Handing those to a shell imposes semantics they never had,
+/// and OUR segment is the one that dies: measured, a plugin installed under a
+/// directory named `dev$work` produced `node "…/dev$work/statusline.js"`, which
+/// a shell reads as `…/dev/statusline.js` — segment gone, `catch` swallows it.
+/// Inside double quotes only `$` and a backtick break, which is why this stayed
+/// invisible until someone had one in an install path.
 ///
 /// Trade-off, stated because it is a real one: through `sh -c`, the timeout's
 /// SIGKILL reaches the SHELL, not necessarily a grandchild that traps signals
-/// (the hazard the direct-exec path was hardened against). It applies only to
-/// commands that cannot run at all today, so nothing that currently works loses
-/// the guarantee. Windows has no `sh`, so there the command stays on the direct
-/// path and a pipeline keeps failing as before rather than failing differently.
-function needsShell(command) {
-  return process.platform !== 'win32' && SHELL_METACHARS.test(command);
+/// (the hazard the direct-exec path was hardened against). Confining the shell
+/// to `_previous` also confines that loss to the entry that cannot work without
+/// it. Windows keeps everything on the direct path — note that Claude Code
+/// itself runs statusline commands through Git Bash there, so a `_previous`
+/// pipeline works in Claude Code and still dies here; the fix is half-applied by
+/// platform, which is a gap rather than a regression (it never worked here).
+function needsShell(command, id) {
+  return id === '_previous' && process.platform !== 'win32' && SHELL_METACHARS.test(command);
 }
 
-function runProvider(command, needsStdin, stdin) {
+function runProvider(command, needsStdin, stdin, id) {
   if (!command) return null;
   try {
     // Parse command into executable + args
-    const parts = needsShell(command) ? ['/bin/sh', '-c', command] : parseCommand(command);
+    const parts = needsShell(command, id) ? ['/bin/sh', '-c', command] : parseCommand(command);
     if (!parts) return null;
 
     // Claude Code runs statusLine.command through a shell, so a leading `~`
@@ -94,7 +109,7 @@ function runProvider(command, needsStdin, stdin) {
     // swallowed below, silently dropping the user's original statusline.
     // `sh -c` does its own tilde expansion; expanding our own would corrupt the
     // script text (`~` inside a quoted string is not a home directory).
-    const argv = needsShell(command) ? parts : parts.map(expandTilde);
+    const argv = needsShell(command, id) ? parts : parts.map(expandTilde);
 
     // Forward Claude Code's authoritative current dir (from the stdin payload) as
     // a plugin-scoped env var. The code-graph provider gates on it instead of its
