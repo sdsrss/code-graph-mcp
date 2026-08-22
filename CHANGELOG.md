@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased
+
+> **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 65 → 66
+> because Rust calls qualified with the crate's own package name now produce
+> edges they used to drop. The rebuild is automatic on first use.
+
+Audit `docs/audit/audit-2026-08-22-01.md`, P1 items only.
+
+### `mycrate::module::f()` calls no longer drop on the floor
+
+A Rust call written with the crate's OWN package name — `code_graph_mcp::cli::cmd_grep()`,
+which is how every `src/main.rs` reaches its library — produced no `calls` edge.
+The parser strips the reserved roots `crate`, `super` and `self` from a
+qualified path, so the surviving segments name real directories; a package name
+is a crate root too, but it is not one of those three literals, so it stayed in
+the qualifier. `code_graph_mcp/cli` matches no path under `src/`, the candidate
+set emptied, and the Path arm's drop-on-empty discipline threw the edge away.
+
+The blast radius is the three features that read that edge, on the most common
+Rust layout there is. On this repository: `dead-code src/` reported 23 of 23
+candidates, every one of them a `cmd_*` that `main.rs` calls; `impact cmd_grep`
+answered "Risk: LOW, 0 callers" for a 768-line function; `refs cmd_map` printed
+nothing while `src/main.rs:279` called it.
+
+The resolver now strips a leading segment equal to one of this project's Cargo
+package names (`-` normalized to `_`), which it reads from the `Cargo.toml`
+files at and under the project root. Keyed on the real package names, so
+`other_crate::cli::f()` — a genuinely foreign path — still drops rather than
+binding to a same-named local symbol. Measured on this repository's own tree:
+7,053 → 7,151 `calls` edges, no edge removed and no confidence changed, the
+same result at `BATCH_SIZE` 500 and 25; `dead-code src/` now finds nothing.
+
+### The auto-updater no longer hangs when a connection dies mid-response
+
+`requestJson` listened for `data` and `end` on the response and nothing else.
+`req.setTimeout` is an inactivity timer that lives on the socket, so a
+connection dropped part-way through the body produced no `end`, no error and no
+timeout: the promise stayed pending forever. The per-session update check runs
+detached, so on a flaky link or a resetting proxy it left a zombie `node`
+process behind for every session; run from a terminal, it hung the terminal.
+
+The response now rejects on `error` and on `aborted`, and an overall watchdog
+(four times the inactivity budget, so a slow-but-progressing fetch is not
+failed by it) backstops any other never-settles shape. Both settle paths are
+single-shot and clear the timer, so a normal response cannot be re-settled by a
+late event or hold the event loop open.
+
+### One query-time freshness resync instead of three copies of it
+
+`show`/`refs`/`search`/…, `grep`'s AST annotations, and the MCP server's
+result-set refresh each carried a line-for-line transcription of the same
+rule — look up the stored hash, hash the bytes, re-index on mismatch,
+decrement a budget — and the budget knob had split into two environment
+variable names along the way. They now share one implementation in
+`src/indexer/resync.rs`; `CODE_GRAPH_RESYNC_BUDGET` tunes every surface, and
+`CODE_GRAPH_GREP_SYNC_BUDGET` keeps working for `grep`.
+
+The copies also re-indexed one file at a time, and each of those calls re-hashed
+the file the caller had just hashed and then paid a whole-graph name-map load
+plus the global edge post-passes. A query touching the eight-file budget cost
+eight whole-graph sweeps. The dirty set is now classified once and re-indexed in
+a single batch. No output shape changes.
+
 ## v0.123.0 (2026-08-22)
 
 > **Upgrade note — your index rebuilds once.** INDEX_VERSION moves 64 → 65
