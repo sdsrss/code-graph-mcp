@@ -7,6 +7,7 @@ const path = require('path');
 
 const { globalNodeModulesCandidates, nvmNodeModulesDirs, findPlatformBinary, createVersionGate,
         BINARY_NAME, compareVersions, getPackageVersion, isCachedBinaryFresh,
+        findBinary, clearCache, CACHE_FILE,
         unsupportedPlatformHint } = require('./find-binary');
 
 function mkDir(t, prefix) {
@@ -444,4 +445,108 @@ test('platformBinaryCandidates finds the NESTED npm optionalDependency layout', 
     else process.env.NPM_CONFIG_PREFIX = prev;
   }
   assert.ok(found.includes(bin), `nested platform binary must be a candidate; got ${JSON.stringify(found)}`);
+});
+
+// ─── cache hits must not re-spawn `--version` (audit 2026-08-22 P2-17) ─────
+//
+// The cache stored a bare path, so every HIT still ran the binary to check its
+// version: four `findBinary()` calls in one session-init process meant four
+// spawns, plus one from the consistency check. Warm that is 2-4ms; a cold spawn
+// behind Windows AV has been measured above 2s in this codebase's own notes,
+// and they run serially inside a hook's time budget.
+
+/// A fake binary that RECORDS every invocation, so the test can count spawns
+/// rather than assert on a timing.
+function buildCountingBinary(t, versionLine) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-count-bin-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const binPath = path.join(dir, BINARY_NAME);
+  const counter = path.join(dir, 'invocations');
+  fs.writeFileSync(binPath, `#!/bin/sh\necho x >> '${counter}'\necho '${versionLine}'\n`);
+  fs.chmodSync(binPath, 0o755);
+  return { binPath, counter, count: () => (fs.existsSync(counter)
+    ? fs.readFileSync(counter, 'utf8').trim().split('\n').filter(Boolean).length
+    : 0) };
+}
+
+function runFindBinary(homeDir, times, cacheContents) {
+  const cachePath = path.join(homeDir, '.cache', 'code-graph', 'binary-path');
+  if (cacheContents !== undefined) {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, cacheContents);
+  }
+  const out = require('child_process').execFileSync(process.execPath, ['-e', `
+    const { findBinary } = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
+    const seen = [];
+    for (let i = 0; i < ${times}; i++) seen.push(findBinary());
+    process.stdout.write(JSON.stringify(seen));
+  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  return { results: JSON.parse(out), cachePath };
+}
+
+test('repeated findBinary() calls in one process spawn --version at most once', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX counting stub'); return; }
+  const homeDir = mkDir(t, 'cgmcp-home-');
+  const fake = buildCountingBinary(t, 'code-graph-mcp 9.9.9');
+
+  // Legacy bare-path cache: no recorded version, so the FIRST call must verify.
+  const { results, cachePath } = runFindBinary(homeDir, 4, fake.binPath);
+  assert.deepEqual(results, Array(4).fill(fake.binPath));
+  assert.ok(
+    fake.count() <= 2,
+    `4 findBinary() calls must not mean 4 spawns; got ${fake.count()}`,
+  );
+
+  // The record was upgraded in place, so the NEXT process spawns nothing.
+  const entry = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+  assert.equal(entry.path, fake.binPath);
+  assert.equal(entry.version, '9.9.9');
+  assert.ok(entry.stamp, 'the record must carry a file stamp');
+
+  fs.writeFileSync(fake.counter, '');
+  const second = runFindBinary(homeDir, 4);
+  assert.deepEqual(second.results, Array(4).fill(fake.binPath));
+  assert.equal(
+    fake.count(), 0,
+    'a stamped cache entry must answer without running the binary at all',
+  );
+});
+
+test('a replaced binary invalidates the recorded version', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX counting stub'); return; }
+  const homeDir = mkDir(t, 'cgmcp-home-');
+  const fake = buildCountingBinary(t, 'code-graph-mcp 9.9.9');
+  runFindBinary(homeDir, 1, fake.binPath); // seeds path+version+stamp
+
+  // Replace the file: same path, different bytes. The stamp must stop matching,
+  // or an update would keep answering with the old version forever.
+  fs.writeFileSync(
+    fake.binPath,
+    `#!/bin/sh\necho x >> '${fake.counter}'\necho 'code-graph-mcp 9.9.10'\n`,
+  );
+  fs.chmodSync(fake.binPath, 0o755);
+  fs.writeFileSync(fake.counter, '');
+
+  const { cachePath } = runFindBinary(homeDir, 1);
+  assert.ok(fake.count() >= 1, 'a changed file must be re-read, not trusted');
+  assert.equal(JSON.parse(fs.readFileSync(cachePath, 'utf8')).version, '9.9.10');
+});
+
+test('clearCache also drops the in-process memo', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX counting stub'); return; }
+  const homeDir = mkDir(t, 'cgmcp-home-');
+  const fake = buildCountingBinary(t, 'code-graph-mcp 9.9.9');
+  const cachePath = path.join(homeDir, '.cache', 'code-graph', 'binary-path');
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  fs.writeFileSync(cachePath, fake.binPath);
+
+  // A memo that survived clearCache() would keep handing out a path the caller
+  // just declared stale — the exact staleness the disk cache was taught to avoid.
+  const out = require('child_process').execFileSync(process.execPath, ['-e', `
+    const fb = require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))});
+    fb.findBinary();
+    fb.clearCache();
+    process.stdout.write(JSON.stringify({ cacheGone: !require('fs').existsSync(${JSON.stringify(cachePath)}) }));
+  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(out), { cacheGone: true });
 });

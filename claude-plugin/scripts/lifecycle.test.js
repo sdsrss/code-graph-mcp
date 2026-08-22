@@ -1493,3 +1493,93 @@ test('uninstall --unadopt-all sweeps every registered adopted project', (t) => {
   assert.equal(fs.existsSync(path.join(proj, 'CLAUDE.md')), false, 'managed CLAUDE.md removed (we created it)');
   assert.equal(fs.existsSync(path.join(proj, '.claude', 'plugin_code_graph_mcp.md')), false, 'detail file removed');
 });
+
+// --- migrateOldPluginIds failure arms (audit 2026-08-22 P2-10) -------------
+//
+// This was the last read-modify-write in the file still using the lenient
+// `readJson` (which collapses "absent" and "unreadable" into the same null),
+// and the only unguarded write inside install()/update(). It runs from both of
+// doctor's repair arms, so an unwritable `~/.claude` plus a leftover legacy ID
+// meant the repair tool threw a bare stack on exactly the state it exists to
+// repair.
+
+function seedLegacyInstalledPlugins(homeDir, contents) {
+  const p = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, contents);
+  return p;
+}
+
+function runMigrate(homeDir, extraEnv = {}) {
+  return execFileSync(process.execPath, ['-e', `
+    const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
+    const changed = migrateOldPluginIds({ enabledPlugins: {} });
+    process.stdout.write(JSON.stringify({ changed }));
+  `], { env: { ...process.env, HOME: homeDir, ...extraEnv }, encoding: 'utf8' });
+}
+
+test('migrateOldPluginIds drops legacy IDs from installed_plugins.json', (t) => {
+  const homeDir = mkHome(t);
+  const { OLD_PLUGIN_IDS } = require('./lifecycle');
+  assert.ok(OLD_PLUGIN_IDS.length > 0, 'precondition: there are legacy IDs to migrate');
+  const p = seedLegacyInstalledPlugins(
+    homeDir,
+    JSON.stringify({ plugins: { [OLD_PLUGIN_IDS[0]]: { version: '1' }, keep: { version: '2' } } }),
+  );
+
+  runMigrate(homeDir);
+
+  const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.deepEqual(Object.keys(after.plugins), ['keep'], 'legacy ID must be gone, others kept');
+});
+
+test('migrateOldPluginIds reports an unreadable installed_plugins.json instead of skipping it', (t) => {
+  const homeDir = mkHome(t);
+  seedLegacyInstalledPlugins(homeDir, '{ this is not json');
+
+  const res = require('child_process').spawnSync(process.execPath, ['-e', `
+    const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
+    migrateOldPluginIds({ enabledPlugins: {} });
+  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+
+  assert.equal(res.status, 0, `must not throw; stderr=${res.stderr}`);
+  assert.match(
+    res.stderr,
+    /cannot read .*installed_plugins\.json/,
+    `a corrupt file must be reported, not silently treated as absent; stderr=${res.stderr}`,
+  );
+});
+
+test('migrateOldPluginIds survives an unwritable installed_plugins.json', (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    // root ignores the mode bits, so the write would succeed and the arm the
+    // test exists for would never run — say so rather than pass vacuously.
+    t.skip('running as root: file modes cannot make a write fail');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { OLD_PLUGIN_IDS } = require('./lifecycle');
+  const p = seedLegacyInstalledPlugins(
+    homeDir,
+    JSON.stringify({ plugins: { [OLD_PLUGIN_IDS[0]]: { version: '1' } } }),
+  );
+  // writeJsonAtomic writes a temp file in the same directory, so the DIRECTORY
+  // is what has to be unwritable — chmod on the file alone would not stop it.
+  fs.chmodSync(path.dirname(p), 0o500);
+
+  const res = require('child_process').spawnSync(process.execPath, ['-e', `
+    const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
+    migrateOldPluginIds({ enabledPlugins: {} });
+  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+
+  // Restore inline, not in `t.after`: mkHome's own after-hook was registered
+  // first and would try to rmSync the still-unwritable directory.
+  fs.chmodSync(path.dirname(p), 0o700);
+
+  assert.equal(res.status, 0, `EACCES must not escape as a stack; stderr=${res.stderr}`);
+  assert.match(
+    res.stderr,
+    /cannot write .*installed_plugins\.json/,
+    `the failure must be named; stderr=${res.stderr}`,
+  );
+});

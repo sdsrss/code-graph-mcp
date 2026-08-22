@@ -219,6 +219,60 @@ function renderMarkdown(review) {
   return lines.join('\n');
 }
 
+/// Split a stream of back-to-back JSON documents into their source texts.
+///
+/// `gh api --paginate` writes ONE document per page, concatenated with no
+/// separator (`[...][...]`), which `JSON.parse` rejects outright. The caller's
+/// catch then fell through to "no existing comment", so every CI run on a PR
+/// past 100 comments POSTed a fresh sticky comment instead of patching the one
+/// already there (audit 2026-08-22 P2-12).
+///
+/// Splits on TOP-LEVEL boundaries only, tracking string and escape state. The
+/// obvious `][` → `],[` rewrite is wrong: `][` occurs inside ordinary comment
+/// bodies (markdown reference links are literally `[text][ref]`), so that
+/// repair would corrupt the very payload it is trying to read.
+function splitJsonDocuments(text) {
+  const out = [];
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let start = -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[' || c === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === ']' || c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+/// Flatten a paginated `gh api` array response into one array of items.
+/// A single page parses as itself; multiple pages concatenate.
+function parseGhPagedArray(stdout) {
+  const items = [];
+  for (const doc of splitJsonDocuments(String(stdout || ''))) {
+    let value;
+    try { value = JSON.parse(doc); } catch { continue; }
+    if (Array.isArray(value)) items.push(...value);
+    else items.push(value);
+  }
+  return items;
+}
+
 /// Upsert a sticky comment: find an existing comment containing MARKER and PATCH
 /// it, else POST a new one. Uses `gh api` (preinstalled on GitHub runners).
 function upsertComment(repo, prNumber, body) {
@@ -230,11 +284,9 @@ function upsertComment(repo, prNumber, body) {
   const list = gh(['api', '--paginate', `repos/${repo}/issues/${prNumber}/comments`]);
   let existingId = null;
   if (list.status === 0) {
-    try {
-      const comments = JSON.parse(list.stdout || '[]');
-      const hit = comments.find((c) => (c.body || '').includes(MARKER));
-      if (hit) existingId = hit.id;
-    } catch { /* fall through to create */ }
+    const comments = parseGhPagedArray(list.stdout);
+    const hit = comments.find((c) => c && (c.body || '').includes(MARKER));
+    if (hit) existingId = hit.id;
   }
 
   if (existingId) {
@@ -308,4 +360,7 @@ if (require.main === module) {
   main(process.argv.slice(2));
 }
 
-module.exports = { isTestPath, renderMarkdown, computeReview, upsertComment, MARKER };
+module.exports = {
+  isTestPath, renderMarkdown, computeReview, upsertComment, MARKER,
+  parseGhPagedArray, splitJsonDocuments,
+};

@@ -65,11 +65,26 @@ function run(stdin) {
   }
 }
 
+/// True when the command needs a shell to mean what it says. Claude Code runs
+/// `statusLine.command` through one, so a captured `_previous` legitimately
+/// contains pipelines — and a pipeline cannot run through `execFileSync` under
+/// any splitting, so today it produces ENOENT and a silently missing segment.
+///
+/// Trade-off, stated because it is a real one: through `sh -c`, the timeout's
+/// SIGKILL reaches the SHELL, not necessarily a grandchild that traps signals
+/// (the hazard the direct-exec path was hardened against). It applies only to
+/// commands that cannot run at all today, so nothing that currently works loses
+/// the guarantee. Windows has no `sh`, so there the command stays on the direct
+/// path and a pipeline keeps failing as before rather than failing differently.
+function needsShell(command) {
+  return process.platform !== 'win32' && SHELL_METACHARS.test(command);
+}
+
 function runProvider(command, needsStdin, stdin) {
   if (!command) return null;
   try {
     // Parse command into executable + args
-    const parts = parseCommand(command);
+    const parts = needsShell(command) ? ['/bin/sh', '-c', command] : parseCommand(command);
     if (!parts) return null;
 
     // Claude Code runs statusLine.command through a shell, so a leading `~`
@@ -77,7 +92,9 @@ function runProvider(command, needsStdin, stdin) {
     // does NOT use a shell, so we must expand `~/` ourselves on every word —
     // otherwise a `_previous` command captured verbatim throws ENOENT and gets
     // swallowed below, silently dropping the user's original statusline.
-    const argv = parts.map(expandTilde);
+    // `sh -c` does its own tilde expansion; expanding our own would corrupt the
+    // script text (`~` inside a quoted string is not a home directory).
+    const argv = needsShell(command) ? parts : parts.map(expandTilde);
 
     // Forward Claude Code's authoritative current dir (from the stdin payload) as
     // a plugin-scoped env var. The code-graph provider gates on it instead of its
@@ -117,17 +134,69 @@ function cwdFromStdin(stdin) {
   } catch { return null; }
 }
 
-function parseCommand(cmd) {
-  // Handle: node "/path/to/script.js"
-  const match = cmd.match(/^(\S+)\s+"([^"]+)"(.*)$/);
-  if (match) {
-    const args = [match[2]];
-    if (match[3].trim()) args.push(...match[3].trim().split(/\s+/));
-    return [match[1], ...args];
+/// Shell constructs a direct `execFileSync` cannot honour at all: pipelines,
+/// redirection, sequencing, command substitution, backgrounding.
+///
+/// Deliberately NOT here: `\\` (every Windows path has them), `~` (expandTilde
+/// handles it), and glob characters (far likelier to be a literal in a path
+/// than an intended glob in a statusline command).
+const SHELL_METACHARS = /[|&;<>()`$]/;
+
+/// Split a command line into argv the way a shell would: double quotes, single
+/// quotes, and backslash escapes of space / quote / backslash.
+///
+/// The old parser was a single regex that only understood ONE double-quoted
+/// word immediately after the executable; everything else went through
+/// `split(/\s+/)`. So a `_previous` command whose path contains a space —
+/// `"C:\Program Files\tools\line.exe"`, `node "~/My Configs/line.js"` — was
+/// torn into fragments, `execFileSync` threw ENOENT, and the catch swallowed
+/// it. The user's original statusline vanished without a word, which is exactly
+/// the case the `_previous` slot exists to protect (audit 2026-08-22 P2-9).
+///
+/// A backslash escapes only space, quote and backslash. Treating it as a
+/// general escape would eat `C:\Users\me\bin` on Windows, turning a working
+/// path into a broken one — a repair that breaks the platform it did not test.
+///
+/// Returns null for an unterminated quote: the caller then leaves the provider
+/// alone rather than exec'ing a guess.
+function tokenize(cmd) {
+  const argv = [];
+  let cur = '';
+  let has = false;
+  let quote = null; // '"' | "'" | null
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote === "'") {
+      // Single quotes are literal, backslash included — POSIX rules.
+      if (c === "'") quote = null;
+      else { cur += c; has = true; }
+      continue;
+    }
+    if (c === '\\' && (cmd[i + 1] === ' ' || cmd[i + 1] === '"' || cmd[i + 1] === '\\')) {
+      cur += cmd[++i];
+      has = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      else { cur += c; has = true; }
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; has = true; continue; }
+    if (/\s/.test(c)) {
+      if (has) { argv.push(cur); cur = ''; has = false; }
+      continue;
+    }
+    cur += c;
+    has = true;
   }
-  // Handle: node /path/to/script.js
-  const parts = cmd.split(/\s+/);
-  return parts.length > 0 ? parts : null;
+  if (quote) return null; // unterminated quote — do not guess
+  if (has) argv.push(cur);
+  return argv.length > 0 ? argv : null;
+}
+
+function parseCommand(cmd) {
+  return tokenize(cmd);
 }
 
 // Expand a leading `~` / `~/` to the home directory, mirroring shell tilde
@@ -145,4 +214,4 @@ function codeGraphCommand() {
   return `node "${path.join(__dirname, 'statusline.js')}"`;
 }
 
-module.exports = { run, runProvider, parseCommand, expandTilde, cwdFromStdin };
+module.exports = { run, runProvider, parseCommand, tokenize, needsShell, expandTilde, cwdFromStdin };

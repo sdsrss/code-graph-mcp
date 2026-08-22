@@ -702,12 +702,44 @@ function migrateOldPluginIds(settings) {
       delete settings.enabledPlugins[oldId];
       changed = true;
     }
+  }
 
-    // Clean old ID from installed_plugins.json
-    const installed = readJson(installedPluginsPath());
-    if (installed && installed.plugins && oldId in installed.plugins) {
-      delete installed.plugins[oldId];
-      writeJsonAtomic(installedPluginsPath(), installed);
+  // Clean old IDs from installed_plugins.json — Claude Code's OWN file.
+  //
+  // Read once and write once, through the same three-way read the other
+  // read-modify-write sites in this file use. The lenient `readJson` was the
+  // last caller left here, and it cannot tell "no such file" (nothing to do)
+  // from "unreadable" (say so): both came back null and were skipped in
+  // silence. The write was also the only unguarded one in install()/update() —
+  // with `~/.claude` unwritable (EACCES) and a legacy ID still present, it threw
+  // a bare stack out of both of doctor's repair arms, which is a repair tool
+  // crashing on the state it exists to repair (audit 2026-08-22 P2-10).
+  const installedRead = readJsonResult(installedPluginsPath());
+  if (installedRead.corrupt || installedRead.lossy) {
+    console.error(
+      `[code-graph] cannot read ${installedPluginsPath()} — leaving legacy plugin ` +
+      'IDs in place. Claude Code may still list an old code-graph entry.'
+    );
+  } else {
+    const installed = installedRead.value;
+    let ipChanged = false;
+    if (installed && installed.plugins) {
+      for (const oldId of OLD_PLUGIN_IDS) {
+        if (oldId in installed.plugins) {
+          delete installed.plugins[oldId];
+          ipChanged = true;
+        }
+      }
+    }
+    if (ipChanged) {
+      try {
+        writeJsonAtomic(installedPluginsPath(), installed);
+      } catch (err) {
+        console.error(
+          `[code-graph] cannot write ${installedPluginsPath()} (${err.code || err.name}) — ` +
+          'a legacy code-graph entry remains. Remove it with `/plugin uninstall`.'
+        );
+      }
     }
   }
 
@@ -1785,6 +1817,7 @@ module.exports = {
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   cleanupDisabledStatusline, unadoptRegisteredProjects,
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
+  migrateOldPluginIds,                                                 // exported so its failure arms are testable (audit 2026-08-22 P2-10)
   readRegistry, readRegistryForWrite, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,

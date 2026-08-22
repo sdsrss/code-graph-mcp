@@ -225,3 +225,51 @@ test('renderMarkdown: tolerates a review object without unanalyzed', () => {
   assert.ok(md.startsWith(MARKER));
   assert.doesNotMatch(md, /Not analyzed/);
 });
+
+// --- gh api --paginate returns concatenated pages (audit 2026-08-22 P2-12) --
+//
+// `gh api --paginate` writes one JSON document per page with no separator.
+// `JSON.parse` rejects that, the catch fell through to "no existing comment",
+// and every CI run on a PR past 100 comments POSTed a new sticky comment
+// instead of patching the one already there.
+const { parseGhPagedArray, splitJsonDocuments } = require('./pr-impact-comment');
+
+test('parseGhPagedArray flattens concatenated pages', () => {
+  assert.deepEqual(parseGhPagedArray('[{"id":1}]'), [{ id: 1 }]);
+  assert.deepEqual(
+    parseGhPagedArray('[{"id":1},{"id":2}][{"id":3}]'),
+    [{ id: 1 }, { id: 2 }, { id: 3 }],
+  );
+  // Pages separated by the newline gh actually emits.
+  assert.deepEqual(parseGhPagedArray('[{"id":1}]\n[{"id":2}]\n'), [{ id: 1 }, { id: 2 }]);
+  assert.deepEqual(parseGhPagedArray(''), []);
+  assert.deepEqual(parseGhPagedArray('[]'), []);
+});
+
+test('parseGhPagedArray does not split on brackets inside a comment body', () => {
+  // The reason this is a state machine and not a `][` → `],[` rewrite: a
+  // markdown reference link is literally `[text][ref]`, and comment bodies are
+  // exactly where that appears. The naive repair corrupts the payload it reads.
+  const body = 'see [the docs][docs] and [this][that]';
+  const stdout = JSON.stringify([{ id: 1, body }]) + JSON.stringify([{ id: 2, body: '] [' }]);
+  assert.deepEqual(parseGhPagedArray(stdout), [
+    { id: 1, body },
+    { id: 2, body: '] [' },
+  ]);
+});
+
+test('splitJsonDocuments respects escaped quotes', () => {
+  const stdout = '[{"body":"a \\" ] [ quote"}][{"id":2}]';
+  assert.equal(splitJsonDocuments(stdout).length, 2);
+  assert.deepEqual(parseGhPagedArray(stdout), [{ body: 'a " ] [ quote' }, { id: 2 }]);
+});
+
+test('the sticky-comment marker survives a paginated lookup', () => {
+  // End to end on the shape upsertComment consumes: the marker sits on page 2,
+  // which is where a single-page parse loses it.
+  const stdout =
+    JSON.stringify([{ id: 1, body: 'unrelated' }]) +
+    JSON.stringify([{ id: 7, body: `something\n${MARKER}\nmore` }]);
+  const hit = parseGhPagedArray(stdout).find((c) => (c.body || '').includes(MARKER));
+  assert.equal(hit && hit.id, 7);
+});

@@ -10,7 +10,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { cwdFromStdin, runProvider } = require('./statusline-composite');
+const { cwdFromStdin, runProvider, parseCommand, needsShell } = require('./statusline-composite');
 
 test('cwdFromStdin reads the top-level cwd field', () => {
   assert.equal(cwdFromStdin('{"cwd":"/a/b"}'), '/a/b');
@@ -105,4 +105,83 @@ test('runProvider leaves CODE_GRAPH_STATUSLINE_CWD unset when stdin carries no c
   fs.writeFileSync(fixture, "process.stdout.write('CWD='+(process.env.CODE_GRAPH_STATUSLINE_CWD||'NONE'));");
   const out = runProvider(`node ${JSON.stringify(fixture)}`, false, '');
   assert.equal(out, 'CWD=NONE');
+});
+
+// --- provider command splitting (audit 2026-08-22 P2-9) --------------------
+//
+// Claude Code runs `statusLine.command` through a shell; the composite runs it
+// through `execFileSync`, so the composite has to do the splitting itself. It
+// used to be one regex that understood exactly one double-quoted word after the
+// executable and `split(/\s+/)` for everything else — so a `_previous` command
+// whose path contains a space was torn apart, `execFileSync` threw ENOENT, and
+// the catch swallowed it. The user's original statusline disappeared silently,
+// which is the one thing the `_previous` slot exists to prevent.
+
+test('parseCommand keeps quoted paths whole, wherever they appear', () => {
+  assert.deepEqual(parseCommand('node /path/x.js'), ['node', '/path/x.js']);
+  assert.deepEqual(
+    parseCommand('node "/path with space/x.js"'),
+    ['node', '/path with space/x.js'],
+  );
+  // A quoted EXECUTABLE — the old regex required the quote to come second.
+  assert.deepEqual(
+    parseCommand('"/Program Files/tools/line.exe" --a b'),
+    ['/Program Files/tools/line.exe', '--a', 'b'],
+  );
+  // A quoted argument that is not the first — likewise unreachable before.
+  assert.deepEqual(
+    parseCommand('node /x.js --label "my project"'),
+    ['node', '/x.js', '--label', 'my project'],
+  );
+  assert.deepEqual(
+    parseCommand("node '/single quoted/x.js'"),
+    ['node', '/single quoted/x.js'],
+  );
+  assert.deepEqual(parseCommand('node /x.js  --a   --b'), ['node', '/x.js', '--a', '--b']);
+});
+
+test('parseCommand leaves Windows path separators alone', () => {
+  // A general backslash escape would turn this into `C:Usersmeline.exe` —
+  // a repair that breaks the platform it did not test on. Backslash escapes
+  // only space, quote and backslash.
+  assert.deepEqual(
+    parseCommand('C:\\Users\\me\\line.exe --a'),
+    ['C:\\Users\\me\\line.exe', '--a'],
+  );
+  assert.deepEqual(parseCommand('node /my\\ dir/x.js'), ['node', '/my dir/x.js']);
+});
+
+test('parseCommand refuses to guess at an unterminated quote', () => {
+  assert.equal(parseCommand('node "/unterminated'), null);
+  assert.equal(parseCommand(''), null);
+  assert.equal(parseCommand('   '), null);
+});
+
+test('needsShell fires on constructs execFileSync cannot run, not on paths', () => {
+  if (process.platform === 'win32') return; // no `sh` there; direct path only
+  assert.equal(needsShell('foo | cut -c1-40'), true);
+  assert.equal(needsShell('a && b'), true);
+  assert.equal(needsShell('echo $(date)'), true);
+  assert.equal(needsShell('x > /tmp/y'), true);
+  // Ordinary commands and paths must stay on the direct-exec path, which is
+  // where the timeout's SIGKILL definitely reaches the provider itself.
+  assert.equal(needsShell('node "/path with space/x.js"'), false);
+  assert.equal(needsShell('C:\\Users\\me\\line.exe'), false);
+  assert.equal(needsShell('~/bin/line.sh --flag'), false);
+});
+
+test('runProvider runs a provider whose path contains a space', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-statusline-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const spaced = path.join(dir, 'my provider');
+  fs.mkdirSync(spaced);
+  const fixture = path.join(spaced, 'line.js');
+  fs.writeFileSync(fixture, "process.stdout.write('SEGMENT');");
+  assert.equal(runProvider(`node "${fixture}"`, false, ''), 'SEGMENT');
+});
+
+test('runProvider runs a piped provider command', (t) => {
+  if (process.platform === 'win32') { t.skip('no /bin/sh'); return; }
+  // Before, this was split into ['echo','hello','|','tr',…] and threw ENOENT.
+  assert.equal(runProvider('echo hello | tr a-z A-Z', false, ''), 'HELLO');
 });

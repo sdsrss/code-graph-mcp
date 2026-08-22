@@ -159,13 +159,81 @@ function isNativeBinary(candidate) {
  * Permissive on unknown values: missing pkg version or unreadable binary
  * version → trust cache (don't refuse the only path we know about).
  */
-function isCachedBinaryFresh(cachedPath, pkgVersion) {
+function isCachedBinaryFresh(cachedPath, pkgVersion, knownVersion) {
   if (!isNativeBinary(cachedPath)) return false;
   if (!pkgVersion) return true;
-  const cacheVer = readBinaryVersion(cachedPath);
+  // `knownVersion` lets the caller skip the `--version` spawn when the cache
+  // entry already recorded it AND the file has not changed since — see
+  // `readCacheEntry`. Absent, behaviour is exactly as before.
+  const cacheVer = knownVersion || readBinaryVersion(cachedPath);
   if (!cacheVer) return true;
   return compareVersions(cacheVer, pkgVersion) >= 0;
 }
+
+/// Identity stamp for a binary file: if this is unchanged, the version we
+/// recorded for it is still its version. mtime alone would be fooled by a
+/// same-second replacement, so size rides along.
+function binaryStamp(binPath) {
+  try {
+    const st = fs.statSync(binPath);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return null;
+  }
+}
+
+/// Read the on-disk cache entry.
+///
+/// The file used to hold a bare path, so every cache HIT still spawned
+/// `code-graph-mcp --version` to check freshness — four `findBinary()` calls in
+/// one SessionStart process meant four spawns, plus one more from the
+/// consistency check. Cheap warm (2-4ms), but a cold spawn behind Windows AV
+/// has been measured above 2s in this codebase's own notes, and they run
+/// serially inside a hook's time budget (audit 2026-08-22 P2-17).
+///
+/// The entry now carries the version and a file stamp. A pre-existing bare-path
+/// file still reads (no version → verified once, then rewritten in the new
+/// shape), and an older plugin reading the new file sees a non-path string,
+/// fails `isNativeBinary`, and re-discovers — one extra walk, never a wrong
+/// answer.
+function readCacheEntry() {
+  let raw;
+  try {
+    raw = fs.readFileSync(CACHE_FILE, 'utf8').trim();
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  if (raw[0] === '{') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed.path === 'string' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return { path: raw };
+}
+
+function writeCacheEntry(binPath) {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    fs.writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({
+        path: binPath,
+        version: readBinaryVersion(binPath) || null,
+        stamp: binaryStamp(binPath),
+      })
+    );
+  } catch { /* ok */ }
+}
+
+/// Per-process memo. `findBinary()` is called four times in a single
+/// session-init run; only the first should touch the disk. Only a FOUND path is
+/// memoized — a miss must stay retryable, because `launcher-install` installs
+/// the binary and looks again in the same process.
+let memoizedBinary = null;
 
 /**
  * Locate the code-graph-mcp binary using multiple strategies.
@@ -183,21 +251,29 @@ function isCachedBinaryFresh(cachedPath, pkgVersion) {
  * Returns the absolute path or null if not found.
  */
 function findBinary() {
+  if (memoizedBinary) return memoizedBinary;
+
   // Try disk cache first (avoids spawning `which` on hot paths)
-  try {
-    const cached = fs.readFileSync(CACHE_FILE, 'utf8').trim();
-    if (isCachedBinaryFresh(cached, getPackageVersion())) return cached;
-    if (cached) clearCache();
-  } catch { /* no cache or stale */ }
+  const entry = readCacheEntry();
+  if (entry) {
+    // Trust the recorded version only while the FILE is the one it was recorded
+    // for; a replaced binary re-reads it.
+    const stamped = entry.stamp && entry.stamp === binaryStamp(entry.path);
+    const known = stamped ? entry.version : null;
+    if (isCachedBinaryFresh(entry.path, getPackageVersion(), known)) {
+      if (!known) writeCacheEntry(entry.path); // upgrade a bare-path / stale-stamp record
+      memoizedBinary = entry.path;
+      return memoizedBinary;
+    }
+    clearCache();
+  }
 
   const result = findBinaryUncached();
 
   // Write cache for subsequent calls
   if (isNativeBinary(result)) {
-    try {
-      fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-      fs.writeFileSync(CACHE_FILE, result);
-    } catch { /* ok */ }
+    writeCacheEntry(result);
+    memoizedBinary = result;
   }
 
   return result;
@@ -414,6 +490,7 @@ function findBinaryUncached() {
  * findBinary() picks up the new location.
  */
 function clearCache() {
+  memoizedBinary = null; // the memo is a cache too — an update must invalidate both
   try { fs.unlinkSync(CACHE_FILE); } catch { /* ok */ }
 }
 

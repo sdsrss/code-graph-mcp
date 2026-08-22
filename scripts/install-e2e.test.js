@@ -608,8 +608,12 @@ test('§2.3 find-binary.js writes and reads disk cache', () => {
   assert.ok(result.length > 0);
   // Cache should be written
   assert.ok(fs.existsSync(cacheFile), 'Cache file must be written');
-  const cached = fs.readFileSync(cacheFile, 'utf8').trim();
-  assert.equal(cached, result, 'Cache must contain resolved path');
+  // The entry carries the path plus the version and file stamp that let a
+  // cache HIT skip re-running the binary (audit 2026-08-22 P2-17); it used to
+  // be a bare path string.
+  const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+  assert.equal(cached.path, result, 'Cache must contain resolved path');
+  assert.ok(cached.stamp, 'Cache entry must carry a file stamp');
 
   // Second run should use cache (still returns same path)
   const result2 = execFileSync(process.execPath, [FIND_BINARY], {
@@ -623,7 +627,9 @@ test('§2.4 find-binary.js handles stale cache gracefully', () => {
   const homeDir = mkHome();
   const cacheFile = path.join(homeDir, '.cache', 'code-graph', 'binary-path');
 
-  // Write a stale cache pointing to nonexistent binary
+  // Write a stale cache pointing to nonexistent binary. Deliberately in the
+  // LEGACY bare-path shape: an installed plugin upgrading into the stamped
+  // format has to keep reading what the previous version wrote.
   fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
   fs.writeFileSync(cacheFile, '/nonexistent/path/code-graph-mcp');
 
@@ -635,9 +641,9 @@ test('§2.4 find-binary.js handles stale cache gracefully', () => {
 
   assert.ok(result.length > 0, 'Must resolve despite stale cache');
   assert.ok(fs.existsSync(result), 'Must resolve to existing binary');
-  // Cache should be updated
-  const newCached = fs.readFileSync(cacheFile, 'utf8').trim();
-  assert.equal(newCached, result);
+  // Cache should be updated, in the current shape
+  const newCached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+  assert.equal(newCached.path, result);
 });
 
 test('§2.5 find-binary.js clearCache removes the cache file', () => {
