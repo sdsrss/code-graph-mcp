@@ -316,13 +316,22 @@ fn extraction_and_schema_sources_match_recorded_fingerprints() {
              \x20 recorded {rec_schema_fp} at SCHEMA_VERSION {rec_schema_version}\n\
              \x20 current  {} at SCHEMA_VERSION {}\n\
              \x20 {}\n\
-             \x20 Decide first: does this change the DDL an existing database already has \
-             (table, column, index, trigger, or FTS shape)?\n\
+             \x20 Decide first: does an existing database END UP WRONG without a migration \
+             step? Not `did the DDL text change` — the two come apart, and getting them \
+             confused costs real compatibility (see the CREATE INDEX case below).\n\
              \x20   YES -> bump SCHEMA_VERSION and add the matching `migrate_vN_to_vN+1` step. \
-             `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing DB, so an edit to the \
-             CREATE statement alone reaches new installs only — upgraders hit `no such \
-             column` at query time.\n\
-             \x20   NO  -> comment/format only; no bump needed.\n\
+             This is the CREATE TABLE / ADD COLUMN shape: `CREATE TABLE IF NOT EXISTS` is a \
+             NO-OP on an existing DB, so an edit to the CREATE statement alone reaches new \
+             installs only — upgraders hit `no such column` at query time.\n\
+             \x20   NO  -> comment/format only, OR a statement that ALREADY reaches existing \
+             databases on its own. `CREATE INDEX IF NOT EXISTS` is the standard case: \
+             create_tables_sql() runs on every writable open, so the index lands on \
+             upgraders with no migration, and a rung for it would be inert (delete the \
+             v5->v6 one and watch nothing go red). Do NOT bump for that. The bump is not \
+             free: open_impl_inner BAILS when user_version exceeds the binary's \
+             SCHEMA_VERSION, so bumping makes every older binary refuse a database it \
+             reads perfectly well — and this project ships a plugin whose shell can update \
+             while the binary stays pinned.\n\
              \x20 Either way, record the new baseline:\n\
              \x20   {REGEN_CMD}",
             obs.schema_fp,

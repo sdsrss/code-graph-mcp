@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### One index: a stale-file query 11.4 s → 2.0 s, and rebuilds get faster too
+
+v0.125.0 took the one-stale-file query from 7.2 s to 2.1 s by materializing the
+projection three global post-passes were re-deriving. What stayed was the shape
+of the work: those passes still ask, once per candidate edge, "is this name
+defined in the caller's own file?" — and `nodes` had no index that answers it.
+
+`idx_nodes_name` alone makes that a name-bucket probe followed by a table fetch
+per row to test `file_id`, and in real code the hot names (`get`, `run`,
+`__init__`) have buckets hundreds of rows deep. The whole fix is a composite:
+
+    CREATE INDEX IF NOT EXISTS idx_nodes_file_name ON nodes(file_id, name);
+
+The query planner shows exactly what changes, and it is one line:
+
+    before:  SEARCH ln USING INDEX idx_nodes_name (name=?)
+    after:   SEARCH ln USING COVERING INDEX idx_nodes_file_name (file_id=? AND name=?)
+
+Covering — the row fetch disappears entirely. Measured on 4,736 files of
+third-party Python (77,121 nodes / 611,486 edges), two samples per figure:
+
+| | before | after |
+|---|---|---|
+| query after one file changed | 11.42 s | **1.98 s** |
+| full rebuild | 35.6 s | **26.0 s** |
+| `bind_calls_to_imported_targets` alone | 28.5 s | 0.34 s |
+
+The rebuild getting *faster* is the answer to the obvious objection: an extra
+index means extra maintenance on every node insert, so it should cost something
+on the write path. It does — and the post-pass saving is an order of magnitude
+larger, so the net is 27% off a full build. Index size is 1.9 MB on a 490 MB
+index; creating it on an existing one takes 47 ms.
+
+**No SCHEMA_VERSION bump, deliberately.** `create_tables_sql()` runs on every
+writable open, so its `CREATE INDEX IF NOT EXISTS` already reaches every index
+built before this release — a migration rung would be inert, which is also
+true of the v5→v6 index rung, verified by deleting it and watching nothing go
+red. And bumping would be actively harmful: `open_impl_inner` BAILS when
+`user_version` exceeds the binary's SCHEMA_VERSION, so every older binary would
+refuse to open a database it can read perfectly well, over an added index. This
+project has a documented failure mode where the plugin shell updates while the
+binary stays pinned; INDEX_VERSION drift only warns, SCHEMA_VERSION drift is
+fatal, and an additive index does not belong on the fatal gate. A test pins the
+version as unchanged so a future rung has to come past it.
+
+Equivalence is asserted where the pass actually fires, not where it is quiet.
+The corpus A/B that motivated the index compared two runs that both inserted
+zero edges — a vacuous equality. The committed fixture builds the case the pass
+exists for (a bare call resolving to the wrong same-name node while the caller's
+file uniquely imports the right one), asserts it binds exactly one edge, and
+compares the full edge set with the index present and dropped.
+
 ## v0.125.0 (2026-08-22)
 
 ### A query that finds one stale file: 7.2 s → 2.1 s

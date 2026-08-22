@@ -1172,6 +1172,100 @@ mod tests {
             );
         }
 
+        /// `idx_nodes_file_name` must be a pure access path: the same edges, with
+        /// and without it.
+        ///
+        /// A SQLite index cannot change a result set by design, but "by design"
+        /// is the argument, not the evidence — and the corpus A/B that motivated
+        /// this index compared two runs that both inserted ZERO edges, which is a
+        /// vacuous equality (the trap the post-pass rewrite already had to dodge).
+        /// So this fixture is built so the pass actually FIRES: it inserts exactly
+        /// one edge, and the assertion is that both index states produce the same
+        /// one.
+        ///
+        /// Shape: `app.py` calls a bare `helper` that currently resolves to the
+        /// WRONG same-name node in `other.py`, while `app.py` carries a unique
+        /// internal import binding `helper` to `util.py`. That is precisely the
+        /// case `bind_calls_to_imported_targets` exists to fix, and it exercises
+        /// the `NOT EXISTS (… ln.file_id = ? AND ln.name = ?)` predicate the index
+        /// serves — `app.py` defines no `helper`, so the subquery must come back
+        /// empty by SEARCHING, not by short-circuiting.
+        #[test]
+        fn composite_file_name_index_does_not_change_which_edges_bind() {
+            use crate::domain::REL_IMPORTS;
+            use crate::storage::queries::insert_edge;
+
+            /// Builds the firing fixture and returns (inserted, full edge set).
+            fn run_once(drop_index: bool) -> (usize, Vec<(i64, i64, String)>) {
+                let tmp = TempDir::new().unwrap();
+                let db = Database::open(&tmp.path().join("p.db")).unwrap();
+                let conn = db.conn();
+
+                if drop_index {
+                    conn.execute_batch("DROP INDEX IF EXISTS idx_nodes_file_name;")
+                        .unwrap();
+                    let gone: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master
+                             WHERE type='index' AND name='idx_nodes_file_name'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(gone, 0, "the no-index arm must really lack the index");
+                }
+
+                let f_app = pyfile(conn, "app.py");
+                let f_util = pyfile(conn, "util.py");
+                let f_other = pyfile(conn, "other.py");
+
+                let run = method(conn, "run", None, f_app);
+                let imported_helper = method(conn, "helper", None, f_util);
+                let decoy_helper = method(conn, "helper", None, f_other);
+
+                // app.py imports `helper` from util.py — the unique internal
+                // import. Its source must live in app.py: the pass keys the
+                // import off `mn.file_id`.
+                let app_mod = method(conn, "<module>", None, f_app);
+                insert_edge(conn, app_mod, imported_helper, REL_IMPORTS, None).unwrap();
+
+                // The bare call currently points at the WRONG same-name node.
+                insert_edge(conn, run, decoy_helper, REL_CALLS, None).unwrap();
+
+                let inserted = bind_calls_to_imported_targets(&db).unwrap();
+
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT source_id, target_id, relation FROM edges
+                         ORDER BY source_id, target_id, relation",
+                    )
+                    .unwrap();
+                let edges: Vec<(i64, i64, String)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                (inserted, edges)
+            }
+
+            let (with_idx, edges_with) = run_once(false);
+            let (without_idx, edges_without) = run_once(true);
+
+            // Non-vacuity first: an equality between two zeros would prove nothing.
+            assert_eq!(
+                with_idx, 1,
+                "fixture must actually FIRE — a 0 == 0 comparison is not evidence"
+            );
+            assert_eq!(
+                without_idx, with_idx,
+                "the index must not change how many edges bind"
+            );
+            assert_eq!(
+                edges_without, edges_with,
+                "the index must not change WHICH edges exist"
+            );
+        }
+
         /// v49 audit fix: same parity for the Path qualifier — empty filter binds
         /// nothing and drains, never bare-falls-back (Phase-2 drops Path on empty).
         #[test]

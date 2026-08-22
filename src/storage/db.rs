@@ -1588,6 +1588,135 @@ mod tests {
         assert_eq!(version, schema::SCHEMA_VERSION);
     }
 
+    /// The composite `nodes(file_id, name)` index the three global edge
+    /// post-passes probe, and the contract that delivers it to an index built
+    /// before it existed.
+    ///
+    /// Deliberately NOT a migration rung, and NOT a SCHEMA_VERSION bump. Two
+    /// reasons, both load-bearing:
+    ///
+    /// 1. `create_tables_sql()` runs unconditionally on every writable open, so
+    ///    its `CREATE INDEX IF NOT EXISTS` already reaches every existing DB. A
+    ///    rung here would be inert — removing one and re-running this test proves
+    ///    it (that is how the v5→v6 index rung turns out to be inert too).
+    /// 2. `open_impl_inner` BAILS when `user_version` exceeds SCHEMA_VERSION.
+    ///    Bumping for an added index would make every older binary refuse to open
+    ///    a DB that it can in fact read perfectly — and this project has a
+    ///    documented failure mode where the plugin shell updates while the binary
+    ///    stays pinned. INDEX_VERSION drift only warns; SCHEMA_VERSION drift is
+    ///    fatal, so an additive index does not belong on that gate.
+    ///
+    /// Hand-build a `nodes` WITHOUT the composite so the test observes the index
+    /// being ADDED rather than a fresh DB that never lacked it.
+    #[test]
+    fn test_open_adds_composite_file_name_index_to_an_older_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            // Pre-existing nodes shape: the single-column indexes only.
+            c.execute_batch(
+                "CREATE TABLE nodes (
+                    id             INTEGER PRIMARY KEY,
+                    file_id        INTEGER NOT NULL,
+                    name           TEXT NOT NULL,
+                    qualified_name TEXT,
+                    type           TEXT NOT NULL
+                );
+                 CREATE INDEX idx_nodes_file ON nodes(file_id);
+                 CREATE INDEX idx_nodes_name ON nodes(name);",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", schema::SCHEMA_VERSION)
+                .unwrap();
+        }
+
+        // Precondition: the index is genuinely absent before the open, or every
+        // assertion below passes vacuously on a DB that already had it.
+        {
+            let c = Connection::open(&db_path).unwrap();
+            let pre: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_nodes_file_name'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre, 0, "fixture must start WITHOUT the composite index");
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        // (a) Opening an older DB adds it.
+        let present: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_nodes_file_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present, 1,
+            "idx_nodes_file_name must exist after opening an older DB"
+        );
+
+        // (b) ...and the planner actually reaches for it on the post-passes'
+        // shadowing predicate, as a COVERING index (no table fetch). Existence
+        // alone is the weaker half: an index the planner ignores (a collation
+        // mismatch on `name`, say) passes a name check and delivers nothing.
+        let plan: String = db
+            .conn()
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM nodes ln WHERE ln.file_id = 1 AND ln.name = 'x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_nodes_file_name"),
+            "the shadowing predicate must use the composite index, got plan: {plan}"
+        );
+        assert!(
+            plan.contains("COVERING"),
+            "the composite must cover the predicate — a non-covering plan still \
+             fetches the row and gives back the cost this index exists to remove; \
+             got plan: {plan}"
+        );
+
+        // (c) The single-column name index is NOT redundant and must survive: a
+        // name-only lookup cannot use a composite led by file_id.
+        let name_idx: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_nodes_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name_idx, 1, "idx_nodes_name must not be dropped");
+
+        // (d) SCHEMA_VERSION is UNCHANGED by this index. Pinned, not incidental:
+        // bumping it would make older binaries bail on a DB they can read (see
+        // the doc comment), so a future edit that adds this index via a rung has
+        // to come past this assertion.
+        let version: i32 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version,
+            schema::SCHEMA_VERSION,
+            "an additive index must not move the schema gate"
+        );
+    }
+
     #[test]
     fn test_open_readonly_rejects_writes() {
         let tmp = TempDir::new().unwrap();
