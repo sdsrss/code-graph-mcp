@@ -1138,3 +1138,64 @@ class ProfileWriter:
         full_edges
     );
 }
+
+/// Regression (audit 2026-08-22 P1-1): a call qualified with the crate's OWN
+/// package name — `my_crate::cli::cmd_grep()`, the standard `bin` → `lib`
+/// shape — kept `my_crate` as the first Path segment. That segment names the
+/// crate root, not a directory, so the chain matched no candidate path and the
+/// edge dropped. In this repo that made `dead-code src/` report 23/23 false
+/// positives and `impact cmd_grep` answer "0 callers" for a function main.rs
+/// really calls. The crate root is now stripped like `crate::`/`super::`.
+#[test]
+fn path_qualifier_strips_own_crate_name() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        root,
+        "src/cli/commands/grep.rs",
+        "pub fn cmd_grep() -> i32 { 1 }\n",
+    );
+    write(
+        root,
+        "src/cli/commands/other.rs",
+        "pub fn cmd_other() -> i32 { 2 }\n",
+    );
+    write(
+        root,
+        "src/main.rs",
+        r#"
+        fn main() {
+            // Own crate name, hyphen → underscore: must resolve.
+            my_crate::cli::cmd_grep();
+            // A DIFFERENT crate's path must still drop (negative control):
+            // stripping must be keyed on this project's package names, not on
+            // "the first segment matches nothing".
+            unknown_crate::cli::cmd_other();
+        }
+    "#,
+    );
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let grep_callers = callers_of(&db, "cmd_grep");
+    assert!(
+        grep_callers.iter().any(|c| c == "main"),
+        "my_crate::cli::cmd_grep() must resolve after the own-crate-root strip; got: {:?}",
+        grep_callers
+    );
+    let other_callers = callers_of(&db, "cmd_other");
+    assert!(
+        other_callers.is_empty(),
+        "unknown_crate::cli::cmd_other() is not this crate's path and must stay dropped; got: {:?}",
+        other_callers
+    );
+}

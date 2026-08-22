@@ -2182,7 +2182,7 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     // The full index above already ran one sweep (attempts = 1). Sweep until
     // one shy of the threshold: the row must still be buffered.
     for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
-        resolve_pending_calls(&db).unwrap();
+        resolve_pending_calls(&db, &Default::default()).unwrap();
     }
     assert_eq!(
         count_pending_unresolved_calls(db.conn()).unwrap(),
@@ -2191,7 +2191,7 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     );
 
     // The threshold-crossing sweep evicts it.
-    resolve_pending_calls(&db).unwrap();
+    resolve_pending_calls(&db, &Default::default()).unwrap();
     assert_eq!(
         count_pending_unresolved_calls(db.conn()).unwrap(),
         0,
@@ -2302,7 +2302,7 @@ fn test_pending_at_eviction_boundary_still_resolves() {
 
     // Age to the brink: attempts = MAX - 1 (full index swept once already).
     for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
-        resolve_pending_calls(&db).unwrap();
+        resolve_pending_calls(&db, &Default::default()).unwrap();
     }
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 

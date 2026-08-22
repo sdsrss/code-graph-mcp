@@ -731,6 +731,12 @@ pub(super) fn index_files(
 
     let counters = SkipCounters::default();
 
+    // This project's own Rust package names, in module spelling. Read once per
+    // run (a handful of `Cargo.toml` reads) and handed to every Path-qualifier
+    // filter so `my_crate::module::f()` strips its crate root the way
+    // `crate::module::f()` already does. See `resolve::path_filter_candidates`.
+    let crate_roots = super::resolve::collect_crate_root_names(root);
+
     // Every caller derives `files` from HashMap iteration — `run_full_index`
     // from `scan_directory`'s hash map keys, both incremental entries from
     // `compute_diff`, which walks the current/old hash maps. So the order
@@ -1765,6 +1771,7 @@ pub(super) fn index_files(
             &global_name_map,
             &all_file_paths,
             &python_module_map,
+            &crate_roots,
         )?;
         tx.commit()?;
         deferred_edges = d_edges;
@@ -1827,7 +1834,7 @@ pub(super) fn index_files(
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        resolve_pending_calls(db)?
+        resolve_pending_calls(db, &crate_roots)?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
@@ -2307,6 +2314,7 @@ fn resolve_deferred_relations(
     global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
     all_file_paths: &HashSet<String>,
     python_module_map: &HashMap<String, Vec<String>>,
+    crate_roots: &HashSet<String>,
 ) -> Result<(usize, usize)> {
     use super::resolve::{
         method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates,
@@ -2663,8 +2671,13 @@ fn resolve_deferred_relations(
                 }
                 Some(CalleeMeta::Path(segments)) => {
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered =
-                        path_filter_candidates(&segments, &same_lang, &node_id_to_path, db)?;
+                    let filtered = path_filter_candidates(
+                        &segments,
+                        &same_lang,
+                        &node_id_to_path,
+                        db,
+                        crate_roots,
+                    )?;
                     if !filtered.is_empty() {
                         let final_targets = if filtered.len() > 1 {
                             refine_ambiguous_targets(&filtered, &d.rel_path, &node_id_to_path)

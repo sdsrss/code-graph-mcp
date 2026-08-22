@@ -8,7 +8,8 @@
 //!   indexed rows once the callee appears (post-incremental sweep).
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::domain::REL_CALLS;
 use crate::storage::db::Database;
@@ -183,7 +184,7 @@ pub(super) fn refine_ambiguous_targets(
 /// `refine_ambiguous_targets` applied when multiple candidates share the name.
 ///
 /// Returns the number of edges inserted by this sweep.
-pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
+pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
     if pending.is_empty() {
         return Ok(0);
@@ -291,7 +292,7 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
             }
             Some(CalleeMeta::Path(segments)) => {
                 // Drop on empty (drain the row without binding), never bare-fall-back.
-                path_filter_candidates(&segments, &candidates, &node_id_to_path, db)?
+                path_filter_candidates(&segments, &candidates, &node_id_to_path, db, crate_roots)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
@@ -564,6 +565,82 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
     Ok(downgraded)
 }
 
+/// Rust crate-root identifiers for this project: every `[package] name` found
+/// in a `Cargo.toml` at or under `root`, with `-` normalized to `_` (the module
+/// path spelling). Scanned once per index run; see
+/// [`path_filter_candidates`] for why the set is needed.
+///
+/// The walk is depth-limited (a crate manifest lives at the project root or one
+/// or two directories down — `crates/foo/`, `scripts/poc/`) and skips build /
+/// dependency directories, so it never becomes a full-tree scan.
+pub(super) fn collect_crate_root_names(root: &Path) -> HashSet<String> {
+    const MAX_DEPTH: usize = 3;
+    const SKIP_DIRS: &[&str] = &["node_modules", "vendor", "target", "bower_components"];
+
+    fn walk(dir: &Path, depth: usize, out: &mut HashSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if depth >= MAX_DEPTH || name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref())
+                {
+                    continue;
+                }
+                walk(&entry.path(), depth + 1, out);
+            } else if name == "Cargo.toml" {
+                if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                    if let Some(pkg) = parse_cargo_package_name(&text) {
+                        out.insert(pkg);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = HashSet::new();
+    walk(root, 0, &mut out);
+    out
+}
+
+/// Pull `name = "..."` out of a `Cargo.toml`'s `[package]` table, normalized to
+/// the module spelling (`-` → `_`). Deliberately a line scan rather than a TOML
+/// parse: the only shape that matters is a literal string on one line, and
+/// `name.workspace = true` (no literal here) correctly yields `None`.
+fn parse_cargo_package_name(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value = rest[1..].split(quote).next()?;
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.replace('-', "_"));
+    }
+    None
+}
+
 /// Filter a candidate set down to those matching the Path qualifier:
 ///   (1) file path contains "/seg1/seg2/" OR starts with "seg1/seg2/", OR
 ///   (2) qualified_name contains the segment chain joined by `.` as a
@@ -572,12 +649,30 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
 /// Storage uses `.` separator for qualified_name (treesitter.rs:582), NOT `::`.
 /// Returns the filtered subset; empty result is a meaningful signal
 /// (no project candidate matches → caller should drop the edge).
+///
+/// `crate_roots` holds this project's own Cargo package names (module
+/// spelling). A leading segment equal to one of them is stripped exactly like
+/// the literal `crate` / `super` / `self` prefixes the parser already removes
+/// (`parser::relations::helpers::extract_rust_scoped`): `my_crate::cli::f()` is
+/// the standard `bin` → `lib` call and names the crate ROOT, not a directory,
+/// so leaving the segment in emptied the filter and dropped the whole class of
+/// edges (audit 2026-08-22 P1-1 — `dead-code`/`impact`/`refs` then answered
+/// "uncalled" for every `cmd_*` in this repo). Keyed on the real package names
+/// so a genuinely foreign `other_crate::x::f()` still drops.
 pub(super) fn path_filter_candidates(
     segments: &[String],
     candidates: &[i64],
     node_id_to_path: &std::collections::HashMap<i64, String>,
     db: &crate::storage::db::Database,
+    crate_roots: &HashSet<String>,
 ) -> anyhow::Result<Vec<i64>> {
+    // An own-crate root with nothing after it (`my_crate::f()`) leaves no path
+    // constraint at all — same verdict the parser reaches for `crate::f()`,
+    // which it hands over as a bare callee.
+    let segments = match segments.split_first() {
+        Some((first, rest)) if crate_roots.contains(first.as_str()) => rest,
+        _ => segments,
+    };
     if candidates.is_empty() || segments.is_empty() {
         return Ok(candidates.to_vec());
     }
@@ -666,6 +761,83 @@ mod tests {
     #[test]
     fn parse_metadata_bare_returns_none() {
         assert!(parse_callee_metadata(None).is_none());
+    }
+
+    mod crate_roots {
+        use super::*;
+        use tempfile::TempDir;
+
+        fn write(dir: &std::path::Path, rel: &str, content: &str) {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+
+        #[test]
+        fn package_name_is_normalized_to_module_spelling() {
+            assert_eq!(
+                parse_cargo_package_name("[package]\nname = \"code-graph-mcp\"\n").as_deref(),
+                Some("code_graph_mcp")
+            );
+            assert_eq!(
+                parse_cargo_package_name("[package]\nname='single-quoted'\n").as_deref(),
+                Some("single_quoted")
+            );
+        }
+
+        #[test]
+        fn name_outside_the_package_table_is_ignored() {
+            // A `name = ...` key under any other table (a dependency, a bin
+            // target, `[workspace.package]`) must not be mistaken for the
+            // crate root — stripping a wrong root re-opens the phantom-edge
+            // direction this fix has to stay clear of.
+            assert_eq!(
+                parse_cargo_package_name(
+                    "[dependencies]\nname = \"not-the-crate\"\n\n[[bin]]\nname = \"also-not\"\n"
+                ),
+                None
+            );
+            assert_eq!(
+                parse_cargo_package_name("[package]\n# name = \"commented-out\"\n"),
+                None
+            );
+            // Workspace-inherited name: no literal here, so nothing to strip.
+            assert_eq!(
+                parse_cargo_package_name("[package]\nname.workspace = true\n"),
+                None
+            );
+        }
+
+        #[test]
+        fn collects_root_and_nested_manifests_but_not_build_dirs() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            write(root, "Cargo.toml", "[package]\nname = \"top-level\"\n");
+            write(
+                root,
+                "scripts/poc/Cargo.toml",
+                "[package]\nname = \"nested-poc\"\n",
+            );
+            // Must be skipped: build output and vendored sources are not this
+            // project's crates, and walking them is what turns a cheap manifest
+            // scan into a full-tree scan.
+            write(
+                root,
+                "target/debug/build/dep-1/Cargo.toml",
+                "[package]\nname = \"build-artifact\"\n",
+            );
+            write(
+                root,
+                "vendor/other/Cargo.toml",
+                "[package]\nname = \"vendored\"\n",
+            );
+
+            let names = collect_crate_root_names(root);
+            assert!(names.contains("top_level"), "got: {names:?}");
+            assert!(names.contains("nested_poc"), "got: {names:?}");
+            assert!(!names.contains("build_artifact"), "got: {names:?}");
+            assert!(!names.contains("vendored"), "got: {names:?}");
+        }
     }
 
     #[test]
@@ -810,7 +982,7 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db).unwrap();
+            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
             let targets = call_targets(conn, run);
 
             assert_eq!(
@@ -847,7 +1019,7 @@ mod tests {
             let helper = method(conn, "helper", None, f_util);
             insert_pending_unresolved_call(conn, run, "helper", "python", None).unwrap();
 
-            let added = resolve_pending_calls(&db).unwrap();
+            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
             assert_eq!(added, 1, "bare unique call must still resolve");
             assert_eq!(call_targets(conn, run), vec![helper]);
         }
@@ -881,7 +1053,7 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db).unwrap();
+            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
             assert_eq!(added, 0,
                 "empty stype filter must bind NOTHING (no bare fallback to Profile.write); got {added}");
             assert!(
@@ -918,7 +1090,7 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db).unwrap();
+            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
             assert_eq!(
                 added, 0,
                 "empty path filter must bind NOTHING (no bare fallback); got {added}"
