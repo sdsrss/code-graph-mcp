@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.126.1 (2026-08-24)
 
 ### The test suite stops littering your live hook directory
 
