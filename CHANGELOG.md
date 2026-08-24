@@ -6,8 +6,11 @@
 
 v0.125.0 took the one-stale-file query from 7.2 s to 2.1 s by materializing the
 projection three global post-passes were re-deriving. What stayed was the shape
-of the work: those passes still ask, once per candidate edge, "is this name
-defined in the caller's own file?" — and `nodes` had no index that answers it.
+of the work in one of them: `bind_calls_to_imported_targets` still asks, once
+per candidate edge, "is this name defined in the caller's own file?" — and
+`nodes` had no index that answers it. (Its two siblings ask a related question
+of the `cg_imports` temp table, which already has its own index; this change
+does nothing for them, which is why the whole win below lands on one pass.)
 
 `idx_nodes_name` alone makes that a name-bucket probe followed by a table fetch
 per row to test `file_id`, and in real code the hot names (`get`, `run`,
@@ -53,6 +56,33 @@ zero edges — a vacuous equality. The committed fixture builds the case the pas
 exists for (a bare call resolving to the wrong same-name node while the caller's
 file uniquely imports the right one), asserts it binds exactly one edge, and
 compares the full edge set with the index present and dropped.
+
+### Running the test suite no longer deletes your live hook state
+
+Contributor-facing, and the root cause of two flakes filed separately.
+
+`lifecycle.js` `uninstall()` removes `<os.tmpdir()>/code-graph-mcp` — the one
+machine-global directory holding hook cooldown flags and interrupted `update-*`
+download staging. That is right in production: after an uninstall nothing is
+left to own it. Every *other* path that function deletes is derived from `HOME`,
+so a test that redirects `HOME` into a sandbox looked fully isolated while this
+single `rmSync` reached straight out to the real directory. Three test files did
+exactly that, which meant `npm test` on a developer's machine silently wiped
+their own live cooldown flags — measured, every run.
+
+Inside a parallel `node --test`, the casualties were whichever sibling file was
+mid-flight: a cooldown flag written milliseconds earlier disappeared and the
+re-grep denied instead of observing, and an `update-<ms>` staging directory
+vanished between extract and copy so a plugin update reported failure. Both had
+been filed as unrelated mysteries, one of them with a mechanism that the unique
+per-test command names make arithmetically impossible.
+
+The three files now redirect `TMPDIR`, `TMP` and `TEMP` at module scope. The
+guard against a repeat is behavioural rather than a source scan — it points
+`TMPDIR` at a throwaway, plants a sentinel where `cgTmpDir()` will resolve, runs
+the suite and asserts the sentinel survives, so it has no file list to go stale
+and sees through helpers that build a child env out of sight of the spawn site.
+Measured after: 40 consecutive full-suite runs, zero failures.
 
 ## v0.125.0 (2026-08-22)
 

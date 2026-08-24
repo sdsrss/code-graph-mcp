@@ -1551,6 +1551,15 @@ fn js_test_files_neutralize_claude_config_dir() {
 /// a sentinel where `cgTmpDir()` will resolve, and running the suite asserts the
 /// property itself: no file list, no env-literal parsing, and a new offender in
 /// a file that does not exist yet still fails it.
+///
+/// Runs on every PLATFORM and in exactly one FEATURE set. The platform axis is
+/// real signal — node ignores TMPDIR on Windows and reads TMP/TEMP, which is the
+/// half of this bug class a POSIX-only guard cannot see. The feature axis is
+/// none at all: nothing here touches embeddings, so running it again under
+/// `--features embed-model` would re-spend ~50 s in the CI embed job and again
+/// on the release gate's second `cargo test` to assert a property already
+/// asserted on the same machine minutes earlier.
+#[cfg(not(feature = "embed-model"))]
 #[test]
 fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1580,31 +1589,97 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     // TMPDIR, so `cgTmpDir()` resolves HERE for every one of them. TMP and TEMP
     // are set too — node reads TMPDIR first on POSIX but ignores it entirely on
     // Windows, where setting only TMPDIR would leave this guard inert on exactly
-    // the platform it claims to cover.
+    // the platform it claims to cover. Running on all three platforms is the
+    // point rather than an oversight: the three-name requirement IS the
+    // Windows-specific half of this bug class.
+    //
+    // HOME is redirected into the same sandbox, and that is a correction rather
+    // than belt-and-braces. With the real HOME inherited, this test rewrote the
+    // developer's own `~/.cache/code-graph/binary-path` (find-binary's on-disk
+    // resolution cache) WHILE `tests/cli_e2e.rs` was resolving a binary through
+    // it in a sibling process, and turned two of its feature-detection tests red
+    // — measured: `cli_e2e` 293/2 with this test in the run, 295/0 with it
+    // skipped. A guard that reddens unrelated tests is not paying for itself.
     let sandbox = tempfile::tempdir().unwrap();
     let cg_tmp = sandbox.path().join("code-graph-mcp");
     fs::create_dir_all(&cg_tmp).unwrap();
     let sentinel = cg_tmp.join(".sentinel-shared-tmp-guard");
     fs::write(&sentinel, b"").unwrap();
 
-    let out = std::process::Command::new("node")
+    // Output goes to a FILE, not a pipe: this reads the child's exit with a
+    // deadline below, and a piped stdout that nobody drains deadlocks the child
+    // once the pipe buffer fills — which would turn a hang-guard into a hang.
+    let log = sandbox.path().join("js-suite.log");
+    let stdout = fs::File::create(&log).unwrap();
+    let stderr = stdout.try_clone().unwrap();
+
+    // `--test-concurrency=1`, matching ci.yml. Its comment records WHY, and the
+    // reason applies here verbatim: `cg-answer` and `find-binary` race on
+    // find-binary's on-disk resolution cache and on `_CG_ANSWER_BINARY` under
+    // per-file parallelism. Serial costs ~28 s against ~11 s warm-parallel and
+    // buys determinism, in a test whose whole subject is cross-process
+    // interference. `install-e2e.test.js` is NOT excluded the way ci.yml
+    // excludes it — it is one of the three files whose sandbox this commit
+    // fixed, so leaving it out would leave the fix unguarded; with HOME
+    // sandboxed it self-skips its binary-dependent cases cleanly.
+    let spawned = std::process::Command::new("node")
         .arg("--test")
+        .arg("--test-concurrency=1")
         .args(&files)
         .current_dir(root)
+        .env("HOME", sandbox.path())
+        .env("USERPROFILE", sandbox.path())
         .env("TMPDIR", sandbox.path())
         .env("TMP", sandbox.path())
         .env("TEMP", sandbox.path())
-        .output();
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn();
 
-    let Ok(out) = out else {
-        // node genuinely absent from this harness. Nothing to assert — and note
-        // this arm is reached ONLY when the process fails to spawn, never when
-        // the suite runs and reports failures: the sentinel check below is
-        // deliberately independent of whether the JS tests passed.
+    let Ok(mut child) = spawned else {
+        // node genuinely absent. Reached ONLY when the process fails to SPAWN,
+        // never when the suite runs and reports failures — the sentinel check
+        // below is deliberately independent of whether the JS tests passed.
+        //
+        // On CI this arm is a silent pass, so it is not allowed to be one:
+        // every job that reaches this test runs `actions/setup-node`, so a
+        // missing node there means the workflow changed under the guard, not
+        // that the guard is inapplicable.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "node could not be spawned on CI, where every job running this test \
+             installs it — the guard would have passed without asserting anything"
+        );
         return;
     };
+
+    // A bound, because an unbounded child is the failure this repository has
+    // actually paid for: two jobs sat 29 and 40 minutes on a stuck step and one
+    // ran into the 6 h ceiling (ci.yml's ripgrep note). 10 minutes is ~20x the
+    // measured 28 s, so it fires only for a genuine hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the JS suite did not finish within 600s; killed it rather \
+                         than letting it hold the job. Log: {}",
+                        log.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => panic!("waiting on the JS suite failed: {e}"),
+        }
+    }
+
+    let produced = fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
     assert!(
-        !out.stdout.is_empty(),
+        produced > 0,
         "the JS suite produced no output — the guard would pass vacuously"
     );
 
