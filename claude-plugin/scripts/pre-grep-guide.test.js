@@ -20,7 +20,7 @@ const pathTmp = require('path');
 // removes this file's own cooldown flags by tail (and a negative control keeps
 // that honest), but the e2e spawns also drive the read-fanout tracker, which
 // writes `.code-graph-readfan-<cwdHash>.json` into the ONE machine-global
-// cgTmpDir and has no cleanup at all: measured on HEAD, one run of this file left
+// cgTmpDir and has no cleanup at all: measured on the commit before this one, one run of this file left
 // 1 behind, reclaimed only by pruneCgTmp's 24h sweep. Owning the directory covers
 // the flags this file does not know it writes, present and future — the e2e path
 // still exercises the REAL flag mechanism, just inside a directory that goes away

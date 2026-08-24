@@ -20,7 +20,7 @@ const crypto = require('crypto');
 // The axis here is residue, not destruction. `trackReadAndMaybeHint` writes
 // `.code-graph-readfan-<cwdHash>.json` into the ONE machine-global cgTmpDir, the
 // fixture roots below are `mkdtempSync` dirs whose hash never repeats, and
-// NOTHING deletes those state files: measured on HEAD, one run of this file left
+// NOTHING deletes those state files: measured on the commit before this one, one run of this file left
 // 3 behind, reclaimed only by pruneCgTmp's 24h sweep. That directory is also
 // where the developer's live hooks keep their cooldown flags.
 //

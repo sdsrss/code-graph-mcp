@@ -1638,10 +1638,15 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     // refactor, so the behavioural half is worth having. It costs no extra
     // runtime: the suite spawn below already exists.
     //
-    // Setting the variable rather than leaving it unset is the whole point. The
-    // CI runners have it unset, which is why the scanning guard's own comment
-    // says it can only fail on a developer's machine — pointing it at a canary
-    // here is what puts the property on CI at all.
+    // Setting the variable rather than leaving it unset is the whole point, and
+    // the precise claim matters. The scanning guard runs and fails on CI like any
+    // other test, so the STATIC form of this property is already covered there;
+    // what the runners never see is the LEAK, because they leave the variable
+    // unset and every write then lands in the redirected HOME. Pointing it at a
+    // canary is what puts the BEHAVIOURAL form on CI for the first time. (The
+    // "CI never sees it" in that guard's own doc comment is about the leak, not
+    // about itself; read the other way it argues for deleting a guard that
+    // works.)
     //
     // Measured before this was added: with the variable pointed at a canary, a
     // full suite run leaves the tree byte-identical, so it starts GREEN and is a
@@ -1845,7 +1850,13 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
-            if p.is_dir() {
+            // `file_type()` off the DirEntry, NOT `p.is_dir()`: the latter
+            // follows symlinks, so a leaked symlink pointing at its own ancestor
+            // would recurse until the stack is gone. That path is only reachable
+            // once a leak already exists — i.e. exactly when this function's
+            // diagnostic is the whole point — and a stack abort prints none of
+            // it.
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 walk(&p, base, out);
             }
         }

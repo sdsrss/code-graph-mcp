@@ -20,7 +20,7 @@ const path = require('path');
 // The axis here is residue, not destruction. `recordInject` writes a
 // `.code-graph-postinject-<cwdHash>-<commandHash>` flag into the ONE
 // machine-global cgTmpDir, and every e2e command carries a `Date.now()` so no
-// two runs ever collide: measured on HEAD, one run of this file left 10 flags
+// two runs ever collide: measured on the commit before this one, one run of this file left 10 flags
 // behind (14 across the three hook test files), reclaimed only by pruneCgTmp's
 // 24h sweep. `cleanupFixture` was supposed to cover that and did not — see the
 // spelling bug documented there. Owning the directory fixes both the flags this

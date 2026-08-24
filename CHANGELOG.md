@@ -21,9 +21,9 @@ Measured on the commit before this one, per full `node --test` run:
 | `pre-read-guide.test.js` | 3 × `.code-graph-readfan-<cwdHash>.json` |
 | `pre-grep-guide.test.js` | 1 × `.code-graph-readfan-<cwdHash>.json` |
 
-Every e2e command carries a `Date.now()` and every fixture root is a fresh
-`mkdtempSync`, so no two runs ever collide and nothing is ever overwritten — the
-directory only grows, reclaimed 24 h later by `pruneCgTmp`'s sweep. On a box where
+Every fixture root is a fresh `mkdtempSync`, so the `cwdHash` half of each flag
+name never repeats and nothing is ever overwritten — the directory only grows,
+reclaimed 24 h later by `pruneCgTmp`'s sweep. On a box where
 the suite runs dozens of times a day it accumulates faster than the sweep clears
 it, in a directory the developer's own live hooks read.
 
@@ -55,13 +55,14 @@ the sentinel and nothing else. Full JS suite 1161 tests / 0 failures, `cargo tes
 module-scope `delete process.env.CLAUDE_CONFIG_DIR`. The variable outranks a
 redirected `HOME` (`claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude`), so
 for a developer who exports it — the documented multi-profile setup — a test that
-sandboxes only `HOME` operates on their live config. That guard's own comment
-records the limit: the runners leave the variable unset, so it can only ever fail
-on a developer's machine.
+sandboxes only `HOME` operates on their live config. That scan runs on CI like any
+other test; what CI never sees is the *leak*, because the runners leave the
+variable unset and every such write lands harmlessly in the redirected `HOME`.
 
 The suite guard above already spawns the whole suite under a sandbox, so pointing
 `CLAUDE_CONFIG_DIR` at a canary inside that same sandbox costs no extra runtime
-and puts the property on CI for the first time. The two are complementary rather
+and puts the behavioural form of the property on CI for the first time — the
+static form was already there. The two are complementary rather
 than redundant: the scanner catches a file that omits the line even when no test
 exercises a leaking path; the canary catches a neutralization that parses but does
 not work, or a new leak reached through a helper the scanner cannot follow — the
