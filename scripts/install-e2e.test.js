@@ -50,6 +50,25 @@ function copyWithLocalDeps(entry, destDir, seen = new Set()) {
 const PLATFORM = os.platform();
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 
+// Redirecting HOME does not sandbox TMPDIR, and the lifecycle `uninstall` this
+// file exercises deletes `<os.tmpdir()>/code-graph-mcp` wholesale — the ONE
+// machine-global directory holding live hook cooldown flags and `update-*`
+// download staging. Every other path that function removes is HOME-derived, so
+// the sandbox looked complete and was not: measured, running this file alone
+// destroyed the real directory, taking with it whatever sibling test file
+// `node --test` happened to be running in parallel.
+//
+// Module scope so it covers every spawn in the file rather than one env literal.
+// All three names because node reads TMPDIR on POSIX and TMP/TEMP on Windows.
+// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-install-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
 // Sandbox HOMEs are removed when the run ends — under Claude Code $TMPDIR is
 // ~/.claude/tmp, and leaked mkdtemp dirs accumulate there (223 observed before
 // this cleanup existed).

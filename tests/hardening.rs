@@ -1523,6 +1523,103 @@ fn js_test_files_neutralize_claude_config_dir() {
     );
 }
 
+/// Running the JS test suite must not destroy the shared tmp dir its own
+/// children are using.
+///
+/// `cgTmpDir()` is `<os.tmpdir()>/code-graph-mcp`, ONE path per machine, holding
+/// live hook cooldown flags and `update-*` download staging. `lifecycle.js`
+/// `uninstall()` deletes it wholesale — correct in production, where an
+/// uninstall should leave no residue. The trap is that every OTHER path that
+/// same function deletes (`CACHE_DIR`, `pluginsCacheDir()`) is derived from
+/// HOME, so a test that redirects HOME alone believes it is sandboxed while this
+/// one `rmSync` reaches straight out to the real machine-global directory.
+///
+/// The victims are whichever sibling test file happens to be mid-flight in
+/// another `node --test` process: `pre-grep-guide.test.js` loses the cooldown
+/// flag it wrote milliseconds earlier and its re-grep denies instead of
+/// observing; `auto-update.test.js` loses the `update-<ms>` staging dir between
+/// extract and copy and `downloadAndInstall` reports `pluginUpdated:false`.
+/// Both were filed as separate mysteries, and the first was mis-attributed to a
+/// command-hash cleanup race that the unique-per-test command names make
+/// arithmetically impossible.
+///
+/// This guard is BEHAVIOURAL on purpose. The obvious alternative — scan
+/// `*.test.js` for spawns that set HOME without TMPDIR — is a source-scanning
+/// guard over a helper-indirected call (`runScript` builds the env, the spawn
+/// sites never mention HOME), and this repository has already watched that shape
+/// go silently inert across a refactor. Pointing TMPDIR at a throwaway, planting
+/// a sentinel where `cgTmpDir()` will resolve, and running the suite asserts the
+/// property itself: no file list, no env-literal parsing, and a new offender in
+/// a file that does not exist yet still fails it.
+#[test]
+fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["claude-plugin/scripts", "scripts"] {
+        let d = root.join(dir);
+        let mut found: Vec<_> = fs::read_dir(&d)
+            .unwrap_or_else(|e| panic!("read {}: {e}", d.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".test.js"))
+            })
+            .collect();
+        found.sort();
+        files.append(&mut found);
+    }
+    assert!(
+        files.len() >= 20,
+        "expected the JS test suite to be discovered, found {} files — a path \
+         change would make this guard vacuous",
+        files.len()
+    );
+
+    // The sandbox stands in for the machine's real tmp dir: the children inherit
+    // TMPDIR, so `cgTmpDir()` resolves HERE for every one of them. TMP and TEMP
+    // are set too — node reads TMPDIR first on POSIX but ignores it entirely on
+    // Windows, where setting only TMPDIR would leave this guard inert on exactly
+    // the platform it claims to cover.
+    let sandbox = tempfile::tempdir().unwrap();
+    let cg_tmp = sandbox.path().join("code-graph-mcp");
+    fs::create_dir_all(&cg_tmp).unwrap();
+    let sentinel = cg_tmp.join(".sentinel-shared-tmp-guard");
+    fs::write(&sentinel, b"").unwrap();
+
+    let out = std::process::Command::new("node")
+        .arg("--test")
+        .args(&files)
+        .current_dir(root)
+        .env("TMPDIR", sandbox.path())
+        .env("TMP", sandbox.path())
+        .env("TEMP", sandbox.path())
+        .output();
+
+    let Ok(out) = out else {
+        // node genuinely absent from this harness. Nothing to assert — and note
+        // this arm is reached ONLY when the process fails to spawn, never when
+        // the suite runs and reports failures: the sentinel check below is
+        // deliberately independent of whether the JS tests passed.
+        return;
+    };
+    assert!(
+        !out.stdout.is_empty(),
+        "the JS suite produced no output — the guard would pass vacuously"
+    );
+
+    assert!(
+        sentinel.exists(),
+        "running the JS test suite deleted {}, a path that stands in for the \
+         machine-global `cgTmpDir()` every developer's live hooks share. Some \
+         test spawns plugin code (`lifecycle.js uninstall` is the wholesale \
+         deleter) with HOME redirected but TMPDIR inherited. Redirect TMPDIR, \
+         TMP and TEMP at module scope in the offending file, the way \
+         `tmp-dir.test.js` does.",
+        sentinel.display()
+    );
+}
+
 /// The `ignored_arguments` disclosure tells an LLM caller "this argument did
 /// nothing". That claim is sound only while the set of arguments the handlers
 /// READ matches the set the published schema DECLARES, plus the exemptions in

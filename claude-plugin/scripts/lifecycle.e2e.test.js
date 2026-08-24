@@ -24,6 +24,27 @@ const currentVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.j
 // explicitly in their own child env, which still wins.
 delete process.env.CLAUDE_CONFIG_DIR;
 
+// Same argument, second variable. `runScript` builds every child env as
+// `{ ...process.env, HOME: homeDir }`, and `uninstall()` step 6.5 deletes
+// `<os.tmpdir()>/code-graph-mcp` wholesale — the machine-global dir holding live
+// cooldown flags and `update-*` staging. Every other path it removes is
+// HOME-derived, so redirecting HOME alone read as sandboxed while this one
+// `rmSync` reached the real directory: measured, a full-suite run destroyed it
+// every time, and the failures surfaced in whichever sibling test file was
+// running in parallel rather than here.
+//
+// The two tests that assert ON that deletion (`uninstall removes the shared tmp
+// dir`, `SessionStart reclaims aged cgTmpDir residue`) pass TMPDIR explicitly in
+// their own child env, which still wins over this.
+// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-e2e-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 // Per-test cleanup PLUS a run-end sweep. The per-test `t.after` alone left
 // exactly one `code-graph-e2e-*` directory behind per run — 154 had accumulated
 // in ~/.claude/tmp/ — and the survivor held only

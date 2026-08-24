@@ -18,6 +18,30 @@ const { execFileSync, spawnSync } = require('child_process');
 // `js_test_files_neutralize_claude_config_dir` keeps new files from skipping it.
 delete process.env.CLAUDE_CONFIG_DIR;
 
+// TMPDIR is the OTHER variable a HOME redirect leaves behind, and `uninstall()`
+// reaches straight through it: step 6.5 deletes `<os.tmpdir()>/code-graph-mcp`
+// wholesale — the ONE machine-global directory holding live hook cooldown flags
+// and `update-*` download staging — while every other path that function removes
+// is HOME-derived. So a sandbox built from HOME alone looks complete and is not.
+//
+// Inheriting the real TMPDIR made this file wipe that directory out from under
+// whichever sibling `node --test` process was mid-flight: measured, a full-suite
+// run destroyed it every single time. The victims looked unrelated —
+// pre-grep-guide's cooldown re-grep denying instead of observing, auto-update's
+// `update-<ms>` staging vanishing between extract and copy.
+//
+// Assigning at module scope covers every spawn in the file, present and future,
+// instead of 47 env literals. All three names because node reads TMPDIR on POSIX
+// but TMP/TEMP on Windows, where TMPDIR alone would leave this inert.
+// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-lifecycle-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const lifecyclePath = path.join(__dirname, 'lifecycle.js');
 const statuslinePath = path.join(__dirname, 'statusline.js');
 
