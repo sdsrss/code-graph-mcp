@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.126.0 (2026-08-24)
 
 ### One index: a stale-file query 11.4 s → 2.0 s, and rebuilds get faster too
 
