@@ -8,10 +8,10 @@ v0.125.0 took the one-stale-file query from 7.2 s to 2.1 s by materializing the
 projection three global post-passes were re-deriving. What stayed was the shape
 of the work in one of them: `bind_calls_to_imported_targets` still asks, once
 per candidate edge, "is this name defined in the caller's own file?" — and
-`nodes` had no index that answers it. (Its two siblings ask different questions
-of the `cg_imports` temp table — one by name, one by target id — each already
-served by its own index there, so this change does nothing for either. That is
-why the whole win below lands on one pass.)
+`nodes` had no index that answers it. (Its two siblings ask their questions of
+the `cg_imports` temp table instead, which carries its own indexes, so this
+change does nothing for either. That is why the whole win below lands on one
+pass.)
 
 `idx_nodes_name` alone makes that a name-bucket probe followed by a table fetch
 per row to test `file_id`, and in real code the hot names (`get`, `run`,

@@ -1618,6 +1618,17 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     // which satisfied the merged check while nothing ran. That is not
     // hypothetical: `--test-concurrency` requires Node >= 20.10, so every older
     // node takes exactly that path, on the flag added right below.
+    // The one axis the sandbox does NOT cover is cwd: `current_dir(root)` is the
+    // repository, so `.code-graph/index.db` is reachable, and `doctor.test.js`,
+    // `hook-fire.test.js` and `lifecycle.e2e.test.js` each touch its `-shm`/`-wal`
+    // sidecars. Measured as a READ — index.db's sha256, `user_version` and
+    // `COUNT(*) FROM nodes` are unchanged across a full run; opening a WAL
+    // database as a reader is enough to touch the sidecars. It cannot reproduce
+    // the `~/.cache` collision that had this test reddening its neighbours,
+    // because no Rust test opens the live repo index. Left un-sandboxed because
+    // `current_dir(sandbox)` would break the repo-relative resolution those
+    // files depend on; named here so the next person does not have to re-derive
+    // that it is deliberate.
     let out_log = sandbox.path().join("js-suite.out");
     let err_log = sandbox.path().join("js-suite.err");
     let stdout = fs::File::create(&out_log).unwrap();
