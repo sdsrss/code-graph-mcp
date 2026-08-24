@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### The test suite stops littering your live hook directory
+
+Contributor-facing, and the other half of a fix v0.126.0 only did one side of.
+
+That release stopped three test files from *deleting* `<os.tmpdir()>/code-graph-mcp`
+— the one machine-global directory holding live hook cooldown flags — and added a
+guard that plants a sentinel there and asserts it survives a full suite run. The
+guard could not see the opposite failure: writing into it. Three *other* hook test
+files did exactly that, and a sentinel that is still present says nothing about the
+14 files that appeared next to it.
+
+Measured on the commit before this one, per full `node --test` run:
+
+| file | entries left behind |
+|---|---|
+| `post-grep-inject.test.js` | 10 × `.code-graph-postinject-<cwdHash>-<cmdHash>` |
+| `pre-read-guide.test.js` | 3 × `.code-graph-readfan-<cwdHash>.json` |
+| `pre-grep-guide.test.js` | 1 × `.code-graph-readfan-<cwdHash>.json` |
+
+Every e2e command carries a `Date.now()` and every fixture root is a fresh
+`mkdtempSync`, so no two runs ever collide and nothing is ever overwritten — the
+directory only grows, reclaimed 24 h later by `pruneCgTmp`'s sweep. On a box where
+the suite runs dozens of times a day it accumulates faster than the sweep clears
+it, in a directory the developer's own live hooks read.
+
+`post-grep-inject.test.js` had a cleanup helper for exactly this, and it had been
+deleting nothing since the flag became project-scoped: it spelled
+`.code-graph-postinject-<cmdHash>` while production writes
+`.code-graph-postinject-<cwdHash>-<cmdHash>`, and `unlinkSync` inside a `try`
+cannot tell a miss from an already-gone file. `pre-grep-guide.test.js` hit the
+identical bug, fixed it by matching the command-hash tail, and added a negative
+control that asserts the flag EXISTS before cleanup runs — the sibling was left on
+the old spelling. Both the fix and its negative control are now in place here too.
+
+All three files redirect `TMPDIR`, `TMP` and `TEMP` into a `mkdtempSync` sandbox at
+module scope, before the require that pulls in `tmp-dir.js` — that module resolves
+`CG_TMP_DIR` from `os.tmpdir()` at require time, so a later assignment is inert.
+The e2e paths still exercise the real flag mechanism; it just happens inside a
+directory that goes away with the run.
+
+The guard now asserts both directions and is renamed for it
+(`js_test_suite_leaves_the_shared_tmp_dir_intact`). It reads the directory rather
+than counting, so a failure names the offenders. Verified by mutation: with the
+three files reverted it fails and lists all 14; with them fixed the directory holds
+the sentinel and nothing else. Full JS suite 1161 tests / 0 failures, `cargo test
+--test hardening` 23 / 0.
+
 ## v0.126.0 (2026-08-24)
 
 ### One index: a stale-file query 11.4 s → 2.0 s, and rebuilds get faster too

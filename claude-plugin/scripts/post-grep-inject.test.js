@@ -12,6 +12,31 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+// TMPDIR is redirected into a private sandbox BEFORE `./tmp-dir` is required,
+// because that module resolves `CG_TMP_DIR` from `os.tmpdir()` at require time —
+// assigning after the require would be inert.
+//
+// The axis here is residue, not destruction. `recordInject` writes a
+// `.code-graph-postinject-<cwdHash>-<commandHash>` flag into the ONE
+// machine-global cgTmpDir, and every e2e command carries a `Date.now()` so no
+// two runs ever collide: measured on HEAD, one run of this file left 10 flags
+// behind (14 across the three hook test files), reclaimed only by pruneCgTmp's
+// 24h sweep. `cleanupFixture` was supposed to cover that and did not — see the
+// spelling bug documented there. Owning the directory fixes both the flags this
+// file knows about and any a future test adds.
+//
+// All three names because node reads TMPDIR on POSIX but TMP/TEMP on Windows,
+// where TMPDIR alone would leave this inert.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-postinject-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const { cgTmpDir } = require('./tmp-dir');
 
 // `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
@@ -325,12 +350,53 @@ function runHook(cmd, fixture, extraEnv = {}, cwdOverride, toolOutput) {
   });
 }
 
+// The command-hash tail of an inject cooldown flag. The full name is
+// `.code-graph-postinject-<cwdHash>-<commandHash>` (post-grep-inject.js
+// `flagPath`), and matching the TAIL alone is what makes this independent of the
+// cwd: the hook keys the flag on the RESOLVED project root, which need not equal
+// the fixture path byte for byte.
+function cooldownFlagTail(cmd) {
+  return `-${commandHash(cmd)}`;
+}
+
 function cleanupFixture(fixture, cmd) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
-  try {
-    fs.unlinkSync(path.join(cgTmpDir(), `.code-graph-postinject-${commandHash(cmd)}`));
-  } catch { /* ok */ }
+  // This deleted NOTHING from the day the flag became project-scoped: it spelled
+  // `.code-graph-postinject-<commandHash>` while production writes
+  // `.code-graph-postinject-<cwdHash>-<commandHash>`, and the try/catch swallowed
+  // the ENOENT, so nothing ever reported the miss. pre-grep-guide.test.js hit the
+  // identical bug and fixed it; this sibling was left on the old spelling — the
+  // sweep-every-sibling rule exists for exactly this. The guard test below keeps
+  // it honest by asserting the flag EXISTS before cleanup runs.
+  const tail = cooldownFlagTail(cmd);
+  let entries;
+  try { entries = fs.readdirSync(cgTmpDir()); } catch { return; }
+  for (const name of entries) {
+    if (!name.startsWith('.code-graph-postinject-') || !name.endsWith(tail)) continue;
+    try { fs.unlinkSync(path.join(cgTmpDir(), name)); } catch { /* raced */ }
+  }
 }
+
+test('e2e: cleanupFixture actually removes the inject cooldown flag the hook wrote', () => {
+  // A negative control for the test harness itself, mirroring pre-grep-guide's.
+  // A cleanup miss is indistinguishable from "already gone" through unlink +
+  // catch, so the only way to know the helper works is to assert the flag is
+  // there first — otherwise this passes vacuously against a hook that wrote
+  // nothing at all.
+  const uniq = `PostClean${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('tests/foo.rs:7  hit\\n');`);
+  const cmd = `echo "x" && grep "${uniq}" tests/`;
+  const tail = cooldownFlagTail(cmd);
+  const flags = () => fs.readdirSync(cgTmpDir())
+    .filter((f) => f.startsWith('.code-graph-postinject-') && f.endsWith(tail));
+  try {
+    runHook(cmd, fixture);
+    assert.deepEqual(flags().length, 1, 'the hook marks exactly one inject flag for this command');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+  assert.deepEqual(flags(), [], 'cleanupFixture leaves no inject flag behind');
+});
 
 test('e2e: `echo "x" && grep Sym tests/` → injects additionalContext with the stub hits + records inject', () => {
   const uniq = `PostHit${Date.now()}`;

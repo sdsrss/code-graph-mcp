@@ -13,6 +13,28 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
+// TMPDIR is redirected into a private sandbox BEFORE `./pre-read-guide` is
+// required, because its `tmp-dir` dependency resolves `CG_TMP_DIR` from
+// `os.tmpdir()` at require time — assigning after the require would be inert.
+//
+// The axis here is residue, not destruction. `trackReadAndMaybeHint` writes
+// `.code-graph-readfan-<cwdHash>.json` into the ONE machine-global cgTmpDir, the
+// fixture roots below are `mkdtempSync` dirs whose hash never repeats, and
+// NOTHING deletes those state files: measured on HEAD, one run of this file left
+// 3 behind, reclaimed only by pruneCgTmp's 24h sweep. That directory is also
+// where the developer's live hooks keep their cooldown flags.
+//
+// All three names because node reads TMPDIR on POSIX but TMP/TEMP on Windows,
+// where TMPDIR alone would leave this inert.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-readfan-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const {
   isSourceFile, dirOf, recordRead, shouldHint, markHint,
   buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,

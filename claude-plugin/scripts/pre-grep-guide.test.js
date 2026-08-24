@@ -8,6 +8,35 @@
 process.env._CG_ANSWER_TIMEOUT_MS = process.env._CG_ANSWER_TIMEOUT_MS || '30000';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fsTmp = require('fs');
+const osTmp = require('os');
+const pathTmp = require('path');
+
+// TMPDIR is redirected into a private sandbox BEFORE `./pre-grep-guide` is
+// required, because its `tmp-dir` dependency resolves `CG_TMP_DIR` from
+// `os.tmpdir()` at require time — assigning after the require would be inert.
+//
+// The axis here is residue, not destruction. `cleanupFixture` below already
+// removes this file's own cooldown flags by tail (and a negative control keeps
+// that honest), but the e2e spawns also drive the read-fanout tracker, which
+// writes `.code-graph-readfan-<cwdHash>.json` into the ONE machine-global
+// cgTmpDir and has no cleanup at all: measured on HEAD, one run of this file left
+// 1 behind, reclaimed only by pruneCgTmp's 24h sweep. Owning the directory covers
+// the flags this file does not know it writes, present and future — the e2e path
+// still exercises the REAL flag mechanism, just inside a directory that goes away
+// with the run.
+//
+// All three names because node reads TMPDIR on POSIX but TMP/TEMP on Windows,
+// where TMPDIR alone would leave this inert.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
+const TMP_SANDBOX = fsTmp.mkdtempSync(pathTmp.join(osTmp.tmpdir(), 'code-graph-pre-grep-tmp-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+test.after(() => {
+  try { fsTmp.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const {
   shouldHint,
   shouldBlock,

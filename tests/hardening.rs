@@ -1552,6 +1552,20 @@ fn js_test_files_neutralize_claude_config_dir() {
 /// property itself: no file list, no env-literal parsing, and a new offender in
 /// a file that does not exist yet still fails it.
 ///
+/// Two directions, one property. Deleting that directory is the loud failure;
+/// LITTERING it is the quiet one, and the sentinel check cannot see it. Three
+/// hook test files wrote cooldown flags and read-fanout state straight into the
+/// real `cgTmpDir()` — measured on the commit before this one, 14 entries per
+/// full-suite run (10 `.code-graph-postinject-*`, 4 `.code-graph-readfan-*`),
+/// none of them cleaned by the test that created them and all of them reclaimed
+/// only by `pruneCgTmp`'s 24h sweep. On a box that runs the suite dozens of
+/// times a day that is a growing directory the developer's LIVE hooks also read,
+/// and a `post-grep-inject.test.js` cleanup helper that had been spelling a flag
+/// name production stopped writing hid it in plain sight. So the assertion is
+/// the stronger one: after the run this directory holds the sentinel and nothing
+/// else. A test file that needs the real flag path still gets it — it just has
+/// to own its own TMPDIR, the way `tmp-dir.test.js` and `lifecycle.test.js` do.
+///
 /// Runs in every feature set, on every platform. Skipping the `embed-model`
 /// build would save ~50 s twice (the CI embed job and the release gate's second
 /// `cargo test`) to re-assert a property nothing here touches embeddings for —
@@ -1563,7 +1577,7 @@ fn js_test_files_neutralize_claude_config_dir() {
 /// nothing going red. Buying 100 s with an unguarded axis is the trade this
 /// whole investigation exists to argue against.
 #[test]
-fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
+fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for dir in ["claude-plugin/scripts", "scripts"] {
@@ -1750,6 +1764,33 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
          TMP and TEMP at module scope in the offending file, the way \
          `tmp-dir.test.js` does.",
         sentinel.display()
+    );
+
+    // The other direction: residue. Read the directory rather than counting, so
+    // the failure names the offending files — a bare count tells the next person
+    // that something littered without telling them what, and these names carry
+    // their own attribution (`postinject` and `readfan` are the writing hooks).
+    let mut residue: Vec<String> = fs::read_dir(&cg_tmp)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n != ".sentinel-shared-tmp-guard")
+                .collect()
+        })
+        .unwrap_or_default();
+    residue.sort();
+    assert!(
+        residue.is_empty(),
+        "the JS test suite left {} entries in {}, which stands in for the \
+         machine-global `cgTmpDir()` the developer's live hooks share — nothing \
+         reclaims them for 24h. Redirect TMPDIR, TMP and TEMP into a \
+         `mkdtempSync` sandbox at MODULE scope in the offending file, before the \
+         require that pulls in `tmp-dir.js` (it resolves `CG_TMP_DIR` at require \
+         time, so a later assignment is inert), and delete the sandbox in a \
+         `test.after`. Leftovers:\n{}",
+        residue.len(),
+        cg_tmp.display(),
+        residue.join("\n")
     );
 }
 

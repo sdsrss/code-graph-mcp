@@ -60,7 +60,7 @@ const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mc
 //
 // Module scope so it covers every spawn in the file rather than one env literal.
 // All three names because node reads TMPDIR on POSIX and TMP/TEMP on Windows.
-// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
 const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-install-tmp-'));
 process.env.TMPDIR = TMP_SANDBOX;
 process.env.TMP = TMP_SANDBOX;

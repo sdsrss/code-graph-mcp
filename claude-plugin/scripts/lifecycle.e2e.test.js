@@ -36,7 +36,7 @@ delete process.env.CLAUDE_CONFIG_DIR;
 // The two tests that assert ON that deletion (`uninstall removes the shared tmp
 // dir`, `SessionStart reclaims aged cgTmpDir residue`) pass TMPDIR explicitly in
 // their own child env, which still wins over this.
-// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
 const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-e2e-tmp-'));
 process.env.TMPDIR = TMP_SANDBOX;
 process.env.TMP = TMP_SANDBOX;

@@ -33,7 +33,7 @@ delete process.env.CLAUDE_CONFIG_DIR;
 // Assigning at module scope covers every spawn in the file, present and future,
 // instead of 47 env literals. All three names because node reads TMPDIR on POSIX
 // but TMP/TEMP on Windows, where TMPDIR alone would leave this inert.
-// Guarded by tests/hardening.rs `js_test_suite_does_not_destroy_the_shared_tmp_dir`.
+// Guarded by tests/hardening.rs `js_test_suite_leaves_the_shared_tmp_dir_intact`.
 const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-lifecycle-tmp-'));
 process.env.TMPDIR = TMP_SANDBOX;
 process.env.TMP = TMP_SANDBOX;
