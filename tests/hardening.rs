@@ -1552,14 +1552,16 @@ fn js_test_files_neutralize_claude_config_dir() {
 /// property itself: no file list, no env-literal parsing, and a new offender in
 /// a file that does not exist yet still fails it.
 ///
-/// Runs on every PLATFORM and in exactly one FEATURE set. The platform axis is
-/// real signal — node ignores TMPDIR on Windows and reads TMP/TEMP, which is the
-/// half of this bug class a POSIX-only guard cannot see. The feature axis is
-/// none at all: nothing here touches embeddings, so running it again under
-/// `--features embed-model` would re-spend ~50 s in the CI embed job and again
-/// on the release gate's second `cargo test` to assert a property already
-/// asserted on the same machine minutes earlier.
-#[cfg(not(feature = "embed-model"))]
+/// Runs in every feature set, on every platform. Skipping the `embed-model`
+/// build would save ~50 s twice (the CI embed job and the release gate's second
+/// `cargo test`) to re-assert a property nothing here touches embeddings for —
+/// but `#[cfg(not(feature = "embed-model"))]` on a `#[test]` would be the only
+/// one in this repository, nothing anywhere asserts a test count, and `default`
+/// is `[]` only until someone flips it (Cargo.toml records that it WAS flipped
+/// once). The day it gains `embed-model`, that cfg deletes this guard from the
+/// pre-commit hook, the three-OS matrix and the release gate at once, with
+/// nothing going red. Buying 100 s with an unguarded axis is the trade this
+/// whole investigation exists to argue against.
 #[test]
 fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1606,12 +1608,20 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     let sentinel = cg_tmp.join(".sentinel-shared-tmp-guard");
     fs::write(&sentinel, b"").unwrap();
 
-    // Output goes to a FILE, not a pipe: this reads the child's exit with a
+    // Output goes to FILES, not pipes: this reads the child's exit with a
     // deadline below, and a piped stdout that nobody drains deadlocks the child
     // once the pipe buffer fills — which would turn a hang-guard into a hang.
-    let log = sandbox.path().join("js-suite.log");
-    let stdout = fs::File::create(&log).unwrap();
-    let stderr = stdout.try_clone().unwrap();
+    //
+    // stdout and stderr stay SEPARATE. Merged into one file, the vacuity check
+    // below reads "some bytes arrived" — and a node that starts but rejects its
+    // arguments writes 37 bytes of `node: bad option: …` to STDERR and exits 9,
+    // which satisfied the merged check while nothing ran. That is not
+    // hypothetical: `--test-concurrency` requires Node >= 20.10, so every older
+    // node takes exactly that path, on the flag added right below.
+    let out_log = sandbox.path().join("js-suite.out");
+    let err_log = sandbox.path().join("js-suite.err");
+    let stdout = fs::File::create(&out_log).unwrap();
+    let stderr = fs::File::create(&err_log).unwrap();
 
     // `--test-concurrency=1`, matching ci.yml. Its comment records WHY, and the
     // reason applies here verbatim: `cg-answer` and `find-binary` race on
@@ -1622,9 +1632,14 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     // excludes it — it is one of the three files whose sandbox this commit
     // fixed, so leaving it out would leave the fix unguarded; with HOME
     // sandboxed it self-skips its binary-dependent cases cleanly.
+    // `--test-reporter=tap` pins the output shape. node's default reporter is
+    // TTY-dependent (`spec` on a terminal, `tap` otherwise), and the assert
+    // below looks for a specific marker — reading it out of a format that
+    // changes with where the output happens to land is not a check.
     let spawned = std::process::Command::new("node")
         .arg("--test")
         .arg("--test-concurrency=1")
+        .arg("--test-reporter=tap")
         .args(&files)
         .current_dir(root)
         .env("HOME", sandbox.path())
@@ -1657,6 +1672,15 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
     // actually paid for: two jobs sat 29 and 40 minutes on a stuck step and one
     // ran into the 6 h ceiling (ci.yml's ripgrep note). 10 minutes is ~20x the
     // measured 28 s, so it fires only for a genuine hang.
+    //
+    // `kill()` signals the RUNNER only. Under `--test-concurrency=1` one
+    // per-file node child is alive underneath it and may itself hold an
+    // `execFileSync` grandchild; neither is reaped here. Left as is rather than
+    // reaching for `process_group` + `killpg`, which is POSIX-only and would put
+    // a cfg fork on the one path that must not have bugs of its own — on a
+    // wedged CI runner the job tears the container down regardless, and on a
+    // developer box this is a stray node, not lost work. Named so nobody has to
+    // rediscover it from a leftover process.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     loop {
         match child.try_wait() {
@@ -1665,10 +1689,19 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // The tail is COPIED into the message, not pointed at:
+                    // `sandbox` is a TempDir, `panic!` unwinds, and Drop deletes
+                    // the whole tree — so a path here would name a file that no
+                    // longer exists by the time anyone reads the failure, on the
+                    // one path where the diagnostic is the entire value.
+                    let tail = fs::read_to_string(&out_log)
+                        .map(|s| s.chars().rev().take(2000).collect::<String>())
+                        .map(|s| s.chars().rev().collect::<String>())
+                        .unwrap_or_else(|e| format!("<could not read the log: {e}>"));
                     panic!(
                         "the JS suite did not finish within 600s; killed it rather \
-                         than letting it hold the job. Log: {}",
-                        log.display()
+                         than letting it hold the job. Last 2000 chars of its \
+                         output:\n{tail}"
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1677,10 +1710,24 @@ fn js_test_suite_does_not_destroy_the_shared_tmp_dir() {
         }
     }
 
-    let produced = fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    // Positive evidence that the RUNNER ran, not that bytes arrived. TAP's
+    // summary line (`# tests 1160`) is emitted only after the runner has walked
+    // the whole file list; a node that rejected its arguments, or one whose
+    // stdout went nowhere, cannot produce it. "The file is non-empty" was the
+    // weaker form and it is what merging stderr in here defeated.
+    let out = fs::read_to_string(&out_log).unwrap_or_default();
+    let err = fs::read_to_string(&err_log).unwrap_or_default();
     assert!(
-        produced > 0,
-        "the JS suite produced no output — the guard would pass vacuously"
+        out.contains("\n# tests "),
+        "the JS suite never reported a TAP test count, so nothing was actually \
+         run and the guard would pass vacuously. Its stdout was {} bytes and its \
+         stderr said: {}",
+        out.len(),
+        if err.trim().is_empty() {
+            "<nothing>"
+        } else {
+            err.trim()
+        }
     );
 
     assert!(

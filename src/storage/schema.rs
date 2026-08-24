@@ -69,12 +69,15 @@ CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);
 -- (file_id, name) serves "is this name defined in THIS file?", which
 -- `bind_calls_to_imported_targets` asks once per candidate edge. It is the ONE
--- post-pass that asks it of `nodes`: the sibling passes
--- (`prune_import_contradicted_call_edges`, `classify_edge_confidence`) ask a
--- related question of the `cg_imports` temp table instead, served by
--- `cg_imports_fid_nm`, and this index does nothing for them. An earlier wording
--- here credited all three, which would overstate what the write cost buys the
--- next time someone weighs keeping it. `idx_nodes_name` alone
+-- post-pass that asks it of `nodes`; the other two ask DIFFERENT questions of
+-- the `cg_imports` temp table, so this index does nothing for either:
+-- `prune_import_contradicted_call_edges` asks by name (`fid`, `nm`), served by
+-- `cg_imports_fid_nm`, while `classify_edge_confidence` asks by target id
+-- (`fid`, `tid`), served by `cg_imports_fid_tid` — and builds the temp table
+-- with `with_name = false`, so the name index is never even created on its
+-- path. Getting this right matters the next time someone weighs the write cost:
+-- one wording here credited all three passes, and its correction then credited
+-- both siblings to the name index. `idx_nodes_name` alone
 -- makes that a name-bucket probe followed by a table fetch per row to test
 -- file_id — and in real corpora the hot names (`get`, `run`, `__init__`) have
 -- buckets hundreds of rows deep. The composite is COVERING for that predicate,
