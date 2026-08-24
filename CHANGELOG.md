@@ -49,6 +49,33 @@ three files reverted it fails and lists all 14; with them fixed the directory ho
 the sentinel and nothing else. Full JS suite 1161 tests / 0 failures, `cargo test
 --test hardening` 23 / 0.
 
+### The same guard now catches a config-directory leak, for free
+
+`js_test_files_neutralize_claude_config_dir` scans every `*.test.js` for a
+module-scope `delete process.env.CLAUDE_CONFIG_DIR`. The variable outranks a
+redirected `HOME` (`claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude`), so
+for a developer who exports it — the documented multi-profile setup — a test that
+sandboxes only `HOME` operates on their live config. That guard's own comment
+records the limit: the runners leave the variable unset, so it can only ever fail
+on a developer's machine.
+
+The suite guard above already spawns the whole suite under a sandbox, so pointing
+`CLAUDE_CONFIG_DIR` at a canary inside that same sandbox costs no extra runtime
+and puts the property on CI for the first time. The two are complementary rather
+than redundant: the scanner catches a file that omits the line even when no test
+exercises a leaking path; the canary catches a neutralization that parses but does
+not work, or a new leak reached through a helper the scanner cannot follow — the
+shape this repository has already watched a source-scanning guard miss across a
+refactor.
+
+Measured before adding it: a full run leaves the canary byte-identical, so it
+lands green and is a regression guard, not a bug fix. Mutation-verified in both
+directions that reproduce — deleting the neutralizer from `lifecycle.test.js`
+leaks `statusline-providers.json`, and from `adopt.test.js` leaks a whole
+`projects/<slug>/memory/` tree; both fail the new assertion by name. The
+second assertion, covering an existing file rewritten in place, is defensive:
+none of the three mutations tried produced that shape.
+
 ## v0.126.0 (2026-08-24)
 
 ### One index: a stale-file query 11.4 s → 2.0 s, and rebuilds get faster too

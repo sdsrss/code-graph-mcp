@@ -1622,6 +1622,35 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     let sentinel = cg_tmp.join(".sentinel-shared-tmp-guard");
     fs::write(&sentinel, b"").unwrap();
 
+    // A third machine-global axis rides the same run for free: CLAUDE_CONFIG_DIR.
+    // `claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude`, so the variable
+    // OUTRANKS a redirected HOME, and a developer who exports it (the documented
+    // multi-profile setup) has their live config in the blast radius of any spawn
+    // built as `{ ...process.env, HOME: sandbox }`.
+    //
+    // `js_test_files_neutralize_claude_config_dir` already covers this — by
+    // SCANNING each file for a module-scope `delete`. That guard catches a file
+    // that omits the line even when no test happens to exercise a leaking path,
+    // which this one cannot; this one catches a neutralization that parses but
+    // does not work, or a new leak reached through a helper the scanner cannot
+    // follow, which that one cannot. They are complementary, and this repository
+    // has already watched a source-scanning guard go silently inert across a
+    // refactor, so the behavioural half is worth having. It costs no extra
+    // runtime: the suite spawn below already exists.
+    //
+    // Setting the variable rather than leaving it unset is the whole point. The
+    // CI runners have it unset, which is why the scanning guard's own comment
+    // says it can only fail on a developer's machine — pointing it at a canary
+    // here is what puts the property on CI at all.
+    //
+    // Measured before this was added: with the variable pointed at a canary, a
+    // full suite run leaves the tree byte-identical, so it starts GREEN and is a
+    // regression guard rather than a bug fix.
+    let canary_cfg = sandbox.path().join("canary-config");
+    fs::create_dir_all(canary_cfg.join("plugins").join("cache")).unwrap();
+    let canary_settings = canary_cfg.join("settings.json");
+    fs::write(&canary_settings, b"{\"canary\":true}").unwrap();
+
     // Output goes to FILES, not pipes: this reads the child's exit with a
     // deadline below, and a piped stdout that nobody drains deadlocks the child
     // once the pipe buffer fills — which would turn a hang-guard into a hang.
@@ -1672,6 +1701,7 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
         .env("TMPDIR", sandbox.path())
         .env("TMP", sandbox.path())
         .env("TEMP", sandbox.path())
+        .env("CLAUDE_CONFIG_DIR", &canary_cfg)
         .stdout(stdout)
         .stderr(stderr)
         .spawn();
@@ -1791,6 +1821,56 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
         residue.len(),
         cg_tmp.display(),
         residue.join("\n")
+    );
+
+    // Third axis: the canary config directory must come back exactly as it went
+    // in. Two failure shapes, and they are not equally evidenced. A NEW path
+    // appearing under it is the one that reproduces: deleting the module-scope
+    // neutralizer from `lifecycle.test.js` leaks `statusline-providers.json`,
+    // and from `adopt.test.js` leaks a whole `projects/<slug>/memory/` tree —
+    // two files, two different writers, both caught by the listing below. An
+    // EXISTING file rewritten IN PLACE leaves that listing identical, so the
+    // second assertion covers it; no mutation reproduced that shape (three
+    // tried), which makes it defensive rather than demonstrated. It is one
+    // comparison against a known literal and cannot pass vacuously, so it stays.
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            out.push(
+                p.strip_prefix(base)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            if p.is_dir() {
+                walk(&p, base, out);
+            }
+        }
+    }
+    let mut tree = Vec::new();
+    walk(&canary_cfg, &canary_cfg, &mut tree);
+    tree.sort();
+    assert_eq!(
+        tree,
+        vec!["plugins", "plugins/cache", "settings.json"],
+        "the JS test suite wrote into CLAUDE_CONFIG_DIR. `claudeHome()` is \
+         `CLAUDE_CONFIG_DIR || homedir/.claude`, so the variable OUTRANKS the \
+         redirected HOME and a developer who exports it had that write land in \
+         their LIVE config. Fix it in the offending file the way its siblings \
+         do: `delete process.env.CLAUDE_CONFIG_DIR` at module scope, before the \
+         first `test(` — which is also what \
+         `js_test_files_neutralize_claude_config_dir` scans for."
+    );
+    assert_eq!(
+        fs::read_to_string(&canary_settings).unwrap_or_default(),
+        "{\"canary\":true}",
+        "the JS test suite rewrote {} in place. Same cause and same fix as \
+         above; this assertion exists because an in-place rewrite leaves the \
+         path listing identical.",
+        canary_settings.display()
     );
 }
 
