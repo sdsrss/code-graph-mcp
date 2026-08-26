@@ -140,10 +140,22 @@ test('every tmp redirect spells TMPDIR, TMP and TEMP together', () => {
       // That is not a hypothetical about string literals. THIS TREE ALREADY
       // CONTAINS THE SHAPE: `pre-grep-guide.js:13` is a `//` line comment ending
       // `.../*.md/*.json)`, whose `/*` opens a span that closes 516 lines later
-      // at a `/* ok */` — measured, 28072 of that file's 45990 bytes, 61% of a
-      // production hook, deleted before counting. It is count-neutral today only
-      // because that file happens to hold no tmp redirect; one landing anywhere
-      // in lines 13-529 would have been silently invisible.
+      // (lines 13-529) at a `/* ok */` — measured, 28271 of that file's 46349
+      // bytes per `wc -c`, 61% of a production hook, deleted before counting.
+      // It is count-neutral today only because that file holds no tmp redirect:
+      // planting a `TMPDIR`-only one at line 300 scores 1/0/0 RED under the
+      // line-prefix form and 0/0/0 PASS under the span form.
+      //
+      // Two honest qualifications, so this comment is not quoted back later in a
+      // situation it does not cover. First, "loud beats silent" holds here
+      // BECAUSE the false-positive rate is currently zero across 73 files — a
+      // guard that cries wolf gets deleted, and a deleted guard detects nothing,
+      // so the trade rests on that rate rather than on a law. Second, the span
+      // form is not the only possible fix: stripping a block comment only when
+      // its `/*` STARTS a line would handle the prose case and could not be
+      // opened by a mid-line `/*.json` inside a `//` comment. It is unbuilt
+      // because the problem it solves has zero instances, not because the class
+      // is unfixable.
       //
       // So the trade is deliberate: this guard over-counts prose (loud, wrong,
       // and instantly obvious to whoever writes that shape) rather than
