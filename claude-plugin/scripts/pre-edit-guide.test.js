@@ -232,6 +232,13 @@ test('emit: impact summary is delivered via the PreToolUse additionalContext env
 //                     which is the exact condition that opens the emit path
 // HOME / TMPDIR / CLAUDE_CONFIG_DIR are redirected into the sandbox so the
 // cooldown flag and recommendation log never touch the live ~/.claude (§8).
+// The tmp redirect spells all THREE names. node's os.tmpdir() reads TMPDIR
+// first on POSIX but only TEMP/TMP on Windows, where TMPDIR is ignored
+// outright — so `TMPDIR` alone sandboxed this spawn on two platforms and left
+// it inheriting the caller's tmp on the third. That is not hypothetical: the
+// child's `.cg-impact-<cwd>-<symbol>` cooldown flag landed in the real shared
+// `cgTmpDir()` on windows-latest and reddened
+// `js_test_suite_leaves_the_shared_tmp_dir_intact` in CI for v0.126.1.
 
 function runPreEditHook(t, { oldString = 'function processPayment(order) {', extraEnv = {} } = {}) {
   const fs = require('node:fs');
@@ -277,6 +284,8 @@ function runPreEditHook(t, { oldString = 'function processPayment(order) {', ext
       HOME: home,
       USERPROFILE: home,
       TMPDIR: path.join(home, 'tmp'),
+      TMP: path.join(home, 'tmp'),
+      TEMP: path.join(home, 'tmp'),
       CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
       ...extraEnv,
     },

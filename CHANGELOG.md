@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.126.2 (2026-08-26)
+
+### The tmp sandbox that only held on two of three platforms
+
+Contributor-facing. v0.126.1's new residue assertion did its job on its own
+release commit: `Check & Test (windows-latest, no-embed)` went red while every
+other job stayed green, and the failure named the leftover.
+
+```
+the JS test suite left 1 entries in ...\Temp\.tmpsKpjuu\code-graph-mcp
+Leftovers: .cg-impact-bb0926fb4271-processPayment
+```
+
+`pre-edit-guide.test.js` spawns the real hook to check the PreToolUse envelope,
+and sandboxed the child's tmp with one name:
+
+```js
+env: { ...process.env, HOME: home, TMPDIR: path.join(home, 'tmp'), … }
+```
+
+node's `os.tmpdir()` reads `TMPDIR` first on POSIX. On Windows it reads `TEMP`
+then `TMP` and ignores `TMPDIR` outright, so the redirect held on Linux and
+macOS and fell through to the *inherited* tmp on Windows — which, for anything
+under `cgTmpDir()`, is the one machine-global directory the developer's live
+hooks are also reading. The hook's `.cg-impact-<cwdHash>-<symbol>` cooldown flag
+landed there and stayed, reclaimed only by `pruneCgTmp`'s 24 h sweep.
+
+Every other tmp redirect in the tree already spelled all three names — all
+thirteen of them, in both of the shapes this repo writes: seven module-scope
+`process.env.TMPDIR/TMP/TEMP` blocks and six hand-built spawn-env literals. So
+this was not a shape a sweep could not see; six siblings share its exact shape
+and are correct. It was simply the one site that got written with one name, and
+nothing checked.
+
+It reached a release tag because the property had only a behavioural guard, and
+a behavioural guard's visibility is platform-dependent — two of three platforms
+are green no matter what. So this release adds the static half:
+`tmpdir-drift-guard.test.js` now fails on any file whose `TMPDIR` count differs
+from its `TMP` and `TEMP` counts. Counted per file rather than matched within a
+window: the two shapes above are written with the names on three consecutive
+lines or all three inline, and in two different orders, so any "look N lines
+down" rule is a magic number waiting to be wrong.
+Equality is checked both directions: `TMP`/`TEMP` without `TMPDIR` is the mirror
+bug, inert on POSIX instead of Windows.
+
+Reproduced on Linux by running the file under Windows' resolution order
+(`env -u TMPDIR TMP=$S TEMP=$S`, with the `TMPDIR:` key stripped): before the
+fix the run leaves `.cg-impact-<hash>-processPayment` in the stand-in shared
+dir, after it leaves nothing, with the subprocess test that writes the flag
+still passing — so the empty result is a fix and not a test that stopped
+running. Mutating the fix back out reddens the new guard with
+`pre-edit-guide.test.js: TMPDIR×1, TMP×0, TEMP×0`.
+
+No runtime change: both files are tests.
+
 ## v0.126.1 (2026-08-24)
 
 ### The test suite stops littering your live hook directory
