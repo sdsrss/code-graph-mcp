@@ -283,6 +283,128 @@ mod tests {
         assert_eq!(indexed, 0);
     }
 
+    /// Two Python files where `b` imports and calls a symbol defined in `a`, so
+    /// deleting `a` leaves real inbound edges to rescue.
+    fn indexed_pair() -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("a.py"), "def target():\n    return 1\n").unwrap();
+        std::fs::write(
+            root.join("b.py"),
+            "from a import target\n\n\ndef caller():\n    return target()\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".code-graph")).unwrap();
+        let db = Database::open(&root.join(".code-graph/graph.db")).unwrap();
+        run_full_index(&db, &root, None, None).unwrap();
+        Fixture {
+            _tmp: tmp,
+            root,
+            db,
+        }
+    }
+
+    fn edge_rows(db: &Database) -> Vec<String> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT sf.path, s.name, e.relation, tf.path, t.name
+                   FROM edges e
+                   JOIN nodes s ON s.id = e.source_id
+                   JOIN nodes t ON t.id = e.target_id
+                   JOIN files sf ON sf.id = s.file_id
+                   JOIN files tf ON tf.id = t.file_id
+                  ORDER BY 1, 2, 3, 4, 5",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?
+                ))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn pending_rows(db: &Database) -> Vec<String> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.name, p.target_name FROM pending_unresolved_calls p
+                   JOIN nodes n ON n.id = p.source_id ORDER BY 1, 2",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}->{}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// The query-time drop leg deleted rows with a bare `delete_files_by_paths`
+    /// and handed `index_files` an EMPTY `delete_paths`, skipping Phase 0's
+    /// `buffer_then_delete_files` — the v59 mechanism written for exactly this
+    /// hole. So a read command that happened to mention a deleted file destroyed
+    /// every inbound edge from files that had not changed, with no recovery
+    /// channel: the incremental path left `caller->target` buffered in
+    /// `pending_unresolved_calls`, the query path left nothing (audit 2026-08-29
+    /// PIPE-01).
+    ///
+    /// Differential rather than absolute: the report's own acceptance criterion
+    /// is that the two paths reach the SAME terminal state, and pinning literal
+    /// edge rows here would re-assert extraction behaviour this test is not about.
+    #[test]
+    fn a_query_time_delete_reaches_the_same_state_as_the_incremental_delete() {
+        use crate::indexer::pipeline::run_incremental_index;
+
+        // Control: the delete path that already buffers.
+        let control = indexed_pair();
+        std::fs::remove_file(control.root.join("a.py")).unwrap();
+        run_incremental_index(&control.db, &control.root, None, None).unwrap();
+        let want_edges = edge_rows(&control.db);
+        let want_pending = pending_rows(&control.db);
+
+        // The control has to have rescued something, or "the two agree" is a
+        // statement about two empty sets.
+        assert!(
+            !want_pending.is_empty(),
+            "control must buffer the inbound call, else this test proves nothing"
+        );
+
+        // Subject: the same deletion reached through a read command's resync.
+        let subject = indexed_pair();
+        std::fs::remove_file(subject.root.join("a.py")).unwrap();
+        let out = resync_stale_files(
+            &subject.db,
+            &subject.root,
+            &["a.py".to_string()],
+            RESYNC_BUDGET,
+        );
+        assert_eq!(out.refreshed, 1, "the deleted file must be handled");
+
+        assert_eq!(
+            pending_rows(&subject.db),
+            want_pending,
+            "query-time delete must buffer the same inbound calls as the incremental one"
+        );
+        assert_eq!(
+            edge_rows(&subject.db),
+            want_edges,
+            "query-time delete must leave the same edge set as the incremental one"
+        );
+    }
+
     #[test]
     fn a_deleted_file_loses_its_stale_rows() {
         let f = indexed_project(2);

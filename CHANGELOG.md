@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### A read command that mentioned a deleted file destroyed its callers' edges (INDEX_VERSION 69)
+
+`apply_file_refreshes` — the query-time freshness path every read command runs —
+deleted a vanished file's rows with a bare `delete_files_by_paths` and then handed
+`index_files` an **empty** `delete_paths`. That parameter is what runs Phase 0's
+`buffer_then_delete_files`, the mechanism added in v59 for exactly this hole, so
+the cascade delete took every inbound call and import with it and nothing buffered
+them.
+
+Reproduced as a differential, because the report's own acceptance criterion is
+that the two delete paths agree:
+
+```
+control  (run_incremental_index after rm a.py):  pending = ["caller->target"]
+subject  (a read command's resync, same fixture): pending = []
+```
+
+Same fixture, same deletion, one path rescues the inbound call and the other
+loses it permanently — until the caller's own file is edited or the whole index
+is rebuilt. v0.124's resync unification is how it spread: the hole lived only in
+`ensure_file_indexed`, and unifying the three copies carried the one that was
+missing the shared mechanism to every read command (CLI `show`/`search`/`refs`/
+`grep` plus the MCP tools).
+
+The fix is to stop hand-rolling the delete: `drop_rows` now goes through
+`index_files`' own `delete_paths`.
+
+**INDEX_VERSION 68 → 69, so every index rebuilds once on upgrade.** Extraction
+semantics did not move — a full index of a 2,000-file Python corpus produces
+2001 files / 4001 nodes / 6000 edges before and after, byte-for-byte the same
+counts. The bump is for the *installed* indexes: one that already took this path
+holds edges that no other trigger will ever restore, and INDEX_VERSION is the
+only rebuild trigger. (The audit recommended a CHANGELOG notice instead; a notice
+leaves a silently-wrong index wrong for everyone who does not read it.)
+
+**Cost.** A read command that touches a deleted file now pays the same global
+post-pass a dirty-file refresh already paid. Measured on the 2,000-file corpus,
+release build: a clean query is 5-6 ms, the drop-refresh was 5-7 ms before and is
+29-37 ms after — roughly +25 ms, once, on the first query that notices the
+deletion. Queries with nothing stale are untouched (early return).
+
 ### A repo-supplied symlink in `.code-graph/` redirected every write out of the tree
 
 **Security.** `.code-graph/` is ordinary repo content: one `git clone` can carry

@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, scan_directory, scan_directory_cached, DirectoryCache};
 use crate::storage::db::Database;
-use crate::storage::queries::{delete_files_by_paths, get_all_file_hashes, get_dirty_node_ids};
+use crate::storage::queries::{get_all_file_hashes, get_dirty_node_ids};
 
 mod context;
 mod embed;
@@ -353,12 +353,7 @@ pub fn apply_file_refreshes(
     reindex: &[(String, String)],
     model: Option<&EmbeddingModel>,
 ) -> Result<()> {
-    if !drop_rows.is_empty() {
-        let tx = db.conn().unchecked_transaction()?;
-        delete_files_by_paths(db.conn(), drop_rows)?;
-        tx.commit()?;
-    }
-    if reindex.is_empty() {
+    if drop_rows.is_empty() && reindex.is_empty() {
         return Ok(());
     }
 
@@ -376,7 +371,15 @@ pub fn apply_file_refreshes(
     // here would retire the evidence before the full re-index it exists to
     // trigger, so a marker that was already set goes back (audit 2026-08-16 P1-2).
     let was_interrupted = index_run_was_interrupted(db)?;
-    index_files(db, project_root, &files, &hashes, model, &[], None)?;
+    // `drop_rows` goes through `index_files`' own `delete_paths`, not a bare
+    // `delete_files_by_paths` before it. That parameter is what runs Phase 0
+    // `buffer_then_delete_files` — the mechanism added in v59 precisely so a
+    // cascade delete does not silently destroy inbound calls from files that did
+    // not change. Deleting the rows here and passing `&[]` skipped it, so any
+    // read command touching a deleted file permanently orphaned its callers and
+    // importers with no recovery channel, while the incremental path buffered
+    // them into `pending_unresolved_calls` (audit 2026-08-29 PIPE-01).
+    index_files(db, project_root, &files, &hashes, model, drop_rows, None)?;
     if was_interrupted {
         crate::storage::queries::set_meta(
             db.conn(),
