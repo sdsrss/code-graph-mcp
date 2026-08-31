@@ -89,10 +89,21 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     // re-run" — a false empty in the one output a CI hook acts on (audit
     // 2026-08-29 CON-03). Nonexistent paths are unaffected: they plan as
     // `Fresh`, so they still reach `not_indexed` and are still reported.
+    //
+    // Paths that no longer EXIST are excluded on purpose. `git diff --name-only`
+    // lists deletions, and for a deleted file the refresh would plan
+    // `DropStaleRow` — removing the very rows this command then reads, so the
+    // file failed the `file_is_indexed` gate below and its dependents vanished
+    // from the answer. That is the worst case to lose: the callers of a file
+    // that no longer exists are exactly the ones that will break. A read command
+    // has no business retiring a deletion from the graph anyway; the next real
+    // index run does that. (Caught by the v0.127.0 pre-tag review — this
+    // regression arrived with the refresh itself.)
     let fresh_inputs: Vec<String> = raw
         .iter()
         .filter_map(|r| normalize_user_path(project_root, r).ok())
         .filter(|p| !p.is_empty())
+        .filter(|p| project_root.join(p).exists())
         .collect();
     let freshness = refresh_input_files(&ctx.db, &ctx.project_root, &fresh_inputs);
     freshness.disclose();

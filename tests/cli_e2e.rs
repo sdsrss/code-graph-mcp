@@ -9303,3 +9303,41 @@ export function refreshToken(token: string): string {
         "map must answer from the edited file, not the pre-edit index: {stdout}"
     );
 }
+
+/// `git diff --name-only` lists DELETIONS, and the callers of a file that no
+/// longer exists are exactly the ones that will break — so they are the last
+/// thing `affected` may drop. Query-time freshness on the input list nearly took
+/// them: for a vanished path the refresh plans `DropStaleRow`, which removes the
+/// rows this command then reads, so the file failed the `file_is_indexed` gate
+/// and its dependents disappeared from the answer (v0.127.0 pre-tag review).
+#[test]
+fn affected_still_reports_the_dependents_of_a_deleted_file() {
+    let project = setup_affected_project();
+
+    // Present: the baseline the deletion must not change.
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let before: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        before["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str() == Some("src/auth.test.ts")),
+        "baseline must find the test: {stdout}"
+    );
+
+    std::fs::remove_file(project.path().join("src/auth.ts")).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let after: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        after["tests"], before["tests"],
+        "a deleted input must keep reporting its dependents: {stdout}"
+    );
+    assert!(
+        after["not_indexed"].as_array().unwrap().is_empty(),
+        "a deleted-but-indexed file is not 'not indexed': {stdout}"
+    );
+}
