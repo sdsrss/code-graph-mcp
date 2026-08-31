@@ -2588,3 +2588,69 @@ fn a_symlinked_code_graph_dir_is_refused_before_anything_is_written() {
         "nothing may be written outside the project root"
     );
 }
+
+/// The shape the first SEC-03 pass missed, and the pre-tag reviewer caught:
+/// `O_NOFOLLOW` and `refuse_non_regular` judge only the FINAL path component, so
+/// a symlinked `.code-graph` holding perfectly ORDINARY files defeats both — the
+/// write lands on a real regular file that simply is not where the caller thinks
+/// it is. The original PoC linked `.code-graph/index.lock` itself (final
+/// component a symlink, which O_NOFOLLOW does catch) and so proved the wrong
+/// half.
+///
+/// Measured before the fix: a 54-byte config at `outside/index.lock` became 1
+/// byte (a PID digit) and `outside/index.db` was DELETED — and the refusal still
+/// printed afterwards, because every guard sat downstream of the destruction.
+#[cfg(unix)]
+#[test]
+fn destructive_commands_refuse_a_symlinked_data_dir_before_touching_anything() {
+    for cmd in ["reindex", "rebuild-index"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        // Ordinary files, NOT symlinks — that is the whole point.
+        const KEEP: &str = "IMPORTANT CONFIG LINE 1\nLINE 2 with more content here\n";
+        std::fs::write(outside.join("index.lock"), KEEP).unwrap();
+        std::fs::write(outside.join("index.db"), "not really a db").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(crate::domain::CODE_GRAPH_DIR)).unwrap();
+
+        let err = match cmd {
+            "reindex" => cmd_reindex(
+                &root,
+                crate::cli::commands::ReindexArgs {
+                    from_snapshot: true,
+                    no_embed: true,
+                    force: false,
+                    json: false,
+                },
+            ),
+            _ => cmd_rebuild_index(
+                &root,
+                crate::cli::RebuildIndexArgs {
+                    confirm: true,
+                    quiet: true,
+                    no_embed: true,
+                    force: false,
+                    json: false,
+                },
+            ),
+        }
+        .expect_err("{cmd} must refuse a symlinked .code-graph");
+        assert!(
+            err.to_string().contains("symlinked"),
+            "{cmd}: refusal must name the reason: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("index.lock")).unwrap(),
+            KEEP,
+            "{cmd} wrote a PID through the directory symlink"
+        );
+        assert!(
+            outside.join("index.db").exists(),
+            "{cmd} deleted a file outside the project root"
+        );
+    }
+}

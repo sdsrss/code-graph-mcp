@@ -102,13 +102,18 @@ pub(crate) fn probe_owned(path: &Path) -> io::Result<File> {
     open_owned(path, OpenOptions::new().write(true))
 }
 
-/// Ensure `path` is a directory this tool may write into, creating it if absent.
+/// Refuse a symlinked (or non-) directory, WITHOUT creating anything.
 ///
-/// A symlink is refused rather than followed: `create_dir_all` silently succeeds
-/// on `.code-graph -> ../outside` (the path exists and resolves to a directory),
-/// which is how a repo could relocate the entire index — and every telemetry
-/// file with it — outside the project root while the tool reported success.
-pub(crate) fn ensure_owned_dir(path: &Path) -> io::Result<()> {
+/// The directory-level half of this module, and the one the first pass got
+/// wrong by only calling it from the three places that CREATE `.code-graph`.
+/// `O_NOFOLLOW` and [`refuse_non_regular`] judge the final path component only,
+/// so `.code-graph -> ../outside` holding perfectly ordinary files defeats both:
+/// the write lands on a real regular file that simply is not where the caller
+/// thinks it is. Anything destructive that names a path *inside* the data
+/// directory therefore has to ask this first — see the callers.
+///
+/// Absent is fine: nothing to be redirected by yet.
+pub(crate) fn reject_symlinked_dir(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -121,9 +126,22 @@ pub(crate) fn ensure_owned_dir(path: &Path) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             format!("{} exists and is not a directory", path.display()),
         )),
-        Ok(_) => Ok(()),
-        Err(_) => std::fs::create_dir_all(path),
+        _ => Ok(()),
     }
+}
+
+/// Ensure `path` is a directory this tool may write into, creating it if absent.
+///
+/// A symlink is refused rather than followed: `create_dir_all` silently succeeds
+/// on `.code-graph -> ../outside` (the path exists and resolves to a directory),
+/// which is how a repo could relocate the entire index — and every telemetry
+/// file with it — outside the project root while the tool reported success.
+pub(crate) fn ensure_owned_dir(path: &Path) -> io::Result<()> {
+    reject_symlinked_dir(path)?;
+    if path.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)
 }
 
 // `unix` on the MODULE, not just on each test: every test in here needs

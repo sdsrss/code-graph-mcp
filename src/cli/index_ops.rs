@@ -4,6 +4,13 @@ use super::*;
 /// Pre-v0.5 iterations briefly used `code-graph.db`, `code_graph.db`, `graph.db`
 /// before settling on `index.db`; the renames never deleted the old 0-byte stubs.
 pub fn cleanup_legacy_db_files(code_graph_dir: &Path) {
+    // Guarded HERE rather than at the three call sites: this deletes files by
+    // fixed name inside a directory the repo can supply, and a guard that lives
+    // in the callers is a guard the next caller does not inherit. Small blast
+    // radius (0-byte files only) but the same primitive.
+    if crate::utils::owned::reject_symlinked_dir(code_graph_dir).is_err() {
+        return;
+    }
     const LEGACY: &[&str] = &["code-graph.db", "code_graph.db", "graph.db"];
     for name in LEGACY {
         let p = code_graph_dir.join(name);
@@ -518,6 +525,12 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
         );
     }
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
+    // Sibling of the degenerate-root refusal above, and for the same reason:
+    // everything below this line is destructive. A symlinked `.code-graph` sends
+    // the lock's PID write, the `index.db.rebuild-*` sweep and the final rename
+    // outside the project root, and the per-file guards cannot see it — they
+    // judge the last path component, not the directory above it.
+    crate::utils::owned::ensure_owned_dir(&code_graph_dir)?;
     let db_path = code_graph_dir.join("index.db");
     // Before any work: refuse to rename over an index another process has open,
     // and hold the lock for the whole rebuild so a concurrent one refuses here

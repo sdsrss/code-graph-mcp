@@ -33,6 +33,16 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     let from_snapshot = args.from_snapshot;
     let no_embed = args.no_embed;
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
+    // BEFORE the lock and the unlink, not after. `O_NOFOLLOW` and
+    // `refuse_non_regular` only judge the FINAL path component, so a symlinked
+    // `.code-graph` containing perfectly ordinary files walks straight through
+    // them: the PID write below lands in someone else's config and the three
+    // `remove_file` calls delete whatever sits at those names outside the
+    // project. The guard existed but every one of its call sites was downstream
+    // of this destruction (pre-tag review of v0.127.0, measured: a 54-byte
+    // config became 1 byte, and an `index.db` outside the root was deleted —
+    // and the refusal still printed, after the fact).
+    crate::utils::owned::ensure_owned_dir(&cg_dir)?;
 
     // Held across the unlink AND the snapshot install — the whole window in
     // which index.db is missing or half-landed — then released explicitly before

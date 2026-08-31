@@ -120,8 +120,22 @@ One helper closes the class rather than four call sites patching it separately �
 naming the path and the reason (and is the only layer Windows has), and
 `O_NOFOLLOW` on the open closes the check-then-open race on Unix. `append_owned`
 / `rewrite_owned` / `hold_owned` / `probe_owned` / `ensure_owned_dir` now back
-`usage.jsonl`, `recommendations.jsonl`, `.gitignore`, `index.lock` and all three
-`.code-graph` creators.
+`usage.jsonl`, `recommendations.jsonl`, `.gitignore`, `index.lock` and every
+`.code-graph` creator.
+
+**The first pass of this fix was incomplete, and the pre-tag review caught it.**
+Both file-level layers judge only the *final* path component, so a symlinked
+`.code-graph` **directory** holding perfectly ordinary files walks through both —
+the write lands on a real regular file that simply is not where the caller thinks
+it is. The directory guard existed but was called only from the three places that
+CREATE the directory, and `reindex`, `rebuild-index` and `snapshot::try_install`
+all do destructive work before reaching any of them. Measured on the original
+fix: `reindex --from-snapshot` against `.code-graph -> ../outside` cut a 54-byte
+config to 1 byte (a PID digit) and deleted an `index.db` outside the project —
+and then printed the refusal, after the fact. Those three now guard first, and
+`cleanup_legacy_db_files` guards inside itself rather than at its four call
+sites. The regression test uses the shape the original PoC missed: the directory
+linked, the files inside it ordinary.
 
 Two details worth naming. The rotator now stats with `symlink_metadata`, so a
 symlinked target is never even **read** — the guard is not merely a write guard.

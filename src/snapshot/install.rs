@@ -227,7 +227,11 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
     }
 
     let cg_dir = root.join(crate::domain::CODE_GRAPH_DIR);
-    std::fs::create_dir_all(&cg_dir)?;
+    // The fourth `.code-graph` creator, and the one the SEC-03 batch missed:
+    // `create_dir_all` succeeds silently on a symlinked directory, so a snapshot
+    // would land — and its atomic rename would replace files — outside the
+    // project root.
+    crate::utils::owned::ensure_owned_dir(&cg_dir)?;
 
     // Use a per-invocation unique suffix so concurrent installers don't clobber
     // each other's in-progress partials.  The final atomic rename serialises who
