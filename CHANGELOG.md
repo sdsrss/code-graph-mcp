@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### The opened project could hand the plugin a binary — and get it run
+
+**Security.** `findBinary()` resolved the developer's binary by walking a list of
+"dev roots", and `CLAUDE_PROJECT_DIR` — the arbitrary directory Claude Code was
+opened on — was one of them. A root qualified on the strength of a `Cargo.toml`
+existing; the tier sat *above* the version gate, and `isNativeBinary` checked
+only that the resolved file's basename was `code-graph-mcp`. Resolution then ran
+the file: `findBinary` → `writeCacheEntry` → `readBinaryVersion` spawns it with
+`--version`.
+
+So cloning an untrusted repository — reviewing a PR, running someone's example,
+pulling a scaffold — and opening it in Claude Code executed whatever that
+repository shipped at `target/release/code-graph-mcp`, at SessionStart, with the
+developer's full permissions, *before any file was read or any tool approved*.
+`.gitignore` does not stop a **tracked**, mode-755 file from arriving intact in a
+fresh clone, so supplying one costs an attacker nothing. Every consumer is
+downstream of the same call (`session-init.js`, `statusline.js`,
+`pre-edit-guide.js`, `mcp-launcher.js`, `doctor.js`, `cg-answer.js`), and
+`mcp-launcher.js` spawns it as a long-lived server.
+
+The two other roots are derived from the plugin's *own* install and stay as they
+were. This one is now behind an explicit opt-in:
+
+```sh
+CODE_GRAPH_DEV=1     # same spelling version-utils.js:isDevMode already uses
+```
+
+**Who feels this.** Only a developer running a source checkout of this repo
+against a *marketplace-installed* plugin: their hooks previously picked up
+`<checkout>/target/release/code-graph-mcp` and will now use the released binary
+from `~/.cache/code-graph/bin/` instead. Export `CODE_GRAPH_DEV=1` to restore the
+old resolution. Nothing changes for `npm link` / source-tree invocations (the
+plugin-derived root already covers those) or for end users (no `Cargo.toml`
+beside a marketplace install).
+
+Regression coverage lands where there was none: `find-binary.test.js` now runs
+the resolver from a plugin tree copied *outside* any cargo repo — running
+in-process would resolve `__dirname/../..` to this repo and mask the finding —
+and asserts on **execution**, not on the return value: the fixture binary writes
+a marker when it runs, and the marker must stay absent. A second arm asserts
+`CODE_GRAPH_DEV=1` still resolves the checkout build, so deleting the tier
+outright cannot pass as a fix.
+
 ## v0.126.2 (2026-08-26)
 
 ### The tmp sandbox that only held on two of three platforms

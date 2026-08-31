@@ -401,8 +401,21 @@ function findBinaryUncached() {
   if (process.env._FIND_BINARY_ROOT) {
     possibleRoots.add(path.resolve(process.env._FIND_BINARY_ROOT));
   }
-  // From CLAUDE_PROJECT_DIR
-  if (process.env.CLAUDE_PROJECT_DIR) {
+  // From CLAUDE_PROJECT_DIR — behind an explicit opt-in, and ONLY that.
+  //
+  // This root is the arbitrary directory the developer opened; the two above are
+  // derived from the plugin's own install. Accepting it made "clone an untrusted
+  // repo and open it" arbitrary code execution: this tier sits above the version
+  // gate, `isDevRepo` asks only whether a `Cargo.toml` exists, and resolution
+  // itself runs the file (`writeCacheEntry` → `readBinaryVersion`) — all before
+  // any file is read or any tool approved. A tracked, mode-755
+  // `target/release/code-graph-mcp` survives `.gitignore` into a fresh clone,
+  // so supplying one costs the attacker nothing.
+  //
+  // No property of the opened directory can re-establish trust here (an attacker
+  // supplies all of them), so the gate is the developer's own opt-in, spelled
+  // the same way `version-utils.js:isDevMode` spells it.
+  if (process.env.CLAUDE_PROJECT_DIR && process.env.CODE_GRAPH_DEV === '1') {
     possibleRoots.add(path.resolve(process.env.CLAUDE_PROJECT_DIR));
   }
 

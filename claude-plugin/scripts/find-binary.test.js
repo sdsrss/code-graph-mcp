@@ -457,6 +457,94 @@ test('platformBinaryCandidates finds the NESTED npm optionalDependency layout', 
   assert.ok(found.includes(bin), `nested platform binary must be a candidate; got ${JSON.stringify(found)}`);
 });
 
+// ─── the opened project may not supply an executable (audit 2026-08-29 SEC-01) ───
+//
+// The dev-repo tier sat ABOVE the version gate and accepted `CLAUDE_PROJECT_DIR`
+// — the arbitrary directory the developer happened to open — as a trusted root
+// on the strength of a `Cargo.toml` alone. Cloning an untrusted repo (reviewing
+// a PR, running an example) and opening it was enough: SessionStart resolved
+// `<repo>/target/release/code-graph-mcp` AND ran it (`--version` during the
+// cache write), before any file was read or any tool approved. `.gitignore`
+// does not stop a tracked, mode-755 file from arriving in a fresh clone.
+//
+// The criterion is EXECUTION, not the return value: the fixture writes a marker
+// when it runs, and the marker must stay absent.
+
+/// A plugin tree copied OUTSIDE any cargo repo — the real marketplace layout,
+/// where no plugin-derived root carries a `Cargo.toml`. Running in-process
+/// would resolve `__dirname/../..` to this very repo and mask the finding.
+function buildDetachedPlugin(t) {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-sec01-'));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const scripts = path.join(sandbox, 'plugin', 'scripts');
+  fs.mkdirSync(scripts, { recursive: true });
+  for (const f of ['find-binary.js', 'version-utils.js', 'npm-exec.js', 'proc-opts.js']) {
+    fs.copyFileSync(path.join(__dirname, f), path.join(scripts, f));
+  }
+  const home = path.join(sandbox, 'home');
+  fs.mkdirSync(home);
+  return { sandbox, scripts, home };
+}
+
+/// A directory shaped like a cargo checkout whose `target/release` binary
+/// records the fact that it ran.
+function buildHostileProject(sandbox) {
+  const root = path.join(sandbox, 'hostile');
+  fs.mkdirSync(path.join(root, 'target', 'release'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'Cargo.toml'), '[package]\nname = "anything"\n');
+  const marker = path.join(sandbox, 'EXECUTED');
+  const bin = path.join(root, 'target', 'release', BINARY_NAME);
+  fs.writeFileSync(bin, `#!/bin/sh\necho pwned >> '${marker}'\necho 'code-graph-mcp 99.9.9'\n`);
+  fs.chmodSync(bin, 0o755);
+  return { root, bin, marker };
+}
+
+function resolveDetached({ scripts, home }, extraEnv) {
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  delete env.CODE_GRAPH_DEV;
+  delete env._FIND_BINARY_ROOT;
+  delete env.CLAUDE_PROJECT_DIR;
+  Object.assign(env, extraEnv);
+  // `findBinary`, not `findBinaryUncached`: the production entry is what every
+  // consumer calls, and it is the one that RUNS the candidate (`writeCacheEntry`
+  // → `readBinaryVersion`). Asserting on the uncached resolver alone would make
+  // the "never executed" assertion vacuous.
+  const out = require('child_process').execFileSync(process.execPath, ['-e', `
+    const fb = require(${JSON.stringify(path.join(scripts, 'find-binary.js'))});
+    process.stdout.write(JSON.stringify(fb.findBinary() || null));
+  `], { env, encoding: 'utf8', cwd: home });
+  return JSON.parse(out);
+}
+
+test('CLAUDE_PROJECT_DIR does not supply — or run — a binary without an explicit dev opt-in', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX exec marker'); return; }
+  const plugin = buildDetachedPlugin(t);
+  const hostile = buildHostileProject(plugin.sandbox);
+
+  const resolved = resolveDetached(plugin, { CLAUDE_PROJECT_DIR: hostile.root });
+
+  assert.equal(
+    fs.existsSync(hostile.marker), false,
+    'the project-supplied file must never be executed (resolution alone ran it)',
+  );
+  assert.notEqual(resolved, hostile.bin, 'the project-supplied file must not be returned');
+});
+
+test('CODE_GRAPH_DEV=1 keeps the CLAUDE_PROJECT_DIR dev root reachable', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX exec marker'); return; }
+  // Negative control for the guard above: without this arm, deleting the whole
+  // tier (or a broken sandbox copy) would look identical to a correct fix.
+  const plugin = buildDetachedPlugin(t);
+  const hostile = buildHostileProject(plugin.sandbox);
+
+  const resolved = resolveDetached(plugin, {
+    CLAUDE_PROJECT_DIR: hostile.root,
+    CODE_GRAPH_DEV: '1',
+  });
+
+  assert.equal(resolved, hostile.bin, 'the documented dev opt-in must still resolve the repo build');
+});
+
 // ─── cache hits must not re-spawn `--version` (audit 2026-08-22 P2-17) ─────
 //
 // The cache stored a bare path, so every HIT still ran the binary to check its
