@@ -1428,6 +1428,66 @@ fn test_parse_timeout_does_not_hang() {
     drop(result);
 }
 
+/// `HONORED_UNDECLARED_ARGS` documents `skip_indexing` as "read by every tool
+/// through `should_skip_indexing`" — and every tool does read it, in its own
+/// dispatch arm. FRS-2 (result-set freshness) arrived later and wrapped those
+/// arms from OUTSIDE, so a caller that said "do not index" still got a write
+/// handle, a resync and a re-dispatch. Declared-is-not-honored on a contract
+/// that has both documentation and tests (audit 2026-08-29 CON-01).
+#[test]
+fn skip_indexing_suppresses_result_set_freshness() {
+    let project = TempDir::new().unwrap();
+    let file = project.path().join("main.ts");
+    fs::write(&file, "export function hello() { return 42; }\n").unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let ask = |args: serde_json::Value| {
+        let msg = tool_call_json("ast_search", args);
+        parse_tool_result(&server.handle_message(&msg).unwrap())
+    };
+    let first_line = |v: &serde_json::Value| -> i64 {
+        v.get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|h| h.get("start_line"))
+            .and_then(|l| l.as_i64())
+            .unwrap_or_else(|| panic!("no start_line in {v}"))
+    };
+
+    let before = ask(serde_json::json!({"query": "hello"}));
+    assert_eq!(first_line(&before), 1, "baseline: {before}");
+
+    // Push the symbol down. On disk it is line 4; the index still says 1.
+    fs::write(
+        &file,
+        "// a\n// b\n// c\nexport function hello() { return 42; }\n",
+    )
+    .unwrap();
+
+    let skipped = ask(serde_json::json!({"query": "hello", "skip_indexing": true}));
+    assert_eq!(
+        first_line(&skipped),
+        1,
+        "skip_indexing:true must answer from the index, not re-index: {skipped}"
+    );
+    assert!(
+        skipped.get("freshness").is_none(),
+        "a skipped call did no refresh, so it must not disclose one: {skipped}"
+    );
+
+    // Positive control in the same test: without the flag the SAME edit is
+    // picked up, so the assertions above cannot pass by freshness being broken.
+    let refreshed = ask(serde_json::json!({"query": "hello"}));
+    assert_eq!(
+        first_line(&refreshed),
+        4,
+        "without skip_indexing the edit must be picked up: {refreshed}"
+    );
+}
+
 #[test]
 fn test_skip_indexing_flag() {
     let project = TempDir::new().unwrap();

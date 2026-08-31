@@ -182,6 +182,20 @@ impl McpServer {
         args: &serde_json::Value,
         value: serde_json::Value,
     ) -> serde_json::Value {
+        // The caller said not to index. `HONORED_UNDECLARED_ARGS` states that
+        // `skip_indexing` is read by every tool through `should_skip_indexing`,
+        // and every tool's own dispatch arm does read it — but FRS-2 arrived
+        // later and wraps those arms from OUTSIDE, so the flag bought nothing:
+        // eight tools still took a write handle, ran a resync and re-dispatched
+        // (audit 2026-08-29 CON-01).
+        //
+        // The gate lives HERE rather than at the `handle_tool` call site the
+        // report suggested: a guard that lives in the caller is a guard the next
+        // caller does not inherit, and this function's whole job is the work the
+        // flag forbids.
+        if super::helpers::should_skip_indexing(args) {
+            return value;
+        }
         // Secondaries hold a read-only DB; nothing to refresh with.
         if !self.is_primary() {
             return value;
