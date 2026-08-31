@@ -437,7 +437,24 @@ function runMain() {
     // sibling hooks already did this; this one was the holdout, so it read
     // nothing under exactly the conditions verifyHooksFire spawns it with.
     const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-    message = (input && input.message) || '';
+    // `prompt` FIRST: that is the field Claude Code puts the user's text in on
+    // UserPromptSubmit, and this hook read only `message` — so in production it
+    // parsed a payload, found nothing, and exited 0 in silence. The whole
+    // intent-driven injection surface (impact / callgraph / overview / search +
+    // the symptom hint) was dead from the day it shipped, and its adoption
+    // metrics read as a structural zero.
+    //
+    // Two things hid it, both worth naming because either alone would have been
+    // enough: the entire test suite fed `{message:…}` — a self-consistent copy
+    // of the defect — and `verifyHooksFire` only asserts exit 0, which is
+    // exactly what a hook that reads nothing does. The production tell was
+    // outside both: zero `.code-graph-ctx-*` cooldown flags in a heavily
+    // dogfooded tmp dir that held 93 flags from the sibling hooks
+    // (audit 2026-08-29 JS-01).
+    //
+    // `message` is kept as a fallback rather than replaced — it costs one `||`
+    // and covers any host that spells it the other way.
+    message = (input && (input.prompt || input.message)) || '';
   } catch {
     return;
   }

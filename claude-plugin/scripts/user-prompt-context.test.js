@@ -561,7 +561,7 @@ test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0
   const { spawnSync } = require('node:child_process');
   const script = path.join(__dirname, 'user-prompt-context.js');
   const proc = spawnSync(process.execPath, [script], {
-    input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
+    input: JSON.stringify({ prompt: 'impact of refactoring parse_code function' }),
     env: { ...process.env, CODE_GRAPH_QUIET_HOOKS: '1' },
     encoding: 'utf8',
     timeout: 2000,
@@ -583,7 +583,7 @@ test('CODE_GRAPH_QUIET_HOOKS=1 silences even the fresh-install (no-manifest) not
   try {
     const script = path.join(__dirname, 'user-prompt-context.js');
     const proc = spawnSync(process.execPath, [script], {
-      input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
+      input: JSON.stringify({ prompt: 'impact of refactoring parse_code function' }),
       // HOME (POSIX) + USERPROFILE (Windows) → os.homedir() points at an empty
       // dir, so MANIFEST_PATH is absent and runMain() enters the install branch.
       env: { ...process.env, HOME: home, USERPROFILE: home, CODE_GRAPH_QUIET_HOOKS: '1' },
@@ -800,9 +800,13 @@ function upcProject(root, name) {
   return dir;
 }
 
-function runUpc(sb, message, { cwd = sb.project, env = {} } = {}) {
+function runUpc(sb, prompt, { cwd = sb.project, env = {} } = {}) {
   return spawnSync(process.execPath, [path.join(__dirname, 'user-prompt-context.js')], {
-    input: JSON.stringify({ message }),
+    // The field Claude Code actually sends on UserPromptSubmit. The whole
+    // suite fed `message` for years — a self-consistent copy of the defect,
+    // which is why 100% of it passed while the hook never fired once in
+    // production (audit 2026-08-29 JS-01).
+    input: JSON.stringify({ prompt }),
     cwd,
     env: {
       ...process.env,
@@ -890,3 +894,69 @@ test('every hook reads stdin from fd 0, not the /dev/stdin path', () => {
     /readFileSync\(\s*['"]\/dev\/stdin['"]/.test(fs.readFileSync(path.join(__dirname, h), 'utf8')));
   assert.deepEqual(offenders, [], 'these hooks re-open /dev/stdin instead of reading fd 0');
 });
+
+// ── the payload contract itself (audit 2026-08-29 JS-01) ─────────────────────
+//
+// Every e2e above now feeds `{prompt:…}`, so the field name is covered by the
+// suite as a whole. This test states the contract on its own terms so a future
+// reader sees WHICH field is load-bearing without reverse-engineering the
+// helper, and so the back-compat arm and the silent arm are pinned too.
+//
+// Note the assertion is on non-empty STDOUT plus a dropped cooldown flag. Exit
+// status is not evidence here: a hook that reads nothing exits 0, which is
+// precisely why `verifyHooksFire` — which only checks exit 0 — reported this
+// surface healthy for its whole dead lifetime.
+test('the documented UserPromptSubmit field drives the hook; message still works; {} stays silent',
+  { skip: posixOnly }, (t) => {
+    const sb = upcSandbox(t, '#!/bin/sh\necho "callers: alpha beta"\n');
+    const ask = 'impact of refactoring parse_code function';
+
+    const viaPrompt = runUpc(sb, ask);
+    assert.notEqual(viaPrompt.stdout.trim(), '', 'a `prompt` payload must produce injection');
+
+    // A fresh sandbox per arm: the cooldown flag the first run drops would
+    // silence the second, and a green-by-cooldown arm proves nothing.
+    const sb2 = upcSandbox(t, '#!/bin/sh\necho "callers: alpha beta"\n');
+    const viaMessage = spawnSync(
+      process.execPath, [path.join(__dirname, 'user-prompt-context.js')],
+      {
+        input: JSON.stringify({ message: ask }),
+        cwd: sb2.project,
+        env: {
+          ...process.env,
+          HOME: sb2.home, USERPROFILE: sb2.home,
+          TMPDIR: sb2.tmp, TMP: sb2.tmp, TEMP: sb2.tmp,
+          CG_MARKER_DIR: sb2.markers,
+          CODE_GRAPH_QUIET_HOOKS: '0',
+        },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+    assert.notEqual(viaMessage.stdout.trim(), '', 'the `message` fallback must keep working');
+
+    // And the production tell: a run that fired leaves a cooldown flag. Zero of
+    // these in a heavily dogfooded tmp dir is how the defect was found.
+    const flags = fs.readdirSync(sb.cgTmp).filter((f) => f.startsWith('.code-graph-ctx-'));
+    assert.equal(flags.length, 1, `expected one cooldown flag, got ${JSON.stringify(flags)}`);
+
+    // A payload with neither field must stay silent rather than inject noise.
+    const sb3 = upcSandbox(t, '#!/bin/sh\necho "callers: alpha beta"\n');
+    const empty = spawnSync(
+      process.execPath, [path.join(__dirname, 'user-prompt-context.js')],
+      {
+        input: '{}',
+        cwd: sb3.project,
+        env: {
+          ...process.env,
+          HOME: sb3.home, USERPROFILE: sb3.home,
+          TMPDIR: sb3.tmp, TMP: sb3.tmp, TEMP: sb3.tmp,
+          CG_MARKER_DIR: sb3.markers,
+          CODE_GRAPH_QUIET_HOOKS: '0',
+        },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+    assert.equal(empty.stdout.trim(), '', 'an empty payload must inject nothing');
+  });

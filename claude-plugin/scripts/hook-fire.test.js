@@ -45,6 +45,22 @@ test('verifyHooksFire: the grep hook actually engages (emits a decision)', () =>
     'pre-grep-guide produced no output on an engaging grep payload — the firing path did not engage');
 });
 
+// The sibling of the assertion above, and the one that was missing. `ok` is
+// `exit === 0`, and a hook that reads a field the host does not send exits 0 in
+// silence — so this probe reported the UserPromptSubmit surface healthy for its
+// entire dead lifetime while `emitted` sat right there in the same result object,
+// recorded and unread. The payload was never the problem: `hookFirePayload('')`
+// has always returned `{prompt:…}`, the shape Claude Code really sends
+// (audit 2026-08-29 JS-01).
+test('verifyHooksFire: the UserPromptSubmit hook actually engages (emits context)', () => {
+  const { results } = verifyHooksFire();
+  const upc = results.find(r => /user-prompt-context/.test(r.script));
+  assert.ok(upc, 'no user-prompt-context hook probe found');
+  assert.ok(upc.emitted,
+    'user-prompt-context produced no output on a real UserPromptSubmit payload — ' +
+    'the injection surface is dark, and exit 0 does not say so');
+});
+
 test('verifyHooksFire: reports a broken hook script (teeth)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hookfire-teeth-'));
   const broken = path.join(dir, 'broken-hook.js');

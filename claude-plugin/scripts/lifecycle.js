@@ -1089,7 +1089,16 @@ function hookFirePayload(matcher) {
     case 'Write|Edit':
       return { tool_name: 'Edit', tool_input: { file_path: 'src/example.rs', old_string: 'a', new_string: 'b' } };
     case '': // UserPromptSubmit
-      return { prompt: 'where is the parse function defined' };
+      // A SYMPTOM-flavoured prompt, for the same reason the Bash probe uses a
+      // quoted identifier: it must reach a path that actually emits. The old
+      // payload ('where is the parse function defined') produced
+      // `determineQueryType(...) === null` — no query, no output — and the two
+      // result-injecting paths that would emit need a real indexed binary, which
+      // this throwaway fixture does not have. `symptom-hint` is prose-only, so it
+      // engages on the fixture alone. Field name is `prompt`: this constructor
+      // has always had it right, while the hook itself read `message`
+      // (audit 2026-08-29 JS-01).
+      return { prompt: 'why does the parser crash on empty input' };
     default:
       return { tool_name: 'Unknown', tool_input: {} };
   }

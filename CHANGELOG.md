@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### The UserPromptSubmit hook had never fired in production
+
+`user-prompt-context.js` read the user's text from `input.message`. Claude Code
+sends it as `prompt` — and this repo's own payload constructor
+(`lifecycle.js:hookFirePayload`) has always said so. So in production the hook
+parsed its payload, found nothing, and exited 0 in silence. The entire
+intent-driven injection surface — impact / callgraph / overview / search results
+plus the symptom hint — was dead from the day it shipped, and its adoption
+metrics read as a structural zero rather than a low number.
+
+Three things hid it, and each one alone would have been enough:
+
+- **The test suite fed `{message:…}`** — a self-consistent copy of the defect.
+  Flipping the spawn payloads to the real shape turned three e2e tests red
+  before any production line changed.
+- **`verifyHooksFire` asserts exit 0**, which is exactly what a hook that reads
+  nothing does. It already records `emitted` (non-empty stdout) in the same
+  result object; nothing ever read it.
+- **The probe payload could not emit either.** `'where is the parse function
+  defined'` yields `determineQueryType(...) === null` — no query, no output — and
+  the paths that would emit need a real indexed binary the throwaway fixture does
+  not have. It is now a symptom-flavoured prompt, which reaches the prose-only
+  `symptom-hint` path, for the same reason the Bash probe uses a quoted
+  identifier.
+
+The production tell was outside all three: zero `.code-graph-ctx-*` cooldown
+flags in a heavily dogfooded tmp directory holding 93 flags from the sibling
+hooks.
+
+`prompt` is read first, `message` kept as a fallback. New coverage asserts
+non-empty stdout plus a dropped cooldown flag on the documented shape, keeps the
+`message` arm alive on its own sandbox (the first run's cooldown would otherwise
+silence the second), and pins `{}` to silence. `verifyHooksFire` now asserts the
+UserPromptSubmit probe emits, the sibling of the assertion the grep hook already
+had. Reverting the field makes four tests fail.
+
+Note for anyone reading adoption numbers: this surface's historical zero is not
+a signal about the feature's usefulness. Nothing has been measured yet.
+
 ### A read command that mentioned a deleted file destroyed its callers' edges (INDEX_VERSION 69)
 
 `apply_file_refreshes` — the query-time freshness path every read command runs —
