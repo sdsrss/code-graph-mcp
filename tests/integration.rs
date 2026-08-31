@@ -1428,6 +1428,98 @@ fn test_parse_timeout_does_not_hang() {
     drop(result);
 }
 
+/// Every `start_line` anywhere in a response, so a shape change in one tool's
+/// envelope cannot quietly turn the assertion below into "found nothing".
+fn all_start_lines(v: &serde_json::Value, out: &mut Vec<i64>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if k == "start_line" {
+                    if let Some(n) = val.as_i64() {
+                        out.push(n);
+                    }
+                }
+                all_start_lines(val, out);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| all_start_lines(x, out)),
+        _ => {}
+    }
+}
+
+/// `module_overview` and `find_dead_code` call `ensure_file_fresh_opt(path)` — a
+/// FILE refresher — and both are normally called with a directory (or nothing).
+/// A directory is classified fresh, so the call is a no-op, `did_reindex` stays
+/// false, the 60s overview cache is never evicted, and the answer carries
+/// pre-edit line numbers with no `freshness` disclosure. Neither tool was in
+/// `RESULT_REFRESH_TOOLS`, the mechanism built for answers whose files are only
+/// known after the query runs (audit 2026-08-29 CON-02).
+#[test]
+fn directory_scoped_tools_refresh_their_result_set() {
+    // One project per tool: a shared server would let the first tool's edit land
+    // in the index through the second's `ensure_indexed`, and the second case
+    // would then be measuring the first one's leftovers.
+    assert_directory_tool_refreshes("module_overview", serde_json::json!({"path": "src"}), 1);
+    assert_directory_tool_refreshes(
+        "find_dead_code",
+        serde_json::json!({"path": "src", "min_lines": 1}),
+        4,
+    );
+}
+
+/// `line` is where the symbol this tool reports sits before the edit; the edit
+/// prepends three lines.
+fn assert_directory_tool_refreshes(tool: &str, args: serde_json::Value, line: i64) {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    let file = project.path().join("src/a.ts");
+    // `alpha` has a caller, so it lands in `active_exports` (which carries line
+    // numbers) rather than the name-only `inactive_summary`; `orphan` has none,
+    // so it is what `find_dead_code` reports.
+    const PRISTINE: &str =
+        "export function alpha() {\n  return 1;\n}\nexport function orphan() {\n  return 2;\n}\n";
+    const EDITED: &str = "// a\n// b\n// c\nexport function alpha() {\n  return 1;\n}\nexport function orphan() {\n  return 2;\n}\n";
+    fs::write(
+        project.path().join("src/b.ts"),
+        "import { alpha } from './a';\nexport function beta() { return alpha(); }\n",
+    )
+    .unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let ask = |tool: &str, args: serde_json::Value| {
+        let msg = tool_call_json(tool, args);
+        parse_tool_result(&server.handle_message(&msg).unwrap())
+    };
+
+    fs::write(&file, PRISTINE).unwrap();
+    // Three calls, not two. `from_project_root` starts `last_incremental_check`
+    // 60s in the past against a 30s debounce, so the call after the first one
+    // runs an incremental backstop pass and RESETS that timer. Only from there
+    // on is a query inside the debounce window — which is the window this defect
+    // lives in, and the one a real session spends almost all of its time in.
+    ask(tool, args.clone()); // full index
+    let before = ask(tool, args.clone()); // backstop pass; debounce now armed
+    let mut lines = Vec::new();
+    all_start_lines(&before, &mut lines);
+    assert!(
+        lines.contains(&line),
+        "{tool} baseline must report line {line}: {before}"
+    );
+
+    // Push it down three lines. Same call, well within the 60s cache window.
+    fs::write(&file, EDITED).unwrap();
+    let after = ask(tool, args.clone());
+    let mut lines = Vec::new();
+    all_start_lines(&after, &mut lines);
+    assert!(
+        lines.contains(&(line + 3)),
+        "{tool} answered pre-edit line numbers with no disclosure: {after}"
+    );
+}
+
 /// `HONORED_UNDECLARED_ARGS` documents `skip_indexing` as "read by every tool
 /// through `should_skip_indexing`" — and every tool does read it, in its own
 /// dispatch arm. FRS-2 (result-set freshness) arrived later and wrapped those

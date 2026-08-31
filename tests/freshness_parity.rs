@@ -621,6 +621,63 @@ fn mcp_file_path_tools_call_ensure_fresh() {
     );
 }
 
+/// MCP tools whose `path` argument names a DIRECTORY (or is omitted entirely),
+/// not a file. `ensure_file_fresh_opt` cannot serve them — it classifies a
+/// directory as fresh and returns, `did_reindex` stays false, and the caches it
+/// would have evicted keep serving pre-edit line numbers. So the guard above
+/// counted their no-op call as coverage, which is how CON-02 stayed invisible
+/// while a green parity table said otherwise.
+///
+/// Coverage for these is `RESULT_REFRESH_TOOLS`, which refreshes the files the
+/// ANSWER points at. ADD A DIRECTORY-SCOPED TOOL HERE, not just to
+/// `MCP_FRESHNESS_TOOLS`.
+const MCP_DIRECTORY_SCOPED_TOOLS: &[&str] = &["module_overview", "find_dead_code"];
+
+/// The `RESULT_REFRESH_TOOLS` entries as spelled in the source, so this guard
+/// reads the production list rather than a copy of it.
+fn result_refresh_tools() -> Vec<String> {
+    let src = fs::read_to_string("src/mcp/server/freshness.rs")
+        .expect("read src/mcp/server/freshness.rs — has the module moved?");
+    let start = src
+        .find("RESULT_REFRESH_TOOLS: &[&str] = &[")
+        .expect("RESULT_REFRESH_TOOLS declaration not found — has it been renamed?");
+    let body = &src[start..];
+    let end = body.find("];").expect("unterminated RESULT_REFRESH_TOOLS");
+    body[..end]
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            // Only quoted list entries; the block comment inside the list names
+            // some of these tools in prose and must not count as membership.
+            l.strip_prefix('"')
+                .and_then(|r| r.split('"').next())
+                .filter(|_| l.ends_with("\","))
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn directory_scoped_mcp_tools_are_result_refreshed() {
+    let listed = result_refresh_tools();
+    assert!(
+        listed.len() >= 8,
+        "parsed RESULT_REFRESH_TOOLS as {listed:?} — the parse, not the list, is what broke"
+    );
+    let missing: Vec<_> = MCP_DIRECTORY_SCOPED_TOOLS
+        .iter()
+        .filter(|t| !listed.iter().any(|l| l == *t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "directory-scoped MCP tool(s) {missing:?} are not in RESULT_REFRESH_TOOLS. \
+         `ensure_file_fresh_opt` is a no-op for a directory path, so without result-set \
+         refresh they answer from a pre-edit index with no disclosure — and the \
+         mcp_file_path_tools_call_ensure_fresh guard above will still pass, because the \
+         no-op call is present in the source."
+    );
+}
+
 /// Permanent negative control: neutralizing the `refresh_files_if_stale(&ctx.db, ...)`
 /// call sites in a working copy of the CLI source must make the guard report the
 /// affected handlers as missing. Proves the guard fires on a real omission without

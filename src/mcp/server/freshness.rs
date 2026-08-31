@@ -43,6 +43,17 @@ pub(super) const RESULT_REFRESH_TOOLS: &[&str] = &[
     "find_http_route",
     "get_call_graph",
     "find_references",
+    // These two DO take a `path`, and both call `ensure_file_fresh_opt` with it —
+    // but that is a FILE refresher and the path they are called with is a
+    // directory (or nothing). A directory is classified fresh, so the call was a
+    // no-op: `did_reindex` stayed false, the 60s overview cache was never
+    // evicted, and the answer carried pre-edit line numbers with no disclosure.
+    // They were the only two MCP read surfaces that could silently answer from a
+    // pre-edit index, and `freshness_parity.rs` counted that no-op call as
+    // coverage (audit 2026-08-29 CON-02). The file-path leg stays: its overlap
+    // with result-set refresh is documented as harmless.
+    "module_overview",
+    "find_dead_code",
 ];
 
 /// Max files hashed for one result set before the rest is reported unchecked.
