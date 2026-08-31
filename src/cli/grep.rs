@@ -837,6 +837,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             // `CODE_GRAPH_GREP_SYNC_BUDGET` predates the unified knob and is
             // still honoured; `CODE_GRAPH_RESYNC_BUDGET` is the shared one.
             crate::indexer::resync::resync_budget_named("CODE_GRAPH_GREP_SYNC_BUDGET"),
+            crate::indexer::pipeline::RefreshScope::IndexedOnly,
         );
         stale_files = outcome.stale_paths;
     }

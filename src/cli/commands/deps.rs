@@ -41,6 +41,20 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     let compact = args.compact;
 
     let ctx = CliContext::open(project_root)?;
+
+    // Query-time freshness on the file the caller named. The MCP twin
+    // `dependency_graph` already refreshes it (`advanced.rs`), and this command
+    // even accepts `dependency_graph` as an alias — so without this the same
+    // question asked two ways gave two answers for an edited file (audit
+    // 2026-08-29 CON-03). `IncludeNew`, like the MCP side: an explicit file
+    // argument is an assertion that the file matters.
+    refresh_input_files(
+        &ctx.db,
+        &ctx.project_root,
+        std::slice::from_ref(&file_path_owned),
+    )
+    .disclose();
+
     let conn = ctx.db.conn();
 
     let deps = queries::get_import_tree(conn, file_path, direction, depth)?;

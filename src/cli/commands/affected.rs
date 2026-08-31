@@ -79,6 +79,24 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     let mut changed: Vec<String> = Vec::new();
     let mut not_indexed: Vec<String> = Vec::new();
     let mut seen_changed: HashSet<String> = HashSet::new();
+
+    // Query-time freshness BEFORE the `file_is_indexed` gate below, and with
+    // `IncludeNew` scope (see `refresh_input_files`): these are paths the caller
+    // named, typically straight out of `git diff --name-only`, so a file the
+    // branch just added is the normal case rather than an unknown path a query
+    // happened to produce. Without this the new file failed the gate, dropped
+    // out of the reverse closure, and the command printed "0 test file(s) to
+    // re-run" — a false empty in the one output a CI hook acts on (audit
+    // 2026-08-29 CON-03). Nonexistent paths are unaffected: they plan as
+    // `Fresh`, so they still reach `not_indexed` and are still reported.
+    let fresh_inputs: Vec<String> = raw
+        .iter()
+        .filter_map(|r| normalize_user_path(project_root, r).ok())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let freshness = refresh_input_files(&ctx.db, &ctx.project_root, &fresh_inputs);
+    freshness.disclose();
+
     for r in &raw {
         let norm = match normalize_user_path(project_root, r) {
             Ok(p) => p,

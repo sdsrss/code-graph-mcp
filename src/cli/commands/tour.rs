@@ -40,7 +40,20 @@ pub fn cmd_tour(project_root: &Path, args: TourArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (modules, deps, entry_points, _hot) = queries::get_project_map(conn)?;
+    let mut map = queries::get_project_map(conn)?;
+    // Query-time freshness over the files this answer is derived from. `tour`
+    // prints module paths, not line numbers, but its reading order is computed
+    // from entry points that a stale index can place in the wrong file — the
+    // same architecture-level sweep gap as `map` (audit 2026-08-29 CON-03).
+    {
+        let files: Vec<String> = map.2.iter().map(|e| e.file.clone()).collect();
+        let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
+        if outcome.any_changed {
+            map = queries::get_project_map(conn)?;
+        }
+        outcome.disclose();
+    }
+    let (modules, deps, entry_points, _hot) = map;
 
     let modules: Vec<_> = match &scope {
         None => modules,

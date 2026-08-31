@@ -563,7 +563,31 @@ const CLI_FRESHNESS_HANDLERS: &[&str] = &[
     "cmd_similar",
     "cmd_refs",
     "cmd_dead_code",
+    // Wired for a long time, absent from this list until the 2026-08-29 audit
+    // (CON-18b) — their resync could have been deleted and every guard would
+    // still have been green. A list that omits what it already covers is not a
+    // guard, it is a coincidence.
+    "cmd_callgraph",
+    "cmd_report",
+    // Architecture-level commands. They were written before query-time freshness
+    // existed and were never swept when it was wired command by command, so an
+    // edited file kept its pre-edit rows here while every sibling refreshed
+    // (audit 2026-08-29 CON-03). `cycles` and `surprising` are deliberately NOT
+    // here: neither emits a file path, so there is no result set to refresh —
+    // adding a whole-index scan to a read command is the cost this budgeted,
+    // result-set-scoped mechanism exists to avoid.
+    "cmd_map",
+    "cmd_tour",
+    "cmd_centrality",
 ];
+
+/// CLI handlers that refresh the paths the CALLER named rather than the paths
+/// their own query produced, via `refresh_input_files` (`RefreshScope::IncludeNew`).
+/// `affected` is the reason the distinction exists: its input is typically
+/// `git diff --name-only`, so a file the branch just added is the normal case,
+/// and the `IndexedOnly` scope every other command wants would drop it —
+/// producing "0 test file(s) to re-run" from a real change (audit CON-03).
+const CLI_INPUT_REFRESH_HANDLERS: &[&str] = &["cmd_affected", "cmd_deps"];
 
 /// File-path-accepting MCP tools. Each MUST call `ensure_file_fresh_opt` (the MCP
 /// shared resync path) so an edited file is reindexed before its line numbers are
@@ -601,6 +625,22 @@ fn cli_line_number_commands_call_refresh() {
          edited-but-unindexed files will yield stale line numbers. Add the resync (see the other \
          handlers in {CLI_SRC}), or if a handler no longer emits line numbers remove it from \
          CLI_FRESHNESS_HANDLERS (tests/freshness_parity.rs)."
+    );
+}
+
+#[test]
+fn cli_input_taking_commands_refresh_their_inputs() {
+    let src = read_cli_sources();
+    let missing: Vec<_> = CLI_INPUT_REFRESH_HANDLERS
+        .iter()
+        .filter(|name| !fn_region(&src, name).contains("refresh_input_files("))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "CLI handler(s) {missing:?} classify caller-supplied paths without calling \
+         refresh_input_files — a file the branch just added is not in the index, so it is \
+         dropped from the answer instead of being indexed. Add the refresh, or remove the \
+         handler from CLI_INPUT_REFRESH_HANDLERS (tests/freshness_parity.rs)."
     );
 }
 

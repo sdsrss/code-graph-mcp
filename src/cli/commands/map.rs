@@ -29,7 +29,22 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (modules, deps, entry_points, hot_functions) = queries::get_project_map(conn)?;
+    let mut map = queries::get_project_map(conn)?;
+    // Query-time freshness over the files this answer names — the same shared
+    // resync every other read command runs. `map` was never swept when freshness
+    // was wired command by command (audit 2026-08-29 CON-03): the architecture-
+    // level commands were added before it and never revisited, so an edited file
+    // kept its pre-edit hot-function and entry-point rows.
+    {
+        let mut files: Vec<String> = map.3.iter().map(|h| h.file.clone()).collect();
+        files.extend(map.2.iter().map(|e| e.file.clone()));
+        let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
+        if outcome.any_changed {
+            map = queries::get_project_map(conn)?;
+        }
+        outcome.disclose();
+    }
+    let (modules, deps, entry_points, hot_functions) = map;
 
     let mut stdout = std::io::stdout().lock();
 

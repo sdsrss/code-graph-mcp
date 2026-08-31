@@ -38,8 +38,23 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let ranked =
+    let mut ranked =
         crate::graph::centrality::betweenness_centrality(conn, include_tests, limit as usize)?;
+    // Query-time freshness over the files this answer names — `centrality` emits
+    // `file_path` per ranked symbol and was never swept when freshness was wired
+    // command by command (audit 2026-08-29 CON-03).
+    {
+        let files: Vec<String> = ranked.iter().map(|c| c.file_path.clone()).collect();
+        let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
+        if outcome.any_changed {
+            ranked = crate::graph::centrality::betweenness_centrality(
+                conn,
+                include_tests,
+                limit as usize,
+            )?;
+        }
+        outcome.disclose();
+    }
 
     let mut stdout = std::io::stdout().lock();
 

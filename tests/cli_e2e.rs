@@ -9162,3 +9162,144 @@ fn test_cli_health_check_size_gate_is_disclosed_and_deep_overrides_it() {
         "--deep must run the pragma regardless of the ceiling; got: {v2}"
     );
 }
+
+/// `affected` is the one command whose entire contract is a list a CI or
+/// pre-commit hook acts on, and it classified its INPUT paths through a stale
+/// `file_is_indexed` gate with no refresh. A file the branch just added is not in
+/// the index, so it landed in `not_indexed`, contributed nothing to the reverse
+/// closure, and the command printed "0 test file(s) to re-run" — indistinguishable
+/// from a genuine clean result (audit 2026-08-29 CON-03).
+///
+/// Every other read command in `src/cli` was wired for query-time freshness one at
+/// a time; the architecture-level ones were never swept.
+#[test]
+fn affected_indexes_the_input_files_it_was_handed() {
+    let project = setup_affected_project();
+    let src = project.path().join("src");
+
+    // A test file the branch just added: on disk, absent from the index.
+    std::fs::write(
+        src.join("session.test.ts"),
+        r#"
+import { validateToken } from './auth';
+export function testSession(): void {
+    validateToken('s');
+}
+"#,
+    )
+    .unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/session.test.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        v["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str() == Some("src/session.test.ts")),
+        "a newly added test file must be reported as a test to re-run, got: {stdout}"
+    );
+    assert!(
+        v["not_indexed"].as_array().unwrap().is_empty(),
+        "the input was refreshed, so nothing should be reported unindexed: {stdout}"
+    );
+
+    // Positive control: a path that genuinely is not a file must STILL be
+    // reported unindexed. The fix must refresh real inputs, not silence the
+    // report that tells the user their argument was wrong.
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/nope.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        v["not_indexed"].as_array().unwrap().len(),
+        1,
+        "a nonexistent path must still be reported: {stdout}"
+    );
+}
+
+/// `deps` and its MCP twin `dependency_graph` answer the same question about the
+/// same file, and the CLI even accepts `dependency_graph` as an alias — but only
+/// the MCP side refreshed, so the two surfaces gave different answers for an
+/// edited file (audit 2026-08-29 CON-03).
+#[test]
+fn deps_refreshes_the_file_it_was_asked_about() {
+    let project = setup_affected_project();
+    let src = project.path().join("src");
+
+    // api.ts imported ./auth at index time; the edit repoints it at ./auth.test.
+    // Both targets are already indexed on purpose — a NEW target would be
+    // legitimately unresolvable here, since refreshing `api.ts` is not licence to
+    // pull an unknown third file into the index.
+    std::fs::write(
+        src.join("api.ts"),
+        r#"
+import { testValidate } from './auth.test';
+export function handleLogin(): void {
+    testValidate();
+}
+"#,
+    )
+    .unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["deps", "src/api.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(
+        stdout.contains("src/auth.test.ts"),
+        "deps must answer from the edited file, not the pre-edit index: {stdout}"
+    );
+    // The removed direct import must be gone as a DIRECT dependency. It still
+    // appears at depth 2, correctly — auth.test.ts imports it — so asserting its
+    // total absence would be asserting a bug.
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let direct: Vec<&str> = v["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["depth"].as_i64() == Some(1))
+        .map(|d| d["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        direct,
+        vec!["src/auth.test.ts"],
+        "the direct dependency the edit replaced must be replaced: {stdout}"
+    );
+}
+
+/// The architecture-level commands (`map`, `tour`, `centrality`) predate
+/// query-time freshness and were never swept when it was wired command by
+/// command, so an edited file kept its pre-edit rows here while every sibling
+/// refreshed (audit 2026-08-29 CON-03). Behavioural cover for one of the three;
+/// `freshness_parity.rs` pins the other two by source, and this test is what
+/// stops that source guard from being satisfied by a call that does nothing.
+#[test]
+fn map_refreshes_the_files_its_answer_names() {
+    let project = setup_affected_project();
+    let src = project.path().join("src");
+
+    // auth.ts is the file `map`'s own answer names (it holds the hot function),
+    // so it is what the result-set resync covers. The mechanism is deliberately
+    // result-set-scoped: it refreshes the files the answer NAMES, not every file
+    // that contributed a count to it.
+    std::fs::write(
+        src.join("auth.ts"),
+        r#"
+export function validateToken(token: string): boolean {
+    return token.length > 0;
+}
+export function refreshToken(token: string): string {
+    return token;
+}
+"#,
+    )
+    .unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["map", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let symbols = v["modules"][0]["key_symbols"].to_string();
+    assert!(
+        symbols.contains("refreshToken"),
+        "map must answer from the edited file, not the pre-edit index: {stdout}"
+    );
+}

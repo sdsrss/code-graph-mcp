@@ -285,6 +285,7 @@ impl McpServer {
                 root,
                 paths,
                 self.result_refresh_budget,
+                crate::indexer::pipeline::RefreshScope::IndexedOnly,
             );
             refreshed = resync.refreshed;
         }

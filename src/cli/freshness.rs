@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::indexer::pipeline::RefreshScope;
+
 /// Outcome of a query-time freshness resync (`refresh_files_if_stale`) over the
 /// files a read command is about to print. Callers re-run their query when
 /// `any_changed` and call `disclose()` to honestly surface a partial refresh.
@@ -66,6 +68,25 @@ impl FreshOutcome {
 /// the whole index. Callers re-run their query when the outcome reports
 /// `any_changed`.
 pub(crate) fn refresh_files_if_stale(db: &Database, root: &Path, paths: &[String]) -> FreshOutcome {
+    resync(db, root, paths, RefreshScope::IndexedOnly)
+}
+
+/// Query-time freshness for paths the USER named, rather than paths a query
+/// produced: `affected`'s changed-file list and `deps`' file argument.
+///
+/// Same machinery, one difference that matters — [`RefreshScope::IncludeNew`].
+/// A result set must not pull an unknown path into the index (that would widen
+/// the index on nothing but a query), but a path the caller typed is an
+/// assertion that the file matters, exactly like an MCP tool's explicit
+/// `file_path`. Without it, `affected` classified a file the branch had just
+/// added as "not indexed", dropped it from the reverse closure, and printed
+/// "0 test file(s) to re-run" — the one output a CI hook acts on
+/// (audit 2026-08-29 CON-03).
+pub(crate) fn refresh_input_files(db: &Database, root: &Path, paths: &[String]) -> FreshOutcome {
+    resync(db, root, paths, RefreshScope::IncludeNew)
+}
+
+fn resync(db: &Database, root: &Path, paths: &[String], scope: RefreshScope) -> FreshOutcome {
     // Never let a concurrent writer (MCP watcher, another index run) stall an
     // interactive command for the default 5s busy_timeout — fail fast, keep stale.
     // Set and forgotten on purpose: unlike the MCP server's long-lived handle,
@@ -80,6 +101,7 @@ pub(crate) fn refresh_files_if_stale(db: &Database, root: &Path, paths: &[String
         root,
         paths,
         crate::indexer::resync::resync_budget(),
+        scope,
     );
     FreshOutcome {
         any_changed: outcome.any_changed(),

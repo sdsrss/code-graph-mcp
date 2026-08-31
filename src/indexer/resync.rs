@@ -92,6 +92,13 @@ impl ResyncOutcome {
 /// `scan_directory`'s scope. Non-file entries (a `project_map` module path, the
 /// `<external>` sentinel) fall out of the same checks as harmless no-ops.
 ///
+/// `scope` decides what "never indexed" means here. A RESULT SET is
+/// [`RefreshScope::IndexedOnly`] for the reason above. Paths the USER named —
+/// `affected`'s changed-file list, `deps`' file argument — are
+/// [`RefreshScope::IncludeNew`]: the caller is asserting these files matter, the
+/// same assertion an MCP tool's explicit `file_path` argument makes, and
+/// refusing to index them turns a brand-new file into a silent empty answer.
+///
 /// Failure is always "keep the stale row and report it" — a read command must
 /// never become an error because of a refresh it only attempted as a courtesy.
 pub fn resync_stale_files(
@@ -99,6 +106,7 @@ pub fn resync_stale_files(
     root: &Path,
     paths: &[String],
     budget: usize,
+    scope: RefreshScope,
 ) -> ResyncOutcome {
     let mut outcome = ResyncOutcome::default();
 
@@ -114,7 +122,7 @@ pub fn resync_stale_files(
     let mut drop_rows: Vec<String> = Vec::new();
     let mut reindex: Vec<(String, String)> = Vec::new();
     for f in files {
-        match plan_file_refresh(db, root, f, RefreshScope::IndexedOnly) {
+        match plan_file_refresh(db, root, f, scope) {
             Ok(FileRefresh::Fresh) => {}
             Ok(FileRefresh::DropStaleRow) => drop_rows.push(f.to_string()),
             Ok(FileRefresh::Reindex(hash)) => reindex.push((f.to_string(), hash)),
@@ -208,7 +216,13 @@ mod tests {
     #[test]
     fn an_untouched_result_set_is_a_no_op() {
         let f = indexed_project(3);
-        let out = resync_stale_files(&f.db, &f.root, &paths(3), RESYNC_BUDGET);
+        let out = resync_stale_files(
+            &f.db,
+            &f.root,
+            &paths(3),
+            RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
+        );
         assert_eq!(out.refreshed, 0);
         assert!(!out.any_changed());
         assert!(!out.is_partial());
@@ -219,7 +233,13 @@ mod tests {
     fn dirty_files_are_refreshed_and_move_their_line_numbers() {
         let f = indexed_project(3);
         touch(&f.root, 1);
-        let out = resync_stale_files(&f.db, &f.root, &paths(3), RESYNC_BUDGET);
+        let out = resync_stale_files(
+            &f.db,
+            &f.root,
+            &paths(3),
+            RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
+        );
         assert_eq!(out.refreshed, 1, "only the edited file is dirty");
         assert!(out.any_changed());
         assert!(!out.is_partial());
@@ -243,7 +263,7 @@ mod tests {
         for i in 0..5 {
             touch(&f.root, i);
         }
-        let out = resync_stale_files(&f.db, &f.root, &paths(5), 2);
+        let out = resync_stale_files(&f.db, &f.root, &paths(5), 2, RefreshScope::IndexedOnly);
         assert_eq!(out.refreshed, 2, "budget caps the re-index at 2");
         assert_eq!(out.skipped_over_budget, 3);
         assert!(out.is_partial());
@@ -269,6 +289,7 @@ mod tests {
             &f.root,
             &["src/new.rs".to_string(), "<external>".to_string()],
             RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
         );
         assert_eq!(out.refreshed, 0, "a read command must not widen the index");
         assert!(!out.is_partial());
@@ -390,6 +411,7 @@ mod tests {
             &subject.root,
             &["a.py".to_string()],
             RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
         );
         assert_eq!(out.refreshed, 1, "the deleted file must be handled");
 
@@ -409,7 +431,13 @@ mod tests {
     fn a_deleted_file_loses_its_stale_rows() {
         let f = indexed_project(2);
         std::fs::remove_file(f.root.join("src/f0.rs")).unwrap();
-        let out = resync_stale_files(&f.db, &f.root, &paths(2), RESYNC_BUDGET);
+        let out = resync_stale_files(
+            &f.db,
+            &f.root,
+            &paths(2),
+            RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
+        );
         assert_eq!(out.refreshed, 1);
         let rows: i64 =
             f.db.conn()
