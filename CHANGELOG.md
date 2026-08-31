@@ -14,6 +14,46 @@ bump rather than patch: three defaults change, each with a stated escape hatch.
 | A symlinked `.code-graph` is refused (exit 1) | Only if you had deliberately symlinked the data directory. Move it back and re-run. |
 | INDEX_VERSION 68 → 69 | Nothing — every index rebuilds once, automatically, on first use. |
 
+### Query-time freshness: a declared switch with no reader, and four commands never swept
+
+Four defects in the same family — a freshness contract that was documented,
+tested, or listed in a guard, and not actually honoured.
+
+- **`skip_indexing` was ignored by eight tools.** `HONORED_UNDECLARED_ARGS` says
+  the flag is read by every tool through `should_skip_indexing`, and every tool's
+  own dispatch arm does read it — but result-set freshness (FRS-2) arrived later
+  and wraps those arms from outside. `semantic_code_search`, `ast_search`,
+  `project_map`, `find_similar_code`, `trace_http_chain`, `find_http_route`,
+  `get_call_graph` and `find_references` still took a write handle, ran a resync
+  and re-dispatched. Measured with `ast_search` after moving a symbol from line 1
+  to line 4: `skip_indexing:true` answered 4. It answers 1 now.
+- **`module_overview` and `find_dead_code` refreshed nothing.** Both called a
+  *file* refresher with a *directory* path, which is classified fresh and returns
+  — so the 60s cache was never evicted and both could answer from a pre-edit
+  index with no `freshness` disclosure. They were the only two MCP read surfaces
+  that could do that. Both now use result-set refresh.
+- **The architecture-level CLI commands were never swept.** `affected` was the
+  damaging one: its whole contract is a list a CI hook acts on, and it classified
+  caller-supplied paths through a stale gate, so a file the branch had just added
+  landed in `not_indexed` and printed "0 test file(s) to re-run". `deps`
+  disagreed with its own MCP twin `dependency_graph` about the same file while
+  the CLI accepted `dependency_graph` as an alias for it. `affected` and `deps`
+  now refresh the paths you name; `map`, `tour` and `centrality` refresh the files
+  their answers name. `cycles` and `surprising` are deliberately unchanged —
+  neither emits a file path, so there is no result set to refresh, and a
+  whole-index scan is the cost this budgeted mechanism exists to avoid.
+- **Two guard meta-holes.** `freshness_parity.rs` listed `module_overview` and
+  `find_dead_code` as covered on the strength of a call that did nothing, and its
+  CLI list omitted `cmd_callgraph` and `cmd_report` — both long since wired, so
+  their resync could have been deleted with every guard still green. The new
+  guards read the production list out of the source and are mutation-verified.
+
+`affected` gained one more property along the way, and lost it again before
+release: refreshing its inputs made it drop the dependents of a *deleted* file,
+because the refresh retires a vanished path's rows and the command then reads
+them. Deletions are the case whose dependents most need re-testing, so paths that
+no longer exist are excluded from the refresh.
+
 ### The UserPromptSubmit hook had never fired in production
 
 `user-prompt-context.js` read the user's text from `input.message`. Claude Code
