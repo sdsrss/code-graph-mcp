@@ -22,7 +22,8 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
 
     // Create a temporary database for benchmarking
     let data_dir = project_root.join(CODE_GRAPH_DIR);
-    std::fs::create_dir_all(&data_dir)?;
+    // Third `.code-graph` creator; same refusal as the other two (SEC-03).
+    crate::utils::owned::ensure_owned_dir(&data_dir)?;
     let bench_db_path = data_dir.join("benchmark-temp.db");
     if bench_db_path.exists() {
         std::fs::remove_file(&bench_db_path)?;

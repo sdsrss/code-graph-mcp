@@ -95,9 +95,21 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// delay the caller. Mirrored in `claude-plugin/scripts/recommendation-log.js`
 /// (recommendations.jsonl is also written by the JS PreToolUse hooks).
 pub(crate) fn rotate_jsonl_if_over(path: &Path, max_bytes: u64, keep_bytes: usize) {
-    let Ok(meta) = std::fs::metadata(path) else {
+    // `symlink_metadata`, not `metadata`: a symlink here used to make the size
+    // test read the TARGET's length and the rewrite below truncate the target —
+    // an arbitrary file outside the project, cut to its last `keep_bytes`
+    // (audit 2026-08-29 SEC-02). Refusing at the stat also means the target is
+    // never read, so this is not merely a write guard.
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     }; // missing → nothing to do
+    if !meta.file_type().is_file() {
+        tracing::warn!(
+            "Not rotating {}: not a regular file (leaving it untouched)",
+            path.display()
+        );
+        return;
+    }
     if meta.len() <= max_bytes {
         return; // under threshold → leave it
     }
@@ -112,8 +124,14 @@ pub(crate) fn rotate_jsonl_if_over(path: &Path, max_bytes: u64, keep_bytes: usiz
         .position(|&b| b == b'\n')
         .map(|pos| start + pos + 1)
         .unwrap_or(start);
-    if let Err(e) = std::fs::write(path, &content[trim_start..]) {
-        tracing::warn!("Failed to rotate {}: {}", path.display(), e);
+    use std::io::Write as _;
+    match crate::utils::owned::rewrite_owned(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(&content[trim_start..]) {
+                tracing::warn!("Failed to rotate {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to rotate {}: {}", path.display(), e),
     }
 }
 
@@ -158,6 +176,48 @@ mod tests {
         std::fs::write(&small, "a\nb\n").unwrap();
         rotate_jsonl_if_over(&small, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
         assert_eq!(std::fs::read_to_string(&small).unwrap(), "a\nb\n");
+    }
+
+    /// `.code-graph/` is ordinary repo content — one `git clone` can carry a
+    /// symlink where the rotator expects its own file. `fs::metadata` and
+    /// `fs::write` both follow it, so the rotator read-modify-wrote the LINK
+    /// TARGET: an unrelated >1 MB file outside the project was silently
+    /// truncated to its last ~512 KB, first line and all (audit 2026-08-29
+    /// SEC-02, measured 687,756 bytes destroyed).
+    #[cfg(unix)]
+    #[test]
+    fn rotate_refuses_to_rewrite_through_a_symlink() {
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim.txt");
+        let payload = format!("SECRET-HEADER-LINE\n{}\n", "A".repeat(1_500_000));
+        std::fs::write(&victim, &payload).unwrap();
+        let link = dir.path().join("recommendations.jsonl");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        rotate_jsonl_if_over(&link, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+
+        let after = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(
+            after.len(),
+            payload.len(),
+            "the link target must not be rewritten (lost {} bytes)",
+            payload.len().saturating_sub(after.len())
+        );
+        assert!(
+            after.starts_with("SECRET-HEADER-LINE"),
+            "the target's first line must survive"
+        );
+
+        // Positive control: the same call on a REGULAR oversized file still
+        // rotates, so the assertions above cannot pass by the rotator having
+        // become a no-op.
+        let real = dir.path().join("real.jsonl");
+        std::fs::write(&real, &payload).unwrap();
+        rotate_jsonl_if_over(&real, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+        assert!(
+            std::fs::metadata(&real).unwrap().len() <= JSONL_ROTATE_KEEP_BYTES as u64,
+            "a regular oversized file must still rotate"
+        );
     }
 
     #[test]

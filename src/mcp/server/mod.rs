@@ -458,7 +458,10 @@ impl McpServer {
     /// Create from project root path: auto-creates .code-graph/ directory and .gitignore entry
     pub fn from_project_root(project_root: &Path) -> Result<Self> {
         let db_dir = project_root.join(CODE_GRAPH_DIR);
-        std::fs::create_dir_all(&db_dir)?;
+        // Same refusal the CLI index path makes: a symlinked `.code-graph`
+        // relocates the whole data directory outside the project root and
+        // `create_dir_all` calls that success (audit 2026-08-29 SEC-03).
+        crate::utils::owned::ensure_owned_dir(&db_dir)?;
         let db_path = db_dir.join("index.db");
 
         // Ensure .code-graph/ is in .gitignore. Shared with the CLI index

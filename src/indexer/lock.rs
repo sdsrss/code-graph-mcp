@@ -73,6 +73,10 @@ pub(crate) fn is_flock_conflict(raw_os_error: Option<i32>) -> bool {
 /// modify — an absent lock file means nobody has ever locked here, i.e. free.
 #[cfg(not(unix))]
 fn open_lock_handle(lock_path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    // Windows has no `O_NOFOLLOW`, so the portable half of the Unix guard stands
+    // alone here: refuse a reparse point / non-regular file at `index.lock`
+    // rather than truncate whatever it points at (audit 2026-08-29 SEC-03).
+    crate::utils::owned::refuse_non_regular(lock_path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(create).truncate(create);
     #[cfg(windows)]
@@ -103,11 +107,11 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
     use std::os::unix::io::AsRawFd;
 
     let lock_path = code_graph_dir.join("index.lock");
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
+    // `hold_owned` keeps the `truncate(false)` the flock needs (the lock lives
+    // on the inode) while refusing a symlink: `.code-graph/` is repo content, and
+    // the `set_len(0)` + PID write below went straight through a planted link,
+    // leaving an unrelated file holding a PID (audit 2026-08-29 SEC-03).
+    let file = crate::utils::owned::hold_owned(&lock_path)
         .map_err(|e| {
             tracing::warn!(
                 "Could not open index lock: {} — running in secondary mode",
@@ -256,8 +260,11 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let lock_path = code_graph_dir.join("index.lock");
     // Deliberately do NOT create the file: its absence means no server has ever
-    // locked here, i.e. free.
-    let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+    // locked here, i.e. free. `probe_owned` additionally refuses a symlink: the
+    // probe does not write, but it would `flock` whatever the link points at —
+    // and an external inode somebody else happens to hold would then read back
+    // as "our index is locked" and refuse a rebuild that is perfectly safe.
+    let file = match crate::utils::owned::probe_owned(&lock_path) {
         Ok(f) => f,
         Err(_) => return false,
     };
@@ -333,6 +340,51 @@ mod tests {
     // became a hard `cargo check` failure on the windows leg once `[lints]` denied
     // warnings crate-wide — a platform this repo's dev box never compiles.
     use tempfile::TempDir;
+
+    /// `index.lock` lives in `.code-graph/`, and `.code-graph/` is repo content
+    /// a clone can carry. Acquisition opened the path and then `set_len(0)` +
+    /// wrote the PID — straight THROUGH a symlink, leaving an unrelated file
+    /// holding exactly the digits of a PID (audit 2026-08-29 SEC-03, PoC: a
+    /// 47-byte `victim.conf` became `10`).
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_refuses_a_symlinked_lock_file() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path().join(".code-graph");
+        std::fs::create_dir(&cg).unwrap();
+        let victim = dir.path().join("victim.conf");
+        std::fs::write(&victim, "keep = 1\nsecond line\n").unwrap();
+        std::os::unix::fs::symlink(&victim, cg.join("index.lock")).unwrap();
+
+        let held = try_acquire_index_lock(&cg);
+        assert!(held.is_none(), "a symlinked lock file must not be acquired");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep = 1\nsecond line\n",
+            "the link target must not be truncated or written"
+        );
+
+        // The read-only probe must not flock the link target either: an external
+        // inode somebody else holds would read back as "our index is locked".
+        assert!(
+            !other_process_holds_index_lock(&cg),
+            "a symlinked lock file must read as free, not as held"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep = 1\nsecond line\n",
+            "the probe must leave the link target alone too"
+        );
+
+        // Positive control: a regular lock file is still acquirable, so the
+        // refusal above is about the symlink and not about the lock breaking.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(
+            try_acquire_index_lock(&plain).is_some(),
+            "a regular lock file must still be acquirable"
+        );
+    }
 
     // The lock file is opened with `truncate(false)` — deliberately, since the
     // flock lives on the inode — so the PID written for diagnostics landed ON

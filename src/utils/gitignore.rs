@@ -32,11 +32,10 @@ pub(crate) fn ensure_code_graph_dir_ignored(project_root: &Path) {
         return;
     }
     use std::io::Write as _;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitignore_path)
-    {
+    // Through `owned::append_owned`: the repo can ship its own `.gitignore` as
+    // a symlink, and a plain append followed it into the target (audit
+    // 2026-08-29 SEC-03). Best-effort as before — a refusal is a warning.
+    match crate::utils::owned::append_owned(&gitignore_path) {
         Ok(mut f) => {
             // Add newline separator if the file doesn't end with one
             if !content.ends_with('\n') && !content.is_empty() {
@@ -67,6 +66,40 @@ mod tests {
         ensure_code_graph_dir_ignored(root.path());
         let content = std::fs::read_to_string(root.path().join(".gitignore")).unwrap();
         assert_eq!(content, "node_modules\n.code-graph/\n", "got: {content:?}");
+    }
+
+    /// A repo can ship its own `.gitignore` as a symlink. The append followed
+    /// it and wrote `.code-graph/` into the LINK TARGET — the constant-content
+    /// half of the same primitive that truncates files in `telemetry::rotate`
+    /// (audit 2026-08-29 SEC-03): pollution rather than destruction, but the
+    /// same "a repo-supplied path is treated as our own file" root cause.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_append_through_a_symlinked_gitignore() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let victim = dir.path().join("victim.conf");
+        std::fs::write(&victim, "keep = 1\n").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".gitignore")).unwrap();
+
+        ensure_code_graph_dir_ignored(&root);
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep = 1\n",
+            "the link target must not be appended to"
+        );
+
+        // Positive control: a regular `.gitignore` in a sibling repo still gets
+        // the entry, so the assertion above is not green by inaction.
+        let ok_root = dir.path().join("plain");
+        std::fs::create_dir(&ok_root).unwrap();
+        ensure_code_graph_dir_ignored(&ok_root);
+        assert_eq!(
+            std::fs::read_to_string(ok_root.join(".gitignore")).unwrap(),
+            ".code-graph/\n"
+        );
     }
 
     /// Idempotence across BOTH spellings — a hand-written `.code-graph` (no

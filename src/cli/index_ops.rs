@@ -168,7 +168,11 @@ pub(crate) fn build_full_index_at(
     no_embed: bool,
 ) -> Result<crate::indexer::pipeline::IndexResult> {
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        // Not `create_dir_all`: that silently succeeds when `.code-graph` is a
+        // repo-supplied symlink, putting `index.db` and every telemetry file
+        // outside the project root while reporting success (audit 2026-08-29
+        // SEC-03). Refuse before anything is written.
+        crate::utils::owned::ensure_owned_dir(parent)?;
         cleanup_legacy_db_files(parent);
     }
     // Same `.gitignore` upkeep the MCP server does when IT creates the dir — a

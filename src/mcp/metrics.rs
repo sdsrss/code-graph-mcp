@@ -330,9 +330,12 @@ impl SessionMetrics {
             }
         };
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists. `ensure_owned_dir` rather than
+        // `create_dir_all`: the latter silently succeeds when `.code-graph` is a
+        // symlink to somewhere else, which is how the whole data directory could
+        // be relocated outside the project root (audit 2026-08-29 SEC-03).
         if let Some(parent) = usage_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = crate::utils::owned::ensure_owned_dir(parent) {
                 tracing::warn!("Failed to create metrics directory: {}", e);
                 return;
             }
@@ -342,12 +345,9 @@ impl SessionMetrics {
         // ~max + one line. recommendations.jsonl shares this exact policy.
         rotate_jsonl_if_over(usage_path, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
 
-        // Append the line
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(usage_path)
-        {
+        // Append the line — refusing a symlink planted at `usage.jsonl`, the
+        // same guard `record_cli_use` applies to its sibling telemetry file.
+        match crate::utils::owned::append_owned(usage_path) {
             Ok(mut file) => {
                 if let Err(e) = writeln!(file, "{}", line) {
                     tracing::warn!("Failed to write session metrics: {}", e);
@@ -407,6 +407,42 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::TempDir;
+
+    /// `usage.jsonl` sits in `.code-graph/` next to `recommendations.jsonl` and
+    /// is written with the same `OpenOptions::append` shape, so it carries the
+    /// same symlink exposure: a repo-supplied link made every MCP session flush
+    /// append into an unrelated file (audit 2026-08-29 SEC-02).
+    #[cfg(unix)]
+    #[test]
+    fn flush_refuses_to_append_through_a_symlinked_usage_file() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path().join(".code-graph");
+        std::fs::create_dir(&cg).unwrap();
+        let victim = dir.path().join("victim.conf");
+        std::fs::write(&victim, "keep = 1\n").unwrap();
+        std::os::unix::fs::symlink(&victim, cg.join("usage.jsonl")).unwrap();
+
+        let mut m = SessionMetrics::new();
+        m.files_indexed = 1; // non-empty, so the flush actually has work
+        m.flush(&cg.join("usage.jsonl"), "0.0.0-test");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep = 1\n",
+            "the link target must not be appended to"
+        );
+
+        // Positive control: a regular path in a sibling dir still receives the
+        // record, so the assertion above is not green by the flush no-opping.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let ok_path = plain.join("usage.jsonl");
+        m.flush(&ok_path, "0.0.0-test");
+        assert!(
+            std::fs::read_to_string(&ok_path).unwrap().contains("\"v\""),
+            "a regular usage.jsonl must still be written"
+        );
+    }
 
     #[test]
     fn test_new_session_is_empty() {

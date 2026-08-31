@@ -2524,3 +2524,67 @@ fn empty_min_confidence_reads_as_absent_on_every_surface() {
         "the MCP surface keeps its own spelling: {mcp_err}"
     );
 }
+
+/// `.code-graph/recommendations.jsonl` is opened by name and appended to. A
+/// clone that ships a symlink there redirected every CLI query's telemetry line
+/// into an unrelated file (audit 2026-08-29 SEC-02 — the same primitive that
+/// truncates once the target crosses the 1 MB rotation threshold).
+#[cfg(unix)]
+#[test]
+fn record_cli_use_refuses_to_append_through_a_symlink() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("repo");
+    let cg = root.join(crate::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&cg).unwrap();
+    let victim = dir.path().join("victim.conf");
+    std::fs::write(&victim, "keep = 1\n").unwrap();
+    std::os::unix::fs::symlink(&victim, cg.join("recommendations.jsonl")).unwrap();
+
+    record_cli_use(&root, "search");
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "keep = 1\n",
+        "the link target must not be appended to"
+    );
+
+    // Positive control in the SAME process, so an inherited `CODE_GRAPH_INTERNAL=1`
+    // (which early-returns) cannot make the assertion above vacuously green.
+    let plain_root = dir.path().join("plain");
+    let plain_cg = plain_root.join(crate::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&plain_cg).unwrap();
+    record_cli_use(&plain_root, "search");
+    let written = std::fs::read_to_string(plain_cg.join("recommendations.jsonl")).unwrap();
+    assert!(
+        written.contains("\"cmd\":\"search\""),
+        "a regular recommendations.jsonl must still receive the line: {written:?}"
+    );
+}
+
+/// The whole data directory is repo-suppliable: `.code-graph -> ../outside`
+/// made `create_dir_all` a silent no-op and put `index.db` (and every telemetry
+/// file with it) outside the project root (audit 2026-08-29 SEC-03).
+#[cfg(unix)]
+#[test]
+fn a_symlinked_code_graph_dir_is_refused_before_anything_is_written() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(crate::domain::CODE_GRAPH_DIR)).unwrap();
+
+    let db_path = root.join(crate::domain::CODE_GRAPH_DIR).join("index.db");
+    let err = match build_full_index_at(&db_path, &root, true, true) {
+        Err(e) => e,
+        Ok(_) => panic!("a symlinked .code-graph must be refused"),
+    };
+    assert!(
+        err.to_string().contains(".code-graph"),
+        "the refusal must name the directory it refuses: {err}"
+    );
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "nothing may be written outside the project root"
+    );
+}

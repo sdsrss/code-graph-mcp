@@ -40,11 +40,10 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
         crate::utils::telemetry::JSONL_ROTATE_MAX_BYTES,
         crate::utils::telemetry::JSONL_ROTATE_KEEP_BYTES,
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rec_path)
-    {
+    // `.code-graph/recommendations.jsonl` is opened by fixed name inside a
+    // directory that is repo content; `append_owned` refuses to follow a
+    // symlink planted there (audit 2026-08-29 SEC-02).
+    if let Ok(mut f) = crate::utils::owned::append_owned(&rec_path) {
         use std::io::Write as _;
         let _ = writeln!(f, "{}", line);
     }

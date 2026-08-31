@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### A repo-supplied symlink in `.code-graph/` redirected every write out of the tree
+
+**Security.** `.code-graph/` is ordinary repo content: one `git clone` can carry
+a symlink where this tool expects its own file. `fs::write`, `OpenOptions::append`
+and `File::set_len` all follow symlinks, so every writer that opened a fixed name
+in that directory was operating on the **link target** — a file the tool never
+chose and the user never named. Measured, on a clone that ships nothing but the
+links:
+
+| Writer | Effect on the link target |
+|---|---|
+| `utils::telemetry::rotate_jsonl_if_over` (`recommendations.jsonl`, `usage.jsonl`) | a 1.2 MB file outside the project truncated to its last ~512 KB — 687,756 bytes destroyed, first line included |
+| `indexer::lock` (`index.lock`) | `set_len(0)` + PID write left a 47-byte config holding the two digits of a PID |
+| `utils::gitignore` (`.gitignore`) | `.code-graph/` appended into an unrelated file |
+| `create_dir_all(.code-graph)` | a `.code-graph -> ../outside` link made the call a silent success, putting `index.db` (1.7 MB) and every telemetry file outside the project root |
+
+No prompt, no `--confirm`, no stderr. The sharp contrast that names this as a
+blind spot rather than an oversight: the **read** side already refuses to follow
+symlinks *into* the tree (`WalkBuilder` runs `follow_links(false)`), while the
+write side followed them *out* of it.
+
+One helper closes the class rather than four call sites patching it separately —
+`src/utils/owned.rs`, two layers on purpose: `refuse_non_regular` gives a message
+naming the path and the reason (and is the only layer Windows has), and
+`O_NOFOLLOW` on the open closes the check-then-open race on Unix. `append_owned`
+/ `rewrite_owned` / `hold_owned` / `probe_owned` / `ensure_owned_dir` now back
+`usage.jsonl`, `recommendations.jsonl`, `.gitignore`, `index.lock` and all three
+`.code-graph` creators.
+
+Two details worth naming. The rotator now stats with `symlink_metadata`, so a
+symlinked target is never even **read** — the guard is not merely a write guard.
+And the read-only lock *probe* is guarded too: it writes nothing, but it would
+`flock` whatever the link points at, and an external inode somebody else holds
+would read back as "our index is locked" and refuse a rebuild that was safe.
+
+Behavior change: a symlinked `.code-graph` is now refused with
+`refusing to use a symlinked <path> — remove it and re-run` (exit 1) instead of
+silently relocating the index. Symlinked telemetry files, `.gitignore` and
+`index.lock` are skipped with a warning; indexing continues.
+
+Verified end to end on a sandbox clone: the 1.2 MB target stays byte-identical at
+1,200,020 bytes with its first line intact, `outside/` stays empty, and both
+`victim.conf` and the symlinked `.gitignore` are unchanged. Six tests reproduce
+the six shapes (each with a positive control, so "the writer stopped working"
+cannot pass as a fix) plus three on the helper.
+
 ### The opened project could hand the plugin a binary — and get it run
 
 **Security.** `findBinary()` resolved the developer's binary by walking a list of
