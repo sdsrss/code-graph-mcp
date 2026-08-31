@@ -77,6 +77,13 @@ pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
 /// Open a file the tool owns for writing while KEEPING its inode and contents —
 /// the index lock, whose `flock` lives on the inode and which is truncated
 /// explicitly after the lock is held.
+///
+/// `#[cfg(unix)]` because its only caller, `lock::try_acquire_index_lock`, is;
+/// the non-Unix lock is an exclusive open HANDLE and reaches the same guard
+/// through `open_lock_handle` → [`refuse_non_regular`]. Without the gate this is
+/// dead code on Windows, and `[lints.rust] warnings = "deny"` makes that a hard
+/// `cargo check` failure on a platform this dev box never compiles.
+#[cfg(unix)]
 pub(crate) fn hold_owned(path: &Path) -> io::Result<File> {
     open_owned(
         path,
@@ -87,6 +94,10 @@ pub(crate) fn hold_owned(path: &Path) -> io::Result<File> {
 /// Open an EXISTING file the tool owns, for writing, without creating or
 /// truncating it — the index-lock probe, whose whole contract is "look, do not
 /// disturb". Absent path stays an error, which the probe reads as "free".
+///
+/// `#[cfg(unix)]` for the same reason as [`hold_owned`]: the non-Unix probe goes
+/// through `open_lock_handle`, which applies [`refuse_non_regular`] itself.
+#[cfg(unix)]
 pub(crate) fn probe_owned(path: &Path) -> io::Result<File> {
     open_owned(path, OpenOptions::new().write(true))
 }
@@ -115,12 +126,17 @@ pub(crate) fn ensure_owned_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+// `unix` on the MODULE, not just on each test: every test in here needs
+// `std::os::unix::fs::symlink` to say anything, so on Windows the module is
+// empty and its two `use` lines become unused-import errors under
+// `warnings = "deny"`. Gating the tests one by one leaves the imports behind —
+// which is exactly how this file broke the windows-latest leg of CI on the
+// v0.127.0 release commit, alongside the two helpers above.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write as _;
 
-    #[cfg(unix)]
     #[test]
     fn every_owned_open_refuses_a_symlink_and_still_serves_a_regular_file() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -156,7 +172,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuse_non_regular_accepts_absent_and_regular_paths() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -170,7 +185,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn ensure_owned_dir_creates_accepts_and_refuses() {
         let dir = tempfile::TempDir::new().unwrap();
