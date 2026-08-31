@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.127.0 (2026-08-31)
+
+**Security release.** Two ways an untrusted repository could act on the machine
+that opened it, plus the data-correctness batch from the 2026-08-29 audit. Minor
+bump rather than patch: three defaults change, each with a stated escape hatch.
+
+**What you may have to do:**
+
+| Change | Action |
+|---|---|
+| `CLAUDE_PROJECT_DIR` is no longer a trusted binary source | Running a source checkout against a marketplace-installed plugin? `export CODE_GRAPH_DEV=1` to keep using `<checkout>/target/release/code-graph-mcp`. Everyone else: nothing. |
+| A symlinked `.code-graph` is refused (exit 1) | Only if you had deliberately symlinked the data directory. Move it back and re-run. |
+| INDEX_VERSION 68 → 69 | Nothing — every index rebuilds once, automatically, on first use. |
 
 ### The UserPromptSubmit hook had never fired in production
 
