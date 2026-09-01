@@ -3,6 +3,11 @@
 
 use super::super::*;
 
+/// How many hot functions compact mode shows. The full envelope carries up to 15
+/// (the query's LIMIT); anything past this cap is dropped and DISCLOSED via
+/// `hot_functions_truncated` — see the trim site in `tool_project_map`.
+const COMPACT_HOT_FUNCTIONS: usize = 10;
+
 /// One module entry, trimmed for compact mode.
 ///
 /// Split out of `tool_project_map` so the field set is unit-testable and so the
@@ -199,6 +204,10 @@ impl McpServer {
                             json!({
                                 "from": d["from"],
                                 "to": d["to"],
+                                // One integer, and the only thing that ranks the
+                                // list: `59 imports` and `1 import` are the same
+                                // edge without it.
+                                "imports": d["imports"],
                             })
                         })
                         .collect()
@@ -209,11 +218,21 @@ impl McpServer {
             // `type` retained so callers can distinguish function vs method
             // without a follow-up get_ast_node call (parity with non-compact
             // envelope and CLI `map --json`).
+            //
+            // The full list is capped at 15 by the query, so this cuts up to 5.
+            // The cut itself is fine; an UNDISCLOSED cut is not — a short list
+            // with no marker reads as "these are all the hot functions there
+            // are", which is a wrong answer rather than a terse one. `truncated`
+            // below is emitted only when something was actually dropped.
+            let hot_total = result["hot_functions"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
             let compact_hot: Vec<serde_json::Value> = result["hot_functions"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
-                        .take(10)
+                        .take(COMPACT_HOT_FUNCTIONS)
                         .map(|h| {
                             let mut obj = json!({
                                 "name": h["name"],
@@ -234,13 +253,18 @@ impl McpServer {
                 })
                 .unwrap_or_default();
 
-            // Trim entry_points: file+handler+kind (kind lets LLM skip `main` when scanning HTTP surface)
+            // entry_points: route+handler+file+kind — the full entry, nothing
+            // trimmed. `kind` lets a caller skip `main` when scanning the HTTP
+            // surface; `route` is the URL, i.e. the answer to the question the
+            // HTTP surface is being scanned FOR. Compact used to drop it and
+            // reply with handler names and no endpoints.
             let compact_entries: Vec<serde_json::Value> = result["entry_points"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
                         .map(|e| {
                             json!({
+                                "route": e["route"],
                                 "file": e["file"],
                                 "handler": e["handler"],
                                 "kind": e["kind"],
@@ -256,6 +280,10 @@ impl McpServer {
                 "entry_points": compact_entries,
                 "hot_functions": compact_hot,
             });
+            if hot_total > COMPACT_HOT_FUNCTIONS {
+                compact_result["hot_functions_truncated"] = json!(true);
+                compact_result["hot_functions_total"] = json!(hot_total);
+            }
             // Compact is a WHITELIST rebuild (feedback_compact_field_allowlist —
             // v0.90/v0.97.1 both dropped new fields here): forward centrality
             // explicitly, trimmed to name+file+score.

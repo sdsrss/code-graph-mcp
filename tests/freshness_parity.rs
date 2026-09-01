@@ -702,6 +702,323 @@ fn project_map_compact_guard_detects_missing_key() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 2c drift-guard: the SAME rule for project_map's NESTED array entries.
+//
+// The two guards above cover the top-level envelope and the `modules[]` entry
+// shape. `project_map` builds three MORE arrays — `module_dependencies`,
+// `entry_points`, `hot_functions` — each with its own producer literal and its
+// own hand-written compact rebuild, and none of them had a guard. Both had
+// drifted: compact dropped `entry_points.route` (the URL — i.e. compact mode
+// answered "what is the HTTP surface" with handler names and no endpoints) and
+// `module_dependencies.imports` (the edge weight that makes the dependency list
+// rankable). Same bug class, one nesting level down.
+// ---------------------------------------------------------------------------
+
+/// Per-entry keys the compact rebuild drops on purpose, keyed by array name.
+/// Add with a reason; never to silence the guard. Empty today — every field in
+/// these three arrays is a single scalar that carries a distinct signal.
+const PROJECT_MAP_ENTRY_DELIBERATELY_DROPPED: &[(&str, &str)] = &[];
+
+/// The `let <anchor> …;` builder region, ending at `terminator`.
+///
+/// Anchored on the statement's own terminator rather than on "the next `let`",
+/// so reordering the four builders inside `tool_project_map` cannot silently
+/// make one region swallow another.
+fn builder_region<'a>(src: &'a str, anchor: &str, terminator: &str) -> &'a str {
+    let start = src
+        .find(anchor)
+        .unwrap_or_else(|| panic!("anchor `{anchor}` not found in project_map.rs"));
+    let after = &src[start..];
+    let end = after.find(terminator).unwrap_or_else(|| {
+        panic!("`{anchor}` region no longer ends with `{terminator}` — repoint the guard")
+    });
+    &after[..end]
+}
+
+/// Keys one array-entry builder introduces: the `json!({…})` literal plus any
+/// conditional `obj["k"] =` assignment that follows it in the same closure.
+fn entry_keys(region: &str) -> Vec<String> {
+    let mut keys = json_literal_keys(region, "json!({");
+    keys.extend(assigned_keys_for(region, "obj"));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// `(array, producer-anchor, compact-anchor)` for every nested array.
+const PROJECT_MAP_ARRAYS: &[(&str, &str, &str)] = &[
+    ("module_dependencies", "let deps_json", "let compact_deps"),
+    ("entry_points", "let routes_json", "let compact_entries"),
+    ("hot_functions", "let hot_json", "let compact_hot"),
+];
+
+fn project_map_uncovered_entry_keys(src: &str, array: &str) -> Vec<String> {
+    let (_, producer_anchor, compact_anchor) = PROJECT_MAP_ARRAYS
+        .iter()
+        .find(|(name, _, _)| *name == array)
+        .expect("unknown array");
+    let produced = entry_keys(builder_region(src, producer_anchor, ".collect();"));
+    assert!(
+        produced.len() > 1,
+        "producer scan for `{array}` found only {produced:?} — the anchors are wrong, \
+         not the code (a guard that reads nothing passes vacuously)"
+    );
+    let compacted = entry_keys(builder_region(src, compact_anchor, ".unwrap_or_default();"));
+    let mut uncovered: Vec<String> = produced
+        .into_iter()
+        .filter(|k| {
+            !compacted.contains(k)
+                && !PROJECT_MAP_ENTRY_DELIBERATELY_DROPPED.contains(&(array, k.as_str()))
+        })
+        .collect();
+    uncovered.sort();
+    uncovered.dedup();
+    uncovered
+}
+
+#[test]
+fn project_map_compact_forwards_every_nested_entry_key() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+    for (array, _, _) in PROJECT_MAP_ARRAYS {
+        let uncovered = project_map_uncovered_entry_keys(&src, array);
+        assert!(
+            uncovered.is_empty(),
+            "the full `{array}` entries emit {uncovered:?}, which the compact rebuild in \
+             {PROJECT_MAP_SRC} neither forwards nor drops on the record. Forward them, or add \
+             (\"{array}\", \"<key>\") to PROJECT_MAP_ENTRY_DELIBERATELY_DROPPED with a reason."
+        );
+    }
+}
+
+/// Permanent negative control, one mutation per array and per key SOURCE: the
+/// `json!` literal for all three, plus the conditional `obj[…] =` assignment that
+/// only `hot_functions` uses. A scanner that read the literal alone would still
+/// pass the positive test above.
+#[test]
+fn project_map_nested_entry_guard_detects_missing_key() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+
+    for (array, key, cut) in [
+        (
+            "module_dependencies",
+            "imports",
+            "\"imports\": d[\"imports\"],",
+        ),
+        ("entry_points", "route", "\"route\": e[\"route\"],"),
+        ("hot_functions", "name", "\"name\": h[\"name\"],"),
+    ] {
+        let broken = src.replace(cut, "");
+        // Compare lengths, not the strings: an `assert_ne!` on two ~14 KB
+        // sources dumps both into the failure output and buries the message.
+        assert!(
+            broken.len() < src.len(),
+            "negative control for `{array}.{key}` cut nothing — `{cut}` is no longer \
+             the literal in the compact rebuild, so the control is inert"
+        );
+        let uncovered = project_map_uncovered_entry_keys(&broken, array);
+        assert!(
+            uncovered.iter().any(|k| k == key),
+            "negative control failed: dropping `{key}` from the compact `{array}` literal must \
+             surface it as uncovered, got {uncovered:?}"
+        );
+    }
+
+    // The other key source: a field that reaches the entry via a conditional
+    // assignment rather than the literal.
+    let broken = src.replace(
+        "obj[\"test_caller_count\"] = h[\"test_caller_count\"].clone();",
+        "",
+    );
+    assert!(
+        broken.len() < src.len(),
+        "negative control for `test_caller_count` cut nothing — the conditional assignment \
+         in the compact rebuild was renamed, so the control is inert"
+    );
+    let uncovered = project_map_uncovered_entry_keys(&broken, "hot_functions");
+    assert!(
+        uncovered.iter().any(|k| k == "test_caller_count"),
+        "negative control failed: dropping the conditional `test_caller_count` assignment from \
+         the compact rebuild must surface it as uncovered, got {uncovered:?}"
+    );
+}
+
+/// Runtime proof of the same drift, from the outside: the symptom is that
+/// `compact: true` answers an HTTP-surface question without any URL in it.
+#[test]
+fn compact_project_map_keeps_route_and_import_counts() {
+    // Two DIRECTORIES: module_dependencies is a module→module edge, so a
+    // single-directory fixture would leave the deps assertion vacuous.
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src/handlers")).unwrap();
+    fs::create_dir_all(project.path().join("src/api")).unwrap();
+    fs::write(
+        project.path().join("src/handlers/widgets.js"),
+        "function widgetsHandler(req, res) { res.json([]); }\n\
+         function healthHandler(req, res) { res.json({ ok: true }); }\n\
+         module.exports = { widgetsHandler, healthHandler };\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/api/server.js"),
+        "const { widgetsHandler, healthHandler } = require('../handlers/widgets');\n\
+         const app = require('express')();\n\
+         function mount() {\n\
+        \x20 app.get('/widgets', widgetsHandler);\n\
+        \x20 app.post('/widgets/:id', widgetsHandler);\n\
+        \x20 app.get('/health', healthHandler);\n\
+         }\n\
+         module.exports = { mount };\n",
+    )
+    .unwrap();
+
+    let server = init_server(&project);
+    let msg = tool_call_json("project_map", json!({ "compact": true }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let entries = result["entry_points"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !entries.is_empty(),
+        "fixture produced no entry_points at all — the test cannot prove anything about \
+         `route`; compact result was:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
+    let routes: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("route").and_then(|r| r.as_str()))
+        .collect();
+    // The extractor emits `"<METHOD> <path>"`, so match on the path substring.
+    assert!(
+        routes.iter().any(|r| r.contains("/widgets")),
+        "compact entry_points must carry the URL — that IS the answer to \"what is the HTTP \
+         surface\". Got {entries:?}"
+    );
+
+    let deps = result["module_dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !deps.is_empty(),
+        "fixture produced no module_dependencies; compact result was:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
+    assert!(
+        deps.iter().all(|d| d.get("imports").is_some()),
+        "compact module_dependencies must keep the `imports` weight — without it every edge \
+         reads as equally important. Got {deps:?}"
+    );
+}
+
+/// The trim itself is fine; answering with a silently short list is not. With
+/// more hot functions than compact shows, the envelope must say so.
+#[test]
+fn compact_project_map_discloses_hot_function_truncation() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    let mut helpers = String::new();
+    let mut calls = String::new();
+    for i in 0..12 {
+        helpers.push_str(&format!(
+            "export function helper{i}(): number {{ return {i}; }}\n"
+        ));
+        calls.push_str(&format!("  t += helper{i}();\n"));
+    }
+    fs::write(project.path().join("src/helpers.ts"), &helpers).unwrap();
+    fs::write(
+        project.path().join("src/main.ts"),
+        format!(
+            "import {{ {} }} from './helpers';\n\
+             export function run(): number {{\n  let t = 0;\n{calls}  return t;\n}}\n",
+            (0..12)
+                .map(|i| format!("helper{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .unwrap();
+
+    let server = init_server(&project);
+    let full = parse_tool_result(
+        &server
+            .handle_message(&tool_call_json("project_map", json!({})))
+            .unwrap(),
+    );
+    let full_hot = full["hot_functions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        full_hot.len() > 10,
+        "fixture produced only {} hot functions — cannot exercise the trim; full envelope:\n{}",
+        full_hot.len(),
+        serde_json::to_string_pretty(&full).unwrap()
+    );
+
+    let compact = parse_tool_result(
+        &server
+            .handle_message(&tool_call_json("project_map", json!({ "compact": true })))
+            .unwrap(),
+    );
+    let compact_hot = compact["hot_functions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        compact_hot.len() < full_hot.len(),
+        "precondition: compact is expected to trim here, got {} vs {}",
+        compact_hot.len(),
+        full_hot.len()
+    );
+    assert_eq!(
+        compact["hot_functions_truncated"],
+        json!(true),
+        "compact showed {} of {} hot functions and must disclose the cut — an undisclosed trim \
+         reads as \"this is the whole list\". Compact envelope was:\n{}",
+        compact_hot.len(),
+        full_hot.len(),
+        serde_json::to_string_pretty(&compact).unwrap()
+    );
+}
+
+/// The disclosure must be conditional, not a constant `true`: a project with
+/// fewer hot functions than the cap loses nothing and must not claim it did.
+#[test]
+fn compact_project_map_omits_truncation_flag_when_nothing_was_cut() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("src/tiny.ts"),
+        "export function leaf(): number { return 1; }\n\
+         export function root(): number { return leaf(); }\n",
+    )
+    .unwrap();
+
+    let server = init_server(&project);
+    let compact = parse_tool_result(
+        &server
+            .handle_message(&tool_call_json("project_map", json!({ "compact": true })))
+            .unwrap(),
+    );
+    let n = compact["hot_functions"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(
+        n <= 10,
+        "precondition: fixture must stay under the compact cap, got {n}"
+    );
+    assert!(
+        compact.get("hot_functions_truncated").is_none(),
+        "nothing was cut, so the envelope must not claim a truncation. Got:\n{}",
+        serde_json::to_string_pretty(&compact).unwrap()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 3 drift-guard: CLI + MCP query-time freshness resync coverage.
 // ---------------------------------------------------------------------------
 

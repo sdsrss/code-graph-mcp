@@ -70,7 +70,7 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
             })
             .collect();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "modules": modules.iter().map(|m| serde_json::json!({
                 "path": m.path,
                 "files": m.files,
@@ -95,6 +95,14 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
             })).collect::<Vec<_>>(),
             "hot_functions": hot_json,
         });
+        // Text mode already prints "... and N more hot functions"; JSON mode cut
+        // the same rows with no marker, so a `--compact --json` consumer read the
+        // short list as the whole list. Same disclosure, same key names as MCP
+        // `project_map` compact.
+        if hot_functions.len() > hot_cap {
+            result["hot_functions_truncated"] = serde_json::json!(true);
+            result["hot_functions_total"] = serde_json::json!(hot_functions.len());
+        }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
