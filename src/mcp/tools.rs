@@ -93,7 +93,17 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "project_map".into(),
-                description: "Architecture map (modules / deps / hot fns; include_centrality=chokepoints). Replaces Glob+Read of N top-level files. SessionStart already injected; recall after major refactor.".into(),
+                // "SessionStart already injected" was false for most installs and
+                // told the model it ALREADY had this map — steering it off a call
+                // it should make. The SessionStart project_map dump has been OFF
+                // by default since v0.17.0 (session-init.js `quietHooks`; opt in
+                // with CODE_GRAPH_VERBOSE_HOOKS=1, and even then only for adopted
+                // projects), and the shipped detail doc says so in as many words,
+                // so the two steering surfaces contradicted each other (audit
+                // 2026-08-29 DOC-01). Stated as a positive cue rather than a
+                // "don't call this unless…" — negative steering measured 20pp
+                // WORSE in this repo's own routing bench.
+                description: "Architecture map (modules / deps / hot fns; include_centrality=chokepoints). Replaces Glob+Read of N top-level files. Use when orienting in an unfamiliar repo or after a major refactor.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
