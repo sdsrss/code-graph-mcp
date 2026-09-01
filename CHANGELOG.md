@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.128.0 (2026-09-01)
 
 Eighteen items from the 2026-08-29 audit: the two that made the index diverge
 from a rebuild or grow without bound, two answers that were wrong rather than
@@ -8,7 +8,18 @@ terse (a source window cut at pre-edit offsets, and a compact map with no URLs i
 it), a benchmark that had reported success for a month without measuring
 anything, the guard holes that let those classes come back, and a batch of
 hook-latency, determinism and diagnosis fixes. Other items from that report
-remain open. Old indexes rebuild once on first use (INDEX_VERSION 69 → 70).
+remain open.
+
+Minor bump rather than patch: three surfaces change behavior by default.
+
+**What you may have to do:**
+
+| Change | Action |
+|---|---|
+| INDEX_VERSION 69 → 70 | Nothing — every index rebuilds once, automatically, on first use. |
+| `get_ast_node(node_id)` / `show --node-id` now re-index the node's file before answering, and may return a **different `node_id`** for the same symbol | Only if you cache node_ids across edits: read `node_id` back off each response (`node_id_renumbered: true` marks the ones that moved) rather than reusing the one you sent. To keep the old behavior — pre-edit line numbers, no re-index — pass `skip_indexing: true`. |
+| compact `project_map` gained `entry_points.route`, `module_dependencies.imports` and, when the list is cut, `hot_functions_truncated` / `hot_functions_total` | Nothing — additive fields. Compact is ~931 B larger on this repo (8799 → 9730 B against an 11197 B full map). |
+| The `Routing Bench` workflow now **fails** on schedule and release tags when `OPENROUTER_API_KEY` is missing | Nothing on a fork — the gate is scoped to the upstream repo, so a fork without the secret keeps its benign no-op. On a fork of the *workflow*, either set the secret or drop the `GITHUB_REPOSITORY` arm. |
 
 ### A file appearing or vanishing left every file that depends on it stale
 
