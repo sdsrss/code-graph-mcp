@@ -18,7 +18,7 @@
 //! - 2c sweep: drain `pending_unresolved_calls` against the new node state.
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -649,6 +649,143 @@ fn buffer_inbound_before_node_purge(
     }
 
     Ok((buffered, requeued))
+}
+
+/// File stems that a module specifier could name when it refers to this path.
+///
+/// `src/util.ts` is spoken as `util`; `src/util/index.ts`, `pkg/__init__.py` and
+/// `foo/mod.rs` are spoken as the DIRECTORY they index, so those three stems
+/// contribute their parent's name as well.
+pub(super) fn module_stems_of(rel_path: &str) -> Vec<String> {
+    const DIRECTORY_INDEX_STEMS: [&str; 3] = ["index", "__init__", "mod"];
+    let p = Path::new(rel_path);
+    let mut out = Vec::new();
+    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+        if !stem.is_empty() {
+            out.push(stem.to_string());
+            if DIRECTORY_INDEX_STEMS.contains(&stem) {
+                if let Some(dir) = p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                {
+                    out.push(dir.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Could an `<external>` sentinel's specifier name refer to a file with `stem`?
+///
+/// Deliberately over-inclusive: a false positive costs one re-extraction of a
+/// file whose relations come out identical, while a false negative leaves the
+/// stale sentinel in place — which is the defect. So all three spellings a
+/// specifier reaches a stem by are accepted: bare (`util`), path-segment
+/// (`./util`, `@scope/util`, with or without an extension), and dotted-module
+/// (`pkg.util`).
+pub(super) fn sentinel_name_matches_stem(name: &str, stem: &str) -> bool {
+    if stem.is_empty() || name.is_empty() {
+        return false;
+    }
+    let seg = name.rsplit('/').next().unwrap_or(name);
+    let seg_no_ext = seg.rsplit_once('.').map(|(head, _)| head).unwrap_or(seg);
+    let dotted_last = name.rsplit('.').next().unwrap_or(name);
+    seg == stem || seg_no_ext == stem || dotted_last == stem
+}
+
+/// Files this run must re-extract because a file they depend on just appeared or
+/// vanished. See the Phase 0-pre block in [`index_files`] for why re-extraction,
+/// and not edge re-resolution, is the mechanism.
+///
+/// Two directions, each with an exact-or-over-inclusive lookup:
+/// - VANISHED: the structural dependents of a deleted path are exact — they are
+///   the edge sources pointing into it, the same rows Phase 0 would requeue.
+/// - APPEARED: a file NEW to the index may satisfy a specifier that failed to
+///   resolve earlier, and the record of that failure is an `<external>` sentinel.
+///   Candidates are its importers whose specifier could name the new file's stem.
+///
+/// Files already in this run's set (they are being re-extracted anyway) and files
+/// being deleted (their nodes are going away) are never added.
+fn existence_change_dependents(
+    db: &Database,
+    files: &[String],
+    delete_paths: &[String],
+) -> Result<Vec<String>> {
+    let in_run: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+    let deleting: HashSet<&str> = delete_paths.iter().map(|s| s.as_str()).collect();
+    let mut extra: BTreeSet<String> = BTreeSet::new();
+
+    for path in delete_paths {
+        for dep in crate::storage::queries::get_structural_dependent_files(db.conn(), path)? {
+            if !in_run.contains(dep.as_str()) && !deleting.contains(dep.as_str()) {
+                extra.insert(dep);
+            }
+        }
+    }
+
+    let new_stems = appearing_file_stems(db, files)?;
+    if !new_stems.is_empty() {
+        for (specifier, importer) in
+            crate::storage::queries::get_external_sentinel_importers(db.conn())?
+        {
+            if in_run.contains(importer.as_str())
+                || deleting.contains(importer.as_str())
+                || extra.contains(&importer)
+            {
+                continue;
+            }
+            if new_stems
+                .iter()
+                .any(|stem| sentinel_name_matches_stem(&specifier, stem))
+            {
+                extra.insert(importer);
+            }
+        }
+    }
+
+    Ok(extra.into_iter().collect())
+}
+
+/// Module stems of the files in this run that the index has never seen.
+///
+/// Empty — skipping the sentinel scan entirely — whenever the index holds no
+/// `<external>` sentinel at all, which is every full index of a fresh database
+/// and every run on a project with no unresolved imports. Re-indexing a file the
+/// index ALREADY knows cannot revive anything: whatever its importers could not
+/// resolve, they still cannot, because the file was there all along.
+fn appearing_file_stems(db: &Database, files: &[String]) -> Result<Vec<String>> {
+    let has_sentinel: i64 = db.conn().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM nodes
+             WHERE file_id = (SELECT id FROM files WHERE path = ?1)
+         )",
+        [crate::domain::EXTERNAL_FILE_PATH],
+        |row| row.get(0),
+    )?;
+    if has_sentinel == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Probed per path against `files.path`'s UNIQUE index rather than read as one
+    // `SELECT path FROM files`. `ensure_file_indexed` reaches here on every query
+    // that touches an edited file, with `files` holding exactly ONE path — the
+    // whole-table read would make that hot path pay a scan proportional to the
+    // repo (2,385 rows here) to answer a single-row question.
+    let mut known = db
+        .conn()
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut stems: Vec<String> = Vec::new();
+    for f in files {
+        let already_indexed = known.exists([f.as_str()])?;
+        if !already_indexed {
+            stems.extend(module_stems_of(f));
+        }
+    }
+    stems.sort_unstable();
+    stems.dedup();
+    Ok(stems)
 }
 
 /// Lightweight post-batch record — no Tree or source string.
@@ -1574,6 +1711,46 @@ pub(super) fn index_files(
         v
     };
     let delete_paths = delete_paths.as_slice();
+
+    // Phase 0-pre: a file's EXISTENCE changing invalidates the files that depend
+    // on it, so pull them into this run's work set and let extraction re-derive
+    // their relations (audit 2026-08-29 PIPE-02).
+    //
+    // Everything else in this pipeline recovers a lost edge by re-RESOLVING the
+    // surviving edge row: Phase 0 buffers the target's NAME and the deferred pass
+    // or the pending sweep binds it again. That is faithful for `calls`, whose
+    // buffer keeps the caller's intent (name + language + receiver metadata). It
+    // is NOT faithful for imports, because an import's identity is a SPECIFIER,
+    // and the edge row no longer holds one — only the resolved target node. For
+    // Python `from a import target`, deleting `a.py` therefore produced an
+    // `<external>` sentinel named `target` while a rebuild of the same tree
+    // produces one named `a`, and the module-level edge (target name `<module>`,
+    // which resolves to nothing) vanished outright. Restoring `a.py` then healed
+    // neither, because only a file whose CONTENT changed re-emits its imports —
+    // and the stale sentinel went on to satisfy `prune_import_contradicted_call_edges`,
+    // which deleted the call edge the pending sweep had just recovered. Every
+    // later run replayed that prune, so `deps`/`impact`/`callgraph` answered from
+    // a graph that diverged from a rebuild permanently and self-reinforcingly.
+    //
+    // Re-extraction is the only mechanism that reproduces extraction's own shape,
+    // and it is correct in BOTH directions (the vanished state and the restored
+    // one) because it is the same code path a full rebuild runs.
+    let files: Vec<String> = {
+        let extra = existence_change_dependents(db, &files, delete_paths)?;
+        if extra.is_empty() {
+            files
+        } else {
+            tracing::info!(
+                "[index] Phase 0-pre: re-extracting {} file(s) whose dependencies appeared or vanished",
+                extra.len()
+            );
+            let mut v = files;
+            v.extend(extra);
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+    };
 
     // Every file THIS RUN will (re)index — `restore_inbound_edges` and Phase 0
     // both consult it: a requeue whose source file is in here must NOT happen,

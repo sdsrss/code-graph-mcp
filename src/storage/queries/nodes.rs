@@ -300,6 +300,75 @@ pub fn get_inbound_relations_for_requeue(
         .collect()
 }
 
+/// Distinct source-file paths holding a non-`calls` relation INTO the given
+/// file — its structural dependents (importers, subclasses, route sources).
+///
+/// The set `index_files` must re-extract when that file's EXISTENCE changes.
+/// [`get_inbound_relations_for_requeue`] re-resolves those same edges by the
+/// TARGET NODE's name, which is a lossy stand-in for what extraction would
+/// produce: for Python `from a import target`, a rebuild of the tree without
+/// `a.py` mints one `<external>` sentinel named after the SPECIFIER (`a`,
+/// `external_module`), while the requeue mints one named after the imported
+/// SYMBOL (`target`) and drops the module-level edge entirely, whose target
+/// name is the useless `<module>`. Re-extracting the dependent is the only
+/// mechanism that reproduces extraction's own shape, in both the vanished and
+/// the restored state (audit 2026-08-29 PIPE-02).
+///
+/// `calls` is excluded because that direction already has a faithful channel:
+/// `pending_unresolved_calls` buffers the caller's intent (name + language +
+/// receiver metadata) rather than a resolved edge, and the Phase-2c sweep
+/// rebinds it when the callee returns.
+pub fn get_structural_dependent_files(conn: &Connection, path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT fs.path
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files ft ON ft.id = nt.file_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE ft.path = ?1
+           AND fs.path <> ?1
+           AND e.relation <> 'calls'
+           AND fs.language IS NOT NULL
+         ORDER BY fs.path",
+    )?;
+    let rows = stmt.query_map([path], |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Every `(sentinel name, importing file)` pair currently bound to an
+/// `<external>` sentinel by a non-`calls` relation.
+///
+/// The candidate pool for the OTHER half of the existence-change sweep: when a
+/// file appears, the files that could not resolve a specifier before are the
+/// ones whose extraction may now bind it to a real node. Matching the specifier
+/// against the new file happens in Rust (`sentinel_name_matches_stem`) rather
+/// than in SQL — the names are module specifiers (`./util`, `pkg.util`,
+/// `@scope/util`) and a LIKE/GLOB pattern built from a file stem would need
+/// metacharacter escaping to stay correct on a stem containing `*`, `[` or `_`.
+///
+/// Cardinality is one row per (specifier, importer) pair, i.e. proportional to
+/// unresolved import statements: 989 rows on this 2,385-file repo. The caller
+/// runs it only when a run actually introduces a file new to the index.
+pub fn get_external_sentinel_importers(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT nt.name, fs.path
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files ft ON ft.id = nt.file_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE ft.path = ?1
+           AND e.relation <> 'calls'
+           AND fs.language IS NOT NULL
+         ORDER BY nt.name, fs.path",
+    )?;
+    let rows = stmt.query_map([crate::domain::EXTERNAL_FILE_PATH], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
 /// Delete `<external>` sentinel nodes that no edge touches any more.
 ///
 /// Sentinels are minted as edge TARGETS only, but pruning

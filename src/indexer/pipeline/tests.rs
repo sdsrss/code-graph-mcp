@@ -1,3 +1,4 @@
+use super::index_files::{module_stems_of, sentinel_name_matches_stem};
 use super::python_modules::build_python_module_map;
 use super::*;
 use crate::domain::REL_CALLS;
@@ -1492,6 +1493,180 @@ fn test_phase2c_restore_binds_only_original_target_file() {
         count_caller_to("src/other.ts"),
         0,
         "restore must NOT bind caller → other.ts:target (cross-file fan-out a rebuild never makes)"
+    );
+}
+
+/// Every edge in the index, spelled `src.name --relation--> dst.name`, sorted.
+/// The whole-graph comparison the PIPE-02 acceptance criterion is written in:
+/// "terminal edge set identical, line by line, to a fresh rebuild".
+fn edge_set(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT fs.path || '.' || ns.name || ' --' || e.relation || '--> ' \
+                 || ft.path || '.' || nt.name \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// Index `files` into a brand-new database — the control every differential in
+/// this pair compares against.
+fn fresh_index_of(files: &[(&str, &str)]) -> (TempDir, TempDir, Database) {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    for (name, body) in files {
+        fs::write(project_dir.path().join(name), body).unwrap();
+    }
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    (project_dir, db_dir, db)
+}
+
+const PIPE02_A_PY: &str = "def target():\n    return 1\n";
+const PIPE02_B_PY: &str = "from a import target\n\n\ndef caller():\n    return target()\n";
+
+/// PIPE-02 (audit 2026-08-29): deleting a file and restoring it must leave the
+/// index where a rebuild of the same tree would.
+///
+/// Both states are asserted, because both were wrong and in OPPOSITE directions.
+/// The recovery channel for a deleted file's inbound relations re-resolves them
+/// by the TARGET NODE's name, and an import's identity is its SPECIFIER:
+///   - vanished state: the requeue minted an `<external>` sentinel named after
+///     the imported SYMBOL (`target`), where extraction mints one named after the
+///     specifier (`a`), and dropped the module-level edge outright (its target
+///     name is `<module>`, which resolves to nothing);
+///   - restored state: nothing re-emitted b.py's imports, because only a file
+///     whose CONTENT changed does — and the stale sentinel then satisfied
+///     `prune_import_contradicted_call_edges`, deleting the call edge the pending
+///     sweep had just recovered. Every later run replayed the prune.
+///
+/// A single terminal assert would pass on a fix that repointed the sentinel while
+/// leaving the vanished state wrong, so the intermediate control is not optional.
+#[test]
+fn test_delete_then_restore_converges_with_fresh_rebuild() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let write_a = || fs::write(project_dir.path().join("a.py"), PIPE02_A_PY).unwrap();
+    fs::write(project_dir.path().join("b.py"), PIPE02_B_PY).unwrap();
+    write_a();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(
+        edge_set(&db)
+            .iter()
+            .any(|e| e == "b.py.caller --calls--> a.py.target"),
+        "precondition: the call edge exists before the delete"
+    );
+
+    // --- vanished state ---
+    fs::remove_file(project_dir.path().join("a.py")).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    let (_pd, _dd, control_without_a) = fresh_index_of(&[("b.py", PIPE02_B_PY)]);
+    assert_eq!(
+        edge_set(&db),
+        edge_set(&control_without_a),
+        "after deleting a.py the edge set must equal a fresh index of the a-less tree"
+    );
+
+    // --- restored state ---
+    write_a();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    let (_pd2, _dd2, control_with_a) =
+        fresh_index_of(&[("a.py", PIPE02_A_PY), ("b.py", PIPE02_B_PY)]);
+    assert_eq!(
+        edge_set(&db),
+        edge_set(&control_with_a),
+        "after restoring a.py the edge set must equal a fresh rebuild of the same tree"
+    );
+    assert!(
+        edge_set(&db)
+            .iter()
+            .any(|e| e == "b.py.caller --calls--> a.py.target"),
+        "the call edge must be back — it is what impact/callgraph answer from"
+    );
+}
+
+/// The other half of the same sweep: a file the index has NEVER seen, appearing
+/// next to an importer that could not resolve it. No deletion is involved, so
+/// nothing buffers or requeues anything — the only record that the specifier
+/// failed to resolve is the `<external>` sentinel, and the sweep has to read it.
+#[test]
+fn test_newly_added_file_revives_its_importers_stale_sentinel() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    fs::write(project_dir.path().join("b.py"), PIPE02_B_PY).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(
+        edge_set(&db)
+            .iter()
+            .any(|e| e.contains("--imports--> <external>.a")),
+        "precondition: b.py's import of the missing module is an <external> sentinel"
+    );
+
+    fs::write(project_dir.path().join("a.py"), PIPE02_A_PY).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let (_pd, _dd, control) = fresh_index_of(&[("a.py", PIPE02_A_PY), ("b.py", PIPE02_B_PY)]);
+    assert_eq!(
+        edge_set(&db),
+        edge_set(&control),
+        "adding a.py must re-extract b.py, whose specifier now resolves"
+    );
+}
+
+#[test]
+fn test_sentinel_name_matches_stem_spellings() {
+    // Every spelling a specifier reaches a file stem by must match...
+    for spelling in [
+        "util",
+        "./util",
+        "../lib/util",
+        "@scope/util",
+        "./util.js",
+        "pkg.util",
+        "a.b.util",
+    ] {
+        assert!(
+            sentinel_name_matches_stem(spelling, "util"),
+            "{spelling} names a file with stem `util`"
+        );
+    }
+    // ...and unrelated names must not, or every added file would drag every
+    // unresolved importer in the project into its run.
+    for spelling in ["utils", "util_helper", "./other", "pkg.other", ""] {
+        assert!(
+            !sentinel_name_matches_stem(spelling, "util"),
+            "{spelling} does not name a file with stem `util`"
+        );
+    }
+    assert!(
+        !sentinel_name_matches_stem("util", ""),
+        "an empty stem must never match — it would match everything"
+    );
+}
+
+#[test]
+fn test_module_stems_of_directory_indexes() {
+    assert_eq!(module_stems_of("src/util.ts"), vec!["util".to_string()]);
+    // A directory index is spoken as the DIRECTORY, so both names count.
+    assert_eq!(
+        module_stems_of("src/util/index.ts"),
+        vec!["index".to_string(), "util".to_string()]
+    );
+    assert_eq!(
+        module_stems_of("pkg/__init__.py"),
+        vec!["__init__".to_string(), "pkg".to_string()]
+    );
+    assert_eq!(
+        module_stems_of("src/foo/mod.rs"),
+        vec!["mod".to_string(), "foo".to_string()]
     );
 }
 
