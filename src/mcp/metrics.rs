@@ -35,6 +35,16 @@ pub enum ErrKind {
 impl ErrKind {
     /// Classify an error message via substring match on known error phrases.
     /// Match order matters: FK check first (most specific), then grace, etc.
+    ///
+    /// EVERY PHRASE BELOW MUST BE MULTI-WORD. That is a load-bearing premise, not
+    /// a coincidence: these messages echo caller-supplied values, so a phrase a
+    /// caller could spell in a single token would let it pick its own telemetry
+    /// bucket. `describe_arg` bounds the echo to one whitespace-delimited token,
+    /// which closes the hole only for as long as no single-word phrase exists
+    /// here. Adding `"timeout"` or `"ambiguous"` would silently re-open it —
+    /// `every_classify_phrase_is_multi_word` fails the moment you do, rather than
+    /// at the next audit. (Reordering these arms is NOT an alternative fix: it
+    /// relocates which side is exposed, it does not close anything.)
     pub fn classify(err_msg: &str) -> Self {
         if err_msg.contains("FOREIGN KEY constraint failed") {
             Self::FkConstraint
@@ -414,6 +424,55 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::TempDir;
+
+    /// The premise `describe_arg`'s bounded echo rests on (pre-tag review of
+    /// v0.129.0, then a reviewer's follow-up: "every phrase is multi-word" is a
+    /// PREMISE, not an incidental property).
+    ///
+    /// Error text echoes caller-supplied values; the echo is bounded to one
+    /// whitespace-delimited token; therefore no caller can spell a classify
+    /// phrase from a value position — but only while every phrase needs a space.
+    /// A future single-word phrase re-opens the injection silently, and the
+    /// behavioural guard over in `server/mod.rs` would keep passing, because it
+    /// asserts the phrases that exist rather than the invariant protecting them.
+    ///
+    /// Reads the phrases out of `classify`'s own source rather than restating
+    /// them: a copy here would go stale exactly when a phrase is added, which is
+    /// the one moment this needs to fire. The floor makes an empty scan fail.
+    #[test]
+    fn every_classify_phrase_is_multi_word() {
+        let src = include_str!("metrics.rs");
+        let body = src
+            .split_once("pub fn classify(err_msg: &str) -> Self {")
+            .expect("classify's signature moved — re-point this guard, do not delete it")
+            .1
+            .split_once("\n    }\n")
+            .expect("could not find the end of classify")
+            .0;
+
+        let phrases: Vec<&str> = body
+            .match_indices("err_msg.contains(\"")
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                &rest[..rest.find('"').expect("unterminated phrase literal")]
+            })
+            .collect();
+
+        assert!(
+            phrases.len() >= 12,
+            "parsed only {} phrase(s) from classify — the guard would be vacuous",
+            phrases.len()
+        );
+
+        let single_word: Vec<&&str> = phrases.iter().filter(|p| !p.contains(' ')).collect();
+        assert!(
+            single_word.is_empty(),
+            "these classify phrases are a single token: {single_word:?}. Error messages echo \
+             caller-supplied values, so a one-token phrase lets a caller choose its own \
+             telemetry bucket. Either give the phrase a space, or stop echoing values into \
+             the message it matches — do NOT reorder the arms, which only moves the hole."
+        );
+    }
 
     /// `usage.jsonl` sits in `.code-graph/` next to `recommendations.jsonl` and
     /// is written with the same `OpenOptions::append` shape, so it carries the
