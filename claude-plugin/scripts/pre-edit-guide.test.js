@@ -211,19 +211,53 @@ test('pattern-sync: the suite runs the hook\'s own patterns, not a copy', () => 
 // window would have hidden it. Post-fix on that box the curve is linear —
 // 10 KB 2.4 ms, 100 KB 21.9 ms, 400 KB 87.4 ms — while the hook's real cost for
 // the same 400 KB input is 1.81 ms, because it only ever matches the window.
-// The threshold sits above the linear number and three orders of magnitude below
-// the quadratic one: anything in between means a bound was dropped.
+//
+// The assertion is the RATIO, not a millisecond count. It was `ms < 250`, a
+// threshold read off the 87.4 ms linear number on a 24-core dev box; the first
+// 2-core CI runner to execute it did the same linear work in 269.7 ms and went
+// red. An absolute budget calibrated on fast hardware is a machine-speed
+// assertion wearing a complexity assertion's name — and the name is the one that
+// is actually testable here. Quadrupling the input costs ~4x when the bounds
+// hold and ~17x when they do not, so the ratio separates them by 4x on ANY box,
+// while the loose absolute ceiling stays only as a backstop for a machine so slow
+// the ratio itself gets noisy.
+//
+// Mutation-verified 2026-09-01 by restoring the three pre-fix patterns (the JS
+// arrow, JS method and Java/C# arms, uncapped): 100 KB 2689.5 ms -> 400 KB
+// 45532.4 ms, growth 16.9x, red. Capped, the same run is 22.1 ms -> 88.1 ms,
+// growth 4.0x. Restoring the Java/C# arm ALONE stays linear (1.9 ms -> 7.4 ms,
+// 4.0x) and correctly does not fire — the backtracking driver is the two JS
+// arms, not that one.
+const REDOS_GROWTH_LIMIT = 8; // linear 4.0x, quadratic 16.9x — sits between them
+const REDOS_ABSOLUTE_CEILING_MS = 5000; // 57x the linear number, 9x below quadratic
 test('SEC-04: bracket-free word-dense input matches in linear time', () => {
+  const timeAt = (build, bytes) => {
+    const input = build(bytes);
+    const t0 = process.hrtime.bigint();
+    for (const pat of fnPatterns) input.match(pat);
+    return Number(process.hrtime.bigint() - t0) / 1e6;
+  };
   for (const build of [
     (n) => 'a'.repeat(n),                        // one unbroken \w run
     (n) => 'foo_bar_baz_'.repeat(Math.ceil(n / 12)).slice(0, n), // underscore-dense
     (n) => 'public static void '.repeat(Math.ceil(n / 19)).slice(0, n), // feeds the \S+ pattern
   ]) {
-    const input = build(400 * 1024);
-    const t0 = process.hrtime.bigint();
-    for (const pat of fnPatterns) input.match(pat);
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    assert.ok(ms < 250, `400 KB of word-dense input took ${ms.toFixed(1)}ms across all patterns`);
+    timeAt(build, 32 * 1024); // warm-up: don't bill regex compilation to the small sample
+    const small = timeAt(build, 100 * 1024);
+    const large = timeAt(build, 400 * 1024);
+    // Floor the divisor: a sub-millisecond `small` would inflate the ratio, and
+    // it can only be sub-millisecond when the bounds ARE holding (the quadratic
+    // case takes seconds at 100 KB).
+    const growth = large / Math.max(small, 1);
+    assert.ok(
+      growth < REDOS_GROWTH_LIMIT,
+      `4x the input cost ${growth.toFixed(1)}x the time (100 KB ${small.toFixed(1)}ms -> ` +
+        `400 KB ${large.toFixed(1)}ms); linear is ~4x, quadratic backtracking ~15x`
+    );
+    assert.ok(
+      large < REDOS_ABSOLUTE_CEILING_MS,
+      `400 KB of word-dense input took ${large.toFixed(1)}ms across all patterns`
+    );
   }
 });
 
