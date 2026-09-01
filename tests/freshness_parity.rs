@@ -1019,6 +1019,87 @@ fn compact_project_map_omits_truncation_flag_when_nothing_was_cut() {
 }
 
 // ---------------------------------------------------------------------------
+// CON-10: `get_ast_node(node_id)` slices LIVE file bytes at INDEXED line numbers.
+//
+// The node_id branch returns before any refresh — the source comment reasoned
+// that a node_id lookup "has no path to refresh against", but the row it just
+// read carries the path. With `context_lines` defaulting to 3 on this branch,
+// `read_source_context` then opens the CURRENT file and takes a window at the
+// PRE-EDIT offsets, so inserting lines above the symbol silently returns a
+// window of unrelated code labelled as that symbol's source.
+// ---------------------------------------------------------------------------
+
+/// The MCP runtime proof lives in `src/mcp/server/mod.rs` next to the other
+/// FRS-2 tests, not here: it needs `close_other_freshness_paths` to shut the
+/// no-watcher debounce, and integration tests cannot reach `server.timing`.
+/// Written here first, it passed vacuously — `TimingConfig::for_tests` sets that
+/// debounce to ZERO, so every `ensure_indexed()` ran a full merkle pass and
+/// refreshed the file through a path production does not take.
+///
+/// Same defect, same mechanism, on the CLI leg: `show --node-id` skips the
+/// resync that `show <symbol>` performs, because the resync sits in the ELSE
+/// branch. The existing `cli_line_number_commands_call_refresh` guard reads
+/// `cmd_show` as covered — a per-function "does it call refresh" scan cannot see
+/// that one of two branches returns before reaching the call.
+/// The `--node-id` arm of `cmd_show`, as source text.
+fn cmd_show_node_id_branch(src: &str) -> &str {
+    let region = fn_region(src, "cmd_show");
+    let i = region
+        .find("if let Some(nid) = node_id_arg {")
+        .expect("`cmd_show` no longer has an `if let Some(nid) = node_id_arg` branch");
+    let rest = &region[i..];
+    let end = rest
+        .find("    } else {")
+        .expect("`cmd_show`'s node_id branch no longer ends at the `else` — repoint the guard");
+    &rest[..end]
+}
+
+#[test]
+fn cli_show_by_node_id_refreshes_like_show_by_symbol() {
+    let src = fs::read_to_string("src/cli/commands/show.rs").expect("read show.rs");
+    let branch = cmd_show_node_id_branch(&src);
+    assert!(
+        branch.contains("refresh_files_if_stale("),
+        "`cmd_show`'s --node-id branch returns its node without a resync, while the symbol \
+         branch resyncs. `show` prints start_line/end_line and slices live file bytes at those \
+         offsets, so the branch that skips the refresh answers with a window cut at pre-edit \
+         coordinates. Branch source was:\n{branch}"
+    );
+    assert!(
+        branch.contains("reresolve_node_by_identity("),
+        "the --node-id branch resyncs but then keeps resolving by id. `nodes.id` is a rowid \
+         alias with no AUTOINCREMENT, so a re-index reuses freed ids and the caller's id can \
+         come back attached to a DIFFERENT symbol — re-resolve by identity. Branch source \
+         was:\n{branch}"
+    );
+}
+
+/// Permanent negative control. Both halves are mutated: a guard that only
+/// checked for the resync would go green again the moment someone "simplified"
+/// the identity re-resolution back into a lookup by id, which is the half that
+/// silently answers about the wrong symbol.
+#[test]
+fn cli_show_node_id_guard_detects_a_branch_that_skips_either_half() {
+    let src = fs::read_to_string("src/cli/commands/show.rs").expect("read show.rs");
+    for cut in ["refresh_files_if_stale(", "reresolve_node_by_identity("] {
+        // Rename only inside the node_id branch, so the symbol branch's own
+        // `refresh_files_if_stale` call cannot mask the mutation.
+        let branch = cmd_show_node_id_branch(&src);
+        assert!(
+            branch.contains(cut),
+            "negative control cut `{cut}` is not in the branch — the control is inert"
+        );
+        let broken_branch = branch.replace(cut, "mutated_away(");
+        let broken = src.replace(branch, &broken_branch);
+        assert!(
+            !cmd_show_node_id_branch(&broken).contains(cut),
+            "negative control failed: after mutating `{cut}` the branch scan still finds it, \
+             so the guard would stay green on a real regression"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 3 drift-guard: CLI + MCP query-time freshness resync coverage.
 // ---------------------------------------------------------------------------
 

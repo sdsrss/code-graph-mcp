@@ -23,6 +23,38 @@ pub enum Surface {
     Mcp,
 }
 
+/// Re-find a node by IDENTITY after a re-index may have renumbered ids (CON-10).
+///
+/// `nodes.id` is a bare `INTEGER PRIMARY KEY`: a rowid alias with no
+/// AUTOINCREMENT. An incremental re-index deletes and re-inserts the file's rows,
+/// and SQLite then hands out `max(rowid)+1` — so ids freed by the delete are
+/// REUSED, and a node_id held across a refresh can come back attached to a
+/// DIFFERENT symbol in the same file. Any caller holding a node_id over a
+/// refresh must therefore re-resolve the way this does, never by id.
+///
+/// Identity is (file_path, type, qualified_name-or-name). The qualified name is
+/// what keeps two same-named methods in one file from swapping places; `name` is
+/// still the lookup key because that is what the index is keyed on.
+///
+/// Both surfaces share this so the CLI's `show --node-id` and MCP's
+/// `get_ast_node(node_id)` cannot disagree about which symbol an id survived as.
+pub fn reresolve_node_by_identity(
+    conn: &Connection,
+    file_path: &str,
+    name: &str,
+    qualified_name: Option<&str>,
+    node_type: &str,
+) -> Result<Option<queries::NodeWithFile>> {
+    let wanted = qualified_name.unwrap_or(name);
+    Ok(queries::get_nodes_with_files_by_name(conn, name)?
+        .into_iter()
+        .find(|c| {
+            c.file_path == file_path
+                && c.node.node_type == node_type
+                && c.node.qualified_name.as_deref().unwrap_or(&c.node.name) == wanted
+        }))
+}
+
 /// Detect whether a bare symbol `name` resolves to ≥2 non-test definitions.
 /// Returns the candidate definitions when ambiguous (same-file OR cross-file),
 /// `None` when unique or not found.

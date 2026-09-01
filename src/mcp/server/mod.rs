@@ -4603,6 +4603,200 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// CON-10. `get_ast_node(node_id)` is the one read surface that returns a
+    /// source WINDOW cut from the live file — `read_source_context` opens the
+    /// current bytes and takes `start_line - context .. end_line + context` — and
+    /// it took those offsets from a possibly pre-edit index row. It reached
+    /// neither freshness mechanism: `ensure_file_fresh_opt` fires only on the
+    /// `file_path` branch (the source comment reasoned a node_id lookup "has no
+    /// path to refresh against", though the row it reads carries the path), and
+    /// `get_ast_node` was absent from `RESULT_REFRESH_TOOLS`.
+    ///
+    /// So an insertion above the symbol returned a window of unrelated code
+    /// labelled as that symbol's source, at the branch's default context_lines=3.
+    /// Silent: the fallback to the stored `code_content` only triggers when the
+    /// file cannot be read at all, and a shifted file reads fine.
+    #[test]
+    fn test_get_ast_node_by_id_refreshes_before_slicing_live_bytes() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(
+            &file,
+            "fn con10_alpha() -> i32 { 1 }\nfn con10_target() -> i32 { con10_alpha() }\n",
+        )
+        .unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({ "symbol_name": "con10_target", "file_path": "a.rs" }),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let by_name: serde_json::Value = serde_json::from_str(text).unwrap();
+        let node_id = by_name["node_id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no node_id in {by_name}"));
+        assert_eq!(
+            by_name["start_line"].as_i64(),
+            Some(2),
+            "precondition: indexed at line 2"
+        );
+
+        close_other_freshness_paths(&mut server);
+        // Ten lines inserted ABOVE the symbol — the ordinary "add a helper, then
+        // ask about the function below it" sequence.
+        let body = std::fs::read_to_string(&file).unwrap();
+        let pad: String = (0..10).map(|i| format!("// pad {i}\n")).collect();
+        std::fs::write(&file, format!("{pad}{body}")).unwrap();
+
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({ "node_id": node_id, "context_lines": 3 }),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let by_id: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        let code = by_id["code_content"].as_str().unwrap_or("");
+        assert!(
+            code.contains("con10_target"),
+            "the returned source window does not contain the symbol it claims to describe — it \
+             was cut from the CURRENT file at PRE-EDIT offsets. code_content was:\n{code}\n\
+             full response: {by_id}"
+        );
+        assert_eq!(
+            by_id["start_line"].as_i64(),
+            Some(12),
+            "start_line must reflect the edited file (symbol moved down 10 lines): {by_id}"
+        );
+    }
+
+    /// Helper: one `get_ast_node` call, parsed.
+    fn ast_node_call(server: &McpServer, args: serde_json::Value) -> serde_json::Value {
+        let resp = server
+            .handle_message(&tool_call_json("get_ast_node", args))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The refresh renumbers the file's nodes, so the id the caller passed is
+    /// dead. Saying nothing would leave them holding an id that may already name
+    /// a different symbol.
+    #[test]
+    fn test_get_ast_node_by_id_discloses_that_the_id_was_renumbered() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(&file, "fn con10_disclose() -> i32 { 7 }\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let by_name = ast_node_call(
+            &server,
+            json!({ "symbol_name": "con10_disclose", "file_path": "a.rs" }),
+        );
+        let node_id = by_name["node_id"].as_i64().unwrap();
+
+        close_other_freshness_paths(&mut server);
+        std::fs::write(&file, "\n\n\nfn con10_disclose() -> i32 { 7 }\n").unwrap();
+
+        let out = ast_node_call(&server, json!({ "node_id": node_id }));
+        assert_eq!(
+            out["node_id_renumbered"],
+            json!(true),
+            "a refresh that renumbered the file's nodes must say so: {out}"
+        );
+        assert_eq!(
+            out["start_line"].as_i64(),
+            Some(4),
+            "and the answer itself must be the post-edit one: {out}"
+        );
+    }
+
+    /// The reason re-resolution goes by IDENTITY and not by id. `nodes.id` is a
+    /// rowid alias with no AUTOINCREMENT, so ids freed by the re-index's delete
+    /// are handed back out — a stale id can land on a different symbol in the
+    /// same file. Asking for a symbol the edit DELETED must report it gone, not
+    /// silently answer about whatever now holds that id.
+    #[test]
+    fn test_get_ast_node_by_id_never_answers_about_a_different_symbol() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(
+            &file,
+            "fn con10_removed() -> i32 { 1 }\nfn con10_kept() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let removed_id = ast_node_call(
+            &server,
+            json!({ "symbol_name": "con10_removed", "file_path": "a.rs" }),
+        )["node_id"]
+            .as_i64()
+            .unwrap();
+
+        close_other_freshness_paths(&mut server);
+        // The edit deletes the symbol the caller is holding an id for.
+        std::fs::write(&file, "fn con10_kept() -> i32 { 2 }\n").unwrap();
+
+        let out = ast_node_call(&server, json!({ "node_id": removed_id }));
+        assert_ne!(
+            out["name"],
+            json!("con10_kept"),
+            "answered about a DIFFERENT symbol than the node_id named — this is the rowid-reuse \
+             hazard that identity re-resolution exists to prevent: {out}"
+        );
+        assert_eq!(
+            out["error"],
+            json!("Symbol no longer present after refresh"),
+            "a deleted symbol must be reported gone, with the name it had: {out}"
+        );
+        assert_eq!(out["name"], json!("con10_removed"), "{out}");
+    }
+
+    /// CON-01's gate still binds on this branch: `skip_indexing` means no write
+    /// handle and no resync, so the caller knowingly gets the pre-edit row.
+    #[test]
+    fn test_get_ast_node_by_id_honors_skip_indexing() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(&file, "fn con10_skip() -> i32 { 3 }\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let node_id = ast_node_call(
+            &server,
+            json!({ "symbol_name": "con10_skip", "file_path": "a.rs" }),
+        )["node_id"]
+            .as_i64()
+            .unwrap();
+
+        close_other_freshness_paths(&mut server);
+        std::fs::write(&file, "\n\n\nfn con10_skip() -> i32 { 3 }\n").unwrap();
+
+        let out = ast_node_call(
+            &server,
+            json!({ "node_id": node_id, "skip_indexing": true }),
+        );
+        assert_eq!(
+            out["start_line"].as_i64(),
+            Some(1),
+            "skip_indexing must suppress the refresh, leaving the pre-edit row: {out}"
+        );
+        assert!(
+            out.get("node_id_renumbered").is_none(),
+            "nothing was re-indexed, so nothing was renumbered: {out}"
+        );
+    }
+
     /// Audit 2026-08-22 P2-11. `get_call_graph` and `find_references` DO accept
     /// a `file_path`, so they looked covered by `ensure_file_fresh_opt` — but
     /// that argument is an optional disambiguator and the ordinary call passes a

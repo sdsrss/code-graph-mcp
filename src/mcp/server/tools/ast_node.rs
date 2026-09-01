@@ -5,7 +5,55 @@
 
 use super::super::*;
 
+/// Outcome of refreshing the file a `node_id` lives in (CON-10).
+pub(in crate::mcp::server) enum NodeIdRefresh {
+    /// Nothing was re-indexed, so the id still names what it named.
+    Unchanged,
+    /// The file was re-indexed; this is the same symbol's new id.
+    Renumbered(i64),
+    /// The file was re-indexed and the symbol is no longer in it.
+    Gone { name: String, file_path: String },
+}
+
 impl McpServer {
+    /// Re-index the file a `node_id` points into, then re-resolve the node BY
+    /// IDENTITY rather than by id.
+    ///
+    /// Re-resolving by id would be the obvious shortcut and is wrong: `nodes.id`
+    /// is a bare `INTEGER PRIMARY KEY`, i.e. a rowid alias with no AUTOINCREMENT,
+    /// and an incremental re-index deletes and re-inserts the file's rows. SQLite
+    /// then hands out `max(rowid)+1`, so ids freed by the delete get REUSED —
+    /// the caller's stale id can come back attached to a different symbol in the
+    /// same file. Identity here is (file_path, qualified_name or name, type),
+    /// which is what the tool's own "re-resolve by symbol_name + file_path" error
+    /// message already tells callers to do by hand.
+    fn refresh_node_file_and_reresolve(&self, node_id: i64) -> Result<NodeIdRefresh> {
+        let Some(nf) = queries::get_node_with_file_by_id(self.db.conn(), node_id)? else {
+            // Unknown id: leave the miss to `ast_node_by_id`, whose error already
+            // explains rebuild-scoped ids and how to re-resolve.
+            return Ok(NodeIdRefresh::Unchanged);
+        };
+        let file_path = nf.file_path;
+        let name = nf.node.name;
+        let qualified = nf.node.qualified_name;
+        let node_type = nf.node.node_type;
+
+        if !self.ensure_file_fresh_reported(Some(&file_path))? {
+            return Ok(NodeIdRefresh::Unchanged);
+        }
+
+        let hit = crate::resolve::reresolve_node_by_identity(
+            self.db.conn(),
+            &file_path,
+            &name,
+            qualified.as_deref(),
+            &node_type,
+        )?;
+        Ok(match hit {
+            Some(c) => NodeIdRefresh::Renumbered(c.node.id),
+            None => NodeIdRefresh::Gone { name, file_path },
+        })
+    }
     pub(in crate::mcp::server) fn tool_get_ast_node(
         &self,
         args: &serde_json::Value,
@@ -39,9 +87,6 @@ impl McpServer {
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
-            // Edit-aware refresh fires only on the file_path branch — node_id
-            // lookups have no path to refresh against, and node_id stability
-            // across reindex isn't guaranteed.
             self.ensure_file_fresh_opt(file_path_arg.as_deref())?;
         }
 
@@ -56,6 +101,33 @@ impl McpServer {
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
+            // CON-10: this branch used to skip the refresh entirely, reasoning
+            // that a node_id lookup "has no path to refresh against" — but the
+            // row it is about to read carries the path. With context_lines
+            // defaulting to 3 HERE and nowhere else, the branch that skipped the
+            // refresh is the one that opens the CURRENT file and cuts a window at
+            // the index's line numbers, so an insertion above the symbol returned
+            // unrelated code under that symbol's name and signature.
+            let (nid, renumbered) = if should_skip_indexing(args) {
+                (nid, false)
+            } else {
+                match self.refresh_node_file_and_reresolve(nid)? {
+                    NodeIdRefresh::Unchanged => (nid, false),
+                    NodeIdRefresh::Renumbered(new_id) => (new_id, true),
+                    NodeIdRefresh::Gone { name, file_path } => {
+                        return Ok(json!({
+                            "error": "Symbol no longer present after refresh",
+                            "node_id": nid,
+                            "name": name,
+                            "file_path": file_path,
+                            "note": "The file changed on disk and was re-indexed before this \
+                                     answer; the symbol this node_id named is not in the new \
+                                     index. Re-resolve with get_ast_node(symbol_name, file_path) \
+                                     or ast_search.",
+                        }));
+                    }
+                }
+            };
             let mut out = self.ast_node_by_id(
                 nid,
                 include_refs,
@@ -67,6 +139,15 @@ impl McpServer {
             )?;
             if include_similar {
                 self.attach_similar(&mut out, nid, similar_top_k)?;
+            }
+            if renumbered {
+                // The id the caller passed is dead — it may already name a
+                // different symbol. Say so rather than letting them reuse it.
+                out["node_id_renumbered"] = json!(true);
+                out["note"] = json!(
+                    "This file was re-indexed to answer your call, which renumbered its nodes. \
+                     The node_id you passed is no longer valid; use the node_id in this response."
+                );
             }
             return Ok(out);
         }

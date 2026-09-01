@@ -149,7 +149,54 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     // Resolve node(s): by --node-id, or by positional symbol name
     let nodes_with_paths: Vec<(queries::NodeResult, String)> = if let Some(nid) = node_id_arg {
         match queries::get_node_with_file_by_id(conn, nid)? {
-            Some(nwf) => vec![(nwf.node, nwf.file_path)],
+            // CON-10: the symbol branch below resyncs; this one used to return
+            // straight from the index. `show` prints start_line/end_line AND
+            // slices the live file at those offsets via `read_source_context`
+            // (with context_lines defaulting to 3 on exactly this branch), so the
+            // branch that skipped the refresh is the one that could print a
+            // window of unrelated code under the symbol's name.
+            //
+            // Re-resolve by identity, never by id: ids are rowid-scoped and a
+            // re-index reuses freed ones — see `resolve::reresolve_node_by_identity`.
+            Some(nwf) => {
+                let outcome = refresh_files_if_stale(
+                    &ctx.db,
+                    &ctx.project_root,
+                    std::slice::from_ref(&nwf.file_path),
+                );
+                let resolved = if outcome.any_changed {
+                    crate::resolve::reresolve_node_by_identity(
+                        conn,
+                        &nwf.file_path,
+                        &nwf.node.name,
+                        nwf.node.qualified_name.as_deref(),
+                        &nwf.node.node_type,
+                    )?
+                } else {
+                    Some(nwf)
+                };
+                outcome.disclose();
+                match resolved {
+                    Some(nwf) => vec![(nwf.node, nwf.file_path)],
+                    None => {
+                        if json_mode {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "error": "Symbol no longer present after refresh",
+                                    "node_id": nid,
+                                })
+                            );
+                        }
+                        eprintln!(
+                            "[code-graph] Node ID {} named a symbol that is gone from the \
+                             re-indexed file. Re-resolve by name: code-graph-mcp show <symbol>",
+                            nid
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             None => {
                 if json_mode {
                     // In-band error object (roadmap 2026-07-18 §1.3), matching

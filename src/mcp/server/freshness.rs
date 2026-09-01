@@ -131,11 +131,24 @@ impl McpServer {
     ///
     /// Reindex caches are invalidated only when the call actually re-indexed.
     pub(super) fn ensure_file_fresh_opt(&self, path: Option<&str>) -> Result<()> {
+        self.ensure_file_fresh_reported(path).map(|_| ())
+    }
+
+    /// [`Self::ensure_file_fresh_opt`], reporting whether it actually re-indexed.
+    ///
+    /// CON-10: `get_ast_node(node_id)` needs the answer, not just the effect.
+    /// `nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
+    /// AUTOINCREMENT — and an incremental re-index deletes and re-inserts the
+    /// file's rows, so a re-index can hand the caller's stale id to a DIFFERENT
+    /// symbol. A caller holding a node_id across a refresh must therefore
+    /// re-resolve by identity, and it can only know to do that if the refresh
+    /// says whether it fired.
+    pub(super) fn ensure_file_fresh_reported(&self, path: Option<&str>) -> Result<bool> {
         if !self.is_primary() {
-            return Ok(());
+            return Ok(false);
         }
         let Some(rel_path) = path else {
-            return Ok(());
+            return Ok(false);
         };
         // Belt-and-braces: every `tool_*` entry point now normalizes its path
         // argument via `tools::normalize_path_arg` before calling here, so the
@@ -145,11 +158,11 @@ impl McpServer {
         // makes `src\` register as the directory it is.
         let rel_path = crate::indexer::merkle::normalize_rel_str(rel_path);
         if rel_path.is_empty() || rel_path.ends_with('/') {
-            return Ok(());
+            return Ok(false);
         }
         let rel_path = rel_path.as_str();
         let Some(root) = self.project_root.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let did_reindex = {
@@ -170,7 +183,7 @@ impl McpServer {
                 rel_path
             );
         }
-        Ok(())
+        Ok(did_reindex)
     }
     /// FRS-2: re-index the files a result set points at, and re-run the tool if
     /// any of them actually changed.
