@@ -5,17 +5,36 @@ const assert = require('node:assert/strict');
 // Pre-edit-guide.js is a script with side effects (reads stdin, checks db).
 // We test its PATTERNS directly without requiring the module.
 
-// --- Function signature patterns (copied from pre-edit-guide.js) ---
-const fnPatterns = [
-  /(?:pub\s+)?(?:async\s+)?fn\s+(\w+)/,                        // Rust
-  /(?:export\s+)?(?:async\s+)?function\s+(\w+)/,                // JS/TS
-  /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|_)\s*=>/, // JS arrow
-  /(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/,                       // JS method / Go func
-  /def\s+(\w+)/,                                                // Python/Ruby
-  /func\s+(\w+)/,                                               // Go/Swift
-  /(?:public|private|protected|static|override|virtual|abstract|internal)\s+\S+\s+(\w+)\s*\(/, // Java/C#/Kotlin
-  /(?:public\s+)?function\s+(\w+)/,                             // PHP
-];
+// --- Function signature patterns, READ OUT OF the hook's source ---
+//
+// These used to be a hand-copied duplicate of the array in pre-edit-guide.js,
+// with a "pattern-sync" test that only counted language comments (>= 7). That
+// counts as no sync at all: the SEC-04 fix rewrote three of the eight regexes to
+// bound their quantifiers, and every extraction test here would have gone on
+// passing against the old unbounded copies — a suite testing a regex the hook
+// does not use. Parsing the literal out of the source means a source edit is
+// exercised by these tests on the next run, whatever it changes.
+const SOURCE = require('node:fs').readFileSync(
+  require('node:path').join(__dirname, 'pre-edit-guide.js'),
+  'utf8'
+);
+
+function fnPatternsFromSource(source) {
+  const start = source.indexOf('const fnPatterns = [');
+  assert.ok(start !== -1, 'fnPatterns array not found in pre-edit-guide.js');
+  const open = source.indexOf('[', start);
+  const close = source.indexOf('\n];', open);
+  assert.ok(close !== -1, 'unterminated fnPatterns array in pre-edit-guide.js');
+  // eslint-disable-next-line no-new-func
+  const patterns = new Function(`return ${source.slice(open, close + 2)}`)();
+  assert.ok(
+    Array.isArray(patterns) && patterns.every((p) => p instanceof RegExp),
+    'fnPatterns must parse to an array of RegExp'
+  );
+  return patterns;
+}
+
+const fnPatterns = fnPatternsFromSource(SOURCE);
 
 function extractFunctionName(code) {
   for (const pat of fnPatterns) {
@@ -167,14 +186,52 @@ test('salience: impact summary forces a per-caller verdict before the edit', () 
   assert.doesNotMatch(source, /caller\(s\) above you will update/); // old wording removed
 });
 
-test('pattern-sync: fnPatterns count matches source', () => {
-  const fs = require('node:fs');
-  const path = require('node:path');
-  const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
-  // Count regex pattern lines in the fnPatterns array (lines containing // Language comment)
-  const sourcePatternCount = (source.match(/\/\/\s*(Rust|JS|Python|Go|Java|C#|PHP|Ruby|Swift|Kotlin)/g) || []).length;
-  assert.ok(fnPatterns.length === 8, `Expected 8 patterns, got ${fnPatterns.length}`);
-  assert.ok(sourcePatternCount >= 7, `Source should have >= 7 language comments, found ${sourcePatternCount}`);
+test('pattern-sync: the suite runs the hook\'s own patterns, not a copy', () => {
+  // The extraction tests above already prove the parsed array works; this states
+  // the invariant the parse exists for, and pins the count so a pattern silently
+  // disappearing still fails something.
+  assert.equal(fnPatterns.length, 8, `Expected 8 patterns, got ${fnPatterns.length}`);
+  assert.ok(
+    !/const fnPatterns = \[[\s\S]*?\n\];/.test(
+      require('node:fs').readFileSync(__filename, 'utf8').replace(/fnPatternsFromSource[\s\S]*$/, '')
+    ),
+    'this test file must not carry its own fnPatterns literal — parse the source instead'
+  );
+});
+
+// SEC-04 (audit 2026-08-29). `old_string` is whatever the model is editing, so a
+// benign bracket-free blob — base64, a hex dump, a minified bundle — used to
+// stall this BLOCKING hook for seconds: three of the eight patterns ran an
+// unbounded \w / \S run in front of a required literal, which backtracks from
+// every start position. Measured at HEAD before the fix, on the same box that
+// runs this test: 100 KB 2.8 s, 200 KB 11.0 s, 400 KB 43.4 s.
+//
+// This runs the patterns over the WHOLE 400 KB deliberately, bypassing the hook's
+// own 8 KB window, so it fails if a quantifier loses its cap even though the
+// window would have hidden it. Post-fix on that box the curve is linear —
+// 10 KB 2.4 ms, 100 KB 21.9 ms, 400 KB 87.4 ms — while the hook's real cost for
+// the same 400 KB input is 1.81 ms, because it only ever matches the window.
+// The threshold sits above the linear number and three orders of magnitude below
+// the quadratic one: anything in between means a bound was dropped.
+test('SEC-04: bracket-free word-dense input matches in linear time', () => {
+  for (const build of [
+    (n) => 'a'.repeat(n),                        // one unbroken \w run
+    (n) => 'foo_bar_baz_'.repeat(Math.ceil(n / 12)).slice(0, n), // underscore-dense
+    (n) => 'public static void '.repeat(Math.ceil(n / 19)).slice(0, n), // feeds the \S+ pattern
+  ]) {
+    const input = build(400 * 1024);
+    const t0 = process.hrtime.bigint();
+    for (const pat of fnPatterns) input.match(pat);
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms < 250, `400 KB of word-dense input took ${ms.toFixed(1)}ms across all patterns`);
+  }
+});
+
+test('SEC-04: the scan window is bounded in the hook itself', () => {
+  // Belt to the quantifier caps' braces, and the part that bounds a pattern a
+  // future author adds without reading the note.
+  assert.match(SOURCE, /oldStr\.length > 8192 \? oldStr\.slice\(0, 8192\)/);
+  assert.match(SOURCE, /for \(const pat of fnPatterns\) \{\n\s*const m = scanned\.match\(pat\)/);
 });
 
 // ── Covering-test targeting (edit-time PUSH) ────────────

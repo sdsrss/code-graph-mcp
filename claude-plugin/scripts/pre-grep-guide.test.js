@@ -2000,3 +2000,31 @@ test('source-text: PreToolUse no longer emits the dark stdout hint fallthrough',
   assert.doesNotMatch(src, /action:\s*'hint'\s*\}\);\s*\n\s*process\.stdout\.write\(buildHint/,
     'the hint-tier recordRecommendation + buildHint pair must be removed');
 });
+
+// SEC-05 (audit 2026-08-29). `rebaseRelativePaths` makes one `exists()` syscall
+// per surviving token and runs BEFORE every length gate in this file, so the
+// guard sat downstream of what it guards — the same shape as SEC-04 in
+// pre-edit-guide.js. Measured with this counting stub before the fix: 100k
+// tokens produced 100,001 probes, 2.2s of real fs.existsSync inside a BLOCKING
+// PreToolUse hook. `exists` is injectable precisely so this is assertable.
+test('SEC-05: an oversize command makes zero existence probes', () => {
+  const huge = 'grep pattern ' + Array.from({ length: 100000 }, (_, i) => 'tok' + i).join(' ');
+  let calls = 0;
+  const counting = () => { calls++; return false; };
+  const t0 = process.hrtime.bigint();
+  const out = rebaseRelativePaths(huge, 'src', process.cwd(), counting);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(calls, 0, `oversize command probed the filesystem ${calls} times`);
+  assert.equal(out, huge, 'an unprocessed command must come back unchanged');
+  assert.ok(ms < 50, `oversize command took ${ms.toFixed(1)}ms`);
+});
+
+test('SEC-05: commands under the bound still rebase, probes and all', () => {
+  // The negative control: the bound must not turn the function off. Without this,
+  // `return cmd` at the top of the function would pass the test above.
+  let calls = 0;
+  const existing = (p) => { calls++; return String(p).endsWith('src/lib.rs'); };
+  const out = rebaseRelativePaths('grep Symbol lib.rs', 'src', process.cwd(), existing);
+  assert.ok(calls > 0, 'a normal command must still probe');
+  assert.equal(out, 'grep Symbol src/lib.rs', 'a normal command must still rebase');
+});

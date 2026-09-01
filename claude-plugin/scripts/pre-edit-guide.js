@@ -45,20 +45,46 @@ if (!oldStr || oldStr.length < 10) process.exit(0);
 
 // --- Extract function/method signature from the edited text ---
 // Match function definitions across languages: Rust, JS/TS, Python, Go, Java/C#/Kotlin, Ruby, PHP
+//
+// Every unbounded run that is FOLLOWED BY A REQUIRED LITERAL carries an explicit
+// `{1,128}` cap — longer than any real identifier, short enough that the engine
+// gives up after 128 steps per start position. Without it those three patterns
+// are quadratic: on a long
+// unbroken \w run with no `name(...)` construct in it, the greedy run swallows to
+// the end at EVERY start position and then backtracks a character at a time.
+// Measured at HEAD on this box, pattern 4 alone: 10 KB 28 ms, 100 KB 2.8 s,
+// 200 KB 11.0 s, 400 KB 43.4 s — doubling the input quadrupled the time.
+//
+// This needs no malice to hit. `old_string` is whatever the model is editing, so
+// one benign blob without brackets — a base64 asset, a hex dump, a minified
+// bundle, a long snake_case table — stalls a BLOCKING PreToolUse hook for
+// seconds. Real code is unaffected either way (225 KB of this repo's own
+// source: 0.3 ms), because a bracket ends the run almost immediately.
+//
+// The runs that are NOT capped are the ones nothing is required after
+// (`fn\s+(\w+)`, `def\s+(\w+)`, …): those anchor on a keyword first and their
+// trailing capture cannot backtrack, so a cap there would only truncate a long
+// symbol name.
 const fnPatterns = [
   /(?:pub\s+)?(?:async\s+)?fn\s+(\w+)/,                        // Rust
   /(?:export\s+)?(?:async\s+)?function\s+(\w+)/,                // JS/TS
-  /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|_)\s*=>/, // JS arrow
-  /(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/,                       // JS method / Go func
+  /(?:const|let|var)\s+(\w{1,128})\s*=\s*(?:async\s+)?(?:\([^)]*\)|_)\s*=>/, // JS arrow
+  /(?:async\s+)?(\w{1,128})\s*\([^)]*\)\s*\{/,                 // JS method / Go func
   /def\s+(\w+)/,                                                // Python/Ruby
   /func\s+(\w+)/,                                               // Go/Swift
-  /(?:public|private|protected|static|override|virtual|abstract|internal)\s+\S+\s+(\w+)\s*\(/, // Java/C#/Kotlin
+  /(?:public|private|protected|static|override|virtual|abstract|internal)\s+\S{1,128}\s+(\w{1,128})\s*\(/, // Java/C#/Kotlin
   /(?:public\s+)?function\s+(\w+)/,                             // PHP
 ];
 
+// Second bound, on the INPUT rather than the patterns: a signature sits at the
+// head of the edited hunk, so matching past the first 8 KB buys nothing and
+// costs linearly. Belt to the caps' braces — it also bounds whatever pattern a
+// future author adds to the array without reading the note above.
+const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
+
 let symbol = null;
 for (const pat of fnPatterns) {
-  const m = oldStr.match(pat);
+  const m = scanned.match(pat);
   if (m) {
     // Find the first captured group
     symbol = m[1] || m[2];

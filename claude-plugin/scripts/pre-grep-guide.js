@@ -291,6 +291,20 @@ const { resolveProjectRoot } = require('./project-root');
 // (the exact shape that would re-create the answered:false glob failure).
 function rebaseRelativePaths(cmd, relPrefix, rootDir, exists = fs.existsSync) {
   if (!cmd || typeof cmd !== 'string' || !relPrefix || !rootDir) return cmd;
+  // SEC-05 (audit 2026-08-29): one `exists()` syscall per surviving token, and
+  // this runs BEFORE every length gate in the file — `shouldHint`'s 1000-char
+  // sanity check (:159) and the 2000-char ones on the sed/tail extractors are all
+  // downstream of it, so the guard sat below the thing it was guarding. Measured
+  // with a counting stub: 100k tokens is 100,001 probes, 2.2 s of real
+  // `fs.existsSync` on this box, paid inside a BLOCKING PreToolUse hook.
+  //
+  // The bound is the loosest one the file already uses, so nothing that any
+  // downstream gate would still have processed changes behavior: a command this
+  // long is past the sed/tail extractors' limit and twice past `shouldHint`'s.
+  // Placed here rather than at the two call sites because both of them
+  // (`pre-grep-guide` runMain, `post-grep-inject` runMain) need it, and a guard
+  // that lives in the callers is one refactor away from being dropped.
+  if (cmd.length > 2000) return cmd;
   const prefix = relPrefix.split(path.sep).join('/');
   // Shell sits outside any known source dir (docs/, target/, …) — don't guess.
   if (!SRC_PATH_TOKEN.test(prefix + '/')) return cmd;
