@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+Three P2 items from the 2026-08-29 audit. Old indexes rebuild once on first use
+(INDEX_VERSION 69 → 70).
+
+### A file appearing or vanishing left every file that depends on it stale
+
+Only a file whose *content* changed re-emits its import relations, so a file's
+*existence* changing left its dependents pinned to whatever they resolved to
+before. The recovery channel for a deleted file's inbound relations re-resolves
+them by the target node's **name**, and an import's identity is its
+**specifier** — which the edge row no longer holds. For Python `from a import
+target`:
+
+| after `rm a.py` | edge |
+|---|---|
+| incremental | `b.<module> --imports--> <external>.target` |
+| fresh rebuild | `b.<module> --imports--> <external>.a` |
+
+So the intermediate state diverged too, in the opposite direction, and the
+module-level edge (target name `<module>`, which resolves to nothing) was
+dropped outright. Restoring `a.py` healed neither, because nothing re-emitted
+`b.py`'s imports — and the stale sentinel then satisfied the import-contradiction
+prune, which deleted the call edge the pending sweep had just recovered. Every
+later run replayed it, so `deps` / `impact` / `callgraph` answered from a graph
+that diverged from a rebuild permanently. Branch switches are the everyday way
+to hit this.
+
+The indexer now re-extracts a changed file's dependents in the same run — the
+same code path a full rebuild runs, which is what makes both states agree with
+one. On a 2,000-file corpus with 400 importers of the module that disappears,
+both states are now byte-identical to a fresh rebuild of the same tree (before:
+800 differing lines, then 800 edges permanently missing). The extra pass costs
+0.05–0.09s there; a no-op reindex is unchanged.
+
+### index.db grew forever, and VACUUM could not reclaim it
+
+sqlite-vec only ever inserts into the newest chunk and never reuses a deleted
+slot, so every re-index, re-embed and version bump stranded its vectors' space
+inside live chunk rows. This repo's index reached **259 MB holding ~7.7 MB of
+vectors** — 5,044 live against 130,048 allocated slots. `rebuild-index` reset it
+as a side effect of its temp-build, so it only accumulated where the MCP server
+rebuilds in place.
+
+Startup repair now rewrites the vector table when the allocator is mostly dead
+slots (below 25% occupancy with at least 16 MB claimed) and VACUUMs after. On
+this index: 259.0 MB → 73.7 MB, chunks 190.8 MB → 7.5 MB, vector coverage
+unchanged, 0.55s. It copies vectors that already exist, so it needs no model and
+no embedding-cache coverage, and it never re-embeds anything.
+
+### The compact-key drift guard could not see the keys it most needed to
+
+`compact_allowlist_covers_all_result_keys` scanned `module_overview`'s producer
+for `result["k"] =` assignments only — but six of its top-level keys come from
+the `json!({…})` seed, so a seventh could have been added, silently dropped in
+`compact: true` mode, and left the guard green. The scan now covers the seed
+literal and `insert()` as well, and reads the compactor's `full["k"]` accesses as
+coverage so renamed-but-forwarded keys are not reported as holes. Both halves are
+mutation-verified.
+
 ## v0.127.0 (2026-08-31)
 
 **Security release.** Two ways an untrusted repository could act on the machine
