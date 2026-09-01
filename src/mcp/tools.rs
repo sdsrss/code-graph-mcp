@@ -97,17 +97,24 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        // No figure here, matching the five sibling `compact`
-                        // descriptions in this file. The old "~50%" was never
-                        // true of any implementation: measured on this repo (15
-                        // modules) compact is 4305 B against a full map of 5445
-                        // B — 20.9%. Reaching 50% would mean dropping BOTH
-                        // key_symbols (1098 B, kept deliberately so the map is
-                        // discoverable without a second round-trip) and part of
-                        // hot_functions (1033 B); dropping key_symbols alone
-                        // only reaches 41%. The ratio also moves with module
-                        // count and symbol density, so any number baked in here
-                        // is a claim that goes stale on the next repo.
+                        // No figure in the description itself, matching the five
+                        // sibling `compact` descriptions in this file. The old
+                        // "~50%" was never true of any implementation, and the
+                        // note that replaced it (4305 B of 5445 B) was measured
+                        // when this repo had 15 modules — a baked-in ratio goes
+                        // stale on the next commit, let alone the next repo.
+                        //
+                        // Re-measured 2026-09-01 (35 modules): full envelope
+                        // 11197 B, compact 9730 B — 13.1% saved. It was 8799 B
+                        // (21.4%) until compact stopped dropping
+                        // `entry_points.route` and `module_dependencies.imports`;
+                        // restoring those two cost 931 B. That trade is
+                        // deliberate: a map without the URLs is a wrong answer to
+                        // "what is the HTTP surface", not a terse one. What
+                        // compact still buys is `languages` and the 15→10
+                        // hot_functions trim (disclosed via
+                        // `hot_functions_truncated`); key_symbols stays so the
+                        // map is discoverable without a second round-trip.
                         "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves tokens)" },
                         "include_centrality": { "type": "boolean", "description": "Include architectural chokepoints (betweenness centrality — functions on the most shortest call paths; high score = structural bridge). Default false." },
                         "centrality_limit": { "type": "number", "description": "With include_centrality: max ranked results (default 10)" }
