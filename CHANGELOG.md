@@ -2,12 +2,13 @@
 
 ## Unreleased
 
-Sixteen items from the 2026-08-29 audit: the two that made the index diverge from
-a rebuild or grow without bound, two answers that were wrong rather than terse
-(a source window cut at pre-edit offsets, and a compact map with no URLs in it),
-the guard holes that let those classes come back, and a batch of hook-latency,
-determinism and diagnosis fixes. Other items from that report remain open. Old
-indexes rebuild once on first use (INDEX_VERSION 69 → 70).
+Seventeen items from the 2026-08-29 audit: the two that made the index diverge
+from a rebuild or grow without bound, two answers that were wrong rather than
+terse (a source window cut at pre-edit offsets, and a compact map with no URLs in
+it), a benchmark that had reported success for a month without measuring
+anything, the guard holes that let those classes come back, and a batch of
+hook-latency, determinism and diagnosis fixes. Other items from that report
+remain open. Old indexes rebuild once on first use (INDEX_VERSION 69 → 70).
 
 ### A file appearing or vanishing left every file that depends on it stale
 
@@ -120,6 +121,28 @@ the `json!({…})` seed, so a seventh could have been added, silently dropped in
 literal and `insert()` as well, and reads the compactor's `full["k"]` accesses as
 coverage so renamed-but-forwarded keys are not reported as holes. Both halves are
 mutation-verified.
+
+### The routing bench reported success for four weeks without measuring anything
+
+Its `OPENROUTER_API_KEY` secret went missing on 2026-08-02. The step handled that
+by writing a step summary saying "no P@1 was measured" and exiting 0 — so every
+weekly schedule and all 14 release tags through v0.126.2 reported **success**,
+because nobody opens a green run to read its summary. A disclosure you have to
+click through is not a signal.
+
+The secret is restored, and the first real run since is `P@1 = 22/22 = 100.0%`
+(threshold 70%, `anthropic/claude-sonnet-4.5`, 125.7s of live calls). The
+unattended triggers — the weekly schedule and release tags — now **fail** when
+the key is missing, so a dark measurement is visible in the run list rather than
+green. Manual dispatch still exits 0 (a human is reading that output), and the
+whole gate is scoped to the upstream repo, so a fork without the secret keeps its
+documented benign no-op.
+
+`scripts/routing-bench-dark-run-guard.test.js` extracts the step's real shell
+script out of the workflow and runs it under each trigger, asserting exit codes —
+a textual "does the source contain exit 1" check would pass for a gate keyed on
+an event name this workflow never receives. It carries a negative control that
+disarms the gate and requires the run to go green again.
 
 ### `get_ast_node` by node_id could return a different symbol's code as yours
 

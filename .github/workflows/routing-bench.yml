@@ -63,16 +63,29 @@ jobs:
           if [ -z "$OPENROUTER_API_KEY" ]; then
             echo "::warning::OPENROUTER_API_KEY not set — skipping routing bench"
             echo "skipped=true" >> "$GITHUB_OUTPUT"
-            # A bare `exit 0` makes a run that measured NOTHING look identical to
-            # a passing one in the run list — the weekly schedule would report
-            # green forever if the secret were ever removed. Record the skip
-            # where the result is read, so "no score" is legible as no score.
+            # The step summary below already said "no score" — and it was not
+            # enough. The secret went missing on 2026-08-02 and this workflow
+            # reported success on every weekly schedule and all 14 release tags
+            # through v0.126.2 before the 2026-08-29 audit (ENG-01) noticed, for
+            # the simple reason that nobody opens a green run to read its
+            # summary. A disclosure you have to click through is not a signal.
+            #
+            # So the AUTOMATED triggers — the weekly schedule and release tags,
+            # where nobody is watching — now fail. Manual dispatch still exits 0,
+            # because there a human is reading this output; and the whole branch
+            # is gated on the upstream repo, so a fork without the secret keeps
+            # the documented benign no-op.
             {
               echo "## Routing Bench — SKIPPED"
               echo ""
               echo "\`OPENROUTER_API_KEY\` is not set, so **no P@1 was measured**."
               echo "This run is green because nothing ran, not because routing passed."
             } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$GITHUB_REPOSITORY" = "sdsrss/code-graph-mcp" ] && \
+               { [ "$GITHUB_EVENT_NAME" = "schedule" ] || [ "$GITHUB_EVENT_NAME" = "push" ]; }; then
+              echo "::error::OPENROUTER_API_KEY is missing on an unattended $GITHUB_EVENT_NAME run — failing so the dark measurement is visible in the run list rather than green."
+              exit 1
+            fi
             exit 0
           fi
           # Capture full output; tee so we can grep for the P@1 line below.
