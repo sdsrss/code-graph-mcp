@@ -158,7 +158,15 @@ impl McpServer {
         // call; the cached envelope stays flag-free). Test callers excluded, same
         // default as the CLI.
         if args["include_centrality"].as_bool().unwrap_or(false) {
-            let limit = args["centrality_limit"].as_u64().unwrap_or(10).max(1) as usize;
+            // Clamped, not just floored (audit 2026-08-29 CON-08): this was the
+            // only numeric MCP parameter without an upper bound, while every
+            // sibling has one (top_k/limit 1-100, depth 1-20, context_lines
+            // 0-100). Betweenness is computed per call, so an unbounded limit is
+            // an unbounded response and an unbounded render.
+            let limit = args["centrality_limit"]
+                .as_u64()
+                .unwrap_or(10)
+                .clamp(1, 100) as usize;
             let ranked =
                 crate::graph::centrality::betweenness_centrality(self.db.conn(), false, limit)?;
             let centrality_json: Vec<serde_json::Value> = ranked

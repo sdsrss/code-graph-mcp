@@ -1890,6 +1890,30 @@ impl McpServer {
             }
         };
         let arguments = &params["arguments"];
+        // CON-09 (audit 2026-08-29). A non-object `arguments` used to sail past
+        // here: every tool reads its parameters with `args["path"]`, which yields
+        // Null on a JSON string, so `{"name":"module_overview","arguments":"src/main.rs"}`
+        // came back as "Error: Missing path" — a diagnosis pointing at the caller's
+        // parameters when the problem is the shape of the envelope holding them.
+        // `note_ignored_arguments` could not cover for it either: it bails when
+        // `as_object()` is None, so nothing was disclosed. Absent/null stays
+        // valid — plenty of tools take no arguments at all.
+        if !arguments.is_null() && !arguments.is_object() {
+            let got = match arguments {
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Array(_) => "an array",
+                _ => "a non-object value",
+            };
+            return JsonRpcResponse::error(
+                id,
+                super::protocol::JSONRPC_INVALID_PARAMS,
+                format!(
+                    "'arguments' must be a JSON object mapping parameter names to values, got {got}"
+                ),
+            );
+        }
 
         match self.handle_tool(tool_name, arguments) {
             Ok(result) => {

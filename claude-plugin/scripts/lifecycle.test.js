@@ -1607,3 +1607,52 @@ test('migrateOldPluginIds survives an unwritable installed_plugins.json', (t) =>
     `the failure must be named; stderr=${res.stderr}`,
   );
 });
+
+// ── JS-06: the uninstall sweep's report has THREE outcomes ──────────────────
+//
+// A project whose managed block the user already removed by hand comes back
+// from `unadopt` with nothing pruned and no error. That used to be bucketed as
+// "Could NOT clean", which is a false alarm at the worst moment — it tells
+// someone to go hand-edit files that are already clean, in the same breath as
+// telling them the plugin is gone. Real failure is reported separately by
+// `unadopt` (`claudeMdUnreadable` / `claudeMdUnwritable`), and that is what the
+// bucket must key on.
+test('unadopt sweep: nothing-to-clean is not reported as a failure', () => {
+  const { reportUnadoptSweep } = require('./lifecycle.js');
+  const captured = [];
+  const realWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { captured.push(String(chunk)); return true; };
+  try {
+    reportUnadoptSweep([
+      { project: '/repo/pruned', cleaned: true, failed: false },
+      { project: '/repo/already-clean', cleaned: false, failed: false },
+      { project: '/repo/unwritable', cleaned: false, failed: true },
+    ]);
+  } finally {
+    process.stderr.write = realWrite;
+  }
+  const out = captured.join('');
+  assert.match(out, /removed the managed CLAUDE\.md block from 1 project/);
+  assert.match(out, /Could NOT clean 1 project/,
+    'a project whose CLAUDE.md could not be rewritten must still be reported');
+  assert.match(out, /\/repo\/unwritable/);
+  assert.doesNotMatch(out, /\/repo\/already-clean/,
+    'a project that needed no cleaning must not be listed as a failure');
+});
+
+test('unadopt sweep: an all-clean registry says nothing at all', () => {
+  const { reportUnadoptSweep } = require('./lifecycle.js');
+  const captured = [];
+  const realWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { captured.push(String(chunk)); return true; };
+  try {
+    reportUnadoptSweep([
+      { project: '/repo/a', cleaned: false, failed: false },
+      { project: '/repo/b', cleaned: false, failed: false },
+    ]);
+  } finally {
+    process.stderr.write = realWrite;
+  }
+  assert.equal(captured.join(''), '',
+    'nothing removed and nothing failed is not news — it used to print a two-project failure list');
+});

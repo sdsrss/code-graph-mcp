@@ -102,8 +102,10 @@ struct FilePreParsed {
     parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
 }
 
-// Heavyweight per-file data used during Phase 1+2, dropped after each batch
-#[allow(dead_code)]
+// Heavyweight per-file data used during Phase 1+2, dropped after each batch.
+// No blanket `#[allow(dead_code)]`: all nine fields have real readers, and the
+// allow was suppressing FIELD-level dead-code detection for the struct that
+// carries a whole batch's parse state (audit 2026-08-29 ARC-04).
 struct FileParsed {
     rel_path: String,
     source: String,

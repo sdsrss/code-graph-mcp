@@ -85,6 +85,24 @@ pub(crate) fn resolve_snapshot_source_impl(
     gate_origin_url(resolve_from_github(root), origin_trusted)
 }
 
+/// Is this a git object id, and nothing else?
+///
+/// SEC-06 (audit 2026-08-29). The value this guards comes out of the snapshot
+/// database being verified — attacker-controlled if the snapshot is — and used to
+/// go straight into an argv position with no `--` separator, so a value starting
+/// with `-` reached `git cat-file` as an OPTION. No exploit was demonstrated (no
+/// shell is involved and `cat-file` exposes nothing executable), so this closes a
+/// missing guard rather than a proven hole.
+///
+/// Validated rather than only separator-escaped, which is strictly better here:
+/// an object id has exactly one shape (40 hex for SHA-1, 64 for SHA-256), so junk
+/// is refused before it becomes a confusing git error. The `--` goes in too — the
+/// sibling call site at `cli/health.rs:415` already passes it, and its comment
+/// predicted that the inconsistency is how the next site would end up without it.
+fn is_commit_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Gate the auto-detected origin GitHub-release snapshot behind out-of-band trust
 /// ([`origin_trusted`]). The URL is resolved FIRST so the opt-in hint is printed
 /// only when the repo actually publishes a snapshot — a normal repo (no snapshot
@@ -561,11 +579,24 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
 
     // Warn (not fail) if snapshot commit is not in local history
     if let Some(commit) = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)? {
-        if !commit.is_empty() {
+        // SEC-06 (audit 2026-08-29). `commit` comes out of the snapshot database
+        // being verified — attacker-controlled if the snapshot is — and went
+        // straight into an argv position with no `--` separator, so a value
+        // starting with `-` reached git as an OPTION. No exploit was demonstrated
+        // (no shell, and `cat-file` exposes nothing executable), so this closes a
+        // missing guard rather than a proven hole; the sibling call site at
+        // `cli/health.rs:415` already passes `--` and its comment predicted that
+        // the inconsistency is how the next site would end up without it.
+        //
+        // Validated rather than separator-escaped, which the sibling's comment
+        // asks for and which is strictly better here: a commit id has exactly one
+        // shape, so junk is refused early and loudly instead of becoming a
+        // confusing git error.
+        if is_commit_id(&commit) {
             // Silence stderr — `cat-file -e` prints "fatal: ..." when commit missing,
             // which is the expected case we want to detect (forks/rebases).
             let exists = std::process::Command::new("git")
-                .args(["cat-file", "-e", &commit])
+                .args(["cat-file", "-e", "--", &commit])
                 .current_dir(root)
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -583,6 +614,36 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-06: the snapshot-supplied commit reaches `git` only when it is an
+    /// object id. Option-shaped and traversal-shaped values are the point — they
+    /// are what a hostile snapshot would put there.
+    #[test]
+    fn only_a_real_object_id_is_handed_to_git() {
+        for good in [
+            "0123456789abcdef0123456789abcdef01234567",
+            "0123456789ABCDEF0123456789abcdef01234567",
+            &"a".repeat(64),
+        ] {
+            assert!(super::is_commit_id(good), "{good} is a valid object id");
+        }
+        for bad in [
+            "",
+            "--upload-pack=touch /tmp/pwned",
+            "-e",
+            "--help",
+            "HEAD",
+            "0123456789abcdef0123456789abcdef0123456", // 39 — one short
+            "0123456789abcdef0123456789abcdef012345678", // 41 — one long
+            "0123456789abcdef0123456789abcdef0123456g", // non-hex
+            "../../etc/passwd",
+        ] {
+            assert!(
+                !super::is_commit_id(bad),
+                "{bad:?} must never reach the git argv"
+            );
+        }
+    }
+
     use super::*;
     use tempfile::TempDir;
 

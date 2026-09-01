@@ -2085,3 +2085,97 @@ fn every_apt_step_in_ci_is_bounded_by_a_timeout() {
          fast: {unbounded:?}"
     );
 }
+
+/// CON-08 (audit 2026-08-29): every numeric MCP parameter must be BOUNDED, not
+/// merely floored.
+///
+/// `centrality_limit` was the only one without an upper bound — `.unwrap_or(10)
+/// .max(1)` straight into `betweenness_centrality`, while every sibling clamps
+/// (top_k / limit 1-100, depth 1-20 and 1-10, context_lines 0-100). Betweenness
+/// is computed per call, so an unbounded limit is an unbounded computation, an
+/// unbounded response and an unbounded render.
+///
+/// A parity table over an axis nothing was guarding. The axis is otherwise clean
+/// today, which is exactly when the table is cheap: it costs one line per new
+/// numeric parameter and refuses the next unbounded one.
+///
+/// Scanned per STATEMENT (from `args["name"]` to the terminating `;`) because the
+/// clamp is written both inline and across four lines, and a line-based scan
+/// would see only the inline half.
+#[test]
+fn every_numeric_mcp_argument_is_clamped() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tools_dir = root.join("src/mcp/server/tools");
+
+    // Numeric reads that are deliberately unbounded, each with the reason it is
+    // safe. Keep this short: an entry here is a promise that the value cannot
+    // size a computation, a response, or an allocation.
+    const UNBOUNDED_BY_DESIGN: &[(&str, &str)] = &[
+        // An identity, not a size: it selects one row by primary key. A huge
+        // value finds nothing.
+        ("advanced.rs", "node_id"),
+        ("refs.rs", "node_id"),
+        // A filter threshold. Raising it HIDES rows (`hidden_below_threshold`
+        // discloses how many), so a large value shrinks the answer.
+        ("advanced.rs", "min_lines"),
+        // Bounded at the use site instead of the read: `ast_node.rs:443` passes
+        // `top_k.clamp(1, 50)` into `tool_find_similar_code`. Listed rather than
+        // "fixed" because moving the clamp earlier would change the documented
+        // ceiling of a published parameter for no gain.
+        ("ast_node.rs", "similar_top_k"),
+    ];
+
+    let mut files: Vec<_> = std::fs::read_dir(&tools_dir)
+        .expect("tools dir moved — update this guard")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 5,
+        "expected the tools module to hold several files, found {} — did the layout move?",
+        files.len()
+    );
+
+    let mut checked = 0usize;
+    let mut unbounded: Vec<String> = Vec::new();
+    for path in &files {
+        let src = std::fs::read_to_string(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let mut rest = src.as_str();
+        while let Some(i) = rest.find("args[\"") {
+            let after = &rest[i + "args[\"".len()..];
+            let Some(key_end) = after.find("\"]") else {
+                break;
+            };
+            let key = &after[..key_end];
+            let stmt_end = after.find(';').unwrap_or(after.len());
+            let stmt = &after[..stmt_end];
+            let numeric = stmt.contains(".as_u64()")
+                || stmt.contains(".as_i64()")
+                || stmt.contains(".as_f64()");
+            if numeric {
+                checked += 1;
+                let exempt = UNBOUNDED_BY_DESIGN
+                    .iter()
+                    .any(|(f, k)| *f == name.as_str() && *k == key);
+                if !stmt.contains(".clamp(") && !exempt {
+                    unbounded.push(format!("{name}: args[\"{key}\"]"));
+                }
+            }
+            rest = &after[key_end..];
+        }
+    }
+
+    assert!(
+        checked >= 8,
+        "the scan found only {checked} numeric argument reads — the accessor spelling probably \
+         changed and this guard is now looking at nothing"
+    );
+    assert!(
+        unbounded.is_empty(),
+        "numeric MCP argument(s) with no upper bound: {unbounded:?}. Add `.clamp(lo, hi)` in the \
+         handler, or list the site in UNBOUNDED_BY_DESIGN with the reason it cannot size a \
+         computation, a response, or an allocation."
+    );
+}

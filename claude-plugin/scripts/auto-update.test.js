@@ -870,6 +870,91 @@ test('downloadAndInstall repoints a healthy installed_plugins.json and advances 
     'a well-formed UTF-8 registry must not be backed up');
 });
 
+test('downloadAndInstall reports a malformed registry entry as BLOCKED, not as success', async (t) => {
+  // JS-05 + JS-02 (audit 2026-08-29), together because fixing one alone opens
+  // the other. `plugins[PLUGIN_ID]` was assumed to be a non-empty array: `[]`
+  // made `[0].installPath = …` throw, and the outer catch reported "Plugin
+  // download/extract failed" — a diagnosis pointing at the download for a
+  // malformed LOCAL file. Guarding the shape without also reporting it would
+  // have turned that crash into a silent skip, which is the JS-02 treadmill:
+  // `pluginUpdated: true` with an un-advanced registry, so the next round sees
+  // the same update, resets the attempt counter, and downloads again — ~48
+  // rounds a day at the 30-minute up-to-date interval.
+  for (const [label, entry] of [
+    ['empty array', []],
+    ['object instead of array', { installPath: '/old', version: '0.0.1' }],
+    ['array of a non-object', ['not-a-record']],
+  ]) {
+    const sandboxHome = mkDir(t, 'code-graph-dai-malformed-');
+    const installedDir = path.join(sandboxHome, '.claude', 'plugins');
+    fs.mkdirSync(installedDir, { recursive: true });
+    const installedPath = path.join(installedDir, 'installed_plugins.json');
+    fs.writeFileSync(installedPath, JSON.stringify({
+      plugins: { 'code-graph-mcp@code-graph-mcp': entry },
+    }));
+
+    const script = `
+      const fs = require('fs');
+      const path = require('path');
+      const crypto = require('crypto');
+      const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+      const errs = [];
+      const realError = console.error;
+      console.error = (...a) => { errs.push(a.join(' ')); };
+      const latest = {
+        version: '9.9.9',
+        tarballUrl: 'https://example/tar',
+        pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+        binaryUrl: null,
+      };
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'curl') {
+          const out = args[args.indexOf('-o') + 1];
+          if (out.endsWith('.sha256')) {
+            const archive = out.slice(0, -'.sha256'.length);
+            const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+            fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+          } else {
+            fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+          }
+        }
+        if (cmd === 'tar') {
+          const mDir = path.join(opts.cwd, 'claude-plugin', '.claude-plugin');
+          fs.mkdirSync(mDir, { recursive: true });
+          fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+        }
+      };
+      (async () => {
+        const result = await downloadAndInstall(latest, {
+          exec,
+          cmdExists: () => true,
+          refreshMarketplace: () => true,
+          downloadBin: async () => true,
+        });
+        console.error = realError;
+        console.log(JSON.stringify({ result, errs }));
+      })();
+    `;
+    const out = execGit(process.execPath, ['-e', script], {
+      env: { ...process.env, HOME: sandboxHome },
+      encoding: 'utf8',
+    });
+    const { result, errs } = JSON.parse(out.trim().split('\n').pop());
+
+    assert.equal(result.repointBlocked, true,
+      `${label}: a repoint that could not happen must be REPORTED to the caller`);
+    assert.equal(
+      errs.filter(e => e.includes('Plugin download/extract failed')).length, 0,
+      `${label}: a malformed local registry must not be reported as a download failure, got: ${JSON.stringify(errs)}`);
+    assert.ok(
+      errs.some(e => e.includes('malformed')),
+      `${label}: the user must be told which file is malformed, got: ${JSON.stringify(errs)}`);
+    assert.ok(
+      !fs.existsSync(path.join(sandboxHome, '.cache', 'code-graph', 'install-manifest.json')),
+      `${label}: a blocked repoint must not advance the manifest`);
+  }
+});
+
 test('downloadAndInstall does NOT repoint install state when the plugin copy is skipped (version drift)', async (t) => {
   // Guard for a silent-breakage bug: when the extracted tarball's plugin.json version
   // doesn't match latest.version, the copy is skipped and pluginDst is never created.
@@ -1819,6 +1904,30 @@ function runCheckForUpdate(sb, latestVersion) {
   });
   return JSON.parse(fs.readFileSync(sb.statePath, 'utf8'));
 }
+
+test('source-text: a blocked repoint is subtracted from success (JS-02 consuming half)', () => {
+  // The producing half — `downloadAndInstall` returning `repointBlocked` — is
+  // covered behaviourally by the malformed-registry test above. This is the
+  // consuming half, and it is source-scanned because the end-to-end shape is not
+  // reachable from `checkForUpdate`'s harness: driving it to a state where the
+  // plugin copy SUCCEEDS while the repoint is refused needs curl/tar stubs, and
+  // `checkForUpdate` calls `downloadAndInstall(latest)` with no injection point.
+  //
+  // So it proves the gate is wired, not that the counter increments. Without it,
+  // deleting `&& !result.repointBlocked` restores the treadmill with every
+  // behavioural test still green.
+  const src = fs.readFileSync(path.join(__dirname, 'auto-update.js'), 'utf8');
+  assert.match(
+    src,
+    /const success = result\.pluginUpdated && !result\.repointBlocked;/,
+    'checkForUpdate must not count a refused repoint as a successful update'
+  );
+  assert.match(
+    src,
+    /return \{ pluginUpdated, binaryUpdated, marketplaceRefreshed, repointBlocked \};/,
+    'downloadAndInstall must return repointBlocked, or the gate above reads undefined'
+  );
+});
 
 test('a failed update keeps the global-npm heal counters instead of resetting them', (t) => {
   // globalPkgHealAttempts is AT the cap and the staged global package is stale,

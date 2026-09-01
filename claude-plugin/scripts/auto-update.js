@@ -700,6 +700,16 @@ async function downloadAndInstall(latest, {
   let pluginUpdated = false;
   let binaryUpdated = false;
   let marketplaceRefreshed = false;
+  // JS-02 (audit 2026-08-29): declared out here so it can be RETURNED. It used
+  // to live inside the `if (pluginUpdated)` block, correctly stopping the
+  // manifest from advancing, and then evaporate — the caller saw
+  // `pluginUpdated: true`, wrote `updateAttempts: 0, updateAvailable: false,
+  // suspendedAt: null`, and re-read the un-advanced registry next round. With
+  // `updateAvailable:false` the recheck interval is 30 minutes, so a registry
+  // that stays broken drives ~48 full download-and-install rounds a day —
+  // exactly the treadmill MAX_UPDATE_ATTEMPTS and the suspension mechanism
+  // exist to stop, both of which stayed dormant because every round "succeeded".
+  let repointBlocked = false;
 
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
@@ -808,7 +818,6 @@ async function downloadAndInstall(latest, {
       // behind, the ordinary check interval retries the whole install and
       // re-reports, and the repoint lands by itself the moment the file is
       // repaired. `missing` is not blocked: no registry means nothing to repoint.
-      let repointBlocked = false;
       if (installedRead.corrupt) {
         // Value unusable — the bytes are not ours to guess at.
         const why = installedRead.error
@@ -848,7 +857,28 @@ async function downloadAndInstall(latest, {
             repointBlocked = true;
           }
         }
-        if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {
+        // JS-05 (audit 2026-08-29): `plugins[PLUGIN_ID]` was assumed to be a
+        // non-empty array. A registry holding `[]` — or any other truthy
+        // non-array — made `[0].installPath = …` throw a TypeError, which the
+        // outer catch reported as "Plugin download/extract failed": a diagnosis
+        // pointing at the download for a malformed local file. `activeInstallPath`
+        // in lifecycle.js already reads this same field the careful way; this is
+        // the sibling that did not.
+        const records = installed && installed.plugins && installed.plugins[PLUGIN_ID];
+        const repointable =
+          Array.isArray(records) && records[0] && typeof records[0] === 'object';
+        if (installed && !repointable && installed.plugins && installed.plugins[PLUGIN_ID]) {
+          // Present but not the shape we can write into (`[]`, or a truthy
+          // non-array). Blocked, NOT skipped: a silent skip here would feed the
+          // JS-02 treadmill through a new door.
+          console.error(
+            `[code-graph] plugin ${latest.version} is installed, but this plugin's entry in ` +
+            `${installedPath} is malformed (expected a non-empty array) — it still points at ` +
+            'the previous version. Run `/plugin update` or repair that file by hand.'
+          );
+          repointBlocked = true;
+        }
+        if (repointable) {
           installed.plugins[PLUGIN_ID][0].installPath = pluginDst;
           installed.plugins[PLUGIN_ID][0].version = latest.version;
           installed.plugins[PLUGIN_ID][0].lastUpdated = new Date().toISOString();
@@ -900,7 +930,7 @@ async function downloadAndInstall(latest, {
       binaryUpdated = true;
     }
 
-    return { pluginUpdated, binaryUpdated, marketplaceRefreshed };
+    return { pluginUpdated, binaryUpdated, marketplaceRefreshed, repointBlocked };
   } catch (e) {
     console.error(`[code-graph] Plugin download/extract failed: ${e.message}`);
     return { pluginUpdated: false, binaryUpdated: false, marketplaceRefreshed };
@@ -1278,7 +1308,11 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
         return { updateAvailable: true, suspended: true, from: installedVersion, to: latest.version };
       }
       const result = await downloadAndInstall(latest);
-      const success = result.pluginUpdated;
+      // A refused repoint is NOT a success (JS-02): the bytes landed, but the
+      // registry Claude Code reads still names the old version, so the next round
+      // sees the same update available. Counting it as success reset the attempt
+      // counter and the suspension stamp every time.
+      const success = result.pluginUpdated && !result.repointBlocked;
       // Suspension clock. It restarts when the daily retry is spent and fails,
       // which is what keeps `retryDue` from staying true and turning the retry
       // back into a per-session treadmill; it clears on success and on a new

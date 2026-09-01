@@ -639,9 +639,18 @@ function unadoptRegisteredProjects() {
   for (const project of (res && res.list) || []) {
     try {
       const r = unadopt({ cwd: project });
-      out.push({ project, cleaned: !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved)) });
+      // Three outcomes, not two (audit 2026-08-29 JS-06). A project whose block
+      // the user already removed by hand comes back with nothing pruned and NO
+      // error — which used to land in the "Could NOT clean" list, sending them
+      // to hand-edit a file that is already clean. `unadopt` reports real
+      // failure separately (`claudeMdUnreadable` / `claudeMdUnwritable`, the
+      // same pair adopt.js folds into its own `cleanupFailed`), so use it rather
+      // than inferring failure from "nothing happened".
+      const cleaned = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
+      const failed = !!(r && (r.claudeMdUnreadable || r.claudeMdUnwritable));
+      out.push({ project, cleaned, failed });
     } catch (e) {
-      out.push({ project, cleaned: false, error: (e && e.message) || String(e) });
+      out.push({ project, cleaned: false, failed: true, error: (e && e.message) || String(e) });
     }
   }
   reportUnadoptSweep(out);
@@ -659,7 +668,9 @@ function unadoptRegisteredProjects() {
 function reportUnadoptSweep(entries) {
   try {
     const cleaned = entries.filter((e) => e && e.cleaned).map((e) => e.project);
-    const failed = entries.filter((e) => e && !e.cleaned).map((e) => e.project);
+    // Only genuine failures. "Nothing to clean" is neither a success worth
+    // announcing nor a problem worth sending someone to fix (JS-06).
+    const failed = entries.filter((e) => e && !e.cleaned && e.failed).map((e) => e.project);
     if (!cleaned.length && !failed.length) return;
     const lines = [];
     if (cleaned.length) {
@@ -1825,6 +1836,7 @@ module.exports = {
   install, uninstall, update, healthCheck, scanForBrokenPaths, checkScopeConflict,
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   cleanupDisabledStatusline, unadoptRegisteredProjects,
+  reportUnadoptSweep,                                                  // exported so its three-way bucketing is testable (audit 2026-08-29 JS-06)
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
   backupCorruptFile,                                                   // auto-update.js repoints installed_plugins.json and owes the same preserve-then-proceed route
   migrateOldPluginIds,                                                 // exported so its failure arms are testable (audit 2026-08-22 P2-10)

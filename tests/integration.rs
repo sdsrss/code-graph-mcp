@@ -2382,6 +2382,72 @@ fn test_tools_call_missing_name_returns_error() {
     );
 }
 
+/// CON-09 (audit 2026-08-29): a non-object `arguments` must be diagnosed as the
+/// envelope problem it is, not reported as a missing parameter.
+///
+/// Every tool reads its parameters with `args["path"]`, which yields Null on a
+/// JSON string, so this call used to answer "Error: Missing path" — sending the
+/// caller to look at a parameter it did pass. `note_ignored_arguments` could not
+/// cover for it either: it bails when `as_object()` is None, so nothing was
+/// disclosed at all.
+#[test]
+fn test_tools_call_non_object_arguments_names_the_real_problem() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    for bad in [
+        serde_json::json!("src/main.rs"),
+        serde_json::json!(42),
+        serde_json::json!(["src/main.rs"]),
+        serde_json::json!(true),
+    ] {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "module_overview", "arguments": bad }
+        });
+        let resp = server.handle_message(&msg.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            parsed["error"]["code"], -32602,
+            "must be invalid-params: {parsed:?}"
+        );
+        let message = parsed["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("'arguments' must be a JSON object"),
+            "the error must name the envelope, not a parameter: {message}"
+        );
+        assert!(
+            !message.contains("Missing path"),
+            "the old misdiagnosis must not come back: {message}"
+        );
+    }
+}
+
+/// The negative control for the check above: absent and null `arguments` are
+/// legitimate — several tools take no parameters — so the type gate must not
+/// turn into "arguments are mandatory".
+#[test]
+fn test_tools_call_absent_or_null_arguments_still_dispatch() {
+    let project = TempDir::new().unwrap();
+    let server = common::init_server(&project);
+
+    for params in [
+        serde_json::json!({ "name": "get_index_status" }),
+        serde_json::json!({ "name": "get_index_status", "arguments": null }),
+        serde_json::json!({ "name": "get_index_status", "arguments": {} }),
+    ] {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params
+        });
+        let resp = server.handle_message(&msg.to_string()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+        assert!(
+            parsed["error"].is_null(),
+            "a tool taking no arguments must still dispatch: {parsed:?}"
+        );
+    }
+}
+
 #[test]
 fn test_unknown_method_returns_error() {
     let project = TempDir::new().unwrap();
