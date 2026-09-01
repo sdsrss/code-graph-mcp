@@ -112,6 +112,126 @@ fn assigned_result_keys(region: &str) -> Vec<String> {
     keys
 }
 
+/// Top-level keys of the `let mut result = json!({ … })` SEED literal.
+///
+/// CON-18(a): the guard used to read `result["k"] =` assignments only, and the
+/// producer introduces most of its envelope in the seed — `path`, `files_count`,
+/// `active_exports`, `inactive_summary`, `hot_paths`, `summary` were six keys the
+/// guard could not see, so a seventh could have been added and dropped by compact
+/// with the guard still green. That is the shape of hole this whole file exists
+/// to close, sitting in the guard itself.
+///
+/// Depth-aware so nested object literals (a per-symbol `{"name": …}` inside the
+/// seed) do not read as top-level keys, and string-aware so a `format!("{}")` in
+/// a value cannot unbalance the nesting.
+fn seed_literal_keys(region: &str, binding: &str) -> Vec<String> {
+    let anchor = format!("let mut {binding} = json!(");
+    let Some(start) = region.find(&anchor) else {
+        return Vec::new();
+    };
+    let bytes: Vec<char> = region[start + anchor.len()..].chars().collect();
+    let mut keys = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            '/' if bytes.get(i + 1) == Some(&'/') => {
+                while i < bytes.len() && bytes[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            '"' => {
+                let key_start = i + 1;
+                let mut j = key_start;
+                while j < bytes.len() && !(bytes[j] == '"' && bytes[j - 1] != '\\') {
+                    j += 1;
+                }
+                // A key sits at depth 1 of the literal and is followed by `:`.
+                let next = bytes[j + 1..].iter().find(|c| !c.is_whitespace());
+                if depth == 1 && next == Some(&':') {
+                    keys.push(bytes[key_start..j].iter().collect());
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    keys
+}
+
+/// Keys the producer inserts through `result…insert("k", …)` — the third shape
+/// the report names, alongside the seed literal and index assignment. Anchored on
+/// a `result` receiver so an unrelated `cache.insert(…)` in the same function is
+/// not mistaken for an envelope key.
+fn inserted_result_keys(region: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut rest = region;
+    while let Some(i) = rest.find("result") {
+        let after = &rest[i + "result".len()..];
+        // Same statement only: an `insert` past a `;` belongs to something else.
+        let stmt_end = after.find(';').unwrap_or(after.len());
+        if let Some(k) = after[..stmt_end].find(".insert(\"") {
+            let key_start = k + ".insert(\"".len();
+            if let Some(j) = after[key_start..stmt_end].find('"') {
+                keys.push(after[key_start..key_start + j].to_string());
+            }
+        }
+        rest = after;
+    }
+    keys
+}
+
+/// Every top-level key the producer can put on the response envelope, in all
+/// three shapes it uses to do so.
+fn produced_envelope_keys(producer: &str) -> Vec<String> {
+    let mut keys = seed_literal_keys(producer, "result");
+    keys.extend(assigned_result_keys(producer));
+    keys.extend(inserted_result_keys(producer));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Keys the compact forwarder demonstrably handles: the `for key in [...]`
+/// verbatim allowlist, plus every key it READS off the full envelope
+/// (`full["k"]` / `full.get("k")`).
+///
+/// The read side is what covers a RENAME: compact answers `files` from
+/// `full["files_count"]` and `active` from `full["active_exports"]`, so those
+/// producer keys are handled even though neither name appears in the allowlist.
+/// Without this, extending the producer scan to the seed literal would have
+/// reported six false positives and pushed a future author to silence them in
+/// DELIBERATELY_COMPACTED — turning the fix into a bigger hole than the bug.
+fn compact_covered_keys(forwarder: &str) -> Vec<String> {
+    let mut keys = compact_allowlist(forwarder);
+    for (marker, terminator) in [("full[\"", "\""), ("full.get(\"", "\"")] {
+        let mut rest = forwarder;
+        while let Some(i) = rest.find(marker) {
+            let after = &rest[i + marker.len()..];
+            if let Some(j) = after.find(terminator) {
+                keys.push(after[..j].to_string());
+                rest = &after[j..];
+            } else {
+                break;
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// Extract the quoted keys from the `for key in [ ... ]` compact allowlist array.
 fn compact_allowlist(compact_region: &str) -> Vec<String> {
     let anchor = "for key in [";
@@ -184,14 +304,83 @@ fn fn_region<'a>(src: &'a str, name: &str) -> &'a str {
 fn uncovered_compact_keys(overview_src: &str) -> Vec<String> {
     let producer = fn_region(overview_src, "tool_module_overview");
     let forwarder = fn_region(overview_src, "compact_module_overview");
-    let allowlist = compact_allowlist(forwarder);
-    let mut uncovered: Vec<String> = assigned_result_keys(producer)
+    let covered = compact_covered_keys(forwarder);
+    let mut uncovered: Vec<String> = produced_envelope_keys(producer)
         .into_iter()
-        .filter(|k| !allowlist.contains(k) && !DELIBERATELY_COMPACTED.contains(&k.as_str()))
+        .filter(|k| !covered.contains(k) && !DELIBERATELY_COMPACTED.contains(&k.as_str()))
         .collect();
     uncovered.sort();
     uncovered.dedup();
     uncovered
+}
+
+/// The guard's own negative control (CON-18(a)).
+///
+/// `compact_allowlist_covers_all_result_keys` passing proves nothing on its own —
+/// it passed for the whole time the scan could not see a seed-literal key. So
+/// each shape a key can enter the envelope by is fed through the real extractors
+/// on a synthetic source, and each must be REPORTED when the compactor ignores
+/// it. A shape this misses is a shape the production guard is blind to.
+#[test]
+fn the_guard_reports_an_uncovered_key_in_every_shape_it_can_arrive_in() {
+    let compactor_ignoring_everything = "
+        fn compact_module_overview(&self, full: &serde_json::Value) -> Result<Value> {
+            let mut result = json!({ \"path\": full[\"path\"] });
+            for key in [\"hint\"] { if let Some(v) = full.get(key) { result[key] = v.clone(); } }
+            Ok(result)
+        }";
+    for (shape, producer_body) in [
+        (
+            "json! seed literal",
+            "fn tool_module_overview(&self) -> Result<Value> {
+                 let mut result = json!({ \"path\": p, \"leaked_key\": v });
+                 Ok(result)
+             }",
+        ),
+        (
+            "index assignment",
+            "fn tool_module_overview(&self) -> Result<Value> {
+                 let mut result = json!({ \"path\": p });
+                 result[\"leaked_key\"] = json!(v);
+                 Ok(result)
+             }",
+        ),
+        (
+            "as_object_mut insert",
+            "fn tool_module_overview(&self) -> Result<Value> {
+                 let mut result = json!({ \"path\": p });
+                 result.as_object_mut().unwrap().insert(\"leaked_key\".into(), json!(v));
+                 Ok(result)
+             }",
+        ),
+    ] {
+        let src = format!("{producer_body}\n{compactor_ignoring_everything}");
+        assert!(
+            uncovered_compact_keys(&src).contains(&"leaked_key".to_string()),
+            "a key introduced by {shape} must be reported as uncovered; \
+             the guard saw {:?}",
+            uncovered_compact_keys(&src)
+        );
+    }
+
+    // ...and a key the compactor DOES read must not be reported, or the guard
+    // pushes authors to silence real coverage in DELIBERATELY_COMPACTED.
+    let covered_src = format!(
+        "fn tool_module_overview(&self) -> Result<Value> {{
+             let mut result = json!({{ \"path\": p, \"files_count\": n }});
+             Ok(result)
+         }}
+         {compactor_ignoring_everything}"
+    )
+    .replace(
+        "json!({ \"path\": full[\"path\"] })",
+        "json!({ \"path\": full[\"path\"], \"files\": full[\"files_count\"] })",
+    );
+    assert!(
+        uncovered_compact_keys(&covered_src).is_empty(),
+        "a renamed-but-forwarded key must not be reported: {:?}",
+        uncovered_compact_keys(&covered_src)
+    );
 }
 
 #[test]
