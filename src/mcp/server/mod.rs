@@ -1102,7 +1102,7 @@ impl McpServer {
         }
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         std::thread::spawn(move || {
-            let outcome = (|| -> Result<(usize, usize, usize, usize)> {
+            let outcome = (|| -> Result<(usize, usize, usize, usize, usize)> {
                 let db = Database::open_with_vec(&db_path)?;
                 #[cfg(feature = "embed-model")]
                 let model = EmbeddingModel::load().ok().flatten();
@@ -1118,6 +1118,17 @@ impl McpServer {
                 // can never nuke live vectors. Independent of embed-model: the vec table exists in
                 // all builds and reap is a cheap anti-join + point deletes.
                 let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
+                // Reclaim the chunk slots that churn strands (audit 2026-08-29 STO-01).
+                // sqlite-vec only ever inserts into the newest chunk and never reuses a
+                // deleted slot, so every generation — incremental re-index, re-embed,
+                // INDEX_VERSION wipe — leaves its vectors' space allocated forever: this
+                // repo reached 189 MB of chunks for ~7.7 MB of live vectors. Runs after
+                // the reap so the rewrite carries the smallest possible set, and inside
+                // this same once-per-session thread because it takes the write lock.
+                // Independent of embed-model for the same reason the reap is: it moves
+                // bytes that already exist and never reaches the model.
+                let compacted =
+                    crate::storage::queries::compact_node_vectors_if_wasteful(db.conn())?;
                 // Same-dim model-swap guard BEFORE seeding (ordering matters): if the model
                 // changed, drop the stale cache + node_vectors now so the seed below cannot
                 // repopulate the cache with OLD-model embeddings that a matching-but-stale
@@ -1140,14 +1151,14 @@ impl McpServer {
                 // Same empty-nodes safety valve as the reap, so a mid-rebuild window can't wipe
                 // the reuse cache.
                 let pruned = crate::storage::queries::gc_embedding_cache(db.conn())?;
-                Ok((repaired, reaped, seeded, pruned))
+                Ok((repaired, reaped, compacted, seeded, pruned))
             })();
             match outcome {
-                Ok((0, 0, 0, 0)) => {}
-                Ok((repaired, reaped, seeded, pruned)) => tracing::info!(
+                Ok((0, 0, 0, 0, 0)) => {}
+                Ok((repaired, reaped, compacted, seeded, pruned)) => tracing::info!(
                     "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors; \
-                     seeded {} cache entries; pruned {} stale",
-                    repaired, reaped, seeded, pruned
+                     compacted {} vectors; seeded {} cache entries; pruned {} stale",
+                    repaired, reaped, compacted, seeded, pruned
                 ),
                 Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
             }

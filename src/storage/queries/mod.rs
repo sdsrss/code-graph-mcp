@@ -65,7 +65,8 @@ pub use routes::{
 pub use search::fts5_search_with_tests;
 pub use search::{find_functions_by_fuzzy_name, fts5_search, FtsResult, NameCandidate};
 pub use vectors::{
-    count_nodes_with_vectors, count_unembedded_nodes, delete_node_vectors_batch,
-    get_node_embedding, get_unembedded_nodes, get_unembedded_nodes_excluding, insert_node_vector,
-    insert_node_vectors_batch, reap_orphan_vectors, vector_search,
+    compact_node_vectors, compact_node_vectors_if_wasteful, count_nodes_with_vectors,
+    count_unembedded_nodes, delete_node_vectors_batch, get_node_embedding, get_unembedded_nodes,
+    get_unembedded_nodes_excluding, insert_node_vector, insert_node_vectors_batch,
+    reap_orphan_vectors, vec_slot_occupancy, vector_search,
 };

@@ -61,6 +61,152 @@ pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+/// `(live vectors, allocated slots)` in the sqlite-vec chunk allocator.
+///
+/// sqlite-vec stores vectors in fixed-size chunks and only ever inserts into the
+/// NEWEST one (`vendor/sqlite-vec/sqlite-vec.c:3518`, `:7703-7716`); a DELETE
+/// clears a validity bit and the slot is never reused. So the allocated total is
+/// a high-water mark across every generation of the index, not a measure of what
+/// is stored now.
+pub fn vec_slot_occupancy(conn: &Connection) -> Result<(i64, i64)> {
+    let live: i64 = conn.query_row("SELECT COUNT(*) FROM node_vectors_rowids", [], |r| r.get(0))?;
+    let slots: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(size), 0) FROM node_vectors_chunks",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok((live, slots))
+}
+
+/// Bytes the chunk allocator has claimed for vectors, live or not.
+fn allocated_vector_bytes(slots: i64) -> i64 {
+    slots * crate::domain::EMBEDDING_DIM as i64 * std::mem::size_of::<f32>() as i64
+}
+
+/// Rewrite `node_vectors` so its chunks hold only the vectors that are still
+/// live, and return how many were carried over.
+///
+/// Every churn generation strands slots — an incremental re-index cascade-deletes
+/// a file's nodes (the `nodes_vectors_ad` trigger takes their vectors with them)
+/// and re-embeds under new node ids, `delete_node_vectors_batch` drops vectors
+/// for re-embedding, an INDEX_VERSION bump wipes the whole table. None of that
+/// space comes back, so `index.db` grows monotonically under churn: measured on
+/// this repo, 5,015 live vectors against 129,024 allocated slots (3.9%) and a
+/// 189 MB `node_vectors_vector_chunks00` holding ~7.7 MB of vectors.
+///
+/// Rewrites rather than dropping and letting the backfill re-embed (the audit's
+/// suggested shape). A rewrite is a byte copy of vectors that already exist, so
+/// it needs neither a loadable model nor complete `embedding_cache` coverage —
+/// it is therefore correct in a `--no-default-features` build, and it cannot
+/// turn a cache miss into inference on a startup path. Vectors stream through a
+/// temp table instead of Rust memory: at 384 dims a 100k-node index would be
+/// 150 MB held at once.
+///
+/// The whole rewrite is one transaction: a failure anywhere rolls back and the
+/// vectors stay exactly as they were. Orphans (a vector whose node is gone) are
+/// dropped in passing by the join — the same rows [`reap_orphan_vectors`] takes.
+pub fn compact_node_vectors(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.vec_compact;
+         CREATE TEMP TABLE vec_compact(
+             node_id   INTEGER PRIMARY KEY,
+             embedding BLOB NOT NULL
+         );",
+    )?;
+    tx.execute(
+        "INSERT INTO temp.vec_compact(node_id, embedding)
+         SELECT v.node_id, v.embedding
+         FROM node_vectors v
+         JOIN nodes n ON n.id = v.node_id",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
+    tx.execute_batch(&crate::storage::schema::create_vec_tables_sql())?;
+    let restored = tx.execute(
+        "INSERT INTO node_vectors(node_id, embedding)
+         SELECT node_id, embedding FROM temp.vec_compact",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE IF EXISTS temp.vec_compact;")?;
+    tx.commit()?;
+    Ok(restored)
+}
+
+/// Compact the vector table when the allocator is mostly holding dead slots,
+/// then return the freed pages to the filesystem. Returns the number of vectors
+/// rewritten, or 0 when nothing was worth doing.
+///
+/// Two thresholds, both required:
+/// - occupancy below [`VEC_COMPACT_MAX_OCCUPANCY`], because a table that is
+///   mostly live has nothing to win and a rewrite is not free;
+/// - at least [`VEC_COMPACT_MIN_ALLOCATED_BYTES`] claimed, so a small index never
+///   pays for a rewrite that would save a few hundred KB.
+///
+/// Skipped entirely when `nodes` is empty — the same safety valve
+/// [`reap_orphan_vectors`] uses. A mid-rebuild or version-bump window looks
+/// exactly like "0% occupancy" from here, and compacting through it would race
+/// the rebuild for the write lock for no gain.
+///
+/// The VACUUM is what actually returns the disk: DROP TABLE moves the chunk
+/// pages onto the freelist, and the file itself does not shrink until the
+/// database is rewritten. It is best-effort — VACUUM needs the whole database
+/// briefly, so a concurrent CLI writer makes it fail with SQLITE_BUSY, and the
+/// only cost of that is that the pages stay on the freelist for the next
+/// session (they are reused before the file grows again).
+pub fn compact_node_vectors_if_wasteful(conn: &Connection) -> Result<usize> {
+    compact_node_vectors_when(
+        conn,
+        VEC_COMPACT_MAX_OCCUPANCY,
+        VEC_COMPACT_MIN_ALLOCATED_BYTES,
+    )
+}
+
+/// [`compact_node_vectors_if_wasteful`] with the thresholds as parameters, so a
+/// test can exercise the gate without writing the 16 MB of vectors the
+/// production floor requires.
+pub(crate) fn compact_node_vectors_when(
+    conn: &Connection,
+    max_occupancy: f64,
+    min_allocated_bytes: i64,
+) -> Result<usize> {
+    let nodes_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM nodes)", [], |r| {
+        r.get::<_, i64>(0)
+    })? == 1;
+    if !nodes_present {
+        return Ok(0);
+    }
+    let (live, slots) = vec_slot_occupancy(conn)?;
+    let allocated = allocated_vector_bytes(slots);
+    if allocated < min_allocated_bytes {
+        return Ok(0);
+    }
+    if slots == 0 || (live as f64 / slots as f64) >= max_occupancy {
+        return Ok(0);
+    }
+
+    let restored = compact_node_vectors(conn)?;
+    tracing::info!(
+        "[vec-compact] rewrote {} live vector(s); allocator was holding {} slot(s) ({:.1} MB) at {:.1}% occupancy",
+        restored,
+        slots,
+        allocated as f64 / 1_048_576.0,
+        live as f64 / slots as f64 * 100.0,
+    );
+    if let Err(e) = conn.execute_batch("VACUUM;") {
+        tracing::debug!(
+            "[vec-compact] VACUUM skipped ({}); freed pages stay on the freelist",
+            e
+        );
+    }
+    Ok(restored)
+}
+
+/// Compact below this live-to-allocated ratio.
+const VEC_COMPACT_MAX_OCCUPANCY: f64 = 0.25;
+/// ...and only once the allocator holds at least this much.
+const VEC_COMPACT_MIN_ALLOCATED_BYTES: i64 = 16 * 1024 * 1024;
+
 pub fn vector_search(
     conn: &Connection,
     query_embedding: &[f32],
@@ -351,6 +497,211 @@ mod tests {
             vec_count(conn),
             0,
             "direct node delete must reap the vector (no orphan)"
+        );
+    }
+
+    /// Insert `n` nodes each carrying a distinct vector, and return their ids.
+    fn seed_vectors(conn: &Connection, path: &str, n: usize) -> Vec<i64> {
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: path.into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        (0..n)
+            .map(|i| {
+                let nid = insert_node(
+                    conn,
+                    &NodeRecord {
+                        file_id: fid,
+                        node_type: "function".into(),
+                        name: format!("f{i}"),
+                        qualified_name: None,
+                        start_line: 1,
+                        end_line: 2,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: Some("ctx".into()),
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )
+                .unwrap();
+                let mut emb = vec![0.0f32; crate::domain::EMBEDDING_DIM];
+                emb[0] = i as f32;
+                emb[1] = (i * 2) as f32;
+                insert_node_vector(conn, nid, &emb).unwrap();
+                nid
+            })
+            .collect()
+    }
+
+    /// STO-01. A rewrite must return the SAME bytes for every surviving vector —
+    /// this is the whole safety argument for compacting on a startup path, since
+    /// a silently-corrupted embedding would degrade semantic search without ever
+    /// failing anything.
+    #[test]
+    fn compaction_preserves_every_live_vector_byte_for_byte() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let ids = seed_vectors(conn, "a.ts", 40);
+        let before: Vec<(i64, Vec<u8>)> = ids
+            .iter()
+            .map(|&id| (id, get_node_embedding(conn, id).unwrap()))
+            .collect();
+
+        let restored = compact_node_vectors(conn).unwrap();
+
+        assert_eq!(
+            restored,
+            ids.len(),
+            "every live vector must be carried over"
+        );
+        for (id, bytes) in &before {
+            assert_eq!(
+                &get_node_embedding(conn, *id).unwrap(),
+                bytes,
+                "vector for node {id} must survive the rewrite unchanged"
+            );
+        }
+        // The table must still be a working vec0 index, not just a byte store.
+        let mut probe = vec![0.0f32; crate::domain::EMBEDDING_DIM];
+        probe[0] = 7.0;
+        probe[1] = 14.0;
+        let hits = vector_search(conn, &probe, 1).unwrap();
+        assert_eq!(
+            hits.first().map(|(id, _)| *id),
+            Some(ids[7]),
+            "KNN search must still find the nearest vector after the rewrite"
+        );
+    }
+
+    /// The rewrite drops vectors whose node is gone — the rows `reap_orphan_vectors`
+    /// targets — rather than carrying dead weight into the new chunks.
+    #[test]
+    fn compaction_drops_orphans_and_keeps_live() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let ids = seed_vectors(conn, "a.ts", 5);
+        // Orphan one vector the way the backfill race does: insert past the trigger.
+        conn.execute("DROP TRIGGER IF EXISTS nodes_vectors_ad", [])
+            .unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = ?1", [ids[0]])
+            .unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            5,
+            "precondition: the orphan is still in the table"
+        );
+
+        let restored = compact_node_vectors(conn).unwrap();
+
+        assert_eq!(restored, 4, "the orphan must not be carried over");
+        assert!(
+            get_node_embedding(conn, ids[0]).is_err(),
+            "orphan vector must be gone"
+        );
+        for id in &ids[1..] {
+            assert!(
+                get_node_embedding(conn, *id).is_ok(),
+                "live vector {id} must remain"
+            );
+        }
+    }
+
+    /// The gate, in both directions.
+    ///
+    /// Note what the first assertion says about the allocator: sqlite-vec claims a
+    /// whole 1024-slot chunk at the first insert, so a fresh index with 30
+    /// vectors already reads as ~3% occupied. The
+    /// occupancy ratio ALONE would therefore rewrite a small, perfectly healthy
+    /// index on every startup — it is the size floor, not the ratio, that makes
+    /// this safe, which is why both thresholds are required.
+    #[test]
+    fn compaction_gate_fires_only_on_a_wasteful_allocator() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let ids = seed_vectors(conn, "a.ts", 2100);
+        let (live, slots) = vec_slot_occupancy(conn).unwrap();
+        assert_eq!(live, 2100);
+        assert!(
+            (live as f64 / slots as f64) >= 0.25,
+            "precondition: {live}/{slots} is a healthy allocator by the production ratio"
+        );
+        assert_eq!(
+            compact_node_vectors_when(conn, 0.25, 0).unwrap(),
+            0,
+            "a healthy allocator must not be rewritten"
+        );
+
+        // Strand slots the way churn does: delete most vectors, keep the chunk.
+        for id in &ids[..2080] {
+            conn.execute("DELETE FROM nodes WHERE id = ?1", [id])
+                .unwrap();
+        }
+        let (live, slots) = vec_slot_occupancy(conn).unwrap();
+        assert_eq!(live, 20, "20 vectors left alive");
+        assert!(
+            slots >= 3072,
+            "the allocator still holds the stranded slots ({slots})"
+        );
+
+        // Below the size floor the gate stays shut even at 2% occupancy...
+        assert_eq!(
+            compact_node_vectors_when(conn, 0.25, 16 * 1024 * 1024).unwrap(),
+            0,
+            "a small table must not pay for a rewrite"
+        );
+        // ...and fires once the floor is met.
+        assert_eq!(
+            compact_node_vectors_when(conn, 0.25, 0).unwrap(),
+            20,
+            "a mostly-dead allocator over the floor must be rewritten"
+        );
+        let (live_after, slots_after) = vec_slot_occupancy(conn).unwrap();
+        assert_eq!(live_after, 20, "the live vectors survive");
+        assert!(
+            slots_after < slots,
+            "the rewrite must release stranded slots ({slots} -> {slots_after})"
+        );
+    }
+
+    /// The same empty-nodes valve `reap_orphan_vectors` carries: a mid-rebuild or
+    /// version-bump window reads as 0% occupancy, and compacting through it would
+    /// fight the rebuild for the write lock to reclaim space the rebuild is about
+    /// to reclaim anyway.
+    #[test]
+    fn compaction_never_runs_against_an_empty_nodes_table() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let ids = seed_vectors(conn, "a.ts", 10);
+        for id in &ids {
+            conn.execute("DELETE FROM nodes WHERE id = ?1", [id])
+                .unwrap();
+        }
+        assert_eq!(
+            compact_node_vectors_when(conn, 0.99, 0).unwrap(),
+            0,
+            "no nodes means no compaction, whatever the occupancy says"
         );
     }
 
