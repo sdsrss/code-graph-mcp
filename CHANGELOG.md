@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Seventeen items from the 2026-08-29 audit: the two that made the index diverge
+Eighteen items from the 2026-08-29 audit: the two that made the index diverge
 from a rebuild or grow without bound, two answers that were wrong rather than
 terse (a source window cut at pre-edit offsets, and a compact map with no URLs in
 it), a benchmark that had reported success for a month without measuring
@@ -121,6 +121,31 @@ the `json!({…})` seed, so a seventh could have been added, silently dropped in
 literal and `insert()` as well, and reads the compactor's `full["k"]` accesses as
 coverage so renamed-but-forwarded keys are not reported as holes. Both halves are
 mutation-verified.
+
+### `project_map`'s description told the model it already had the map
+
+The description ended "SessionStart already injected; recall after major
+refactor." That injection has been off by default since v0.17.0 (opt in with
+`CODE_GRAPH_VERBOSE_HOOKS=1`, and even then only for adopted projects), and the
+shipped detail doc says so — so the two steering surfaces contradicted each
+other, and the one the model reads was the false one.
+
+The timeline is the interesting part. v0.17.0 removed the dump and named its
+replacement in as many words: *"The decision table + the on-demand `project_map`
+MCP tool + the per-tool descriptions cover every workflow that the SessionStart
+map dump used to support."* The clause was then added three patch releases later,
+at v0.17.3, telling the model the dump still happens — suppressing exactly the
+call v0.17.0 had designated as the dump's replacement. It was recorded at the
+time as saving ~33K tokens/month of "redundant" `project_map` calls at zero
+routing regression. The tokens were real; the calls were not redundant, because
+the thing they supposedly duplicated had already been switched off.
+
+Now a positive cue rather than a qualified one — negative "don't call this
+unless…" framing measured 20pp worse in this repo's own bench. Re-benched per the
+tool-description contract (sonnet-4.5, tool-only, Backend): baseline 22/22 =
+100.0%, after 22/22 = 100.0%. That shows no triage regression; it does not show
+the intended gain, since tool-only P@1 measures which tool is picked once the
+model has decided to pick one, not whether it decides to.
 
 ### The routing bench reported success for four weeks without measuring anything
 
