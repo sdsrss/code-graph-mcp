@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-Fourteen items from the 2026-08-29 audit: the two that made the index diverge
-from a rebuild or grow without bound, the guard hole that let that class come
-back, and a batch of hook-latency, determinism and diagnosis fixes. Other items
-from that report remain open. Old indexes rebuild once on first use
-(INDEX_VERSION 69 → 70).
+Sixteen items from the 2026-08-29 audit: the two that made the index diverge from
+a rebuild or grow without bound, two answers that were wrong rather than terse
+(a source window cut at pre-edit offsets, and a compact map with no URLs in it),
+the guard holes that let those classes come back, and a batch of hook-latency,
+determinism and diagnosis fixes. Other items from that report remain open. Old
+indexes rebuild once on first use (INDEX_VERSION 69 → 70).
 
 ### A file appearing or vanishing left every file that depends on it stale
 
@@ -119,6 +120,59 @@ the `json!({…})` seed, so a seventh could have been added, silently dropped in
 literal and `insert()` as well, and reads the compactor's `full["k"]` accesses as
 coverage so renamed-but-forwarded keys are not reported as holes. Both halves are
 mutation-verified.
+
+### `get_ast_node` by node_id could return a different symbol's code as yours
+
+`get_ast_node(node_id)` and `show --node-id` are the only read paths that cut a
+source *window* out of the live file — `read_source_context` opens the current
+bytes and takes `start_line − context .. end_line + context` — and both took
+those offsets from the index without refreshing it first. `context_lines`
+defaults to 3 on exactly this branch and nowhere else.
+
+Neither freshness mechanism reached it: MCP's `ensure_file_fresh_opt` fires only
+on the `file_path` branch (the comment there reasoned a node_id lookup "has no
+path to refresh against" — the row it is about to read carries the path), and the
+CLI's resync sits in the `else` arm, so `show <symbol>` resynced and
+`show --node-id` did not. With ten lines inserted above a function, asking for it
+by id returned:
+
+```json
+{"name": "con10_target", "signature": "() -> i32",
+ "code_content": "// pad 0\n// pad 1\n// pad 2\n// pad 3\n// pad 4"}
+```
+
+Five comment lines, under the right name and signature. Silent, because the
+fallback to the stored `code_content` fires only when the file cannot be read at
+all — and a shifted file reads fine.
+
+Both surfaces now refresh the node's file first, then re-resolve **by identity**
+(file, type, qualified name), never by id, through one shared helper. `nodes.id`
+is a bare `INTEGER PRIMARY KEY` — a rowid alias, no `AUTOINCREMENT` — and a
+re-index deletes and re-inserts the file's rows, so SQLite hands freed ids back
+out. Mutating the fix to re-resolve by id and asking for a *deleted* symbol's id
+returns the neighbouring function's full body and signature with no error; the
+regression test is red under exactly that mutation. When a refresh does renumber,
+the response says so (`node_id_renumbered`) instead of leaving you holding a dead
+id; when the symbol is gone, it says that. `skip_indexing` still suppresses all
+of it.
+
+### compact `project_map` answered "what HTTP endpoints?" with no URLs
+
+Compact mode hand-rebuilds the envelope, and two of its nested arrays had drifted
+from the full one. `entry_points` dropped `route` — so a compact map replied to an
+HTTP-surface question with handler names, file paths and no endpoints, the one
+field the question asks for. `module_dependencies` dropped `imports`, the edge
+weight, which is what makes the list rankable at all. Neither was documented as
+trimmed. `hot_functions` *is* trimmed on purpose (15 → 10) but said nothing about
+it, so a short list read as the whole list; the trim stays and now discloses via
+`hot_functions_truncated` + `hot_functions_total`. CLI `map --compact --json` cut
+the same rows with no marker while its text mode printed "... and N more", so it
+gets the same two keys.
+
+Two guards already covered this envelope's top-level keys and its `modules[]`
+entries, after that drift recurred three times; the three other nested arrays had
+none. They do now, with a negative control that mutates both key sources — the
+`json!` literal and the conditional `obj["k"] =` assignment — for each array.
 
 ## v0.127.0 (2026-08-31)
 
