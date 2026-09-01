@@ -93,7 +93,7 @@ test('cleanupDisabledStatusline restores previous statusline and removes registr
   const out = execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   // Disabled (not uninstalled) → settings are cleaned but the cache must
   // survive: the user may re-enable, and re-download costs ~40MB.
@@ -113,7 +113,7 @@ test('statusline exits cleanly and self-heals when plugin is disabled', (t) => {
   fs.writeFileSync(path.join(projectDir, '.code-graph', 'index.db'), '');
 
   const stdout = execFileSync(process.execPath, [statuslinePath], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
     cwd: projectDir,
   }).toString();
 
@@ -130,7 +130,7 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
   const out = execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   // Genuine uninstall → the composite render is the ONLY plugin code that still
   // runs (CC stopped loading hooks.json), so it must also reclaim the cache.
@@ -170,7 +170,7 @@ test('cleanupDisabledStatusline unadopts every registered project on a genuine u
   const out = JSON.parse(execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString());
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString());
 
   assert.equal(out.cacheRemoved, true);
   assert.deepEqual(out.unadopted.map((u) => u.cleaned), [true, true], 'both projects cleaned');
@@ -212,7 +212,7 @@ test('the uninstall sweep keeps the registry when a project could not be cleaned
     out = JSON.parse(execFileSync(process.execPath, ['-e', `
       const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
       process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-    `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
+    `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
   } finally {
     fs.chmodSync(bad, 0o700);
   }
@@ -247,7 +247,7 @@ test('an UNUSABLE registry stops the sweep and is preserved byte-for-byte', (t) 
   const out = JSON.parse(execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] }).toString());
 
   assert.equal(out.registryUnusable, true, 'the refusal must be reported, not silent');
   assert.deepEqual(out.unadopted, []);
@@ -273,7 +273,7 @@ test('the uninstall sweep tells the user which projects it rewrote', (t) => {
   const res = spawnSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     cleanupDisabledStatusline();
-  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
 
   assert.match(res.stderr, /code-graph/, 'the notice is tagged like every other plugin line');
   assert.match(res.stderr, /uninstall/i, 'it says WHY the files changed');
@@ -292,7 +292,7 @@ test('a temporary disable does NOT unadopt (the user may re-enable)', (t) => {
   const out = JSON.parse(execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString());
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString());
 
   assert.deepEqual(out.unadopted, [], 'disable is reversible — adoption stays');
   assert.equal(out.cacheRemoved, false);
@@ -310,7 +310,7 @@ test('isPluginUninstalled distinguishes a genuine uninstall from a temporary dis
   const probe = (home) => JSON.parse(execFileSync(process.execPath, ['-e', `
     const { isPluginUninstalled } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(isPluginUninstalled()));
-  `], { env: { ...process.env, HOME: home } }).toString());
+  `], { env: { ...process.env, HOME: home, USERPROFILE: home } }).toString());
 
   assert.equal(probe(uninstalledHome), true, 'orphaned/no-record → uninstalled');
   assert.equal(probe(disabledHome), false, 'explicit disable → not uninstalled (re-enable safe)');
@@ -325,7 +325,7 @@ test('removeCacheResidue deletes ~/.cache/code-graph and is idempotent', (t) => 
   const run = () => execFileSync(process.execPath, ['-e', `
     const { removeCacheResidue } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(removeCacheResidue()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.equal(run(), 'true');
   assert.equal(fs.existsSync(cacheDir), false, 'cache dir removed');
@@ -420,7 +420,7 @@ test('writeRegistry mirrors entries to durable backup outside ~/.cache/', (t) =>
     const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     registerStatuslineProvider('_previous', 'echo prev', true);
     registerStatuslineProvider('code-graph', 'node /cg.js', false);
-  `], { env: { ...process.env, HOME: homeDir } });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } });
 
   const primary = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   const backup = JSON.parse(fs.readFileSync(backupPath, 'utf8'));
@@ -460,7 +460,7 @@ test('readRegistry self-heals primary from durable backup after cache wipe', (t)
   const out = execFileSync(process.execPath, ['-e', `
     const { readRegistry } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(readRegistry()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   const restored = JSON.parse(out);
   assert.equal(restored.length, 2);
@@ -494,7 +494,7 @@ test('self-heal does not resurrect a stale code-graph entry from a dead install'
   const out = execFileSync(process.execPath, ['-e', `
     const { readRegistry } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(readRegistry()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   const restored = JSON.parse(out);
   const ids = restored.map(p => p.id).sort();
@@ -511,7 +511,7 @@ test('writeRegistry([]) clears both primary and backup', (t) => {
     const { registerStatuslineProvider, unregisterStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     registerStatuslineProvider('code-graph', 'node /cg.js', false);
     unregisterStatuslineProvider('code-graph');
-  `], { env: { ...process.env, HOME: homeDir } });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } });
 
   assert.equal(fs.existsSync(registryPath), false);
   assert.equal(fs.existsSync(backupPath), false);
@@ -520,7 +520,7 @@ test('writeRegistry([]) clears both primary and backup', (t) => {
 test('statusline-chain CLI register/unregister/list + reserved-id guard', (t) => {
   const homeDir = mkHome(t);
   const chainPath = path.join(__dirname, 'statusline-chain.js');
-  const env = { ...process.env, HOME: homeDir };
+  const env = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
 
   const reg = execFileSync(process.execPath, [chainPath, 'register', 'gsd', 'node /gsd.cjs', '--stdin'], { env }).toString();
   assert.match(reg, /registered gsd/);
@@ -587,7 +587,7 @@ test('registerStatuslineProvider refuses to rewrite an UNREADABLE registry (P1-1
   const out = execFileSync(process.execPath, ['-e', `
     const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.equal(out, 'false', 'an unusable registry must report "nothing registered", not success');
   assert.deepEqual(readBytes(registryPath), before.primary,
@@ -607,7 +607,7 @@ test('unregisterStatuslineProvider refuses on an unreadable registry (uninstall 
   const out = execFileSync(process.execPath, ['-e', `
     const { unregisterStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(String(unregisterStatuslineProvider('code-graph')));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.equal(out, 'false');
   assert.deepEqual(readBytes(registryPath), before.primary);
@@ -629,7 +629,7 @@ test('detachStatuslineIntegration refuses on an unreadable registry instead of d
     const settings = { statusLine: { type: 'command', command: 'node ' + ${JSON.stringify(path.join(homeDir, '.cache', 'code-graph', 'statusline-composite.js'))} } };
     const changed = detachStatuslineIntegration(settings);
     process.stdout.write(JSON.stringify({ changed, hasSlot: !!settings.statusLine }));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.deepEqual(JSON.parse(out), { changed: false, hasSlot: true },
     'an unreadable registry must refuse the detach — deleting statusLine here orphans the user\'s _previous forever');
@@ -649,7 +649,7 @@ test('a CORRUPT registry (valid JSON, wrong shape) is also refused, not overwrit
   const out = execFileSync(process.execPath, ['-e', `
     const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.equal(out, 'false');
   assert.deepEqual(fs.readFileSync(registryPath), before.primary);
@@ -666,7 +666,7 @@ test('the refusal is scoped: a MISSING registry is still a normal fresh registra
   const out = execFileSync(process.execPath, ['-e', `
     const { registerStatuslineProvider } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(String(registerStatuslineProvider('code-graph', 'node /new/statusline.js', false)));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.equal(out, 'true');
   assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')),
@@ -684,7 +684,7 @@ test('an unreadable PRIMARY still self-heals from a readable backup (no data los
     const { registerStatuslineProvider, readRegistry } = require(${JSON.stringify(lifecyclePath)});
     const ok = registerStatuslineProvider('code-graph', 'node /new/statusline.js', false);
     process.stdout.write(JSON.stringify({ ok, ids: readRegistry().map(p => p.id) }));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   // The primary is unusable, so nothing may be written over it; the entries the
   // backup still holds must NOT be reported as gone.
@@ -702,7 +702,7 @@ test('the third-party statusline-chain CLI exits 2 on an unusable registry (no f
   t.after(() => { try { fs.chmodSync(registryPath, 0o600); } catch { /* gone */ } });
   const chainPath = path.join(__dirname, 'statusline-chain.js');
   const { spawnSync } = require('child_process');
-  const env = { ...process.env, HOME: homeDir };
+  const env = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
 
   for (const argv of [['register', 'gsd', 'node /gsd.cjs'], ['unregister', 'gsd']]) {
     const r = spawnSync(process.execPath, [chainPath, ...argv], { env, encoding: 'utf8' });
@@ -725,7 +725,7 @@ test('uninstall REPORTS an unusable installed_plugins.json instead of skipping i
   const out = execFileSync(process.execPath, ['-e', `
     const { uninstall } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(uninstall({ runNpm: () => true, scanGlobalPkgs: () => [] })));
-  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
 
   assert.equal(JSON.parse(out.toString()).installedPluginsUnusable, true);
   assert.deepEqual(fs.readFileSync(installedPath), before, 'and the file itself is untouched');
@@ -758,7 +758,7 @@ test('uninstall neutralizes the statusline slot even when the registry refuses a
   execFileSync(process.execPath, ['-e', `
     const { uninstall } = require(${JSON.stringify(lifecyclePath)});
     uninstall({ runNpm: () => true, scanGlobalPkgs: () => [] });
-  `], { env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'] });
 
   const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   const slot = after.statusLine && after.statusLine.command;
@@ -785,7 +785,7 @@ test('install() registers PreToolUse/PostToolUse/UserPromptSubmit hooks in setti
   });
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
 
   const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
@@ -823,7 +823,7 @@ test('install() strips legacy code-graph hooks AND writes fresh ones (migration 
   });
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
 
   const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
@@ -841,12 +841,12 @@ test('install() is idempotent on settings.json (second call no-op)', (t) => {
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
   const first = fs.readFileSync(settingsPath, 'utf8');
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
   const second = fs.readFileSync(settingsPath, 'utf8');
 
@@ -873,7 +873,7 @@ test('install() preserves foreign plugin hooks (other plugins\' entries survive)
   });
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
 
   const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
@@ -920,13 +920,13 @@ test('uninstall() removes settings.json hook entries end-to-end', (t) => {
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
   const afterInstall = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.ok(afterInstall.hooks?.PreToolUse, 'install must have created hooks');
 
   execFileSync(process.execPath, [lifecyclePath, 'uninstall'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
   const afterUninstall = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   // Our hooks should be gone (foreign ones would survive but we didn't seed any)
@@ -943,7 +943,7 @@ test('hook commands use absolute paths (no ${CLAUDE_PLUGIN_ROOT} in settings.jso
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
 
   execFileSync(process.execPath, [lifecyclePath, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
   const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   const serialized = JSON.stringify(after.hooks || {});
@@ -977,7 +977,7 @@ test('update() from v0.31.x manifest registers fresh hooks in empty settings.jso
   writeJson(settingsPath, {});
 
   const out = execFileSync(process.execPath, [lifecyclePath, 'update'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString();
   assert.match(out, /Updated 0\.31\.2 → /, 'CLI output must show version transition');
 
@@ -1019,7 +1019,7 @@ test('update() from v0.31.x evicts legacy v0.7/v0.8 entries with stale paths', (
   });
 
   execFileSync(process.execPath, [lifecyclePath, 'update'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
 
   const settingsAfter = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
@@ -1053,7 +1053,7 @@ test('update() preserves foreign plugin hooks during upgrade', (t) => {
   });
 
   execFileSync(process.execPath, [lifecyclePath, 'update'], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   });
 
   const settingsAfter = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
@@ -1077,7 +1077,7 @@ function runHealthCheckInChild(homeDir) {
     process.stdout.write(JSON.stringify(lc.healthCheck()));
   `;
   const out = execFileSync(process.execPath, ['-e', code], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
     encoding: 'utf8',
   });
   return JSON.parse(out);
@@ -1160,7 +1160,7 @@ test('scanForBrokenPaths is exported and returns the issue structure', (t) => {
     process.stdout.write(JSON.stringify(lc.scanForBrokenPaths()));
   `;
   const out = execFileSync(process.execPath, ['-e', code], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
     encoding: 'utf8',
   });
   const issues = JSON.parse(out);
@@ -1289,7 +1289,7 @@ function runUninstallInSubprocess(homeDir, { marker, purgeGlobal = false, pkgs }
     process.stdout.write(JSON.stringify({ r, npmCalls }));
   `;
   return JSON.parse(execFileSync(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString());
 }
 
@@ -1349,7 +1349,7 @@ test('uninstall hands the statusLine slot to a surviving third-party provider', 
   const out = execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir } }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
 
   assert.deepEqual(JSON.parse(out),
     { cleaned: true, settingsChanged: true, cacheRemoved: true, unadopted: [], registryUnusable: false });
@@ -1371,7 +1371,7 @@ test('temporary disable keeps the composite when a third-party provider is regis
   execFileSync(process.execPath, ['-e', `
     const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
     cleanupDisabledStatusline();
-  `], { env: { ...process.env, HOME: homeDir } });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } });
 
   const settings = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'));
   // Composite script survives a mere disable and keeps rendering gsd.
@@ -1413,7 +1413,7 @@ test('install stands down after 3 displacements; explicit install re-claims', (t
   writeJson(manifestPath, { version: '0.0.1', config: { statusLine: true } });
 
   const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString());
 
   // Two re-claims, then stand-down; explicit install() re-claims again.
@@ -1453,7 +1453,7 @@ test('stand-down re-arms once the slot is empty again (P2-22)', (t) => {
   });
 
   const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString());
 
   assert.equal(r.claimed, true, 'an empty slot must be claimed — nobody is displacing us');
@@ -1483,7 +1483,7 @@ test('stand-down HOLDS while a foreign provider still occupies the slot (P2-22)'
   });
 
   const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString());
 
   assert.equal(r.cmd, 'node "/peer-plugin/statusline.js"',
@@ -1507,7 +1507,7 @@ test('uninstall --unadopt-all sweeps every registered adopted project', (t) => {
     process.stdout.write(JSON.stringify({ adopted: a.ok, r }));
   `;
   const { adopted, r } = JSON.parse(execFileSync(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
   }).toString());
 
   assert.equal(adopted, true);
@@ -1539,7 +1539,7 @@ function runMigrate(homeDir, extraEnv = {}) {
     const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
     const changed = migrateOldPluginIds({ enabledPlugins: {} });
     process.stdout.write(JSON.stringify({ changed }));
-  `], { env: { ...process.env, HOME: homeDir, ...extraEnv }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, ...extraEnv }, encoding: 'utf8' });
 }
 
 test('migrateOldPluginIds drops legacy IDs from installed_plugins.json', (t) => {
@@ -1564,7 +1564,7 @@ test('migrateOldPluginIds reports an unreadable installed_plugins.json instead o
   const res = require('child_process').spawnSync(process.execPath, ['-e', `
     const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
     migrateOldPluginIds({ enabledPlugins: {} });
-  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
 
   assert.equal(res.status, 0, `must not throw; stderr=${res.stderr}`);
   assert.match(
@@ -1594,7 +1594,7 @@ test('migrateOldPluginIds survives an unwritable installed_plugins.json', (t) =>
   const res = require('child_process').spawnSync(process.execPath, ['-e', `
     const { migrateOldPluginIds } = require(${JSON.stringify(lifecyclePath)});
     migrateOldPluginIds({ enabledPlugins: {} });
-  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
 
   // Restore inline, not in `t.after`: mkHome's own after-hook was registered
   // first and would try to rmSync the still-unwritable directory.

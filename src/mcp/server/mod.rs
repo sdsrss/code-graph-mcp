@@ -3200,6 +3200,221 @@ function handleLogin(req: Request) {
         }
     }
 
+    /// CON-15 (audit 2026-08-29): every numeric MCP argument used to read as
+    /// `as_u64().unwrap_or(default)`, which cannot distinguish "absent" from "sent
+    /// as a string". `{"limit": "50"}` — a plausible spelling when a model fills a
+    /// JSON schema — returned the DEFAULT 20 results and said nothing.
+    ///
+    /// A parity table rather than one test per site, because the site list IS the
+    /// unguarded axis: the string-enum half of this same defect was fixed at every
+    /// entry while the numeric half was fixed at none, and a single-site test would
+    /// have gone green for either state of the other thirteen. Rows are (tool, arg).
+    /// Each row is asserted in both directions — the wrong type is refused, and the
+    /// right type does not trip the same check — so a row cannot pass by being
+    /// unreachable.
+    #[test]
+    fn numeric_arguments_are_refused_rather_than_silently_defaulted() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return helper(); }\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // (tool, companion args needed to reach the read, numeric arg under test)
+        let rows: &[(&str, serde_json::Value, &str)] = &[
+            ("semantic_code_search", json!({"query": "handler"}), "top_k"),
+            ("semantic_code_search", json!({"query": "handler"}), "limit"),
+            ("ast_search", json!({"query": "handler"}), "limit"),
+            (
+                "get_call_graph",
+                json!({"function_name": "handler"}),
+                "depth",
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "similar_top_k",
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "context_lines",
+            ),
+            ("get_ast_node", json!({}), "node_id"),
+            ("find_references", json!({}), "node_id"),
+            ("module_overview", json!({"path": "."}), "deps_depth"),
+            ("module_overview", json!({"path": "."}), "dead_min_lines"),
+            (
+                "project_map",
+                json!({"include_centrality": true}),
+                "centrality_limit",
+            ),
+            (
+                "find_http_route",
+                json!({"route_path": "/x", "downstream": true}),
+                "depth",
+            ),
+            ("dependency_graph", json!({"file_path": "app.ts"}), "depth"),
+            // node_id here was the one site CON-15 missed on the first pass, and
+            // the parity table missed it too — the table had rows for the other
+            // two node_id sites, which is exactly how a table over an axis stops
+            // covering the axis. Its failure mode was the worst of the three: a
+            // string node_id fell through to the symbol_name arm and came back
+            // with "re-query with node_id", so a caller that obeyed the advice
+            // re-sent the same spelling and got the same answer. (pre-tag review)
+            ("find_similar_code", json!({}), "node_id"),
+            (
+                "find_similar_code",
+                json!({"symbol_name": "handler"}),
+                "top_k",
+            ),
+            (
+                "find_similar_code",
+                json!({"symbol_name": "handler"}),
+                "max_distance",
+            ),
+            ("find_dead_code", json!({}), "min_lines"),
+        ];
+
+        let call = |tool: &str, args: serde_json::Value| -> (bool, String) {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            (parsed["result"]["isError"].as_bool().unwrap_or(false), text)
+        };
+
+        for (tool, base, arg) in rows {
+            let mut hostile = base.clone();
+            hostile[*arg] = json!("3"); // the exact shape observed: a numeric string
+            let (is_error, text) = call(tool, hostile);
+            assert!(
+                is_error && text.contains(*arg) && text.contains("must be a"),
+                "{tool}.{arg}: a string where a number belongs must be refused by name; got isError={is_error} text={text}"
+            );
+
+            // Negative control for this same row: the well-typed call must not trip
+            // the type check. It may still fail for unrelated reasons (no embeddings,
+            // nothing indexed) — what must not appear is THIS complaint.
+            let mut typed = base.clone();
+            typed[*arg] = if *arg == "max_distance" {
+                json!(0.5)
+            } else {
+                json!(3)
+            };
+            let (_, text) = call(tool, typed);
+            assert!(
+                !text.contains(&format!("{arg} must be a")),
+                "{tool}.{arg}: a correctly-typed value was refused; got {text}"
+            );
+        }
+    }
+
+    /// A caller must not be able to pick its own telemetry bucket.
+    ///
+    /// The wrong-typed value is echoed back in the error text, and
+    /// `ErrKind::classify` buckets errors by substring match — so before pre-tag
+    /// review, `{"depth": "Ambiguous symbol"}` was recorded in usage.jsonl as
+    /// `ambiguous` rather than `bad_param`, degrading the very metric CON-15
+    /// sharpens. Newly reachable, too: before this batch a wrong-typed numeric
+    /// produced no error at all. `describe_arg` now echoes only the first
+    /// whitespace-delimited token, and every phrase `classify` matches on is
+    /// multi-word, so none can be spelled from the value position.
+    #[test]
+    fn a_caller_cannot_spell_its_way_into_another_error_bucket() {
+        use crate::mcp::metrics::ErrKind;
+        let server = McpServer::new_test();
+
+        // One row per classify phrase reachable from a value. `bad_param` is the
+        // only correct answer for all of them.
+        for hostile in [
+            "Ambiguous symbol",
+            "not found in index",
+            "must be one of",
+            "mutually exclusive",
+            "Indexing in progress",
+            "FOREIGN KEY constraint failed",
+        ] {
+            let resp = server
+                .handle_message(&tool_call_json(
+                    "get_call_graph",
+                    json!({"function_name": "f", "depth": hostile}),
+                ))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(
+                ErrKind::classify(text).as_str(),
+                "bad_param",
+                "a depth of {hostile:?} steered its own bucket; error text was: {text}"
+            );
+        }
+
+        // Negative control: the useful echo still survives. A one-token value is
+        // reproduced in full, so the message a model reads still names what it
+        // actually sent.
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_call_graph",
+                json!({"function_name": "f", "depth": "50"}),
+            ))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("\"50\""),
+            "the echoed value is the point of the message; got: {text}"
+        );
+    }
+
+    /// The other half of CON-15's numeric downgrade: `as_u64()` returns `None` for
+    /// `-3` exactly as it does for `"3"`, so a negative count fell through to the
+    /// default. `module_overview` fed its value on to `find_dead_code`, which
+    /// applied the same fallback a second time.
+    #[test]
+    fn negative_counts_are_refused_rather_than_defaulted() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("app.ts"), "function handler() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        for (tool, args, arg) in [
+            ("find_dead_code", json!({"min_lines": -3}), "min_lines"),
+            (
+                "module_overview",
+                json!({"path": ".", "include_dead": true, "dead_min_lines": -3}),
+                "dead_min_lines",
+            ),
+        ] {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                parsed["result"]["isError"].as_bool().unwrap_or(false)
+                    && text.contains(arg)
+                    && text.contains("non-negative"),
+                "{tool}.{arg}: a negative count must be refused; got {text}"
+            );
+        }
+    }
+
     #[test]
     fn test_semantic_search_unknown_language_rejected() {
         // Parity with CLI `search` and the node_type guard: an unknown language

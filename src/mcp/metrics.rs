@@ -50,6 +50,13 @@ impl ErrKind {
         } else if err_msg.contains("must be one of")
             || err_msg.contains("mutually exclusive")
             || err_msg.contains("Unknown relation filter")
+            // CON-15's numeric half. Without these three the type rejections land
+            // in `Other`, and the bucket whose whole job is "the model is calling
+            // this tool wrong" would miss exactly the misuse that was just made
+            // visible.
+            || err_msg.contains("must be an integer")
+            || err_msg.contains("must be a non-negative integer")
+            || err_msg.contains("must be a number")
         {
             // Invalid parameter VALUE (bad enum / bad combination). Kept ahead of
             // EmptyInput so a wrong value isn't mistaken for a missing one.

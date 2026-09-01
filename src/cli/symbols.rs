@@ -55,6 +55,68 @@ pub(crate) fn emit_exact_ambiguity(
     std::process::exit(1);
 }
 
+/// Which JSON envelope a command wraps its fuzzy-ambiguity candidates in.
+///
+/// ARC-01: `callgraph` and `refs` are the only two fuzzy-Ambiguous sites, and the
+/// two hand-written copies had already drifted into different key names and
+/// different envelope shapes for one concept. Both spellings are PUBLISHED CLI
+/// contract (project CLAUDE.md), so this is parameterised to keep each command's
+/// bytes exactly as they are — unifying the keys would break anyone parsing
+/// either one. The sibling exact-ambiguity path shared its renderer from the
+/// start (`emit_exact_ambiguity` above); this is the leg that stayed forked, and
+/// the drift grew precisely there.
+pub(crate) enum FuzzyEnvelope {
+    /// `callgraph`: `{"results": [], "error": …, "candidates": [...]}`
+    ResultsAndCandidates,
+    /// `refs`: `{"error": …, "suggestions": [...]}`
+    Suggestions,
+}
+
+/// Emit the "ambiguous symbol" error for a FUZZY (not exact) match in the calling
+/// command's own envelope, then exit(1).
+///
+/// `json_suffix` / `human_suffix` are appended to the shared
+/// `Ambiguous symbol 'X': N matches` stem; they differ per command and per
+/// surface, so they stay explicit at the call site rather than being derived.
+pub(crate) fn emit_fuzzy_ambiguity(
+    symbol: &str,
+    cands: &[queries::NameCandidate],
+    json_mode: bool,
+    envelope: FuzzyEnvelope,
+    json_suffix: &str,
+    human_suffix: &str,
+) -> ! {
+    let stem = format!("Ambiguous symbol '{}': {} matches", symbol, cands.len());
+    if json_mode {
+        let sugg: Vec<serde_json::Value> = crate::resolve::candidates_to_json(cands)
+            .into_iter()
+            .take(5)
+            .collect();
+        let error = format!("{stem}{json_suffix}");
+        let payload = match envelope {
+            FuzzyEnvelope::ResultsAndCandidates => serde_json::json!({
+                "results": [],
+                "error": error,
+                "candidates": sugg,
+            }),
+            FuzzyEnvelope::Suggestions => serde_json::json!({
+                "error": error,
+                "suggestions": sugg,
+            }),
+        };
+        println!("{}", payload);
+    } else {
+        eprintln!("[code-graph] {}{}", stem, human_suffix);
+        for c in cands.iter().take(5) {
+            eprintln!(
+                "  {} ({}) in {} [node_id {}]",
+                c.name, c.node_type, c.file_path, c.node_id
+            );
+        }
+    }
+    std::process::exit(1);
+}
+
 /// Resolve a possibly-qualified symbol name (e.g. "Database.open") to a base name
 /// and optional file path for disambiguation. When the user passes a qualified name,
 /// we find the matching node and use its file_path as a filter so that downstream

@@ -578,7 +578,7 @@ function runFindBinary(homeDir, times, cacheContents) {
     const seen = [];
     for (let i = 0; i < ${times}; i++) seen.push(findBinary());
     process.stdout.write(JSON.stringify(seen));
-  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
   return { results: JSON.parse(out), cachePath };
 }
 
@@ -650,6 +650,6 @@ test('clearCache also drops the in-process memo', (t) => {
     fb.findBinary();
     fb.clearCache();
     process.stdout.write(JSON.stringify({ cacheGone: !require('fs').existsSync(${JSON.stringify(cachePath)}) }));
-  `], { env: { ...process.env, HOME: homeDir }, encoding: 'utf8' });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
   assert.deepEqual(JSON.parse(out), { cacheGone: true });
 });

@@ -78,7 +78,7 @@ function readJson(filePath) {
 }
 
 function runScript(homeDir, scriptPath, args = [], options = {}) {
-  const env = { ...process.env, HOME: homeDir };
+  const env = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
   // Do NOT set CLAUDE_PLUGIN_ROOT — lifecycle.js derives PLUGIN_ROOT from __dirname
   // to avoid env var leakage from other plugins in shared hook execution context.
   delete env.CLAUDE_PLUGIN_ROOT;
@@ -174,7 +174,7 @@ test('lifecycle install writes to CLAUDE_CONFIG_DIR instead of ~/.claude when se
   });
 
   // Run install with CLAUDE_CONFIG_DIR set; HOME points elsewhere.
-  const env = { ...process.env, HOME: homeDir, CLAUDE_CONFIG_DIR: configDir };
+  const env = { ...process.env, HOME: homeDir, USERPROFILE: homeDir, CLAUDE_CONFIG_DIR: configDir };
   delete env.CLAUDE_PLUGIN_ROOT;
   execFileSync(process.execPath, [lifecycleCli, 'install'], {
     cwd: repoRoot, env, stdio: ['pipe', 'pipe', 'pipe'],
@@ -532,7 +532,7 @@ test('an unwritable settings.json is reported and does not stamp the manifest', 
   let stdout = '', stderr = '', code = 0;
   try {
     stdout = execFileSync(process.execPath, [lifecycleCli, 'install'], {
-      cwd: repoRoot, env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: repoRoot, env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
     }).toString();
   } catch (err) {
     code = err.status; stdout = err.stdout.toString(); stderr = err.stderr.toString();
@@ -559,9 +559,10 @@ test('cache teardown preserves a registry that still names other projects', (t) 
 
   const out = execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
     const { removeCacheResidue } = require(${JSON.stringify(lifecycleCli)});
     console.log(JSON.stringify({ removed: removeCacheResidue() }));
-  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
 
   assert.equal(JSON.parse(out.trim().split('\n').pop()).removed, true);
   assert.equal(fs.existsSync(binary), false, 'the ~40MB binary is still reclaimed');
@@ -581,8 +582,9 @@ test('cache teardown leaves nothing behind when the registry is already empty', 
 
   execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
     require(${JSON.stringify(lifecycleCli)}).removeCacheResidue();
-  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot });
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot });
 
   assert.equal(fs.existsSync(cacheDir), false,
     'an empty registry strands nothing, so re-creating the dir would just be new residue');
@@ -719,9 +721,10 @@ function inactiveHome(t, settingsBytes, { registry } = {}) {
 function callCleanup(homeDir) {
   return execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
     const r = require(${JSON.stringify(lifecycleCli)}).cleanupDisabledStatusline();
     console.log(JSON.stringify(r));
-  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
 }
 
 test('cleanupDisabledStatusline() preserves non-UTF-8 bytes before rewriting settings.json', (t) => {
@@ -787,7 +790,7 @@ test('the statusline renders instead of throwing when ~/.claude is read-only',
   let code = 0, stderr = '';
   try {
     execFileSync(process.execPath, [path.join(__dirname, 'statusline.js')], {
-      cwd: emptyCwd, env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: emptyCwd, env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
     });
   } catch (err) {
     code = err.status;
@@ -825,8 +828,9 @@ test('scanForBrokenPaths reads a hook command that names the node interpreter by
 
   const out = execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
     console.log(JSON.stringify(require(${JSON.stringify(lifecycleCli)}).scanForBrokenPaths()));
-  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot }).toString();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, cwd: repoRoot }).toString();
 
   const issues = JSON.parse(out.trim().split('\n').pop());
   assert.deepEqual(issues.filter((i) => i.type === 'hook'),
@@ -859,7 +863,7 @@ test('SessionStart reclaims aged cgTmpDir residue', (t) => {
   try {
     execFileSync(process.execPath, [path.join(__dirname, 'session-init.js')], {
       cwd: homeDir,
-      env: { ...process.env, HOME: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+      env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
              CODE_GRAPH_QUIET_HOOKS: '1' },
       input: JSON.stringify({ source: 'startup' }),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -883,7 +887,7 @@ test('uninstall removes the shared tmp dir', (t) => {
 
   execFileSync(process.execPath, [lifecycleCli, 'uninstall'], {
     cwd: repoRoot,
-    env: { ...process.env, HOME: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 

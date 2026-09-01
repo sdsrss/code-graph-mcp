@@ -119,39 +119,17 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 resolved_symbol = resolved;
             }
             CliFuzzyResolution::Ambiguous(cands) => {
-                if json_mode {
-                    let sugg: Vec<serde_json::Value> = cands
-                        .iter()
-                        .take(5)
-                        .map(|c| {
-                            serde_json::json!({
-                                "name": c.name, "file_path": c.file_path, "type": c.node_type,
-                                "node_id": c.node_id, "start_line": c.start_line,
-                            })
-                        })
-                        .collect();
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "results": [],
-                            "error": format!("Ambiguous symbol '{}': {} matches", symbol, cands.len()),
-                            "candidates": sugg,
-                        })
-                    );
-                } else {
-                    eprintln!(
-                        "[code-graph] Ambiguous symbol '{}': {} matches. Did you mean:",
-                        symbol,
-                        cands.len()
-                    );
-                    for c in cands.iter().take(5) {
-                        eprintln!(
-                            "  {} ({}) in {} [node_id {}]",
-                            c.name, c.node_type, c.file_path, c.node_id
-                        );
-                    }
-                }
-                std::process::exit(1);
+                // ARC-01: shared renderer, callgraph's published envelope
+                // (`results` + `candidates`) and its own suffixes. The JSON error
+                // string carries no trailing hint — refs is the one that does.
+                crate::cli::symbols::emit_fuzzy_ambiguity(
+                    symbol,
+                    &cands,
+                    json_mode,
+                    crate::cli::symbols::FuzzyEnvelope::ResultsAndCandidates,
+                    "",
+                    ". Did you mean:",
+                );
             }
             CliFuzzyResolution::NotFound => { /* fall through to empty-nodes branch */ }
         }

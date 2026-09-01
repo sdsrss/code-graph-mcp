@@ -1388,24 +1388,72 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
 /// `tests/cli_e2e.rs` and `doctor.test.js` while missing `install-e2e.test.js`,
 /// and the fix for that missed six more files. CI never sees it — the variable
 /// is unset on the runners — so it can only fail on a developer's machine.
-#[test]
-fn js_test_files_neutralize_claude_config_dir() {
+/// Enumerate the JS test corpus the way CI, pre-commit and the release gate do.
+///
+/// ENG-06 (audit 2026-08-29): this was a non-recursive `read_dir` in two guards
+/// at once, while all three discovery chains have been recursive since the fix
+/// pinned by `scripts/test-discovery-drift-guard.test.js`. The first JS test file
+/// placed in a subdirectory would therefore have RUN in CI while being invisible
+/// to every guard that grades the corpus — the guards' scan surface was narrower
+/// than the surface they guard. Zero nested files exist today, which is why this
+/// was cheap to fix and would have stayed unnoticed.
+///
+/// The `>= N` floors stay at the call sites: they are per-guard vacuity
+/// detectors, and folding them in here is how a shared helper quietly disarms the
+/// checks that lived in its callers.
+fn js_test_files() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return; // an optional directory; the call-site floor catches a bad root
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                walk(&path, out);
+            } else if name.ends_with(".test.js") {
+                out.push(path);
+            }
+        }
+    }
+
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut files = Vec::new();
     for dir in ["claude-plugin/scripts", "scripts"] {
         let d = root.join(dir);
-        let mut found: Vec<_> = fs::read_dir(&d)
-            .unwrap_or_else(|e| panic!("read {}: {e}", d.display()))
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".test.js"))
-            })
-            .collect();
+        // The ROOTS are asserted; only nested dirs may vanish silently. The first
+        // version of this helper let `walk` swallow a missing root and claimed
+        // "the call-site floor catches a bad root" — pre-tag review measured that
+        // it does not: `claude-plugin/scripts` alone holds 34 test files against a
+        // floor of 20, so losing all 6 in `scripts/` would leave both callers
+        // green while scanning less. The old non-recursive code panicked by name;
+        // this restores that.
+        assert!(
+            d.is_dir(),
+            "{dir} is not a directory — the JS corpus moved; update js_test_files() \
+             instead of letting these guards scan a smaller tree"
+        );
+        let mut found = Vec::new();
+        walk(&d, &mut found);
+        assert!(
+            !found.is_empty(),
+            "{dir} holds no *.test.js — a per-root floor, because the call-site \
+             floors are met by the larger root alone"
+        );
         found.sort();
         files.append(&mut found);
     }
+    files
+}
+
+#[test]
+fn js_test_files_neutralize_claude_config_dir() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let files = js_test_files();
     assert!(
         files.len() >= 20,
         "expected the JS test suite to be discovered, found {} files — a path \
@@ -1446,13 +1494,24 @@ fn js_test_files_neutralize_claude_config_dir() {
         let lines: Vec<&str> = src.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
-            // A `process.env.HOME = …` immediately followed by a
-            // `process.env.CLAUDE_CONFIG_DIR = …` is the explicit-pairing form
-            // (install-e2e's generated child script uses it), so look one line
-            // ahead before calling it an offender.
+            // A `process.env.HOME = …` inside a run of `process.env.X = …`
+            // statements that also sets CLAUDE_CONFIG_DIR is the explicit-pairing
+            // form (install-e2e's generated child script uses it).
+            //
+            // This read exactly ONE line ahead until 2026-09-01, which is the same
+            // magic-number mistake the spawn window below documents three versions
+            // of: adding `process.env.USERPROFILE = home;` between the HOME line
+            // and the CLAUDE_CONFIG_DIR line (ENG-05) pushed the pairing out of
+            // view and reddened two correctly-sandboxed files. The bound is now the
+            // redirect BLOCK — consecutive `process.env.* =` assignments — so
+            // inserting another env name into it cannot break the pairing. The 24
+            // is a runaway cap, not a semantic limit, matching the sibling window.
             let paired_next = lines
-                .get(i + 1)
-                .is_some_and(|n| n.contains("process.env.CLAUDE_CONFIG_DIR"));
+                .iter()
+                .skip(i + 1)
+                .take(24)
+                .take_while(|n| n.trim_start().starts_with("process.env."))
+                .any(|n| n.contains("process.env.CLAUDE_CONFIG_DIR"));
             // Two shapes leak the variable:
             //   * a spawn spreading `...process.env` (an env object built from
             //     scratch, `{ HOME: dir, PATH: '' }`, never inherits it);
@@ -1503,9 +1562,12 @@ fn js_test_files_neutralize_claude_config_dir() {
                 && !line.contains("CLAUDE_CONFIG_DIR")
                 && !paired_next
             {
+                // Relative path, not basename: now that the corpus is walked
+                // recursively (ENG-06), two files can share a name and a bare
+                // `doctor.test.js:12` would not say which one.
                 offenders.push(format!(
                     "{}:{}: {}",
-                    path.file_name().unwrap().to_string_lossy(),
+                    path.strip_prefix(root).unwrap_or(path).display(),
                     i + 1,
                     line.trim()
                 ));
@@ -1579,21 +1641,7 @@ fn js_test_files_neutralize_claude_config_dir() {
 #[test]
 fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for dir in ["claude-plugin/scripts", "scripts"] {
-        let d = root.join(dir);
-        let mut found: Vec<_> = fs::read_dir(&d)
-            .unwrap_or_else(|e| panic!("read {}: {e}", d.display()))
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".test.js"))
-            })
-            .collect();
-        found.sort();
-        files.append(&mut found);
-    }
+    let files = js_test_files();
     assert!(
         files.len() >= 20,
         "expected the JS test suite to be discovered, found {} files — a path \
@@ -1921,13 +1969,26 @@ fn test_no_new_undeclared_mcp_args() {
                     continue;
                 }
                 let bytes = line.as_bytes();
-                // Match `args.get("key")` and `args["key"]`.
+                // Match `args.get("key")`, `args["key"]`, and the typed accessors
+                // `arg_*(args, "key", …)` that CON-15 introduced. The third form
+                // is why this scan is written as three patterns rather than one:
+                // it is TEXT, and when the accessor spelling changed under it the
+                // pinned set silently lost `min_lines`. The `read.len() > 10`
+                // floor below is what turned that into a red test.
                 for (idx, _) in line.match_indices("args") {
                     let rest = &line[idx + 4..];
                     let key = if let Some(r) = rest.strip_prefix(".get(\"") {
                         r.split('"').next()
                     } else if let Some(r) = rest.strip_prefix("[\"") {
                         r.split('"').next()
+                    } else if let Some(r) = rest.strip_prefix(", \"") {
+                        // `arg_u64(args, "key", 20)` — only when `args` is itself
+                        // preceded by `arg_…(`, so an unrelated `foo(args, "x")`
+                        // is not mistaken for a caller-supplied key.
+                        line[..idx]
+                            .rfind("arg_")
+                            .filter(|at| line[*at..idx].ends_with('('))
+                            .and_then(|_| r.split('"').next())
                     } else {
                         None
                     };
@@ -1985,6 +2046,11 @@ fn test_no_new_undeclared_mcp_args() {
         "confirm",
         "function_name",
         "ignore_paths",
+        // Same third case as its neighbours: `find_similar_code` publishes no
+        // schema. Not a new argument — it was read as
+        // `args.get("max_distance")` spread over three lines, which this
+        // line-based scan could not see until CON-15 moved it to `arg_f64`.
+        "max_distance",
         "min_lines",
         "skip_indexing",
     ];
@@ -2116,13 +2182,34 @@ fn every_numeric_mcp_argument_is_clamped() {
         ("advanced.rs", "node_id"),
         ("refs.rs", "node_id"),
         // A filter threshold. Raising it HIDES rows (`hidden_below_threshold`
-        // discloses how many), so a large value shrinks the answer.
+        // discloses how many), so a large value shrinks the answer — with one
+        // boundary this claim does not cover, found in pre-tag review and left
+        // as-is because it predates and is untouched by this batch:
+        // `find_dead_code` does `arg_u64(...)? as u32`, so `min_lines >= 2^32`
+        // wraps toward 0 and returns MORE rows, not fewer. Still bounded by the
+        // result set, so it sizes nothing new; recorded so the next reader does
+        // not take the sentence above as unconditional.
         ("advanced.rs", "min_lines"),
         // Bounded at the use site instead of the read: `ast_node.rs:443` passes
         // `top_k.clamp(1, 50)` into `tool_find_similar_code`. Listed rather than
         // "fixed" because moving the clamp earlier would change the documented
         // ceiling of a published parameter for no gain.
         ("ast_node.rs", "similar_top_k"),
+        // The three below are NOT new sites. They were written as
+        // `args.get("k").and_then(|v| v.as_i64())`, which this scan never matched
+        // — it looked for `args["k"]` only — so they were unguarded and silent
+        // until CON-15 moved them onto the typed accessors and the widened scan
+        // surfaced them. Each is classified here rather than clamped:
+        //
+        // A similarity THRESHOLD, not a count. A large value accepts more
+        // neighbours, but how many come back is `top_k`, which is clamped.
+        ("advanced.rs", "max_distance"),
+        // Bounded at the use site, like `similar_top_k`: forwarded as `depth`
+        // into `tool_dependency_graph`, which clamps it to 1..=10.
+        ("overview.rs", "deps_depth"),
+        // A filter threshold forwarded to `find_dead_code`'s `min_lines`, whose
+        // own entry above records why raising it only shrinks the answer.
+        ("overview.rs", "dead_min_lines"),
     ];
 
     let mut files: Vec<_> = std::fs::read_dir(&tools_dir)
@@ -2137,11 +2224,29 @@ fn every_numeric_mcp_argument_is_clamped() {
         files.len()
     );
 
+    // Two spellings, because this is a TEXT scan and CON-15 changed the shape
+    // under it: the old `args["key"].as_u64()` and the typed accessors
+    // (`arg_u64(args, "key", default)`) that replaced it. The `checked` floor
+    // below caught the drift — it dropped from 15 to 1 — which is exactly what
+    // that floor exists for; without it this guard would have gone green while
+    // scanning nothing. Both spellings stay listed: the raw form is still legal
+    // Rust and a future handler could reach for it.
     let mut checked = 0usize;
     let mut unbounded: Vec<String> = Vec::new();
     for path in &files {
         let src = std::fs::read_to_string(path).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        let mut record = |key: &str, stmt: &str| {
+            checked += 1;
+            let exempt = UNBOUNDED_BY_DESIGN
+                .iter()
+                .any(|(f, k)| *f == name.as_str() && *k == key);
+            if !stmt.contains(".clamp(") && !exempt {
+                unbounded.push(format!("{name}: {key}"));
+            }
+        };
+
         let mut rest = src.as_str();
         while let Some(i) = rest.find("args[\"") {
             let after = &rest[i + "args[\"".len()..];
@@ -2151,19 +2256,34 @@ fn every_numeric_mcp_argument_is_clamped() {
             let key = &after[..key_end];
             let stmt_end = after.find(';').unwrap_or(after.len());
             let stmt = &after[..stmt_end];
-            let numeric = stmt.contains(".as_u64()")
+            if stmt.contains(".as_u64()")
                 || stmt.contains(".as_i64()")
-                || stmt.contains(".as_f64()");
-            if numeric {
-                checked += 1;
-                let exempt = UNBOUNDED_BY_DESIGN
-                    .iter()
-                    .any(|(f, k)| *f == name.as_str() && *k == key);
-                if !stmt.contains(".clamp(") && !exempt {
-                    unbounded.push(format!("{name}: args[\"{key}\"]"));
-                }
+                || stmt.contains(".as_f64()")
+            {
+                record(key, stmt);
             }
             rest = &after[key_end..];
+        }
+
+        for accessor in [
+            "arg_u64(args, \"",
+            "arg_i64(args, \"",
+            "arg_f64(args, \"",
+            // Included so the `node_id` entries in UNBOUNDED_BY_DESIGN stay live
+            // rather than becoming dead exemptions for a shape nothing scans.
+            "arg_opt_i64(args, \"",
+        ] {
+            let mut rest = src.as_str();
+            while let Some(i) = rest.find(accessor) {
+                let after = &rest[i + accessor.len()..];
+                let Some(key_end) = after.find('"') else {
+                    break;
+                };
+                let key = &after[..key_end];
+                let stmt_end = after.find(';').unwrap_or(after.len());
+                record(key, &after[..stmt_end]);
+                rest = &after[key_end..];
+            }
         }
     }
 

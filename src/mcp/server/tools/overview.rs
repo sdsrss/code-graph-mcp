@@ -25,6 +25,12 @@ impl McpServer {
                     deps_direction_raw
                 )
             })?;
+        // Same argument, applied to the numeric half (CON-15): both of these are
+        // consumed only inside their `include_*` block, so a wrong-typed value sent
+        // without the companion flag would be swallowed exactly the way a bogus
+        // `deps_direction` used to be. Bind them here so the check is unconditional.
+        let deps_depth = arg_i64(args, "deps_depth", 2)?;
+        let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -267,7 +273,7 @@ impl McpServer {
                 let dep_args = json!({
                     "file_path": path,
                     "direction": deps_direction,
-                    "depth": args.get("deps_depth").and_then(|v| v.as_i64()).unwrap_or(2),
+                    "depth": deps_depth,
                     "compact": compact,
                     "skip_indexing": true,
                 });
@@ -293,10 +299,11 @@ impl McpServer {
         // include_dead: append unreferenced symbols under this path.
         // Folds the former find_dead_code tool (v0.18.4).
         if include_dead {
-            let min_lines = args
-                .get("dead_min_lines")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(3);
+            // Bound at entry (above) as u64: this is forwarded to find_dead_code's
+            // `min_lines`, whose own `as_u64` used to turn a negative into the
+            // default a SECOND time — CON-15's double downgrade. Rejecting means
+            // the caller hears about it once, at the surface they actually called.
+            let min_lines = dead_min_lines;
             let dead_args = json!({
                 "path": path,
                 "min_lines": min_lines,

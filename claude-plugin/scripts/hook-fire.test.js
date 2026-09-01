@@ -120,7 +120,7 @@ test('CLI verify-hooks-fire runs and writes hook-fire-state.json (HOME-redirecte
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hf-home-'));
   try {
     const r = spawnSync(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'verify-hooks-fire'], {
-      env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 30000,
+      env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8', timeout: 30000,
     });
     assert.equal(r.status, 0, `CLI exit ${r.status}: ${r.stderr}`);
     assert.match(r.stdout, /Hook firing: (OK|FAIL)/);

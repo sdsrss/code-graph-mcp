@@ -597,7 +597,7 @@ function runDoctorCli(homeDir, args, entry = ENTRY_POINTS[0]) {
       // for any developer who exports it. The `no arguments still repairs` case
       // below runs the full repair pass, which is what would land in their real
       // config. Same fix as tests/cli_e2e.rs; this JS sibling was missed.
-      env: { ...process.env, HOME: homeDir, CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude') },
+      env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude') },
       stdio: ['pipe', 'pipe', 'pipe'],
     }).toString();
     return { code: 0, stdout, stderr: '' };
@@ -981,14 +981,22 @@ test('every doctor row is repairable or explicitly advisory', () => {
   // whatever the current build actually emits rather than a transcription.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-rows-'));
   const prevHome = process.env.HOME;
+  // USERPROFILE is saved/restored alongside HOME because `os.homedir()` reads it
+  // instead of HOME on Windows — an in-process HOME override alone leaves this
+  // test running `runDiagnostics` against the developer's real home there
+  // (ENG-05, the same axis as the TMPDIR/TMP/TEMP rule next door).
+  const prevUserProfile = process.env.USERPROFILE;
   const prevConfig = process.env.CLAUDE_CONFIG_DIR;
   let rows;
   try {
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
     rows = runDiagnostics({ checkOnly: true });
   } finally {
     if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
     if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prevConfig;
     fs.rmSync(home, { recursive: true, force: true });

@@ -107,7 +107,7 @@ test('launchBackgroundAutoUpdate spawns detached silent updater', () => {
         record.unrefCalled = true;
       },
     };
-  }, { HOME: '/tmp/fake-home' });
+  }, { HOME: '/tmp/fake-home', USERPROFILE: '/tmp/fake-home' });
 
   assert.equal(ok, true);
   assert.equal(calls.length, 1);
@@ -182,7 +182,7 @@ test('runSessionInit in a non-project cwd: global self-heal fires, zero project 
   const home = sb, cfg = path.join(sb, '.claude'), bare = path.join(sb, 'bare');
   fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
   fs.mkdirSync(bare, { recursive: true }); // no .git / package.json → non-project
-  const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg };
   const lc = path.join(__dirname, 'lifecycle.js');
   const si = path.join(__dirname, 'session-init.js');
 
@@ -234,7 +234,17 @@ test.after(() => {
   }
 });
 
-function runSessionInitHook(t, { adoptThrows = false, preloadSrc = null, prefix = 'cg-si-failopen-' } = {}) {
+function runSessionInitHook(t, {
+  adoptThrows = false,
+  preloadSrc = null,
+  prefix = 'cg-si-failopen-',
+  // JS-08: run the hook from a SUBDIRECTORY of the project, the shape a
+  // persistent shell reaches after `cd backend/`. `indexDb` plants the marker
+  // `resolveProjectRoot` walks up to; without it the walk finds nothing and
+  // correctly falls back to cwd, so the two options go together.
+  cwdSub = null,
+  indexDb = false,
+} = {}) {
   const os = require('os');
   const { spawnSync } = require('child_process');
   const sb = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -275,11 +285,18 @@ function runSessionInitHook(t, { adoptThrows = false, preloadSrc = null, prefix 
   }
   args.push(path.join(__dirname, 'session-init.js'));
 
+  if (indexDb) fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
+  let cwd = proj;
+  if (cwdSub) {
+    cwd = path.join(proj, cwdSub);
+    fs.mkdirSync(cwd, { recursive: true });
+  }
+
   const res = spawnSync(process.execPath, args, {
-    cwd: proj,
+    cwd,
     encoding: 'utf8',
     input: JSON.stringify({ source: 'startup' }),
-    env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' },
+    env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' },
   });
   return { res, proj, home };
 }
@@ -332,6 +349,37 @@ test('an unrecorded adoption warns that uninstall will not clean this project', 
 
 // Control for the two tests above: the same harness with NO stubbed failure
 // must stay quiet, so neither assertion can be passing on an unconditional line.
+// JS-08 (audit 2026-08-29): the hook-dark detector read `process.cwd()` while
+// every writer of recommendations.jsonl records into the RESOLVED project root.
+// A session whose shell has `cd`-ed into a subdirectory — the exact case the
+// subdir-cwd fix exists for — therefore found no file and made no claim: the
+// detector for dark hooks was itself dark, silently.
+test('the hook-dark detector reads the resolved project root, not the shell cwd', (t) => {
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-subdir-',
+    cwdSub: path.join('src', 'deep'),
+    indexDb: true,
+  });
+  assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
+  assert.match(res.stderr, /may be dark/,
+    'the seeded recommendations.jsonl sits at the project root; a subdir session ' +
+    `must still find it. stderr was:\n${res.stderr}`);
+});
+
+// Control for the test above: with no index.db to walk up to, resolveProjectRoot
+// has nothing to resolve and cwd remains the answer — so the assertion above is
+// about root resolution, not about the warning being unconditional.
+test('a subdir session with no indexed ancestor falls back to cwd and stays quiet', (t) => {
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-subdir-noidx-',
+    cwdSub: path.join('src', 'deep'),
+    indexDb: false,
+  });
+  assert.equal(res.status, 0, `hook must exit 0; stderr:\n${res.stderr}`);
+  assert.doesNotMatch(res.stderr, /may be dark/,
+    'without an indexed ancestor there is no file to read and nothing to conclude');
+});
+
 test('a clean session start emits neither disclosure', (t) => {
   const { res } = runSessionInitHook(t, { prefix: 'cg-si-clean-' });
   assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
@@ -376,7 +424,7 @@ test('runSessionInit tears down cache + adoption on a genuine uninstall (order r
   fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
   fs.writeFileSync(path.join(proj, 'CLAUDE.md'), '# P\n\nKEEP THIS USER LINE.\n');
   fs.writeFileSync(path.join(cfg, 'settings.json'), '{"statusLine":{"type":"command","command":"/bin/prior.sh"}}');
-  const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg };
   const lc = path.join(__dirname, 'lifecycle.js'), ad = path.join(__dirname, 'adopt.js');
   const si = path.join(__dirname, 'session-init.js');
 

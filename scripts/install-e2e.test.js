@@ -98,7 +98,7 @@ function mkHome() {
 function sandboxEnv(homeDir, extra) {
   return {
     ...process.env,
-    HOME: homeDir,
+    HOME: homeDir, USERPROFILE: homeDir,
     CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude'),
     ...extra,
   };
@@ -676,6 +676,7 @@ test('§2.5 find-binary.js clearCache removes the cache file', () => {
   // Clear via module
   const result = execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.USERPROFILE = ${JSON.stringify(homeDir)};
     process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(path.join(homeDir, '.claude'))};
     const { clearCache, CACHE_FILE } = require(${JSON.stringify(FIND_BINARY)});
     clearCache();
@@ -764,7 +765,7 @@ test('§2.8 bin/cli.js shows install instructions when binary is missing', (t) =
   `;
 
   const result = spawnSync(process.execPath, ['-e', cliScript], {
-    env: { HOME: homeDir, PATH: '' },
+    env: { HOME: homeDir, USERPROFILE: homeDir, PATH: '' },
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 5000,
   });
@@ -807,7 +808,7 @@ test('§2.9 find-binary.js auto-update cache path checked', () => {
   `);
 
   const result = execFileSync(process.execPath, [testScript], {
-    env: { HOME: homeDir, PATH: process.env.PATH },
+    env: { HOME: homeDir, USERPROFILE: homeDir, PATH: process.env.PATH },
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString().trim();
 

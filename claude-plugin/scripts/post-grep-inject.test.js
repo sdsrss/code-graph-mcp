@@ -650,7 +650,7 @@ test('e2e: no index up to $HOME → silent exit 0', () => {
       cwd: bare,
       input: JSON.stringify({ tool_input: { command: cmd } }),
       encoding: 'utf8',
-      env: { ...process.env, _CG_ANSWER_BINARY: stub, HOME: bare, CODE_GRAPH_QUIET_HOOKS: '0' },
+      env: { ...process.env, _CG_ANSWER_BINARY: stub, HOME: bare, USERPROFILE: bare, CODE_GRAPH_QUIET_HOOKS: '0' },
     });
     assert.equal(res.status, 0);
     assert.equal(res.stdout.trim(), '');

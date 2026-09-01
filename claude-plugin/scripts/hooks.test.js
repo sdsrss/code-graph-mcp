@@ -96,6 +96,53 @@ test('hooks.json: SessionStart wires session-init.js', () => {
   assert.match(cmd || '', /session-init\.js/);
 });
 
+// JS-04 (audit 2026-08-29). The matcher shipped as `startup|clear|compact` and
+// silently excluded `resume` — every resumed session ran with NO statusLine
+// self-heal, no forced update check, no index-freshness probe and no recent-impact
+// injection, even though session-init.js handles that source explicitly.
+//
+// The expected set is READ OUT OF session-init.js rather than duplicated here:
+// a test that carries its own copy of the production list goes green while the
+// two drift apart (the same shape as the pre-edit-guide regex copy). Parse
+// failure is a hard failure, not a silent skip — a vacuous guard is worse than
+// no guard.
+function documentedSessionStartSources() {
+  const src = fs.readFileSync(path.resolve(__dirname, 'session-init.js'), 'utf8');
+  const line = src.split('\n').find((l) => l.includes('SessionStart passes {source:'));
+  assert.ok(line,
+    'could not find the `SessionStart passes {source:...}` comment in session-init.js — ' +
+    'this guard derives its expectation from it; re-point the guard rather than deleting it');
+  const sources = [...line.matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  // Pinned at the CURRENT cardinality, not at some low floor. Pre-tag review
+  // caught the first version at `>= 2`, which would accept a comment truncated
+  // to {source:"startup"|"clear"} and then pass while the matcher was missing
+  // `resume` — the exact bug this guard exists for. If Claude Code adds a fifth
+  // source, this fails loudly and both the comment and the matcher get updated.
+  assert.ok(sources.length >= 4,
+    `parsed only ${sources.length} source(s) from ${JSON.stringify(line)} — guard would be vacuous`);
+  return sources;
+}
+
+test('hooks.json: SessionStart matcher covers every source session-init.js handles', () => {
+  const cfg = loadHooks();
+  const matcher = cfg.hooks.SessionStart[0].matcher;
+  const alternatives = matcher.split('|');
+  const documented = documentedSessionStartSources();
+
+  const missing = documented.filter((s) => !alternatives.includes(s));
+  assert.deepEqual(missing, [],
+    `SessionStart matcher ${JSON.stringify(matcher)} does not fire for ${missing.join(', ')} — ` +
+    'session-init.js handles those sources, so the hook is dark on exactly those sessions (JS-04)');
+
+  // Both directions (pre-tag review). An alternative with no documented source
+  // behind it is either a typo that will never match, or a real fifth source
+  // nobody wrote down — both worth failing on, and neither visible one-way.
+  const undocumented = alternatives.filter((s) => !documented.includes(s));
+  assert.deepEqual(undocumented, [],
+    `SessionStart matcher ${JSON.stringify(matcher)} lists ${undocumented.join(', ')}, which ` +
+    "session-init.js's stdin contract does not mention — a typo matches nothing silently");
+});
+
 // Cross-validate that lifecycle.js's buildSettingsHookEntries covers the
 // matchers we removed from hooks.json — keeps the migration whole. If a
 // future refactor accidentally drops a matcher in one place, this fails.

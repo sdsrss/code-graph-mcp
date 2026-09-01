@@ -246,19 +246,88 @@ fn origin_snapshot_is_gated_behind_trust() {
     );
     // Untrusted (no CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN, no pin) → install skipped.
     assert_eq!(
-        gate_origin_url(url.clone(), false),
+        gate_origin_url(|| url.clone(), false),
         None,
         "an untrusted repo's published snapshot must not auto-install"
     );
     // Trusted (developer opted in, or a pin is set) → install proceeds.
     assert_eq!(
-        gate_origin_url(url.clone(), true),
+        gate_origin_url(|| url.clone(), true),
         url,
         "an opt-in / pinned origin snapshot installs"
     );
-    // No published snapshot → None either way (no spurious hint for normal repos).
-    assert_eq!(gate_origin_url(None, false), None);
-    assert_eq!(gate_origin_url(None, true), None);
+    // No published snapshot → None even when trusted.
+    assert_eq!(gate_origin_url(|| None, true), None);
+}
+
+// SEC-07 (audit 2026-08-29): the gate must decide BEFORE the network call, not
+// after. The resolver used to be an eagerly-evaluated argument, so `git remote
+// get-url origin` + `gh api` ran on every project open no matter what this gate
+// then decided — the check read as though it governed the fetch without preventing
+// it. Counting resolver calls is the only way to see that: the return value is
+// `None` under the old code and the new one alike.
+#[test]
+fn untrusted_origin_never_reaches_the_network() {
+    use std::cell::Cell;
+    let resolved = Cell::new(0);
+    let out = gate_origin_url(
+        || {
+            resolved.set(resolved.get() + 1);
+            Some("https://github.com/o/r/releases/download/v1/s.db.zst".to_string())
+        },
+        false,
+    );
+    assert_eq!(out, None);
+    assert_eq!(
+        resolved.get(),
+        0,
+        "untrusted origin must not spawn `git remote get-url` / `gh api` at all"
+    );
+
+    // Negative control: the same probe under trust DOES resolve, so the assertion
+    // above is about the gate and not about a resolver that never runs.
+    let resolved = Cell::new(0);
+    let out = gate_origin_url(
+        || {
+            resolved.set(resolved.get() + 1);
+            Some("https://github.com/o/r/releases/download/v1/s.db.zst".to_string())
+        },
+        true,
+    );
+    assert!(out.is_some());
+    assert_eq!(resolved.get(), 1, "trusted origin resolves exactly once");
+}
+
+// SEC-07 part 2: `repo` is the tail of a `splitn(2, '/')`, so without a validator
+// it carries embedded `/` and `..` into the `gh api` path segment.
+#[test]
+fn github_remote_rejects_names_outside_the_github_alphabet() {
+    use crate::snapshot::install::parse_github_remote;
+
+    // Well-formed remotes still parse, in both supported spellings.
+    assert_eq!(
+        parse_github_remote("https://github.com/octo-cat/my_repo.v2.git"),
+        Some(("octo-cat".to_string(), "my_repo.v2".to_string()))
+    );
+    assert_eq!(
+        parse_github_remote("git@github.com:octo-cat/my_repo"),
+        Some(("octo-cat".to_string(), "my_repo".to_string()))
+    );
+
+    for hostile in [
+        "https://github.com/o/r/../../../x",
+        "https://github.com/o/..",
+        "https://github.com/o/r?foo=bar",
+        "https://github.com/o/r%2f..",
+        "https://github.com/o/-r --flag",
+        "https://github.com/o/r/releases",
+    ] {
+        assert_eq!(
+            parse_github_remote(hostile),
+            None,
+            "remote {hostile:?} must not reach the gh api path"
+        );
+    }
 }
 
 #[test]

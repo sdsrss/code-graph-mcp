@@ -82,7 +82,7 @@ pub(crate) fn resolve_snapshot_source_impl(
         }
         return Some(url);
     }
-    gate_origin_url(resolve_from_github(root), origin_trusted)
+    gate_origin_url(|| resolve_from_github(root), origin_trusted)
 }
 
 /// Is this a git object id, and nothing else?
@@ -104,24 +104,37 @@ fn is_commit_id(s: &str) -> bool {
 }
 
 /// Gate the auto-detected origin GitHub-release snapshot behind out-of-band trust
-/// ([`origin_trusted`]). The URL is resolved FIRST so the opt-in hint is printed
-/// only when the repo actually publishes a snapshot — a normal repo (no snapshot
-/// asset) stays silent. Untrusted + a published snapshot → install is skipped
-/// (the security fix); trusted (env opt-in or a pin) → install proceeds.
-pub(crate) fn gate_origin_url(origin_url: Option<String>, origin_trusted: bool) -> Option<String> {
-    let url = origin_url?;
+/// ([`origin_trusted`]). Untrusted → skipped (the security fix); trusted (env opt-in
+/// or a pin) → install proceeds.
+///
+/// SEC-07 (audit 2026-08-29). The resolver is a CLOSURE and stays uncalled without
+/// trust. It used to be an eagerly-evaluated argument, so `git remote get-url origin`
+/// plus a `gh api` round-trip ran on every project open regardless of trust and this
+/// gate only suppressed the install afterwards — a check that reads as if it governs
+/// the network call while not preventing it. Untrusted is the default, so gating
+/// first also drops a pair of subprocesses from the overwhelmingly common path.
+///
+/// What that costs, stated rather than hidden: resolving first was deliberate — it
+/// let the opt-in hint name the actual snapshot URL and stay silent for the many
+/// repos that publish none. A gate that declines to look cannot know either, and
+/// warning unconditionally would fire on every repo in the world. So the hint drops
+/// to `debug` (visible when someone is asking why no snapshot installed) and the
+/// opt-in lives where the other trust knobs are documented: README's env-var table.
+pub(crate) fn gate_origin_url(
+    resolve_origin_url: impl FnOnce() -> Option<String>,
+    origin_trusted: bool,
+) -> Option<String> {
     if !origin_trusted {
-        let msg = format!(
-            "warning: this repo publishes a code-graph snapshot ({url}) but auto-installing it \
-             from the repo's own GitHub release is opt-in — a snapshot from an untrusted repo \
-             could seed a misleading code graph (no code execution, but callgraph / impact / \
-             dead-code on unchanged files would reflect attacker-chosen edges). Set \
-             CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1 (or a CODE_GRAPH_SNAPSHOT_PIN) to install it."
+        tracing::debug!(
+            "skipping GitHub-release snapshot auto-detect: installing a snapshot from the repo's \
+             own release is opt-in, because a snapshot from an untrusted repo could seed a \
+             misleading code graph (no code execution, but callgraph / impact / dead-code on \
+             unchanged files would reflect attacker-chosen edges). Set \
+             CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1 (or a CODE_GRAPH_SNAPSHOT_PIN) to enable it."
         );
-        tracing::warn!("{msg}");
         return None;
     }
-    Some(url)
+    resolve_origin_url()
 }
 
 fn resolve_from_github(root: &Path) -> Option<String> {
@@ -138,7 +151,26 @@ fn resolve_from_github(root: &Path) -> Option<String> {
     fetch_latest_snapshot_asset_url(&owner, &repo)
 }
 
-fn parse_github_remote(url: &str) -> Option<(String, String)> {
+/// GitHub's own account/repository name alphabet. Anything outside it cannot be a
+/// real remote, so refusing it costs nothing.
+///
+/// SEC-07 (audit 2026-08-29): `repo` is the tail of a `splitn(2, '/')`, so it used
+/// to accept embedded `/` and `..` and carry them straight into the `gh api` path.
+/// The demonstrated blast radius was small — `endpoint` always starts with the
+/// literal `repos/`, so `gh` could not be pointed at another host, and the GET's
+/// response never flows back to whoever wrote the remote — which makes this a
+/// missing guard rather than a proven hole. It is still repo-supplied text reaching
+/// an argv position, and the check is one predicate.
+fn is_github_name(s: &str) -> bool {
+    !s.is_empty()
+        // `.` is legal INSIDE a name (`my_repo.v2`), so the alphabet alone still
+        // admits the two names that are pure path traversal. GitHub rejects both.
+        && s.chars().any(|c| c != '.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+pub(crate) fn parse_github_remote(url: &str) -> Option<(String, String)> {
     // Supports https://github.com/o/r(.git) and git@github.com:o/r(.git)
     let stripped = url
         .strip_prefix("https://github.com/")
@@ -147,7 +179,7 @@ fn parse_github_remote(url: &str) -> Option<(String, String)> {
     let mut parts = stripped.splitn(2, '/');
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.trim_end_matches('/').to_string();
-    if owner.is_empty() || repo.is_empty() {
+    if !is_github_name(&owner) || !is_github_name(&repo) {
         return None;
     }
     Some((owner, repo))

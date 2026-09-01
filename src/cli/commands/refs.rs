@@ -149,28 +149,19 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         )
                     }
                     CliFuzzyResolution::Ambiguous(cands) => {
-                        if json_mode {
-                            let sugg: Vec<serde_json::Value> = cands.iter().take(5).map(|c| serde_json::json!({
-                                "name": c.name, "file_path": c.file_path,
-                                "type": c.node_type, "node_id": c.node_id, "start_line": c.start_line,
-                            })).collect();
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "error": format!("Ambiguous symbol '{}': {} matches. Specify --file or --node-id to disambiguate.", base, cands.len()),
-                                    "suggestions": sugg,
-                                })
-                            );
-                        } else {
-                            eprintln!("[code-graph] Ambiguous symbol '{}': {} matches. Specify --file or --node-id.", base, cands.len());
-                            for c in cands.iter().take(5) {
-                                eprintln!(
-                                    "  {} ({}) in {} [node_id {}]",
-                                    c.name, c.node_type, c.file_path, c.node_id
-                                );
-                            }
-                        }
-                        std::process::exit(1);
+                        // ARC-01: shared renderer, refs's published envelope
+                        // (`suggestions`, no `results` key). Both suffixes name the
+                        // disambiguation flags, but the JSON one spells out
+                        // "to disambiguate" and the stderr one does not — kept
+                        // verbatim, since both strings are already shipped.
+                        crate::cli::symbols::emit_fuzzy_ambiguity(
+                            base,
+                            &cands,
+                            json_mode,
+                            crate::cli::symbols::FuzzyEnvelope::Suggestions,
+                            ". Specify --file or --node-id to disambiguate.",
+                            ". Specify --file or --node-id.",
+                        );
                     }
                     CliFuzzyResolution::NotFound => {
                         // Match the success-case envelope shape (object with

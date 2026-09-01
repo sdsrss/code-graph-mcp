@@ -27,7 +27,7 @@ impl McpServer {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
-        let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
+        let depth = arg_i64(args, "depth", 3)?.clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
         // Same default as `get_call_graph`'s symbol arm. This is the surviving
         // sibling of the `min_confidence` defect described just below: another
@@ -216,11 +216,7 @@ impl McpServer {
             // staleness is the canonical failure mode here.
             self.ensure_file_fresh_opt(Some(file_path))?;
         }
-        let depth = args
-            .get("depth")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2)
-            .clamp(1, 10) as i32;
+        let depth = arg_i64(args, "depth", 2)?.clamp(1, 10) as i32;
         let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Check if file exists in index
@@ -320,7 +316,7 @@ impl McpServer {
         // Accept node_id directly, or resolve from symbol_name. Treat empty
         // symbol_name as absent — without this, the error message echoes
         // "Symbol '' not found" which looks like a real lookup miss.
-        let node_id = if let Some(id) = args["node_id"].as_i64() {
+        let node_id = if let Some(id) = arg_opt_i64(args, "node_id")? {
             id
         } else if let Some(name) = args["symbol_name"]
             .as_str()
@@ -342,15 +338,8 @@ impl McpServer {
         } else {
             return Err(anyhow!("Either node_id or symbol_name is required. Provide symbol_name (e.g. \"my_function\") or node_id (from other tool results)."));
         };
-        let top_k = args
-            .get("top_k")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(5)
-            .clamp(1, 100);
-        let max_distance = args
-            .get("max_distance")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.8);
+        let top_k = arg_i64(args, "top_k", 5)?.clamp(1, 100);
+        let max_distance = arg_f64(args, "max_distance", 0.8)?;
 
         // Check if embeddings are available
         if !self.db.vec_enabled() {
@@ -459,7 +448,7 @@ impl McpServer {
         // returns zero rows — a false-clean empty result. Mirror tool_ast_search.
         crate::storage::queries::validate_dead_code_type_filter(node_type)?;
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
-        let min_lines = args["min_lines"].as_u64().unwrap_or(3) as u32;
+        let min_lines = arg_u64(args, "min_lines", 3)? as u32;
         let compact = args["compact"].as_bool().unwrap_or(true);
 
         // ignore_paths: prefix-match exclusions. When omitted, apply defaults for

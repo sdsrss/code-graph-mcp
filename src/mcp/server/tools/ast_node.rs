@@ -94,13 +94,13 @@ impl McpServer {
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         let include_impact = args["include_impact"].as_bool().unwrap_or(false);
         let include_similar = args["include_similar"].as_bool().unwrap_or(false);
-        let similar_top_k = args["similar_top_k"].as_i64().unwrap_or(5);
+        let similar_top_k = arg_i64(args, "similar_top_k", 5)?;
         let compact = args["compact"].as_bool().unwrap_or(false);
 
         // Support lookup by node_id or file_path+symbol_name
-        if let Some(nid) = args["node_id"].as_i64() {
+        if let Some(nid) = arg_opt_i64(args, "node_id")? {
             // When called with node_id, default context_lines=3
-            let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
+            let ctx = arg_i64(args, "context_lines", 3)?.clamp(0, 100) as usize;
             // CON-10: this branch used to skip the refresh entirely, reasoning
             // that a node_id lookup "has no path to refresh against" — but the
             // row it is about to read carries the path. With context_lines
@@ -152,7 +152,7 @@ impl McpServer {
             return Ok(out);
         }
 
-        let context_lines = args["context_lines"].as_i64().unwrap_or(0).clamp(0, 100) as usize;
+        let context_lines = arg_i64(args, "context_lines", 0)?.clamp(0, 100) as usize;
 
         // Empty/whitespace-only symbol_name behaves like absent — prevents
         // "Symbol '' not found" and accidental fuzzy hits on the only candidate.

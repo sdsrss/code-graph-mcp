@@ -700,6 +700,28 @@ fn mcp_find_dead_code_rejects_unknown_node_type() {
     );
 }
 
+/// Deadline for the embedding-backfill polls below (ENG-02 / D#166).
+///
+/// Every one of those polls breaks on its hit, so a generous ceiling costs the
+/// green path nothing and only a real strand pays it — which is why this is a
+/// deadline, not a duration anyone should tune down.
+///
+/// It must be several times `PERIODIC_BACKFILL_SECS`, and the value that matters
+/// is the one in the SPAWNED BINARY: these tests drive `CARGO_BIN_EXE_…`, which
+/// is built without `cfg(test)`, so the `#[cfg(test)] = 1` override in
+/// `src/mcp/server/mod.rs` does NOT apply — the server under test sleeps the
+/// production **60s** between backfill passes. The previous 30s window on the
+/// periodic-driver poll was therefore shorter than a single tick: it could only
+/// pass when the startup drain happened to finish 29-59s in, so that the one
+/// tick at t=60s fell inside the window. Measured on a quiet 24-core box before
+/// this change, that test passed at 61.4s — at the edge, and a FASTER drain
+/// makes it worse, not better. 300s spans five ticks regardless of drain time.
+///
+/// Gated like its only two users: without `embed-model` both tests compile out,
+/// and an ungated const is dead code on that leg (`-D warnings` fails the build).
+#[cfg(feature = "embed-model")]
+const EMBED_POLL_BUDGET: Duration = Duration::from_secs(300);
+
 /// Regression: an "edit-only" session that issues NO code-graph tool call must
 /// still get its index embedded. The embedding backfill used to be kicked off
 /// only by `consume_startup_index_result()`, which runs on an incoming MCP
@@ -758,7 +780,7 @@ fn mcp_startup_embeds_without_any_tool_call() {
     // vector count until it climbs above zero.
     let mut embedded = 0i64;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < EMBED_POLL_BUDGET {
         std::thread::sleep(Duration::from_millis(500));
         if let Ok(db) = Database::open_with_vec(&db_path) {
             if let Ok((with_vectors, _)) = count_nodes_with_vectors(db.conn()) {
@@ -772,7 +794,8 @@ fn mcp_startup_embeds_without_any_tool_call() {
 
     assert!(
         embedded > 0,
-        "startup index must embed nodes with NO tool call; got {embedded} vectors after 60s"
+        "startup index must embed nodes with NO tool call; got {embedded} vectors after {:?}",
+        EMBED_POLL_BUDGET
     );
 }
 
@@ -821,7 +844,7 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     let mut base_vectors = 0i64;
     let settled_unembedded = 0i64;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(90) {
+    while start.elapsed() < EMBED_POLL_BUDGET {
         std::thread::sleep(Duration::from_millis(1000));
         let db = match Database::open_with_vec(&db_path) {
             Ok(d) => d,
@@ -879,9 +902,11 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     }
 
     // No tool call is ever sent. The periodic driver alone must embed the new node.
+    // The window must span SEVERAL of the spawned binary's 60s backfill ticks —
+    // see EMBED_POLL_BUDGET for why 30s here was shorter than one tick.
     let mut now_vectors = base_vectors;
     let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(30) {
+    while t.elapsed() < EMBED_POLL_BUDGET {
         std::thread::sleep(Duration::from_millis(500));
         if let Ok(db) = Database::open_with_vec(&db_path) {
             if let Ok((with_vectors, _)) = count_nodes_with_vectors(db.conn()) {

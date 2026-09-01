@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 /// Newtype wrapper around `Arc<Mutex<io::Stdout>>` so both the main loop
@@ -437,6 +437,32 @@ fn main() -> Result<()> {
                 run_node_script("adopt.js", &["unadopt".to_string()])
             }
         }
+        // DOC-03 (audit 2026-08-29). `uninstall` is implemented only in the npm
+        // wrapper (`bin/cli.js`), which never runs for a `cargo install`. README
+        // told every reader to run it, so a cargo user following the documented
+        // teardown got a bare "unknown subcommand" and no idea what to do next —
+        // for the one command whose whole job is leaving no residue behind.
+        //
+        // Answering here rather than only fixing the README: the binary is where
+        // the user already is when they find out. It cannot DO the teardown (the
+        // logic lives in the Node lifecycle module that a cargo install does not
+        // ship), so it names the command that can and exits non-zero — the
+        // requested work did not happen.
+        Some("uninstall") => {
+            let msg = "code-graph-mcp uninstall \u{2014} not available in this build\n\n\
+                 Teardown (statusline restore, hook removal, cache deletion) lives in the\n\
+                 npm wrapper, which a `cargo install` does not ship. Run it with npx:\n\n    \
+                 npx -y @sdsrs/code-graph uninstall [--unadopt-all] [--purge-global]\n\n\
+                 To remove just this project's CLAUDE.md block, `code-graph-mcp unadopt`\n\
+                 works here. In Claude Code, also run `/plugin uninstall code-graph-mcp`.\n";
+            if wants_subcommand_help(&args) {
+                print!("{msg}");
+                Ok(())
+            } else {
+                eprint!("{msg}");
+                std::process::exit(1);
+            }
+        }
         Some("snapshot") => {
             // clap-migrated (audit #4): nested #[command(subcommand)] replaces the
             // hand-rolled args[2]/args[3] dispatch. clap owns the no-subcommand and
@@ -598,6 +624,8 @@ fn print_help() {
     println!("    outcome             Retrieval adoption from session transcripts (field-MRR; read-only)");
     println!("    adopt               Install the steering block into the project CLAUDE.md + detail doc");
     println!("    unadopt             Remove the steering block + detail doc");
+    println!("    uninstall           Full local teardown (statusline, hooks, cache).");
+    println!("                        npm/npx installs only — this build says where to get it");
     println!("    snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
     println!("                        Build a portable graph snapshot. Auto zstd-compresses");
     println!("                        when --out ends in .db.zst; otherwise writes raw .db");
@@ -610,11 +638,15 @@ fn print_help() {
     println!("OPTIONS (place AFTER the subcommand, e.g. `search foo --json`):");
     // Every clap subcommand carries --json, including the index commands the old
     // wording excluded (they all emit an index-result envelope). Only the
-    // JS-dispatched trio and `serve` do not. `every_clap_command_accepts_json`
-    // (tests/doc_cli_alignment.rs) keeps this claim true (2026-08-16 audit §四).
+    // JS-dispatched ones and `serve` do not. `every_clap_command_accepts_json`
+    // (tests/doc_cli_alignment.rs) keeps this claim true (2026-08-16 audit §四) —
+    // its assertion message says the help text names them BY HAND, so adding a
+    // JS command to `js_commands()` without editing this sentence leaves the
+    // claim false. That is exactly what happened when `uninstall` landed, and
+    // pre-tag review caught it.
     println!("    --json              JSON output (every subcommand except serve, doctor,");
-    println!("                        adopt, unadopt and snapshot — snapshot inspect always");
-    println!("                        prints JSON)");
+    println!("                        adopt, unadopt, uninstall and snapshot — snapshot");
+    println!("                        inspect always prints JSON)");
     println!(
         "    --compact           Compact output (search, callgraph, map, overview, deps, refs)"
     );
@@ -727,69 +759,32 @@ fn run_serve() -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut byte_buf: Vec<u8> = Vec::new();
-    const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10MB
+    use code_graph_mcp::utils::stdio::{read_frame, StdioFrame, MAX_MESSAGE_SIZE};
 
     loop {
-        byte_buf.clear();
-        // Read raw bytes, not `read_line`: when a message's 10 MiB `take` boundary
-        // splits a multi-byte UTF-8 char, `read_line`'s UTF-8 validation returns
-        // Err(InvalidData) and the `?` propagates OUTSIDE the per-request
-        // catch_unwind below — a single oversized CJK request would kill the whole
-        // long-lived session (H3). `read_until` + lossy decode tolerate it.
-        let n = reader
-            .by_ref()
-            .take(MAX_MESSAGE_SIZE as u64)
-            .read_until(b'\n', &mut byte_buf)?;
-        if n == 0 {
-            break; // EOF
-        }
-        // Oversized: hit the `take` cap with no terminating newline. Drain the rest
-        // of the line, reject with a JSON-RPC error, and keep serving. Checked on
-        // the raw byte buffer before decoding to avoid a huge lossy allocation.
-        if byte_buf.len() >= MAX_MESSAGE_SIZE && byte_buf.last() != Some(&b'\n') {
-            let oversized_len = byte_buf.len();
-            // Free the oversized buffer before draining to avoid 2x peak allocation
-            byte_buf.clear();
-            byte_buf.shrink_to(1024);
-            // Drain until newline (line-aware), discarding the bytes. LOOP: a
-            // single `take(MAX)` only consumes one MAX-sized chunk, so a line
-            // larger than 2xMAX would leave a tail that gets misparsed as the
-            // next message. Keep reading MAX-sized chunks until the terminating
-            // newline is consumed or EOF is reached, so arbitrarily large lines
-            // are fully drained.
-            let mut sink: Vec<u8> = Vec::new();
-            loop {
-                sink.clear();
-                let drained = reader
-                    .by_ref()
-                    .take(MAX_MESSAGE_SIZE as u64)
-                    .read_until(b'\n', &mut sink)
-                    .unwrap_or(0);
-                // EOF (nothing left) or we consumed through the newline → done.
-                if drained == 0 || sink.last() == Some(&b'\n') {
-                    break;
+        // Framing (raw bytes over `read_line`, size cap, full drain of an
+        // oversized line) lives in `protocol::read_frame`, shared with the
+        // non-project stub. The reply wording and the blank-line skip stay here.
+        let buf = match read_frame(&mut reader, &mut byte_buf)? {
+            StdioFrame::Eof => break,
+            StdioFrame::Oversized(oversized_len) => {
+                let err_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": code_graph_mcp::mcp::protocol::JSONRPC_INVALID_REQUEST,
+                        "message": format!("Message too large: {} bytes (max {})", oversized_len, MAX_MESSAGE_SIZE)
+                    }
+                });
+                {
+                    let mut out = lock_stdout(&stdout_shared);
+                    writeln!(out, "{}", err_resp)?;
+                    out.flush()?;
                 }
+                continue;
             }
-            let err_resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": {
-                    "code": code_graph_mcp::mcp::protocol::JSONRPC_INVALID_REQUEST,
-                    "message": format!("Message too large: {} bytes (max {})", oversized_len, MAX_MESSAGE_SIZE)
-                }
-            });
-            {
-                let mut out = lock_stdout(&stdout_shared);
-                writeln!(out, "{}", err_resp)?;
-                out.flush()?;
-            }
-            continue;
-        }
-
-        // Lossily decode: a `take`-truncated or otherwise malformed multi-byte
-        // sequence becomes U+FFFD rather than killing the session (H3). Well-formed
-        // JSON-RPC lines are unaffected.
-        let buf = String::from_utf8_lossy(&byte_buf);
+            StdioFrame::Message(line) => line,
+        };
         if buf.trim().is_empty() {
             continue;
         }

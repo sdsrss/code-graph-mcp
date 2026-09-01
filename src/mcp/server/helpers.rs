@@ -17,6 +17,105 @@ pub(super) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result
     Ok(s)
 }
 
+/// One-line, bounded description of what a caller actually sent, for error text.
+///
+/// The echoed string is cut at the FIRST WHITESPACE, not merely truncated —
+/// pre-tag review found the reason. This text flows into `ErrKind::classify`,
+/// which buckets errors by substring match, so a caller could pick its own
+/// telemetry bucket: `{"depth": "Ambiguous symbol"}` would be recorded as
+/// `ambiguous` instead of `bad_param`, quietly poisoning the metric this very
+/// change exists to sharpen. Every phrase `classify` looks for is multi-word, so
+/// a single token cannot spell one. Reordering `classify` instead would only
+/// mirror the problem — a `symbol_name` of "must be an integer" would then land
+/// in `bad_param` rather than `not_found`. Closing the injection beats ranking it.
+///
+/// The useful case survives intact: `"50"`, the spelling this whole fix is about,
+/// is one token and echoes in full.
+fn describe_arg(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => {
+            let first_token = s.split_whitespace().next().unwrap_or("");
+            let mut shown: String = first_token.chars().take(40).collect();
+            if shown.len() < s.len() {
+                shown.push('…');
+            }
+            format!("the string \"{shown}\"")
+        }
+        serde_json::Value::Bool(b) => format!("the boolean {b}"),
+        serde_json::Value::Number(n) => format!("{n}"),
+        serde_json::Value::Array(_) => "an array".to_string(),
+        serde_json::Value::Object(_) => "an object".to_string(),
+        serde_json::Value::Null => "null".to_string(),
+    }
+}
+
+/// Read an optional integer argument, defaulting only when it is genuinely absent.
+///
+/// CON-15 (audit 2026-08-29). Every numeric argument used to be read as
+/// `args[key].as_i64().unwrap_or(default)`, which cannot tell "not sent" from
+/// "sent as the wrong type": `{"limit": "50"}` — a plausible spelling for a model
+/// filling a JSON schema — succeeded and quietly returned the default 20 results
+/// with nothing in the response saying so. The string-enum half of this same defect
+/// class was already fixed at every entry (bad `direction` / `node_type` / relation
+/// values are rejected and the vocabulary is listed); this is the numeric half,
+/// which was never done. Rejecting rather than coercing is what keeps the two
+/// halves symmetric — and an error a model can read is worth more than a silent
+/// answer to a question it did not ask.
+pub(super) fn arg_i64(args: &serde_json::Value, key: &str, default: i64) -> Result<i64> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(default),
+        v => v.as_i64().ok_or_else(|| {
+            anyhow!(
+                "{key} must be an integer (got {}); the request was rejected rather than answered with a default",
+                describe_arg(v)
+            )
+        }),
+    }
+}
+
+/// [`arg_i64`] for counts that cannot be negative. A negative number is rejected
+/// here rather than falling through to the default — `as_u64()` returns `None` for
+/// `-3` exactly as it does for `"3"`, so `min_lines: -3` used to silently become 3.
+pub(super) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> Result<u64> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(default),
+        v => v.as_u64().ok_or_else(|| {
+            anyhow!(
+                "{key} must be a non-negative integer (got {}); the request was rejected rather than answered with a default",
+                describe_arg(v)
+            )
+        }),
+    }
+}
+
+/// [`arg_i64`] for arguments with no default, where absence selects a different
+/// code path (`node_id` picks id-lookup over name-lookup). Same rule: absent is
+/// `None`, wrong type is an error — not a third silent spelling of absent.
+pub(super) fn arg_opt_i64(args: &serde_json::Value, key: &str) -> Result<Option<i64>> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(None),
+        v => v.as_i64().map(Some).ok_or_else(|| {
+            anyhow!(
+                "{key} must be an integer (got {}); the request was rejected rather than answered with a default",
+                describe_arg(v)
+            )
+        }),
+    }
+}
+
+/// [`arg_i64`] for fractional arguments (similarity thresholds).
+pub(super) fn arg_f64(args: &serde_json::Value, key: &str, default: f64) -> Result<f64> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(default),
+        v => v.as_f64().ok_or_else(|| {
+            anyhow!(
+                "{key} must be a number (got {}); the request was rejected rather than answered with a default",
+                describe_arg(v)
+            )
+        }),
+    }
+}
+
 /// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
 /// If no method prefix, returns (None, original_path).
 pub(super) fn parse_route_input(input: &str) -> (Option<String>, &str) {

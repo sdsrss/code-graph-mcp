@@ -55,17 +55,18 @@ Every design decision — from token-aware compression to node_id-based snippet 
 ## Performance
 
 Every row below is a line `code-graph-mcp benchmark` prints, measured on this
-repository (278 files, 5,065 nodes, 10,731 edges) with a release build. Run the
-same command on your own project — the numbers that matter are yours, and these
-scale with tree size and machine.
+repository (283 files, 5,311 nodes, 11,215 edges) with a release build — median
+of three consecutive runs on an otherwise idle machine. Run the same command on
+your own project: the numbers that matter are yours, and these scale with tree
+size and machine.
 
-| `benchmark` line | This repo, v0.123.0 |
+| `benchmark` line | This repo, v0.129.0 |
 |--------|-------|
-| Full index | **~1.9s** (≈145 files/second, single-threaded) |
-| Incremental (noop) | **~30ms** no-change detection via BLAKE3 Merkle tree |
-| Query latency P50 / P99 | **~575us / ~1.9ms** |
-| DB size | **~21.8MB** (≈4.4MB per 1,000 nodes) |
-| Avg tokens/node | **~239** |
+| Full index | **~2.0s** (≈139 files/second, single-threaded) |
+| Incremental (noop) | **~28ms** no-change detection via BLAKE3 Merkle tree |
+| Query latency P50 / P99 | **~655us / ~2.1ms** |
+| DB size | **~22.4MB** (≈4.2MB per 1,000 nodes) |
+| Avg tokens/node | **~242** |
 
 ## Efficiency: code-graph vs Traditional Tools
 
@@ -286,6 +287,18 @@ code-graph-mcp uninstall     # restore statusline, strip hooks, drop the cache
 npm uninstall -g @sdsrs/code-graph
 ```
 
+### Built from source (cargo)
+
+`uninstall` lives in the npm wrapper, so a `cargo install` / `cargo build` binary
+does not carry it — that binary tells you as much and points here. Run the
+teardown through npx without installing globally (npx still downloads the package
+and its platform binary into the npm cache), then remove your binary:
+
+```bash
+npx -y @sdsrs/code-graph uninstall   # statusline, hooks, cache
+cargo uninstall code-graph-mcp       # or delete the target/release binary
+```
+
 ## MCP Tools
 
 `tools/list` advertises exactly these seven. Several older niche tools were folded into flags on them, so one call now covers what used to take a separate tool:
@@ -338,6 +351,7 @@ All tools are also available as CLI subcommands for shell scripts, hooks, and te
 | `doctor` | — | Diagnose and repair environment issues |
 | `adopt` | — | Install the steering block into the project `CLAUDE.md` + detail doc |
 | `unadopt` | — | Remove the steering block + detail doc |
+| `uninstall` | — | Full local teardown (statusline, hooks, cache). npm/npx installs only — a `cargo install` build prints where to get it |
 | `serve` | — | Start the MCP JSON-RPC server on stdio (the default with no subcommand) |
 
 Common options: `--json` (JSON output), `--compact` (compact output), `--limit N`, `--depth N`, `--file <path>`.

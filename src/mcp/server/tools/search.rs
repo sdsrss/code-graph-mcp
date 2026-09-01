@@ -26,11 +26,13 @@ impl McpServer {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let query = required_str(args, "query")?;
-        let top_k = args["top_k"]
-            .as_u64()
-            .or_else(|| args["limit"].as_u64())
-            .unwrap_or(20)
-            .clamp(1, 100) as i64;
+        // `limit` is the documented alias for `top_k`; whichever the caller sent is
+        // type-checked (CON-15), and sending neither still means 20.
+        let top_k = match &args["top_k"] {
+            serde_json::Value::Null => arg_u64(args, "limit", 20)?,
+            _ => arg_u64(args, "top_k", 20)?,
+        }
+        .clamp(1, 100) as i64;
         let node_type_filter = args["node_type"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
 

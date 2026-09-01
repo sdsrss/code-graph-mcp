@@ -507,9 +507,23 @@ function cachedBinaryStaleVsState(state, { binaryPath = cachedBinaryPath(), read
  *      install dropped the platform package).
  *
  * Returns true on successful promote, false otherwise. Never throws.
+ *
+ * JS-03: gated on `cachedBinaryNeedsUpdate` so an already-current binary is
+ * never re-fetched. The gate lives HERE rather than at the call sites because
+ * all four of them wanted it: `downloadAndInstall` Step 2 called this
+ * unconditionally, and its two early-return arms (no plugin tarball / tarball
+ * integrity failure) call it again on the way out. On the normal update path
+ * the binary really is behind, so the gate is a no-op; it pays off on every
+ * REPEATED round — e.g. the JS-02 treadmill, where a blocked repoint replayed
+ * `downloadAndInstall` about every 30 minutes and each replay re-downloaded and
+ * re-promoted a ~40 MB binary that was already latest.
+ *
+ * `needsUpdate` is injectable for tests only; production always uses the real
+ * predicate. Returning false on a skip is accurate: nothing was updated.
  */
-async function downloadBinary(latest) {
+async function downloadBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate } = {}) {
   if (!latest || !latest.binaryUrl) return false;
+  if (!needsUpdate(latest)) return false; // already at latest.version — no fetch
   if (!commandExists('curl')) {
     console.error('[code-graph] Binary download skipped: curl not on PATH.');
     return false;

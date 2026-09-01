@@ -76,7 +76,7 @@ function setUpdateState(home, state) {
 function runStatusline(home, projectDir) {
   return execFileSync('node', [STATUSLINE], {
     cwd: projectDir,
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home },
     encoding: 'utf8',
   }).trim();
 }
@@ -87,7 +87,7 @@ function runStatusline(home, projectDir) {
 function runStatuslineIn(home, processCwd, extraEnv) {
   return execFileSync('node', [STATUSLINE], {
     cwd: processCwd,
-    env: { ...process.env, HOME: home, ...extraEnv },
+    env: { ...process.env, HOME: home, USERPROFILE: home, ...extraEnv },
     encoding: 'utf8',
   }).trim();
 }

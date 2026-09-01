@@ -46,6 +46,13 @@ impl McpServer {
         &self,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        // Bound at entry, not inside `if include_centrality` below — same rule as
+        // `module_overview`'s `deps_direction` / `deps_depth` / `dead_min_lines`,
+        // and pre-tag review caught this one sitting on the wrong side of it: a
+        // `centrality_limit` sent without the flag was still swallowed, which is
+        // precisely what the sibling comment says must not happen.
+        let centrality_limit = arg_u64(args, "centrality_limit", 10)?.clamp(1, 100) as usize;
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
@@ -168,10 +175,7 @@ impl McpServer {
             // sibling has one (top_k/limit 1-100, depth 1-20, context_lines
             // 0-100). Betweenness is computed per call, so an unbounded limit is
             // an unbounded response and an unbounded render.
-            let limit = args["centrality_limit"]
-                .as_u64()
-                .unwrap_or(10)
-                .clamp(1, 100) as usize;
+            let limit = centrality_limit;
             let ranked =
                 crate::graph::centrality::betweenness_centrality(self.db.conn(), false, limit)?;
             let centrality_json: Vec<serde_json::Value> = ranked

@@ -1,5 +1,253 @@
 # Changelog
 
+## 0.129.0
+
+**Upgrading:** two defaults change in ways you can feel.
+
+1. **MCP numeric arguments are now type-checked.** A wrong-typed number is
+   rejected instead of silently becoming the default — `semantic_code_search
+   {"limit": "50"}` used to return 20 results and say nothing; it now returns an
+   error naming the argument. If a client of yours passes numbers as JSON
+   strings, it will start seeing errors where it previously got quietly-wrong
+   results. That is the fix, not a regression: the schema always declared these
+   as integers. No opt-out — restoring the old behaviour means restoring a silent
+   wrong answer. To defer, pin `0.128.0`.
+2. **SessionStart hooks now run on resumed sessions.** The plugin's matcher
+   excluded `resume`, so statusline self-heal, update checks, index-freshness
+   probes and recent-impact injection were all dark there. Resuming a session
+   will now do that work — and print the same one-time lines a fresh start does.
+
+Nothing else changes shape; the rest of this entry is behaviour that was already
+supposed to work.
+
+### SessionStart never fired on a resumed session (JS-04)
+
+`hooks.json` matched `startup|clear|compact`. `resume` was not in the list, and
+`session-init.js` handles that source explicitly — it is named in the stdin
+contract at the entry point and drives the branch that decides whether the
+last-commit reminder is worth showing. So every resumed session ran with no
+statusLine self-heal, no forced update check, no index-freshness probe and no
+recent-impact injection, silently, for anyone whose workflow leans on resume.
+
+The matcher now spells all four. The guard reads the source list out of
+`session-init.js`'s stdin comment rather than restating it in the test, and a
+parse failure there is a hard failure, not a silent skip. Stated with its limit,
+because pre-tag review pushed back on the first wording: a hand-maintained
+comment is still a copy — only two of the four sources (`startup`, `compact`)
+have any code branch keyed on them, so nothing mechanically ties that comment to
+behaviour. What the arrangement buys is one home instead of two, not a derived
+truth. The count floor is pinned at the current cardinality so a comment
+truncated to two sources trips it instead of passing.
+
+### The snapshot trust gate ran after the network call it reads as gating (SEC-07)
+
+`gate_origin_url(resolve_from_github(root), origin_trusted)` evaluates its
+argument first, so `git remote get-url origin` plus a `gh api` round-trip
+happened on **every project open**, regardless of trust; the gate only suppressed
+the install afterwards. The module's own comment described that gate as deciding
+whether to fetch. It now takes the resolver as a closure and does not call it
+without trust — untrusted is the default, so this also drops a pair of
+subprocesses from the overwhelmingly common startup path.
+
+What it costs is stated rather than hidden: resolving first was deliberate, so
+the opt-in hint could name the actual snapshot URL and stay silent for repos that
+publish none. A gate that declines to look cannot know either, so that hint drops
+to `debug` and the opt-in stays documented in README's env-var table. The guard
+counts resolver calls (0 untrusted, 1 trusted) — the return value is `None` under
+both the old and the new code, so nothing weaker can see the difference.
+
+Second half: `parse_github_remote` accepted anything in `owner`/`repo`, and
+`repo` is the tail of a `splitn(2, '/')`, so embedded `/` and `..` went into the
+`gh api` path. Blast radius was small and is worth recording as such — `endpoint`
+always starts with the literal `repos/`, and the GET's response never flows back
+to whoever wrote the remote — which makes this a missing guard rather than a
+proven hole. Names outside GitHub's alphabet are now refused, `.` and `..`
+included.
+
+### Numeric MCP arguments were silently downgraded to their defaults (CON-15)
+
+`semantic_code_search {"limit": "50"}` succeeded, returned 20 results, and
+disclosed nothing. Every numeric argument on every tool read as
+`as_u64().unwrap_or(default)`, which cannot distinguish "absent" from "sent as
+the wrong type" — and `as_u64` answers `None` for `-3` exactly as it does for
+`"3"`, so `min_lines: -3` quietly became 3, twice over on the
+`module_overview` → `find_dead_code` path.
+
+The string-enum half of this defect class was already fixed at every entry; this
+is the numeric half, which had been fixed at none. All seventeen sites now go
+through `arg_i64` / `arg_u64` / `arg_f64` / `arg_opt_i64`, which default only on
+a genuinely absent value and otherwise name the argument and what arrived.
+Rejecting rather than coercing is what keeps the two halves symmetric: an error a
+model can read beats a silent answer to a question it did not ask. The new errors
+classify as `bad_param`, so the metrics bucket whose job is "the model is calling
+this tool wrong" sees the misuse this made visible.
+
+`module_overview` validates `deps_depth` and `dead_min_lines` at entry rather
+than inside their `include_*` blocks, matching what the file already does for
+`deps_direction` and for the same reason. The guard is a parity table over
+(tool, argument) because the site list *is* the unguarded axis — a single-site
+test would have passed for either state of the other fifteen.
+
+### Guard scan surfaces were narrower than what they guard (ENG-04/05/06, JS-08)
+
+Four instances of one shape, all found by reading guards rather than by a red
+test — which is the point: a scanning guard's blind spot is invisible in a corpus
+that contains no offender.
+
+* The tmp three-name matcher recognized `process.env.NAME =` and `NAME:` only, so
+  the bracket spelling `process.env['TMPDIR'] = x` counted 0/0/0 — and zero
+  equals zero. It now recognizes every spelling, and the matcher itself is
+  exercised against each one, since the corpus cannot tell a working matcher from
+  a broken one.
+* HOME/USERPROFILE is the same axis one directory over and had no guard at all:
+  `os.homedir()` reads USERPROFILE on Windows, and 13 test files redirected HOME
+  while 4 of them also spelled USERPROFILE. All 104 sites now spell both, with
+  the same both-directions count rule. Two mitigations existed and neither covers a
+  developer running `node --test` on a Windows machine.
+* Three JS hygiene guards enumerated only the top level while all three discovery
+  chains have been recursive since the fix `test-discovery-drift-guard.test.js`
+  pins — so the first nested test file would have RUN in CI while escaping every
+  guard that grades the corpus. All three now walk.
+* `detectHookDark` read `process.cwd()` while every writer of
+  `recommendations.jsonl` records into the resolved root. In a subdirectory or
+  worktree session — exactly what the subdir-cwd fix exists for — the detector
+  for dark hooks was itself dark.
+
+DOC-07 is a bet, not a determination: the `code-explorer` agent's tool allowlist
+now carries both the bare `mcp__code-graph__*` and the plugin-hosted
+`mcp__plugin_code-graph-mcp_code-graph__*` spellings. A plugin-hosted server has
+been observed using the second form, but which one resolves for THIS plugin could
+not be confirmed without a live install. The asymmetry settles it: an entry that
+matches no tool is inert, a missing entry silently strips the agent to
+Read/Grep/Bash with no error anywhere. Delete at most one half if a future
+harness makes it definitively wrong.
+
+Adding `USERPROFILE` next to `HOME` immediately reddened two correctly-sandboxed
+files, because `js_test_files_neutralize_claude_config_dir` looked exactly ONE
+line ahead for the paired `CLAUDE_CONFIG_DIR` — the same magic-number mistake its
+own neighbour documents three versions of. Its bound is now the redirect block.
+Also closed the last vacuous assertion in the tree,
+`assert.ok(existsSync(...) === true || true)`, which was true for every input.
+
+### `uninstall` was a documented command that did not exist in half the builds (DOC-03)
+
+It lives only in the npm wrapper, and README sent every reader to it — so a
+from-source user following the documented teardown got a bare "unknown
+subcommand" for the one command whose whole job is leaving no residue. The Rust
+binary now answers for it: names the npx invocation that works, points at
+`unadopt` for the part it *can* do, and exits 1 because the requested work did
+not happen. README gains a from-source teardown section, and the subcommand joins
+the typo table and the doc-alignment guard.
+
+The README performance table was three versions stale and is re-measured on
+v0.128.0 (median of three runs, idle machine). Correcting it, not improving it:
+P50 655us vs the 575us it claimed, P99 2.1ms vs 1.9ms, full index 2.0s vs 1.9s —
+on a corpus that also grew, 278 → 283 files and 5,065 → 5,311 nodes.
+
+### Five items from the 2026-08-29 audit
+
+Five more items from the 2026-08-29 audit: the MCP stub that had none of the
+hardening the real server loop got, a ~40 MB binary re-downloaded on every
+repeated update round, a test whose deadline was shorter than the interval it
+was waiting on, a skill document teaching a destructive path plus the guard hole
+that hid it, and the last forked copy of the ambiguity renderer.
+
+No published contract changes shape. The one observable difference is on the
+non-project MCP stub, and it is the fix: an oversized message is now answered
+with `-32600` and the session continues, where before the session ended.
+
+### The non-project MCP stub had neither hardening the main loop has (CON-05)
+
+`serve_non_project_stub` — what every headless `/tmp` session actually connects
+to — read requests with a bare `read_line`. That is the exact call the main loop
+documents why it does *not* use: `read_line` validates UTF-8, so one malformed
+byte returns `Err(InvalidData)`, and the `?` carried it straight out of the serve
+loop, ending the session. It also had no size cap, so a single unterminated line
+allocated without bound.
+
+Both loops now share `utils::stdio::read_frame`, which reads raw bytes under a
+10 MiB cap, fully drains an oversized line through its newline, and decodes
+lossily. It lives in `utils`, not in `mcp::protocol`, because `src/cli ->
+crate::mcp` is a forbidden edge — the two published surfaces must not borrow from
+each other — and the arch-lock guard in `tests/hardening.rs` caught the first
+attempt at exactly that. The JSON-RPC error codes moved to `domain` for the same
+reason and are re-exported from `mcp::protocol`, so every existing
+`protocol::JSONRPC_*` path is unchanged. The reply wording and the blank-line skip
+stay at each call site, so neither command's output changed. Reverting the stub to
+`read_line` turns the two new tests red —
+the invalid-UTF-8 one dies at the call, the oversized one comes back with the
+rejection missing — while the pre-existing stub test stays green either way,
+which is why this went unnoticed.
+
+### An already-current binary was re-downloaded on every repeated round (JS-03)
+
+`downloadAndInstall` called `downloadBin(latest)` unconditionally at Step 2, and
+again from each of its two early-return arms, while `downloadBinary` had no
+"already latest" check. On the normal update path the binary really is behind, so
+nothing looked wrong. On a *repeated* round it re-fetched and re-promoted a
+~40 MB binary that was already current — which is what sat underneath the
+repoint-blocked treadmill (JS-02), one full download roughly every 30 minutes.
+`downloadBinary` is now gated on `cachedBinaryNeedsUpdate`, so a current cache
+performs zero curl calls; missing, unreadable and older binaries all still
+download, since the predicate returns true for each.
+
+### A test deadline shorter than the interval it waited on (ENG-02, D#166)
+
+The periodic-backfill test polled for 30s for a driver that sleeps
+`PERIODIC_BACKFILL_SECS` between passes. That constant is 1s under `cfg(test)`
+and 60s otherwise — and this test drives `CARGO_BIN_EXE_…`, a binary built
+*without* `cfg(test)`, so the server under test slept the production 60s. The 30s
+window could therefore not contain a tick on its own: it passed only when the
+startup drain happened to finish 29–59s in, so that the single tick at t=60s fell
+inside it. Measured on a quiet 24-core box before the change, it passed at 61.4s.
+A faster drain makes that worse, not better, which is the inversion D#166
+described.
+
+All three embedding polls now share a 300s `EMBED_POLL_BUDGET`, spanning five
+ticks regardless of drain time. Each poll breaks on its hit, so the green path
+pays nothing. Acceptance: three rounds of two concurrent `mcp_stdio_integration`
+processes with all 24 cores saturated — 0 of 6 processes failed, 185–186s per
+round.
+
+### A skill taught a non-atomic rebuild, in a directory no guard could see (DOC-02, DOC-08)
+
+`claude-plugin/skills/index.md` taught deleting `.code-graph/` by hand and then
+re-indexing, bypassing `rebuild-index --confirm`'s temp-build-and-atomic-rename —
+the path that exists precisely so a live server and its open WAL never observe a
+half-built index.
+
+Its front matter also said these commands are not exposed over MCP. The first
+repair overcorrected — `dispatch_tool` does route `get_index_status` and
+`rebuild_index`, so the sentence read as false — but dispatchable is not the same
+as reachable: both are deliberately withheld from `tools/list` to save tokens
+(`src/mcp/tools.rs`, asserted there), and a model builds its callable set from
+that list. Telling it to "use whichever surface is at hand" would have sent it
+looking for a tool it does not have. The skill now states the CLI is the surface
+it has, and why. Caught in pre-tag review, not by the author.
+
+The reason this could drift at all is DOC-08: `claude-plugin/skills/**` and
+`agents/**` were outside every scan surface `doc_cli_alignment` had. They are now
+enumerated from the directory rather than a hardcoded list — a hardcoded list is
+itself the unguarded axis, and the next skill added would land back in the blind
+spot — and each directory must be non-empty, so a move that empties one fails
+loudly instead of silently checking nothing. Widening the surface reddened the
+guard immediately on the real defect.
+
+### The last forked copy of the ambiguity renderer (ARC-01)
+
+`callgraph` and `refs` are the only two fuzzy-Ambiguous sites, and their
+hand-written copies had drifted into different key names and different envelope
+shapes for one concept. The sibling exact-ambiguity path has shared a renderer
+since it was written; this was the leg that stayed forked, and that is where the
+drift grew.
+
+Both now call `emit_fuzzy_ambiguity`. The envelope and the two message suffixes
+are parameters, **not** unified: both spellings are published CLI contract, so
+`callgraph` still emits `{results, error, candidates}` and `refs` still emits
+`{error, suggestions}`. Verified by diffing both commands' `--json` output and
+their stderr rendering against the pre-change binary — byte-identical on all
+four, with exit code 1 unchanged.
+
 ## v0.128.0 (2026-09-01)
 
 Eighteen items from the 2026-08-29 audit: the two that made the index diverge

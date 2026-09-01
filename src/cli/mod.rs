@@ -71,6 +71,10 @@ pub const SUBCOMMANDS: &[&str] = &[
     "outcome",
     "adopt",
     "unadopt",
+    // Dispatched by the npm wrapper (`bin/cli.js`); the Rust arm only explains
+    // where it lives. Listed so a typo lands on it instead of on nothing, and so
+    // `tests/doc_cli_alignment.rs` covers its documented flags (DOC-03).
+    "uninstall",
     "snapshot",
     // MCP tool names accepted as aliases (see the dispatch in main.rs). Listed
     // here so the typo-suggester picks the closer alias for inputs like
@@ -130,12 +134,33 @@ pub fn serve_non_project_stub<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
 ) -> std::io::Result<()> {
-    let mut line = String::new();
+    use crate::utils::stdio::{read_frame, StdioFrame, MAX_MESSAGE_SIZE};
+
+    let mut byte_buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break; // EOF
-        }
+        // Same framing as the full server loop (CON-05). A bare `read_line` here
+        // gave the stub neither hardening: one unterminated line allocated without
+        // bound, and one invalid UTF-8 byte returned Err(InvalidData) that the `?`
+        // propagated straight out of the loop, ending the session.
+        let line = match read_frame(&mut reader, &mut byte_buf)? {
+            StdioFrame::Eof => break,
+            StdioFrame::Oversized(oversized_len) => {
+                let err_resp = serde_json::json!({
+                    "jsonrpc": "2.0", "id": null,
+                    "error": {
+                        "code": crate::domain::JSONRPC_INVALID_REQUEST,
+                        "message": format!(
+                            "Message too large: {} bytes (max {})",
+                            oversized_len, MAX_MESSAGE_SIZE
+                        )
+                    }
+                });
+                writeln!(writer, "{}", err_resp)?;
+                writer.flush()?;
+                continue;
+            }
+            StdioFrame::Message(line) => line,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

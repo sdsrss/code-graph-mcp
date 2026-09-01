@@ -12,6 +12,10 @@ const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-util
 const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
+// Module scope on purpose: `detectHookDark` reads it inside a try/catch that
+// treats any throw as "nothing to conclude", so a lazy require in there would
+// turn a resolution failure into a silent disable (pre-tag review, JS-08).
+const { resolveProjectRoot } = require('./project-root');
 
 // v0.17.0 — quietHooks: unconditional quiet 默认。
 // 项目地图与 MEMORY.md plugin contract + on-demand `project_map` 工具高度重叠，
@@ -954,7 +958,20 @@ function analyzeHookDark(recText) {
 
 function detectHookDark() {
   try {
-    const recPath = path.join(process.cwd(), '.code-graph', 'recommendations.jsonl');
+    // JS-08 (audit 2026-08-29). Every WRITER of this file records into the
+    // RESOLVED root — subdir cwd walks up to the project root, a linked worktree
+    // reads the main checkout's index — while this reader used a bare
+    // `process.cwd()`. So in exactly the sessions the subdir-cwd fix exists for,
+    // the dark DETECTOR was itself dark: no file at that path, no claim made,
+    // nothing said. `resolveProjectRoot` returns null when nothing on the walk is
+    // indexed; cwd remains the fallback for that case (unchanged behaviour).
+    //
+    // Required at module scope (see top of file), not here: inside this
+    // try/catch a module-resolution failure would be indistinguishable from
+    // "no recommendations.jsonl", which is the silent-disable shape this whole
+    // finding is about. The sibling hooks all require it at top level too.
+    const root = resolveProjectRoot(process.cwd()) || process.cwd();
+    const recPath = path.join(root, '.code-graph', 'recommendations.jsonl');
     return analyzeHookDark(fs.readFileSync(recPath, 'utf8'));
   } catch { return null; } // no recommendations.jsonl → nothing to conclude
 }

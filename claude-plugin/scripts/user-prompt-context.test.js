@@ -730,7 +730,7 @@ test('integration: Why does this not work? → symptom-hint', () => {
 // ── buildRunEnv: hook-internal delivery marker (anti phantom-conversion) ──
 
 test('buildRunEnv: tags CODE_GRAPH_INTERNAL=1 so deliveries are not logged as model `use`', () => {
-  const env = buildRunEnv({ PATH: '/usr/bin', HOME: '/home/x' });
+  const env = buildRunEnv({ PATH: '/usr/bin', HOME: '/home/x', USERPROFILE: '/home/x' });
   assert.equal(env.CODE_GRAPH_INTERNAL, '1');
   // preserves the base env (binary still resolves on PATH, cwd inherited, etc.)
   assert.equal(env.PATH, '/usr/bin');

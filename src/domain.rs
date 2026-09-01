@@ -5,6 +5,17 @@
 // -- Data directory --
 pub const CODE_GRAPH_DIR: &str = ".code-graph";
 
+// -- JSON-RPC 2.0 standard error codes --
+// Canonical here, re-exported from `mcp::protocol` (same shape as the relation
+// constants). Both JSON-RPC serve loops emit these: the full server in `main.rs`
+// and the non-project stub in `cli`, and `src/cli -> crate::mcp` is a forbidden
+// edge (tests/hardening.rs), so the shared spelling has to sit below both.
+pub const JSONRPC_PARSE_ERROR: i32 = -32700;
+pub const JSONRPC_INVALID_REQUEST: i32 = -32600;
+pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
+pub const JSONRPC_INVALID_PARAMS: i32 = -32602;
+pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
+
 /// Opt-in per-project metrics-silence sentinel (a file under `.code-graph/`). When
 /// present, the recommendations.jsonl writers — `cli::record_cli_use` (Rust) and
 /// `recommendation-log.js` (JS hooks) — skip recording, so a development/dogfood

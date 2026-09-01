@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-// JSON-RPC 2.0 standard error codes
-pub const JSONRPC_PARSE_ERROR: i32 = -32700;
-pub const JSONRPC_INVALID_REQUEST: i32 = -32600;
-pub const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
-pub const JSONRPC_INVALID_PARAMS: i32 = -32602;
-pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
+// JSON-RPC 2.0 standard error codes. Defined in `domain` and re-exported here —
+// the same shape the relation constants use — because the non-project stub in
+// `cli` emits them too, and `src/cli -> crate::mcp` is a forbidden edge
+// (tests/hardening.rs). Every existing `mcp::protocol::JSONRPC_*` path keeps
+// working through this re-export.
+pub use crate::domain::{
+    JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST,
+    JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {

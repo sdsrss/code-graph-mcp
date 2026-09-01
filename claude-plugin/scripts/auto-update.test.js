@@ -488,7 +488,7 @@ test('the DEFAULT binaryPresent treats an unreadable cached binary as absent', (
       }
       process.stdout.write(String(downloads));
     })();
-  `], { env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+  `], { env: { ...process.env, HOME: home, USERPROFILE: home }, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
   fs.rmSync(home, { recursive: true, force: true });
   assert.equal(out, '2',
     'the default must classify an unreadable cached binary as absent (unbounded recovery), not park it as stale');
@@ -751,7 +751,7 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: sandboxHome },
+    env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
     encoding: 'utf8',
   });
   const { result, refreshed, binDownloads, tarCall } = JSON.parse(out.trim().split('\n').pop());
@@ -847,7 +847,7 @@ test('downloadAndInstall repoints a healthy installed_plugins.json and advances 
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: sandboxHome },
+    env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
     encoding: 'utf8',
   });
   const { result, errs } = JSON.parse(out.trim().split('\n').pop());
@@ -936,7 +936,7 @@ test('downloadAndInstall reports a malformed registry entry as BLOCKED, not as s
       })();
     `;
     const out = execGit(process.execPath, ['-e', script], {
-      env: { ...process.env, HOME: sandboxHome },
+      env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
       encoding: 'utf8',
     });
     const { result, errs } = JSON.parse(out.trim().split('\n').pop());
@@ -995,7 +995,7 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: sandboxHome },
+    env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
     encoding: 'utf8',
   });
   const { result } = JSON.parse(out.trim().split('\n').pop());
@@ -1073,7 +1073,7 @@ test('downloadAndInstall SAYS SO when installed_plugins.json cannot be repointed
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: sandboxHome },
+    env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
     encoding: 'utf8',
   });
   const { result, errs } = JSON.parse(out.trim().split('\n').pop());
@@ -1167,7 +1167,7 @@ test('downloadAndInstall repoints a NON-UTF-8 installed_plugins.json, preserving
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
-    env: { ...process.env, HOME: sandboxHome },
+    env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
     encoding: 'utf8',
   });
   const { result, errs } = JSON.parse(out.trim().split('\n').pop());
@@ -1452,7 +1452,7 @@ test('a GitHub 403 leaves the rate-limit backoff armed after checkForUpdate retu
     })().catch(e => { process.stderr.write(String(e)); process.exit(1); });
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
-    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    env: { ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
     encoding: 'utf8',
     timeout: 30000,
   });
@@ -1519,7 +1519,7 @@ test('an UNREADABLE update state does not silently re-arm the give-up budgets', 
     })().catch(e => { process.stderr.write(String(e)); process.exit(1); });
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
-    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    env: { ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
     encoding: 'utf8',
     timeout: 30000,
   });
@@ -1608,7 +1608,7 @@ for (const [label, mutate] of [
       })();
     `;
     const out = execGit(process.execPath, ['-e', script], {
-      env: { ...process.env, HOME: sandboxHome },
+      env: { ...process.env, HOME: sandboxHome, USERPROFILE: sandboxHome },
       encoding: 'utf8',
     });
     const { result, calls } = JSON.parse(out.trim().split('\n').pop());
@@ -1664,7 +1664,7 @@ function runCheckWithState(t, seedState, { installedVersion = '1.0.0', tag = 'v9
     })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
-    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
+    env: { ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
     encoding: 'utf8',
     timeout: 60000,
   });
@@ -1753,7 +1753,7 @@ test('CODE_GRAPH_NO_AUTO_UPDATE=1 skips the update check entirely', (t) => {
     `;
     const r = spawnSync(process.execPath, ['-e', script], {
       env: {
-        ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+        ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
         CG_PLUGIN_ROOT: path.join(root, 'plugin'), PATH: '', ...extraEnv,
       },
       encoding: 'utf8',
@@ -2031,7 +2031,7 @@ function runThrottleProbe(t, { state, cachedBinary = false, force = true }) {
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
     env: {
-      ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
       NPM_CONFIG_PREFIX: path.join(home, 'npm-prefix'), PATH: '',
     },
     encoding: 'utf8',
@@ -2211,7 +2211,7 @@ test('downloadBinary fetches the binary with curl -f, like the sidecar (BIN-4)',
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
     env: {
-      ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
       CURL_LOG: curlLog, PATH: `${fakeBin}:/usr/bin:/bin`,
     },
     encoding: 'utf8',
@@ -2229,6 +2229,64 @@ test('downloadBinary fetches the binary with curl -f, like the sidecar (BIN-4)',
   assert.match(sidecarCall, /(^|\s)-sfL(\s|$)/, 'control: the sidecar fetch already did');
   // Same run proves the size floor now speaks (the fake curl writes 1 byte).
   assert.match(r.stderr, /1 bytes/, 'and the discard is explained on stderr');
+});
+
+test('downloadBinary does not re-fetch a binary that is already at latest.version (JS-03)', { skip: os.platform() === 'win32' ? 'POSIX shell fixture' : false }, (t) => {
+  // `downloadAndInstall` Step 2 called this unconditionally, and its two
+  // early-return arms call it again — so every REPEATED round re-downloaded and
+  // re-promoted a ~40 MB binary that was already current. Under the JS-02
+  // treadmill (a blocked repoint replaying the install about every 30 minutes)
+  // that was the cost amplifier on top of the accounting bug.
+  //
+  // Same fixture as the BIN-4 test above, with ONE difference: the cache already
+  // holds a binary reporting latest.version. That test is this one's control —
+  // it runs with an EMPTY cache and still fetches, so the skip below is the
+  // version check, not a broken harness.
+  const root = mkDir(t, 'cg-au-nofetch-');
+  const fakeBin = path.join(root, 'fakebin');
+  fs.mkdirSync(fakeBin);
+  const curlLog = path.join(root, 'curl.log');
+  fs.writeFileSync(path.join(fakeBin, 'curl'), [
+    '#!/bin/sh',
+    'printf "%s\\n" "$*" >> "$CURL_LOG"',
+    'out=""; prev=""',
+    'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
+    'if [ -n "$out" ]; then printf x > "$out"; fi',
+    'exit 0',
+    '',
+  ].join('\n'));
+  fs.chmodSync(path.join(fakeBin, 'curl'), 0o755);
+  const home = path.join(root, 'home');
+  const cachedBin = path.join(home, '.cache', 'code-graph', 'bin', 'code-graph-mcp');
+  fs.mkdirSync(path.dirname(cachedBin), { recursive: true });
+  writeFakeBinary(cachedBin, '9.9.9');
+  const before = sha256Of(cachedBin);
+
+  const { spawnSync } = require('child_process');
+  const script = `
+    const { downloadBinary } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    downloadBinary({ version: '9.9.9', binaryUrl: 'https://example/code-graph-mcp-linux-x64' })
+      .then(r => process.stdout.write(String(r)));
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: {
+      ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      CURL_LOG: curlLog, PATH: `${fakeBin}:/usr/bin:/bin`,
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+
+  // The acceptance criterion: ZERO curl invocations for the binary assets. The
+  // shim logs every call it receives, so an absent log is an absent fetch.
+  assert.equal(fs.existsSync(curlLog), false,
+    `no asset may be fetched when the cache is already current; curl was called with:\n${
+      fs.existsSync(curlLog) ? fs.readFileSync(curlLog, 'utf8') : ''}`);
+  assert.equal(r.stdout.trim().split('\n').pop(), 'false',
+    'a skip is not an update — the return value must not claim one');
+  assert.equal(sha256Of(cachedBin), before,
+    'and the current binary is left exactly as it was, not re-promoted');
 });
 
 test('an unreachable GitHub reports UNKNOWN, not "up to date"', (t) => {
@@ -2257,7 +2315,7 @@ test('an unreachable GitHub reports UNKNOWN, not "up to date"', (t) => {
     })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
   `;
   const r = spawnSync(process.execPath, ['-e', script], {
-    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
+    env: { ...cleanGitEnv(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
     encoding: 'utf8', timeout: 60000,
   });
   assert.equal(r.status, 0, `child failed: ${r.stderr}`);

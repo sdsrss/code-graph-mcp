@@ -86,6 +86,10 @@ fn js_commands() -> Vec<(&'static str, &'static [&'static str])> {
         ("doctor", &["--check-only"]),
         ("adopt", &[]),
         ("unadopt", &[]),
+        // npm-wrapper-only (`bin/cli.js`); the Rust arm explains where it lives
+        // and exits 1. Listed here so its documented flags are covered by the
+        // same alignment checks as every other subcommand (DOC-03).
+        ("uninstall", &["--unadopt-all", "--purge-global"]),
     ]
 }
 
@@ -213,8 +217,8 @@ fn every_clap_command_accepts_json() {
     let js: Vec<&str> = js_commands().into_iter().map(|(n, _)| n).collect();
     assert_eq!(
         js,
-        vec!["doctor", "adopt", "unadopt"],
-        "the help text names these three by hand; a new JS command must be added there too"
+        vec!["doctor", "adopt", "unadopt", "uninstall"],
+        "the help text names these by hand; a new JS command must be added there too"
     );
     // Negative control: the exception list must not be a place to hide a command
     // that simply forgot the flag. `snapshot` earns it by printing JSON already.
@@ -479,6 +483,44 @@ fn check(source: &str, text: &str, cli: &CliSurface) -> Vec<String> {
     errs
 }
 
+/// Every shipped Markdown steering file under `claude-plugin/skills/` and
+/// `claude-plugin/agents/`, as `(label, contents)`.
+///
+/// DOC-08: these two directories were outside every scan surface this file has —
+/// the four were the templates detail doc, the two `INSTRUCTIONS_*` constants and
+/// `adopt.js`'s `buildBlock` — so drift in them had no guard at all, which is
+/// exactly where DOC-02 was found. Enumerated from the DIRECTORY rather than a
+/// hardcoded file list: a hardcoded list is itself an unguarded axis, and the
+/// next skill added would land straight back in the blind spot. Both dirs must
+/// be non-empty, so a rename that empties one fails loudly instead of quietly
+/// checking nothing.
+fn shipped_steering_docs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for dir in ["claude-plugin/skills", "claude-plugin/agents"] {
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+        let entries = std::fs::read_dir(&full)
+            .unwrap_or_else(|e| panic!("cannot read steering dir {}: {e}", full.display()));
+        let mut found = 0usize;
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            out.push((format!("{dir}/{name}"), text));
+            found += 1;
+        }
+        assert!(
+            found > 0,
+            "{dir} has no .md files — the scan surface silently went empty; \
+             update this list if the docs moved"
+        );
+    }
+    out
+}
+
 #[test]
 fn detail_doc_and_instructions_match_cli() {
     let cli = cli_surface();
@@ -492,6 +534,9 @@ fn detail_doc_and_instructions_match_cli() {
         .unwrap_or_else(|e| panic!("cannot read detail doc {doc_path}: {e}"));
 
     errs.extend(check(".claude/plugin_code_graph_mcp.md", &doc, &cli));
+    for (label, text) in shipped_steering_docs() {
+        errs.extend(check(&label, &text, &cli));
+    }
     errs.extend(check("MCP instructions (noisy)", INSTRUCTIONS_NOISY, &cli));
     errs.extend(check("MCP instructions (quiet)", INSTRUCTIONS_QUIET, &cli));
     for pt in BLOCK_PROJECT_TYPES {

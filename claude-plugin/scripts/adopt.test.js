@@ -26,6 +26,7 @@ const ISOLATED_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-isolated-h
 // which is now correctly "absent".
 delete process.env.CLAUDE_CONFIG_DIR;
 process.env.HOME = ISOLATED_HOME;
+process.env.USERPROFILE = ISOLATED_HOME;
 test.after(() => {
   try { fs.rmSync(ISOLATED_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -757,7 +758,29 @@ test('adopt records the project in the registry; unadopt removes it', () => {
     unadopt({ cwd: sb.cwd, home: sb.home });
     assert.deepStrictEqual(readAdoptedProjects(sb.home), [],
       'unadopt must deregister the project');
-    assert.ok(fs.existsSync(adoptedRegistryFile(sb.home)) === true || true); // file may stay as []
+    // Two end-states are acceptable — the file removed, or kept holding an empty
+    // array — so this pins the DISJUNCTION rather than picking one. It was
+    // written as `assert.ok(existsSync(...) === true || true)`, which is true for
+    // every possible input and asserted nothing (JS-15).
+    //
+    // Worth an assertion because `readAdoptedProjects` above is lenient: it
+    // answers `[]` for a missing file, an empty file and an unparseable one
+    // alike, so on its own it cannot tell "deregistered" from "registry
+    // corrupted". Reading the bytes can.
+    // Pinned, not hedged. The first replacement wrote `if (existsSync) { … }` to
+    // allow either end-state; pre-tag review pointed out the behaviour is
+    // single-valued — `removeAdopted` (adopt.js) always rewrites the file with
+    // `[]` and never unlinks it — so the disjunction would silently drop the
+    // check the day someone made it delete instead.
+    const registry = adoptedRegistryFile(sb.home);
+    assert.ok(fs.existsSync(registry),
+      'unadopt rewrites the registry rather than deleting it; if that changed on ' +
+      'purpose, change this assertion deliberately rather than widening it');
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(registry, 'utf8')),
+      [],
+      'a kept registry file must hold an empty array, not stale or unparseable content'
+    );
   } finally { sb.cleanup(); }
 });
 

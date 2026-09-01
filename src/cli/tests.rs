@@ -866,6 +866,84 @@ fn non_project_stub_answers_initialize_tools_list_and_rejects_rest() {
     assert_eq!(call["error"]["code"], -32601);
 }
 
+/// CON-05: the stub used a bare `read_line`, whose UTF-8 validation returns
+/// `Err(InvalidData)` on a malformed byte — and the `?` carried that straight
+/// out of the serve loop, ending the session over one bad request. The full
+/// server loop was hardened against exactly this (H3); the stub, which is what
+/// every headless `/tmp` session actually gets, was not.
+///
+/// Negative control: revert `serve_non_project_stub` to `read_line` and this
+/// panics at the `unwrap` below, because the call returns Err rather than
+/// answering either request.
+#[test]
+fn non_project_stub_survives_invalid_utf8_line() {
+    let mut input: Vec<u8> = Vec::new();
+    // A lone 0xFF/0xFE pair is not valid UTF-8 in any position.
+    input.extend_from_slice(
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"junk\":\"\xFF\xFE\"}\n",
+    );
+    input.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
+    input.push(b'\n');
+
+    let mut out: Vec<u8> = Vec::new();
+    serve_non_project_stub(std::io::Cursor::new(input), &mut out).unwrap();
+    let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+
+    // The bad bytes become U+FFFD, so the line is still parseable JSON and gets
+    // its normal answer; what matters is that the SECOND request is answered at
+    // all — that is the session surviving.
+    assert_eq!(
+        lines.len(),
+        2,
+        "session must survive the bad line, got: {lines:?}"
+    );
+    let ping: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(ping["id"], 1);
+    let tl: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(tl["id"], 2);
+    assert_eq!(tl["result"]["tools"], serde_json::json!([]));
+}
+
+/// CON-05: the stub had no size cap, so one unterminated line allocated without
+/// bound. It now mirrors the main loop — reject with -32600, drain the line's
+/// tail through its newline, keep serving.
+///
+/// Negative control: with the old `read_line`, the oversized line is swallowed
+/// whole and merely fails to parse, so only ONE response (the tools/list) comes
+/// back and the `lines.len() == 2` assert below fires.
+#[test]
+fn non_project_stub_rejects_oversized_line_and_keeps_serving() {
+    use crate::utils::stdio::MAX_MESSAGE_SIZE;
+
+    let mut input: Vec<u8> = Vec::new();
+    // One line longer than the cap, terminated: the frame reader must reject it
+    // AND consume its tail, or the leftover bytes get misparsed as the next
+    // message and the tools/list below is never seen.
+    input.extend(std::iter::repeat_n(b'a', MAX_MESSAGE_SIZE + 1024));
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#);
+    input.push(b'\n');
+
+    let mut out: Vec<u8> = Vec::new();
+    serve_non_project_stub(std::io::Cursor::new(input), &mut out).unwrap();
+    let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+    assert_eq!(lines.len(), 2, "got: {lines:?}");
+
+    let err: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(err["error"]["code"], -32600);
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Message too large"),
+        "got: {}",
+        err["error"]["message"]
+    );
+
+    let tl: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(tl["id"], 7, "the line after the oversized one must be seen");
+}
+
 #[test]
 fn cleanup_legacy_db_files_removes_empty_legacy_only() {
     let tmp = tempfile::tempdir().unwrap();
