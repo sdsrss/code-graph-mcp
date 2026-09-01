@@ -40,8 +40,10 @@ impl FreshOutcome {
             "{} file(s) changed since indexing; refreshed {}, line numbers for the rest may be stale (rerun after 'code-graph-mcp incremental-index')",
             stale, self.refreshed
         );
-        eprintln!("[code-graph] note: {msg}");
-        tracing::warn!("cli freshness partial: {msg}");
+        // ONE channel (audit 2026-08-29 CON-06): the CLI installs a subscriber,
+        // so the pair printed the same fact twice, once as prose and once as a
+        // log line.
+        tracing::warn!("{msg}");
     }
 
     /// In-band partial-freshness marker for OBJECT-shaped `--json` outputs

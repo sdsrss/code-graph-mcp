@@ -139,13 +139,24 @@ fn main() -> Result<()> {
 
     // CLI subcommands (everything except serve) get a stderr tracing subscriber
     // too, so warn!/error! from the indexer is visible — RUST_LOG overrides the
-    // "warn" default (feedback_tracing_invisible_in_cli). serve installs its own
+    // default (feedback_tracing_invisible_in_cli). serve installs its own
     // ("info") inside run_serve; help/version need no logging.
+    //
+    // `--quiet` has to reach the FILTER, not just the eprintln sites (audit
+    // 2026-08-29 CON-06). Suppressing only the manual prints left the tracing
+    // half of every warning going to stderr, so `incremental-index --quiet` —
+    // the PostToolUse hook's command, whose entire contract is silence — printed
+    // WARN lines, and the per-file parse warnings that the `warn_parse_errors`
+    // summary exists to replace became unsuppressible. Read straight off argv
+    // because this runs before any subcommand parses its own flags.
+    let quiet_flag = args
+        .iter()
+        .any(|a| a == "--quiet" || a == "-q" || a == "--quiet=true");
     if !matches!(
         subcommand,
         Some("serve") | None | Some("--help" | "-h" | "help") | Some("--version" | "-V")
     ) {
-        init_tracing("warn");
+        init_tracing(if quiet_flag { "error" } else { "warn" });
     }
 
     let result = match subcommand {
@@ -662,6 +673,13 @@ fn init_tracing(default_level: &str) {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
+        // No timestamp, no module path: with the double-writes collapsed
+        // (CON-06), this subscriber IS the user-facing channel for a CLI warning,
+        // and `2026-09-01T14:44:03.512344Z WARN code_graph_mcp::cli::index_ops:`
+        // in front of a sentence written for a human is noise. `serve` keeps the
+        // full format — that output is a log, read by whoever runs the server.
+        .without_time()
+        .with_target(false)
         .with_writer(io::stderr)
         .try_init();
 }

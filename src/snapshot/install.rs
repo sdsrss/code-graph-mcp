@@ -58,15 +58,17 @@ pub(crate) fn resolve_snapshot_source_impl(
         return None;
     }
     if let Some(url) = cfg.snapshot.url {
-        // tracing::warn! is not visible in CLI/MCP startup paths (no subscriber),
-        // so users would otherwise just see "No snapshot source resolved" and
-        // have no idea their TOML override was rejected. Print to stderr too.
+        // Said once, through tracing (audit 2026-08-29 CON-06). These used to
+        // print twice: the comment that stood here said tracing was invisible on
+        // the CLI/MCP startup paths, which stopped being true when `main` began
+        // installing a subscriber for every subcommand. Being LOUD still matters
+        // — without it users just see "No snapshot source resolved" and have no
+        // idea their TOML override was rejected.
         if !url.starts_with("https://") {
             let msg = format!(
                 "warning: .code-graph.toml [snapshot] url must start with https:// (got '{url}'), ignoring"
             );
             tracing::warn!("{msg}");
-            eprintln!("{msg}");
             return None;
         }
         if !url_trusted {
@@ -76,7 +78,6 @@ pub(crate) fn resolve_snapshot_source_impl(
                  database. Set CODE_GRAPH_SNAPSHOT_TRUST_URL=1 in your environment to trust it."
             );
             tracing::warn!("{msg}");
-            eprintln!("{msg}");
             return None;
         }
         return Some(url);
@@ -100,7 +101,6 @@ pub(crate) fn gate_origin_url(origin_url: Option<String>, origin_trusted: bool) 
              CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1 (or a CODE_GRAPH_SNAPSHOT_PIN) to install it."
         );
         tracing::warn!("{msg}");
-        eprintln!("{msg}");
         return None;
     }
     Some(url)

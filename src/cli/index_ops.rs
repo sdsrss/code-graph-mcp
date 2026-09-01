@@ -141,13 +141,16 @@ pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
 }
 
 /// Surface, on the CLI path, the count of files that parsed with tree-sitter
-/// ERROR nodes (symbols may be incomplete). Dual-writes `tracing::warn!` AND a
-/// stderr summary line: the CLI entry points install no tracing subscriber
-/// (feedback_tracing_invisible_in_cli), so the eprintln is what the user
-/// actually sees; the tracing line keeps it visible under a server/log setup.
-/// Silent when the count is zero. `quiet` suppresses only the stderr line, like
-/// the surrounding index summaries.
-pub(crate) fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats, quiet: bool) {
+/// ERROR nodes (symbols may be incomplete). Silent when the count is zero.
+///
+/// ONE channel. This used to dual-write `tracing::warn!` AND the same sentence
+/// through `eprintln!`, on the premise — stated in the comment that used to live
+/// here — that CLI entry points install no subscriber. They have installed one
+/// since `feedback_tracing_invisible_in_cli` was addressed in `main`, so the
+/// convention had inverted into printing everything twice (audit 2026-08-29
+/// CON-06). `--quiet` now works through the tracing filter, which is also what
+/// makes it cover the per-file warnings this summary exists to replace.
+pub(crate) fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats) {
     let n = stats.files_with_parse_errors;
     if n == 0 {
         return;
@@ -156,12 +159,6 @@ pub(crate) fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats, qu
         "{} file(s) parsed with syntax errors (symbols may be incomplete)",
         n
     );
-    if !quiet {
-        eprintln!(
-            "{} file(s) parsed with syntax errors (symbols may be incomplete)",
-            n
-        );
-    }
 }
 
 /// Build a fresh FULL index into an explicit `db_path` and embed it. The DB is
@@ -196,7 +193,7 @@ pub(crate) fn build_full_index_at(
             result.files_indexed, result.nodes_created, result.edges_created
         );
     }
-    warn_parse_errors(&result.stats, quiet);
+    warn_parse_errors(&result.stats);
     finish_embedding(&db, quiet, no_embed)?;
     Ok(result)
 }
@@ -277,29 +274,26 @@ pub(crate) fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Re
 /// is looked for. Destructive callers use
 /// [`lock_index_for_replace`] instead — for them this is a refusal,
 /// not a warning.
-pub(crate) fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
+pub(crate) fn warn_if_index_locked(code_graph_dir: &Path) {
     if !crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) {
         return;
     }
     let lock = code_graph_dir.join("index.lock");
+    // ONE channel, carrying the sentence written for a human (CON-06). The
+    // terse twin that used to sit here printed alongside it on every CLI run.
+    //
+    // Same holders as the replace-gate's refusal names: since the CLI takes this
+    // lock too, "likely a running MCP server" was no longer true — it sent the
+    // user to stop a server that may not exist while a concurrent rebuild-index
+    // was the real holder.
     tracing::warn!(
-        "another process holds the index lock at {} — indexing now may race its writes",
+        "another process (a running MCP server, or a concurrent rebuild-index / \
+         reindex) holds the index lock at {}. \
+         Indexing now races its writes; if that trips a foreign-key error on \
+         the other side, its recovery is to discard the index and rebuild it \
+         from scratch. Wait for it to finish, or stop the server.",
         lock.display()
     );
-    if !quiet {
-        // Same holders as the replace-gate's refusal names: since the CLI takes
-        // this lock too, "likely a running MCP server" was no longer true — it
-        // sent the user to stop a server that may not exist while a concurrent
-        // rebuild-index was the real holder.
-        eprintln!(
-            "[code-graph] Warning: another process (a running MCP server, or a \
-             concurrent rebuild-index / reindex) holds the index lock at {}. \
-             Indexing now races its writes; if that trips a foreign-key error on \
-             the other side, its recovery is to discard the index and rebuild it \
-             from scratch. Wait for it to finish, or stop the server.",
-            lock.display()
-        );
-    }
 }
 
 /// Gate for commands that REPLACE `index.db` wholesale (`rebuild-index`'s atomic
@@ -338,10 +332,9 @@ pub(crate) fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
 pub(crate) fn lock_index_for_replace(
     code_graph_dir: &Path,
     force: bool,
-    quiet: bool,
 ) -> Result<Option<crate::indexer::lock::IndexLockGuard>> {
     let lock = code_graph_dir.join("index.lock");
-    let refuse_or_force = |quiet: bool| -> Result<()> {
+    let refuse_or_force = || -> Result<()> {
         if !force {
             anyhow::bail!(
                 "another process (a running MCP server, or a concurrent rebuild-index / \
@@ -355,22 +348,17 @@ pub(crate) fn lock_index_for_replace(
                 lock.display()
             );
         }
+        // ONE channel (CON-06); the terse twin printed alongside this one.
         tracing::warn!(
-            "--force: replacing index.db while another process holds {} — its pending writes will be lost",
+            "--force: another process holds the index lock at {}. \
+             Replacing the index anyway — that process's pending writes will be lost.",
             lock.display()
         );
-        if !quiet {
-            eprintln!(
-                "[code-graph] --force: another process holds the index lock at {}. \
-                 Replacing the index anyway — that process's pending writes will be lost.",
-                lock.display()
-            );
-        }
         Ok(())
     };
 
     if crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) {
-        refuse_or_force(quiet)?;
+        refuse_or_force()?;
         return Ok(None);
     }
     // Free a moment ago — claim it, so a rebuild starting now refuses instead of
@@ -380,7 +368,7 @@ pub(crate) fn lock_index_for_replace(
     match crate::indexer::lock::acquire_index_lock_guard(code_graph_dir) {
         Some(guard) => Ok(Some(guard)),
         None if crate::indexer::lock::other_process_holds_index_lock(code_graph_dir) => {
-            refuse_or_force(quiet)?;
+            refuse_or_force()?;
             Ok(None)
         }
         None => {
@@ -408,7 +396,7 @@ pub fn cmd_incremental_index_opts(
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
-    warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR), quiet);
+    warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR));
     // Covers the incremental path too, not just the full-index one inside
     // build_full_index_at: an index created before this existed (or by a user
     // who removed the line) gets the entry back on the next run (audit DB-4).
@@ -454,7 +442,7 @@ pub fn cmd_incremental_index_opts(
             );
         }
     }
-    warn_parse_errors(&stats.stats, quiet);
+    warn_parse_errors(&stats.stats);
 
     finish_embedding(&db, quiet, no_embed)?;
     if json {
@@ -536,7 +524,7 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     // and hold the lock for the whole rebuild so a concurrent one refuses here
     // rather than colliding in the temp sweep below. `_index_lock` must stay
     // bound to the end of the function — `let _ = …` would drop it immediately.
-    let _index_lock = lock_index_for_replace(&code_graph_dir, args.force, quiet)?;
+    let _index_lock = lock_index_for_replace(&code_graph_dir, args.force)?;
 
     // Atomic rebuild: build the fresh index into a temp file in the SAME dir,
     // then rename it over index.db in one syscall. Concurrent readers (a second

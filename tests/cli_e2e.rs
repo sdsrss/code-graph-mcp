@@ -9341,3 +9341,97 @@ fn affected_still_reports_the_dependents_of_a_deleted_file() {
         "a deleted-but-indexed file is not 'not indexed': {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CON-06 (audit 2026-08-29): one channel per warning, and `--quiet` means quiet.
+//
+// `main` installs a stderr tracing subscriber for every non-serve subcommand, so
+// the dual-write convention several sites carried — `tracing::warn!` AND the same
+// sentence through `eprintln!`, on the premise that CLI has no subscriber —
+// had inverted into printing everything twice. `--quiet` suppressed only the
+// manual half, which left the PostToolUse hook's own command (`incremental-index
+// --quiet`, whose entire contract is silence) emitting WARN lines.
+//
+// Subprocess tests on purpose: both halves are properties of the assembled
+// binary (argv -> filter -> subscriber -> stderr), and neither is observable
+// from inside the library.
+// ---------------------------------------------------------------------------
+
+/// A project with one file tree-sitter can only partially parse.
+fn project_with_a_parse_error() -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("broken.rs"),
+        "fn broken( {\n  let x = ;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("fine.rs"), "fn fine() -> i32 { 1 }\n").unwrap();
+    project
+}
+
+#[test]
+fn incremental_index_warns_about_parse_errors_exactly_once() {
+    let project = project_with_a_parse_error();
+    let out = Command::new(binary_path())
+        .arg("incremental-index")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let hits = stderr.matches("parsed with syntax errors").count();
+    assert_eq!(
+        hits, 1,
+        "the parse-error summary must reach stderr through ONE channel; stderr was:\n{stderr}"
+    );
+}
+
+#[test]
+fn incremental_index_quiet_prints_nothing_at_all() {
+    let project = project_with_a_parse_error();
+    // Index once so the second run is the incremental path the hook actually runs.
+    Command::new(binary_path())
+        .arg("incremental-index")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    std::fs::write(
+        project.path().join("broken2.rs"),
+        "fn broken2( {\n let y = ;\n}\n",
+    )
+    .unwrap();
+
+    let out = Command::new(binary_path())
+        .args(["incremental-index", "--quiet"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "--quiet must silence the tracing half too, not just the manual prints; stderr was:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "--quiet must not print to stdout either"
+    );
+}
+
+#[test]
+fn rust_log_still_overrides_the_quiet_default() {
+    // The filter is a DEFAULT, not a mute: a user who asks for warnings gets them
+    // back. Without this, "make --quiet work" could be implemented by dropping the
+    // subscriber entirely and nothing here would notice.
+    let project = project_with_a_parse_error();
+    let out = Command::new(binary_path())
+        .args(["incremental-index", "--quiet"])
+        .env("RUST_LOG", "warn")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("parsed with syntax errors"),
+        "RUST_LOG must still override the --quiet default; stderr was:\n{stderr}"
+    );
+}

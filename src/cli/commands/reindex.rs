@@ -55,7 +55,7 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
         // Same door as `rebuild-index`: unlinking index.db under a running
         // server strands its open fd on the deleted inode (audit P1-3). Taken
         // BEFORE the removal so a refusal leaves the index untouched.
-        index_lock = lock_index_for_replace(&cg_dir, args.force, false)?;
+        index_lock = lock_index_for_replace(&cg_dir, args.force)?;
         // Remove just index.db + WAL files; leave usage.jsonl etc. intact.
         for name in ["index.db", "index.db-wal", "index.db-shm"] {
             let _ = std::fs::remove_file(cg_dir.join(name));

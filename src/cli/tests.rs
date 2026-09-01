@@ -2322,7 +2322,7 @@ fn lock_index_for_replace_claims_the_lock_it_reports_free() {
         "precondition: the lock must start free, else the claim below is unobservable"
     );
 
-    let guard = lock_index_for_replace(&cg, false, true).unwrap();
+    let guard = lock_index_for_replace(&cg, false).unwrap();
     assert!(
         guard.is_some(),
         "a free lock must be CLAIMED, not merely observed to be free"
@@ -2415,7 +2415,7 @@ fn lock_index_for_replace_proceeds_when_the_lock_file_cannot_be_opened() {
     let original = std::fs::metadata(&cg).unwrap().permissions();
     std::fs::set_permissions(&cg, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let outcome = lock_index_for_replace(&cg, false, true);
+    let outcome = lock_index_for_replace(&cg, false);
 
     // Restore before asserting so a failure still leaves a removable TempDir.
     std::fs::set_permissions(&cg, original).unwrap();
@@ -2438,7 +2438,7 @@ fn a_second_rebuild_refuses_while_the_first_holds_the_lock() {
     let cg = project.path().join(CODE_GRAPH_DIR);
     // Stand-in for rebuild #1: the exact guard cmd_rebuild_index now keeps
     // alive for the length of its run.
-    let _first = lock_index_for_replace(&cg, false, true)
+    let _first = lock_index_for_replace(&cg, false)
         .unwrap()
         .expect("rebuild #1 must get the lock");
 

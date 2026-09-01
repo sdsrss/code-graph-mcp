@@ -220,6 +220,21 @@ fn build_stats_json(
 /// The human-readable half of `stats`. Extracted from `cmd_stats` (audit
 /// 2026-08-22 P2-15): 300 lines of rendering sat inside the `else` arm of a
 /// 500-line function, so the two output modes could not be read side by side.
+/// Order `(name, value)` pairs by count DESC, then name ASC.
+///
+/// The name is not decoration — it is what makes the order TOTAL. These pairs
+/// come out of `HashMap`s (`UsageSummary.tools`, `ToolAgg.err_kinds`), so a sort
+/// keyed on the count alone leaves every tied group in whatever order the map
+/// happened to yield, and two runs over an UNCHANGED `usage.jsonl` print
+/// different text: measured at HEAD, 5 runs produced 5 different md5s.
+///
+/// `--json` never had the bug — `build_stats_json` goes through
+/// `serde_json::Map`, whose key order is fixed — which is exactly why the JSON
+/// regression tests could not see it (audit 2026-08-29 CON-04).
+fn sort_by_count_then_name<V>(items: &mut [(&String, V)], count: impl Fn(&V) -> u64) {
+    items.sort_by(|(a_name, a), (b_name, b)| count(b).cmp(&count(a)).then(a_name.cmp(b_name)));
+}
+
 /// Uses the module-level `sout!`, which is why it returns `Result`.
 fn render_stats_text(
     summary: &UsageSummary,
@@ -249,7 +264,7 @@ fn render_stats_text(
     sout!();
 
     let mut sorted: Vec<(&String, &ToolAgg)> = summary.tools.iter().collect();
-    sorted.sort_by_key(|(_, a)| std::cmp::Reverse(a.n));
+    sort_by_count_then_name(&mut sorted, |a| a.n);
 
     if sorted.is_empty() {
         sout!("(no tool calls recorded)");
@@ -300,12 +315,12 @@ fn render_stats_text(
     let mut err_tools: Vec<(&String, &ToolAgg)> =
         summary.tools.iter().filter(|(_, a)| a.err > 0).collect();
     if !err_tools.is_empty() {
-        err_tools.sort_by_key(|(_, a)| std::cmp::Reverse(a.err));
+        sort_by_count_then_name(&mut err_tools, |a| a.err);
         sout!();
         sout!("Error kinds (per tool, most errors first — large `other` = unclassified, investigate):");
         for (name, agg) in &err_tools {
             let mut kinds: Vec<(&String, &u64)> = agg.err_kinds.iter().collect();
-            kinds.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+            sort_by_count_then_name(&mut kinds, |c| **c);
             let classified: u64 = agg.err_kinds.values().sum();
             let mut parts: Vec<String> =
                 kinds.iter().map(|(k, c)| format!("{} {}", k, c)).collect();
@@ -612,3 +627,46 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 }
 
 // --- grep subcommand ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CON-04. The tie-break has to make the order TOTAL, and the way to state
+    /// that is: the same tied set must come out the same way whatever order it
+    /// went in. A plain `sort_by_key(Reverse(count))` passes a single-order test
+    /// — Rust's sort is stable, so it PRESERVES the input order of a tied group,
+    /// which is precisely the bug (the input order is a HashMap's).
+    #[test]
+    fn count_then_name_is_a_total_order_whatever_the_input_order() {
+        let (alpha, beta, gamma) = ("alpha".to_string(), "beta".to_string(), "gamma".to_string());
+        let expected = vec![("gamma", 9_u64), ("alpha", 4), ("beta", 4)];
+
+        for input in [
+            vec![(&alpha, 4_u64), (&beta, 4), (&gamma, 9)],
+            vec![(&beta, 4_u64), (&alpha, 4), (&gamma, 9)],
+            vec![(&gamma, 9_u64), (&beta, 4), (&alpha, 4)],
+        ] {
+            let mut items = input;
+            sort_by_count_then_name(&mut items, |n| *n);
+            let got: Vec<(&str, u64)> = items.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+            assert_eq!(
+                got, expected,
+                "tied entries must land in name order regardless of how they arrived"
+            );
+        }
+    }
+
+    /// The count still dominates — a tie-break that quietly became a name sort
+    /// would pass the test above if every count were equal.
+    #[test]
+    fn count_still_dominates_the_name() {
+        let (a, z) = ("aaa".to_string(), "zzz".to_string());
+        let mut items = vec![(&a, 1_u64), (&z, 7)];
+        sort_by_count_then_name(&mut items, |n| *n);
+        assert_eq!(
+            items[0].0, &z,
+            "the higher count sorts first, not the lower name"
+        );
+    }
+}

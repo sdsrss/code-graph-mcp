@@ -157,9 +157,11 @@ pub fn betweenness_centrality_capped(
         (0..n).collect()
     };
     if sampled {
-        // Double-written: `tracing` output is invisible on the CLI, and a silently
-        // approximate ranking presented as exact is the "false clean" failure this
-        // repo keeps re-learning.
+        // A silently approximate ranking presented as exact is the "false clean"
+        // failure this repo keeps re-learning, so it is said out loud. Said ONCE:
+        // this was double-written on the premise that tracing is invisible on the
+        // CLI, which stopped being true when `main` started installing a
+        // subscriber for every subcommand (audit 2026-08-29 CON-06).
         let msg = format!(
             "graph has {n} nodes (> {}) — betweenness computed from {} sampled sources; \
              scores are ESTIMATES and small differences in rank are not meaningful",
@@ -167,7 +169,6 @@ pub fn betweenness_centrality_capped(
             pivots.len()
         );
         tracing::warn!("{msg}");
-        eprintln!("[code-graph] {msg}");
     }
 
     for &s in &pivots {
