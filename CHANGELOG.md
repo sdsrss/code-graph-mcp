@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-Three P2 items from the 2026-08-29 audit. Old indexes rebuild once on first use
+Fourteen items from the 2026-08-29 audit: the two that made the index diverge
+from a rebuild or grow without bound, the guard hole that let that class come
+back, and a batch of hook-latency, determinism and diagnosis fixes. Other items
+from that report remain open. Old indexes rebuild once on first use
 (INDEX_VERSION 69 → 70).
 
 ### A file appearing or vanishing left every file that depends on it stale
@@ -49,6 +52,63 @@ slots (below 25% occupancy with at least 16 MB claimed) and VACUUMs after. On
 this index: 259.0 MB → 73.7 MB, chunks 190.8 MB → 7.5 MB, vector coverage
 unchanged, 0.55s. It copies vectors that already exist, so it needs no model and
 no embedding-cache coverage, and it never re-embeds anything.
+
+### Two blocking hooks stalled for seconds on ordinary repository content
+
+`pre-edit-guide` matches eight function-signature patterns against whatever you
+are editing. Three of them ran an unbounded `\w` / `\S` run in front of a
+required literal, which on a long bracket-free run backtracks from every start
+position — quadratic. Measured: 100 KB of such text took 2.8s, 200 KB 11.0s,
+400 KB 43.4s, all of it blocking the Edit. No malice needed: a base64 asset, a
+hex dump or a minified bundle does it. Real code never paid it (225 KB of this
+repo's own source: 0.3ms).
+
+The three runs are now capped at 128 characters, which makes the curve linear,
+and the hook matches only the first 8 KB, where a signature lives. A 400 KB
+`old_string` now costs 1.81ms instead of 43,351ms.
+
+`pre-grep-guide`'s `rebaseRelativePaths` made one `fs.existsSync` call per token
+and ran before every length gate in the file, so a very long command line meant
+tens of thousands of syscalls inside a blocking hook (100k tokens = 100,001
+probes, 2.2s). It now returns early past 2000 characters — the loosest bound the
+file already applies elsewhere.
+
+### `stats` printed differently every run, and `--quiet` was never quiet
+
+`stats` text output sorted HashMap-collected rows by count alone, so tied groups
+came out in per-process random order: five runs over an unchanged `usage.jsonl`
+produced five different outputs. `--json` was unaffected, which is exactly why
+the JSON regression tests never saw it.
+
+Separately, `main` installs a stderr tracing subscriber for every CLI
+subcommand, but eight sites still wrote both a `tracing::warn!` and the same
+sentence through `eprintln!`, on the older premise that the CLI has no
+subscriber. So every one of those warnings printed twice, and `--quiet` — which
+suppressed only the manual half — left the tracing lines on stderr.
+`incremental-index --quiet` is what the PostToolUse hook runs, and its whole
+contract is silence.
+
+`--quiet` now reaches the log filter (`RUST_LOG` still overrides it), and each
+site keeps one channel — the one written for a human, where the two had drifted
+apart: the lock warning now names which processes hold it and what to do.
+
+### Smaller fixes
+
+- A non-object `arguments` in a `tools/call` — `"arguments": "src/main.rs"` —
+  was answered as "Error: Missing path", pointing at a parameter you did pass.
+  It is now an invalid-params error naming the envelope.
+- `centrality_limit` was the only numeric MCP parameter with no upper bound. It
+  clamps to 1-100 like every sibling, and a new guard fails the build on the
+  next unbounded one.
+- A malformed `installed_plugins.json` entry (an empty array) made auto-update
+  report "Plugin download/extract failed" — a download diagnosis for a local
+  file — and, once guarded, would have silently succeeded forever: a refused
+  repoint left the registry pointing at the old version while the update was
+  recorded as done, re-running a full download roughly every 30 minutes. A
+  refused repoint is no longer counted as success.
+- Uninstall no longer reports projects whose managed block you had already
+  removed by hand as "Could NOT clean".
+- A snapshot-supplied commit id is validated before it reaches `git cat-file`.
 
 ### The compact-key drift guard could not see the keys it most needed to
 
