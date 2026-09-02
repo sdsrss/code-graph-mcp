@@ -1548,6 +1548,66 @@ impl McpServer {
         Ok(())
     }
 
+    /// Wipe every `files` row and rebuild the whole index — inside ONE
+    /// transaction, so external readers never see the gap.
+    ///
+    /// Two callers used to spell this out separately and had drifted into
+    /// OPPOSITE transaction shapes (audit 2026-09-02 P2-4): `tool_rebuild_index`
+    /// wrapped DELETE + rebuild in one `unchecked_transaction`, with a comment
+    /// naming the alternative as the bug it had fixed, while the FK-recovery arm
+    /// still ran the old "DELETE, commit, then rebuild in place" — leaving the
+    /// index EMPTY for the whole multi-second rebuild for any fresh-connection
+    /// reader (a CLI `grep`, a secondary instance), and leaving it empty for good
+    /// if the rebuild then failed.
+    ///
+    /// In WAL mode a reader keeps seeing the last committed — old, complete —
+    /// index until this commits. `run_full_index`'s phase transactions are
+    /// SAVEPOINTs (see `index_files`), so they nest inside this BEGIN rather than
+    /// erroring with "cannot start a transaction within a transaction". The CLI's
+    /// temp-file + atomic-rename swap can't be reused here: this server holds a
+    /// persistent `self.db` connection whose fd would keep pointing at the old
+    /// unlinked inode after a rename.
+    ///
+    /// Caller-side state that is NOT hoisted, because it differs by caller and
+    /// hoisting it would silently drop it: the FK arm's pre-wipe `dir_cache` /
+    /// `indexed` invalidation (it must happen BEFORE the wipe) and its
+    /// `pending_incremental` clear (only an incremental owes one).
+    fn wipe_and_rebuild(
+        &self,
+        project_root: &Path,
+        model: Option<&EmbeddingModel>,
+        progress_label: &str,
+    ) -> Result<crate::indexer::pipeline::IndexResult> {
+        let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
+            self.send_progress(progress_label, current, total);
+        };
+
+        let result = {
+            // `write_db()` is `self.db` for a normal primary and the read-write
+            // handle opened at promotion for an instance that started as a
+            // secondary — `self.db` is read-only in that case and every write
+            // below would fail with SQLITE_READONLY. Scoped to this block so the
+            // handle (lock order 7) is released before the bookkeeping locks
+            // (2/3/5) below, which is the ordering the type's doc comment forbids
+            // inverting. It is also why the caller must not already hold one: the
+            // promoted variant's mutex is not reentrant.
+            let write_db = self.write_db();
+            let tx = write_db.conn().unchecked_transaction()?;
+            tx.execute("DELETE FROM files", [])?; // CASCADE nodes→edges→node_vectors
+            let result = run_full_index(&write_db, project_root, model, Some(&progress_cb))?;
+            tx.commit()?;
+            result
+        };
+
+        *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats.clone();
+        *lock_or_recover(&self.indexed, "indexed") = true;
+        *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+        lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
+        self.spawn_background_embedding();
+
+        Ok(result)
+    }
+
     /// Run incremental index with cache snapshot/restore on failure.
     ///
     /// If background embedding is in progress, waits briefly for it to finish
@@ -1641,34 +1701,19 @@ impl McpServer {
                         "Incremental index hit FK constraint — DB state is inconsistent. \
                          Truncating and rebuilding from scratch."
                     );
+                    // BEFORE the wipe, and deliberately not hoisted into
+                    // `wipe_and_rebuild`: the in-memory caches are the ones known
+                    // to disagree with the DB, so they must stop being trusted
+                    // even if the rebuild below never completes.
                     *lock_or_recover(&self.dir_cache, "dir_cache") = None;
                     *lock_or_recover(&self.indexed, "indexed") = false;
                     *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
                     lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
-                    // CASCADE nodes→edges→node_vectors via FK ON DELETE CASCADE.
-                    // The handle from above was released before the invalidations,
-                    // so re-acquiring here is correct (and required — the promoted
-                    // variant's mutex is not reentrant, so this must stay the only
-                    // live `write_db` for the rest of the arm).
-                    let write_db = self.write_db();
-                    {
-                        let tx = write_db.conn().unchecked_transaction()?;
-                        tx.execute("DELETE FROM files", [])?;
-                        tx.commit()?;
-                    }
-
-                    let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
-                        self.send_progress("indexing", current, total);
-                    };
-                    let recovery =
-                        run_full_index(&write_db, project_root, model, Some(&progress_cb));
-                    drop(write_db); // same ordering rule as above
-                    match recovery {
-                        Ok(result) => {
-                            *lock_or_recover(&self.last_index_stats, "last_index_stats") =
-                                result.stats;
-                            *lock_or_recover(&self.indexed, "indexed") = true;
-                            self.spawn_background_embedding();
+                    // The handle from above was already released, so
+                    // `wipe_and_rebuild` may acquire its own (the promoted
+                    // variant's mutex is not reentrant).
+                    match self.wipe_and_rebuild(project_root, model, "indexing") {
+                        Ok(_) => {
                             // Full rebuild captured current on-disk state — clear owed flag.
                             self.indexing
                                 .pending_incremental
@@ -1677,6 +1722,9 @@ impl McpServer {
                             Ok(())
                         }
                         Err(e2) => {
+                            // The DELETE rolled back with it, so the old index is
+                            // still there to answer queries — unlike the old shape,
+                            // which left it wiped.
                             tracing::error!("Full re-index recovery also failed: {}", e2);
                             Err(e2)
                         }
@@ -3372,6 +3420,241 @@ function handleLogin(req: Request) {
         }
     }
 
+    /// The BOOLEAN half of CON-15, which the first pass left open at all 21 flag
+    /// sites (audit 2026-09-02 P2-2). `args["compact"].as_bool().unwrap_or(false)`
+    /// cannot tell "not sent" from "sent as the wrong type", and because the key
+    /// IS declared on the schema, `note_ignored_arguments` reports nothing
+    /// either: `{"compact": "true"}` returned the full uncompacted envelope and
+    /// `{"include_tests": 1}` dropped every test, both silently.
+    ///
+    /// One row per (tool, flag) — the whole point of the table is that the axis is
+    /// the flag list, and a table that only enumerates the sites already known to
+    /// pass stops covering the axis (pre-tag review v0.129.0). Enumerating it is
+    /// what found the 22nd: `skip_indexing` is declared on no schema at all, so
+    /// the flag-by-flag walk over the tool definitions never reached it, while
+    /// every tool reads it through one shared helper.
+    #[test]
+    fn boolean_arguments_are_refused_rather_than_silently_defaulted() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return helper(); }\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // (tool, companion args needed to reach the read, flag, well-typed control)
+        let rows: &[(&str, serde_json::Value, &str, bool)] = &[
+            (
+                "semantic_code_search",
+                json!({"query": "handler"}),
+                "compact",
+                true,
+            ),
+            (
+                "get_call_graph",
+                json!({"function_name": "handler"}),
+                "compact",
+                true,
+            ),
+            (
+                "get_call_graph",
+                json!({"function_name": "handler"}),
+                "include_tests",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "include_references",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "include_tests",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "include_impact",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "include_similar",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "compact",
+                true,
+            ),
+            (
+                "find_references",
+                json!({"symbol_name": "handler"}),
+                "compact",
+                true,
+            ),
+            (
+                "find_references",
+                json!({"symbol_name": "handler"}),
+                "include_tests",
+                true,
+            ),
+            ("module_overview", json!({"path": "."}), "compact", true),
+            (
+                "module_overview",
+                json!({"path": "."}),
+                "include_deps",
+                true,
+            ),
+            (
+                "module_overview",
+                json!({"path": "."}),
+                "include_dead",
+                true,
+            ),
+            ("project_map", json!({}), "compact", true),
+            ("project_map", json!({}), "include_centrality", true),
+            (
+                "dependency_graph",
+                json!({"file_path": "app.ts"}),
+                "compact",
+                true,
+            ),
+            ("find_dead_code", json!({}), "include_tests", true),
+            ("find_dead_code", json!({}), "compact", true),
+            (
+                "find_http_route",
+                json!({"route_path": "/x"}),
+                "include_middleware",
+                true,
+            ),
+            (
+                "find_http_route",
+                json!({"route_path": "/x"}),
+                "include_tests",
+                true,
+            ),
+            // The destructive one: `{"confirm": "true"}` used to read as false, so
+            // the caller got the confirmation prompt back and could not tell its
+            // spelling had been discarded. Its control is `false` on purpose —
+            // `true` would run a real rebuild for no added coverage.
+            ("rebuild_index", json!({}), "confirm", false),
+            // `skip_indexing`: the 22nd flag, and the one a pass over the tool
+            // SCHEMAS cannot find — it is declared on none of them
+            // (`HONORED_UNDECLARED_ARGS` carries it as `("*", "skip_indexing")`)
+            // while every tool below reads it through the one shared
+            // `should_skip_indexing`. Reading `"true"` as `false` sent the server
+            // off to index exactly when the caller had asked it not to.
+            //
+            // One row per tool rather than one for the helper: the axis this
+            // table exists to cover is (tool, flag), and a shared reader is
+            // precisely the shape that lets a single caller-side omission go
+            // unnoticed. Two of these tools — `find_similar_code` and
+            // `ast_search` — appear nowhere above, so this is also the first row
+            // the table has ever had for them.
+            (
+                "semantic_code_search",
+                json!({"query": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "get_call_graph",
+                json!({"function_name": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "find_references",
+                json!({"symbol_name": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "find_similar_code",
+                json!({"symbol_name": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "ast_search",
+                json!({"query": "handler"}),
+                "skip_indexing",
+                true,
+            ),
+            (
+                "module_overview",
+                json!({"path": "."}),
+                "skip_indexing",
+                true,
+            ),
+            ("project_map", json!({}), "skip_indexing", true),
+            (
+                "dependency_graph",
+                json!({"file_path": "app.ts"}),
+                "skip_indexing",
+                true,
+            ),
+            ("find_dead_code", json!({}), "skip_indexing", true),
+            (
+                "find_http_route",
+                json!({"route_path": "/x"}),
+                "skip_indexing",
+                true,
+            ),
+        ];
+
+        let call = |tool: &str, args: serde_json::Value| -> (bool, String) {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            (parsed["result"]["isError"].as_bool().unwrap_or(false), text)
+        };
+
+        for (tool, base, arg, control) in rows {
+            // Both spellings a model actually produces for a JSON-schema boolean.
+            for hostile_value in [json!("true"), json!(1)] {
+                let mut hostile = base.clone();
+                hostile[*arg] = hostile_value.clone();
+                let (is_error, text) = call(tool, hostile);
+                assert!(
+                    is_error && text.contains(*arg) && text.contains("must be a boolean"),
+                    "{tool}.{arg}: {hostile_value} where a boolean belongs must be refused by name; \
+                     got isError={is_error} text={text}"
+                );
+            }
+
+            // Negative control on the same row: a well-typed flag must not trip the
+            // check. The call may still fail for unrelated reasons (nothing indexed,
+            // no embeddings) — what must not appear is THIS complaint.
+            let mut typed = base.clone();
+            typed[*arg] = json!(*control);
+            let (_, text) = call(tool, typed);
+            assert!(
+                !text.contains(&format!("{arg} must be a boolean")),
+                "{tool}.{arg}: a correctly-typed value was refused; got {text}"
+            );
+        }
+    }
+
     /// A caller must not be able to pick its own telemetry bucket.
     ///
     /// The wrong-typed value is echoed back in the error text, and
@@ -4346,6 +4629,123 @@ app.post('/api/login', handleLogin);
         assert!(
             result.is_err(),
             "ensure_indexed must return Err under spurious wakeups while indexing is unfinished"
+        );
+    }
+
+    /// Audit 2026-09-02 P2-4: the FK-recovery arm ran the OLD shape —
+    /// `DELETE FROM files`, **commit**, then rebuild outside the transaction —
+    /// which `tool_rebuild_index` had already been fixed away from, with a
+    /// comment naming the empty mid-rebuild window as the reason. Both now go
+    /// through `wipe_and_rebuild`, and this asserts the property that shape
+    /// buys, from the only place it is observable: a SEPARATE connection.
+    ///
+    /// The observation point is the progress callback, which `run_full_index`
+    /// fires from INSIDE the open transaction, after the DELETE. A fresh
+    /// read-only connection opened at that moment must still see the previous —
+    /// complete — index, because in WAL mode it reads the last committed
+    /// snapshot. Under the old shape the DELETE was already committed and that
+    /// same reader saw zero nodes for the whole multi-second rebuild.
+    #[test]
+    fn a_reader_never_sees_an_empty_index_while_a_wipe_and_rebuild_is_running() {
+        use std::sync::Arc;
+
+        // Enough files that the rebuild spans MULTIPLE progress events. With three
+        // files the whole index lands in one batch, so every sample happens to
+        // equal the final count and the assertion below is vacuous — the first
+        // draft of this test passed against the broken shape for exactly that
+        // reason.
+        let project_dir = TempDir::new().unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                project_dir.path().join(format!("f{i}.ts")),
+                format!("export function fn{i}() {{ return {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let db_path = project_dir.path().join(CODE_GRAPH_DIR).join("index.db");
+        let count_nodes = |path: &Path| -> i64 {
+            let c = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("an independent reader must be able to open the DB mid-rebuild");
+            c.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = count_nodes(&db_path);
+        assert!(before > 0, "precondition: the old index has nodes");
+
+        // Make the REBUILT index differ from the old one. Without this the two
+        // have identical node counts, and a reader that is wrongly seeing the
+        // new index reads back the same number as one correctly seeing the old —
+        // which is how the first draft of this test passed against the broken
+        // shape.
+        for i in 0..30 {
+            std::fs::remove_file(project_dir.path().join(format!("f{i}.ts"))).unwrap();
+        }
+
+        /// Samples an INDEPENDENT read-only connection on every progress
+        /// notification the rebuild emits — i.e. from inside the transaction,
+        /// after `DELETE FROM files`.
+        struct SampleEveryProgress {
+            db_path: std::path::PathBuf,
+            samples: Arc<Mutex<Vec<i64>>>,
+        }
+        impl Write for SampleEveryProgress {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if String::from_utf8_lossy(buf).contains("notifications/progress") {
+                    let c = rusqlite::Connection::open_with_flags(
+                        &self.db_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .expect("independent reader must not be locked out mid-rebuild");
+                    let n: i64 = c
+                        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                        .unwrap();
+                    lock_or_recover(&self.samples, "samples").push(n);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let samples: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        server.set_notify_writer(Box::new(SampleEveryProgress {
+            db_path: db_path.clone(),
+            samples: Arc::clone(&samples),
+        }));
+
+        let result = server
+            .wipe_and_rebuild(project_dir.path(), None, "test-rebuild")
+            .expect("rebuild must succeed");
+        assert_eq!(
+            result.files_indexed, 30,
+            "only the surviving files are re-indexed"
+        );
+
+        let samples = lock_or_recover(&samples, "samples").clone();
+        assert!(
+            samples.len() >= 2,
+            "only {} progress sample(s) — the rebuild did not span multiple events, so \
+             the assertion below would be vacuous",
+            samples.len()
+        );
+        assert!(
+            samples.iter().all(|&n| n == before),
+            "an independent reader saw {samples:?} nodes at successive points during the \
+             rebuild, but the old index had {before} throughout: the wipe (and the \
+             partially rebuilt index behind it) is visible outside its transaction"
+        );
+        let after = count_nodes(&db_path);
+        assert!(
+            after > 0 && after < before,
+            "after commit the reader must see the SMALLER rebuilt index ({after}) rather \
+             than the old one ({before}) — otherwise the samples above proved nothing"
         );
     }
 

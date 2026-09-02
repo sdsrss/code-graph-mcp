@@ -103,6 +103,29 @@ pub(super) fn arg_opt_i64(args: &serde_json::Value, key: &str) -> Result<Option<
     }
 }
 
+/// [`arg_i64`] for boolean flags — the other half of CON-15, which fixed only the
+/// numeric arguments (audit 2026-09-02 P2-2). `args[key].as_bool().unwrap_or(d)`
+/// has exactly the numeric defect: `{"compact": "true"}` returned the full
+/// uncompacted envelope and `{"include_tests": 1}` dropped the tests, both with
+/// nothing in the response saying the argument had been discarded — the key IS
+/// declared, so `note_ignored_arguments` stays silent about it too.
+///
+/// Only `true`/`false` are accepted. `"true"` and `1` are NOT coerced: a
+/// coercion here would have to guess, and the numeric half already established
+/// that an error a model can read beats a silent answer to a question it did not
+/// ask.
+pub(super) fn arg_bool(args: &serde_json::Value, key: &str, default: bool) -> Result<bool> {
+    match &args[key] {
+        serde_json::Value::Null => Ok(default),
+        v => v.as_bool().ok_or_else(|| {
+            anyhow!(
+                "{key} must be a boolean (got {}); the request was rejected rather than answered with a default",
+                describe_arg(v)
+            )
+        }),
+    }
+}
+
 /// [`arg_i64`] for fractional arguments (similarity thresholds).
 pub(super) fn arg_f64(args: &serde_json::Value, key: &str, default: f64) -> Result<f64> {
     match &args[key] {
@@ -180,10 +203,17 @@ pub(super) fn apply_inline_handler_metadata(
 }
 
 /// Check if the caller requested to skip indexing (read-only mode).
-pub(super) fn should_skip_indexing(args: &serde_json::Value) -> bool {
-    args.get("skip_indexing")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+///
+/// Fallible for the same reason as [`arg_bool`], which it delegates to: this is
+/// the 22nd boolean argument, and the one the flag-by-flag pass over the
+/// declared schemas could not see. `skip_indexing` is DECLARED nowhere — it is
+/// `("*", "skip_indexing")` in `HONORED_UNDECLARED_ARGS` — so a grep of the
+/// tool schemas does not reach it, while every tool reads it through here.
+/// Silently reading `{"skip_indexing": "true"}` as `false` made the server go
+/// index precisely when the caller had asked it not to, which is the most
+/// expensive way to get this particular argument wrong.
+pub(super) fn should_skip_indexing(args: &serde_json::Value) -> Result<bool> {
+    arg_bool(args, "skip_indexing", false)
 }
 
 /// Normalize user-facing type filter aliases to internal AST node types.

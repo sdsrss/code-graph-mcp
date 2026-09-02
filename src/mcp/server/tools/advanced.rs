@@ -28,11 +28,11 @@ impl McpServer {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
         let depth = arg_i64(args, "depth", 3)?.clamp(1, 20) as i32;
-        let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
+        let include_middleware = arg_bool(args, "include_middleware", true)?;
         // Same default as `get_call_graph`'s symbol arm. This is the surviving
         // sibling of the `min_confidence` defect described just below: another
         // parameter the schema advertises that the route arm never read.
-        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
+        let include_tests = arg_bool(args, "include_tests", false)?;
         // Confidence floor (default 'inferred'): hide the ambiguous by-name fan-out
         // from both the call chain and the downstream list, matching get_call_graph.
         // route_path mode of get_call_graph reaches here, where min_confidence was
@@ -44,7 +44,7 @@ impl McpServer {
                 .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
 
@@ -210,14 +210,14 @@ impl McpServer {
             )
         })?;
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             // Edit-aware: file_path is required for this tool — post-edit
             // staleness is the canonical failure mode here.
             self.ensure_file_fresh_opt(Some(file_path))?;
         }
         let depth = arg_i64(args, "depth", 2)?.clamp(1, 10) as i32;
-        let compact = args["compact"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
 
         // Check if file exists in index
         let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
@@ -309,7 +309,7 @@ impl McpServer {
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         self.try_lazy_load_model();
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
 
@@ -447,9 +447,9 @@ impl McpServer {
         // and find_dead_code falls through to a literal `n.type = :x` match that
         // returns zero rows — a false-clean empty result. Mirror tool_ast_search.
         crate::storage::queries::validate_dead_code_type_filter(node_type)?;
-        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
+        let include_tests = arg_bool(args, "include_tests", false)?;
         let min_lines = arg_u64(args, "min_lines", 3)? as u32;
-        let compact = args["compact"].as_bool().unwrap_or(true);
+        let compact = arg_bool(args, "compact", true)?;
 
         // ignore_paths: prefix-match exclusions. When omitted, apply defaults for
         // shell-invoked entry points (plugin hooks / lifecycle scripts) that the
@@ -472,7 +472,7 @@ impl McpServer {
             _ => (default_dead_code_ignores(), true),
         };
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             // Edit-aware: this tool emits start_line/end_line, and it was the
             // ONE path-taking tool without the query-time refresh — post-Edit

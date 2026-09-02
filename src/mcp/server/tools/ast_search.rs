@@ -16,7 +16,7 @@ impl McpServer {
         &self,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
 

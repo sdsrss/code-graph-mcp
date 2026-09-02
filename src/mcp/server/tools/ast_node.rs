@@ -85,17 +85,17 @@ impl McpServer {
             .filter(|s| !s.trim().is_empty())
             .map(super::normalize_path_arg);
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             self.ensure_file_fresh_opt(file_path_arg.as_deref())?;
         }
 
-        let include_refs = args["include_references"].as_bool().unwrap_or(false);
-        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
-        let include_impact = args["include_impact"].as_bool().unwrap_or(false);
-        let include_similar = args["include_similar"].as_bool().unwrap_or(false);
+        let include_refs = arg_bool(args, "include_references", false)?;
+        let include_tests = arg_bool(args, "include_tests", false)?;
+        let include_impact = arg_bool(args, "include_impact", false)?;
+        let include_similar = arg_bool(args, "include_similar", false)?;
         let similar_top_k = arg_i64(args, "similar_top_k", 5)?;
-        let compact = args["compact"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = arg_opt_i64(args, "node_id")? {
@@ -108,7 +108,7 @@ impl McpServer {
             // refresh is the one that opens the CURRENT file and cuts a window at
             // the index's line numbers, so an insertion above the symbol returned
             // unrelated code under that symbol's name and signature.
-            let (nid, renumbered) = if should_skip_indexing(args) {
+            let (nid, renumbered) = if should_skip_indexing(args)? {
                 (nid, false)
             } else {
                 match self.refresh_node_file_and_reresolve(nid)? {

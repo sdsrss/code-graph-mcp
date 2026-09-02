@@ -119,8 +119,8 @@ impl McpServer {
             .filter(|s| !s.is_empty())
             .map(super::normalize_path_arg);
         let file_path = file_path_arg.as_deref();
-        let compact = args["compact"].as_bool().unwrap_or(false);
-        let include_tests = args["include_tests"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
+        let include_tests = arg_bool(args, "include_tests", false)?;
         // Confidence floor (default 'inferred'): hide the ambiguous by-name
         // fan-out from the default response so Claude Code isn't fed phantom
         // call edges; min_confidence:"ambiguous" includes every edge. Validated
@@ -130,7 +130,7 @@ impl McpServer {
                 .unwrap_or(crate::domain::DEFAULT_RISK_CONF_FLOOR);
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             // Edit-aware: if the agent named a specific file, sync-refresh it
             // before answering so post-Edit queries don't see stale call edges.

@@ -26,10 +26,10 @@ impl McpServer {
             .map(super::normalize_path_arg);
         let file_path = file_path_arg.as_deref();
         let relation_raw = args["relation"].as_str().unwrap_or("all");
-        let compact = args["compact"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
         // Default true preserves the "every usage site" contract for rename audits
         // (tests must be renamed too). Pass false for "production callers only".
-        let include_tests = args["include_tests"].as_bool().unwrap_or(true);
+        let include_tests = arg_bool(args, "include_tests", true)?;
 
         if node_id.is_none() && symbol_name_arg.is_none() {
             return Err(anyhow!("symbol_name or node_id is required"));
@@ -58,7 +58,7 @@ impl McpServer {
         let min_confidence: Option<&'static str> =
             crate::domain::parse_min_confidence(args["min_confidence"].as_str(), "min_confidence")?;
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             self.ensure_file_fresh_opt(file_path)?;
         }

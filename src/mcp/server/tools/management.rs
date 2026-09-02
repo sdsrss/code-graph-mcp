@@ -210,7 +210,7 @@ impl McpServer {
                 "message": "This instance is in secondary (read-only) mode. Rebuild must be done from the primary instance."
             }));
         }
-        let confirm = args["confirm"].as_bool().unwrap_or(false);
+        let confirm = arg_bool(args, "confirm", false)?;
         if !confirm {
             return Err(anyhow!("Must pass confirm: true to rebuild index"));
         }
@@ -241,48 +241,11 @@ impl McpServer {
         }
 
         self.send_log("info", "Rebuilding index...");
-        let progress_cb =
-            |_phase: crate::indexer::pipeline::IndexPhase, current: usize, total: usize| {
-                self.send_progress("rebuild-index", current, total);
-            };
 
-        // Atomic rebuild: the DELETE and the full re-index run inside ONE outer
-        // transaction. In WAL mode, external fresh-connection readers (a CLI `grep`,
-        // a secondary MCP instance) keep seeing the last committed — old, complete —
-        // index until this commits, never the empty/partial mid-rebuild window the
-        // old "DELETE-commit then rebuild in place" left open for the whole (multi-
-        // second) rebuild; and a failure ANYWHERE below rolls the DELETE back too,
-        // leaving the old index intact instead of wiped. run_full_index's phase
-        // transactions are SAVEPOINTs (see index_files), so they nest inside this
-        // BEGIN rather than erroring with "cannot start a transaction within a
-        // transaction". (The CLI's temp-file + atomic-rename swap can't be reused
-        // here: this server holds a persistent self.db connection whose fd would keep
-        // pointing at the old unlinked inode after a rename — see the snapshot-install
-        // inode-swap note in server/mod.rs. So we get atomicity from one transaction
-        // on the live connection instead.)
-        let result = {
-            // `write_db()` is `self.db` for a normal primary and the read-write
-            // handle opened at promotion for an instance that started as a
-            // secondary — `self.db` is read-only in that case and every write
-            // below would fail with SQLITE_READONLY.
-            let write_db = self.write_db();
-            let tx = write_db.conn().unchecked_transaction()?;
-            tx.execute("DELETE FROM files", [])?; // CASCADE handles nodes→edges
-                                                  // Skip inline embedding; the background thread (spawned below) handles it.
-            let result = run_full_index(&write_db, project_root, None, Some(&progress_cb))?;
-            tx.commit()?;
-            result
-        };
-
-        // Save indexing stats for observability
-        *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats.clone();
-
-        // Reset indexed flag and invalidate caches
-        *lock_or_recover(&self.indexed, "indexed") = true;
-        *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
-        lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
-
-        self.spawn_background_embedding();
+        // Atomicity, the transaction shape and why a rename swap can't be used
+        // here: see `McpServer::wipe_and_rebuild`. `model = None` skips inline
+        // embedding — the background thread it spawns handles it.
+        let result = self.wipe_and_rebuild(project_root, None, "rebuild-index")?;
 
         Ok(json!({
             "status": "rebuilt",

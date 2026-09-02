@@ -32,7 +32,7 @@ impl McpServer {
         let deps_depth = arg_i64(args, "deps_depth", 2)?;
         let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
 
@@ -83,9 +83,9 @@ impl McpServer {
                 raw_path
             ));
         }
-        let compact = args["compact"].as_bool().unwrap_or(false);
-        let include_deps = args["include_deps"].as_bool().unwrap_or(false);
-        let include_dead = args["include_dead"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
+        let include_deps = arg_bool(args, "include_deps", false)?;
+        let include_dead = arg_bool(args, "include_dead", false)?;
         // Normalize: strip leading "./" and treat "." as empty prefix (match all)
         let path = raw_path.strip_prefix("./").unwrap_or(raw_path);
         let path = if path == "." { "" } else { path };
@@ -95,7 +95,7 @@ impl McpServer {
         // invalidation inside `ensure_file_fresh_opt` evicts the stale overview
         // for this exact file path so the cached-result branch above doesn't
         // serve a pre-edit answer on the next call.
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_file_fresh_opt(Some(path))?;
         }
 

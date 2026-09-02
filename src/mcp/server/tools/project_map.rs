@@ -53,10 +53,10 @@ impl McpServer {
         // precisely what the sibling comment says must not happen.
         let centrality_limit = arg_u64(args, "centrality_limit", 10)?.clamp(1, 100) as usize;
 
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
-        let compact = args["compact"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
 
         // Return cached result if fresh (< 60s) — project_map is expensive and rarely changes mid-session
         // Note: cache stores full result; compact is derived from it on the fly
@@ -169,7 +169,7 @@ impl McpServer {
         // per call and attached OUTSIDE the 60s cache (the flag/limit vary per
         // call; the cached envelope stays flag-free). Test callers excluded, same
         // default as the CLI.
-        if args["include_centrality"].as_bool().unwrap_or(false) {
+        if arg_bool(args, "include_centrality", false)? {
             // Clamped, not just floored (audit 2026-08-29 CON-08): this was the
             // only numeric MCP parameter without an upper bound, while every
             // sibling has one (top_k/limit 1-100, depth 1-20, context_lines

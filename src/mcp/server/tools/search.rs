@@ -34,7 +34,7 @@ impl McpServer {
         }
         .clamp(1, 100) as i64;
         let node_type_filter = args["node_type"].as_str();
-        let compact = args["compact"].as_bool().unwrap_or(false);
+        let compact = arg_bool(args, "compact", false)?;
 
         // Validate node_type up-front: unknown aliases normalize to empty and
         // would silently filter every result away (see tool_ast_search parity).
@@ -86,7 +86,7 @@ impl McpServer {
         self.try_lazy_load_model();
 
         // Ensure index is up to date (unless caller requested read-only mode)
-        if !should_skip_indexing(args) {
+        if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
         }
 
