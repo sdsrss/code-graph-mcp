@@ -1057,6 +1057,10 @@ function isBinaryHealExhausted(state) {
 // release target, silent failure (an unhealable npm env must not block or spam).
 
 const SHELL_PKG = '@sdsrs/code-graph';
+// Exported because doctor.js renders "gave up" from the same threshold. It
+// used to hardcode a literal 3 next to a comment naming this constant, so
+// raising the cap here would have left the diagnosis reporting the old one
+// (audit 2026-08-29 JS-07).
 const GLOBAL_PKG_HEAL_MAX_ATTEMPTS = 3;
 const GLOBAL_PKG_HEAL_TIMEOUT_MS = 180000; // npm resolves + downloads the platform optionalDependency (~40MB)
 
@@ -1432,7 +1436,7 @@ module.exports = {
   isUpdateSuspended,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode, isForceMode, isAutoUpdateDisabled,
-  MAX_UPDATE_ATTEMPTS,
+  MAX_UPDATE_ATTEMPTS, GLOBAL_PKG_HEAL_MAX_ATTEMPTS,
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
   PLUGIN_ASSET_NAME,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,

@@ -540,6 +540,7 @@ function runMain() {
 }
 
 if (require.main === module) {
+  require('./hook-fail-open').installHookFailOpen('UserPromptSubmit');
   runMain();
 }
 

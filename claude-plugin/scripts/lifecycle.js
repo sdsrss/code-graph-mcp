@@ -139,6 +139,42 @@ function readJson(filePath) {
 // will usually fail for the same reason the read did, and that failure is the
 // point: it makes the caller refuse rather than overwrite. Returns the backup
 // path, or null when no copy could be made.
+/** How many `.corrupt-*` copies of one file to keep. */
+const MAX_CORRUPT_BACKUPS = 5;
+
+/**
+ * Delete all but the newest `MAX_CORRUPT_BACKUPS` copies of `filePath`.
+ *
+ * The copies are a safety net, and a safety net nobody ever empties is a leak:
+ * each one is a full settings.json, they are created on a path that can repeat,
+ * and nothing else deletes them (audit 2026-08-29 JS-09). Newest survive because
+ * the reason to keep any is "undo what just happened".
+ *
+ * Deliberately narrow: same directory, exactly `<basename>.corrupt-` prefixed,
+ * regular files only. It runs inside `~/.claude`, so the matcher is a prefix on
+ * a name this function itself produced, never a glob.
+ */
+function pruneCorruptBackups(filePath, keep = MAX_CORRUPT_BACKUPS) {
+  const dir = path.dirname(filePath);
+  const prefix = `${path.basename(filePath)}.corrupt-`;
+  let pruned = 0;
+  try {
+    const mine = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.startsWith(prefix))
+      .map((e) => {
+        const full = path.join(dir, e.name);
+        // Sort by the timestamp we wrote into the NAME, not by mtime: a restore
+        // or a copy re-stamps mtime and would reorder the history.
+        return { full, name: e.name };
+      })
+      .sort((a, b) => b.name.localeCompare(a.name));
+    for (const stale of mine.slice(keep)) {
+      try { fs.unlinkSync(stale.full); pruned++; } catch { /* raced or read-only */ }
+    }
+  } catch { /* unreadable dir — the copy still succeeded, which is what matters */ }
+  return pruned;
+}
+
 function backupCorruptFile(filePath, raw) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = `${filePath}.corrupt-${stamp}`;
@@ -147,6 +183,7 @@ function backupCorruptFile(filePath, raw) {
     if (Buffer.isBuffer(raw)) fs.writeFileSync(dest, raw);
     else if (typeof raw === 'string') fs.writeFileSync(dest, Buffer.from(raw, 'utf8'));
     else fs.copyFileSync(filePath, dest);
+    pruneCorruptBackups(filePath);
     return dest;
   } catch {
     return null;
@@ -1201,7 +1238,20 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
 function install({ reclaimStatusline = false } = {}) {
   const version = getPluginVersion();
   const manifest = readManifest();
-  const { settings, backedUpTo } = readSettingsForWrite();
+  // Probe FIRST, and pay the backup only on the write path (audit 2026-08-29
+  // JS-09). `readSettingsForWrite()` with no argument takes its `.corrupt-*`
+  // copy eagerly, which is right for a caller that is certainly going to
+  // rewrite the file and wrong here: install() is idempotent and usually
+  // changes nothing. Combined with any condition that re-runs it every session
+  // — the documented `manifestUnwritable` loop is one — a settings.json with a
+  // single non-UTF-8 byte grew one timestamped copy in ~/.claude per session,
+  // unbounded, for a file nothing ever rewrote. Same reasoning as
+  // `cleanupDisabledStatusline`, which already probes.
+  const probe = readJsonResult(settingsPath());
+  const deferBackup = Boolean(probe.value && probe.lossy);
+  let { settings, backedUpTo } = deferBackup
+    ? { settings: probe.value, backedUpTo: null }
+    : readSettingsForWrite(probe);
   if (!settings) {
     // Unusable settings.json that we could not even copy aside. Bail without
     // touching it — and without stamping the manifest, so the next run retries
@@ -1303,6 +1353,22 @@ function install({ reclaimStatusline = false } = {}) {
 
   // 3. Write settings atomically if changed
   if (settingsChanged) {
+    if (deferBackup) {
+      // Now it IS a rewrite, so the deferred copy is owed. A failure to make it
+      // is the same refusal as the eager path: skipping the settings work beats
+      // destroying bytes we cannot restore.
+      const late = readSettingsForWrite(probe);
+      if (!late.settings) {
+        return {
+          version,
+          settingsChanged: false,
+          statusLineClaimed: manifest.config.statusLine,
+          hooksRegistered: false,
+          settingsUnreadable: true,
+        };
+      }
+      backedUpTo = late.backedUpTo;
+    }
     const writeErr = tryWriteSettings(settings);
     if (writeErr) {
       // Do NOT fall through to the manifest stamp. A manifest carrying the
@@ -1838,7 +1904,7 @@ module.exports = {
   cleanupDisabledStatusline, unadoptRegisteredProjects,
   reportUnadoptSweep,                                                  // exported so its three-way bucketing is testable (audit 2026-08-29 JS-06)
   readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
-  backupCorruptFile,                                                   // auto-update.js repoints installed_plugins.json and owes the same preserve-then-proceed route
+  backupCorruptFile, pruneCorruptBackups, MAX_CORRUPT_BACKUPS,                                                   // auto-update.js repoints installed_plugins.json and owes the same preserve-then-proceed route
   migrateOldPluginIds,                                                 // exported so its failure arms are testable (audit 2026-08-22 P2-10)
   readRegistry, readRegistryForWrite, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
@@ -1930,6 +1996,16 @@ if (require.main === module) {
     // argument — `lifecycle.js doctor --check-onlyy` ran the full repair pass.
     // Exit code still reflects issues that remain UNRESOLVED after repair, not
     // issues found (see unresolvedCount in doctor.js).
+    //
+    // LAZY ON PURPOSE — do not hoist (audit 2026-08-29 JS-13). The plugin's JS
+    // has exactly one require cycle: auto-update → lifecycle → doctor →
+    // auto-update. Deferring this one edge to call time is the only thing that
+    // keeps the top-level graph a DAG. Hoisted, `require('./auto-update')`
+    // reaches `doctor` before auto-update has finished evaluating, so doctor
+    // sees a half-built module and dies on load — from a module nobody in that
+    // chain was even asking about. Pinned by
+    // `every_hook_module_loads_first_in_a_cold_process` in lifecycle.test.js,
+    // which loads each module first in its own process.
     const { runDoctorCli } = require('./doctor');
     process.exit(runDoctorCli(process.argv.slice(3)));
   } else if (cmd === 'verify-hooks-fire') {

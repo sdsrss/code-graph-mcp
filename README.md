@@ -520,6 +520,36 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_PROJECT_TYPE=<type>` | Override project-type detection for the steering block. |
 | `CODE_GRAPH_FAIL_ON_RISK=1` | Make the PR impact comment fail the check on HIGH risk (CI). |
 
+### Sharing the statusline with another plugin
+
+code-graph claims Claude Code's single `statusLine` slot and runs a **composite**
+that calls each registered provider in turn, so other plugins keep their segment
+instead of losing the slot. Whatever occupied it at install time is captured
+automatically as the `_previous` provider and restored on uninstall.
+
+A third-party plugin registers itself through the shipped CLI:
+
+```bash
+# <id> is a stable name (your plugin's, not a version); <command> is a shell
+# command that prints ONE line. Add --stdin if it expects Claude Code's status
+# JSON on stdin.
+node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" register gsd "node /path/to/gsd-status.js" --stdin
+node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" list
+node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" unregister gsd
+```
+
+| Detail | Value |
+|---|---|
+| Registry (working copy) | `~/.cache/code-graph/statusline-registry.json` |
+| Durable mirror | `~/.claude/statusline-providers.json` — survives a cache wipe |
+| Reserved ids | `code-graph`, `_previous` |
+| Exit codes | `0` registered / unregistered / already in that state · `1` usage · `2` reserved id, or a registry file that exists and cannot be read |
+
+Exit 2 on an unreadable registry is deliberate: the mutation refuses rather than
+rebuilding, because that file holds the user's previous statusline and other
+plugins' entries. An installer that reads exit codes must not treat it as
+"registered".
+
 <details>
 <summary><b>Internal and test-only</b> — set by the plugin's own processes, or by the test suite. Setting them by hand is not supported.</summary>
 

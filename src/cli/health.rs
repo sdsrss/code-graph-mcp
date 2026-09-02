@@ -74,9 +74,8 @@ pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
 /// 32 MB keeps the polled path near 80 ms even when the page cache is cold,
 /// which is the case that matters: the 2.4 ms/MB above was measured warm, and a
 /// quick_check reads EVERY page, so the first render after a cold boot pays disk
-/// latency for the whole file. At 128 MB that is the exact shape that makes the
-/// statusline segment vanish — trading a real signal for a broken one on the
-/// largest indexes, which is what the gate exists to prevent.
+/// latency for the whole file. At 128 MB that is what makes the statusline
+/// segment vanish.
 ///
 /// Above the limit the probe reports `"skipped_large"` — visibly absent, never
 /// silently, and `doctor` renders that as a skipped row rather than a pass.

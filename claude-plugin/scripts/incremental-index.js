@@ -38,6 +38,7 @@ function runMain() {
 }
 
 if (require.main === module) {
+  require('./hook-fail-open').installHookFailOpen('PostToolUse:Write|Edit');
   runMain();
 }
 

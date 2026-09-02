@@ -19,12 +19,20 @@ const path = require('path');
 //
 // The axis here is residue, not destruction. `recordInject` writes a
 // `.code-graph-postinject-<cwdHash>-<commandHash>` flag into the ONE
-// machine-global cgTmpDir, and every e2e command carries a `Date.now()` so no
-// two runs ever collide: measured on the commit before this one, one run of this file left 10 flags
-// behind (14 across the three hook test files), reclaimed only by pruneCgTmp's
-// 24h sweep. `cleanupFixture` was supposed to cover that and did not — see the
-// spelling bug documented there. Owning the directory fixes both the flags this
-// file knows about and any a future test adds.
+// machine-global cgTmpDir: measured on the commit before this one, one run of
+// this file left 10 flags behind (14 across the three hook test files),
+// reclaimed only by pruneCgTmp's 24h sweep. `cleanupFixture` was supposed to
+// cover that and did not — see the spelling bug documented there. Owning the
+// directory fixes both the flags this file knows about and any a future test
+// adds.
+//
+// This used to claim "every e2e command carries a `Date.now()` so no two runs
+// ever collide". Pre-tag review judged that false and only the CHANGELOG copy
+// of the sentence was corrected (audit 2026-08-29 ENG-03). What is true: most
+// commands embed a per-run `uniq` (which is Date.now()-derived), two use fixed
+// strings, and collisions do not matter either way — the sandbox above is
+// per-run, so no flag from a previous run is visible to this one. The sandbox
+// is the mechanism; the uniqueness was never the load-bearing part.
 //
 // All three names because node reads TMPDIR on POSIX but TMP/TEMP on Windows,
 // where TMPDIR alone would leave this inert.

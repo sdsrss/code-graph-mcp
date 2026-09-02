@@ -20,7 +20,35 @@ function settingsWithCurrentHooks() {
 }
 
 test('runDiagnostics returns an array of check results', () => {
-  const results = runDiagnostics();
+  // Sandboxed HOME + `checkOnly` (audit 2026-08-29 ENG-07). This was the one
+  // test that called `runDiagnostics()` bare, and the shape assertions below
+  // hid what that costs: with no argument the hook check runs `healthCheck()`,
+  // which auto-attempts `install()` when it finds a broken path — so on a
+  // developer machine in that state, this "returns an array" test WROTE their
+  // real ~/.claude/settings.json. The results also varied per host, which is
+  // how it was noticed; the write is the reason it matters.
+  //
+  // USERPROFILE and CLAUDE_CONFIG_DIR travel with HOME for the reasons the
+  // sibling tests document: os.homedir() reads USERPROFILE on Windows, and
+  // claudeHome() lets CLAUDE_CONFIG_DIR outrank HOME everywhere.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-shape-'));
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+  };
+  let results;
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
+    results = runDiagnostics({ checkOnly: true });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
   assert.ok(Array.isArray(results));
   assert.ok(results.length > 0, 'should have at least one check result');
   for (const r of results) {
@@ -1061,4 +1089,77 @@ test('every doctor row is repairable or explicitly advisory', () => {
   const synthetic = [{ name: 'Synthetic', status: 'warn', detail: 'x' }]
     .filter(r => !r.advisory && !(r.fixId && repairable.has(r.fixId)));
   assert.equal(synthetic.length, 1, 'the predicate must catch an unrepairable row');
+});
+
+test('the heal-exhausted threshold comes from auto-update, not a copy', () => {
+  // JS-07 (audit 2026-08-29). doctor rendered "self-heal gave up" from a literal
+  // 3 while auto-update owned the real cap in an un-exported constant, with a
+  // comment here naming that constant. Raising the cap there would have left
+  // this diagnosis reporting the old threshold, and no test could see it.
+  //
+  // Asserted as a RELATIONSHIP, not as the number: pinning 3 in a third place is
+  // the defect again.
+  const { GLOBAL_PKG_HEAL_MAX_ATTEMPTS } = require('./auto-update');
+  assert.equal(typeof GLOBAL_PKG_HEAL_MAX_ATTEMPTS, 'number');
+  assert.ok(GLOBAL_PKG_HEAL_MAX_ATTEMPTS >= 1);
+
+  const src = fs.readFileSync(path.join(__dirname, 'doctor.js'), 'utf8');
+  const line = src.split('\n').find((l) => l.includes('const healGaveUp'));
+  assert.ok(line, 'the healGaveUp line moved — update this guard');
+  assert.match(
+    line,
+    /GLOBAL_PKG_HEAL_MAX_ATTEMPTS/,
+    `doctor compares against a literal again: ${line.trim()}`
+  );
+});
+
+test('doctor tells the three update-state outcomes apart', () => {
+  // JS-11 (audit 2026-08-29). doctor read update-state.json through lifecycle's
+  // `readJson`, which returns null for "absent", "corrupt" and "unreadable"
+  // alike — so all three fell through to "Auto-update ✅ up-to-date", a claim
+  // with nothing behind it. The `catch` arm that was supposed to cover the bad
+  // cases could not fire, because `readJson` never throws.
+  //
+  // Run in a CHILD with HOME redirected: CACHE_DIR is resolved when the module
+  // loads, so an in-process env swap after the require would point the write at
+  // one directory and the read at another.
+  const { spawnSync } = require('child_process');
+  const probe = (setup) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-state-'));
+    try {
+      const code = `
+        const fs = require('fs'), path = require('path');
+        const { CACHE_DIR } = require('./lifecycle');
+        fs.mkdirSync(CACHE_DIR, { recursive: true });
+        (${setup})(path.join(CACHE_DIR, 'update-state.json'), fs);
+        const { runDiagnostics } = require('./doctor');
+        const row = runDiagnostics({ checkOnly: true }).find(r => r.name === 'Auto-update');
+        process.stdout.write(JSON.stringify(row));
+      `;
+      const res = spawnSync(process.execPath, ['-e', code], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+      });
+      assert.equal(res.status, 0, res.stderr);
+      return JSON.parse(res.stdout);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  };
+
+  const absent = probe('() => {}');
+  assert.equal(absent.status, 'ok');
+  assert.match(absent.detail, /no check has run/,
+    `a machine that never checked is not "up-to-date": ${absent.detail}`);
+
+  const corrupt = probe('(p, fs) => fs.writeFileSync(p, "{ not json")');
+  assert.equal(corrupt.status, 'warn',
+    `a state file the updater cannot read must not render as ok: ${JSON.stringify(corrupt)}`);
+  assert.match(corrupt.detail, /unreadable/);
+
+  // A readable state with nothing pending is the one case that IS up-to-date.
+  const clean = probe('(p, fs) => fs.writeFileSync(p, JSON.stringify({ lastCheck: Date.now(), updateAvailable: false }))');
+  assert.equal(clean.status, 'ok');
+  assert.match(clean.detail, /up-to-date/);
 });

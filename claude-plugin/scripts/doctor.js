@@ -12,7 +12,7 @@ const {
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 const { hidden } = require('./proc-opts');
-const { MAX_UPDATE_ATTEMPTS, isBinaryHealExhausted } = require('./auto-update');
+const { MAX_UPDATE_ATTEMPTS, GLOBAL_PKG_HEAL_MAX_ATTEMPTS, isBinaryHealExhausted, readState } = require('./auto-update');
 
 // ── Diagnostics ───────────────────────────────────────────
 
@@ -356,9 +356,28 @@ function runDiagnostics({ checkOnly = false } = {}) {
   }
 
   // 5. Auto-update state
-  try {
-    const state = readJson(path.join(CACHE_DIR, 'update-state.json'));
+  //
+  // Read through auto-update's own `readState`, which distinguishes three
+  // outcomes: a missing file (`{}`), a readable one, and an unreadable one
+  // (`{ stateUnreadable: <code> }`). doctor used lifecycle's `readJson`, which
+  // collapses all three to `null` — so a corrupt state file, and a machine that
+  // had never checked at all, both rendered as "Auto-update ✅ up-to-date", a
+  // claim with nothing behind it (audit 2026-08-29 JS-11). The `catch` arm that
+  // was supposed to cover this could not fire: `readJson` never throws.
+  {
+    const state = readState();
     const attempts = (state && state.updateAttempts) || 0;
+    if (state && state.stateUnreadable) {
+      results.push({
+        name: 'Auto-update',
+        status: 'warn',
+        detail: `update-state.json is unreadable (${state.stateUnreadable}) — the next check `
+          + 'rewrites it, so this clears itself; until then the throttle and the '
+          + 'failed-install counter are both starting from zero.',
+      });
+    } else if (!state || Object.keys(state).length === 0) {
+      results.push({ name: 'Auto-update', status: 'ok', detail: 'no update state yet (no check has run)' });
+    } else
     if (state && state.updateAvailable && attempts >= MAX_UPDATE_ATTEMPTS) {
       // The updater has given up on this release (issue #40). Deliberately NO
       // fixId: re-running `auto-update.js check` is precisely the thing that was
@@ -381,8 +400,6 @@ function runDiagnostics({ checkOnly = false } = {}) {
     } else {
       results.push({ name: 'Auto-update', status: 'ok', detail: 'up-to-date' });
     }
-  } catch {
-    results.push({ name: 'Auto-update', status: 'ok', detail: 'no update state' });
   }
 
   // 6. Hook paths validity
@@ -548,10 +565,14 @@ function runDiagnostics({ checkOnly = false } = {}) {
     if (found.length) {
       const marker = !!readJson(GLOBAL_INSTALL_MARKER);
       // Heal-exhausted is otherwise invisible: selfHealGlobalPkgs stops after
-      // 3 failed npm runs per target version and stays silent until the next
-      // release re-arms the counter — a drifted CLI shim just sits there.
+      // GLOBAL_PKG_HEAL_MAX_ATTEMPTS failed npm runs per target version and
+      // stays silent until the next release re-arms the counter — a drifted CLI
+      // shim just sits there. The threshold is imported rather than repeated:
+      // this line used to hardcode 3 while the comment named the constant, so
+      // raising the cap in auto-update.js would have left this diagnosis
+      // reporting the old one (audit 2026-08-29 JS-07).
       const state = readJson(path.join(CACHE_DIR, 'update-state.json')) || {};
-      const healGaveUp = (state.globalPkgHealAttempts || 0) >= 3;
+      const healGaveUp = (state.globalPkgHealAttempts || 0) >= GLOBAL_PKG_HEAL_MAX_ATTEMPTS;
       results.push({
         name: 'Global npm packages',
         status: healGaveUp ? 'warn' : 'ok',

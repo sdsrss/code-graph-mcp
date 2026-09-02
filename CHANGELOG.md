@@ -41,6 +41,57 @@ requirement nothing enforces is the same defect pointing the other way. Both go
 red under a dropped `anyOf`, a changed arm, a deleted handler check, and an
 emptied table.
 
+### Hooks fail open; a test stopped writing your real settings (JS-09/12, ENG-07)
+
+- **A crashing hook no longer answers with an exit code.** The eight hook entry
+  points had no top-level catch, so an unhandled throw printed a node stack
+  trace into your session and exited non-zero — and for a PreToolUse hook a
+  non-zero exit *is a decision*. They now install a fail-open handler: one line
+  on stderr, exit 0, nothing on stdout. `EPIPE` stays silent, because it means
+  the reader already went away. A handler rather than a try/catch per file:
+  two of the eight are straight-line scripts with no `main()` to wrap, and the
+  async escape (a rejected promise from a spawn) is the one that actually
+  happens. The guard derives its list from what `lifecycle` registers, so a
+  ninth hook cannot join without one.
+- **`.corrupt-*` backups of settings.json were unbounded.** `install()` took the
+  lossy-UTF-8 backup before knowing whether it would write, and `install()` is
+  idempotent — so with any condition that re-runs it each session, a
+  settings.json with one bad byte grew a full timestamped copy in `~/.claude`
+  per session, and nothing ever deleted them. The backup is now owed only on the
+  write path, and copies are capped at the newest five per file.
+- **A unit test was repairing your machine.** `runDiagnostics()` with no
+  argument runs `healthCheck()`, which auto-attempts `install()` when it finds a
+  broken hook path — and one test called it bare. On a developer machine in that
+  state, a test named "returns an array of check results" rewrote their real
+  `~/.claude/settings.json`. It runs sandboxed and read-only now.
+- **`bump-version.sh` printed "Updated Cargo.lock" either way**: the `cargo
+  update` line ended in `2>/dev/null || true`, so a cargo that refused looked
+  exactly like one that worked. The failure is reported now (still non-fatal —
+  the pre-commit version check stops the commit).
+- **The snapshot workflow's npm pin is a checked version site.** `sync-versions`
+  rewrites it; `pre-commit` did not check it, so a hand-edited template
+  committed alone slipped through to tag time. A new guard cross-checks the two
+  lists by parsing both, so an eleventh site cannot be added to one alone.
+
+Also: `doctor` no longer reads its "self-heal gave up" threshold from a literal
+that duplicated auto-update's constant (JS-07); the require cycle that survives
+only because one edge is lazy is now documented and pinned by a test that loads
+each module first in its own process (JS-13); `npm run build`'s copy step
+explains a full disk or an unwritable `bin/` instead of throwing a stack
+(JS-14); and the third-party statusline registration API is documented in the
+README, with its exit codes and registry paths re-derived from the running CLI
+by a test rather than transcribed (JS-10).
+
+### `doctor` called a corrupt update-state file "up-to-date" (JS-11)
+
+`update-state.json` has three outcomes — absent, readable, unreadable — and the
+updater already tells them apart. doctor read the same file through a helper
+that returns `null` for all three, so a corrupt state file *and* a machine that
+had never checked both rendered as **Auto-update ✅ up-to-date**. The `catch` arm
+that was supposed to cover the bad cases could not fire: that helper never
+throws. doctor now reads through the updater's own `readState` and reports all
+three.
+
 ### Four duplications, removed with the differences kept (ARC-02/03/06/07)
 
 Behaviour-preserving, and each verified against the pre-change code rather than

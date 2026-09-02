@@ -36,7 +36,10 @@ function main() {
 }
 
 // Only run the statusline when invoked as a CLI; `require()` (tests) just imports helpers.
-if (require.main === module) main();
+if (require.main === module) {
+  require('./hook-fail-open').installHookFailOpen('statusLine');
+  main();
+}
 
 function run(stdin) {
   const registry = readRegistry();

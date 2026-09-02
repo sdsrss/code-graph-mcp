@@ -1005,6 +1005,104 @@ fn assert_ignore_paths_normalized_in_source() {
     }
 }
 
+/// `sync-versions.js` writes N version sites; `pre-commit.sh` checks a list of
+/// them. Those two lists were maintained by hand and had drifted by one: the
+/// shipped snapshot workflow's npm pin was rewritten by the first and unchecked
+/// by the second, so a hand-edited template committed on its own passed the hook
+/// and was caught only at tag time, by release.yml re-running the sync (audit
+/// 2026-08-29 ENG-07).
+///
+/// Adding the missing entry fixes today. This keeps tomorrow: the axis is "a
+/// version site exists in one list and not the other".
+///
+/// BOTH sides are read as anchored BLOCKS, not as free text, and that is the
+/// whole design. The first version of this guard asked whether the path appeared
+/// anywhere in `pre-commit.sh` — which the new `report` line satisfies on its
+/// own, so deleting the `VERSION_FILES` entry left it green. It also scanned
+/// sync-versions.js for any quoted line, which swept up unrelated arrays and
+/// kept the vacuity floor satisfied after the `file:` key was renamed away.
+/// Both mistakes were found by mutating, not by reading.
+#[test]
+fn pre_commit_checks_every_version_site_sync_versions_writes() {
+    fn quoted(line: &str) -> Option<String> {
+        let start = line.find('\'')?;
+        let rest = &line[start + 1..];
+        let len = rest.find('\'')?;
+        Some(rest[..len].to_string())
+    }
+    /// Lines of the `NAME = [` / `NAME=(` block that opens at `header`.
+    fn block<'a>(src: &'a str, header: &str, close: &str) -> Vec<&'a str> {
+        let Some(pos) = src.find(header) else {
+            panic!("`{header}` moved — update this guard rather than letting it scan nothing")
+        };
+        src[pos..]
+            .lines()
+            .skip(1)
+            .take_while(|l| l.trim() != close)
+            .collect()
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sync = std::fs::read_to_string(root.join("scripts/sync-versions.js"))
+        .expect("scripts/sync-versions.js moved — update this guard");
+    let hook = std::fs::read_to_string(root.join("scripts/pre-commit.sh"))
+        .expect("scripts/pre-commit.sh moved — update this guard");
+
+    // Sites written by sync-versions.js: every `file: '<path>'` field, plus the
+    // PLATFORM_PACKAGES array it iterates.
+    let mut sites: Vec<String> = sync
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("file:"))
+        .filter_map(quoted)
+        .collect();
+    sites.extend(
+        block(&sync, "const PLATFORM_PACKAGES = [", "];")
+            .into_iter()
+            .filter_map(|l| quoted(l.trim())),
+    );
+    sites.sort();
+    sites.dedup();
+
+    // Sites checked by the hook: the VERSION_FILES array, and ONLY that array.
+    // Reading the whole file would count a path that merely appears in a
+    // `report` line — which is how the first version of this test passed while
+    // the entry it was written for was absent.
+    let checked: Vec<String> = block(&hook, "VERSION_FILES=(", ")")
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let l = l.trim_matches('"');
+            (!l.is_empty()).then(|| l.to_string())
+        })
+        .collect();
+
+    // Vacuity floors on both sides: these scans read files they do not own, and
+    // "found nothing" has to fail rather than pass. Ten sites today (Cargo.toml,
+    // package.json, plugin.json, marketplace.json, five npm platform packages,
+    // the snapshot template).
+    assert!(
+        sites.len() >= 10,
+        "only {} version sites found in sync-versions.js — the scan lost its grip \
+         on the file's shape, which is the failure mode that makes this guard pass \
+         while checking nothing: {sites:?}",
+        sites.len()
+    );
+    assert!(
+        checked.len() >= 10,
+        "only {} entries parsed out of VERSION_FILES: {checked:?}",
+        checked.len()
+    );
+
+    let missing: Vec<&String> = sites.iter().filter(|p| !checked.contains(p)).collect();
+    assert!(
+        missing.is_empty(),
+        "sync-versions.js rewrites these version sites and pre-commit.sh's \
+         VERSION_FILES does not list them, so a hand-edit lands unnoticed: {missing:?}"
+    );
+}
+
 /// The trimmed, comment-stripped directive lines of a YAML block.
 ///
 /// Every containment check below MUST go through this. The first version of this

@@ -8,6 +8,9 @@ const { findBinary } = require('./find-binary');
 const { resolveProjectRoot } = require('./project-root');
 const lifecycle = require('./lifecycle');
 const { hidden } = require('./proc-opts');
+// Fail open: this file runs straight through with no main() to wrap — see
+// hook-fail-open.js for why a handler rather than a try/catch (JS-12).
+require('./hook-fail-open').installHookFailOpen('statusLine');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 // True when auto-update has a newer release queued or in flight (the background

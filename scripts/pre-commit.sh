@@ -30,6 +30,13 @@ VERSION_FILES=(
   "npm/darwin-x64/package.json"
   "npm/darwin-arm64/package.json"
   "npm/win32-x64/package.json"
+  # The shipped snapshot workflow pins the npm package it runs. sync-versions.js
+  # rewrites that pin like every other site; this guard did not check it, so a
+  # hand-edited template committed on its own passed here and was only caught by
+  # release.yml re-running sync-versions at tag time (audit 2026-08-29 ENG-07).
+  # Kept in step with sync-versions.js by `pre_commit_checks_every_version_site`
+  # in tests/hardening.rs, so site #11 cannot be added to one list alone.
+  "claude-plugin/templates/code-graph-snapshot.yml"
 )
 
 staged_files=$(git diff --cached --name-only)
@@ -67,6 +74,11 @@ if $version_staged; then
   # package entry from staged content and compare it against the reference.
   report Cargo.lock "$(git show :Cargo.lock | awk '/^name = "code-graph-mcp"$/{f=1;next} f&&/^version = /{gsub(/version = "|"/,"");print;exit}')"
 
+  # The snapshot template's npm pin. Extracted with the SCOPED name in the
+  # pattern on purpose: the unscoped `code-graph-mcp` on npm belongs to someone
+  # else, so a rewrite that lands there must not look like a matching version.
+  report snapshot-template "$(git show :claude-plugin/templates/code-graph-snapshot.yml | grep -oE '@sdsrs/code-graph@[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/.*code-graph@//')"
+
   if $mismatch; then
     echo ""
     echo "Fix: node scripts/sync-versions.js $ref"
@@ -74,7 +86,7 @@ if $version_staged; then
     exit 1
   fi
 
-  echo "✓ Version consistency: $ref (Cargo + plugin + marketplace×2 + 5 npm + optionalDeps)"
+  echo "✓ Version consistency: $ref (Cargo + plugin + marketplace×2 + 5 npm + optionalDeps + snapshot template)"
 fi
 
 # ── 2. Plugin JS tests ───────────────────────────────────────

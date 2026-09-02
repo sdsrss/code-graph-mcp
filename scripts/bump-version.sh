@@ -22,9 +22,19 @@ git config core.hooksPath scripts/githooks
 export SYNC_VERSIONS_FEATURES="${SYNC_VERSIONS_FEATURES-embed-model}"
 node scripts/sync-versions.js "$VERSION"
 
-# Cargo.lock
-cargo update -p code-graph-mcp 2>/dev/null || true
-echo "Updated Cargo.lock"
+# Cargo.lock. The failure is REPORTED rather than swallowed (audit 2026-08-29
+# ENG-07): `2>/dev/null || true` printed "Updated Cargo.lock" whether or not
+# anything happened, so a cargo that refused (offline, a vendored registry, a
+# lock held by another build) looked exactly like a success. Still non-fatal —
+# pre-commit compares Cargo.lock's own version against package.json and stops
+# the commit — but the person running the bump now learns which one they got.
+if cargo_out=$(cargo update -p code-graph-mcp 2>&1); then
+  echo "Updated Cargo.lock"
+else
+  echo "⚠ cargo update failed — Cargo.lock still holds the OLD version." >&2
+  echo "$cargo_out" | tail -3 >&2
+  echo "  The pre-commit version check will refuse the commit until it is fixed." >&2
+fi
 
 echo ""
 echo "All versions updated to $VERSION"

@@ -16,6 +16,9 @@ const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
 const { hidden } = require('./proc-opts');
+// Fail open: this file runs straight through with no main() to wrap — see
+// hook-fail-open.js for why a handler rather than a try/catch (JS-12).
+require('./hook-fail-open').installHookFailOpen('PreToolUse:Edit');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu

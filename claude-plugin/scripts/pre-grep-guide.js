@@ -828,6 +828,7 @@ function runMain() {
 }
 
 if (require.main === module) {
+  require('./hook-fail-open').installHookFailOpen('PreToolUse:Bash');
   runMain();
 }
 

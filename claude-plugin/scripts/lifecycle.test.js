@@ -1656,3 +1656,131 @@ test('unadopt sweep: an all-clean registry says nothing at all', () => {
   assert.equal(captured.join(''), '',
     'nothing removed and nothing failed is not news — it used to print a two-project failure list');
 });
+
+test('every module in the require cycle loads first in a cold process', () => {
+  // JS-13 (audit 2026-08-29). The plugin's JS has one require cycle —
+  // auto-update → lifecycle → doctor → auto-update — held open only by
+  // lifecycle.js requiring doctor lazily, inside the `doctor` CLI arm. That was
+  // undocumented and untested: hoisting it to the top of the file crashes
+  // whichever module happens to be loaded first, from a module the caller never
+  // named.
+  //
+  // Each module is loaded FIRST in its own process, because require caching
+  // makes order within one process meaningless — whoever ran earlier already
+  // resolved the graph.
+  const { spawnSync } = require('child_process');
+  const mods = ['auto-update', 'lifecycle', 'doctor'];
+  for (const first of mods) {
+    const rest = mods.filter((m) => m !== first);
+    const code = [first, ...rest].map((m) => `require('./${m}.js');`).join('') +
+      // Touch a value auto-update computes at load: a partial module resolves
+      // to undefined here rather than throwing, which is the shape that made
+      // this cycle survivable-looking in the first place.
+      `const au = require('./auto-update.js');` +
+      `if (typeof au.MAX_UPDATE_ATTEMPTS !== 'number') { throw new Error('auto-update loaded partially: MAX_UPDATE_ATTEMPTS=' + au.MAX_UPDATE_ATTEMPTS); }` +
+      `process.stdout.write('ok');`;
+    const res = spawnSync(process.execPath, ['-e', code], {
+      cwd: __dirname, encoding: 'utf8', env: { ...process.env, CODE_GRAPH_NO_AUTOUPDATE: '1' },
+    });
+    assert.equal(res.status, 0,
+      `requiring ${first} first failed — the cycle is no longer broken by a lazy edge:\n${res.stderr}`);
+    assert.equal(res.stdout, 'ok');
+  }
+});
+
+test('a lossy settings.json does not grow one backup per install() that changes nothing', () => {
+  // JS-09 (audit 2026-08-29). install() called readSettingsForWrite() with no
+  // probe, so the `.corrupt-*` copy was taken before knowing whether anything
+  // would be written. install() is idempotent and usually writes nothing, so
+  // any condition that re-runs it each session grew one full copy of
+  // settings.json in ~/.claude per session, forever, for a file nothing
+  // rewrote.
+  //
+  // The fixture has to STAY lossy across runs, which is the part that took a
+  // second try: seeding a lossy file and installing into it repairs the bad
+  // byte on the first write, and every later run then reads clean UTF-8 and
+  // takes no backup — green for the wrong reason. So: install first, THEN
+  // inject the byte into a value install does not touch.
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lossy-settings-'));
+  try {
+    const claude = path.join(home, '.claude');
+    fs.mkdirSync(claude, { recursive: true });
+    const settings = path.join(claude, 'settings.json');
+    const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: claude };
+    const run = () => {
+      const res = spawnSync(process.execPath, ['-e', `require('./lifecycle').install();`], {
+        cwd: __dirname, encoding: 'utf8', env,
+      });
+      assert.equal(res.status, 0, res.stderr);
+      return fs.readdirSync(claude).filter((f) => f.startsWith('settings.json.corrupt-'));
+    };
+
+    run(); // first install: registers hooks, writes, leaves a clean file
+    // Valid JSON whose bytes are not valid UTF-8, in a key install never edits.
+    // Built by serializing a marker and swapping its byte, rather than by
+    // splicing text: the first attempt appended to the file and produced
+    // INVALID json, which sends install down the rebuild path — a different
+    // defect than the one under test, and it writes.
+    const parsed = JSON.parse(fs.readFileSync(settings, 'utf8'));
+    parsed.model = '@';
+    const marker = Buffer.from(JSON.stringify(parsed, null, 2), 'utf8');
+    const at = marker.lastIndexOf(Buffer.from('"model": "@"'));
+    assert.ok(at > 0, 'marker not found — the fixture no longer builds a lossy file');
+    marker[at + '"model": "'.length] = 0xff;
+    fs.writeFileSync(settings, marker);
+    for (const f of fs.readdirSync(claude).filter((f) => f.startsWith('settings.json.corrupt-'))) {
+      fs.unlinkSync(path.join(claude, f));
+    }
+
+    // Precondition: this install has nothing to change. If that stops being
+    // true the test would pass for the wrong reason, so assert it — the file
+    // must come back byte-identical.
+    const before = fs.readFileSync(settings);
+    const first = run();
+    assert.deepEqual(fs.readFileSync(settings), before,
+      'precondition: an already-installed settings.json is not rewritten');
+    assert.equal(first.length, 0,
+      `a run that writes nothing owes no backup; got ${first.length}: ${first}`);
+
+    for (let i = 0; i < 4; i++) run();
+    const after = fs.readdirSync(claude).filter((f) => f.startsWith('settings.json.corrupt-'));
+    assert.equal(after.length, 0,
+      `five no-op installs left ${after.length} copies of settings.json behind: ${after}`);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('corrupt-file backups are bounded', () => {
+  // The other half of JS-09: nothing ever deleted these, and each is a full
+  // copy of the file. Newest survive — the reason to keep any is "undo what
+  // just happened".
+  const { pruneCorruptBackups, MAX_CORRUPT_BACKUPS } = require('./lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-corrupt-prune-'));
+  try {
+    const target = path.join(dir, 'settings.json');
+    fs.writeFileSync(target, '{}');
+    const names = [];
+    for (let i = 0; i < MAX_CORRUPT_BACKUPS + 4; i++) {
+      // Timestamp-shaped names, ascending — the pruner sorts on the NAME, so a
+      // filesystem that hands them back in any order must not change the outcome.
+      const n = `settings.json.corrupt-2026-09-02T00-00-${String(i).padStart(2, '0')}-000Z`;
+      fs.writeFileSync(path.join(dir, n), `copy ${i}`);
+      names.push(n);
+    }
+    // A neighbouring file's backups must survive: the matcher is per-file.
+    fs.writeFileSync(path.join(dir, 'other.json.corrupt-2026-01-01T00-00-00-000Z'), 'x');
+
+    const pruned = pruneCorruptBackups(target);
+    assert.equal(pruned, 4, 'four oldest removed');
+    const left = fs.readdirSync(dir).filter((f) => f.startsWith('settings.json.corrupt-')).sort();
+    assert.deepEqual(left, names.slice(-MAX_CORRUPT_BACKUPS).sort(),
+      'the newest copies are the ones kept');
+    assert.ok(fs.existsSync(path.join(dir, 'other.json.corrupt-2026-01-01T00-00-00-000Z')),
+      'another file’s backups are not this file’s to delete');
+    assert.ok(fs.existsSync(target), 'and the original is never touched');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
