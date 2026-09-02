@@ -39,7 +39,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { cgTmpDir, cwdHash } = require('./tmp-dir');
+const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
 
@@ -523,25 +523,10 @@ function splitTopLevelSegments(cmd) {
   return out.map(s => s.trim()).filter(Boolean);
 }
 
-function commandHash(cmd) {
-  return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
-}
-
-// Project-scoped: the same `grep -rn "foo" src/` in two repos is two different
-// questions and must not share one 60s cooldown (see cwdHash in tmp-dir.js).
-function flagPath(cmd, cwd = process.cwd()) {
-  return path.join(cgTmpDir(), `.code-graph-bash-${cwdHash(cwd)}-${commandHash(cmd)}`);
-}
-
-function isOnCooldown(cmd, now = Date.now(), windowMs = 60000, cwd = process.cwd()) {
-  try {
-    return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
-  } catch { return false; }
-}
-
-function markCooldown(cmd, cwd = process.cwd()) {
-  try { fs.writeFileSync(flagPath(cmd, cwd), ''); } catch { /* ok */ }
-}
+// One implementation of the cooldown quartet, in tmp-dir.js (ARC-02/ARC-06);
+// the `bash` prefix is what keeps this hook's flags distinct from
+// post-grep-inject's.
+const { commandHash, flagPath, isOnCooldown, markCooldown } = makeCooldown('bash');
 
 function buildHint() {
   // Terse, no banner spam. Single message budget ~600 bytes.

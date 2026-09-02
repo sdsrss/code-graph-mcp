@@ -209,42 +209,19 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // one row. When their confidence differs, show the LOWEST (most conservative)
     // tier: the displayed confidence must not understate a hidden sibling's
     // ambiguity (L1 — surfacing low confidence is the whole point of the feature).
+    // The rule itself lives in `resolve::rollup_incoming_references`, shared with
+    // MCP `find_references` (ARC-03). `skip_tests: false` — `refs` shows every
+    // usage site, because a rename has to reach the tests too.
     let build_refs =
         |conn: &rusqlite::Connection| -> Result<(Vec<queries::IncomingReference>, usize)> {
-            let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
-            let mut seen: std::collections::HashMap<(String, String, String), usize> =
-                std::collections::HashMap::new();
-            let mut conf_filtered = 0usize;
-            for target_id in &target_ids {
-                let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
-                for r in refs {
-                    // --min-confidence: drop refs below the requested tier (default: keep all).
-                    if let Some(min) = min_confidence {
-                        if crate::domain::confidence_rank(&r.confidence)
-                            < crate::domain::confidence_rank(min)
-                        {
-                            conf_filtered += 1;
-                            continue;
-                        }
-                    }
-                    let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-                    match seen.get(&key) {
-                        Some(&idx) => {
-                            // Keep the worst-case (lowest) confidence among deduped siblings.
-                            if crate::domain::confidence_rank(&r.confidence)
-                                < crate::domain::confidence_rank(&all_refs[idx].confidence)
-                            {
-                                all_refs[idx].confidence = r.confidence;
-                            }
-                        }
-                        None => {
-                            seen.insert(key, all_refs.len());
-                            all_refs.push(r);
-                        }
-                    }
-                }
-            }
-            Ok((all_refs, conf_filtered))
+            let rollup = crate::resolve::rollup_incoming_references(
+                conn,
+                &target_ids,
+                relation_filter,
+                min_confidence,
+                false,
+            )?;
+            Ok((rollup.refs, rollup.confidence_filtered))
         };
     let (mut all_refs, mut conf_filtered) = build_refs(conn)?;
     let files: Vec<String> = all_refs.iter().map(|r| r.file_path.clone()).collect();

@@ -41,6 +41,39 @@ function cwdHash(cwd) {
   return crypto.createHash('sha1').update(String(cwd)).digest('hex').slice(0, 12);
 }
 
+// The per-command cooldown quartet — commandHash / flagPath / isOnCooldown /
+// markCooldown — was written twice, near-byte-identically, in pre-grep-guide.js
+// and post-grep-inject.js (audit 2026-08-29 ARC-06). The only thing that
+// differed was the filename prefix, and a prefix is a parameter; the four
+// functions are not. They already disagreed in one place: one hashed `cmd`, the
+// other `String(cmd)`, so a non-string command threw in one hook and hashed in
+// the other. This takes the `String()` form for both.
+//
+// The prefix stays the caller's, and must stay DISTINCT per hook: a PreToolUse
+// deny and a PostToolUse inject for different commands must not suppress each
+// other. Flag paths are byte-identical to what each hook wrote before.
+//
+// pre-read-guide.js is deliberately NOT folded in: its `.code-graph-readfan-*`
+// file is a JSON state document keyed on the cwd alone, not a per-command
+// cooldown flag — same directory, different thing.
+function makeCooldown(prefix, { windowMs: defaultWindowMs = 60000 } = {}) {
+  const commandHash = (cmd) =>
+    crypto.createHash('sha1').update(String(cmd)).digest('hex').slice(0, 12);
+  // Project-scoped: the same `grep -rn "foo" src/` in two repos is two different
+  // questions and must not share one cooldown (see cwdHash above).
+  const flagPath = (cmd, cwd = process.cwd()) =>
+    path.join(cgTmpDir(), `.code-graph-${prefix}-${cwdHash(cwd)}-${commandHash(cmd)}`);
+  const isOnCooldown = (cmd, now = Date.now(), windowMs = defaultWindowMs, cwd = process.cwd()) => {
+    try {
+      return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
+    } catch { return false; }
+  };
+  const markCooldown = (cmd, cwd = process.cwd()) => {
+    try { fs.writeFileSync(flagPath(cmd, cwd), ''); } catch { /* ok */ }
+  };
+  return { commandHash, flagPath, isOnCooldown, markCooldown };
+}
+
 // Nothing ever deleted what cgTmpDir() collects. Every cooldown flag, read-fanout
 // state file and interrupted `update-*` download stayed forever: measured 281
 // entries on a working dev box, 232 of them older than a day. They are 0-byte
@@ -86,4 +119,4 @@ function pruneCgTmp({ now = Date.now(), maxAgeMs = PRUNE_MAX_AGE_MS, dir = CG_TM
   return removed;
 }
 
-module.exports = { cgTmpDir, CG_TMP_DIR, cwdHash, pruneCgTmp, PRUNE_MAX_AGE_MS };
+module.exports = { cgTmpDir, CG_TMP_DIR, cwdHash, makeCooldown, pruneCgTmp, PRUNE_MAX_AGE_MS };

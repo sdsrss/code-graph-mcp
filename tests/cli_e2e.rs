@@ -9487,6 +9487,173 @@ export function refreshToken(token: string): string {
     );
 }
 
+// CON-19 (audit 2026-08-29) reported the `--json` empty shapes as inconsistent:
+// `search` answers a miss with `[]` while `ast-search` answers with
+// `{"count":0,"results":[]}`, so a machine consumer must special-case per
+// command. Measured against HEAD, each of those matches ITS OWN success shape —
+// `search` succeeds with a bare array, `ast-search` with a `{count, results}`
+// envelope — which is tier 1 of the three-tier contract
+// (feedback_cli_json_empty_contract), and that memory says in as many words not
+// to normalize a shape for cross-command parity.
+//
+// So no shape changes. What was missing is a guard on the property itself, and
+// this repo has already shipped its violation once: `refs` used to answer a miss
+// with a bare `[]` while succeeding with an object, and a consumer's
+// `.references` access broke (2026-06-05 dogfood sweep). Ten per-command tests
+// pin ten literals; none of them can see a NEW command that drifts.
+#[test]
+fn every_json_command_answers_a_miss_in_a_shape_its_consumer_can_parse() {
+    // (label, args that hit, args that miss)
+    const CASES: &[(&str, &[&str], &[&str])] = &[
+        ("search", &["search", "token"], &["search", "zzzq_no_such"]),
+        (
+            "ast-search",
+            &["ast-search", "validateToken"],
+            &["ast-search", "zzzq_no_such"],
+        ),
+        (
+            "show",
+            &["show", "validateToken"],
+            &["show", "zzzq_no_such"],
+        ),
+        (
+            "callgraph",
+            &["callgraph", "validateToken"],
+            &["callgraph", "zzzq_no_such"],
+        ),
+        (
+            "overview",
+            &["overview", "src"],
+            &["overview", "no_such_dir"],
+        ),
+        (
+            "refs",
+            &["refs", "validateToken"],
+            &["refs", "zzzq_no_such"],
+        ),
+        ("deps", &["deps", "src/api.ts"], &["deps", "no_such.ts"]),
+        (
+            "dead-code",
+            &["dead-code", "src"],
+            &["dead-code", "no_such_dir"],
+        ),
+    ];
+    // Tier 2 (something was hidden) and tier 3 (miss/error) are allowed to
+    // deviate from the success shape, but only as a SELF-DESCRIBING object —
+    // that is the whole reason the deviation exists. A bare `[]` where success
+    // is an object describes nothing, which is the shape that broke a consumer.
+    const MARKERS: &[&str] = &[
+        "error",
+        "filtered_out",
+        "ignored_count",
+        "below_threshold_count",
+        "total_found",
+    ];
+
+    let project = setup_indexed_project();
+    let run_json = |args: &[&str]| -> serde_json::Value {
+        let mut argv = args.to_vec();
+        argv.push("--json");
+        let (stdout, stderr, _) = run_cli(&project, &argv);
+        assert!(
+            !stdout.trim().is_empty(),
+            "`{}` wrote nothing to stdout under --json; stderr={stderr:?}",
+            argv.join(" ")
+        );
+        serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("`{}` did not write JSON ({e}): {stdout:?}", argv.join(" ")))
+    };
+
+    let mut checked = 0usize;
+    for (label, hit_args, miss_args) in CASES {
+        let hit = run_json(hit_args);
+        let miss = run_json(miss_args);
+        let same_kind = hit.is_array() == miss.is_array();
+        if !same_kind {
+            let obj = miss.as_object().unwrap_or_else(|| {
+                panic!(
+                    "{label}: success is {} but the miss is {} — a consumer that \
+                     indexes the success shape gets a type error",
+                    if hit.is_array() {
+                        "an array"
+                    } else {
+                        "an object"
+                    },
+                    if miss.is_array() {
+                        "an array"
+                    } else {
+                        "a scalar"
+                    },
+                )
+            });
+            assert!(
+                MARKERS.iter().any(|m| obj.contains_key(*m)),
+                "{label}: the miss deviates from the success shape without saying \
+                 why. Tier 2/3 must carry one of {MARKERS:?}; got {miss}"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, CASES.len(), "every case must have run");
+    assert!(
+        checked >= 8,
+        "vacuity floor: this guard is only worth its runtime across the whole \
+         --json surface, and a table trimmed to a couple of commands passes for \
+         the wrong reason"
+    );
+}
+
+// CON-17 (audit 2026-08-29): the funnel-telemetry write rotates
+// `recommendations.jsonl`, and its "something else owns this name" warning was
+// raised through `tracing` from a call site that ran BEFORE `init_tracing` —
+// the only warning in the binary no `RUST_LOG` could make visible. Reproduced
+// by making that path a directory, which is exactly the case the warning is
+// for: the rotation declines, and the caller has no way to learn why.
+#[test]
+fn the_rotation_warning_is_visible_because_the_subscriber_exists_by_then() {
+    let project = setup_indexed_project();
+    // Not a regular file → `rotate_jsonl_if_over` warns and leaves it alone.
+    std::fs::create_dir(
+        project
+            .path()
+            .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+            .join("recommendations.jsonl"),
+    )
+    .unwrap();
+
+    // CODE_GRAPH_INTERNAL is set by the plugin's own hook-answer runs, which
+    // skip this path entirely; pin it off so the test measures the CLI, not
+    // whatever the host shell happens to export.
+    let (_, stderr, code) = run_cli_env(
+        &project,
+        &["show", "validateToken"],
+        &[("CODE_GRAPH_INTERNAL", "0")],
+    );
+    assert_eq!(
+        code, 0,
+        "the query still succeeds; only the rotation declines"
+    );
+    assert!(
+        stderr.contains("Not rotating"),
+        "CON-17: the rotation warning must reach stderr — it is raised before any \
+         subcommand runs, so ordering against `init_tracing` is the whole fix. \
+         stderr={stderr:?}"
+    );
+
+    // `--quiet` means quiet (CON-06): the filter is `error`, so this warning is
+    // suppressed like every other. Without this arm, "fixing" CON-17 by adding a
+    // second unconditional `eprintln!` would pass just as well.
+    let (_, quiet_err, _) = run_cli_env(
+        &project,
+        &["show", "validateToken", "--quiet"],
+        &[("CODE_GRAPH_INTERNAL", "0")],
+    );
+    assert!(
+        !quiet_err.contains("Not rotating"),
+        "--quiet must still suppress it; got {quiet_err:?}"
+    );
+}
+
 /// `git diff --name-only` lists DELETIONS, and the callers of a file that no
 /// longer exists are exactly the ones that will break — so they are the last
 /// thing `affected` may drop. Query-time freshness on the input list nearly took

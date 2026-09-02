@@ -71,6 +71,24 @@ const _: () = assert!(
 /// listing them here would be dead configuration. `test_no_new_undeclared_mcp_args`
 /// in tests/hardening.rs pins that whole set: adding a handler that reads a new
 /// undeclared key fails there until it is classified here.
+/// The mirror image of [`HONORED_UNDECLARED_ARGS`]: arguments a tool DECLARES
+/// and honors in one mode, while the other mode's backend never reads them.
+///
+/// `(tool, the argument that selects the mode, the arguments that mode drops)`.
+///
+/// `get_call_graph` with `route_path` delegates the whole call to
+/// `tool_trace_http_chain`, which reads `route_path`, `depth`,
+/// `include_middleware`, `include_tests` and `min_confidence` — not `file_path`,
+/// not `direction` (audit 2026-08-29 CON-14). The schema cannot express this
+/// (a per-mode property set is not a thing JSON Schema says well), and the
+/// descriptions carry it unevenly: `direction`'s says "ignored when route_path
+/// is set", `file_path`'s says "Disambiguate same-name functions" and stops
+/// there. So a caller narrowing a route trace by file got the unnarrowed answer
+/// with nothing to indicate it. Disclosure at answer time is the one channel
+/// that cannot go stale relative to the code.
+const MODE_INERT_ARGS: &[(&str, &str, &[&str])] =
+    &[("get_call_graph", "route_path", &["file_path", "direction"])];
+
 const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
     ("*", "skip_indexing"),
     ("get_call_graph", "function_name"),
@@ -2189,8 +2207,14 @@ impl McpServer {
             .map(|value| self.note_ignored_arguments(name, args, value))
     }
 
-    /// Name back any argument the tool does not declare, as
+    /// Name back any argument this call did nothing with, as
     /// `"ignored_arguments": ["language", …]` on the result object.
+    ///
+    /// Two sources feed that list, and they are different questions. An
+    /// argument the tool does not DECLARE was never going to be read by anyone
+    /// (the paragraph below). An argument the tool declares but this MODE does
+    /// not read is [`MODE_INERT_ARGS`] — the caller consulted a schema that was
+    /// telling the truth about the other mode.
     ///
     /// Undeclared members were dropped in silence, which is fine for a human
     /// reading a schema and fatal for the actual caller here: an LLM that sent
@@ -2245,13 +2269,37 @@ impl McpServer {
             .filter(|k| !declared.contains_key(k.as_str()) && !honored_undeclared(k))
             .map(|k| k.as_str())
             .collect();
+        // Declared, but inert in the mode this call selected (CON-14). Computed
+        // here rather than in the handler so the two kinds of "your argument did
+        // nothing" arrive in ONE key: a handler that inserted its own
+        // `ignored_arguments` would be overwritten by this function a moment
+        // later, and the caller would see whichever list happened to win.
+        for (tool, selector, inert) in MODE_INERT_ARGS {
+            if *tool != schema_name {
+                continue;
+            }
+            let mode_selected = sent
+                .get(*selector)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !mode_selected {
+                continue;
+            }
+            for key in *inert {
+                // Only what the caller actually sent, and only once: a key can
+                // reach here from the undeclared branch as well.
+                if sent.contains_key(*key) && !ignored.contains(key) {
+                    ignored.push(key);
+                }
+            }
+        }
         if ignored.is_empty() {
             return result;
         }
         ignored.sort_unstable();
         ignored.truncate(MAX_REPORTED); // the list is caller-supplied; keep it bounded
         tracing::warn!(
-            "[tool] {} received undeclared arguments: {}",
+            "[tool] {} ignored these arguments: {}",
             name,
             ignored.join(", ")
         );

@@ -23,7 +23,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { cgTmpDir, cwdHash } = require('./tmp-dir');
+const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, sanitizeSearchPath } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
@@ -213,25 +213,10 @@ function isInjectDisabled(env = process.env) {
 // Per-command cooldown, mirror of pre-grep-guide's flag pattern but with a
 // DISTINCT prefix so the two hooks never share a flag (a PreToolUse deny and a
 // PostToolUse inject for different commands must not suppress each other).
-function commandHash(cmd) {
-  return crypto.createHash('sha1').update(String(cmd)).digest('hex').slice(0, 12);
-}
-
-// Project-scoped for the same reason as pre-grep-guide's (see cwdHash in
-// tmp-dir.js): one shared tmp dir means an un-scoped flag is machine-global.
-function flagPath(cmd, cwd = process.cwd()) {
-  return path.join(cgTmpDir(), `.code-graph-postinject-${cwdHash(cwd)}-${commandHash(cmd)}`);
-}
-
-function isOnCooldown(cmd, now = Date.now(), windowMs = 60000, cwd = process.cwd()) {
-  try {
-    return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
-  } catch { return false; }
-}
-
-function markCooldown(cmd, cwd = process.cwd()) {
-  try { fs.writeFileSync(flagPath(cmd, cwd), ''); } catch { /* ok */ }
-}
+// Shared implementation (ARC-06). The DISTINCT prefix is the load-bearing part:
+// a PreToolUse deny and a PostToolUse inject for different commands must not
+// suppress each other.
+const { commandHash, flagPath, isOnCooldown, markCooldown } = makeCooldown('postinject');
 
 // --- Main execution ---
 

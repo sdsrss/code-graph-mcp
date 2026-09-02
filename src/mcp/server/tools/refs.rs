@@ -217,70 +217,48 @@ impl McpServer {
         // `extracted` same-file hit from an `ambiguous` by-name fan-out
         // (audit 2026-08-16 P1-11).
         //
-        // Dedup key is (name, file_path, relation) and does NOT include the
-        // target, so two edges from one source to DIFFERENT same-name targets
-        // collapse into one row. When their tiers differ, keep the LOWEST — the
-        // displayed confidence must not understate a hidden sibling's ambiguity
-        // (same rule as `cli::cmd_refs`).
-        let mut all_refs: Vec<serde_json::Value> = Vec::new();
-        let mut seen: std::collections::HashMap<(String, String, String), usize> =
-            std::collections::HashMap::new();
-        let mut test_refs_filtered: usize = 0;
-        let mut confidence_filtered: usize = 0;
-        for target_id in &target_ids {
-            let refs =
-                queries::get_incoming_references(self.db.conn(), *target_id, relation_filter)?;
-            for r in refs {
-                // Test filter: caller (r.name + r.file_path) looks like a test node → skip
-                // unless caller opted in. Count separately so response shows the hidden total.
-                if !include_tests && is_test_symbol(&r.name, &r.file_path) {
-                    test_refs_filtered += 1;
-                    continue;
+        // The dedup rule — key `(name, file_path, relation)`, keep the LOWEST
+        // confidence among collapsed siblings — lives in
+        // `resolve::rollup_incoming_references`, shared with CLI `refs`
+        // (audit 2026-08-29 ARC-03). It used to be written twice, and this copy
+        // patched `confidence` inside an already-built JSON object, so the rule
+        // was expressed in terms of the output format. Rows first, rendering
+        // after.
+        let rollup = crate::resolve::rollup_incoming_references(
+            self.db.conn(),
+            &target_ids,
+            relation_filter,
+            min_confidence,
+            !include_tests,
+        )?;
+        let test_refs_filtered = rollup.test_filtered;
+        let confidence_filtered = rollup.confidence_filtered;
+        let mut all_refs: Vec<serde_json::Value> = rollup
+            .refs
+            .iter()
+            .map(|r| {
+                if compact {
+                    json!({
+                        "name": r.name,
+                        "file_path": r.file_path,
+                        "start_line": r.start_line,
+                        "relation": r.relation,
+                        "confidence": r.confidence,
+                        "node_id": r.node_id,
+                    })
+                } else {
+                    json!({
+                        "name": r.name,
+                        "type": r.node_type,
+                        "file_path": r.file_path,
+                        "start_line": r.start_line,
+                        "relation": r.relation,
+                        "confidence": r.confidence,
+                        "node_id": r.node_id,
+                    })
                 }
-                if let Some(min) = min_confidence {
-                    if crate::domain::confidence_rank(&r.confidence)
-                        < crate::domain::confidence_rank(min)
-                    {
-                        confidence_filtered += 1;
-                        continue;
-                    }
-                }
-                let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-                match seen.get(&key) {
-                    Some(&idx) => {
-                        let kept = all_refs[idx]["confidence"].as_str().unwrap_or_default();
-                        if crate::domain::confidence_rank(&r.confidence)
-                            < crate::domain::confidence_rank(kept)
-                        {
-                            all_refs[idx]["confidence"] = json!(r.confidence);
-                        }
-                    }
-                    None => {
-                        seen.insert(key, all_refs.len());
-                        if compact {
-                            all_refs.push(json!({
-                                "name": r.name,
-                                "file_path": r.file_path,
-                                "start_line": r.start_line,
-                                "relation": r.relation,
-                                "confidence": r.confidence,
-                                "node_id": r.node_id,
-                            }));
-                        } else {
-                            all_refs.push(json!({
-                                "name": r.name,
-                                "type": r.node_type,
-                                "file_path": r.file_path,
-                                "start_line": r.start_line,
-                                "relation": r.relation,
-                                "confidence": r.confidence,
-                                "node_id": r.node_id,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
+            })
+            .collect();
 
         // Stable sort prod-first: include_tests defaults to true and
         // centralized_compress truncates large arrays to first 10 + last 5.

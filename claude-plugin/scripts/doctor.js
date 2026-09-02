@@ -879,14 +879,12 @@ function runRepairs(results, {
           console.log('     for semantic search rebuild with `cargo build --release --features embed-model`)');
         }
         console.log(`    \u2192 ${buildCmd}`);
+        // Through the injectable helper, like the binary-broken arm below
+        // (audit 2026-08-29 ARC-02). An inline `execSync` here is not merely
+        // duplication: `execSync` is destructured at load, so a test injecting
+        // `buildBinary` leaves this arm running a REAL ten-minute cargo build.
         try {
-          const projectRoot = path.resolve(__dirname, '..', '..');
-          execSync(buildCmd, hidden({
-            cwd: projectRoot,
-            stdio: 'inherit',
-            timeout: 600000,  // embed-model (Candle) builds exceed the old 5min
-          }));
-          clearBinaryCache();
+          buildBinary(buildCmd);
           console.log('  \u2705 Build complete');
           fixed++;
         } catch {
@@ -903,13 +901,8 @@ function runRepairs(results, {
           console.log('    \u2192 cargo build --release --no-default-features');
           console.log('      (for semantic search: cargo build --release --features embed-model)');
           try {
-            const projectRoot = path.resolve(__dirname, '..', '..');
-            execSync('cargo build --release --no-default-features', hidden({
-              cwd: projectRoot,
-              stdio: 'inherit',
-              timeout: 600000,
-            }));
-            clearBinaryCache();
+            // Same injectable helper as the other two build arms (ARC-02).
+            buildBinary('cargo build --release --no-default-features');
             console.log('  \u2705 Build complete');
             fixed++;
           } catch {

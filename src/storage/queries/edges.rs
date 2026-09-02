@@ -221,8 +221,13 @@ pub fn get_edge_target_names_batch(
     for chunk in source_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(2, chunk.len());
         let sql = format!(
+            // Ordered by name alone, and that is complete: the output of this
+            // query IS the name, so two rows that tie here are indistinguishable
+            // downstream (CON-16). Anything id-based would reintroduce the
+            // rebuild-dependence it is here to remove.
             "SELECT e.source_id, n.name FROM edges e JOIN nodes n ON n.id = e.target_id
-             WHERE e.source_id IN ({placeholders}) AND e.relation = ?1 {conf_gate}"
+             WHERE e.source_id IN ({placeholders}) AND e.relation = ?1 {conf_gate}
+             ORDER BY n.name"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut params: Vec<&dyn rusqlite::types::ToSql> =
@@ -362,8 +367,15 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
             .collect();
 
         // Outgoing edges: node is source
+        // ORDER BY on CONTENT, never on an id (audit 2026-08-29 CON-16). The
+        // ordering has to survive a rebuild, and `nodes.id` is a reused rowid
+        // (see `resolve::reresolve_node_by_identity`), so a tiebreak on it would
+        // be exactly as unstable as the row order it replaces. These three
+        // columns are the whole `EdgeInfo` tuple apart from the direction, which
+        // is a literal per query — so two rows that still tie are byte-identical
+        // in the output.
         let sql_out = format!(
-            "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({})",
+            "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({}) ORDER BY e.relation, n.name, e.metadata",
             placeholders
         );
         let mut stmt = conn.prepare(&sql_out)?;
@@ -385,7 +397,7 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
 
         // Incoming edges: node is target
         let sql_in = format!(
-            "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({})",
+            "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({}) ORDER BY e.relation, n.name, e.metadata",
             placeholders
         );
         let mut stmt = conn.prepare(&sql_in)?;
@@ -524,6 +536,94 @@ mod tests {
         delete_files_by_paths(db.conn(), &["t.ts".into()]).unwrap();
         let edges_after = get_edges_from(db.conn(), n1).unwrap();
         assert_eq!(edges_after.len(), 0);
+    }
+
+    /// Both batch fetchers took SQLite's row order (audit 2026-08-29 CON-16).
+    /// Within one database file that order is stable, which is why nothing here
+    /// ever went red — but it is a function of the physical order rows were
+    /// written in, so a rebuild that visits the same source in a different order
+    /// silently reorders the answer.
+    ///
+    /// That reaches further than `trace`'s `downstream_calls`, which is what the
+    /// finding named: `get_edges_batch` also feeds `categorize_edges` →
+    /// `build_context_string`, the text that gets EMBEDDED
+    /// (`pipeline::context::regenerate_context_strings`). An order-dependent
+    /// context string means the same unedited symbol can embed to a different
+    /// vector after a rebuild, moving semantic-search ranking with no source
+    /// change behind it.
+    ///
+    /// The property is "same edges in, same order out, whatever order they were
+    /// written" — so the test writes them twice, in opposite orders, and
+    /// compares. A single-order fixture would pass on the old code, because a
+    /// stable sort preserves exactly the insertion order it was handed.
+    #[test]
+    fn batch_edge_fetches_do_not_inherit_the_order_rows_were_written_in() {
+        fn build(order: &[&str]) -> (Vec<String>, Vec<String>) {
+            let (db, _tmp) = test_db();
+            let conn = db.conn();
+            let fid = upsert_file(
+                conn,
+                &FileRecord {
+                    path: "t.ts".into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: Some("typescript".into()),
+                },
+            )
+            .unwrap();
+            let node = |name: &str, line: i64| {
+                insert_node(
+                    conn,
+                    &NodeRecord {
+                        file_id: fid,
+                        node_type: "function".into(),
+                        name: name.into(),
+                        qualified_name: None,
+                        start_line: line,
+                        end_line: line,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )
+                .unwrap()
+            };
+            let src = node("caller", 1);
+            // Targets are created in a FIXED order, so the only thing varying
+            // between the two runs is the order the EDGES are written in.
+            let ids: std::collections::HashMap<&str, i64> = ["alpha", "beta", "gamma"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (*n, node(n, 10 + i as i64)))
+                .collect();
+            for name in order {
+                insert_edge(conn, src, ids[name], "calls", None).unwrap();
+            }
+            let names =
+                get_edge_target_names_batch(conn, &[src], "calls", 0).unwrap()[&src].clone();
+            let infos: Vec<String> = get_edges_batch(conn, &[src]).unwrap()[&src]
+                .iter()
+                .map(|e| format!("{}:{}:{}", e.0, e.1, e.2))
+                .collect();
+            (names, infos)
+        }
+
+        let (names_a, infos_a) = build(&["alpha", "beta", "gamma"]);
+        let (names_b, infos_b) = build(&["gamma", "beta", "alpha"]);
+        assert_eq!(names_a.len(), 3, "fixture must produce three edges");
+        assert_eq!(
+            names_a, names_b,
+            "get_edge_target_names_batch returned the write order, not a defined one"
+        );
+        assert_eq!(
+            infos_a, infos_b,
+            "get_edges_batch returned the write order, not a defined one"
+        );
     }
 
     #[test]

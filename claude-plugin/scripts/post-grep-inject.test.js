@@ -658,3 +658,37 @@ test('e2e: no index up to $HOME → silent exit 0', () => {
     fs.rmSync(bare, { recursive: true, force: true });
   }
 });
+
+test('the two grep hooks keep separate cooldown flags after sharing one implementation', () => {
+  // ARC-06 (audit 2026-08-29): the cooldown quartet lived twice, near
+  // byte-identically, in pre-grep-guide.js and post-grep-inject.js. It is one
+  // implementation now (`makeCooldown` in tmp-dir.js), and the ONE thing that
+  // must not be shared is the flag namespace: a PreToolUse deny and a
+  // PostToolUse inject for different commands must not suppress each other.
+  // A factory makes that a one-character mistake, so it gets a test rather than
+  // a comment.
+  const pre = require('./pre-grep-guide');
+  const post = require('./post-grep-inject');
+  const cmd = `grep -rn "ArcSix${Date.now()}" src/`;
+  const cwd = '/repo/arc06';
+
+  post.markCooldown(cmd, cwd);
+  assert.equal(post.isOnCooldown(cmd, Date.now(), 60000, cwd), true,
+    'the hook that wrote the flag must see it — otherwise the rest is vacuous');
+  assert.equal(pre.isOnCooldown(cmd, Date.now(), 60000, cwd), false,
+    'a PostToolUse inject must not put the PreToolUse guard on cooldown');
+
+  pre.markCooldown(cmd, cwd);
+  assert.equal(pre.isOnCooldown(cmd, Date.now(), 60000, cwd), true);
+
+  // Both flags exist side by side, distinguished only by prefix.
+  const flags = fs.readdirSync(cgTmpDir())
+    .filter(f => f.includes(post.commandHash(cmd)));
+  assert.equal(flags.length, 2, `expected one flag per hook, got ${flags.join(', ')}`);
+  assert.equal(flags.filter(f => f.startsWith('.code-graph-bash-')).length, 1);
+  assert.equal(flags.filter(f => f.startsWith('.code-graph-postinject-')).length, 1);
+
+  // Both hooks derive the same command digest — they always did, and the shared
+  // helper is what keeps that true rather than a coincidence of two copies.
+  assert.equal(pre.commandHash(cmd), post.commandHash(cmd));
+});

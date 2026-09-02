@@ -389,6 +389,232 @@ mod fuzzy_tests {
     }
 }
 
+/// What [`rollup_incoming_references`] folded away, alongside what survived.
+pub struct ReferenceRollup {
+    /// First-seen order, deduped. Rendering is the caller's job — that is the
+    /// part that legitimately differs between the CLI and MCP surfaces.
+    pub refs: Vec<queries::IncomingReference>,
+    /// Dropped by the `min_confidence` floor.
+    pub confidence_filtered: usize,
+    /// Dropped as test callers (only when `skip_tests`).
+    pub test_filtered: usize,
+}
+
+/// Fold every resolved target's incoming references into ONE deduped list.
+///
+/// The dedup key is `(name, file_path, relation)` and deliberately excludes the
+/// TARGET, so two edges from one source to different same-name targets collapse
+/// into a single row. When the collapsed siblings disagree on confidence, the
+/// LOWEST tier wins: the displayed confidence must never understate a hidden
+/// sibling's ambiguity, which is the entire point of surfacing the tier.
+///
+/// Shared because it was written twice (audit 2026-08-29 ARC-03) — once in
+/// `cli::cmd_refs` over `IncomingReference` values, once in
+/// `mcp::…::tool_find_references` over already-rendered `serde_json` objects,
+/// kept in step by a comment claiming "same rule as `cli::cmd_refs`". A rule
+/// with two implementations has two behaviours the moment one is edited, and
+/// this one decides what a rename audit is told about risk.
+///
+/// Filter ORDER is part of the contract: a test caller below the confidence
+/// floor counts as test-filtered, not confidence-filtered, because that is what
+/// the MCP surface reported before this was hoisted. `skip_tests` is false for
+/// the CLI, which shows every usage site by design — so `test_filtered` stays 0
+/// there rather than becoming a number nothing displays.
+///
+/// The test predicate is the `is_test_symbol` name/path heuristic rather than
+/// the `IncomingReference::is_test` AST flag the row carries. That is the
+/// pre-existing behaviour, preserved deliberately: swapping it here would change
+/// what MCP hides while wearing the clothes of a refactor.
+pub fn rollup_incoming_references(
+    conn: &Connection,
+    target_ids: &[i64],
+    relation_filter: Option<&str>,
+    min_confidence: Option<&str>,
+    skip_tests: bool,
+) -> Result<ReferenceRollup> {
+    let mut refs: Vec<queries::IncomingReference> = Vec::new();
+    let mut seen: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
+    let mut confidence_filtered = 0usize;
+    let mut test_filtered = 0usize;
+
+    for target_id in target_ids {
+        for r in queries::get_incoming_references(conn, *target_id, relation_filter)? {
+            // `mcp::server::is_test_symbol`, which this call site used to reach,
+            // is a one-line forward to exactly this function — same predicate,
+            // not merely an equivalent one.
+            if skip_tests && crate::domain::is_test_symbol(&r.name, &r.file_path) {
+                test_filtered += 1;
+                continue;
+            }
+            if let Some(min) = min_confidence {
+                if crate::domain::confidence_rank(&r.confidence)
+                    < crate::domain::confidence_rank(min)
+                {
+                    confidence_filtered += 1;
+                    continue;
+                }
+            }
+            let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
+            match seen.get(&key) {
+                Some(&idx) => {
+                    if crate::domain::confidence_rank(&r.confidence)
+                        < crate::domain::confidence_rank(&refs[idx].confidence)
+                    {
+                        refs[idx].confidence = r.confidence;
+                    }
+                }
+                None => {
+                    seen.insert(key, refs.len());
+                    refs.push(r);
+                }
+            }
+        }
+    }
+    Ok(ReferenceRollup {
+        refs,
+        confidence_filtered,
+        test_filtered,
+    })
+}
+
+#[cfg(test)]
+mod reference_rollup_tests {
+    use super::*;
+    use crate::storage::db::Database;
+    use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
+    use tempfile::TempDir;
+
+    /// Two same-name targets reached from ONE caller, with different edge
+    /// confidences — the shape the dedup key (name, file_path, relation) folds
+    /// together, and the reason the rule has to pick a tier rather than take
+    /// whichever row arrived first.
+    fn two_targets_one_caller(caller_is_test: bool) -> (TempDir, Database, Vec<i64>) {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        let file = |path: &str| {
+            upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: path.into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: Some("rust".into()),
+                },
+            )
+            .unwrap()
+        };
+        let caller_path = if caller_is_test {
+            "tests/a_test.rs"
+        } else {
+            "src/a.rs"
+        };
+        let fa = file(caller_path);
+        let fb = file("src/b.rs");
+        let node = |fid: i64, name: &str, line: i64, is_test: bool| {
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: line,
+                    end_line: line,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test,
+                },
+            )
+            .unwrap()
+        };
+        let caller = node(fa, "caller", 1, caller_is_test);
+        let t1 = node(fb, "target", 10, false);
+        let t2 = node(fb, "target", 20, false);
+        insert_edge(db.conn(), caller, t1, "calls", None).unwrap();
+        insert_edge(db.conn(), caller, t2, "calls", None).unwrap();
+        // Confidence is assigned by a later pipeline pass; set it directly so the
+        // fixture states the exact disagreement being tested.
+        db.conn()
+            .execute(
+                "UPDATE edges SET confidence = 'extracted' WHERE target_id = ?1",
+                [t1],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE edges SET confidence = 'ambiguous' WHERE target_id = ?1",
+                [t2],
+            )
+            .unwrap();
+        (dir, db, vec![t1, t2])
+    }
+
+    #[test]
+    fn collapsed_siblings_report_the_lowest_confidence_of_the_group() {
+        let (_dir, db, targets) = two_targets_one_caller(false);
+        let rollup = rollup_incoming_references(db.conn(), &targets, None, None, false).unwrap();
+        assert_eq!(
+            rollup.refs.len(),
+            1,
+            "one caller, one row — the key excludes the target on purpose"
+        );
+        assert_eq!(
+            rollup.refs[0].confidence, "ambiguous",
+            "the surviving row must not understate the hidden sibling's ambiguity"
+        );
+
+        // Negative control: the same fixture read one target at a time keeps the
+        // per-edge tiers, so the assertion above is about the FOLD, not about
+        // what the query happens to return.
+        let single =
+            rollup_incoming_references(db.conn(), &targets[..1], None, None, false).unwrap();
+        assert_eq!(single.refs[0].confidence, "extracted");
+    }
+
+    #[test]
+    fn the_confidence_floor_counts_what_it_dropped() {
+        let (_dir, db, targets) = two_targets_one_caller(false);
+        // 'extracted' floor drops the ambiguous edge before the fold, leaving the
+        // extracted one — one filtered, one kept.
+        let rollup =
+            rollup_incoming_references(db.conn(), &targets, None, Some("extracted"), false)
+                .unwrap();
+        assert_eq!(rollup.refs.len(), 1);
+        assert_eq!(rollup.refs[0].confidence, "extracted");
+        assert_eq!(rollup.confidence_filtered, 1);
+        assert_eq!(rollup.test_filtered, 0, "no test caller in this fixture");
+    }
+
+    /// Filter ORDER is contract, not incidental: a test caller that is ALSO
+    /// below the floor counts once, as test-filtered. MCP `find_references`
+    /// reports these two numbers separately, so which bucket a row lands in is
+    /// visible to the caller.
+    #[test]
+    fn a_test_caller_below_the_floor_counts_as_test_filtered_only() {
+        let (_dir, db, targets) = two_targets_one_caller(true);
+        let rollup =
+            rollup_incoming_references(db.conn(), &targets, None, Some("extracted"), true).unwrap();
+        assert!(rollup.refs.is_empty(), "the only caller is a test caller");
+        assert_eq!(rollup.test_filtered, 2, "both edges came from that caller");
+        assert_eq!(
+            rollup.confidence_filtered, 0,
+            "the floor never saw them — swapping the two filters would move this \
+             count and change what the response reports"
+        );
+
+        // And with tests kept, the same fixture folds normally — otherwise this
+        // test would also pass against a rollup that drops everything.
+        let kept = rollup_incoming_references(db.conn(), &targets, None, None, false).unwrap();
+        assert_eq!(kept.refs.len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod external_sentinel_tests {
     use super::*;

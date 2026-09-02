@@ -41,6 +41,109 @@ requirement nothing enforces is the same defect pointing the other way. Both go
 red under a dropped `anyOf`, a changed arm, a deleted handler check, and an
 emptied table.
 
+### Four duplications, removed with the differences kept (ARC-02/03/06/07)
+
+Behaviour-preserving, and each verified against the pre-change code rather than
+argued: the reference rollup byte-for-byte over 28 CLI invocations and 5 MCP
+argument shapes, the cooldown flag names over 12 write-and-read pairs, and
+`cg-answer`'s runner matrix over 34 spawn outcomes.
+
+- **ARC-02** — `doctor`'s three dev-mode build arms: only `binary-broken` went
+  through the injectable `buildBinary`; the other two called `execSync` inline.
+  Not cosmetic. `execSync` is destructured at module load, so a test injecting
+  `buildBinary` did not stub those arms at all — measured, the new guard takes
+  **112 seconds** against the old code, because it stands up a real
+  `cargo build --release`. All three go through the helper now.
+- **ARC-03** — the `find_references` dedup rule (key `(name, file_path,
+  relation)`, keep the LOWEST confidence among collapsed siblings) existed
+  twice: once over reference rows in the CLI, once over already-rendered JSON in
+  MCP, held together by a comment claiming "same rule as `cli::cmd_refs`". It is
+  `resolve::rollup_incoming_references` now, with the filter ORDER pinned by a
+  test — a test caller below the confidence floor counts as test-filtered, not
+  confidence-filtered, and MCP reports those two numbers separately.
+- **ARC-06** — the per-command cooldown quartet lived in both grep hooks. Now
+  `makeCooldown(prefix)` in `tmp-dir.js`. The prefix stays per-hook and a test
+  pins that: a PostToolUse inject must not put the PreToolUse guard on cooldown.
+  The two copies had already drifted — one hashed `cmd`, the other
+  `String(cmd)`, so a non-string command threw in one hook and hashed in the
+  other; both take the `String()` form.
+- **ARC-07** — `cg-answer`'s four runners each spawned and mapped results by
+  hand. One `classifyRun` now, and the exit-code table is a single place. The
+  arms are NOT identical and the difference is a parameter rather than something
+  you have to notice: `grep` and `callgraph` read exit 1 as an empty result,
+  while `overview`'s exit 1 means "no indexed files under that path" and stays
+  `unavailable`. The first version of that hoist collapsed the verdict to a
+  literal on the overview path, which made the parameter decorative — flipping
+  it changed nothing and the guard stayed green. Caught by mutating it; the arm
+  returns the verdict now.
+
+### Route mode silently dropped two arguments it declares (CON-14)
+
+`get_call_graph` with `route_path` hands the entire call to the HTTP tracer,
+which reads `route_path`, `depth`, `include_middleware`, `include_tests` and
+`min_confidence` — not `file_path`, not `direction`. The schema declares both,
+and `file_path`'s description ("Disambiguate same-name functions") promises
+something the route arm does not do, so narrowing a route trace by file returned
+the unnarrowed answer with nothing to indicate it.
+
+JSON Schema has no good way to say "not in this mode", and the descriptions
+carried it unevenly (`direction`'s mentions the exception; `file_path`'s does
+not). The answer can say it, though, and an answer cannot go stale against the
+code: route mode now reports them through the existing `ignored_arguments` key,
+the same channel undeclared arguments already use. Symbol mode reads both and
+reports nothing — asserted separately, because "always claim these were ignored"
+would be a new false statement rather than a fix.
+
+### Two edge queries returned rows in whatever order they were written (CON-16)
+
+`get_edge_target_names_batch` and `get_edges_batch` had no `ORDER BY`. Within one
+database file that is stable, which is why no test ever saw it, but it is a
+function of physical write order — so re-indexing the same unchanged source can
+reorder the answer.
+
+That reaches further than the `trace` output the finding named.
+`get_edges_batch` also feeds `categorize_edges` → `build_context_string`, which
+is **the text that gets embedded**. An order-dependent context string means the
+same untouched symbol can embed to a different vector after a rebuild, moving
+semantic-search ranking with no source change behind it.
+
+Both now order by content — target name, relation, metadata — and deliberately
+not by any id: `nodes.id` is a reused rowid, so an id tiebreak would be exactly
+as rebuild-dependent as the row order it replaced. The guard writes the same
+three edges twice in opposite orders and requires identical output; a
+single-order fixture passes on the old code, because a stable sort preserves the
+insertion order it was handed.
+
+The singular siblings (`get_edges_from`, `get_edge_target_names`) were checked
+and left alone: the first has only test callers, the second has none at all.
+
+### One warning in the binary that no `RUST_LOG` could show you (CON-17)
+
+Recording CLI funnel telemetry rotates `recommendations.jsonl`, and that
+rotation has one warning — "not a regular file", the case where something else
+owns that name and the rotation declines. It was raised through `tracing` from a
+call site that ran *before* `init_tracing`, so it went to no subscriber, at any
+verbosity. The telemetry write now happens after the subscriber is installed;
+every subcommand that reaches it installs one. `--quiet` still suppresses it,
+which is the arm that distinguishes this fix from bolting on an unconditional
+`eprintln!`.
+
+### `--json` empty shapes: checked, no change (CON-19)
+
+The finding reported `search` answering a miss with `[]` while `ast-search`
+answers `{"count":0,"results":[]}`. Measured at HEAD, each matches its own
+success shape — `search` succeeds with a bare array, `ast-search` with a
+`{count, results}` envelope — which is what the three-tier contract asks for,
+and normalizing one for cross-command parity is explicitly what that contract
+tells you not to do.
+
+What was missing was a guard on the property rather than on ten literals, and
+this repo has shipped its violation before: `refs` once answered a miss with a
+bare `[]` while succeeding with an object, breaking a consumer's `.references`
+access. Eight commands are now checked hit-against-miss, requiring either the
+same top-level shape or a self-describing object (`error`, `filtered_out`,
+`ignored_count`, …). Restoring that old `refs` behaviour turns it red.
+
 ### `dead-code --ignore` was root-relative while the path next to it was not (CON-11)
 
 One invocation carried two readings of a path. The scan path goes through

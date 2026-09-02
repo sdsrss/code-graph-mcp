@@ -128,15 +128,6 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
 
-    // Funnel visibility: a model-initiated CLI query IS the conversion the deny
-    // hook works toward — record it (best-effort, never creates .code-graph/;
-    // hook-internal answer runs carry CODE_GRAPH_INTERNAL=1 and are skipped).
-    if let Some(cmd) = subcommand.and_then(code_graph_mcp::utils::telemetry::canonical_query_cmd) {
-        if let Ok(root) = code_graph_mcp::cli::resolve_project_root() {
-            code_graph_mcp::cli::record_cli_use(&root, cmd);
-        }
-    }
-
     // CLI subcommands (everything except serve) get a stderr tracing subscriber
     // too, so warn!/error! from the indexer is visible — RUST_LOG overrides the
     // default (feedback_tracing_invisible_in_cli). serve installs its own
@@ -157,6 +148,25 @@ fn main() -> Result<()> {
         Some("serve") | None | Some("--help" | "-h" | "help") | Some("--version" | "-V")
     ) {
         init_tracing(if quiet_flag { "error" } else { "warn" });
+    }
+
+    // Funnel visibility: a model-initiated CLI query IS the conversion the deny
+    // hook works toward — record it (best-effort, never creates .code-graph/;
+    // hook-internal answer runs carry CODE_GRAPH_INTERNAL=1 and are skipped).
+    //
+    // AFTER the subscriber, not before (audit 2026-08-29 CON-17). This path
+    // rotates `recommendations.jsonl`, and the rotation's one warning — "not a
+    // regular file", the case where something else owns that name — was raised
+    // through `tracing` while no subscriber existed yet. It was the only
+    // warning in the binary that could not be made visible by any RUST_LOG
+    // setting. Every subcommand that reaches here installs a subscriber above
+    // (`canonical_query_cmd` names query subcommands only — never `serve`,
+    // `help` or `--version`, the three that deliberately have none), so the
+    // ordering is what fixes it; no second print site is needed.
+    if let Some(cmd) = subcommand.and_then(code_graph_mcp::utils::telemetry::canonical_query_cmd) {
+        if let Ok(root) = code_graph_mcp::cli::resolve_project_root() {
+            code_graph_mcp::cli::record_cli_use(&root, cmd);
+        }
     }
 
     let result = match subcommand {

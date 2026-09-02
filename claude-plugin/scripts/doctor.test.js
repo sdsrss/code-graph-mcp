@@ -437,6 +437,49 @@ test('runRepairs: index-corrupt counts fixed only when the post-rebuild probe is
   assert.equal(rebuilds, 2, 'precondition: the spawn injection is live, not inert');
 });
 
+test('runRepairs: every dev build arm goes through the injectable builder', () => {
+  // ARC-02 (audit 2026-08-29). Three arms build from source in dev mode, and
+  // only `binary-broken` used the injectable `buildBinary`; the other two called
+  // `execSync` inline. That is not cosmetic duplication: `execSync` is
+  // destructured at module load, so a test injecting `buildBinary` did not stub
+  // those arms at all — it stood a real `cargo build --release` up behind an
+  // assertion, in a unit test.
+  //
+  // The arms are addressed by fixId rather than by scanning the source, so a
+  // rename or a reflow cannot quietly narrow what this covers.
+  const { runRepairs } = require('./doctor');
+  const arms = ['binary-stale', 'binary-missing', 'binary-broken'];
+
+  for (const fixId of arms) {
+    const calls = [];
+    const fixed = runRepairs([{ name: 'Binary', status: 'error', fixId }], {
+      devMode: () => true,
+      buildBinary: (cmd) => { calls.push(cmd); return true; },
+      // Reached only by the non-dev legs; present so a regression that takes
+      // one of them fails loudly here instead of shelling out.
+      runAutoUpdate: () => { throw new Error(`${fixId} took the download path in dev mode`); },
+      binaryResolved: () => true,
+      binaryUsable: () => true,
+    });
+    assert.equal(calls.length, 1, `${fixId}: expected exactly one injected build, got ${calls.length}`);
+    assert.match(calls[0], /^cargo build --release/, `${fixId}: built with ${calls[0]}`);
+    assert.equal(fixed, 1, `${fixId}: a successful build counts as fixed`);
+  }
+
+  // A build that throws must not count — the arms report their own failure
+  // rather than inheriting the previous loop's success.
+  for (const fixId of arms) {
+    const fixed = runRepairs([{ name: 'Binary', status: 'error', fixId }], {
+      devMode: () => true,
+      buildBinary: () => { throw new Error('cargo exploded'); },
+      runAutoUpdate: () => { throw new Error('wrong path'); },
+      binaryResolved: () => true,
+      binaryUsable: () => true,
+    });
+    assert.equal(fixed, 0, `${fixId}: a failed build must not be counted as addressed`);
+  }
+});
+
 // ── P1-13: every emitted fixId must have a repair arm ───────────────────────
 //
 // `binary-broken` was emitted from two places and handled by none, so runRepairs

@@ -90,6 +90,60 @@ function sanitizeSearchPath(searchPath) {
 }
 
 /**
+ * The four runners below each spawned the binary and mapped the result by hand
+ * — the same fifteen lines, four times (audit 2026-08-29 ARC-07). Hoisted into
+ * three pieces, with the one genuine difference between them made a PARAMETER
+ * rather than a divergence you have to notice.
+ */
+
+/** Explicit `opts.binary` → `_CG_ANSWER_BINARY` → `findBinary()`; null if none. */
+function resolveAnswerBinary(opts) {
+  let binary = opts.binary;
+  if (binary === undefined) {
+    binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
+  }
+  return binary || null;
+}
+
+/** One spawn, one options block, one `CODE_GRAPH_INTERNAL` stamp. */
+function runCg(binary, args, { cwd, timeoutMs }) {
+  return spawnSync(binary, args, hidden({
+    cwd,
+    timeout: timeoutMs,
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    // Hook-internal run: a delivered answer, not a model-initiated conversion.
+    // The CLI skips its recommendations.jsonl `use` record when this is set.
+    env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
+  }));
+}
+
+/**
+ * The exit-code table: 0 = answered, 1 = the query found nothing, anything else
+ * (plus a spawn error or a signal) = the tool did not run.
+ *
+ * `exitOneIsNoHits` is the whole reason this is a parameter and not a constant.
+ * `grep` and `callgraph` treat exit 1 as an empty result — the v0.50
+ * grep-parity contract. `overview` does NOT: its exit 1 means "no indexed files
+ * under that path", which the read-fanout hint reports as unavailable rather
+ * than as an answered-but-empty query. That difference predates this hoist and
+ * lived in four separate copies; folding it away silently would have changed
+ * one of them.
+ */
+function classifyRun(res, { exitOneIsNoHits }) {
+  if (res.error || res.signal) return 'unavailable';
+  if (res.status === 1) return exitOneIsNoHits ? 'no-hits' : 'unavailable';
+  if (res.status !== 0) return 'unavailable';
+  return 'ok';
+}
+
+/** stdout carrying no answer: empty, or the CLI's own no-match line. */
+function isEmptyAnswer(out) {
+  return !out || out.startsWith(NO_MATCH_PREFIX);
+}
+
+/**
  * Run `code-graph-mcp grep <pattern> [searchPath]` synchronously.
  *
  * @param {object} opts
@@ -121,10 +175,7 @@ function runGrepAnswer(opts = {}) {
     if (!pattern || typeof pattern !== 'string' || pattern.length > MAX_PATTERN_LEN) {
       return { status: 'unavailable' };
     }
-    let binary = opts.binary;
-    if (binary === undefined) {
-      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
-    }
+    const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
 
     // Defensive re-sanitize: callers should pass a clean path, but a glob
@@ -132,30 +183,13 @@ function runGrepAnswer(opts = {}) {
     const scope = sanitizeSearchPath(searchPath);
     const args = ['grep', pattern];
     if (scope) args.push(scope);
-    const res = spawnSync(binary, args, hidden({
-      cwd,
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      // Hook-internal run: a delivered answer, not a model-initiated conversion.
-      // The CLI skips its recommendations.jsonl `use` record when this is set.
-      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    }));
-    if (res.error || res.signal) {
-      return { status: 'unavailable' };
-    }
-    // v0.50 grep-parity exit codes: 0 = matched, 1 = no match, 2 = error.
-    // Older binaries exit 0 on no-match with the NO_MATCH_PREFIX on stderr
-    // (stdout empty) — both shapes resolve to 'no-hits' below.
-    if (res.status === 1) {
-      return { status: 'no-hits' };
-    }
-    if (res.status !== 0) {
-      return { status: 'unavailable' };
-    }
+    const res = runCg(binary, args, { cwd, timeoutMs });
+    // Older binaries exit 0 on no-match with NO_MATCH_PREFIX on stdout — that
+    // shape resolves to 'no-hits' through isEmptyAnswer below.
+    const verdict = classifyRun(res, { exitOneIsNoHits: true });
+    if (verdict !== 'ok') return { status: verdict };
     const out = (res.stdout || '').trim();
-    if (!out || out.startsWith(NO_MATCH_PREFIX)) {
+    if (isEmptyAnswer(out)) {
       return { status: 'no-hits' };
     }
     const { text, truncated } = truncateAtLine(out, maxBytes);
@@ -189,26 +223,19 @@ function runShowAnswer(opts = {}) {
     if (!Array.isArray(symbols) || symbols.length === 0) {
       return { status: 'unavailable' };
     }
-    let binary = opts.binary;
-    if (binary === undefined) {
-      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
-    }
+    const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
 
     const parts = [];
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
-      const res = spawnSync(binary, ['show', sym], hidden({
-        cwd,
-        timeout: timeoutMs,
-        encoding: 'utf8',
-        maxBuffer: 4 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'ignore'],
-        env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-      }));
-      if (res.error || res.signal || res.status !== 0) continue;
+      const res = runCg(binary, ['show', sym], { cwd, timeoutMs });
+      // A symbol that did not resolve is SKIPPED, not fatal — exit 1 included,
+      // which is why this asks for `exitOneIsNoHits: false` and then treats
+      // every non-`ok` verdict the same way.
+      if (classifyRun(res, { exitOneIsNoHits: false }) !== 'ok') continue;
       const out = (res.stdout || '').trim();
-      if (!out || out.startsWith(NO_MATCH_PREFIX)) continue;
+      if (isEmptyAnswer(out)) continue;
       parts.push(`$ code-graph-mcp show ${sym}\n${out}`);
     }
     if (parts.length === 0) return { status: 'no-hits' };
@@ -241,24 +268,25 @@ function runOverviewAnswer(opts = {}) {
     if (!dir || typeof dir !== 'string' || dir.length > 300) {
       return { status: 'unavailable' };
     }
-    let binary = opts.binary;
-    if (binary === undefined) {
-      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
-    }
+    const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
-    const res = spawnSync(binary, ['overview', dir], hidden({
-      cwd,
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    }));
-    if (res.error || res.signal || res.status !== 0) {
-      return { status: 'unavailable' };
+    const res = runCg(binary, ['overview', dir], { cwd, timeoutMs });
+    // Deliberately NOT exitOneIsNoHits: `overview` exits 1 for "no indexed
+    // files under that path", and this hint reports that as unavailable. It is
+    // the one arm that differs, preserved from the pre-hoist code.
+    //
+    // The verdict is RETURNED rather than collapsed to a literal
+    // `'unavailable'`. Collapsing it reads the same on this exit path and is
+    // not: it makes the flag above decorative, so flipping it changes nothing
+    // and no test can see the difference. Measured — the first version of this
+    // hoist had exactly that shape, and the mutation that flips the flag stayed
+    // green against it.
+    const verdict = classifyRun(res, { exitOneIsNoHits: false });
+    if (verdict !== 'ok') {
+      return { status: verdict };
     }
     const out = (res.stdout || '').trim();
-    if (!out || out.startsWith(NO_MATCH_PREFIX)) return { status: 'no-hits' };
+    if (isEmptyAnswer(out)) return { status: 'no-hits' };
     const { text, truncated } = truncateAtLine(out, maxBytes);
     return { status: 'hits', text, truncated };
   } catch {
@@ -295,27 +323,16 @@ function runCallgraphAnswer(opts = {}) {
     if (typeof symbol !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) {
       return { status: 'unavailable' };
     }
-    let binary = opts.binary;
-    if (binary === undefined) {
-      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
-    }
+    const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
 
-    const res = spawnSync(binary, ['callgraph', symbol], hidden({
-      cwd,
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    }));
-    if (res.error || res.signal) return { status: 'unavailable' };
+    const res = runCg(binary, ['callgraph', symbol], { cwd, timeoutMs });
     // grep-parity exit codes: 1 = symbol not found (no graph node).
-    if (res.status === 1) return { status: 'no-hits' };
-    if (res.status !== 0) return { status: 'unavailable' };
+    const verdict = classifyRun(res, { exitOneIsNoHits: true });
+    if (verdict !== 'ok') return { status: verdict };
     const out = (res.stdout || '').trim();
     // Only an edge-bearing tree is marginal over the grep the model already ran.
-    if (!out || out.startsWith(NO_MATCH_PREFIX) ||
+    if (isEmptyAnswer(out) ||
         !(out.includes('← called by') || out.includes('→ calls'))) {
       return { status: 'no-hits' };
     }

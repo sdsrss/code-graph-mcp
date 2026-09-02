@@ -335,3 +335,66 @@ test('runCallgraphAnswer: timeout → unavailable', () => {
   const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'HangForever', binary: stubBinary(), timeoutMs: 300 });
   assert.equal(r.status, 'unavailable');
 });
+
+// ── ARC-07: the exit-code table, now in one place ────────────────────────────
+//
+// The four runners used to spawn and map results by hand, fifteen near-identical
+// lines each. They are one `classifyRun` now, and the whole risk of that hoist
+// is a mapping quietly changing on the way in — so this pins the full matrix,
+// including the arm that is deliberately NOT like the others: `overview` treats
+// exit 1 as unavailable ("no indexed files under that path"), while `grep` and
+// `callgraph` treat it as an answered-but-empty query.
+test('every runner maps spawn outcomes the way it did before the hoist', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-answer-exitmap-'));
+  const script = path.join(dir, 'stub.js');
+  const shim = path.join(dir, 'shim.sh');
+  fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${script}"\n`);
+  fs.chmodSync(shim, 0o755);
+
+  // (stub behaviour) → expected status per runner
+  const MATRIX = [
+    ['exit 0, no output', 'process.exit(0);',
+      { grep: 'no-hits', show: 'no-hits', overview: 'no-hits', callgraph: 'no-hits' }],
+    ['exit 0, NO_MATCH line', `process.stdout.write('[code-graph] No matches for: x\\n'); process.exit(0);`,
+      { grep: 'no-hits', show: 'no-hits', overview: 'no-hits', callgraph: 'no-hits' }],
+    ['exit 1', 'process.exit(1);',
+      // overview is the odd one out, on purpose.
+      { grep: 'no-hits', show: 'no-hits', overview: 'unavailable', callgraph: 'no-hits' }],
+    ['exit 2', `process.stderr.write('boom\\n'); process.exit(2);`,
+      // show SKIPS a failed symbol and ends with nothing to show, which is
+      // no-hits rather than unavailable — also pre-existing.
+      { grep: 'unavailable', show: 'no-hits', overview: 'unavailable', callgraph: 'unavailable' }],
+    ['killed by signal', `process.kill(process.pid, 'SIGKILL');`,
+      { grep: 'unavailable', show: 'no-hits', overview: 'unavailable', callgraph: 'unavailable' }],
+  ];
+
+  let checked = 0;
+  try {
+    for (const [label, body, expected] of MATRIX) {
+      fs.writeFileSync(script, body);
+      const common = { cwd: dir, binary: shim, timeoutMs: 20000 };
+      const got = {
+        grep: runGrepAnswer({ ...common, pattern: 'someSymbol' }).status,
+        show: runShowAnswer({ ...common, symbols: ['someSymbol'] }).status,
+        overview: runOverviewAnswer({ ...common, dir: 'src' }).status,
+        callgraph: runCallgraphAnswer({ ...common, symbol: 'someSymbol' }).status,
+      };
+      assert.deepEqual(got, expected, `${label}: ${JSON.stringify(got)}`);
+      checked += 4;
+    }
+    // Missing binary is its own status on every runner — distinct from a
+    // runtime failure, because the funnel counts them differently.
+    for (const [name, call] of [
+      ['grep', () => runGrepAnswer({ cwd: dir, binary: null, pattern: 'x' })],
+      ['show', () => runShowAnswer({ cwd: dir, binary: null, symbols: ['x'] })],
+      ['overview', () => runOverviewAnswer({ cwd: dir, binary: null, dir: 'src' })],
+      ['callgraph', () => runCallgraphAnswer({ cwd: dir, binary: null, symbol: 'x' })],
+    ]) {
+      assert.equal(call().status, 'no-binary', `${name}: a missing binary is not 'unavailable'`);
+      checked++;
+    }
+    assert.equal(checked, 24, 'vacuity floor: every runner × every outcome');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

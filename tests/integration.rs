@@ -182,6 +182,81 @@ app.get('/api/users', getUsers);
     assert!(!handlers.is_empty(), "should find route handler");
 }
 
+// CON-14 (audit 2026-08-29): `get_call_graph` in route mode hands the whole
+// call to the HTTP tracer, which reads neither `file_path` nor `direction`. The
+// schema declares both, and `file_path`'s description ("Disambiguate same-name
+// functions") makes a promise the route arm does not keep — so narrowing a
+// route trace by file returned the unnarrowed answer, silently. The schema
+// cannot say "not in this mode"; the answer can.
+#[test]
+fn route_mode_discloses_the_arguments_it_does_not_read() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("server.ts"),
+        r#"
+function handleLogin(req: Request, res: Response) {
+    res.json({ ok: true });
+}
+app.post('/api/login', handleLogin);
+"#,
+    )
+    .unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let call = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "route_path": "/api/login",
+            "file_path": "server.ts",
+            "direction": "callers"
+        }),
+    );
+    let resp = server.handle_message(&call).unwrap();
+    let result = parse_tool_result(&resp);
+    let ignored = result["ignored_arguments"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        ignored.contains(&"file_path".to_string()),
+        "route mode must disclose that file_path did nothing; got {result}"
+    );
+    assert!(
+        ignored.contains(&"direction".to_string()),
+        "direction is inert here too — its description says so, but a description \
+         is not the answer the caller reads; got {result}"
+    );
+    // The answer itself is unaffected: disclosure, not refusal.
+    assert!(
+        !result["handlers"].as_array().unwrap().is_empty(),
+        "the trace must still answer; got {result}"
+    );
+
+    // Symbol mode honors both, so neither may be reported there — otherwise the
+    // fix is "always claim these were ignored", which is a new lie.
+    let call = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "handleLogin",
+            "file_path": "server.ts",
+            "direction": "callers"
+        }),
+    );
+    let resp = server.handle_message(&call).unwrap();
+    let result = parse_tool_result(&resp);
+    assert!(
+        result.get("ignored_arguments").is_none(),
+        "symbol mode reads file_path and direction; nothing to disclose. got {result}"
+    );
+}
+
 #[test]
 fn test_e2e_incremental_reindex() {
     let project = TempDir::new().unwrap();
