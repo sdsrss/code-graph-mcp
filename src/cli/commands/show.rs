@@ -123,11 +123,24 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
 
     // If positional arg points at a real file on disk (has a recognized code
     // extension), nudge the user toward `overview` — `show` takes symbol names.
+    //
+    // The probe resolves the argument the same way `--file` above and every
+    // other path in this command do: against the caller's cwd (audit 2026-08-29
+    // CON-12). It used to be `project_root.join(arg)`, which made the hint dead
+    // from every subdirectory — `show auth.ts` from `src/` fell through to
+    // symbol resolution and answered "Symbol not found: auth.ts", for the one
+    // input where the tool knows the right next command. A normalization error
+    // (a `..` escape, a drive letter) is not a file path worth hinting about,
+    // so it falls through to the ordinary symbol path.
     if node_id_arg.is_none() {
         if let Some(arg) = args.symbol.as_deref() {
+            let as_path = normalize_user_path(project_root, arg)
+                .ok()
+                .filter(|rel| !rel.is_empty())
+                .map(|rel| project_root.join(rel));
             if !arg.is_empty()
                 && crate::utils::config::detect_language(arg).is_some()
-                && project_root.join(arg).is_file()
+                && as_path.is_some_and(|p| p.is_file())
             {
                 eprintln!(
                     "[code-graph] `{}` looks like a file path. `show` takes a symbol name (function/struct/const).",

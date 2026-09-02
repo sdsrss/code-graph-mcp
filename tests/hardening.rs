@@ -959,21 +959,31 @@ fn assert_ignore_paths_normalized_in_source() {
     // leg can observe the wiring. The behavioural contract — both spellings
     // exclude the same set once normalized — is pinned separately by
     // `test_dead_code_ignore_prefixes_are_separator_normalized`.
+    //
+    // The CLI half moved from `normalize_rel_str` to `normalize_user_path`
+    // (CON-11: the prefix must resolve against the caller's cwd, like the scan
+    // path, not merely have its separators swapped). `normalize_user_path`
+    // delegates to `normalize_rel_str_on` for the relative branch and
+    // `normalize_rel_path` for the absolute one, so it SUBSUMES the property
+    // this guard was written for. Both spellings are accepted per site rather
+    // than one, because pinning the exact call this guard happens to see today
+    // is what makes it fire on a rename that preserved the property — the class
+    // that disarmed the accessor-spelling guards in v0.129.0.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sites: [(&str, &str, &str); 2] = [
+    let sites: [(&str, &str, &[&str]); 2] = [
         (
             "src/mcp/server/tools/advanced.rs",
             r#"args.get("ignore_paths")"#,
-            "normalize_path_arg",
+            &["normalize_path_arg"],
         ),
         (
             "src/cli/commands/dead_code.rs",
-            "let ignore_prefixes: Vec<String>",
-            "normalize_rel_str",
+            "let resolve_ignore = ",
+            &["normalize_user_path", "normalize_rel_str"],
         ),
     ];
 
-    for (file, anchor_text, expected) in sites {
+    for (file, anchor_text, accepted) in sites {
         let src = std::fs::read_to_string(root.join(file))
             .unwrap_or_else(|e| panic!("{file} moved or unreadable: {e}"));
         let lines: Vec<&str> = src.lines().collect();
@@ -985,11 +995,11 @@ fn assert_ignore_paths_normalized_in_source() {
             });
         let block: String = lines[anchor..(anchor + 14).min(lines.len())].join("\n");
         assert!(
-            block.contains(expected),
+            accepted.iter().any(|e| block.contains(e)),
             "dead-code ignore prefixes reach the index without separator \
              normalization ({file}:{}). They are matched with starts_with against \
              `/`-stored paths, so a backslash-spelled prefix excludes nothing and \
-             the tool OVER-reports dead code.\n{block}",
+             the tool OVER-reports dead code. Expected one of {accepted:?}.\n{block}",
             anchor + 1
         );
     }

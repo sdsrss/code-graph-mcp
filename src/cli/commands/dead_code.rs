@@ -70,11 +70,44 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
     // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
     // Defaults are owned by `domain::default_dead_code_ignores()` (claude-plugin/, benches/).
-    // Separator-normalized like every other path argument: these are matched with
-    // `starts_with` against `/`-stored paths, so a Windows user's
-    // `--ignore src\generated` would exclude nothing and silently over-report.
-    // Not routed through `normalize_user_path` — a PREFIX is not required to name
-    // an existing file, and the escape check would reject legitimate ones.
+    //
+    // User-supplied prefixes resolve against the CALLER'S CWD, exactly like the
+    // scan path above — one invocation must not mix two readings of a path
+    // (audit 2026-08-29 CON-11). Separator normalization alone left
+    // `dead-code . --ignore generated`, run from `src/`, scoping the scan to
+    // `src/` and then excluding nothing, because the index stores
+    // `src/generated/…`: a filter that silently did not run, reported as a full
+    // clean report at exit 0. The old comment here reasoned that a PREFIX need
+    // not name an existing file — true, and `normalize_user_path` does not
+    // require one either (it only touches the filesystem for the near-miss
+    // rebase, where a missing cwd-relative target is precisely what makes the
+    // root reading win). Its escape check rejects a `..` prefix, which is not a
+    // legitimate one: no indexed path can start above the root.
+    //
+    // The DEFAULTS stay root-relative and unresolved. They are the tool's own
+    // list, not user input, so `claude-plugin/` must keep meaning the tree at
+    // the root even when the caller stands in `src/`.
+    //
+    // A trailing separator is preserved across the resolution: `--ignore tmp/`
+    // must not silently widen into a prefix that also matches `tmpfiles/`.
+    let resolve_ignore = |raw: &str| -> Result<String> {
+        let trailing = raw.ends_with('/') || raw.ends_with('\\');
+        let resolved = normalize_user_path(project_root, raw)?;
+        // "" is what `.` (and an empty value) normalize to, and every path
+        // `starts_with("")` — the whole report would vanish behind an exit-0
+        // "No dead code found". Same false-clean this command already refuses
+        // for a misspelled --type: say what happened instead.
+        if resolved.is_empty() {
+            anyhow::bail!(
+                "--ignore '{raw}' resolves to the project root \u{2014} it would exclude every file. Pass a prefix inside the project (e.g. --ignore src/generated)."
+            );
+        }
+        Ok(if trailing && !resolved.ends_with('/') {
+            format!("{resolved}/")
+        } else {
+            resolved
+        })
+    };
     let ignore_prefixes: Vec<String> = if no_ignore {
         Vec::new()
     } else if ignore.is_empty() {
@@ -82,8 +115,8 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     } else {
         ignore
             .iter()
-            .map(|p| crate::indexer::merkle::normalize_rel_str(p))
-            .collect()
+            .map(|p| resolve_ignore(p))
+            .collect::<Result<Vec<String>>>()?
     };
 
     let ctx = CliContext::open(project_root)?;

@@ -1,5 +1,92 @@
 # Changelog
 
+## Unreleased
+
+### Four MCP tools published a schema that required nothing, and rejected calls that gave nothing (CON-13)
+
+`find_references` declares seven optional properties and no `required` array,
+while `refs.rs:35` rejects any call carrying neither `symbol_name` nor
+`node_id`. The client builds the model's picture of a tool from that schema, so
+the model was being told every argument is optional by the same surface that
+then answered with an error it had no way to anticipate.
+
+The audit named one tool and reported that "the six siblings all declare
+`required`". Both halves were off, and checking is what found it:
+
+- **Five** declare it, not six. `get_call_graph` had the identical omission
+  (`symbol_name` or `route_path`, `callgraph.rs:95`).
+- Two more — `get_ast_node` and `ast_search` — declare `"required": []`, which
+  the finding would count as compliant. In JSON Schema an empty `required` is
+  indistinguishable from no `required` at all, so those two were making exactly
+  the same silent promise. That also rules out the obvious fix: adding
+  `"required": []` to the two tools missing it would have changed nothing while
+  looking like a repair.
+
+All four now publish the disjunction their handler enforces:
+
+```json
+"anyOf": [{ "required": ["symbol_name"] }, { "required": ["node_id"] }]
+```
+
+Property descriptions are untouched — the model's routing text is byte-identical
+to 0.129.0, so this does not need a routing-bench baseline (which is dark until
+`OPENROUTER_API_KEY` returns).
+
+Two guards, because either alone is satisfiable by a lie. One reads the registry
+and fails if a listed tool appears in neither the disjunctive table nor the
+"`{}` is a valid call" table — a new tool has to declare which it is. The other
+reads the bytes `tools/list` actually returns, and separately asserts each
+handler still rejects a call that omits every arm: a schema promising a
+requirement nothing enforces is the same defect pointing the other way. Both go
+red under a dropped `anyOf`, a changed arm, a deleted handler check, and an
+emptied table.
+
+### `dead-code --ignore` was root-relative while the path next to it was not (CON-11)
+
+One invocation carried two readings of a path. The scan path goes through
+`normalize_user_path` — relative arguments resolve against your shell's cwd, the
+way `grep` and `ls` do — while `--ignore` was only separator-normalized. So from
+`src/`:
+
+```
+code-graph-mcp dead-code . --ignore generated
+```
+
+scoped the scan to `src/` and then excluded **nothing**, because the index
+stores `src/generated/…` and the prefix stayed `generated`. Exit 0, full report,
+no disclosure — a filter that silently did not run. An absolute prefix
+(`--ignore /home/me/repo/src/generated`, the spelling an editor pastes) failed
+the same way, for the same reason: prefixes are matched against project-relative
+keys.
+
+`--ignore` now resolves like the path it sits next to. Three details worth
+naming, because each is a way the fix could have been worse than the defect:
+
+- **The defaults stay root-relative.** `claude-plugin/` and `benches/` are the
+  tool's own list, not user input; resolving them against the cwd would make
+  them mean `src/claude-plugin/` for anyone standing in `src/`.
+- **A trailing separator survives.** `--ignore tmp/` must not widen into a
+  prefix that also matches `tmpfiles/`.
+- **`--ignore .` now errors instead of reporting clean.** It normalizes to the
+  empty string, and every path starts with that — the whole report would vanish
+  behind an exit-0 "No dead code found", which is the false clean this command
+  already refuses for a misspelled `--type`.
+
+The MCP twin (`find_dead_code`'s `ignore_paths`) is unaffected: its arguments
+are root-relative by contract, and its empty report already discloses
+`ignored_count` and `ignore_paths_applied`.
+
+### `show`'s "that's a file, not a symbol" hint was dead from every subdirectory (CON-12)
+
+`show` nudges you toward `overview` when the positional argument names a file.
+The probe was `project_root.join(arg).is_file()` while everything else in the
+command resolves against the cwd, so from `src/`, `show auth.ts` fell through to
+symbol resolution and answered `Symbol not found: auth.ts` — for the one input
+where the tool knows exactly which command you wanted. The probe now resolves
+the argument the same way the rest of the command does. A path that fails
+normalization (a `..` escape, a drive letter) is not a file worth hinting about
+and still takes the ordinary symbol path.
+
 ## 0.129.0
 
 **Upgrading:** two defaults change in ways you can feel.

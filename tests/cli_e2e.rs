@@ -4651,6 +4651,53 @@ fn test_cli_show() {
     assert!(stdout.contains("token"), "should show code content");
 }
 
+// CON-12 (audit 2026-08-29): `show` nudges you toward `overview` when the
+// positional argument names a file rather than a symbol — but the probe was
+// `project_root.join(arg).is_file()` while every other path in this command
+// resolves the argument against the cwd. From any subdirectory the probe was
+// therefore dead, and `show auth.ts` fell through to symbol resolution and
+// answered "Symbol not found: auth.ts" — the one input for which the tool knows
+// the right next command.
+#[test]
+fn test_cli_show_file_path_hint_fires_from_a_subdirectory() {
+    let project = setup_indexed_project();
+
+    // Control: the root-relative spelling from the root. This arm passed before
+    // the fix too — it is here so a regression that kills the hint entirely
+    // cannot be mistaken for the subdirectory fix.
+    let (_, root_err, root_code) = run_cli(&project, &["show", "src/auth.ts"]);
+    assert_ne!(
+        root_code, 0,
+        "a file path is not a symbol; stderr={root_err:?}"
+    );
+    assert!(
+        root_err.contains("looks like a file path"),
+        "root-relative file path must hint at `overview`; got {root_err:?}"
+    );
+
+    // The same file, named the way the shell names it from `src/`.
+    let (_, sub_err, sub_code) = run_cli_from(&project, "src", &["show", "auth.ts"]);
+    assert_ne!(sub_code, 0);
+    assert!(
+        sub_err.contains("looks like a file path"),
+        "CON-12: the hint must resolve the argument against the cwd; got {sub_err:?}"
+    );
+    assert!(
+        !sub_err.contains("Symbol not found"),
+        "the file-path hint must replace the symbol miss, not follow it; got {sub_err:?}"
+    );
+
+    // A real symbol from that same cwd must NOT trip the hint — the fix widens
+    // where the probe looks, and this is the arm that would catch it widening
+    // onto ordinary symbol names.
+    let (stdout, _, code) = run_cli_from(&project, "src", &["show", "validateToken"]);
+    assert_eq!(
+        code, 0,
+        "a symbol name must still resolve from a subdirectory"
+    );
+    assert!(stdout.contains("validateToken"));
+}
+
 #[test]
 fn test_cli_show_nonexistent() {
     let project = setup_indexed_project();
@@ -5215,6 +5262,142 @@ fn test_cli_dead_code_ignore_before_path_equals_after() {
         before.trim(),
         after.trim(),
         "--ignore before vs after the path must yield identical results"
+    );
+}
+
+/// A project whose dead code lives in two places: `src/keep.ts` (must stay
+/// reported) and `src/generated/gen.ts` (the tree an `--ignore` prefix aims at).
+/// Both symbols are long enough to clear the default `--min-lines 3`.
+fn setup_ignore_scoped_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(src.join("generated")).unwrap();
+
+    std::fs::write(
+        src.join("keep.ts"),
+        r#"
+export function keepMeDead(a: number): number {
+    const b = a + 1;
+    const c = b + 1;
+    return c;
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("generated/gen.ts"),
+        r#"
+export function generatedDead(a: number): number {
+    const b = a + 2;
+    const c = b + 2;
+    return c;
+}
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+// CON-11 (audit 2026-08-29): one invocation mixed two path readings. The scan
+// path went through `normalize_user_path` (cwd-relative, like grep/ls), while
+// `--ignore` was only separator-normalized — so from `src/`,
+// `dead-code . --ignore generated` scoped the scan to `src/` and then excluded
+// NOTHING, because the index stores `src/generated/gen.ts`. Exit 0, full report,
+// no disclosure: the shape of a filter that silently did not run.
+#[test]
+fn test_cli_dead_code_ignore_prefix_resolves_against_cwd_like_the_path_arg() {
+    let project = setup_ignore_scoped_project();
+
+    // Non-vacuity, from the same cwd as the failing case: without --ignore the
+    // generated symbol IS reported, so a later "not present" assertion cannot
+    // pass because the fixture never had it.
+    let (unfiltered, _, unfiltered_code) =
+        run_cli_from(&project, "src", &["dead-code", ".", "--json"]);
+    assert_eq!(unfiltered_code, 0, "baseline scan should succeed");
+    assert!(
+        unfiltered.contains("generatedDead") && unfiltered.contains("keepMeDead"),
+        "fixture must report both dead symbols before filtering; got {unfiltered:?}"
+    );
+
+    // Root-relative spelling from the root — the reading that always worked.
+    let (from_root, _, root_code) = run_cli(
+        &project,
+        &["dead-code", "src", "--ignore", "src/generated", "--json"],
+    );
+    assert_eq!(root_code, 0);
+    assert!(
+        from_root.contains("keepMeDead") && !from_root.contains("generatedDead"),
+        "root-relative --ignore must exclude the generated tree; got {from_root:?}"
+    );
+
+    // The same intent spelled from `src/`, where the shell puts the user.
+    let (from_subdir, _, subdir_code) = run_cli_from(
+        &project,
+        "src",
+        &["dead-code", ".", "--ignore", "generated", "--json"],
+    );
+    assert_eq!(subdir_code, 0);
+    assert!(
+        from_subdir.contains("keepMeDead"),
+        "the unignored symbol must survive (an over-broad prefix is the other failure); got {from_subdir:?}"
+    );
+    assert!(
+        !from_subdir.contains("generatedDead"),
+        "CON-11: --ignore must resolve against cwd like the scan path does; got {from_subdir:?}"
+    );
+}
+
+// CON-11, second spelling — its own test rather than a tail assertion in the
+// one above, because an assertion that only ever runs after another has already
+// failed is an assertion nothing has proven red. An absolute prefix under the
+// root is the same silent no-op: the index holds project-relative paths, so
+// `/tmp/…/src/generated` could never prefix-match one.
+#[test]
+fn test_cli_dead_code_absolute_ignore_prefix_excludes_the_same_tree() {
+    let project = setup_ignore_scoped_project();
+    let abs = project.path().join("src/generated");
+    let (from_abs, _, abs_code) = run_cli(
+        &project,
+        &[
+            "dead-code",
+            "src",
+            "--ignore",
+            abs.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(abs_code, 0);
+    assert!(
+        from_abs.contains("keepMeDead"),
+        "non-vacuity: the unignored symbol must still be reported; got {from_abs:?}"
+    );
+    assert!(
+        !from_abs.contains("generatedDead"),
+        "an absolute --ignore under the root must exclude the same tree; got {from_abs:?}"
+    );
+}
+
+// CON-11 tail: with the prefix now cwd-resolved, `--ignore .` from the project
+// root normalizes to the empty string, and `starts_with("")` is true for every
+// path — the whole report would vanish under an exit-0 "No dead code found".
+// That is the false-clean this command already rejects for `--type`; say so.
+#[test]
+fn test_cli_dead_code_whole_project_ignore_errors_instead_of_reporting_clean() {
+    let project = setup_ignore_scoped_project();
+    let (stdout, stderr, code) =
+        run_cli(&project, &["dead-code", "src", "--ignore", ".", "--json"]);
+    assert_ne!(
+        code, 0,
+        "a prefix that excludes the entire project must error, not print a clean report; stdout={stdout:?}"
+    );
+    assert!(
+        stderr.contains("--ignore"),
+        "the error must name the flag that emptied the scan; got {stderr:?}"
     );
 }
 

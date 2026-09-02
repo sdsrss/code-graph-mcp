@@ -226,6 +226,90 @@ fn test_e2e_incremental_reindex() {
     );
 }
 
+/// The disjunction each handler enforces must survive to the WIRE, and the
+/// handler must still enforce it (audit 2026-08-29 CON-13).
+///
+/// Two halves, because either alone is satisfiable by a lie. `handle_tools_list`
+/// currently passes `input_schema` through whole (`server/mod.rs:1858`), so the
+/// registry-level guard in `mcp::tools` would keep passing if someone rebuilt
+/// the response from `type` / `properties` / `required` — the exact shape that
+/// drops an unrecognized keyword silently. And a schema that declares a
+/// requirement no handler enforces is the same defect pointing the other way.
+#[test]
+fn tools_list_publishes_the_disjunction_each_handler_enforces() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("app.ts"),
+        "function greet(name: string): string { return name; }\n",
+    )
+    .unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let resp = server.handle_message(msg).unwrap().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let tools = parsed["result"]["tools"].as_array().unwrap();
+
+    // (tool, arms) — mirrors `every_disjunctive_tool_publishes_its_disjunction`
+    // on purpose: that one reads the registry struct, this one reads the bytes
+    // a client receives.
+    let expected: [(&str, &[&str]); 4] = [
+        ("get_call_graph", &["symbol_name", "route_path"]),
+        ("get_ast_node", &["symbol_name", "node_id"]),
+        ("ast_search", &["query", "type", "returns", "params"]),
+        ("find_references", &["symbol_name", "node_id"]),
+    ];
+
+    let mut checked = 0usize;
+    for (name, arms) in expected {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tools/list no longer advertises '{name}'"));
+        let published: Vec<&str> = tool["inputSchema"]["anyOf"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{name}' reaches the client with no `anyOf` — the schema tells the \
+                     model every argument is optional while the handler rejects a call \
+                     that omits all of {arms:?}. Response was: {tool}"
+                )
+            })
+            .iter()
+            .map(|arm| arm["required"][0].as_str().unwrap())
+            .collect();
+        let mut got = published.clone();
+        got.sort_unstable();
+        let mut want = arms.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "'{name}': wire disjunction differs from the handler's"
+        );
+
+        // The other half: the handler must actually reject the call the schema
+        // now forbids. Without this, deleting the check in the handler would
+        // leave the schema making a promise nothing keeps.
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{name}","arguments":{{"compact":true}}}}}}"#
+        );
+        let resp = server.handle_message(&call).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+            + parsed["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            arms.iter().any(|a| text.contains(a)),
+            "'{name}' accepted a call with none of {arms:?}, or failed without naming \
+             them: {parsed}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "every row must have been exercised");
+}
+
 #[test]
 fn test_e2e_full_protocol_lifecycle() {
     let project = TempDir::new().unwrap();
