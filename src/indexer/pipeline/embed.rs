@@ -157,3 +157,95 @@ pub fn embed_and_store_batch(
     );
     Ok(embedded_ids)
 }
+
+// Minimal regression coverage for the one embed chokepoint. Both tests build
+// the stub `EmbeddingModel` (the `not(feature = "embed-model")` unit struct),
+// so they run on the FTS5-only CI leg where this file otherwise had 0/70
+// covered lines (audit baseline 2026-09-02). The stub's `embed*` always fails,
+// which is exactly the sequential-fallback path: a cache HIT must still be
+// copied into `node_vectors` and reported, a MISS must be reported as NOT
+// embedded (so the backfill can advance past it) without failing the call.
+#[cfg(all(test, not(feature = "embed-model")))]
+mod tests {
+    use super::*;
+    use crate::storage::queries::{
+        cache_key, cache_put_embeddings, get_node_embedding, insert_node, upsert_file, FileRecord,
+        NodeRecord,
+    };
+
+    fn vec_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open_with_vec(&tmp.path().join("index.db")).unwrap();
+        assert!(
+            db.vec_enabled(),
+            "test needs the vec0 + embedding_cache tables"
+        );
+        (db, tmp)
+    }
+
+    fn add_node(db: &Database, path: &str, ctx: &str) -> i64 {
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: path.into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some(ctx.into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_input_is_a_noop() {
+        let (db, _tmp) = vec_db();
+        let got = embed_and_store_batch(&db, &EmbeddingModel, &[]).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn cache_hit_is_copied_and_model_miss_is_reported_as_not_embedded() {
+        let (db, _tmp) = vec_db();
+        let hit = add_node(&db, "src/a.rs", "ctx-cached");
+        let miss = add_node(&db, "src/b.rs", "ctx-fresh");
+        let seeded = vec![0.25f32; crate::domain::EMBEDDING_DIM];
+        cache_put_embeddings(db.conn(), &[(cache_key("ctx-cached"), seeded.clone())]).unwrap();
+
+        let got = embed_and_store_batch(
+            &db,
+            &EmbeddingModel,
+            &[(hit, "ctx-cached".into()), (miss, "ctx-fresh".into())],
+        )
+        .unwrap();
+
+        // Only the cache hit got a vector; the stub model cannot embed the miss,
+        // and that must surface as "not in the returned ids", not as an Err.
+        assert_eq!(got, vec![hit]);
+        let bytes = get_node_embedding(db.conn(), hit).unwrap();
+        assert_eq!(bytes.len(), crate::domain::EMBEDDING_DIM * 4);
+        assert!(
+            get_node_embedding(db.conn(), miss).is_err(),
+            "miss must not receive a vector from a failing model"
+        );
+    }
+}
