@@ -42,7 +42,12 @@ VERSION_FILES=(
 staged_files=$(git diff --cached --name-only)
 version_staged=false
 for vf in "${VERSION_FILES[@]}"; do
-  if echo "$staged_files" | grep -qF "$vf"; then
+  # `grep -F` without `-q`, output discarded: `-q` exits on the first match, and
+  # once "$staged_files" outgrows the pipe buffer `echo` takes SIGPIPE, which
+  # `set -o pipefail` turns into a failed pipeline — inverting the test exactly
+  # when it matched. Measured: correct at a few KB, wrong at 4.8 MB (~100k staged
+  # paths). Same shape as the two probes in §3/§4 below.
+  if echo "$staged_files" | grep -F "$vf" >/dev/null; then
     version_staged=true
     break
   fi
@@ -158,6 +163,61 @@ if [ "$rs_staged" -gt 0 ] || [ "$cargo_staged" -gt 0 ]; then
     exit 1
   fi
   echo "✓ cargo clippy passed"
+
+  # The embed-model leg. Everything above runs with `default = []`, so anything
+  # inside `#[cfg(feature = "embed-model")]` is not even COMPILED here — while
+  # ci.yml and the release gate build both legs. A warning or type error in that
+  # code is therefore locally green and remotely red, which for a solo dev
+  # pushing straight to main means "main is red" (v0.128.0 instance; audit
+  # 2026-09-02 P2-7).
+  #
+  # Conditional, not unconditional: candle is a multi-minute first build, and
+  # paying it on every Rust commit would be the kind of gate people disable. The
+  # trigger set is where cfg-gated code actually lives plus the dependency files
+  # that can break it — and, as a catch-all, any staged diff that introduces or
+  # touches a `cfg(feature` line anywhere.
+  embed_touched=false
+  if echo "$staged_files" | grep -E '^(src/embedding/|Cargo\.(toml|lock))' >/dev/null; then
+    embed_touched=true
+  else
+    # Captured, then matched in-shell — the strictest form of the same fix the
+    # `grep` probes above use. `git diff | grep -q` is a pipefail trap that only
+    # bites at scale: grep -q exits on the FIRST match, and once the diff outgrows
+    # the pipe buffer git is still writing, takes SIGPIPE, and `set -o pipefail`
+    # reports the whole pipeline as failed — flipping this flag OFF exactly when
+    # it fired. Measured: correct at a few KB, wrong 3/3 at 2.7 MB. A gate that
+    # silently stops gating on big commits is worse than no gate.
+    staged_diff=$("${git_clean[@]}" git diff --cached -U0 || true)
+    if [[ $staged_diff == *"cfg(feature"* ]]; then
+      embed_touched=true
+    fi
+  fi
+  if $embed_touched; then
+    echo "Running cargo clippy --features embed-model..."
+    if ! "${git_clean[@]}" cargo clippy --features embed-model --all-targets --quiet -- -D warnings 2>&1; then
+      echo "❌ cargo clippy (embed-model leg) failed"
+      exit 1
+    fi
+    echo "✓ cargo clippy (embed-model leg) passed"
+  fi
+fi
+
+# ── 4. Rust guards over NON-Rust files ───────────────────────
+# `tests/hardening.rs` and `tests/doc_cli_alignment.rs` read README.md,
+# CHANGELOG.md, .github/workflows/*, this very hook, the plugin templates/skills/
+# agents and sync-versions.js. Section 3 only fires on staged `.rs`/`Cargo.*`, so
+# a yml-only or README-only commit ran NONE of them locally — the guards that
+# exist precisely to catch edits to those files were the ones that did not run
+# (audit 2026-09-02 P2-8). Skipped when section 3 already ran: its `cargo test`
+# is a superset.
+if [ "$rs_staged" -eq 0 ] && [ "$cargo_staged" -eq 0 ] && \
+   echo "$staged_files" | grep -E '^(\.github/|README\.md|CHANGELOG\.md|scripts/pre-commit\.sh|scripts/sync-versions\.js|claude-plugin/(templates|skills|agents)/|\.claude-plugin/)' >/dev/null; then
+  echo "Running Rust guards over non-Rust files..."
+  if ! "${git_clean[@]}" cargo test --quiet --test hardening --test doc_cli_alignment 2>&1; then
+    echo "❌ hardening / doc_cli_alignment guards failed"
+    exit 1
+  fi
+  echo "✓ Rust guards passed"
 fi
 
 echo "Pre-commit checks passed."
