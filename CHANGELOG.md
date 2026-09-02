@@ -1,5 +1,152 @@
 # Changelog
 
+## 0.131.0
+
+**Upgrading:** one security fix you want, and one MCP argument that used to be
+answered wrong and is now refused.
+
+1. **Update if you clone repositories you did not write.** The PreToolUse hooks
+   write adoption metrics to `.code-graph/recommendations.jsonl`, and
+   `.code-graph/` is ordinary repo content — so a clone could carry a symlink
+   where that file belongs, and the hook followed it. Cloning such a repo and
+   reading one source file truncated a 1,200,020-byte file outside the tree to
+   67 bytes. Nothing in the session said so. Fixed below; no action needed
+   beyond upgrading.
+2. **MCP boolean arguments sent as a string or a number are now an error.**
+   `{"compact": "true"}` used to return the full uncompacted envelope and
+   `{"include_tests": 1}` used to drop every test, both silently — the answer
+   to a question you did not ask. All 22 boolean arguments now reject anything
+   that is not `true` or `false`, naming the argument. If you have a script
+   spelling a boolean as `"true"`, it will start failing loudly instead of
+   quietly doing the opposite.
+
+To defer (2), pin `0.130.0`. The security fix in (1) is in this release only.
+
+### The metrics hook followed a symlink out of your project
+
+`recommendation-log.js` runs inside `pre-read-guide` and its siblings, so it
+executes on ordinary Read/Edit/Grep calls, and it ships to every user through
+npm and the marketplace. It appended with `appendFileSync` and rotated with
+`writeFileSync`. Both follow symlinks, and a symlink is a thing a repository can
+contain: `git clone` reproduces it, and the first tool call after that writes
+through it. The rotator is the destructive half — it truncates.
+
+The fix is three layers. `O_NOFOLLOW` on the open (atomic, Unix). An `lstat`
+check on the path, which is the only layer on Windows, where `O_NOFOLLOW` is
+undefined. And an `fstat` on the descriptor actually opened — the only check
+that describes the object the write lands on, which is also what refuses a
+**hardlink**: `lstat` reports a hardlinked victim as a plain regular file and
+`O_NOFOLLOW` has nothing to say about one, so the symlink guard alone left the
+identical damage reachable, 1,200,020 → 67 bytes, measured. `git` cannot deliver
+a hardlink (its index has no such mode), but `tar x` can. The rotator no longer
+passes `O_TRUNC`, because truncation on the open would happen before any of
+this could look; it truncates through the vouched-for descriptor instead.
+
+The `.code-graph` directory is checked too, because a symlinked directory
+holding perfectly ordinary files defeats a per-file guard — the write then lands
+on a real regular file that simply is not where the hook thinks it is.
+
+Each layer is pinned by its own test, including one that loads the module with
+`O_NOFOLLOW` forced to 0 to exercise the Windows shape on Linux. That test
+exists because the first cut pinned only the *pair*: deleting either half kept
+the suite green, which on Windows would have left no protection at all.
+
+### The boolean half of CON-15, and the 22nd site the schema could not show
+
+0.129.0 gave the numeric MCP arguments an error a model can read instead of a
+silent default, and left the booleans alone. `as_bool().unwrap_or(false)` cannot
+tell "not sent" from "sent as the wrong type", and because the key *is* declared
+on the schema, the `ignored_arguments` disclosure said nothing either. So a
+wrong-typed flag was invisible from both directions at once.
+
+`"true"` and `1` are not coerced. A coercion would have to guess, and the
+numeric half already settled that an error a model can read beats a silent
+answer to a question it did not ask.
+
+These rejections are also bucketed as caller misuse in `usage.jsonl`. They were
+not at first: `ErrKind::classify` had the numeric phrases and not this one, so
+all 22 boolean rejections landed in the catch-all bucket — the misuse a model is
+most likely to make was the one made invisible to the analysis that exists to
+find it. The parity table now asserts the classification, not only the message.
+
+The parity table that pins this has one row per (tool, flag), and enumerating
+the axis is what found the 22nd site: `skip_indexing` is declared on **no**
+schema — it is an honored-but-undeclared argument — so a walk over the tool
+definitions never reaches it, while eleven tools read it through one shared
+helper. Reading `"true"` as `false` there sent the server off to index at
+exactly the moment the caller had asked it not to. Two of those eleven tools,
+`find_similar_code` and `ast_search`, had never appeared in the table at all.
+
+### One transaction shape for wipe-and-rebuild, not two
+
+`rebuild_index` wrapped its `DELETE FROM files` and the rebuild in one
+transaction, with a comment naming the alternative as the bug it had fixed. The
+FK-constraint recovery arm — same operation, different caller — still ran that
+alternative: delete, commit, then rebuild in place. For any reader on a fresh
+connection (a CLI `grep`, a secondary instance) the index was empty for the
+whole multi-second rebuild, and stayed empty for good if the rebuild then
+failed. Both callers now go through one function.
+
+The test observes from the only place the property is visible: an independent
+read-only connection sampled on every progress event, which fires from inside
+the open transaction. It needs 60 files and a rebuild that *shrinks* the index —
+with three files the whole rebuild lands in one batch, every sample equals the
+final count, and the assertion is vacuous. That is how its first draft passed
+against the broken shape.
+
+And that test covered the shared helper, not the caller that had the defect: the
+recovery arm still had no end-to-end coverage, while the test named after it
+re-implemented the recovery inline — keeping a verbatim copy of the removed bug
+as its own fixture. Reverting the production call therefore left the whole suite
+green. The arm is now driven for real through a one-shot test seam, and
+reverting it goes red.
+
+### A file that stops being UTF-8 no longer re-diffs forever
+
+A source file `read_to_string` rejects — a Latin-1 file, the common shape in
+legacy C/C++/Java trees — recorded no `files` row at all. The parse-failure
+branch four lines below already recorded one for exactly this reason. Two
+consequences: the file was listed as changed on every single run, and symbols
+indexed while it was still UTF-8 outlived the change that made it unreadable, so
+queries kept answering with them. Both are fixed, and no reindex is needed —
+because the broken state re-diffed the file every run, the first run after
+upgrading corrects it on its own.
+
+The first cut of that fix traded the bug for a rarer, worse one, and pre-tag
+review caught it. It decided "unreadable" with `read_to_string` and then took
+the hash from `hash_file`, which is an independent second open — so a
+*transient* first-read failure (a descriptor exhausted under the parallel scan,
+an EIO blip, a concurrent writer caught mid-multibyte) would fail read one,
+succeed read two, and record a row whose hash matches the disk *after* the
+file's symbols had been purged. The next scan would then see nothing to do, and
+the symbols would be gone for good. Both facts now come from one read, so they
+cannot describe different bytes, and a file that cannot be read at all records
+nothing and simply gets retried.
+
+### Developer-facing: one pre-commit gate that inverted, and two that were missing
+
+Not user-visible; recorded because the reason generalizes. `set -o pipefail`
+plus `grep -q` inverts at scale: `-q` exits on the first match, the writer
+upstream takes SIGPIPE once its output outgrows the pipe buffer, and pipefail
+reports the whole pipeline as failed — exactly when it matched. Onset is around
+1,000 staged paths (44 KB), not the millions it looks like; and if the match
+happens to be on the last line, `grep -q` reads to EOF and stays correct at any
+size, which is what makes the bug look unreproducible.
+
+The two missing gates: everything the hook ran used `default = []`, so
+`#[cfg(feature = "embed-model")]` code was never compiled locally while CI
+builds both legs; and the Rust guards that read the workflows, the plugin
+templates and both script trees only ran when a `.rs` file was staged, so the
+commits they exist to police were the ones that skipped them.
+
+Both were then found under-scoped by the pre-tag review, against this batch's
+own commits: the embed trigger missed the 17 gated files outside
+`src/embedding/` (an edit inside a `cfg` block puts no attribute line in a `-U0`
+diff), and the non-Rust trigger did not cover `claude-plugin/scripts/`, so the
+security commit above would not have run it. Both widened, and the "candle is a
+multi-minute build" premise that argued for the narrow trigger was measured:
+7.6s warm for the whole embed clippy leg.
+
 ## 0.130.0
 
 **Upgrading:** one command changes behaviour in a way you can feel, and one
