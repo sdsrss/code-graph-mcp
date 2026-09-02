@@ -530,12 +530,17 @@ automatically as the `_previous` provider and restored on uninstall.
 A third-party plugin registers itself through the shipped CLI:
 
 ```bash
+# Resolve the script through the installed package. NOT $CLAUDE_PLUGIN_ROOT:
+# Claude Code sets that per-plugin, so inside YOUR hook it points at YOUR
+# plugin's root, and in a plain shell it is unset.
+CG="$(npm root -g)/@sdsrs/code-graph/claude-plugin/scripts/statusline-chain.js"
+
 # <id> is a stable name (your plugin's, not a version); <command> is a shell
 # command that prints ONE line. Add --stdin if it expects Claude Code's status
 # JSON on stdin.
-node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" register gsd "node /path/to/gsd-status.js" --stdin
-node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" list
-node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" unregister gsd
+node "$CG" register gsd "node /path/to/gsd-status.js" --stdin
+node "$CG" list
+node "$CG" unregister gsd
 ```
 
 | Detail | Value |
@@ -543,7 +548,7 @@ node "$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js" unregister gsd
 | Registry (working copy) | `~/.cache/code-graph/statusline-registry.json` |
 | Durable mirror | `~/.claude/statusline-providers.json` — survives a cache wipe |
 | Reserved ids | `code-graph`, `_previous` |
-| Exit codes | `0` registered / unregistered / already in that state · `1` usage · `2` reserved id, or a registry file that exists and cannot be read |
+| Exit codes | `0` registered / unregistered / listed / already in that state · `1` usage · `2` reserved id, or a registry file that exists and cannot be read |
 
 Exit 2 on an unreadable registry is deliberate: the mutation refuses rather than
 rebuilding, because that file holds the user's previous statusline and other

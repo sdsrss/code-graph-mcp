@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 'use strict';
+// FIRST statement, before this file's other requires (pre-tag review
+// 2026-09-02): the handler installed after them could not catch a throw
+// from `require('./lifecycle')` itself, which is exactly the broken-install
+// case JS-12 exists for. Guarded on `require.main` so importing this module
+// in a test does NOT install a process-wide handler that exits 0 — that
+// would swallow the test's own failures.
+if (require.main === module) require('./hook-fail-open').installHookFailOpen('PreToolUse:Bash');
+
 // PreToolUse(Bash) hook: detect raw `grep`/`rg`/`ag` on the indexed source tree
 // and either BLOCK with suggestion (v0.32+) or HINT (legacy path). Closes the
 // "Bash comfort zone" leak — pre-training bias has Claude reach for `grep -rn`
@@ -38,7 +46,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
@@ -526,7 +533,7 @@ function splitTopLevelSegments(cmd) {
 // One implementation of the cooldown quartet, in tmp-dir.js (ARC-02/ARC-06);
 // the `bash` prefix is what keeps this hook's flags distinct from
 // post-grep-inject's.
-const { commandHash, flagPath, isOnCooldown, markCooldown } = makeCooldown('bash');
+const { commandHash, isOnCooldown, markCooldown } = makeCooldown('bash');
 
 function buildHint() {
   // Terse, no banner spam. Single message budget ~600 bytes.
@@ -828,7 +835,6 @@ function runMain() {
 }
 
 if (require.main === module) {
-  require('./hook-fail-open').installHookFailOpen('PreToolUse:Bash');
   runMain();
 }
 

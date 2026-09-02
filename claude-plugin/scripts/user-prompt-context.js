@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 'use strict';
+// FIRST statement, before this file's other requires (pre-tag review
+// 2026-09-02): the handler installed after them could not catch a throw
+// from `require('./lifecycle')` itself, which is exactly the broken-install
+// case JS-12 exists for. Guarded on `require.main` so importing this module
+// in a test does NOT install a process-wide handler that exits 0 — that
+// would swallow the test's own failures.
+if (require.main === module) require('./hook-fail-open').installHookFailOpen('UserPromptSubmit');
+
 // UserPromptSubmit hook: inject relevant code-graph RESULTS based on user's intent.
 // Strategy: PUSH structural context (not suggestions) that Grep/Read cannot provide.
 // This is a CODE INDEX — only inject structural code context (impact, overview, callgraph).
@@ -540,7 +548,6 @@ function runMain() {
 }
 
 if (require.main === module) {
-  require('./hook-fail-open').installHookFailOpen('UserPromptSubmit');
   runMain();
 }
 

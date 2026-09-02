@@ -1,8 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.130.0
 
-### Four MCP tools published a schema that required nothing, and rejected calls that gave nothing (CON-13)
+**Upgrading:** one command changes behaviour in a way you can feel, and one
+long-standing quiet failure stops being quiet.
+
+1. **`dead-code --ignore` now resolves like the path next to it.** Prefixes used
+   to be matched root-relative while the scan path was cwd-relative, so from a
+   subdirectory `dead-code . --ignore generated` excluded nothing and said
+   nothing. It now excludes what you meant. If you have a script that leaned on
+   the old no-op — passing a prefix that never matched — it will start
+   excluding. The tool's own defaults (`claude-plugin/`, `benches/`) stay
+   root-relative and are unaffected.
+2. **`--ignore .` is now an error.** It normalizes to the empty string, and
+   every path starts with that, so it used to empty the whole report behind an
+   exit-0 "No dead code found". Pass a prefix inside the project instead.
+3. **MCP responses may carry a new `ignored_arguments` key.** `get_call_graph`
+   in `route_path` mode reports `file_path` / `direction` when you send them,
+   because that mode does not read them. Additive: the key appears only when
+   you sent an argument the call ignored.
+
+To defer any of this, pin `0.129.0`. Nothing else changes shape; the rest of
+this entry is behaviour that was already supposed to work.
+
+
+### Four MCP tools require an argument their schema cannot name (CON-13)
 
 `find_references` declares seven optional properties and no `required` array,
 while `refs.rs:35` rejects any call carrying neither `symbol_name` nor
@@ -11,35 +33,35 @@ the model was being told every argument is optional by the same surface that
 then answered with an error it had no way to anticipate.
 
 The audit named one tool and reported that "the six siblings all declare
-`required`". Both halves were off, and checking is what found it:
+`required`". Both halves were off, and checking is what found it: **five**
+declare it (`get_call_graph` had the identical omission), and two more —
+`get_ast_node` and `ast_search` — declare `"required": []`, which in JSON Schema
+is indistinguishable from declaring nothing while their handlers enforce the
+same kind of disjunction. So the finding's own criterion counts a lie as
+compliance, and its minimal fix would have said nothing new while looking like a
+repair.
 
-- **Five** declare it, not six. `get_call_graph` had the identical omission
-  (`symbol_name` or `route_path`, `callgraph.rs:95`).
-- Two more — `get_ast_node` and `ast_search` — declare `"required": []`, which
-  the finding would count as compliant. In JSON Schema an empty `required` is
-  indistinguishable from no `required` at all, so those two were making exactly
-  the same silent promise. That also rules out the obvious fix: adding
-  `"required": []` to the two tools missing it would have changed nothing while
-  looking like a repair.
+**The accurate expression is `anyOf`, and it cannot be published.** That is
+measured, not assumed: a build carrying
+`anyOf: [{required:[symbol_name]}, {required:[node_id]}]` on those four tools
+was loaded, and the client dropped **exactly those four** while keeping the
+three without it — same server, same reconnect, and the server's own
+`tools/list` still carried all seven. The schema reached the client; the client
+answered by removing the tools, silently. For a tool surface that is the worst
+available failure: the model simply stops having them, with nothing to read.
 
-All four now publish the disjunction their handler enforces:
+So what shipped is the honest half. All seven tools now declare an explicit
+`required` array — `[]` where no single argument is unconditionally required,
+which is true and was the drift the finding really found. The disjunction lives
+in the handler, and two guards keep it: one forbids `anyOf` in any published
+schema (with the measurement written next to it, so the next author re-runs the
+experiment instead of assuming), and one asserts on the wire that each handler
+still rejects a call naming none of its alternatives — a requirement nobody
+enforces is the same defect pointing the other way.
 
-```json
-"anyOf": [{ "required": ["symbol_name"] }, { "required": ["node_id"] }]
-```
-
-Property descriptions are untouched — the model's routing text is byte-identical
-to 0.129.0, so this does not need a routing-bench baseline (which is dark until
-`OPENROUTER_API_KEY` returns).
-
-Two guards, because either alone is satisfiable by a lie. One reads the registry
-and fails if a listed tool appears in neither the disjunctive table nor the
-"`{}` is a valid call" table — a new tool has to declare which it is. The other
-reads the bytes `tools/list` actually returns, and separately asserts each
-handler still rejects a call that omits every arm: a schema promising a
-requirement nothing enforces is the same defect pointing the other way. Both go
-red under a dropped `anyOf`, a changed arm, a deleted handler check, and an
-emptied table.
+Property descriptions are untouched, so the model's routing text is
+byte-identical to 0.129.0 and this needs no routing-bench baseline (which is
+dark until `OPENROUTER_API_KEY` returns).
 
 ### Hooks fail open; a test stopped writing your real settings (JS-09/12, ENG-07)
 
@@ -77,8 +99,8 @@ Also: `doctor` no longer reads its "self-heal gave up" threshold from a literal
 that duplicated auto-update's constant (JS-07); the require cycle that survives
 only because one edge is lazy is now documented and pinned by a test that loads
 each module first in its own process (JS-13); `npm run build`'s copy step
-explains a full disk or an unwritable `bin/` instead of throwing a stack
-(JS-14); and the third-party statusline registration API is documented in the
+explains a full disk or an unwritable `bin/` instead of throwing a stack, and
+creates `bin/` when it is missing rather than failing with ENOENT (JS-14); and the third-party statusline registration API is documented in the
 README, with its exit codes and registry paths re-derived from the running CLI
 by a test rather than transcribed (JS-10).
 
@@ -95,9 +117,12 @@ three.
 ### Four duplications, removed with the differences kept (ARC-02/03/06/07)
 
 Behaviour-preserving, and each verified against the pre-change code rather than
-argued: the reference rollup byte-for-byte over 28 CLI invocations and 5 MCP
-argument shapes, the cooldown flag names over 12 write-and-read pairs, and
-`cg-answer`'s runner matrix over 34 spawn outcomes.
+argued — by one-off comparison harnesses that are not kept in the tree, so the
+counts below record what was run, not something you can re-run: the reference
+rollup byte-for-byte over 28 CLI invocations and 5 MCP argument shapes, the
+cooldown flag names over 12 write-and-read pairs, and
+`cg-answer`'s runner matrix over every spawn outcome the shipped guard asserts
+(24: five stub behaviours × four runners, plus one missing-binary check each).
 
 - **ARC-02** — `doctor`'s three dev-mode build arms: only `binary-broken` went
   through the injectable `buildBinary`; the other two called `execSync` inline.

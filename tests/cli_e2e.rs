@@ -5295,6 +5295,20 @@ export function generatedDead(a: number): number {
 "#,
     )
     .unwrap();
+    // A sibling whose name EXTENDS `generated` — the prefix-widening trap that
+    // `--ignore generated/` must not fall into.
+    std::fs::create_dir_all(src.join("generated_extra")).unwrap();
+    std::fs::write(
+        src.join("generated_extra/extra.ts"),
+        r#"
+export function siblingDead(a: number): number {
+    const b = a + 3;
+    const c = b + 3;
+    return c;
+}
+"#,
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -5349,6 +5363,26 @@ fn test_cli_dead_code_ignore_prefix_resolves_against_cwd_like_the_path_arg() {
     assert!(
         !from_subdir.contains("generatedDead"),
         "CON-11: --ignore must resolve against cwd like the scan path does; got {from_subdir:?}"
+    );
+
+    // The trailing separator is preserved across the resolution, and that is the
+    // one genuinely new code path in this fix — pre-tag review found it had no
+    // test, only a comment stating the rationale. `generated/` must not widen
+    // into a prefix that also swallows the sibling `generated_extra/`.
+    let (kept_sibling, _, sib_code) = run_cli_from(
+        &project,
+        "src",
+        &["dead-code", ".", "--ignore", "generated/", "--json"],
+    );
+    assert_eq!(sib_code, 0);
+    assert!(
+        !kept_sibling.contains("generatedDead"),
+        "the trailing-slash spelling must still exclude its own tree; got {kept_sibling:?}"
+    );
+    assert!(
+        kept_sibling.contains("siblingDead"),
+        "`--ignore generated/` must NOT swallow `generated_extra/` — that silent \
+         widening is what the trailing separator exists to prevent; got {kept_sibling:?}"
     );
 }
 

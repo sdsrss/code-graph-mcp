@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 'use strict';
+// FIRST statement, before this file's other requires (pre-tag review
+// 2026-09-02): the handler installed after them could not catch a throw
+// from `require('./lifecycle')` itself, which is exactly the broken-install
+// case JS-12 exists for. Guarded on `require.main` so importing this module
+// in a test does NOT install a process-wide handler that exits 0 — that
+// would swallow the test's own failures.
+if (require.main === module) require('./hook-fail-open').installHookFailOpen('PreToolUse:Read');
+
 // PreToolUse(Read) hook: detect read-fanout into the same source directory
 // and suggest module_overview / `code-graph-mcp overview` once. The 7d audit
 // (2026-05-12 → 2026-05-14, 141 sessions) found 16 sessions with 5+ Reads
@@ -225,7 +233,6 @@ function runMain() {
 }
 
 if (require.main === module) {
-  require('./hook-fail-open').installHookFailOpen('PreToolUse:Read');
   runMain();
 }
 

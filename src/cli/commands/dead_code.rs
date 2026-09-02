@@ -93,10 +93,17 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     let resolve_ignore = |raw: &str| -> Result<String> {
         let trailing = raw.ends_with('/') || raw.ends_with('\\');
         let resolved = normalize_user_path(project_root, raw)?;
-        // "" is what `.` (and an empty value) normalize to, and every path
+        // An empty result means "the project root", and every path
         // `starts_with("")` — the whole report would vanish behind an exit-0
         // "No dead code found". Same false-clean this command already refuses
         // for a misspelled --type: say what happened instead.
+        //
+        // Which inputs land here depends on where you stand, and the earlier
+        // wording here got that wrong (pre-tag review): `.` normalizes to ""
+        // only when cwd IS the root. From `src/` it resolves to `src`, which
+        // suppresses everything under `src` — but that is a real prefix, it is
+        // what the user asked for, and `ignored_count` discloses it. An empty
+        // value (`--ignore ""`) reaches this from anywhere.
         if resolved.is_empty() {
             anyhow::bail!(
                 "--ignore '{raw}' resolves to the project root \u{2014} it would exclude every file. Pass a prefix inside the project (e.g. --ignore src/generated)."

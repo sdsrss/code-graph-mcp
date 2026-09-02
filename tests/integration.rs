@@ -210,7 +210,8 @@ app.post('/api/login', handleLogin);
         serde_json::json!({
             "route_path": "/api/login",
             "file_path": "server.ts",
-            "direction": "callers"
+            "direction": "callers",
+            "compact": true
         }),
     );
     let resp = server.handle_message(&call).unwrap();
@@ -232,6 +233,12 @@ app.post('/api/login', handleLogin);
         ignored.contains(&"direction".to_string()),
         "direction is inert here too — its description says so, but a description \
          is not the answer the caller reads; got {result}"
+    );
+    assert!(
+        ignored.contains(&"compact".to_string()),
+        "compact is inert in route mode as well, and unlike `direction` its \
+         description makes no exception — so a caller asking for a smaller answer \
+         gets the full one; got {result}"
     );
     // The answer itself is unaffected: disclosure, not refusal.
     assert!(
@@ -301,17 +308,22 @@ fn test_e2e_incremental_reindex() {
     );
 }
 
-/// The disjunction each handler enforces must survive to the WIRE, and the
-/// handler must still enforce it (audit 2026-08-29 CON-13).
+/// What the wire carries, and what the handler still enforces (audit
+/// 2026-08-29 CON-13).
 ///
-/// Two halves, because either alone is satisfiable by a lie. `handle_tools_list`
-/// currently passes `input_schema` through whole (`server/mod.rs:1858`), so the
-/// registry-level guard in `mcp::tools` would keep passing if someone rebuilt
-/// the response from `type` / `properties` / `required` — the exact shape that
-/// drops an unrecognized keyword silently. And a schema that declares a
-/// requirement no handler enforces is the same defect pointing the other way.
+/// Four tools reject a call that omits every one of their alternatives. The
+/// accurate schema for that is `anyOf`, and publishing it is measurably not an
+/// option: for one build these four carried it and the client dropped exactly
+/// those four while keeping the three without it — see
+/// `no_tool_publishes_an_anyof_the_client_drops` in `mcp::tools`. So the
+/// constraint lives in the handler alone, and this pins BOTH halves of what is
+/// left: the wire stays free of the keyword that makes a tool disappear, and
+/// the handler keeps rejecting the call the schema can no longer describe.
+///
+/// The second half matters on its own. A requirement nobody enforces is the
+/// same defect as an unstated one, pointing the other way.
 #[test]
-fn tools_list_publishes_the_disjunction_each_handler_enforces() {
+fn tools_list_shape_matches_what_each_handler_enforces() {
     let project = TempDir::new().unwrap();
     fs::write(
         project.path().join("app.ts"),
@@ -325,9 +337,16 @@ fn tools_list_publishes_the_disjunction_each_handler_enforces() {
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let tools = parsed["result"]["tools"].as_array().unwrap();
 
-    // (tool, arms) — mirrors `every_disjunctive_tool_publishes_its_disjunction`
-    // on purpose: that one reads the registry struct, this one reads the bytes
-    // a client receives.
+    for tool in tools {
+        assert!(
+            tool["inputSchema"].get("anyOf").is_none(),
+            "'{}' reaches the client carrying `anyOf`; the client answers that by \
+             dropping the tool entirely: {tool}",
+            tool["name"]
+        );
+    }
+
+    // (tool, the alternatives its handler accepts)
     let expected: [(&str, &[&str]); 4] = [
         ("get_call_graph", &["symbol_name", "route_path"]),
         ("get_ast_node", &["symbol_name", "node_id"]),
@@ -337,34 +356,12 @@ fn tools_list_publishes_the_disjunction_each_handler_enforces() {
 
     let mut checked = 0usize;
     for (name, arms) in expected {
-        let tool = tools
-            .iter()
-            .find(|t| t["name"] == name)
-            .unwrap_or_else(|| panic!("tools/list no longer advertises '{name}'"));
-        let published: Vec<&str> = tool["inputSchema"]["anyOf"]
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "'{name}' reaches the client with no `anyOf` — the schema tells the \
-                     model every argument is optional while the handler rejects a call \
-                     that omits all of {arms:?}. Response was: {tool}"
-                )
-            })
-            .iter()
-            .map(|arm| arm["required"][0].as_str().unwrap())
-            .collect();
-        let mut got = published.clone();
-        got.sort_unstable();
-        let mut want = arms.to_vec();
-        want.sort_unstable();
-        assert_eq!(
-            got, want,
-            "'{name}': wire disjunction differs from the handler's"
+        assert!(
+            tools.iter().any(|t| t["name"] == name),
+            "tools/list no longer advertises '{name}'"
         );
-
-        // The other half: the handler must actually reject the call the schema
-        // now forbids. Without this, deleting the check in the handler would
-        // leave the schema making a promise nothing keeps.
+        // `compact` is a real argument for each of these and satisfies nothing:
+        // the call is well-formed and still names none of the alternatives.
         let call = format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{name}","arguments":{{"compact":true}}}}}}"#
         );
@@ -377,8 +374,8 @@ fn tools_list_publishes_the_disjunction_each_handler_enforces() {
             + parsed["error"]["message"].as_str().unwrap_or_default();
         assert!(
             arms.iter().any(|a| text.contains(a)),
-            "'{name}' accepted a call with none of {arms:?}, or failed without naming \
-             them: {parsed}"
+            "'{name}' accepted a call naming none of {arms:?}, or refused without \
+             naming them — and the schema cannot warn the caller either: {parsed}"
         );
         checked += 1;
     }

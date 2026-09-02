@@ -61,6 +61,13 @@ function runUnregister(id) {
 }
 
 function runList() {
+  // Refuses like its siblings (pre-tag review, 2026-09-02). `readRegistry()`
+  // returns [] for an unreadable file as well as for an empty one, so `list`
+  // answered a corrupt registry with `(empty)` at exit 0 — telling an installer
+  // that nothing is registered while other plugins' entries and the user's
+  // previous statusline sit in a file we could not parse. Same defect class as
+  // JS-11 in this batch: a corrupt file rendered as a clean state.
+  bailIfRegistryUnusable('listed');
   const registry = readRegistry();
   if (registry.length === 0) {
     process.stdout.write('(empty)\n');

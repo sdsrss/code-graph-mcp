@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 'use strict';
+// FIRST statement, before this file's other requires (pre-tag review
+// 2026-09-02): the handler installed after them could not catch a throw
+// from `require('./lifecycle')` itself, which is exactly the broken-install
+// case JS-12 exists for. Guarded on `require.main` so importing this module
+// in a test does NOT install a process-wide handler that exits 0 — that
+// would swallow the test's own failures.
+if (require.main === module) require('./hook-fail-open').installHookFailOpen('statusLine');
+
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
@@ -8,9 +16,6 @@ const { findBinary } = require('./find-binary');
 const { resolveProjectRoot } = require('./project-root');
 const lifecycle = require('./lifecycle');
 const { hidden } = require('./proc-opts');
-// Fail open: this file runs straight through with no main() to wrap — see
-// hook-fail-open.js for why a handler rather than a try/catch (JS-12).
-require('./hook-fail-open').installHookFailOpen('statusLine');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 // True when auto-update has a newer release queued or in flight (the background

@@ -32,6 +32,14 @@ function installHookFailOpen(label) {
     }
     // Exit 0, not the throw's non-zero: for a PreToolUse hook a non-zero exit is
     // a DECISION (2 = deny), so crashing must not read as a verdict.
+    //
+    // Known limit: `process.exit` does not flush a pending stdout write, so an
+    // async throw AFTER a partial decision write could truncate it mid-JSON.
+    // Every entry point here writes its decision in one final call, so the
+    // window is "threw between that write and process exit". Draining instead
+    // (setting `process.exitCode` and returning) trades that for a hang risk
+    // against the hook's own 3-10s timeout, which is the worse failure — a
+    // timeout blocks the user's tool call, a truncated write does not.
     process.exit(0);
   };
   process.on('uncaughtException', bail);

@@ -1101,6 +1101,17 @@ fn pre_commit_checks_every_version_site_sync_versions_writes() {
         "sync-versions.js rewrites these version sites and pre-commit.sh's \
          VERSION_FILES does not list them, so a hand-edit lands unnoticed: {missing:?}"
     );
+
+    // And the reverse. This direction is not the dangerous one — a file checked
+    // but never synced costs a confusing failure, not a silent bad release — but
+    // the comment in pre-commit.sh promises that a site "cannot be added to one
+    // list alone", and a one-way check does not deliver that (pre-tag review).
+    let unsynced: Vec<&String> = checked.iter().filter(|p| !sites.contains(p)).collect();
+    assert!(
+        unsynced.is_empty(),
+        "pre-commit.sh checks these files for a version sync-versions.js never \
+         writes there: {unsynced:?}"
+    );
 }
 
 /// The trimmed, comment-stripped directive lines of a YAML block.

@@ -56,14 +56,14 @@ function cwdHash(cwd) {
 // pre-read-guide.js is deliberately NOT folded in: its `.code-graph-readfan-*`
 // file is a JSON state document keyed on the cwd alone, not a per-command
 // cooldown flag — same directory, different thing.
-function makeCooldown(prefix, { windowMs: defaultWindowMs = 60000 } = {}) {
+function makeCooldown(prefix) {
   const commandHash = (cmd) =>
     crypto.createHash('sha1').update(String(cmd)).digest('hex').slice(0, 12);
   // Project-scoped: the same `grep -rn "foo" src/` in two repos is two different
   // questions and must not share one cooldown (see cwdHash above).
   const flagPath = (cmd, cwd = process.cwd()) =>
     path.join(cgTmpDir(), `.code-graph-${prefix}-${cwdHash(cwd)}-${commandHash(cmd)}`);
-  const isOnCooldown = (cmd, now = Date.now(), windowMs = defaultWindowMs, cwd = process.cwd()) => {
+  const isOnCooldown = (cmd, now = Date.now(), windowMs = 60000, cwd = process.cwd()) => {
     try {
       return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
     } catch { return false; }

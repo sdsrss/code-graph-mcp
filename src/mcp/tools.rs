@@ -68,12 +68,10 @@ impl ToolRegistry {
                         "include_tests": { "type": "boolean", "description": "Include test callers (default false)" },
                         "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to FOLLOW (default 'inferred'): hides 'ambiguous' by-name fan-out — a method name shared by many defs that resolves to all of them (e.g. `.execute()` → every execute). Pass 'ambiguous' to include every edge; 'extracted' for same-file-precise only. `ambiguous_edges_hidden` in the response counts what was suppressed." }
                     },
-                    // `callgraph.rs:95` rejects a call carrying neither. See
-                    // `every_disjunctive_tool_publishes_its_disjunction`.
-                    "anyOf": [
-                        { "required": ["symbol_name"] },
-                        { "required": ["route_path"] }
-                    ]
+                    // `callgraph.rs:95` rejects a call carrying neither
+                    // `symbol_name` nor `route_path`, and the schema cannot say
+                    // so — see `no_tool_publishes_an_anyof_the_client_drops`.
+                    "required": []
                 }),
             },
             ToolDefinition {
@@ -94,13 +92,10 @@ impl ToolRegistry {
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },
                         "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
                     },
-                    "required": [],
-                    // `ast_node.rs:200` rejects a call carrying neither (a bare
-                    // `file_path` is not enough — it names a file, not a symbol).
-                    "anyOf": [
-                        { "required": ["symbol_name"] },
-                        { "required": ["node_id"] }
-                    ]
+                    // `ast_node.rs:200` rejects a call carrying neither
+                    // `symbol_name` nor `node_id` (a bare `file_path` is not
+                    // enough — it names a file, not a symbol).
+                    "required": []
                 }),
             },
             ToolDefinition {
@@ -179,15 +174,9 @@ impl ToolRegistry {
                         "params": { "type": "string", "description": "Parameter text substring filter" },
                         "limit": { "type": "number", "description": "Max results (default 20)" }
                     },
-                    "required": [],
-                    // `ast_search.rs:46`: a query OR at least one typed filter.
-                    // A bare `limit` is not a search.
-                    "anyOf": [
-                        { "required": ["query"] },
-                        { "required": ["type"] },
-                        { "required": ["returns"] },
-                        { "required": ["params"] }
-                    ]
+                    // `ast_search.rs:46`: a query OR at least one typed
+                    // filter. A bare `limit` is not a search.
+                    "required": []
                 }),
             },
             ToolDefinition {
@@ -204,18 +193,21 @@ impl ToolRegistry {
                         "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to KEEP. Default: no floor — every reference is returned, each tagged with its own `confidence` ('extracted' = same-file precise, 'inferred' = import-resolved, 'ambiguous' = by-name fan-out that may point at a same-named symbol elsewhere). Pass 'inferred' to drop the ambiguous tier; `confidence_filtered` in the response counts what was dropped." },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+relation+confidence+node_id only, no code or signature (saves tokens)" }
                     },
-                    // `refs.rs:35` rejects a call carrying neither. This is the
-                    // site audit 2026-08-29 CON-13 named; the audit's "the six
-                    // siblings all declare `required`" was off — FIVE do, and
-                    // `get_call_graph` had the identical omission. Two more
-                    // (`get_ast_node`, `ast_search`) declared `required: []`,
+                    // `refs.rs:35` rejects a call carrying neither `symbol_name`
+                    // nor `node_id`. This is the site audit 2026-08-29 CON-13
+                    // named; that finding's "the six siblings all declare
+                    // `required`" was off — FIVE do, `get_call_graph` had the
+                    // identical omission, and two more declared `required: []`,
                     // which in JSON Schema says exactly as much as saying
-                    // nothing: an empty array cannot express "one of these
-                    // two". Hence `anyOf` on all four.
-                    "anyOf": [
-                        { "required": ["symbol_name"] },
-                        { "required": ["node_id"] }
-                    ]
+                    // nothing.
+                    //
+                    // The accurate expression is `anyOf`, and it MEASURABLY
+                    // cannot be published — see
+                    // `no_tool_publishes_an_anyof_the_client_drops`. So the
+                    // disjunction lives in the handler and in that guard, and
+                    // the schema stays as honest as it is able to be: no
+                    // argument is unconditionally required, which is true.
+                    "required": []
                 }),
             },
         ];
@@ -291,103 +283,52 @@ mod tests {
         );
     }
 
-    /// Every listed tool whose HANDLER enforces "one of these arguments" must
-    /// publish that disjunction (audit 2026-08-29 CON-13). The failure it
-    /// prevents is a schema that over-promises optionality: the client offers
-    /// the model a tool where nothing is required, the model calls it with a
-    /// filter argument alone, and the handler answers with an error the schema
-    /// gave no way to anticipate.
+    /// No tool may publish `anyOf` — MEASURED, not stylistic.
     ///
-    /// `"required": []` does NOT count. In JSON Schema an empty `required` is
-    /// indistinguishable from no `required` at all, so the three tools that
-    /// carried one were making the same silent promise as the two that carried
-    /// nothing — which is why this guard reads `anyOf` and not the presence of
-    /// a key.
+    /// Four tools enforce "one of these arguments" in their handler
+    /// (audit 2026-08-29 CON-13), and `anyOf` is the accurate JSON Schema for
+    /// that. It was published for one build, and the client DROPPED exactly
+    /// those four tools while keeping the three without it: same server, same
+    /// reconnect, and `tools/list` over stdio still carried all seven. So the
+    /// schema reached the client and the client refused the tools — silently,
+    /// which is the worst available failure for a tool surface (the model
+    /// simply stops having them, with nothing to read).
     ///
-    /// The rows are (tool, the arms its handler accepts). Adding a tool means
-    /// deciding which column it belongs in: a genuinely all-optional tool goes
-    /// in `NO_REQUIRED_ARGUMENT`, everything else needs its arms here.
+    /// `"required": []` is therefore as honest as this schema can be: it says
+    /// no single argument is unconditionally required, which is true. The
+    /// disjunction itself lives in the handler, and
+    /// `tools_list_shape_matches_what_each_handler_enforces` in
+    /// tests/integration.rs pins that the handler still enforces it.
+    ///
+    /// If you are here because you want to express the constraint properly:
+    /// re-run the experiment before assuming the client has changed. Publish
+    /// it, reconnect, and check whether the tool is still callable.
     #[test]
-    fn every_disjunctive_tool_publishes_its_disjunction() {
-        // Arms verified against the handler that raises the error, not against
-        // the schema being checked — a table copied from the thing under test
-        // proves nothing.
-        const DISJUNCTIVE: &[(&str, &[&str])] = &[
-            // callgraph.rs:95  "symbol_name or route_path is required"
-            ("get_call_graph", &["symbol_name", "route_path"]),
-            // ast_node.rs:200  "Either node_id, symbol_name, or file_path+symbol_name"
-            ("get_ast_node", &["symbol_name", "node_id"]),
-            // ast_search.rs:46 "Either query or at least one filter (type, returns, params)"
-            ("ast_search", &["query", "type", "returns", "params"]),
-            // refs.rs:35       "symbol_name or node_id is required"
-            ("find_references", &["symbol_name", "node_id"]),
-        ];
-        // Tools that really do accept a bare `{}`: every argument is a modifier
-        // of a default answer. `project_map` maps the whole project;
-        // `semantic_code_search` and `module_overview` name their one mandatory
-        // argument in `required` instead.
-        const NO_DISJUNCTION: &[&str] = &["project_map", "semantic_code_search", "module_overview"];
-
+    fn no_tool_publishes_an_anyof_the_client_drops() {
         let registry = ToolRegistry::new();
         let mut checked = 0usize;
         for tool in registry.list_tools() {
             let name = tool.name.as_str();
-            let Some((_, arms)) = DISJUNCTIVE.iter().find(|(n, _)| *n == name) else {
-                assert!(
-                    NO_DISJUNCTION.contains(&name),
-                    "tool '{name}' is in neither table — does its handler require one of \
-                     several arguments? Add it to DISJUNCTIVE with the arms its handler \
-                     accepts, or to NO_DISJUNCTION if `{{}}` is a valid call."
-                );
-                continue;
-            };
-            let schema = &tool.input_schema;
-            let published = schema["anyOf"].as_array().unwrap_or_else(|| {
-                panic!(
-                    "tool '{name}' requires one of {arms:?} but publishes no `anyOf`. \
-                     A `required: []` does not express this — it is JSON Schema for \
-                     \"nothing is required\", which is the over-promise itself."
-                )
-            });
-            let mut published_arms: Vec<String> = published
-                .iter()
-                .map(|arm| {
-                    let req = arm["required"].as_array().unwrap_or_else(|| {
-                        panic!("tool '{name}': every `anyOf` arm must be a `required` list")
-                    });
-                    assert_eq!(
-                        req.len(),
-                        1,
-                        "tool '{name}': one argument per arm keeps the arms readable \
-                         as \"any one of these\""
-                    );
-                    req[0].as_str().unwrap().to_string()
-                })
-                .collect();
-            published_arms.sort();
-            let mut expected: Vec<String> = arms.iter().map(|a| a.to_string()).collect();
-            expected.sort();
-            assert_eq!(
-                published_arms, expected,
-                "tool '{name}': the published disjunction and the one its handler \
-                 enforces disagree"
+            assert!(
+                tool.input_schema.get("anyOf").is_none(),
+                "tool '{name}' publishes `anyOf`. Measured 2026-09-02: the client \
+                 drops every tool whose schema carries it, so shipping this makes \
+                 '{name}' vanish from the model's tool set with no error anywhere."
             );
-            // Each arm must name a declared property, or the schema requires an
-            // argument the client cannot see.
-            for arm in arms.iter() {
-                assert!(
-                    schema["properties"].get(arm).is_some(),
-                    "tool '{name}': `anyOf` names '{arm}', which is not a declared property"
-                );
-            }
+            // The drift axis the CON-13 finding actually named: `required` was
+            // present on five of seven tools and absent on two, for no reason.
+            // An empty array and an absent key mean the same thing to a
+            // validator, but not to the next author reading the file.
+            assert!(
+                tool.input_schema.get("required").is_some(),
+                "tool '{name}' declares no `required` array; every sibling does"
+            );
             checked += 1;
         }
-        // Vacuity floor: a registry that stopped returning these tools, or a
-        // table someone emptied, must fail rather than pass with nothing checked.
         assert_eq!(
             checked,
-            DISJUNCTIVE.len(),
-            "every DISJUNCTIVE row must correspond to a listed tool"
+            crate::domain::LIVE_MCP_TOOLS.len(),
+            "vacuity floor: every listed tool must have been examined"
         );
     }
 

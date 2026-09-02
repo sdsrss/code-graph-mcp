@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 'use strict';
+// FIRST statement, before this file's other requires (pre-tag review
+// 2026-09-02): the handler installed after them could not catch a throw
+// from `require('./lifecycle')` itself, which is exactly the broken-install
+// case JS-12 exists for. Guarded on `require.main` so importing this module
+// in a test does NOT install a process-wide handler that exits 0 — that
+// would swallow the test's own failures.
+if (require.main === module) require('./hook-fail-open').installHookFailOpen('PreToolUse:Edit');
+
 // PreToolUse(Edit) hook: auto-inject impact analysis when editing function definitions.
 // Only fires when:
 //   1. The old_string contains a function/method definition (signature being modified)
@@ -16,9 +24,6 @@ const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
 const { hidden } = require('./proc-opts');
-// Fail open: this file runs straight through with no main() to wrap — see
-// hook-fail-open.js for why a handler rather than a try/catch (JS-12).
-require('./hook-fail-open').installHookFailOpen('PreToolUse:Edit');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu

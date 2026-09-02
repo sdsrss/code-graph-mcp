@@ -45,6 +45,13 @@ test('copy-binary: an unwritable destination explains itself instead of throwing
     t.skip('root ignores the mode bits this test relies on');
     return;
   }
+  if (process.platform === 'win32') {
+    // chmod does not make a directory unwritable there, so the copy would
+    // succeed and this test would fail for a reason that is not the product's.
+    // CI is ubuntu-only, but pre-commit runs this suite on the developer's box.
+    t.skip('directory mode bits do not gate writes on Windows');
+    return;
+  }
   const { root, scripts } = layout();
   const bin = path.join(root, 'bin');
   fs.mkdirSync(bin);

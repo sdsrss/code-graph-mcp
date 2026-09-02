@@ -22,7 +22,10 @@ function readmeSection() {
   const start = src.indexOf('### Sharing the statusline with another plugin');
   assert.ok(start > 0, 'the README section moved or was removed — update this guard');
   const rest = src.slice(start + 1);
-  const end = rest.indexOf('\n### ');
+  // Terminate on ANY following heading, not just `### `: the next heading here
+  // is `## Build from Source`, so a `### `-only cut ran 50 lines past the
+  // section and let assertions be satisfied by unrelated text (pre-tag review).
+  const end = rest.search(/\n#{2,3} /);
   return end === -1 ? rest : rest.slice(0, end);
 }
 
@@ -60,11 +63,41 @@ test('the documented exit codes are the ones the CLI returns', () => {
     const registry = path.join(home, '.cache', 'code-graph', 'statusline-registry.json');
     fs.mkdirSync(path.dirname(registry), { recursive: true });
     fs.writeFileSync(registry, '{ not json');
-    const refused = run('register', 'gsd', 'echo hi');
-    assert.equal(refused.status, 2, `an unreadable registry must refuse; got ${refused.status}`);
+    for (const cmd of [['register', 'gsd', 'echo hi'], ['unregister', 'gsd'], ['list']]) {
+      const refused = run(...cmd);
+      assert.equal(refused.status, 2,
+        `an unreadable registry must refuse \`${cmd[0]}\`; got ${refused.status}`);
+      assert.doesNotMatch(refused.stdout, /\(empty\)/,
+        `\`${cmd[0]}\` must not render a corrupt registry as a clean one`);
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('the documented invocation path is one that resolves for a third party', () => {
+  // Pre-tag review 2026-09-02: the first draft told third-party plugins to run
+  // `$CLAUDE_PLUGIN_ROOT/scripts/statusline-chain.js`. Claude Code sets that
+  // variable per-plugin, so inside THEIR hook it resolves to THEIR root, and in
+  // a plain shell it is unset — the one fact most likely to be wrong was the
+  // one this guard did not check.
+  const doc = readmeSection();
+  assert.doesNotMatch(doc, /CLAUDE_PLUGIN_ROOT[^\n]*statusline-chain/,
+    'the registration command must not be rooted at $CLAUDE_PLUGIN_ROOT — it ' +
+    'points at whichever plugin is running, which is never this one');
+
+  // What it documents instead must be a path this package actually ships.
+  const m = /\$\(npm root -g\)\/(\S+statusline-chain\.js)/.exec(doc);
+  assert.ok(m, `the README no longer documents an npm-resolvable path: ${doc.slice(0, 400)}`);
+  const relative = m[1].replace(/^@[^/]+\/[^/]+\//, ''); // strip the package name
+  assert.ok(fs.existsSync(path.join(__dirname, '..', '..', relative)),
+    `the documented path ${relative} does not exist in this repo`);
+  // And the package must actually publish it — `files` is what npm ships.
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+  assert.ok(pkg.files.includes('claude-plugin'),
+    `package.json files does not ship claude-plugin/: ${pkg.files}`);
+  assert.match(m[0], new RegExp(`\\$\\(npm root -g\\)/${pkg.name.replace('/', '\\/')}/`),
+    `the documented path names a different package than ${pkg.name}`);
 });
 
 test('the documented registry paths are the ones lifecycle writes', () => {

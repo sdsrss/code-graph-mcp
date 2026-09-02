@@ -71,24 +71,6 @@ const _: () = assert!(
 /// listing them here would be dead configuration. `test_no_new_undeclared_mcp_args`
 /// in tests/hardening.rs pins that whole set: adding a handler that reads a new
 /// undeclared key fails there until it is classified here.
-/// The mirror image of [`HONORED_UNDECLARED_ARGS`]: arguments a tool DECLARES
-/// and honors in one mode, while the other mode's backend never reads them.
-///
-/// `(tool, the argument that selects the mode, the arguments that mode drops)`.
-///
-/// `get_call_graph` with `route_path` delegates the whole call to
-/// `tool_trace_http_chain`, which reads `route_path`, `depth`,
-/// `include_middleware`, `include_tests` and `min_confidence` — not `file_path`,
-/// not `direction` (audit 2026-08-29 CON-14). The schema cannot express this
-/// (a per-mode property set is not a thing JSON Schema says well), and the
-/// descriptions carry it unevenly: `direction`'s says "ignored when route_path
-/// is set", `file_path`'s says "Disambiguate same-name functions" and stops
-/// there. So a caller narrowing a route trace by file got the unnarrowed answer
-/// with nothing to indicate it. Disclosure at answer time is the one channel
-/// that cannot go stale relative to the code.
-const MODE_INERT_ARGS: &[(&str, &str, &[&str])] =
-    &[("get_call_graph", "route_path", &["file_path", "direction"])];
-
 const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
     ("*", "skip_indexing"),
     ("get_call_graph", "function_name"),
@@ -99,6 +81,31 @@ const HONORED_UNDECLARED_ARGS: &[(&str, &str)] = &[
     // ignored the argument.
     ("ast_search", "node_type"),
 ];
+
+/// The mirror image of [`HONORED_UNDECLARED_ARGS`]: arguments a tool DECLARES
+/// and honors in one mode, while the other mode's backend never reads them.
+///
+/// `(tool, the argument that selects the mode, the arguments that mode drops)`.
+///
+/// `get_call_graph` with `route_path` delegates the whole call to
+/// `tool_trace_http_chain`, which reads `route_path`, `depth`,
+/// `include_middleware`, `include_tests` and `min_confidence` — and nothing
+/// else (audit 2026-08-29 CON-14). So `file_path`, `direction` and `compact`
+/// are all inert there. `compact` was missed on the first pass and found by
+/// pre-tag review: it is the one whose description makes no exception at all
+/// ("Compact mode: name+file+depth only"), so a caller asking a route trace for
+/// a smaller answer got the full one with nothing to indicate it — the very
+/// shape this table exists to disclose.
+///
+/// The schema cannot express a per-mode property set, and the descriptions
+/// carry it unevenly: `direction`'s says "ignored when route_path is set",
+/// the other two say nothing. Disclosure at answer time is the one channel that
+/// cannot go stale relative to the code.
+const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[(
+    "get_call_graph",
+    "route_path",
+    &["compact", "direction", "file_path"],
+)];
 
 use super::metrics::ErrKind;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};

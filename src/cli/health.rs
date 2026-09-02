@@ -74,8 +74,16 @@ pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
 /// 32 MB keeps the polled path near 80 ms even when the page cache is cold,
 /// which is the case that matters: the 2.4 ms/MB above was measured warm, and a
 /// quick_check reads EVERY page, so the first render after a cold boot pays disk
-/// latency for the whole file. At 128 MB that is what makes the statusline
-/// segment vanish.
+/// latency for the whole file.
+///
+/// The cold multiplier is NOT measured, and the limit is set for it anyway. Say
+/// so rather than dress it up: warm, 128 MB would be ~307 ms against the 1500 ms
+/// budget — comfortable. The gate exists because the first render after a cold
+/// boot is the one that pays disk latency for every page, and nothing here has
+/// measured that. 32 MB is the size at which being wrong about it stays cheap.
+/// (Pre-tag review caught the earlier wording asserting the 128 MB failure as a
+/// result; the audit had flagged its stronger twin, and the rewrite had kept the
+/// load-bearing half.)
 ///
 /// Above the limit the probe reports `"skipped_large"` — visibly absent, never
 /// silently, and `doctor` renders that as a skipped row rather than a pass.

@@ -48,18 +48,30 @@ test('every registered hook entry point installs the fail-open handler', () => {
   // statusline entry points, not typed out here: a hand-written list is how a
   // ninth hook joins without one.
   const { buildSettingsHookEntries } = require('./lifecycle');
+  // Name pattern accepts `_` and uppercase: the earlier `[a-z0-9-]+` would have
+  // skipped such a script in silence, which is the failure mode this whole test
+  // exists to prevent (pre-tag review).
+  const SCRIPT = /scripts[/\\]([A-Za-z0-9_-]+\.js)/;
   const registered = new Set();
   for (const entries of Object.values(buildSettingsHookEntries())) {
     for (const entry of entries) {
       for (const h of entry.hooks) {
-        const m = /scripts[/\\]([a-z0-9-]+\.js)/.exec(h.command);
+        const m = SCRIPT.exec(h.command);
         if (m) registered.add(m[1]);
       }
     }
   }
-  // statusLine is configured through a different key, and session-init through
-  // hooks.json; both are hook entry points by every other measure.
-  for (const extra of ['statusline.js', 'statusline-composite.js', 'session-init.js']) {
+  // The plugin-manifest family (SessionStart today) is DERIVED from hooks.json
+  // rather than listed here, so a second script added there joins this guard
+  // automatically — the CHANGELOG claims a ninth hook cannot join without a
+  // handler, and a hardcoded list would not have made that true.
+  const manifest = fs.readFileSync(path.join(HERE, '..', 'hooks', 'hooks.json'), 'utf8');
+  const fromManifest = [...manifest.matchAll(new RegExp(SCRIPT.source, 'g'))].map((m) => m[1]);
+  assert.ok(fromManifest.length >= 1,
+    'no hook scripts found in hooks.json — the scan lost its grip on the file');
+  for (const f of fromManifest) registered.add(f);
+  // statusLine is configured through neither: it is a top-level settings key.
+  for (const extra of ['statusline.js', 'statusline-composite.js']) {
     registered.add(extra);
   }
 
