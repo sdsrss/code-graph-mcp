@@ -27,6 +27,47 @@ const NO_METRICS_FILE = '.no-metrics';
 const ROTATE_MAX_BYTES = 1048576; // 1 MB
 const ROTATE_KEEP_BYTES = 524288; // 512 KB
 
+// Unix-only, atomic: refuse to traverse a final-component symlink on the open
+// itself. Undefined on Windows, where `refuseNonRegular` below is the only
+// layer — same split as the Rust `utils::owned`.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+
+let warnedNonRegular = false;
+
+/**
+ * Reject anything at `p` that is not a regular file (or, for a directory, that
+ * is a symlink). JS twin of Rust `utils::owned::refuse_non_regular` /
+ * `reject_symlinked_dir`: `.code-graph/` is ordinary repo content, so one
+ * `git clone` can carry a symlink where this module expects its own file, and
+ * `writeFileSync` / `appendFileSync` both follow it out of the project (audit
+ * 2026-09-02 P1-1: a 1.2 MB file outside the tree truncated by the rotator).
+ * Absent is fine — the open will create it.
+ * @param {string} p    absolute path
+ * @param {'file'|'dir'} kind
+ * @returns {boolean} true if `p` is safe to write
+ */
+function isOwnedPath(p, kind) {
+  let st;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    return true; // absent (or unreadable) → leave it to the real syscall
+  }
+  if (kind === 'dir' ? !st.isSymbolicLink() : st.isFile()) return true;
+  if (!warnedNonRegular) {
+    warnedNonRegular = true;
+    try {
+      process.stderr.write(
+        `[code-graph] skipping adoption metrics: ${p} is not a regular file ` +
+          `(a symlink here would redirect the write outside the project)\n`
+      );
+    } catch {
+      /* stderr closed → nothing to do */
+    }
+  }
+  return false;
+}
+
 /**
  * Best-effort size-based rotation: if `file` exceeds ROTATE_MAX_BYTES, rewrite
  * it keeping ~the last ROTATE_KEEP_BYTES, trimmed *forward* to the next line
@@ -42,7 +83,15 @@ function rotateIfNeeded(file) {
     const start = Math.max(0, buf.length - ROTATE_KEEP_BYTES);
     const nl = buf.indexOf(0x0a, start); // first newline at/after start
     const trimStart = nl >= 0 ? nl + 1 : start;
-    fs.writeFileSync(file, buf.subarray(trimStart));
+    const fd = fs.openSync(
+      file,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | O_NOFOLLOW
+    );
+    try {
+      fs.writeSync(fd, buf.subarray(trimStart));
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     /* missing file or IO error → skip; the append below still runs */
   }
@@ -58,17 +107,35 @@ function recordRecommendation(cwd, event = {}) {
   try {
     const dir = path.join(cwd, '.code-graph');
     // Append-only: do NOT create .code-graph. Its absence means "not an indexed
-    // project" — recording there would pollute non-project cwds.
-    if (!fs.existsSync(dir)) return false;
+    // project" — recording there would pollute non-project cwds. `lstat`, not
+    // `existsSync`: a symlinked `.code-graph` holding perfectly ordinary files
+    // defeats the per-file guard below, because the write then lands on a real
+    // regular file that simply is not where this hook thinks it is.
+    let dirStat;
+    try {
+      dirStat = fs.lstatSync(dir);
+    } catch {
+      return false; // absent → not an indexed project
+    }
+    if (!dirStat.isDirectory() || !isOwnedPath(dir, 'dir')) return false;
     // Opt-in metrics silence for dev/dogfood checkouts: when the project marks
     // itself with `.code-graph/.no-metrics`, the tool's own hook/CLI runs (sims,
     // functionality testing) must not self-pollute its adoption metrics. Mirrors
     // the Rust cli::record_cli_use guard. Reversible: delete the file to re-enable.
     if (fs.existsSync(path.join(dir, NO_METRICS_FILE))) return false;
     const file = path.join(dir, REC_FILE);
+    if (!isOwnedPath(file, 'file')) return false;
     rotateIfNeeded(file); // rotate-before-append so the file never exceeds ~max + one line
     const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
-    fs.appendFileSync(file, line);
+    const fd = fs.openSync(
+      file,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | O_NOFOLLOW
+    );
+    try {
+      fs.writeSync(fd, line);
+    } finally {
+      fs.closeSync(fd);
+    }
     return true;
   } catch {
     return false;
