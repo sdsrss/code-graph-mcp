@@ -107,8 +107,15 @@ pub(super) fn arg_opt_i64(args: &serde_json::Value, key: &str) -> Result<Option<
 /// numeric arguments (audit 2026-09-02 P2-2). `args[key].as_bool().unwrap_or(d)`
 /// has exactly the numeric defect: `{"compact": "true"}` returned the full
 /// uncompacted envelope and `{"include_tests": 1}` dropped the tests, both with
-/// nothing in the response saying the argument had been discarded — the key IS
-/// declared, so `note_ignored_arguments` stays silent about it too.
+/// nothing in the response saying the argument had been discarded.
+///
+/// `note_ignored_arguments` stays silent about it either way, but for two
+/// different reasons — on the seven registry tools because the key IS declared,
+/// and on the six schema-less ones (`dependency_graph`, `find_dead_code`,
+/// `find_similar_code`, `find_http_route`, `trace_http_chain`, `rebuild_index`)
+/// because a tool with no published schema is skipped before
+/// `HONORED_UNDECLARED_ARGS` is consulted. The first cut of this comment gave
+/// only the first reason, which covers half the sites.
 ///
 /// Only `true`/`false` are accepted. `"true"` and `1` are NOT coerced: a
 /// coercion here would have to guess, and the numeric half already established

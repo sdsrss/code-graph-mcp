@@ -28,44 +28,102 @@ const ROTATE_MAX_BYTES = 1048576; // 1 MB
 const ROTATE_KEEP_BYTES = 524288; // 512 KB
 
 // Unix-only, atomic: refuse to traverse a final-component symlink on the open
-// itself. Undefined on Windows, where `refuseNonRegular` below is the only
-// layer — same split as the Rust `utils::owned`.
+// itself. Undefined on Windows, where the `lstat` / `fstat` checks below are the
+// only layer — same split as the Rust `utils::owned`. Each layer is pinned by
+// its own test (`refuses … with O_NOFOLLOW unavailable` covers the Windows
+// shape); a suite that only pins the pair lets either half be deleted green.
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 
-let warnedNonRegular = false;
+// Keyed by path, not a bare boolean: every hook is a one-shot process today, but
+// a module-global flag would silence the diagnostic for the SECOND project if
+// this is ever required from something long-lived.
+const warnedPaths = new Set();
+
+function warnNotOwned(p, why) {
+  if (warnedPaths.has(p)) return;
+  warnedPaths.add(p);
+  try {
+    process.stderr.write(`[code-graph] skipping adoption metrics: ${p} ${why}\n`);
+  } catch {
+    /* stderr closed → nothing to do */
+  }
+}
 
 /**
- * Reject anything at `p` that is not a regular file (or, for a directory, that
- * is a symlink). JS twin of Rust `utils::owned::refuse_non_regular` /
+ * Reject anything at `p` that is not the ordinary file/directory this module
+ * expects to own. JS twin of Rust `utils::owned::refuse_non_regular` /
  * `reject_symlinked_dir`: `.code-graph/` is ordinary repo content, so one
  * `git clone` can carry a symlink where this module expects its own file, and
  * `writeFileSync` / `appendFileSync` both follow it out of the project (audit
  * 2026-09-02 P1-1: a 1.2 MB file outside the tree truncated by the rotator).
+ *
+ * Symlink is tested FIRST so each rejection gets its own diagnostic, matching
+ * `reject_symlinked_dir`. The first cut tested `isDirectory()` first, which is
+ * false for a symlink-to-directory — so the symlink arm never ran, the distinct
+ * message was dead, and deleting the whole call changed nothing (pre-tag review,
+ * P3-1).
+ *
  * Absent is fine — the open will create it.
  * @param {string} p    absolute path
  * @param {'file'|'dir'} kind
+ * @param {fs.Stats} [known]  an lstat the caller already took, to avoid a second
  * @returns {boolean} true if `p` is safe to write
  */
-function isOwnedPath(p, kind) {
-  let st;
-  try {
-    st = fs.lstatSync(p);
-  } catch {
-    return true; // absent (or unreadable) → leave it to the real syscall
-  }
-  if (kind === 'dir' ? !st.isSymbolicLink() : st.isFile()) return true;
-  if (!warnedNonRegular) {
-    warnedNonRegular = true;
+function isOwnedPath(p, kind, known) {
+  let st = known;
+  if (!st) {
     try {
-      process.stderr.write(
-        `[code-graph] skipping adoption metrics: ${p} is not a regular file ` +
-          `(a symlink here would redirect the write outside the project)\n`
-      );
+      st = fs.lstatSync(p);
     } catch {
-      /* stderr closed → nothing to do */
+      return true; // absent (or unreadable) → leave it to the real syscall
     }
   }
+  if (st.isSymbolicLink()) {
+    warnNotOwned(p, 'is a symlink (following it would write outside the project)');
+    return false;
+  }
+  if (kind === 'dir' ? st.isDirectory() : st.isFile()) return true;
+  warnNotOwned(p, 'is not a regular file');
   return false;
+}
+
+/**
+ * Open `file` for writing only if the thing actually opened is a file this
+ * module owns. `fstat` on the returned descriptor — not `lstat` on the path —
+ * because that is the only check that describes the object the subsequent write
+ * lands on, closing the lstat→open window on the platforms where `O_NOFOLLOW`
+ * is 0.
+ *
+ * `nlink > 1` refuses a HARDLINK. `lstat` reports a hardlinked victim as a
+ * plain regular file and `O_NOFOLLOW` says nothing about one, so the symlink
+ * guard alone left the identical damage reachable — measured by the pre-tag
+ * review at 1,200,020 → 67 bytes, same as the symlink case. `git` cannot
+ * deliver a hardlink (its index stores no such mode) but `tar x` can.
+ *
+ * Callers must NOT pass `O_TRUNC`: truncation would happen on the open, before
+ * any of this could look. Truncate through the returned descriptor instead.
+ * @returns {number|null} an open fd the caller must close, or null if refused
+ */
+function openOwned(file, flags) {
+  const fd = fs.openSync(file, flags | O_NOFOLLOW);
+  let st;
+  try {
+    st = fs.fstatSync(fd);
+  } catch (e) {
+    fs.closeSync(fd);
+    throw e;
+  }
+  if (!st.isFile()) {
+    warnNotOwned(file, 'is not a regular file');
+    fs.closeSync(fd);
+    return null;
+  }
+  if (st.nlink > 1) {
+    warnNotOwned(file, 'has more than one hard link (the write would reach another path)');
+    fs.closeSync(fd);
+    return null;
+  }
+  return fd;
 }
 
 /**
@@ -83,11 +141,12 @@ function rotateIfNeeded(file) {
     const start = Math.max(0, buf.length - ROTATE_KEEP_BYTES);
     const nl = buf.indexOf(0x0a, start); // first newline at/after start
     const trimStart = nl >= 0 ? nl + 1 : start;
-    const fd = fs.openSync(
-      file,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | O_NOFOLLOW
-    );
+    // No O_TRUNC: it would empty the target on the open, before `openOwned`
+    // could refuse it. Truncate through the descriptor once it is vouched for.
+    const fd = openOwned(file, fs.constants.O_WRONLY);
+    if (fd === null) return;
     try {
+      fs.ftruncateSync(fd, 0);
       fs.writeSync(fd, buf.subarray(trimStart));
     } finally {
       fs.closeSync(fd);
@@ -117,7 +176,7 @@ function recordRecommendation(cwd, event = {}) {
     } catch {
       return false; // absent → not an indexed project
     }
-    if (!dirStat.isDirectory() || !isOwnedPath(dir, 'dir')) return false;
+    if (!isOwnedPath(dir, 'dir', dirStat)) return false;
     // Opt-in metrics silence for dev/dogfood checkouts: when the project marks
     // itself with `.code-graph/.no-metrics`, the tool's own hook/CLI runs (sims,
     // functionality testing) must not self-pollute its adoption metrics. Mirrors
@@ -127,10 +186,11 @@ function recordRecommendation(cwd, event = {}) {
     if (!isOwnedPath(file, 'file')) return false;
     rotateIfNeeded(file); // rotate-before-append so the file never exceeds ~max + one line
     const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
-    const fd = fs.openSync(
+    const fd = openOwned(
       file,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | O_NOFOLLOW
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND
     );
+    if (fd === null) return false;
     try {
       fs.writeSync(fd, line);
     } finally {

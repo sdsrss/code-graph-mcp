@@ -210,14 +210,18 @@ impl McpServer {
             )
         })?;
 
+        // Bound before the indexing side effects below, for the reason spelled
+        // out in `tool_get_ast_node`: a type rejection must not cost a full index
+        // pass first (pre-tag review P3-2).
+        let depth = arg_i64(args, "depth", 2)?.clamp(1, 10) as i32;
+        let compact = arg_bool(args, "compact", false)?;
+
         if !should_skip_indexing(args)? {
             self.ensure_indexed()?;
             // Edit-aware: file_path is required for this tool — post-edit
             // staleness is the canonical failure mode here.
             self.ensure_file_fresh_opt(Some(file_path))?;
         }
-        let depth = arg_i64(args, "depth", 2)?.clamp(1, 10) as i32;
-        let compact = arg_bool(args, "compact", false)?;
 
         // Check if file exists in index
         let file_nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;

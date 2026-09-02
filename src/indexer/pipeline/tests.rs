@@ -2057,6 +2057,130 @@ fn a_non_utf8_file_is_recorded_once_instead_of_re_diffing_forever() {
     );
 }
 
+/// Pre-tag review P2-2: the first cut of the branch above called `hash_file`,
+/// an INDEPENDENT second open, so a transient I/O failure on the first read
+/// (fd exhaustion under the rayon fan-out, EIO, a concurrent non-atomic writer)
+/// would fail read 1, succeed read 2, and record a `files` row whose hash
+/// matches disk — after the symbols had been purged. `compute_diff` then sees
+/// the file as settled and never re-offers it, so the purge is permanent. Under
+/// the old `Nothing` that case was self-healing.
+///
+/// Asserts the surviving contract: an unreadable file records NO identity and
+/// keeps whatever the index already knows, so the next run tries again.
+///
+/// This is the TRANSIENT case, forced through a test seam: the read fails while
+/// the file stays readable, so a second open — which is what the first cut did —
+/// succeeds and hands back a hash of content nobody validated. `mode 000` cannot
+/// stand in for it, because then BOTH opens fail and the fixed and broken
+/// versions behave identically (measured: the mutation stayed green until this
+/// seam existed).
+#[test]
+fn a_transient_read_failure_records_no_identity_and_keeps_its_symbols() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let src = project_dir.path().join("readable.ts");
+
+    fs::write(&src, "export function keeper() { return 1; }\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "keeper").unwrap().len(),
+        1,
+        "precondition: indexed while readable"
+    );
+    let hash_before = get_all_file_hashes(db.conn())
+        .unwrap()
+        .get("readable.ts")
+        .cloned()
+        .expect("precondition: a files row exists");
+
+    // New content, so a run that wrongly re-reads and records would record a
+    // DIFFERENT hash — otherwise the assertion below could not tell.
+    fs::write(&src, "export function keeper() { return 2; }\n").unwrap();
+    *super::index_files::FORCE_READ_FAILURE.lock().unwrap() = Some(src.clone());
+    let result = run_full_index(&db, project_dir.path(), None, None);
+    *super::index_files::FORCE_READ_FAILURE.lock().unwrap() = None;
+    let result = result.unwrap();
+
+    assert_eq!(
+        result.stats.files_skipped_read, 1,
+        "precondition: the seam really did fail the read"
+    );
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "keeper").unwrap().len(),
+        1,
+        "a transient read failure must NOT purge the file's symbols"
+    );
+    assert_eq!(
+        get_all_file_hashes(db.conn()).unwrap().get("readable.ts"),
+        Some(&hash_before),
+        "no identity may be recorded for bytes we never held: recording the hash of a \
+         SECOND read makes compute_diff treat the file as settled, so the purge above \
+         would never be undone"
+    );
+}
+
+/// The permanent-I/O-failure twin of the test above: nothing readable at all.
+///
+/// Unix-only: `mode 000` is how an unreadable file is produced here, and
+/// Windows ACLs do not answer to `set_permissions`. The branch under test is
+/// platform-independent, so covering it on one platform covers it.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_records_no_identity_and_keeps_its_symbols() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let src = project_dir.path().join("readable.ts");
+
+    fs::write(&src, "export function keeper() { return 1; }\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "keeper").unwrap().len(),
+        1,
+        "precondition: indexed while readable"
+    );
+    let hash_before = get_all_file_hashes(db.conn())
+        .unwrap()
+        .get("readable.ts")
+        .cloned()
+        .expect("precondition: a files row exists");
+
+    // Change the content AND make it unreadable, so a run that wrongly records
+    // an identity would record the NEW hash — distinguishable from the old one.
+    fs::write(&src, "export function keeper() { return 2; }\n").unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+    // Capability probe rather than a uid check: root (and some CI containers)
+    // read mode-000 files anyway, and a test that silently asserts nothing is
+    // worse than one that says why it stopped.
+    if fs::read(&src).is_ok() {
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("skipping: this process can read a mode-000 file, so the branch is unreachable");
+        return;
+    }
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap(); // so TempDir can clean up
+
+    assert_eq!(
+        result.stats.files_skipped_read, 1,
+        "precondition: the read really did fail"
+    );
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "keeper").unwrap().len(),
+        1,
+        "an unreadable file must NOT have its symbols purged — the failure is \
+         environmental and the next run may well succeed"
+    );
+    assert_eq!(
+        get_all_file_hashes(db.conn()).unwrap().get("readable.ts"),
+        Some(&hash_before),
+        "no identity may be recorded for bytes we never held; recording the \
+         current hash would make compute_diff treat the file as settled forever"
+    );
+}
+
 #[test]
 fn test_index_stats_default() {
     // IndexStats should implement Default

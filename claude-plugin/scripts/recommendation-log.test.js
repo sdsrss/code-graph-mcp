@@ -103,6 +103,58 @@ test('recordRecommendation refuses to write through a symlinked jsonl', (t) => {
   assert.match(fs.readFileSync(path.join(plain, '.code-graph', REC_FILE), 'utf8'), /"observe"/);
 });
 
+// Pre-tag review P2-3: `lstat` reports a hardlinked victim as a plain regular
+// file and `O_NOFOLLOW` has nothing to say about one, so the symlink guard alone
+// left the identical damage reachable — 1,200,020 → 67 bytes, measured. `git`
+// cannot deliver a hardlink (no such mode in its index) but `tar x` can, as can
+// anything with write access to `.code-graph/`.
+test('recordRecommendation refuses to write through a hardlinked jsonl', (t) => {
+  const cwd = tmpProject(t, true);
+  const victim = path.join(cwd, 'victim.conf');
+  const original = 'SECRET-HEADER-LINE\n' + 'x'.repeat(1_200_000) + '\n';
+  fs.writeFileSync(victim, original);
+  const link = path.join(cwd, '.code-graph', REC_FILE);
+  fs.linkSync(victim, link); // same inode, nlink === 2
+
+  assert.equal(recordRecommendation(cwd, { hook: 'read', action: 'observe' }), false);
+  assert.equal(fs.readFileSync(victim, 'utf8'), original, 'link target must be byte-identical');
+  assert.equal(fs.statSync(victim).size, original.length, 'the rotator must not have truncated it');
+});
+
+// Pins the `lstat`/`fstat` layer ALONE. The pair was load-bearing before this
+// test existed, but each half could be deleted with the suite still green
+// (pre-tag review P2-4) — and on Windows `O_NOFOLLOW` is undefined and falls
+// back to 0, so that half is all there is. Loading a copy with the constant
+// forced to 0 is how the Windows shape gets exercised on Linux.
+test('recordRecommendation refuses a symlink with O_NOFOLLOW unavailable (Windows shape)', (t) => {
+  const srcPath = require.resolve('./recommendation-log');
+  const src = fs.readFileSync(srcPath, 'utf8');
+  const NEEDLE = 'const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;';
+  // Vacuity floor: if the constant is ever renamed or reformatted, this test
+  // would silently load an UNMODIFIED module and pass while pinning nothing.
+  assert.ok(src.includes(NEEDLE), `recommendation-log.js no longer declares \`${NEEDLE}\` — this test would load an unmodified copy and assert nothing; update the needle.`);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rec-nofollow-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const modPath = path.join(dir, 'recommendation-log-nofollow0.js');
+  fs.writeFileSync(modPath, src.replace(NEEDLE, 'const O_NOFOLLOW = 0;'));
+  const { recordRecommendation: recordNoFollow } = require(modPath);
+
+  const cwd = tmpProject(t, true);
+  const victim = path.join(cwd, 'victim.conf');
+  const original = 'SECRET-HEADER-LINE\n' + 'x'.repeat(1_200_000) + '\n';
+  fs.writeFileSync(victim, original);
+  fs.symlinkSync(victim, path.join(cwd, '.code-graph', REC_FILE));
+
+  assert.equal(recordNoFollow(cwd, { hook: 'read', action: 'observe' }), false);
+  assert.equal(fs.readFileSync(victim, 'utf8'), original, 'link target must be byte-identical');
+
+  // Positive control on the SAME O_NOFOLLOW-less module: proves it did not
+  // simply stop writing everywhere.
+  const plain = tmpProject(t, true);
+  assert.equal(recordNoFollow(plain, { hook: 'read', action: 'observe' }), true);
+});
+
 test('recordRecommendation refuses a symlinked .code-graph directory', (t) => {
   const cwd = tmpProject(t, false);
   const outside = path.join(cwd, 'outside');

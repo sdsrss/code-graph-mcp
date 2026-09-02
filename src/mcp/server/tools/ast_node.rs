@@ -85,17 +85,23 @@ impl McpServer {
             .filter(|s| !s.trim().is_empty())
             .map(super::normalize_path_arg);
 
-        if !should_skip_indexing(args)? {
-            self.ensure_indexed()?;
-            self.ensure_file_fresh_opt(file_path_arg.as_deref())?;
-        }
-
+        // Bound BEFORE `ensure_indexed` / `ensure_file_fresh_opt`, which can run a
+        // full index pass and re-index a file — i.e. seconds of work and a write.
+        // Reading them afterwards meant `{"file_path": "x.ts", "compact": "true"}`
+        // paid for all of that and then failed on the type; validation this cheap
+        // belongs in front of the side effect, which is the rule `overview.rs`
+        // already states for its own numeric args (pre-tag review P3-2).
         let include_refs = arg_bool(args, "include_references", false)?;
         let include_tests = arg_bool(args, "include_tests", false)?;
         let include_impact = arg_bool(args, "include_impact", false)?;
         let include_similar = arg_bool(args, "include_similar", false)?;
         let similar_top_k = arg_i64(args, "similar_top_k", 5)?;
         let compact = arg_bool(args, "compact", false)?;
+
+        if !should_skip_indexing(args)? {
+            self.ensure_indexed()?;
+            self.ensure_file_fresh_opt(file_path_arg.as_deref())?;
+        }
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = arg_opt_i64(args, "node_id")? {

@@ -67,6 +67,12 @@ impl ErrKind {
             || err_msg.contains("must be an integer")
             || err_msg.contains("must be a non-negative integer")
             || err_msg.contains("must be a number")
+            // CON-15's BOOLEAN half, added one release later and initially left
+            // out of this list — so all 22 boolean rejections landed in `Other`,
+            // the bucket this arm exists to drain, and the misuse a model is most
+            // likely to make (`"true"` / `1`) was the one made invisible. Note
+            // "must be a number" does NOT cover it: "boolean" is not a substring.
+            || err_msg.contains("must be a boolean")
         {
             // Invalid parameter VALUE (bad enum / bad combination). Kept ahead of
             // EmptyInput so a wrong value isn't mistaken for a missing one.

@@ -251,6 +251,19 @@ pub struct DiffResult {
     pub deleted_files: Vec<String>,
 }
 
+/// Hash bytes already in memory.
+///
+/// Digest-identical to [`hash_file`] over the same content: the streaming form
+/// below folds in no length, path or chunk framing, so blake3 sees one byte
+/// sequence either way. That equality is what lets a caller which already holds
+/// a file's bytes record an identity `compute_diff` will compare equal on the
+/// next run — and it is pinned by `hash_bytes_matches_hash_file`, because a
+/// caller trusting it while it silently drifted would record hashes that never
+/// match, re-diffing the file forever.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 /// Hash a file using streaming blake3 (constant memory, handles large files).
 pub fn hash_file(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)?;
@@ -984,5 +997,32 @@ mod tests {
         assert!(!is_excluded_build_dir("src/target.rs"));
         assert!(!is_excluded_build_dir("src/vendoring.rs"));
         assert!(!is_excluded_build_dir("src/main.rs"));
+    }
+
+    /// `hash_bytes` exists so a caller holding a file's bytes can record an
+    /// identity that `compute_diff` — which hashes with `hash_file` — compares
+    /// equal on the next run. If the two ever disagreed, such a file would be
+    /// reported as changed forever, silently, which is the exact defect the
+    /// caller was added to fix. Sized past the 16 KiB streaming chunk so a
+    /// chunk-boundary difference would show.
+    #[test]
+    fn hash_bytes_matches_hash_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, bytes) in [
+            ("empty.bin", Vec::new()),
+            ("small.bin", b"fn main() {}\n".to_vec()),
+            // Invalid UTF-8 — the case the caller actually hashes.
+            ("latin1.c", b"int caf\xE9(void) { return 1; }\n".to_vec()),
+            ("multi-chunk.bin", (0..50_000u32).map(|i| i as u8).collect()),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, &bytes).unwrap();
+            assert_eq!(
+                hash_bytes(&bytes),
+                hash_file(&p).unwrap(),
+                "{name}: hash_bytes and hash_file disagree, so a recorded identity \
+                 would never match on the next scan"
+            );
+        }
     }
 }

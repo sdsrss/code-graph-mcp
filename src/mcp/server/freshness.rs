@@ -221,9 +221,17 @@ impl McpServer {
         // `unwrap_or(true)` because this wrapper returns a value, not a Result,
         // so it cannot propagate the type error the tool arm raises for
         // `{"skip_indexing": "true"}`. A value we cannot read is not permission
-        // to do the work the flag exists to forbid, so the unreadable case skips
-        // too — and the caller still gets the error, from the arm that can
-        // return one.
+        // to do the work the flag exists to forbid, so the unreadable case skips.
+        //
+        // The `Err` arm is unreachable TODAY, and only because of a property of
+        // the callers, not of this function: all ten `RESULT_REFRESH_TOOLS`
+        // dispatch to handlers that call `should_skip_indexing(args)?`
+        // unconditionally, and `handle_tool` only reaches this wrapper on `Ok`.
+        // The moment a tool joins that list without reading the flag, this branch
+        // starts returning an UNREFRESHED result with neither a `freshness`
+        // disclosure nor an error. Skipping is the safer of the two silent
+        // outcomes, which is why it is written this way rather than defaulting to
+        // false — but the real guarantee lives in those ten handlers.
         if super::helpers::should_skip_indexing(args).unwrap_or(true) {
             return value;
         }

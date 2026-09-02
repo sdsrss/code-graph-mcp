@@ -235,6 +235,36 @@ fn is_fk_constraint_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("FOREIGN KEY constraint failed")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot seam letting a test drive the REAL FK-recovery arm.
+    ///
+    /// The arm cannot be reached by black-box injection — the original in-flight
+    /// FK race needs orphan rows that `get_inbound_cross_file_edges` filters out
+    /// — so the arm shipped with no end-to-end coverage at all, and the test
+    /// named after it re-implemented the recovery inline: DELETE, commit, then
+    /// rebuild, a verbatim copy of the shape the arm was fixed AWAY from. Both
+    /// halves of that are the failure: reverting the production call left the
+    /// suite green, and the fixture preserved the bug as its own reference
+    /// implementation (pre-tag review P2-4).
+    ///
+    /// Consumed before the incremental runs, so the committed index the arm
+    /// wipes is the pre-existing one — which is what lets a test make the
+    /// rebuilt index differ and catch a reader that is wrongly seeing it.
+    static FORCE_FK_ERROR_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// False in every non-test build, so the branch it guards folds away.
+#[cfg(not(test))]
+fn take_forced_fk_error() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_forced_fk_error() -> bool {
+    FORCE_FK_ERROR_ONCE.with(|f| f.replace(false))
+}
+
 /// Whether an indexing error is "another connection holds the write path right
 /// now", as opposed to a real failure.
 ///
@@ -1646,8 +1676,11 @@ impl McpServer {
         drop(cache_guard); // Release lock during I/O
 
         let write_db = self.write_db();
-        let outcome =
-            run_incremental_index_cached(&write_db, project_root, model, cache.as_ref(), None);
+        let outcome = if take_forced_fk_error() {
+            Err(anyhow!("FOREIGN KEY constraint failed"))
+        } else {
+            run_incremental_index_cached(&write_db, project_root, model, cache.as_ref(), None)
+        };
         // Release the promoted-DB handle BEFORE any of the bookkeeping locks
         // below. `write_db()` may hold the `promoted_db` mutex (level 7 in this
         // type's lock ordering) and every lock touched from here down —
@@ -3640,6 +3673,19 @@ function handleLogin(req: Request) {
                     "{tool}.{arg}: {hostile_value} where a boolean belongs must be refused by name; \
                      got isError={is_error} text={text}"
                 );
+                // The rejection must also be BUCKETED as caller misuse. Asserting
+                // only the text is how the first cut shipped with every one of
+                // these landing in `other` — `ErrKind::classify` had the numeric
+                // phrases and not this one, so the bucket whose whole job is "the
+                // model is calling this tool wrong" missed the misuse the error
+                // had just made visible (pre-tag review P2-1). A table that pins
+                // only the property already passing is not covering the axis.
+                assert_eq!(
+                    crate::mcp::metrics::ErrKind::classify(&text).as_str(),
+                    "bad_param",
+                    "{tool}.{arg}: a boolean type rejection must classify as bad_param, not \
+                     land in the catch-all bucket; text={text}"
+                );
             }
 
             // Negative control on the same row: a well-typed flag must not trip the
@@ -4749,23 +4795,135 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// Drives the REAL FK-recovery arm, which had no end-to-end coverage: the
+    /// test below re-implements the recovery inline, so reverting
+    /// `self.wipe_and_rebuild(...)` at the arm's call site back to the old
+    /// DELETE-commit-then-rebuild left the whole suite green — the one mutation
+    /// nothing caught (pre-tag review P2-4).
+    ///
+    /// Asserts the property the shape buys, from the only place it is
+    /// observable: an independent read-only connection sampled on every progress
+    /// event, i.e. from inside the still-open transaction. Same two vacuity
+    /// traps as the direct `wipe_and_rebuild` test, avoided the same way — 60
+    /// files so the rebuild spans several progress events, and a rebuild that
+    /// SHRINKS the index so a reader wrongly seeing the new one reads a
+    /// different number than a reader correctly seeing the old.
+    #[test]
+    fn the_fk_recovery_arm_never_exposes_an_empty_index_to_another_reader() {
+        use std::sync::Arc;
+
+        let project_dir = TempDir::new().unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                project_dir.path().join(format!("f{i}.ts")),
+                format!("export function fn{i}() {{ return {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let db_path = project_dir.path().join(CODE_GRAPH_DIR).join("index.db");
+        let count_nodes = |path: &Path| -> i64 {
+            let c = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("an independent reader must be able to open the DB mid-rebuild");
+            c.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = count_nodes(&db_path);
+        assert!(before > 0, "precondition: the old index has nodes");
+
+        // Shrink the tree so the rebuilt index differs from the committed one.
+        for i in 0..30 {
+            std::fs::remove_file(project_dir.path().join(format!("f{i}.ts"))).unwrap();
+        }
+
+        struct SampleEveryProgress {
+            db_path: std::path::PathBuf,
+            samples: Arc<Mutex<Vec<i64>>>,
+        }
+        impl Write for SampleEveryProgress {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if String::from_utf8_lossy(buf).contains("notifications/progress") {
+                    let c = rusqlite::Connection::open_with_flags(
+                        &self.db_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .expect("independent reader must not be locked out mid-rebuild");
+                    let n: i64 = c
+                        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                        .unwrap();
+                    lock_or_recover(&self.samples, "samples").push(n);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let samples: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        server.set_notify_writer(Box::new(SampleEveryProgress {
+            db_path: db_path.clone(),
+            samples: Arc::clone(&samples),
+        }));
+
+        // Consumed before the incremental runs, so the arm wipes the index that
+        // is committed right now — the 60-file one.
+        FORCE_FK_ERROR_ONCE.with(|f| f.set(true));
+        server
+            .run_incremental_with_cache_restore(project_dir.path(), None)
+            .expect("the FK arm must recover, not propagate");
+
+        let samples = lock_or_recover(&samples, "samples").clone();
+        assert!(
+            samples.len() >= 2,
+            "only {} progress sample(s) — the rebuild did not span multiple events, so the \
+             assertion below would be vacuous",
+            samples.len()
+        );
+        assert!(
+            samples.iter().all(|&n| n == before),
+            "an independent reader saw {samples:?} nodes during the FK-recovery rebuild, but \
+             the committed index had {before} throughout: the wipe is visible outside its \
+             transaction"
+        );
+        let after = count_nodes(&db_path);
+        assert!(
+            after > 0 && after < before,
+            "after commit the reader must see the SMALLER rebuilt index ({after}) rather than \
+             the old one ({before}) — otherwise the samples above proved nothing"
+        );
+        assert!(
+            !server.indexing.pending_incremental.load(Ordering::Acquire),
+            "a completed full rebuild captured on-disk state, so no incremental stays owed"
+        );
+    }
+
+    /// Covers the truncate→rebuild RECOVERY MECHANISM with injected stale data.
+    /// It does its own `DELETE FROM files` rather than driving the FK arm, so it
+    /// says nothing about the arm's transaction shape — that is
+    /// `the_fk_recovery_arm_never_exposes_an_empty_index_to_another_reader`
+    /// above. An earlier version of this comment claimed removing the
+    /// production `DELETE FROM files` would fail this test; it would not, and
+    /// the FK branch no longer contains that statement at all.
     #[test]
     fn test_fk_fallback_truncate_purges_stale_state_and_rebuild_recovers() {
         // Regression for v0.11.x-v0.14.4 "FOREIGN KEY constraint failed" bubbling
         // to agents via project_map / module_overview / semantic_code_search.
-        // The fix (mod.rs:987) truncates `files` before re-running run_full_index,
-        // because run_full_index on its own does per-file upsert — orphan rows
-        // from the failed incremental survive and re-trigger FK on retry.
+        // Recovery wipes `files` before re-running run_full_index, because
+        // run_full_index on its own does per-file upsert — orphan rows from the
+        // failed incremental survive and re-trigger FK on retry.
         //
-        // This test exercises the recovery mechanism (truncate → full index from
-        // clean) with injected stale data representing the kind of dirty state
-        // the FK branch exists to recover from: phantom files with no on-disk
-        // counterpart, plus their nodes and edges. We cannot reproduce the
-        // original in-flight FK race via black-box injection (internal JOINs in
-        // get_inbound_cross_file_edges filter out orphan rows), so this covers
-        // the recovery path itself — if anyone removes the `DELETE FROM files`
-        // from mod.rs:987's FK branch, this test fails when the stale rows
-        // survive rebuild.
+        // Injected stale data stands in for the dirty state the FK branch exists
+        // to recover from: phantom files with no on-disk counterpart, plus their
+        // nodes and edges. The original in-flight FK race is not reproducible by
+        // black-box injection (internal JOINs in get_inbound_cross_file_edges
+        // filter out orphan rows), which is why the arm itself is driven through
+        // a test seam in the sibling test rather than from here.
         let project_dir = TempDir::new().unwrap();
         std::fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
         std::fs::write(

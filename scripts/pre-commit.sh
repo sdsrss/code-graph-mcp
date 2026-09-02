@@ -45,8 +45,14 @@ for vf in "${VERSION_FILES[@]}"; do
   # `grep -F` without `-q`, output discarded: `-q` exits on the first match, and
   # once "$staged_files" outgrows the pipe buffer `echo` takes SIGPIPE, which
   # `set -o pipefail` turns into a failed pipeline — inverting the test exactly
-  # when it matched. Measured: correct at a few KB, wrong at 4.8 MB (~100k staged
-  # paths). Same shape as the two probes in §3/§4 below.
+  # when it matched. Same shape as the two probes in §3/§4 below.
+  #
+  # Onset is far lower than it looks: measured green at 500 staged paths (22 KB)
+  # and INVERTED (exit 141) at 1,000 (44 KB) — an ordinary vendored-directory or
+  # generated-code commit, so this gate was plausibly already dark in practice.
+  # And the MATCH POSITION decides it: with the match on the last line `grep -q`
+  # must read to EOF and stays correct at any size, which is why a casual
+  # reproduction at multi-MB can show nothing and conclude there is no bug.
   if echo "$staged_files" | grep -F "$vf" >/dev/null; then
     version_staged=true
     break
@@ -171,25 +177,51 @@ if [ "$rs_staged" -gt 0 ] || [ "$cargo_staged" -gt 0 ]; then
   # pushing straight to main means "main is red" (v0.128.0 instance; audit
   # 2026-09-02 P2-7).
   #
-  # Conditional, not unconditional: candle is a multi-minute first build, and
-  # paying it on every Rust commit would be the kind of gate people disable. The
-  # trigger set is where cfg-gated code actually lives plus the dependency files
-  # that can break it — and, as a catch-all, any staged diff that introduces or
-  # touches a `cfg(feature` line anywhere.
+  # Conditional, but the condition is "could this commit touch embed-gated code",
+  # NOT "is it in src/embedding/". The first cut used only the path prefix plus a
+  # `cfg(feature` scan of a `-U0` diff, and pre-tag review showed that misses the
+  # majority of the gated code: 17 files outside src/embedding/ carry
+  # `embed-model` gating (src/mcp/server/mod.rs alone has 11), and an edit to a
+  # line INSIDE such a block never puts the attribute line in a -U0 diff. Both
+  # Rust commits of the batch that added this gate evaluated false.
+  #
+  # So leg 3 asks the question directly: does any staged .rs file CONTAIN
+  # `embed-model` gating? The original objection to a broad trigger was that
+  # "candle is a multi-minute build" — true cold, but measured warm on this repo
+  # at 7.6s for the whole `clippy --features embed-model --all-targets` leg. A
+  # 7.6s gate does not get disabled; a gate that misses most of what it guards is
+  # already disabled.
   embed_touched=false
   if echo "$staged_files" | grep -E '^(src/embedding/|Cargo\.(toml|lock))' >/dev/null; then
     embed_touched=true
   else
     # Captured, then matched in-shell — the strictest form of the same fix the
-    # `grep` probes above use. `git diff | grep -q` is a pipefail trap that only
-    # bites at scale: grep -q exits on the FIRST match, and once the diff outgrows
-    # the pipe buffer git is still writing, takes SIGPIPE, and `set -o pipefail`
-    # reports the whole pipeline as failed — flipping this flag OFF exactly when
-    # it fired. Measured: correct at a few KB, wrong 3/3 at 2.7 MB. A gate that
-    # silently stops gating on big commits is worse than no gate.
-    staged_diff=$("${git_clean[@]}" git diff --cached -U0 || true)
+    # `grep` probes above use. `git diff | grep -q` would be the same pipefail
+    # trap: `-q` exits on the first match, git upstream takes SIGPIPE once the
+    # diff outgrows the pipe buffer, and pipefail reports the pipeline as failed,
+    # flipping this flag OFF exactly when it fired. Matching the captured string
+    # in-shell has no pipe and no early exit. (`[[ == *lit* ]]` is linear —
+    # measured ~7 ms/MB, 432 ms on a 60 MB diff — so this is not a cost.)
+    #
+    # `|| true` is deliberately NOT used: a `git diff` that fails would yield an
+    # empty string, no match, and a silently un-gated commit — the exact shape
+    # this section condemns. A failure here fails the hook instead.
+    staged_diff=$("${git_clean[@]}" git diff --cached -U0)
     if [[ $staged_diff == *"cfg(feature"* ]]; then
       embed_touched=true
+    else
+      # Leg 3: staged .rs files whose CONTENT is embed-gated, read from the
+      # staged blob so an unstaged edit cannot change the verdict.
+      while IFS= read -r f; do
+        case "$f" in
+          *.rs) ;;
+          *) continue ;;
+        esac
+        if git show ":$f" 2>/dev/null | grep -F 'embed-model' >/dev/null; then
+          embed_touched=true
+          break
+        fi
+      done <<< "$staged_files"
     fi
   fi
   if $embed_touched; then
@@ -203,15 +235,31 @@ if [ "$rs_staged" -gt 0 ] || [ "$cargo_staged" -gt 0 ]; then
 fi
 
 # ── 4. Rust guards over NON-Rust files ───────────────────────
-# `tests/hardening.rs` and `tests/doc_cli_alignment.rs` read README.md,
-# CHANGELOG.md, .github/workflows/*, this very hook, the plugin templates/skills/
-# agents and sync-versions.js. Section 3 only fires on staged `.rs`/`Cargo.*`, so
-# a yml-only or README-only commit ran NONE of them locally — the guards that
-# exist precisely to catch edits to those files were the ones that did not run
-# (audit 2026-09-02 P2-8). Skipped when section 3 already ran: its `cargo test`
-# is a superset.
+# `tests/hardening.rs` and `tests/doc_cli_alignment.rs` read — and in three cases
+# EXECUTE under node — files that are not Rust: README.md, .github/workflows/*,
+# this very hook, the plugin templates/skills/agents, and every `*.js` /
+# `*.test.js` under `claude-plugin/scripts/` and `scripts/`. Section 3 only fires
+# on staged `.rs`/`Cargo.*`, so a yml-only or README-only commit ran NONE of them
+# locally — the guards that exist precisely to catch edits to those files were
+# the ones that did not run (audit 2026-09-02 P2-8). Skipped when section 3
+# already ran: its `cargo test` is a superset.
+#
+# The first cut of this list named only `scripts/sync-versions.js` and the
+# plugin templates, which left the two script trees uncovered — and pre-tag
+# review replayed it against this gate's OWN batch: the security commit
+# (`claude-plugin/scripts/recommendation-log.js`) did not trigger section 4. The
+# guard sites that were uncovered: hardening.rs:625 runs `project-root.js` under
+# node, doc_cli_alignment.rs:285 runs `adopt.js` to render the shipped CLAUDE.md
+# block, hardening.rs:1545 walks both trees for `*.test.js`, and
+# doc_cli_alignment.rs:789 walks both for every `*.js` (the README env-var
+# table). Hence `(claude-plugin/)?scripts/` rather than two named files.
+#
+# `CHANGELOG.md` is deliberately NOT here: `grep -rn CHANGELOG` over both guard
+# files returns nothing, so listing it only bought a full `cargo test` build on
+# every CHANGELOG-only commit. It was in the first cut, with a comment claiming
+# the guards read it.
 if [ "$rs_staged" -eq 0 ] && [ "$cargo_staged" -eq 0 ] && \
-   echo "$staged_files" | grep -E '^(\.github/|README\.md|CHANGELOG\.md|scripts/pre-commit\.sh|scripts/sync-versions\.js|claude-plugin/(templates|skills|agents)/|\.claude-plugin/)' >/dev/null; then
+   echo "$staged_files" | grep -E '^(\.github/|README\.md|(claude-plugin/)?scripts/|claude-plugin/(templates|skills|agents)/|\.claude-plugin/)' >/dev/null; then
   echo "Running Rust guards over non-Rust files..."
   if ! "${git_clean[@]}" cargo test --quiet --test hardening --test doc_cli_alignment 2>&1; then
     echo "❌ hardening / doc_cli_alignment guards failed"

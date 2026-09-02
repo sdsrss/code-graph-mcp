@@ -152,10 +152,20 @@ struct SkipCounters {
 /// changed on every single run and `ensure_file_indexed` re-ran the whole
 /// pipeline on every query touching it (indexing audit 2026-08-02 IDX-1).
 ///
-/// Read and hash failures deliberately do NOT land here: those are the
-/// transient, environmental failures (a permission blip, a file being rewritten
-/// under us), and purging a file's symbols because one read failed is the same
-/// destructive-on-transient-state mistake the `<external>` exemption exists for.
+/// A file whose bytes cannot be READ lands here only when the failure is an
+/// encoding one — the bytes arrived, they are simply not UTF-8 (a Latin-1 source
+/// in a legacy C/C++/Java tree). That case is permanent, not environmental, so
+/// leaving it out meant the file re-diffed on every run forever and its
+/// pre-re-encode symbols were never purged.
+///
+/// I/O failures still do NOT land here: a permission blip, a file rewritten
+/// under us, a descriptor exhausted mid-scan. Purging a file's symbols because
+/// one read failed is the same destructive-on-transient-state mistake the
+/// `<external>` exemption exists for — and worse here, because recording a hash
+/// makes `compute_diff` treat the file as settled, so the purge would never be
+/// undone. That is why `pre_parse_batch` derives the encoding verdict and the
+/// recorded hash from ONE read: the two cannot then disagree about which bytes
+/// they describe.
 struct SkippedFile {
     rel_path: String,
     hash: String,
@@ -171,9 +181,42 @@ struct PreParsed {
     skipped: Vec<SkippedFile>,
 }
 
+/// Test seam: makes the source read fail for ONE absolute path while the file
+/// itself stays perfectly readable.
+///
+/// That interleaving — read 1 fails, a second open would have succeeded — is the
+/// only thing separating "derive the encoding verdict and the recorded hash from
+/// one read" from "derive them from two", and a real transient failure is a race
+/// that cannot be scheduled. Without the seam the fix for that data-loss defect
+/// would ship with no guard at all, which is exactly how the defect arrived
+/// (pre-tag review P2-2). Keyed on the absolute path, so a parallel test in
+/// another temp dir cannot collide.
+#[cfg(test)]
+pub(super) static FORCE_READ_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn read_source_bytes(abs_path: &Path) -> std::io::Result<Vec<u8>> {
+    let forced = FORCE_READ_FAILURE
+        .lock()
+        .map(|g| g.as_deref() == Some(abs_path))
+        .unwrap_or(false);
+    if forced {
+        return Err(std::io::Error::other("forced read failure (test seam)"));
+    }
+    std::fs::read(abs_path)
+}
+
+#[cfg(not(test))]
+fn read_source_bytes(abs_path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(abs_path)
+}
+
 /// One file's Phase 1a verdict. `Nothing` covers the skips we must not act on
-/// (unknown language, read error, hash error) — the file keeps whatever the
-/// index already knows about it.
+/// (unknown language, I/O read failure) — the file keeps whatever the index
+/// already knows about it and stays in the changed set, so the next run tries
+/// again. A non-UTF-8 file is NOT one of these: its bytes were read, so it has a
+/// knowable identity and lands in `Skipped` (see [`SkippedFile`]).
 enum PreParseOutcome {
     Parsed(Box<FilePreParsed>),
     Skipped(SkippedFile),
@@ -239,33 +282,62 @@ fn pre_parse_batch(
                 }
             }
 
-            let source = match std::fs::read_to_string(&abs_path) {
-                Ok(s) => s,
+            // Read as BYTES, then decode — so the encoding verdict and the hash we
+            // record come from the SAME read and cannot describe different content.
+            //
+            // The first cut used `read_to_string` and, on failure, `hash_file`,
+            // which is an independent second `File::open` (merkle.rs). Its comment
+            // claimed that "succeeds exactly where the failure was an encoding one";
+            // it does not — it succeeds wherever the bytes are readable at that
+            // later moment, a strictly larger set. So a TRANSIENT first-read failure
+            // (fd exhaustion under this rayon fan-out, an EIO blip, a concurrent
+            // non-atomic writer caught mid-multibyte) would fail read 1, succeed
+            // read 2, and record a `files` row whose hash matches what is on disk —
+            // after `buffer_then_delete_files` had already purged the file's
+            // symbols. `compute_diff` then sees it as unchanged and never re-offers
+            // it, so the symbols stay gone until the content changes again or
+            // INDEX_VERSION moves. Under the old `Nothing` that case was
+            // self-healing (pre-tag review P2-2).
+            //
+            // One read makes the two agree by construction: an identity is recorded
+            // only for bytes actually held.
+            let bytes = match read_source_bytes(&abs_path) {
+                Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("Skipping file {}: {}", rel_path, e);
                     counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                    // Genuinely unreadable — deleted mid-scan, EACCES, EIO. No bytes
+                    // in hand, so no identity can honestly be claimed: keep the old
+                    // `Nothing` and let the file re-diff until a read succeeds.
+                    return PreParseOutcome::Nothing;
+                }
+            };
+            let source = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping file {}: not valid UTF-8 ({})",
+                        rel_path,
+                        e.utf8_error()
+                    );
+                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
                     // Same reasoning as the parse-failure branch below: the file
-                    // exists and we know which bytes we are declining, so record
-                    // the identity. Without it a Latin-1 source (legacy C/C++/Java
-                    // trees) was listed as changed on EVERY run forever, and
-                    // symbols indexed before the file stopped being UTF-8 were
+                    // exists and we hold exactly the bytes we are declining, so
+                    // record the identity. Without it a Latin-1 source (legacy
+                    // C/C++/Java trees) was listed as changed on EVERY run forever,
+                    // and symbols indexed before the file stopped being UTF-8 were
                     // never purged (audit 2026-09-02 P2-1).
                     //
-                    // `hash_file` re-reads as BYTES, so it succeeds exactly where
-                    // the failure was an encoding one. A genuinely unreadable file
-                    // (deleted mid-scan, EACCES) fails here too and keeps the old
-                    // `Nothing` — recording a hash we could not compute would be
-                    // the wrong claim.
-                    let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
-                    return match known_hash {
-                        Some(hash) => PreParseOutcome::Skipped(SkippedFile {
-                            rel_path: rel_path.clone(),
-                            hash,
-                            last_modified,
-                            language: language.to_string(),
-                        }),
-                        None => PreParseOutcome::Nothing,
-                    };
+                    // Hashed from `e.as_bytes()` rather than `provided_hash`: the
+                    // scan's hash was taken earlier and may already describe
+                    // different content, which is the same disagreement this branch
+                    // exists to avoid.
+                    return PreParseOutcome::Skipped(SkippedFile {
+                        rel_path: rel_path.clone(),
+                        hash: crate::indexer::merkle::hash_bytes(e.as_bytes()),
+                        last_modified,
+                        language: language.to_string(),
+                    });
                 }
             };
 
