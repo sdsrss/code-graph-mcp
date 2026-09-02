@@ -3,7 +3,7 @@ use super::python_modules::build_python_module_map;
 use super::*;
 use crate::domain::REL_CALLS;
 use crate::storage::queries::{
-    get_edges_from, get_import_tree, get_nodes_by_file_path, get_nodes_by_name,
+    get_all_file_hashes, get_edges_from, get_import_tree, get_nodes_by_file_path, get_nodes_by_name,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -2000,6 +2000,61 @@ fn test_index_stats_skipped_parse_error() {
     assert_eq!(result.stats.files_skipped_parse, 0);
     assert_eq!(result.stats.files_skipped_read, 0);
     assert_eq!(result.stats.files_skipped_hash, 0);
+}
+
+/// Audit 2026-09-02 P2-1: a file `read_to_string` rejects (Latin-1 source — the
+/// common shape in legacy C/C++/Java trees) returned `PreParseOutcome::Nothing`,
+/// so NO `files` row was ever recorded. The parse-failure branch four lines
+/// below already recorded a `SkippedFile` precisely so the file stops re-diffing
+/// and its stale symbols go away; the read-failure branch did neither.
+///
+/// Two consequences, both asserted here: the file is listed as changed on every
+/// single run forever, and symbols indexed while it was still UTF-8 outlive the
+/// change that made it unreadable.
+#[test]
+fn a_non_utf8_file_is_recorded_once_instead_of_re_diffing_forever() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let legacy = project_dir.path().join("legacy.c");
+
+    // Phase 1: valid UTF-8, indexed normally.
+    fs::write(&legacy, "int caf\u{e9}_count(void) { return 1; }\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "café_count").unwrap().len(),
+        1,
+        "precondition: the symbol is indexed while the file is still UTF-8"
+    );
+
+    // Phase 2: re-encoded to Latin-1 — same bytes semantically, invalid UTF-8.
+    // 0xE9 is a lone continuation byte, exactly what `read_to_string` rejects.
+    fs::write(&legacy, b"int caf\xE9_count(void) { return 1; }\n").unwrap();
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.stats.files_skipped_read, 1,
+        "precondition: the read really did fail"
+    );
+
+    // The stale symbol must be gone: the file's current content has no symbols
+    // this indexer can see, and answering queries with the old ones is wrong.
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "café_count").unwrap().len(),
+        0,
+        "symbols from the pre-Latin-1 revision must be purged"
+    );
+
+    // And the identity must be on record, so the next run diffs it as unchanged
+    // rather than re-reading and re-warning about it forever.
+    let hashes = get_all_file_hashes(db.conn()).unwrap();
+    let recorded = hashes
+        .get("legacy.c")
+        .expect("an unreadable-but-present file still needs a `files` row");
+    assert_eq!(
+        *recorded,
+        crate::indexer::merkle::hash_file(&legacy).unwrap(),
+        "the recorded hash must be the file's real content hash"
+    );
 }
 
 #[test]

@@ -244,7 +244,28 @@ fn pre_parse_batch(
                 Err(e) => {
                     tracing::warn!("Skipping file {}: {}", rel_path, e);
                     counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    return PreParseOutcome::Nothing;
+                    // Same reasoning as the parse-failure branch below: the file
+                    // exists and we know which bytes we are declining, so record
+                    // the identity. Without it a Latin-1 source (legacy C/C++/Java
+                    // trees) was listed as changed on EVERY run forever, and
+                    // symbols indexed before the file stopped being UTF-8 were
+                    // never purged (audit 2026-09-02 P2-1).
+                    //
+                    // `hash_file` re-reads as BYTES, so it succeeds exactly where
+                    // the failure was an encoding one. A genuinely unreadable file
+                    // (deleted mid-scan, EACCES) fails here too and keeps the old
+                    // `Nothing` — recording a hash we could not compute would be
+                    // the wrong claim.
+                    let known_hash = provided_hash.or_else(|| hash_file(&abs_path).ok());
+                    return match known_hash {
+                        Some(hash) => PreParseOutcome::Skipped(SkippedFile {
+                            rel_path: rel_path.clone(),
+                            hash,
+                            last_modified,
+                            language: language.to_string(),
+                        }),
+                        None => PreParseOutcome::Nothing,
+                    };
                 }
             };
 
