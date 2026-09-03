@@ -51,7 +51,7 @@ impl McpServer {
         // and pre-tag review caught this one sitting on the wrong side of it: a
         // `centrality_limit` sent without the flag was still swallowed, which is
         // precisely what the sibling comment says must not happen.
-        let centrality_limit = arg_u64(args, "centrality_limit", 10)?.clamp(1, 100) as usize;
+        let centrality_limit = arg_clamped(args, "centrality_limit", "project_map", 10)? as usize;
 
         if !should_skip_indexing(args)? {
             self.ensure_indexed()?;

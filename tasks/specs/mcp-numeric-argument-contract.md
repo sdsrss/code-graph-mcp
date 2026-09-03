@@ -84,3 +84,10 @@ revision: 1
   由「未调查」变为「已确认下游已限界」。
 - r3（2026-09-03）：Q1 裁决，拆 A/B 两批。本批 = 批 A（handler 行为，无 description 改动，
   不触发 routing-bench 前置）。status 仍 draft——批 B 未做，spec 未实现完。
+- r4（2026-09-03）：**批 A 完成**（`66ea53c` 负数统一 + 本次 clamp 披露）。
+  success-criteria 2 与 3 达成，5 的本地部分达成（bench 那项属批 B）。
+  实现中一处设计被守卫推翻并订正：`arg_clamped` 初版签名把 tool 放在 key 之前，
+  而 `tests/hardening.rs` 的两个源码扫描守卫都把 `args, ` 之后的第一个字符串当参数名——
+  于是工具名被当成了未声明参数。改签名顺序（而不是教两个守卫认新形状），
+  理由记在 `arg_clamped` 的 doc 里。
+  status 仍 draft：批 B（description 范围文字 + CON-13）未做。

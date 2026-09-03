@@ -31,7 +31,7 @@ impl McpServer {
         // `deps_direction` used to be. Bind them here so the check is unconditional.
         // Forwarded verbatim as `dependency_graph`'s `depth`, which clamps it to
         // 1..=10 — so this argument's effective range is set one tool over.
-        let deps_depth = arg_u64(args, "deps_depth", 2)? as i64;
+        let deps_depth = arg_clamped(args, "deps_depth", "module_overview", 2)? as i64;
         let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
 
         if !should_skip_indexing(args)? {

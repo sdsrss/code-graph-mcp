@@ -107,7 +107,7 @@ impl McpServer {
                     direction_raw
                 )
             })?;
-        let depth = arg_u64(args, "depth", 3)?.clamp(1, 20) as i32;
+        let depth = arg_clamped(args, "depth", "get_call_graph", 3)? as i32;
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact
         // path" and silently returns no edges. Separator-normalized at entry

@@ -37,7 +37,7 @@ impl McpServer {
             .filter(|s| !s.is_empty());
         let returns_filter = args["returns"].as_str();
         let params_filter = args["params"].as_str();
-        let limit = arg_u64(args, "limit", 20)?.clamp(1, 100) as usize;
+        let limit = arg_clamped(args, "limit", "ast_search", 20)? as usize;
 
         let has_filters =
             type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();

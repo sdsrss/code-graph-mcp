@@ -29,10 +29,9 @@ impl McpServer {
         // `limit` is the documented alias for `top_k`; whichever the caller sent is
         // type-checked (CON-15), and sending neither still means 20.
         let top_k = match &args["top_k"] {
-            serde_json::Value::Null => arg_u64(args, "limit", 20)?,
-            _ => arg_u64(args, "top_k", 20)?,
-        }
-        .clamp(1, 100) as i64;
+            serde_json::Value::Null => arg_clamped(args, "limit", "semantic_code_search", 20)?,
+            _ => arg_clamped(args, "top_k", "semantic_code_search", 20)?,
+        } as i64;
         let node_type_filter = args["node_type"].as_str();
         let compact = arg_bool(args, "compact", false)?;
 

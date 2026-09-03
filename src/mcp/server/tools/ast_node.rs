@@ -95,7 +95,7 @@ impl McpServer {
         let include_tests = arg_bool(args, "include_tests", false)?;
         let include_impact = arg_bool(args, "include_impact", false)?;
         let include_similar = arg_bool(args, "include_similar", false)?;
-        let similar_top_k = arg_u64(args, "similar_top_k", 5)? as i64;
+        let similar_top_k = arg_clamped(args, "similar_top_k", "get_ast_node", 5)? as i64;
         let compact = arg_bool(args, "compact", false)?;
 
         if !should_skip_indexing(args)? {
@@ -106,7 +106,7 @@ impl McpServer {
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = arg_opt_i64(args, "node_id")? {
             // When called with node_id, default context_lines=3
-            let ctx = arg_u64(args, "context_lines", 3)?.clamp(0, 100) as usize;
+            let ctx = arg_clamped(args, "context_lines", "get_ast_node", 3)? as usize;
             // CON-10: this branch used to skip the refresh entirely, reasoning
             // that a node_id lookup "has no path to refresh against" — but the
             // row it is about to read carries the path. With context_lines
@@ -158,7 +158,7 @@ impl McpServer {
             return Ok(out);
         }
 
-        let context_lines = arg_u64(args, "context_lines", 0)?.clamp(0, 100) as usize;
+        let context_lines = arg_clamped(args, "context_lines", "get_ast_node", 0)? as usize;
 
         // Empty/whitespace-only symbol_name behaves like absent — prevents
         // "Symbol '' not found" and accidental fuzzy hits on the only candidate.

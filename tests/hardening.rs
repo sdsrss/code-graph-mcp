@@ -2361,7 +2361,12 @@ fn every_numeric_mcp_argument_is_clamped() {
             let exempt = UNBOUNDED_BY_DESIGN
                 .iter()
                 .any(|(f, k)| *f == name.as_str() && *k == key);
-            if !stmt.contains(".clamp(") && !exempt {
+            // `arg_clamped` IS the bound: it looks `(tool, key)` up in
+            // `COUNT_RANGES` and clamps inside the helper, so requiring a literal
+            // `.clamp(` in the statement would flag exactly the reads that moved
+            // to the single-source table.
+            let clamped_by_helper = stmt.contains("arg_clamped(");
+            if !stmt.contains(".clamp(") && !clamped_by_helper && !exempt {
                 unbounded.push(format!("{name}: {key}"));
             }
         };
@@ -2386,11 +2391,15 @@ fn every_numeric_mcp_argument_is_clamped() {
 
         for accessor in [
             "arg_u64(args, \"",
-            "arg_i64(args, \"",
             "arg_f64(args, \"",
             // Included so the `node_id` entries in UNBOUNDED_BY_DESIGN stay live
             // rather than becoming dead exemptions for a shape nothing scans.
             "arg_opt_i64(args, \"",
+            // `arg_clamped` carries no `.clamp(` in its statement — the bound
+            // lives in `COUNT_RANGES` and is applied inside the helper, which is
+            // the point of it. Counted here so the floor below stays meaningful,
+            // and exempted from the `.clamp(` requirement just below.
+            "arg_clamped(args, \"",
         ] {
             let mut rest = src.as_str();
             while let Some(i) = rest.find(accessor) {
@@ -2400,7 +2409,10 @@ fn every_numeric_mcp_argument_is_clamped() {
                 };
                 let key = &after[..key_end];
                 let stmt_end = after.find(';').unwrap_or(after.len());
-                record(key, &after[..stmt_end]);
+                // Accessor name prepended: `record` decides boundedness from the
+                // statement text, and the helper that supplies the bound is named
+                // in the accessor, not in what follows it.
+                record(key, &format!("{accessor}{}", &after[..stmt_end]));
                 rest = &after[key_end..];
             }
         }

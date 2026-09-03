@@ -90,6 +90,92 @@ pub(super) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> Resu
     }
 }
 
+/// The clamp range of every count-like argument, keyed by (canonical tool, arg).
+///
+/// SINGLE SOURCE, and that is the whole point. Handlers read their bounds from
+/// [`arg_clamped`] instead of spelling `.clamp(1, 20)` inline, and
+/// `note_clamped_arguments` reports against these same rows — so the range that
+/// is ENFORCED and the range that is DISCLOSED cannot drift apart. A table that
+/// merely restated the literals would be a second copy to keep in sync, which is
+/// the failure this repo has filed as `source-scanning-guard`.
+///
+/// Tool names are canonical: `trace_http_chain` and `read_snippet` are aliases
+/// that `dispatch_tool` folds into `find_http_route` and `get_ast_node`, so they
+/// do not get their own rows — see [`canonical_tool`].
+///
+/// `module_overview.deps_depth` is the odd row: its bound is not enforced in
+/// `module_overview` at all. The value is forwarded verbatim as
+/// `dependency_graph`'s `depth`, which clamps to 1..=10, so the range belongs to
+/// a tool one hop away. Clamping it here too is a no-op on the result and is what
+/// makes the disclosure possible at the tool the caller actually named.
+pub(super) const COUNT_RANGES: &[(&str, &str, u64, u64)] = &[
+    ("get_call_graph", "depth", 1, 20),
+    ("find_http_route", "depth", 1, 20),
+    ("dependency_graph", "depth", 1, 10),
+    ("module_overview", "deps_depth", 1, 10),
+    ("find_similar_code", "top_k", 1, 100),
+    ("get_ast_node", "similar_top_k", 1, 50),
+    ("get_ast_node", "context_lines", 0, 100),
+    ("ast_search", "limit", 1, 100),
+    ("project_map", "centrality_limit", 1, 100),
+    ("semantic_code_search", "top_k", 1, 100),
+    ("semantic_code_search", "limit", 1, 100),
+];
+
+/// Fold a dispatch alias onto the name [`COUNT_RANGES`] is keyed by.
+///
+/// `dispatch_tool` maps two names onto one handler each. Without this, a call
+/// spelled `trace_http_chain` would clamp exactly as `find_http_route` does and
+/// then disclose nothing, which is the silent-truncation bug wearing the other
+/// name.
+pub(super) fn canonical_tool(name: &str) -> &str {
+    match name {
+        "trace_http_chain" => "find_http_route",
+        "read_snippet" => "get_ast_node",
+        other => other,
+    }
+}
+
+/// The clamp range for `(tool, key)`, or `None` when the argument is not clamped.
+pub(super) fn count_range(tool: &str, key: &str) -> Option<(u64, u64)> {
+    let tool = canonical_tool(tool);
+    COUNT_RANGES
+        .iter()
+        .find(|(t, k, _, _)| *t == tool && *k == key)
+        .map(|(_, _, lo, hi)| (*lo, *hi))
+}
+
+/// [`arg_u64`] plus the clamp, with the bounds taken from [`COUNT_RANGES`] rather
+/// than written at the call site.
+///
+/// Argument order is `(args, key, tool, …)` on purpose: two source-scanning
+/// guards in `tests/hardening.rs` read the first string literal after `args, `
+/// as the argument name. With the tool first they read the TOOL name instead —
+/// `test_no_new_undeclared_mcp_args` then reported `get_call_graph` as an
+/// undeclared argument. Teaching each guard a new shape would have been the
+/// other fix; keeping the shape they already parse is the one that does not
+/// need every future guard to learn it too.
+///
+/// Panics in debug builds if `(tool, key)` has no row — a handler that clamps an
+/// argument the table does not know about is the drift this design exists to
+/// prevent, and it should fail loudly in tests rather than silently skip
+/// disclosure in production. Release builds fall back to the raw value.
+pub(super) fn arg_clamped(
+    args: &serde_json::Value,
+    key: &str,
+    tool: &str,
+    default: u64,
+) -> Result<u64> {
+    let raw = arg_u64(args, key, default)?;
+    match count_range(tool, key) {
+        Some((lo, hi)) => Ok(raw.clamp(lo, hi)),
+        None => {
+            debug_assert!(false, "{tool}.{key} is clamped but has no COUNT_RANGES row");
+            Ok(raw)
+        }
+    }
+}
+
 /// [`arg_u64`] for arguments with no default, where absence selects a different
 /// code path (`node_id` picks id-lookup over name-lookup). Same rule: absent is
 /// `None`, wrong type is an error — not a third silent spelling of absent.

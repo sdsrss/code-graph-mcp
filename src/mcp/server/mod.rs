@@ -2293,6 +2293,7 @@ impl McpServer {
         result
             .map(centralized_compress)
             .map(|value| self.note_ignored_arguments(name, args, value))
+            .map(|value| self.note_clamped_arguments(name, args, value))
     }
 
     /// Name back any argument this call did nothing with, as
@@ -2393,6 +2394,72 @@ impl McpServer {
         );
         if let Some(obj) = result.as_object_mut() {
             obj.insert("ignored_arguments".into(), json!(ignored));
+        }
+        result
+    }
+
+    /// Disclose any count argument that was silently clamped, as
+    /// `"clamped_arguments": [{"argument": "limit", "requested": 5000, …}]`.
+    ///
+    /// `limit: 5000` came back as 100 results with nothing saying so, which is
+    /// the same class as the wrong-typed and negative arguments already refused:
+    /// the caller gets an answer to a question it did not ask and cannot tell.
+    /// Refusing is wrong here — clamping a too-large count is a sane default and
+    /// callers legitimately pass "give me lots" — so this discloses instead.
+    ///
+    /// Bounds come from [`COUNT_RANGES`], the same rows [`arg_clamped`] enforces,
+    /// so what is reported is what was applied.
+    ///
+    /// Attached AFTER compression for the reason given at the call site: every
+    /// compaction path here is an explicit field allowlist and a new top-level key
+    /// that forgets to enrol gets silently dropped.
+    ///
+    /// Only arguments the handler actually READ are reported. The one place that
+    /// matters is `semantic_code_search`, where `limit` is an alias consulted only
+    /// when `top_k` is absent — reporting a clamp on an alias that was never read
+    /// would be its own false statement. That mirror of handler logic is the one
+    /// piece of this that can drift; it is pinned by
+    /// `clamped_arguments_are_disclosed_for_every_clamped_count`.
+    fn note_clamped_arguments(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        mut result: serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(sent) = args.as_object() else {
+            return result;
+        };
+        let mut notes = Vec::new();
+        for (key, raw) in sent {
+            // `semantic_code_search.limit` is read only when `top_k` is absent.
+            if canonical_tool(name) == "semantic_code_search"
+                && key == "limit"
+                && !sent.get("top_k").is_none_or(serde_json::Value::is_null)
+            {
+                continue;
+            }
+            let Some((lo, hi)) = count_range(name, key) else {
+                continue;
+            };
+            // A wrong type or a negative was already refused before reaching a
+            // handler, so anything here is a well-formed count.
+            let Some(requested) = raw.as_u64() else {
+                continue;
+            };
+            let applied = requested.clamp(lo, hi);
+            if applied != requested {
+                notes.push(json!({
+                    "argument": key,
+                    "requested": requested,
+                    "applied": applied,
+                    "range": [lo, hi],
+                }));
+            }
+        }
+        if !notes.is_empty() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("clamped_arguments".to_string(), json!(notes));
+            }
         }
         result
     }
@@ -3864,6 +3931,173 @@ function handleLogin(req: Request) {
                 "{tool}.{arg}: a valid count was refused; got {text}"
             );
         }
+    }
+
+    /// Every row of `COUNT_RANGES` must disclose when it actually clamps.
+    ///
+    /// Driven BY the production table rather than by a hand-written copy of it:
+    /// a row added to `COUNT_RANGES` with no fixture here fails loudly instead of
+    /// quietly not being covered, which is how a table-driven guard stops
+    /// covering its axis.
+    #[cfg(unix)]
+    #[test]
+    fn clamped_arguments_are_disclosed_for_every_clamped_count() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return helper(); }\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        // Companion arguments that get each row's call as far as the handler.
+        let fixture = |tool: &str, key: &str| -> Option<serde_json::Value> {
+            Some(match (tool, key) {
+                ("get_call_graph", "depth") => json!({"function_name": "handler"}),
+                ("find_http_route", "depth") => json!({"route_path": "/x", "downstream": true}),
+                ("dependency_graph", "depth") => json!({"file_path": "app.ts"}),
+                ("module_overview", "deps_depth") => {
+                    json!({"path": "app.ts", "include_deps": true})
+                }
+                ("find_similar_code", "top_k") => json!({"symbol_name": "handler"}),
+                ("get_ast_node", "similar_top_k") => {
+                    json!({"symbol_name": "handler", "include_similar": true})
+                }
+                ("get_ast_node", "context_lines") => json!({"symbol_name": "handler"}),
+                ("ast_search", "limit") => json!({"query": "handler"}),
+                ("project_map", "centrality_limit") => json!({"include_centrality": true}),
+                ("semantic_code_search", "top_k") => json!({"query": "handler"}),
+                ("semantic_code_search", "limit") => json!({"query": "handler"}),
+                _ => return None,
+            })
+        };
+
+        let call = |tool: &str, args: serde_json::Value| -> (bool, serde_json::Value) {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let body = serde_json::from_str(&text).unwrap_or(json!({"_raw": text}));
+            (parsed["result"]["isError"].as_bool().unwrap_or(false), body)
+        };
+
+        // Two rows need a built embedding model to reach their handler at all.
+        // They are skipped only when the response says exactly that, and the skip
+        // set is asserted below — so a row that becomes unreachable for any OTHER
+        // reason fails instead of quietly dropping out of the table.
+        const EMBEDDING_DEPENDENT: &[(&str, &str)] = &[
+            ("find_similar_code", "top_k"),
+            ("get_ast_node", "similar_top_k"),
+        ];
+
+        let mut checked = 0usize;
+        let mut skipped: Vec<(&str, &str)> = Vec::new();
+        for (tool, key, _lo, hi) in crate::mcp::server::helpers::COUNT_RANGES {
+            let base = fixture(tool, key).unwrap_or_else(|| {
+                panic!("COUNT_RANGES row {tool}.{key} has no fixture here — add one")
+            });
+
+            let mut over = base.clone();
+            over[*key] = json!(hi + 1);
+            let (is_error, body) = call(tool, over);
+            if is_error
+                && body["_raw"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Embedding not available"))
+            {
+                skipped.push((tool, key));
+                continue;
+            }
+            assert!(
+                !is_error,
+                "{tool}.{key}: the fixture must reach the handler; got {body}"
+            );
+            let notes = body["clamped_arguments"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "{tool}.{key}: sending {} must be disclosed; got {body}",
+                    hi + 1
+                )
+            });
+            let note = notes
+                .iter()
+                .find(|n| n["argument"] == json!(key))
+                .unwrap_or_else(|| panic!("{tool}.{key}: not named in {notes:?}"));
+            assert_eq!(note["requested"], json!(hi + 1), "{tool}.{key}");
+            assert_eq!(
+                note["applied"],
+                json!(hi),
+                "{tool}.{key}: the disclosed value must be the one enforced"
+            );
+
+            // Negative control: a value inside the range discloses nothing, so the
+            // assertion above is about clamping and not about a field that is
+            // always present.
+            let mut inside = base.clone();
+            inside[*key] = json!(hi);
+            let (_, body) = call(tool, inside);
+            assert!(
+                body.get("clamped_arguments").is_none(),
+                "{tool}.{key}: an in-range value must not be reported as clamped; got {body}"
+            );
+            checked += 1;
+        }
+        for row in &skipped {
+            assert!(
+                EMBEDDING_DEPENDENT.contains(row),
+                "{row:?} skipped for a reason other than a missing embedding model"
+            );
+        }
+        assert_eq!(
+            checked + skipped.len(),
+            crate::mcp::server::helpers::COUNT_RANGES.len(),
+            "every COUNT_RANGES row must be exercised or explicitly skipped"
+        );
+        // Vacuity floor: without it, a change that made every row skip would leave
+        // this test green while checking nothing.
+        assert!(
+            checked >= crate::mcp::server::helpers::COUNT_RANGES.len() - EMBEDDING_DEPENDENT.len(),
+            "too few rows actually checked: {checked} (skipped {skipped:?})"
+        );
+    }
+
+    /// `semantic_code_search.limit` is an alias read only when `top_k` is absent.
+    /// Reporting a clamp on an alias the handler never read would be a false
+    /// statement in the disclosure itself.
+    #[test]
+    fn an_unread_alias_is_not_reported_as_clamped() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("app.ts"), "function handler() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "semantic_code_search",
+                json!({"query": "handler", "top_k": 5, "limit": 9999}),
+            ))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap_or(json!({}));
+        let names: Vec<String> = body["clamped_arguments"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|n| n["argument"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !names.iter().any(|n| n == "limit"),
+            "limit was not read (top_k won) and must not be reported clamped; got {names:?}"
+        );
     }
 
     #[test]
