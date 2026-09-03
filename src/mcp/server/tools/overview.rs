@@ -29,8 +29,10 @@ impl McpServer {
         // consumed only inside their `include_*` block, so a wrong-typed value sent
         // without the companion flag would be swallowed exactly the way a bogus
         // `deps_direction` used to be. Bind them here so the check is unconditional.
-        // Forwarded verbatim as `dependency_graph`'s `depth`, which clamps it to
-        // 1..=10 — so this argument's effective range is set one tool over.
+        // The bound originates one tool over: this value becomes
+        // `dependency_graph`'s `depth`, which clamps to 1..=10. `arg_clamped`
+        // applies the same bound here at the read so the clamp can be disclosed
+        // against the tool the caller actually named.
         let deps_depth = arg_clamped(args, "deps_depth", "module_overview", 2)? as i64;
         let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
 

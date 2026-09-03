@@ -107,6 +107,26 @@ const MODE_INERT_ARGS: &[(&str, &str, &[&str])] = &[(
     &["compact", "direction", "file_path"],
 )];
 
+/// `(tool, argument, gate)` — `argument` is read only when `gate` is present and
+/// true. Used by `note_clamped_arguments` so a clamp is not reported for a value
+/// the call never consulted: `similar_top_k: 9999` without `include_similar`
+/// reaches no code that could clamp it, and saying it was clamped is a small
+/// false statement inside a field whose whole job is to stop those.
+///
+/// This is a mirror of handler logic and therefore the piece that can drift; it
+/// is pinned in BOTH directions by
+/// `a_clamp_is_not_reported_for_an_argument_the_gate_left_unread`.
+///
+/// Coarse on purpose: it models the boolean gate only. `module_overview` also
+/// ignores `deps_depth` when `path` names a directory rather than a file, and
+/// that shape is NOT modelled here — a directory call with an out-of-range
+/// `deps_depth` still reports the clamp. Stated rather than silently approximated.
+const READ_GATES: &[(&str, &str, &str)] = &[
+    ("get_ast_node", "similar_top_k", "include_similar"),
+    ("module_overview", "deps_depth", "include_deps"),
+    ("project_map", "centrality_limit", "include_centrality"),
+];
+
 use super::metrics::ErrKind;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
@@ -2431,11 +2451,23 @@ impl McpServer {
         };
         let mut notes = Vec::new();
         for (key, raw) in sent {
-            // `semantic_code_search.limit` is read only when `top_k` is absent.
+            // Two ways an argument can go unread, both of which would make a
+            // clamp report a false statement.
+            //
+            // `semantic_code_search.limit` is an alias consulted only when
+            // `top_k` is absent.
             if canonical_tool(name) == "semantic_code_search"
                 && key == "limit"
                 && !sent.get("top_k").is_none_or(serde_json::Value::is_null)
             {
+                continue;
+            }
+            // A gated argument whose gate is absent or false — see `READ_GATES`.
+            if READ_GATES.iter().any(|(tool, arg, gate)| {
+                *tool == canonical_tool(name)
+                    && arg == key
+                    && sent.get(*gate).and_then(serde_json::Value::as_bool) != Some(true)
+            }) {
                 continue;
             }
             let Some((lo, hi)) = count_range(name, key) else {
@@ -3990,10 +4022,12 @@ function handleLogin(req: Request) {
         // They are skipped only when the response says exactly that, and the skip
         // set is asserted below — so a row that becomes unreachable for any OTHER
         // reason fails instead of quietly dropping out of the table.
-        const EMBEDDING_DEPENDENT: &[(&str, &str)] = &[
-            ("find_similar_code", "top_k"),
-            ("get_ast_node", "similar_top_k"),
-        ];
+        // Exactly one row cannot reach its handler without a built model.
+        // `get_ast_node.similar_top_k` was in here too and should not have been:
+        // `attach_similar` sets `similar_unavailable` rather than erroring, so it
+        // runs on both legs. Carrying it made the floor one weaker than reality —
+        // a regression that started skipping it would not have tripped anything.
+        const EMBEDDING_DEPENDENT: &[(&str, &str)] = &[("find_similar_code", "top_k")];
 
         let mut checked = 0usize;
         let mut skipped: Vec<(&str, &str)> = Vec::new();
@@ -4065,6 +4099,138 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// `READ_GATES` pinned in BOTH directions.
+    ///
+    /// Absent gate → no clamp reported (the value reached nothing that could
+    /// clamp it, so saying it was clamped would be false). Gate true → reported.
+    /// Without the second half this test would also pass if the disclosure had
+    /// simply stopped working for these three arguments.
+    #[test]
+    fn a_clamp_is_not_reported_for_an_argument_the_gate_left_unread() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return helper(); }\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let base_for = |tool: &str| -> serde_json::Value {
+            match tool {
+                "get_ast_node" => json!({"symbol_name": "handler"}),
+                "module_overview" => json!({"path": "app.ts"}),
+                "project_map" => json!({}),
+                other => panic!("READ_GATES row for {other} has no fixture here — add one"),
+            }
+        };
+        let reports = |args: serde_json::Value, tool: &str, arg: &str| -> bool {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_str(text).unwrap_or(json!({}));
+            body["clamped_arguments"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|n| n["argument"] == json!(arg)))
+        };
+
+        let mut checked = 0usize;
+        for (tool, arg, gate) in READ_GATES {
+            let (_, hi) = crate::mcp::server::helpers::count_range(tool, arg)
+                .unwrap_or_else(|| panic!("{tool}.{arg} is gated but has no COUNT_RANGES row"));
+
+            let mut ungated = base_for(tool);
+            ungated[*arg] = json!(hi + 1);
+            assert!(
+                !reports(ungated, tool, arg),
+                "{tool}.{arg}: gate `{gate}` absent, so the value was never read — \
+                 reporting it as clamped is a false statement"
+            );
+
+            let mut gated = base_for(tool);
+            gated[*arg] = json!(hi + 1);
+            gated[*gate] = json!(true);
+            assert!(
+                reports(gated, tool, arg),
+                "{tool}.{arg}: with gate `{gate}` on, an out-of-range value MUST be disclosed"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            READ_GATES.len(),
+            "every READ_GATES row must be exercised"
+        );
+        assert!(checked >= 3, "vacuity floor: got {checked}");
+    }
+
+    /// The disclosure must match BEHAVIOUR, not just the table.
+    ///
+    /// `clamped_arguments_are_disclosed_for_every_clamped_count` compares the note
+    /// against `COUNT_RANGES` and nothing else, so it cannot tell "the table is
+    /// right" from "the table says a bound the pipeline does not honour". That is
+    /// how `get_call_graph.depth` came to advertise `applied: 20` while
+    /// `graph::query::CALL_GRAPH_MAX_DEPTH` capped the traversal at 10 — the same
+    /// response object carried `"applied": 20` and `"effective_max_depth": 10`.
+    /// A disclosure naming a value the code did not use is worse than none.
+    #[test]
+    fn a_disclosed_depth_is_the_depth_the_traversal_actually_used() {
+        let project_dir = TempDir::new().unwrap();
+        // A chain deeper than any candidate ceiling, so the depth reached is set
+        // by the code and not by running out of graph.
+        let mut src = String::new();
+        for i in 0..30 {
+            src.push_str(&format!("function f{i}() {{ return f{}(); }}\n", i + 1));
+        }
+        src.push_str("function f30() { return 1; }\n");
+        std::fs::write(project_dir.path().join("chain.ts"), src).unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_call_graph",
+                json!({"function_name": "f0", "direction": "callees", "depth": 30}),
+            ))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap_or(json!({}));
+
+        let applied = body["clamped_arguments"]
+            .as_array()
+            .and_then(|a| a.iter().find(|n| n["argument"] == json!("depth")))
+            .and_then(|n| n["applied"].as_i64())
+            .unwrap_or_else(|| panic!("depth:30 must be disclosed as clamped; got {body}"));
+
+        let deepest = body["callees"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n["depth"].as_i64())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
+        assert!(
+            deepest > 0,
+            "fixture must produce a call chain to measure; got {body}"
+        );
+        assert_eq!(
+            deepest, applied,
+            "the disclosed `applied` depth ({applied}) must be the depth the traversal \
+             actually reached ({deepest}); response also carried effective_max_depth={}",
+            body["effective_max_depth"]
+        );
+    }
+
     /// `semantic_code_search.limit` is an alias read only when `top_k` is absent.
     /// Reporting a clamp on an alias the handler never read would be a false
     /// statement in the disclosure itself.
@@ -4077,7 +4243,7 @@ function handleLogin(req: Request) {
         let resp = server
             .handle_message(&tool_call_json(
                 "semantic_code_search",
-                json!({"query": "handler", "top_k": 5, "limit": 9999}),
+                json!({"query": "handler", "top_k": 9999, "limit": 9999}),
             ))
             .unwrap()
             .unwrap();
@@ -4097,6 +4263,13 @@ function handleLogin(req: Request) {
         assert!(
             !names.iter().any(|n| n == "limit"),
             "limit was not read (top_k won) and must not be reported clamped; got {names:?}"
+        );
+        // The positive half. Without it this is a constructively-satisfiable
+        // negative control: a server that discloses NOTHING also has no "limit"
+        // in the list, so suppressing the whole feature left this test green.
+        assert!(
+            names.iter().any(|n| n == "top_k"),
+            "top_k WAS read and is out of range, so it must be reported; got {names:?}"
         );
     }
 

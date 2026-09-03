@@ -91,3 +91,11 @@ revision: 1
   于是工具名被当成了未声明参数。改签名顺序（而不是教两个守卫认新形状），
   理由记在 `arg_clamped` 的 doc 里。
   status 仍 draft：批 B（description 范围文字 + CON-13）未做。
+- r5（2026-09-03）：批 A 独立评审（1 P1 + 3 P2 + 8 P3），P1 已修并复现验证。
+  **P1 改变了批 B 的前提**：`get_call_graph` / `find_http_route` 的 `depth` 表行原写 1..=20，
+  而 `graph::query::CALL_GRAPH_MAX_DEPTH` 实际把遍历截在 10——
+  披露因此报了一个代码没用过的数字（同一响应里 `"applied": 20` 与 `effective_max_depth: 10` 并存）。
+  两行改为从该常量推导。**批 B 若照抄旧值，会把"1–20"写进 published schema，是真实上限的两倍。**
+  success-criteria 1（范围从生产常量推导）因此不是风格要求而是正确性要求。
+  同时补上「披露必须与行为一致」的守卫——此前守卫只比对表与 JSON，从不看结果，
+  这正是让 P1 溜过的洞。

@@ -2309,11 +2309,6 @@ fn every_numeric_mcp_argument_is_clamped() {
         // result set, so it sizes nothing new; recorded so the next reader does
         // not take the sentence above as unconditional.
         ("advanced.rs", "min_lines"),
-        // Bounded at the use site instead of the read: `ast_node.rs:443` passes
-        // `top_k.clamp(1, 50)` into `tool_find_similar_code`. Listed rather than
-        // "fixed" because moving the clamp earlier would change the documented
-        // ceiling of a published parameter for no gain.
-        ("ast_node.rs", "similar_top_k"),
         // The three below are NOT new sites. They were written as
         // `args.get("k").and_then(|v| v.as_i64())`, which this scan never matched
         // — it looked for `args["k"]` only — so they were unguarded and silent
@@ -2323,9 +2318,6 @@ fn every_numeric_mcp_argument_is_clamped() {
         // A similarity THRESHOLD, not a count. A large value accepts more
         // neighbours, but how many come back is `top_k`, which is clamped.
         ("advanced.rs", "max_distance"),
-        // Bounded at the use site, like `similar_top_k`: forwarded as `depth`
-        // into `tool_dependency_graph`, which clamps it to 1..=10.
-        ("overview.rs", "deps_depth"),
         // A filter threshold forwarded to `find_dead_code`'s `min_lines`, whose
         // own entry above records why raising it only shrinks the answer.
         ("overview.rs", "dead_min_lines"),
@@ -2352,6 +2344,9 @@ fn every_numeric_mcp_argument_is_clamped() {
     // Rust and a future handler could reach for it.
     let mut checked = 0usize;
     let mut unbounded: Vec<String> = Vec::new();
+    // (file, key, tool) for every `arg_clamped` site, cross-checked against the
+    // parsed COUNT_RANGES rows below.
+    let mut clamped_calls: Vec<(String, String, String)> = Vec::new();
     for path in &files {
         let src = std::fs::read_to_string(path).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -2413,9 +2408,81 @@ fn every_numeric_mcp_argument_is_clamped() {
                 // statement text, and the helper that supplies the bound is named
                 // in the accessor, not in what follows it.
                 record(key, &format!("{accessor}{}", &after[..stmt_end]));
+                // `arg_clamped(args, "key", "tool", …)` — capture the pair so the
+                // row cross-check below can run without any runtime coverage.
+                if accessor.starts_with("arg_clamped") {
+                    if let Some(t) = after[key_end + 1..].trim_start().strip_prefix(", \"") {
+                        if let Some(t_end) = t.find('"') {
+                            clamped_calls.push((
+                                name.clone(),
+                                key.to_string(),
+                                t[..t_end].to_string(),
+                            ));
+                        }
+                    }
+                }
                 rest = &after[key_end..];
             }
         }
+    }
+
+    // Every `arg_clamped(args, "key", "tool", …)` must have a COUNT_RANGES row.
+    // Without this the scan counts any `arg_clamped(` as bounded-by-construction and a
+    // missing row is caught only if some test happens to exercise that tool at
+    // runtime — while in a release build the helper silently falls back.
+    {
+        let helpers = std::fs::read_to_string(root.join("src/mcp/server/helpers.rs"))
+            .expect("helpers.rs moved — update this guard");
+        let table_start = helpers
+            .find("pub(super) const COUNT_RANGES")
+            .expect("COUNT_RANGES renamed or moved — update this guard");
+        let table_end = helpers[table_start..]
+            .find("\n];")
+            .map(|i| table_start + i)
+            .expect("COUNT_RANGES table shape changed — update this guard");
+        let table = &helpers[table_start..table_end];
+        // `("tool", "key",` — a comment containing `"applied": 20` cannot match,
+        // the separator there is a colon.
+        // Whitespace-tolerant: rows whose bound is an expression rather than a
+        // literal are formatted across several lines, so `(` and the first string
+        // are not adjacent.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut rest = table;
+        while let Some(i) = rest.find('(') {
+            let after = rest[i + 1..].trim_start();
+            if let Some(a) = after.strip_prefix('"') {
+                if let Some(a_end) = a.find('"') {
+                    let tail = a[a_end + 1..].trim_start();
+                    if let Some(t) = tail.strip_prefix(',') {
+                        if let Some(b) = t.trim_start().strip_prefix('"') {
+                            if let Some(b_end) = b.find('"') {
+                                if b[b_end + 1..].trim_start().starts_with(',') {
+                                    rows.push((a[..a_end].to_string(), b[..b_end].to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            rest = &rest[i + 1..];
+        }
+        assert!(
+            rows.len() >= 11,
+            "parsed only {} COUNT_RANGES rows — the table shape changed and this \
+             cross-check is now looking at nothing",
+            rows.len()
+        );
+        for (file, key, tool) in &clamped_calls {
+            assert!(
+                rows.iter().any(|(t, k)| t == tool && k == key),
+                "{file}: arg_clamped(.., \"{key}\", \"{tool}\", ..) has no COUNT_RANGES row — \
+                 it would fall back to the default in release and disclose nothing"
+            );
+        }
+        assert!(
+            !clamped_calls.is_empty(),
+            "no arg_clamped call sites found — the accessor spelling changed"
+        );
     }
 
     assert!(

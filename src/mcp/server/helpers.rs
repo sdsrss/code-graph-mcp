@@ -103,14 +103,31 @@ pub(super) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> Resu
 /// that `dispatch_tool` folds into `find_http_route` and `get_ast_node`, so they
 /// do not get their own rows — see [`canonical_tool`].
 ///
-/// `module_overview.deps_depth` is the odd row: its bound is not enforced in
-/// `module_overview` at all. The value is forwarded verbatim as
-/// `dependency_graph`'s `depth`, which clamps to 1..=10, so the range belongs to
-/// a tool one hop away. Clamping it here too is a no-op on the result and is what
-/// makes the disclosure possible at the tool the caller actually named.
+/// `module_overview.deps_depth` is the odd row: the bound ORIGINATES one tool
+/// away. The value is forwarded to `dependency_graph`'s `depth`, which clamps to
+/// 1..=10, and that is where the number comes from. Since this batch it is also
+/// clamped here at the read — a no-op on the result, and what makes the
+/// disclosure possible at the tool the caller actually named.
 pub(super) const COUNT_RANGES: &[(&str, &str, u64, u64)] = &[
-    ("get_call_graph", "depth", 1, 20),
-    ("find_http_route", "depth", 1, 20),
+    // Taken from the traversal's own cap, NOT restated. These two rows said 20
+    // while `graph::query` stopped at 10, so a `depth: 30` call answered
+    // `"applied": 20` and `"effective_max_depth": 10` in the same object — a
+    // disclosure naming a value the code never used, which is worse than no
+    // disclosure and is the thing this whole field exists to prevent. Deriving
+    // is also what keeps batch B honest: the published schema text has to come
+    // from the constant that enforces the bound, not from a second copy.
+    (
+        "get_call_graph",
+        "depth",
+        1,
+        crate::graph::query::CALL_GRAPH_MAX_DEPTH as u64,
+    ),
+    (
+        "find_http_route",
+        "depth",
+        1,
+        crate::graph::query::CALL_GRAPH_MAX_DEPTH as u64,
+    ),
     ("dependency_graph", "depth", 1, 10),
     ("module_overview", "deps_depth", 1, 10),
     ("find_similar_code", "top_k", 1, 100),
@@ -171,7 +188,14 @@ pub(super) fn arg_clamped(
         Some((lo, hi)) => Ok(raw.clamp(lo, hi)),
         None => {
             debug_assert!(false, "{tool}.{key} is clamped but has no COUNT_RANGES row");
-            Ok(raw)
+            // Release falls back to the DEFAULT, not to `raw`. A missing row means
+            // the bound is unknown, and handing back the caller's unbounded number
+            // is the wrong direction for a published server — `count_range` also
+            // returns `None` there, so `note_clamped_arguments` would disclose
+            // nothing about it. The default is our own constant and is in range by
+            // construction. `every_numeric_mcp_argument_is_clamped` makes the case
+            // statically unreachable; this is what happens if it ever is reached.
+            Ok(default)
         }
     }
 }

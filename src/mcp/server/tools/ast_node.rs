@@ -528,7 +528,13 @@ impl McpServer {
     ) -> Result<()> {
         let args = json!({
             "node_id": node_id,
-            "top_k": top_k.clamp(1, 50),
+            // No second `.clamp(1, 50)` here: the only caller reads this through
+            // `arg_clamped(.., "similar_top_k", "get_ast_node", ..)`, so the bound
+            // is already the one `COUNT_RANGES` holds. A copy here would be a
+            // twelfth literal contradicting the single-source claim, and retuning
+            // it would silently diverge from what `clamped_arguments` reports —
+            // a mutation that stayed green until this line went away.
+            "top_k": top_k,
             "skip_indexing": true,
         });
         match self.tool_find_similar_code(&args) {
