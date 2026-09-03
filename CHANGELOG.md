@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.132.0
+
+**Upgrading:** one behaviour change you may need to act on, and one new field.
+
+1. **A negative count is now an error instead of a silent 1.** `depth: -5`,
+   `context_lines: -7`, `top_k: -3` and their siblings used to be accepted and
+   clamped into range without saying so, which returned a real answer to a
+   question you did not ask. All thirteen count-like arguments now reject a
+   negative and name the argument. If a script sends one, it starts failing
+   loudly instead of quietly answering something else. Two of the thirteen
+   (`min_lines`, `dead_min_lines`) already behaved this way; the other eleven
+   did not.
+2. **Clamped arguments are now disclosed.** `limit: 5000` still returns 100
+   results, but the response now carries
+   `"clamped_arguments": [{"argument": "limit", "requested": 5000, "applied": 100, "range": [1, 100]}]`.
+   Additive — nothing that read the old shape breaks.
+
+To defer (1), pin `0.131.0`. Nothing in this release changes what a well-formed
+request returns.
+
+### A negative count was answered, not refused
+
+`v0.129.0` fixed the "wrong type" half of every numeric argument: `{"limit": "50"}`
+is refused rather than silently defaulted. The negative half was left split by
+which helper an argument happened to call. Six arguments read through a helper
+that refuses `-3`; seven read through a twin that accepted it and handed it to
+`.clamp(lo, hi)`. So `depth: -5` became `1` and the answer came back looking
+ordinary.
+
+The regression test covered two of the six that already worked. That is how a
+pass specifically about numeric arguments left seven sites open — the table
+enumerated the sites that already passed. It now has a row per count argument,
+thirteen of them, each with its own negative control.
+
+The lenient helper is deleted rather than left unused. A new count argument
+cannot reach it because there is no longer one to reach, which is a guard no
+test can be removed to defeat.
+
+### A clamp that fires now says so
+
+Every count-like argument has a range, and exceeding it was silent. Nine inline
+literals moved into one table of eleven rows — the other two arguments never had
+a literal, their bound being set by the tool they forward to. Enforcement and
+disclosure both read that table, so what is applied and what is reported cannot
+drift apart.
+
+Two of those ranges were wrong when the table was first written, and the
+disclosure is what exposed it: `get_call_graph` and `find_http_route` advertised
+a depth ceiling of 20 while the traversal has always stopped at 10. A `depth: 30`
+call answered `"applied": 20` and `"effective_max_depth": 10` in the same object.
+Both rows now derive from the constant that actually enforces the bound. If you
+were passing `depth` between 11 and 20 expecting 20 levels, you were getting 10
+before this release too — the number in the response is now the one the code
+used.
+
+The disclosure only names arguments the call actually read: `limit` is not
+reported when `top_k` supersedes it, and a gated argument is not reported when
+its `include_*` flag is absent.
+
+### Not covered
+
+The CLI keeps its own copy of these bounds and still turns `--depth=-3` into 1
+with no error and no disclosure. It is a separate argument layer and is not
+touched here.
+
 ## 0.131.0
 
 **Upgrading:** one security fix you want, and one MCP argument that used to be
