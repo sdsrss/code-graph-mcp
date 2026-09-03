@@ -101,6 +101,12 @@ pub(crate) fn refuse_non_regular(path: &Path) -> io::Result<()> {
 /// of this layer. Kept as defence in depth; stated as a gap rather than asserted
 /// as a fact, because an unexercised security check that reads like a guarantee
 /// is how this module has been wrong before.
+// `intent` is read only by the hardlink branch below, which is `#[cfg(unix)]`.
+// On Windows the parameter is genuinely unused, and `warnings = "deny"` turns
+// that into a build failure on a platform this dev box never compiles — which is
+// how this exact file broke the windows leg on the v0.127.0 release commit, and
+// again here on v0.132.0's first push. Narrow `cfg_attr`, not a blanket allow.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn refuse_unowned_handle(path: &Path, file: &File, intent: Intent) -> io::Result<()> {
     let meta = file.metadata()?; // fstat on the descriptor, not stat on the path
     if !meta.is_file() {
@@ -184,6 +190,9 @@ impl Intent {
     /// `flock` is inode-scoped and a second directory entry does not affect it,
     /// which is why the probe is safe without the check and why the check was
     /// protecting nothing here.
+    // Called only from the `#[cfg(unix)]` hardlink branch — see the note on
+    // `refuse_unowned_handle`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn writes(self) -> bool {
         !matches!(self, Intent::Probe)
     }
@@ -193,6 +202,8 @@ impl Intent {
 /// refusing the handle if what opened is not a file this tool owns.
 fn open_owned(path: &Path, intent: Intent) -> io::Result<File> {
     refuse_non_regular(path)?;
+    // `mut` is needed only for the `#[cfg(unix)]` `custom_flags` call below.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = intent.options();
     #[cfg(unix)]
     {
