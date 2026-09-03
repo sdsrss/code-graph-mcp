@@ -220,6 +220,54 @@ mod tests {
         );
     }
 
+    /// The symlink test above passes with the hardlink hole wide open: `lstat`
+    /// reports a hardlinked victim as a plain regular file and `O_NOFOLLOW` says
+    /// nothing about one, so the rotator read-modify-wrote a second path to the
+    /// same inode. The guard that catches it lives in `utils::owned`, one level
+    /// down — this row is here because the rotator is the caller that measurably
+    /// destroyed a 1.2 MB file, and a guard pinned only at its own definition
+    /// stops covering the caller the moment someone re-plumbs the open.
+    ///
+    /// `set_len` is the reason `rewrite_owned` must not carry `O_TRUNC`: with it,
+    /// the victim is emptied by the open and this assertion fails before any
+    /// refusal can happen.
+    #[cfg(unix)]
+    #[test]
+    fn rotate_refuses_to_rewrite_through_a_hardlink() {
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim.txt");
+        let payload = format!("SECRET-HEADER-LINE\n{}\n", "A".repeat(1_500_000));
+        std::fs::write(&victim, &payload).unwrap();
+        let link = dir.path().join("recommendations.jsonl");
+        std::fs::hard_link(&victim, &link).unwrap();
+
+        rotate_jsonl_if_over(&link, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+
+        let after = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(
+            after.len(),
+            payload.len(),
+            "the hardlinked file must not be rewritten (lost {} bytes)",
+            payload.len().saturating_sub(after.len())
+        );
+        assert!(
+            after.starts_with("SECRET-HEADER-LINE"),
+            "the hardlinked file's first line must survive"
+        );
+
+        // Positive control: the same call on a single-link oversized file still
+        // rotates, so the assertions above cannot pass by the rotator having
+        // become a no-op — which is exactly what dropping `set_len(0)` along with
+        // `O_TRUNC` would produce.
+        let real = dir.path().join("real.jsonl");
+        std::fs::write(&real, &payload).unwrap();
+        rotate_jsonl_if_over(&real, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+        assert!(
+            std::fs::metadata(&real).unwrap().len() <= JSONL_ROTATE_KEEP_BYTES as u64,
+            "a regular oversized file must still rotate"
+        );
+    }
+
     #[test]
     fn test_iso8601_format() {
         let ts = iso8601_now();

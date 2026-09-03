@@ -15,14 +15,27 @@
 //! symlinks into the tree (`WalkBuilder` runs `follow_links(false)`), while the
 //! write side followed them out of it.
 //!
-//! Two layers, on purpose:
+//! Three layers, on purpose:
 //!
 //! * [`refuse_non_regular`] — portable, gives the caller a message that names
 //!   the path and the reason. Racy on its own (the check and the open are two
 //!   syscalls).
 //! * `O_NOFOLLOW` on the open itself — Unix only, atomic, closes that race.
+//! * [`refuse_unowned_handle`] — `fstat` on the descriptor that was ACTUALLY
+//!   opened, which is the only check describing the object the write lands on.
+//!   It is what catches a HARDLINK: `lstat` reports a hardlinked victim as a
+//!   plain regular file and `O_NOFOLLOW` says nothing about one, so the first
+//!   two layers passed it through and the write reached a second path (found by
+//!   the v0.131.0 pre-tag review on the JS twin, measured there at 1,200,020 →
+//!   67 bytes; this module carried the identical shape since v0.129.0). `git`
+//!   cannot deliver a hardlink — its index stores no such mode — but `tar x`
+//!   can.
 //!
-//! Neither replaces the other, and callers get both by construction.
+//! No layer replaces another, and callers get all three by construction.
+//!
+//! The hardlink half is Unix-only: `std::fs::Metadata` exposes no link count on
+//! Windows, so there the guard is the `is_file()` check alone. Stated rather
+//! than papered over — see [`refuse_unowned_handle`].
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -46,7 +59,52 @@ pub(crate) fn refuse_non_regular(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Open `path` with `opts`, refusing to traverse a final-component symlink.
+/// Reject the OPENED OBJECT if it is not a file this tool may own — judged by
+/// `fstat` on the descriptor rather than by another look at the path, so it
+/// describes exactly what the subsequent write will reach.
+///
+/// `nlink > 1` refuses a hardlink: a second directory entry means the write
+/// reaches a path the tool never chose, which is the same damage as the symlink
+/// case with none of the same tells. Unix-only, because `Metadata` carries no
+/// link count on Windows — there this degrades to the `is_file()` check, so the
+/// Windows leg is knowingly hardlink-blind rather than silently assumed safe.
+///
+/// The `is_file()` half is what closes the `lstat`→`open` race for the
+/// non-regular cases on every platform.
+fn refuse_unowned_handle(path: &Path, file: &File) -> io::Result<()> {
+    let meta = file.metadata()?; // fstat on the descriptor, not stat on the path
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write {}: the opened object is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write {}: it has more than one hard link \
+                     (the write would also reach another path)",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` with `opts`, refusing to traverse a final-component symlink and
+/// refusing the handle if what opened is not a file this tool owns.
+///
+/// Callers must NOT put `truncate(true)` in `opts`: `O_TRUNC` empties the file
+/// on the open itself, before [`refuse_unowned_handle`] can look at it. Truncate
+/// through the returned handle instead — see [`rewrite_owned`].
 fn open_owned(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
     refuse_non_regular(path)?;
     #[cfg(unix)]
@@ -54,7 +112,9 @@ fn open_owned(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    opts.open(path)
+    let file = opts.open(path)?;
+    refuse_unowned_handle(path, &file)?;
+    Ok(file)
 }
 
 /// Append to a file the tool owns, creating it if absent.
@@ -66,12 +126,17 @@ pub(crate) fn append_owned(path: &Path) -> io::Result<File> {
     open_owned(path, OpenOptions::new().create(true).append(true))
 }
 
-/// Open a file the tool owns for a full rewrite (create + truncate).
+/// Open a file the tool owns for a full rewrite (create, then truncate).
+///
+/// The truncation deliberately does NOT ride on the open: `O_TRUNC` empties the
+/// target before [`open_owned`]'s handle check can refuse it, which would leave
+/// the whole guard decorative for exactly the destructive caller — the telemetry
+/// rotator, the one that measurably destroyed a 1.2 MB file through a planted
+/// link. `set_len(0)` runs only once the descriptor has been vouched for.
 pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
-    open_owned(
-        path,
-        OpenOptions::new().create(true).write(true).truncate(true),
-    )
+    let file = open_owned(path, OpenOptions::new().create(true).write(true))?;
+    file.set_len(0)?;
+    Ok(file)
 }
 
 /// Open a file the tool owns for writing while KEEPING its inode and contents —
@@ -187,6 +252,43 @@ mod tests {
             let mut f = open(&plain).unwrap_or_else(|e| panic!("{name} on a regular path: {e}"));
             f.write_all(b"x").unwrap();
             assert!(plain.exists(), "{name} must create a regular file");
+        }
+    }
+
+    /// RED probe (pre-tag review of v0.131.0, deferred as out-of-batch): a
+    /// HARDLINK defeats both layers. `lstat` reports the victim as a plain
+    /// regular file, so `refuse_non_regular` passes it, and `O_NOFOLLOW` says
+    /// nothing about one. The write then lands on a path the tool never chose.
+    #[test]
+    fn every_owned_open_refuses_a_hardlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        let payload = format!("SECRET-HEADER\n{}\n", "A".repeat(4096));
+        std::fs::write(&victim, &payload).unwrap();
+
+        type Opener = fn(&Path) -> io::Result<File>;
+        let openers: [(&str, Opener); 4] = [
+            ("append_owned", append_owned),
+            ("rewrite_owned", rewrite_owned),
+            ("hold_owned", hold_owned),
+            ("probe_owned", probe_owned),
+        ];
+
+        for (name, open) in openers {
+            let link = dir.path().join(format!("hard-{name}"));
+            std::fs::hard_link(&victim, &link).unwrap();
+            let err = open(&link).err();
+            assert!(
+                err.is_some(),
+                "{name} must refuse a hardlink (the write would reach {})",
+                victim.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                payload,
+                "{name} must leave the hardlinked file's contents alone"
+            );
+            std::fs::remove_file(&link).unwrap();
         }
     }
 
