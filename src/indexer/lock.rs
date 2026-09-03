@@ -618,4 +618,54 @@ mod tests {
         // coverage was worth. The two assertions above are what the fix is about
         // and both are mutation-verified.
     }
+
+    /// Regression guard for the `9b4821c` → this-commit fix. `9b4821c` applied the
+    /// hardlink refusal to `probe_owned` as well, and the probe never writes, so
+    /// the refusal protected nothing there and cost the probe its answer:
+    /// `other_process_holds_index_lock` reads any open error as "free".
+    ///
+    /// A second directory entry on `index.lock` is what `cp -al`,
+    /// `rsync --link-dest` and hardlink-dedup backup tools leave behind — no
+    /// attacker required. Both assertions failed at `9b4821c` and pass here.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_is_still_seen_through_a_hardlinked_lock_file() {
+        use std::os::unix::io::AsRawFd;
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path().join(".code-graph");
+        std::fs::create_dir_all(&cg).unwrap();
+        let lock = cg.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        std::fs::hard_link(&lock, dir.path().join("backup.lock")).unwrap();
+
+        // Stand in for the live server: hold the flock on an independent fd.
+        let holder = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        // SAFETY: `holder` is an open File owned by this scope, so the fd is live
+        // for the duration of the call.
+        let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the test holder must be able to take the lock");
+
+        assert!(
+            other_process_holds_index_lock(&cg),
+            "a HELD lock must still read as held when index.lock has a second hard link"
+        );
+
+        // The CLI-side consequence (`lock_index_for_replace` must refuse rather
+        // than log "proceeding unlocked") is asserted in `cli::tests` — `indexer`
+        // is surface-agnostic and must not reach into `crate::cli`, which
+        // `tests/hardening.rs::no_forbidden_module_dependency_edges` enforces.
+
+        // Negative control: with no holder, the same hardlinked lock file reads as
+        // free and is acquirable — so the assertions above are about the holder,
+        // not about a probe that refuses everything.
+        drop(holder);
+        assert!(
+            !other_process_holds_index_lock(&cg),
+            "an unheld lock must read as free"
+        );
+        assert!(
+            try_acquire_index_lock(&cg).is_none(),
+            "acquisition still refuses a hardlinked lock file: it WRITES a PID through it"
+        );
+    }
 }

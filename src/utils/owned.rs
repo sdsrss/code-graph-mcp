@@ -31,11 +31,26 @@
 //!   cannot deliver a hardlink — its index stores no such mode — but `tar x`
 //!   can.
 //!
-//! No layer replaces another, and callers get all three by construction.
+//! No layer replaces another, and every caller that goes through [`open_owned`]
+//! gets all three by construction. Two exceptions, both named rather than
+//! implied:
 //!
-//! The hardlink half is Unix-only: `std::fs::Metadata` exposes no link count on
-//! Windows, so there the guard is the `is_file()` check alone. Stated rather
-//! than papered over — see [`refuse_unowned_handle`].
+//! * `lock::open_lock_handle` (the `#[cfg(not(unix))]` lock) calls
+//!   [`refuse_non_regular`] directly and gets layer one only — and still carries
+//!   `truncate` on its open, which is the pattern [`Intent`] exists to make
+//!   unspellable. Not fixed here; it is the Windows leg, which this dev box
+//!   never compiles and which no test in this file reaches.
+//! * `index.db` does not come through this module at all — rusqlite opens it,
+//!   follows symlinks, and gets none of the three layers. [`ensure_owned_dir`]
+//!   guards the *directory*, which closes the relocated-`.code-graph` vector but
+//!   not a planted `index.db`. So "everything under `.code-graph/`" above
+//!   describes what this module MEDIATES — telemetry JSONL, the repo's
+//!   `.gitignore`, the index lock — not literally every write under that
+//!   directory.
+//!
+//! The hardlink half is also Unix-only, and deliberately differs from the JS
+//! twin there — see [`refuse_unowned_handle`] for the reason and for what is
+//! left untested.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -65,13 +80,28 @@ pub(crate) fn refuse_non_regular(path: &Path) -> io::Result<()> {
 ///
 /// `nlink > 1` refuses a hardlink: a second directory entry means the write
 /// reaches a path the tool never chose, which is the same damage as the symlink
-/// case with none of the same tells. Unix-only, because `Metadata` carries no
-/// link count on Windows — there this degrades to the `is_file()` check, so the
-/// Windows leg is knowingly hardlink-blind rather than silently assumed safe.
+/// case with none of the same tells. Applied only when the handle will actually
+/// be written through ([`Intent::writes`]) — on a read-only probe it protects
+/// nothing and costs correctness.
 ///
-/// The `is_file()` half is what closes the `lstat`→`open` race for the
-/// non-regular cases on every platform.
-fn refuse_unowned_handle(path: &Path, file: &File) -> io::Result<()> {
+/// Unix-only, because `std::fs::Metadata`'s STABLE API exposes no link count on
+/// Windows — the information does exist on the same handle
+/// (`GetFileInformationByHandle`, and `MetadataExt::number_of_links` behind the
+/// unstable `windows_by_handle` feature), so this is a choice forced by std's
+/// surface, not an OS limitation. The JS twin
+/// (`claude-plugin/scripts/recommendation-log.js`) checks `nlink` with no
+/// platform gate and libuv fills it on Windows, so the two surfaces deliberately
+/// differ there and the Windows Rust leg stays hardlink-blind.
+///
+/// The `is_file()` half is UNTESTED and, on Unix, unreachable: `refuse_non_regular`
+/// rejects a non-regular path first and the open itself answers before this can
+/// — `ELOOP` for a symlink under `O_NOFOLLOW`, `EISDIR` for a directory, `ENXIO`
+/// for a socket, and a FIFO blocks in `open` and never returns. It is reachable
+/// only by winning the `lstat`→`open` race, or on Windows, where it is the whole
+/// of this layer. Kept as defence in depth; stated as a gap rather than asserted
+/// as a fact, because an unexercised security check that reads like a guarantee
+/// is how this module has been wrong before.
+fn refuse_unowned_handle(path: &Path, file: &File, intent: Intent) -> io::Result<()> {
     let meta = file.metadata()?; // fstat on the descriptor, not stat on the path
     if !meta.is_file() {
         return Err(io::Error::new(
@@ -85,7 +115,7 @@ fn refuse_unowned_handle(path: &Path, file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.nlink() > 1 {
+        if intent.writes() && meta.nlink() > 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -99,21 +129,78 @@ fn refuse_unowned_handle(path: &Path, file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Open `path` with `opts`, refusing to traverse a final-component symlink and
-/// refusing the handle if what opened is not a file this tool owns.
+/// What the caller will do with the handle. This is an enum rather than an
+/// `OpenOptions` the caller builds, for two reasons that are both defects
+/// otherwise:
 ///
-/// Callers must NOT put `truncate(true)` in `opts`: `O_TRUNC` empties the file
-/// on the open itself, before [`refuse_unowned_handle`] can look at it. Truncate
-/// through the returned handle instead — see [`rewrite_owned`].
-fn open_owned(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
+/// * `O_TRUNC` must never ride on the open — it empties the file before
+///   [`refuse_unowned_handle`] can look at it, which would leave the guard
+///   decorative for precisely the destructive callers. Taking `OpenOptions` from
+///   the caller left that rule enforceable only by a doc comment, and
+///   `OpenOptions` cannot be read back to check. Here `truncate(true)` has no
+///   call site it could appear at.
+/// * Whether the handle is WRITTEN through decides whether the hardlink refusal
+///   applies at all — see [`Intent::writes`].
+#[derive(Clone, Copy)]
+// On non-Unix only `Append` and `Rewrite` are constructed (`hold_owned` and
+// `probe_owned` are `#[cfg(unix)]`), and `warnings = "deny"` turns the resulting
+// dead-code lint into a build failure on a platform this dev box never compiles.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Intent {
+    /// Append, creating the file if absent.
+    Append,
+    /// Replace the contents entirely — truncation happens through the handle,
+    /// after the checks, never on the open.
+    Rewrite,
+    /// Keep the inode and its contents; the index lock, whose `flock` lives on
+    /// the inode and which truncates explicitly once the lock is held.
+    Hold,
+    /// Look without disturbing: no create, no truncate, and **no write**.
+    Probe,
+}
+
+impl Intent {
+    fn options(self) -> OpenOptions {
+        let mut o = OpenOptions::new();
+        match self {
+            Intent::Append => o.create(true).append(true),
+            Intent::Rewrite => o.create(true).write(true),
+            Intent::Hold => o.write(true).create(true).truncate(false),
+            Intent::Probe => o.write(true),
+        };
+        o
+    }
+
+    /// Whether a write will be issued through the handle.
+    ///
+    /// Only [`Intent::Probe`] answers `false`, and that answer is load-bearing:
+    /// the hardlink refusal exists to stop a write from reaching a second path,
+    /// so applying it to an opener that never writes buys nothing and costs the
+    /// probe its answer. `9b4821c` applied it uniformly and thereby broke index
+    /// mutual exclusion — `other_process_holds_index_lock` reads any open error
+    /// as "free", so a hardlinked `index.lock` (what `cp -al` and
+    /// `rsync --link-dest` leave behind) made a HELD lock read as free and
+    /// `lock_index_for_replace` replace an index a live process was writing.
+    /// `flock` is inode-scoped and a second directory entry does not affect it,
+    /// which is why the probe is safe without the check and why the check was
+    /// protecting nothing here.
+    fn writes(self) -> bool {
+        !matches!(self, Intent::Probe)
+    }
+}
+
+/// Open `path` for `intent`, refusing to traverse a final-component symlink and
+/// refusing the handle if what opened is not a file this tool owns.
+fn open_owned(path: &Path, intent: Intent) -> io::Result<File> {
     refuse_non_regular(path)?;
+    let mut opts = intent.options();
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let file = opts.open(path)?;
-    refuse_unowned_handle(path, &file)?;
+    refuse_unowned_handle(path, &file, intent)?;
     Ok(file)
 }
 
@@ -123,7 +210,7 @@ fn open_owned(path: &Path, opts: &mut OpenOptions) -> io::Result<File> {
 /// (`mcp::metrics`), `recommendations.jsonl` (`cli::record_cli_use`) and the
 /// repo's `.gitignore` (`utils::gitignore`).
 pub(crate) fn append_owned(path: &Path) -> io::Result<File> {
-    open_owned(path, OpenOptions::new().create(true).append(true))
+    open_owned(path, Intent::Append)
 }
 
 /// Open a file the tool owns for a full rewrite (create, then truncate).
@@ -134,7 +221,7 @@ pub(crate) fn append_owned(path: &Path) -> io::Result<File> {
 /// rotator, the one that measurably destroyed a 1.2 MB file through a planted
 /// link. `set_len(0)` runs only once the descriptor has been vouched for.
 pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
-    let file = open_owned(path, OpenOptions::new().create(true).write(true))?;
+    let file = open_owned(path, Intent::Rewrite)?;
     file.set_len(0)?;
     Ok(file)
 }
@@ -150,21 +237,24 @@ pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
 /// `cargo check` failure on a platform this dev box never compiles.
 #[cfg(unix)]
 pub(crate) fn hold_owned(path: &Path) -> io::Result<File> {
-    open_owned(
-        path,
-        OpenOptions::new().write(true).create(true).truncate(false),
-    )
+    open_owned(path, Intent::Hold)
 }
 
 /// Open an EXISTING file the tool owns, for writing, without creating or
 /// truncating it — the index-lock probe, whose whole contract is "look, do not
 /// disturb". Absent path stays an error, which the probe reads as "free".
 ///
+/// Because it never writes, the hardlink refusal does not apply here — see
+/// [`Intent::writes`] for why applying it anyway broke mutual exclusion. The
+/// symlink layers DO still apply: the probe would otherwise `flock` whatever the
+/// link points at, and an external inode somebody else happens to hold would read
+/// back as "our index is locked" and refuse a rebuild that is perfectly safe.
+///
 /// `#[cfg(unix)]` for the same reason as [`hold_owned`]: the non-Unix probe goes
 /// through `open_lock_handle`, which applies [`refuse_non_regular`] itself.
 #[cfg(unix)]
 pub(crate) fn probe_owned(path: &Path) -> io::Result<File> {
-    open_owned(path, OpenOptions::new().write(true))
+    open_owned(path, Intent::Probe)
 }
 
 /// Refuse a symlinked (or non-) directory, WITHOUT creating anything.
@@ -227,7 +317,12 @@ mod tests {
         std::fs::write(&victim, "keep\n").unwrap();
 
         // One row per opener: a guard added to only some of them is the defect
-        // class this module exists to close, so the table enumerates all three.
+        // class this module exists to close. Three rows, not four: this table's
+        // negative control asserts that the opener CREATES the file, which
+        // `probe_owned` deliberately never does. `probe_owned`'s symlink refusal
+        // is covered by `indexer::lock::tests` and it takes the same
+        // `refuse_non_regular` + `O_NOFOLLOW` path as these three; the hardlink
+        // table below carries all four.
         type Opener = fn(&Path) -> io::Result<File>;
         let openers: [(&str, Opener); 3] = [
             ("append_owned", append_owned),
@@ -260,28 +355,36 @@ mod tests {
     /// regular file, so `refuse_non_regular` passes it, and `O_NOFOLLOW` says
     /// nothing about one. The write then lands on a path the tool never chose.
     #[test]
-    fn every_owned_open_refuses_a_hardlink() {
+    fn writing_opens_refuse_a_hardlink_and_the_probe_accepts_one() {
         let dir = tempfile::TempDir::new().unwrap();
         let victim = dir.path().join("victim");
         let payload = format!("SECRET-HEADER\n{}\n", "A".repeat(4096));
         std::fs::write(&victim, &payload).unwrap();
 
+        // The WRITING openers only. `probe_owned` is asserted in the opposite
+        // direction below — it must ACCEPT a hardlink, and that is load-bearing:
+        // refusing there is what broke index mutual exclusion in `9b4821c`.
         type Opener = fn(&Path) -> io::Result<File>;
-        let openers: [(&str, Opener); 4] = [
+        let openers: [(&str, Opener); 3] = [
             ("append_owned", append_owned),
             ("rewrite_owned", rewrite_owned),
             ("hold_owned", hold_owned),
-            ("probe_owned", probe_owned),
         ];
 
         for (name, open) in openers {
             let link = dir.path().join(format!("hard-{name}"));
             std::fs::hard_link(&victim, &link).unwrap();
-            let err = open(&link).err();
+            let err = open(&link)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must refuse a hardlink"));
+            // Kind AND reason, not merely "it failed": `err.is_some()` alone is
+            // satisfied by a refusal for the wrong reason — a permissions error,
+            // an ELOOP, a future guard that rejects everything — and the sibling
+            // symlink table below already sets this bar (pre-tag review F2).
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err}");
             assert!(
-                err.is_some(),
-                "{name} must refuse a hardlink (the write would reach {})",
-                victim.display()
+                err.to_string().contains("hard link"),
+                "{name} must say WHY it refused: {err}"
             );
             assert_eq!(
                 std::fs::read_to_string(&victim).unwrap(),
@@ -289,7 +392,37 @@ mod tests {
                 "{name} must leave the hardlinked file's contents alone"
             );
             std::fs::remove_file(&link).unwrap();
+
+            // Negative control, per opener: the same call on a single-link path
+            // must still succeed. Without it the whole table is satisfied by a
+            // guard that refuses everything — verified: a blanket refusal left
+            // this test green before this control existed (pre-tag review F3).
+            // `probe_owned` needs the file to exist already; it never creates.
+            let plain = dir.path().join(format!("plain-hard-{name}"));
+            std::fs::write(&plain, "x").unwrap();
+            open(&plain).unwrap_or_else(|e| panic!("{name} on a single-link path: {e}"));
         }
+
+        // The other direction, and the reason it is not a fourth row: the probe
+        // never writes, so there is no write to reach a second path, and refusing
+        // here is what made a HELD lock read as free in `9b4821c` (the probe maps
+        // any open error to "free"). The end-to-end consequence is pinned by
+        // `indexer::lock::tests::a_held_lock_is_still_seen_through_a_hardlinked_lock_file`;
+        // this is the unit-level half.
+        let probe_link = dir.path().join("hard-probe");
+        std::fs::hard_link(&victim, &probe_link).unwrap();
+        probe_owned(&probe_link)
+            .expect("probe_owned must ACCEPT a hardlink — it never writes through the handle");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            payload,
+            "probe_owned must still not modify anything"
+        );
+        // ...but the symlink layers must remain in force for the probe.
+        let probe_sym = dir.path().join("sym-probe");
+        std::os::unix::fs::symlink(&victim, &probe_sym).unwrap();
+        let err = probe_owned(&probe_sym).expect_err("probe_owned must still refuse a symlink");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]

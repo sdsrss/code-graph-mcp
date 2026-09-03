@@ -2732,3 +2732,50 @@ fn destructive_commands_refuse_a_symlinked_data_dir_before_touching_anything() {
         );
     }
 }
+
+/// CLI half of the `9b4821c` regression (the `indexer` half lives in
+/// `indexer::lock::tests::a_held_lock_is_still_seen_through_a_hardlinked_lock_file`,
+/// which cannot call into `crate::cli` — `tests/hardening.rs` forbids that edge).
+///
+/// `9b4821c` applied the hardlink refusal to `probe_owned`, which never writes.
+/// `other_process_holds_index_lock` reads any open error as "free", so a
+/// hardlinked `index.lock` — what `cp -al` / `rsync --link-dest` leave behind —
+/// made a HELD lock read as free, and this function fell through to its
+/// "proceeding unlocked" arm and replaced an index a live process was writing.
+#[cfg(unix)]
+#[test]
+fn replace_refuses_when_a_held_lock_file_has_a_hardlink() {
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::TempDir::new().unwrap();
+    let cg = dir.path().join(".code-graph");
+    std::fs::create_dir_all(&cg).unwrap();
+    let lock = cg.join("index.lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::hard_link(&lock, dir.path().join("backup.lock")).unwrap();
+
+    // Stand in for the live server holding the lock.
+    let holder = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+    // SAFETY: `holder` is an open File owned by this scope, so the fd is live.
+    let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test holder must be able to take the lock");
+
+    // `match`, not `expect_err`: the Ok side is `Option<IndexLockGuard>`, and the
+    // guard holds a live File rather than deriving Debug.
+    let err = match crate::cli::index_ops::lock_index_for_replace(&cg, false) {
+        Ok(_) => panic!("a held lock must refuse the replace, not proceed unlocked"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("holds the index lock"),
+        "the refusal must name the reason: {err}"
+    );
+
+    // Negative control: released, the same hardlinked lock file stops refusing —
+    // so the assertion above is about the holder, not about a call that always
+    // errors.
+    drop(holder);
+    assert!(
+        crate::cli::index_ops::lock_index_for_replace(&cg, false).is_ok(),
+        "with no holder the replace must be allowed to proceed"
+    );
+}
