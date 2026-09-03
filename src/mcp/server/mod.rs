@@ -3768,20 +3768,71 @@ function handleLogin(req: Request) {
     /// `-3` exactly as it does for `"3"`, so a negative count fell through to the
     /// default. `module_overview` fed its value on to `find_dead_code`, which
     /// applied the same fallback a second time.
+    ///
+    /// Widened to the whole COUNT-LIKE axis. The two rows this started with were
+    /// the only two reading through `arg_u64`; every other count read through
+    /// `arg_i64`, which accepts `-3` happily and hands it to `.clamp(lo, hi)`,
+    /// so `depth: -5` silently became `1` and `context_lines: -7` became `0`.
+    /// A parity table that enumerates only the sites already passing is the
+    /// failure this repo has filed before — the rows below were RED when added.
     #[test]
     fn negative_counts_are_refused_rather_than_defaulted() {
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("app.ts"), "function handler() {}\n").unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return helper(); }\nfunction helper() { return 1; }\n",
+        )
+        .unwrap();
         let server = McpServer::new_test_with_project(project_dir.path());
 
-        for (tool, args, arg) in [
-            ("find_dead_code", json!({"min_lines": -3}), "min_lines"),
+        // Every argument that names a COUNT or a DEPTH — the values for which a
+        // negative has no meaning. `node_id` is excluded (an id, not a count) and
+        // so is `max_distance` (an f64 similarity threshold).
+        let rows: &[(&str, serde_json::Value, &str)] = &[
+            ("find_dead_code", json!({}), "min_lines"),
             (
                 "module_overview",
-                json!({"path": ".", "include_dead": true, "dead_min_lines": -3}),
+                json!({"path": ".", "include_dead": true}),
                 "dead_min_lines",
             ),
-        ] {
+            ("semantic_code_search", json!({"query": "handler"}), "top_k"),
+            ("semantic_code_search", json!({"query": "handler"}), "limit"),
+            ("ast_search", json!({"query": "handler"}), "limit"),
+            (
+                "project_map",
+                json!({"include_centrality": true}),
+                "centrality_limit",
+            ),
+            (
+                "get_call_graph",
+                json!({"function_name": "handler"}),
+                "depth",
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler"}),
+                "context_lines",
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "handler", "include_similar": true}),
+                "similar_top_k",
+            ),
+            ("module_overview", json!({"path": "."}), "deps_depth"),
+            ("dependency_graph", json!({"file_path": "app.ts"}), "depth"),
+            (
+                "find_similar_code",
+                json!({"symbol_name": "handler"}),
+                "top_k",
+            ),
+            (
+                "find_http_route",
+                json!({"route_path": "/x", "downstream": true}),
+                "depth",
+            ),
+        ];
+
+        let call = |tool: &str, args: serde_json::Value| -> (bool, String) {
             let resp = server
                 .handle_message(&tool_call_json(tool, args))
                 .unwrap()
@@ -3789,12 +3840,28 @@ function handleLogin(req: Request) {
             let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
             let text = parsed["result"]["content"][0]["text"]
                 .as_str()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
+            (parsed["result"]["isError"].as_bool().unwrap_or(false), text)
+        };
+
+        for (tool, base, arg) in rows {
+            let mut hostile = base.clone();
+            hostile[*arg] = json!(-3);
+            let (is_error, text) = call(tool, hostile);
             assert!(
-                parsed["result"]["isError"].as_bool().unwrap_or(false)
-                    && text.contains(arg)
-                    && text.contains("non-negative"),
-                "{tool}.{arg}: a negative count must be refused; got {text}"
+                is_error && text.contains(*arg) && text.contains("non-negative"),
+                "{tool}.{arg}: a negative count must be refused by name; got isError={is_error} text={text}"
+            );
+
+            // Negative control on the same row: a well-formed value must not trip
+            // this complaint. It may still fail for unrelated reasons.
+            let mut typed = base.clone();
+            typed[*arg] = json!(3);
+            let (_, text) = call(tool, typed);
+            assert!(
+                !text.contains(&format!("{arg} must be a non-negative")),
+                "{tool}.{arg}: a valid count was refused; got {text}"
             );
         }
     }

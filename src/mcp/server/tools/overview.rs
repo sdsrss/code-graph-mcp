@@ -29,7 +29,9 @@ impl McpServer {
         // consumed only inside their `include_*` block, so a wrong-typed value sent
         // without the companion flag would be swallowed exactly the way a bogus
         // `deps_direction` used to be. Bind them here so the check is unconditional.
-        let deps_depth = arg_i64(args, "deps_depth", 2)?;
+        // Forwarded verbatim as `dependency_graph`'s `depth`, which clamps it to
+        // 1..=10 — so this argument's effective range is set one tool over.
+        let deps_depth = arg_u64(args, "deps_depth", 2)? as i64;
         let dead_min_lines = arg_u64(args, "dead_min_lines", 3)?;
 
         if !should_skip_indexing(args)? {

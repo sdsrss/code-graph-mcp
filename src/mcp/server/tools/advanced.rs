@@ -27,7 +27,7 @@ impl McpServer {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
-        let depth = arg_i64(args, "depth", 3)?.clamp(1, 20) as i32;
+        let depth = arg_u64(args, "depth", 3)?.clamp(1, 20) as i32;
         let include_middleware = arg_bool(args, "include_middleware", true)?;
         // Same default as `get_call_graph`'s symbol arm. This is the surviving
         // sibling of the `min_confidence` defect described just below: another
@@ -213,7 +213,7 @@ impl McpServer {
         // Bound before the indexing side effects below, for the reason spelled
         // out in `tool_get_ast_node`: a type rejection must not cost a full index
         // pass first (pre-tag review P3-2).
-        let depth = arg_i64(args, "depth", 2)?.clamp(1, 10) as i32;
+        let depth = arg_u64(args, "depth", 2)?.clamp(1, 10) as i32;
         let compact = arg_bool(args, "compact", false)?;
 
         if !should_skip_indexing(args)? {
@@ -342,7 +342,7 @@ impl McpServer {
         } else {
             return Err(anyhow!("Either node_id or symbol_name is required. Provide symbol_name (e.g. \"my_function\") or node_id (from other tool results)."));
         };
-        let top_k = arg_i64(args, "top_k", 5)?.clamp(1, 100);
+        let top_k = arg_u64(args, "top_k", 5)?.clamp(1, 100) as i64;
         let max_distance = arg_f64(args, "max_distance", 0.8)?;
 
         // Check if embeddings are available

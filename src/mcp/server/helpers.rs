@@ -49,7 +49,8 @@ fn describe_arg(v: &serde_json::Value) -> String {
     }
 }
 
-/// Read an optional integer argument, defaulting only when it is genuinely absent.
+/// Read a COUNT-LIKE numeric argument (a count, a depth, a line span), defaulting
+/// only when it is genuinely absent and refusing anything a count cannot be.
 ///
 /// CON-15 (audit 2026-08-29). Every numeric argument used to be read as
 /// `args[key].as_i64().unwrap_or(default)`, which cannot tell "not sent" from
@@ -61,21 +62,22 @@ fn describe_arg(v: &serde_json::Value) -> String {
 /// which was never done. Rejecting rather than coercing is what keeps the two
 /// halves symmetric — and an error a model can read is worth more than a silent
 /// answer to a question it did not ask.
-pub(super) fn arg_i64(args: &serde_json::Value, key: &str, default: i64) -> Result<i64> {
-    match &args[key] {
-        serde_json::Value::Null => Ok(default),
-        v => v.as_i64().ok_or_else(|| {
-            anyhow!(
-                "{key} must be an integer (got {}); the request was rejected rather than answered with a default",
-                describe_arg(v)
-            )
-        }),
-    }
-}
-
-/// [`arg_i64`] for counts that cannot be negative. A negative number is rejected
-/// here rather than falling through to the default — `as_u64()` returns `None` for
-/// `-3` exactly as it does for `"3"`, so `min_lines: -3` used to silently become 3.
+///
+/// It also refuses a NEGATIVE, and that half used to depend on which helper a
+/// given argument happened to call. The `arg_i64` twin that stood here accepted
+/// `-3` and handed it straight to `.clamp(lo, hi)`, so `depth: -5` silently
+/// became `1` and `context_lines: -7` became `0` — the same "answered a question
+/// you did not ask" shape CON-15 exists to close, reached by a different road.
+/// Six of the thirteen count arguments already read through this `u64` side and
+/// seven read through the twin, so the rule was real for six and absent for the
+/// rest — and the regression test covered only two of the six, which is how the
+/// split survived a pass that was specifically about numeric arguments. Every
+/// count now reads through here; `arg_i64` had no callers left and was removed
+/// (its absence is the guard: a new count argument cannot reach the lenient
+/// helper, because there is no longer one to reach). Arguments that
+/// are NOT counts keep their own helpers — [`arg_opt_i64`] for `node_id` (an id,
+/// where absence selects a different code path) and [`arg_f64`] for
+/// `max_distance` (a similarity threshold, not a quantity).
 pub(super) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> Result<u64> {
     match &args[key] {
         serde_json::Value::Null => Ok(default),
@@ -88,7 +90,7 @@ pub(super) fn arg_u64(args: &serde_json::Value, key: &str, default: u64) -> Resu
     }
 }
 
-/// [`arg_i64`] for arguments with no default, where absence selects a different
+/// [`arg_u64`] for arguments with no default, where absence selects a different
 /// code path (`node_id` picks id-lookup over name-lookup). Same rule: absent is
 /// `None`, wrong type is an error — not a third silent spelling of absent.
 pub(super) fn arg_opt_i64(args: &serde_json::Value, key: &str) -> Result<Option<i64>> {
@@ -103,7 +105,7 @@ pub(super) fn arg_opt_i64(args: &serde_json::Value, key: &str) -> Result<Option<
     }
 }
 
-/// [`arg_i64`] for boolean flags — the other half of CON-15, which fixed only the
+/// [`arg_u64`] for boolean flags — the other half of CON-15, which fixed only the
 /// numeric arguments (audit 2026-09-02 P2-2). `args[key].as_bool().unwrap_or(d)`
 /// has exactly the numeric defect: `{"compact": "true"}` returned the full
 /// uncompacted envelope and `{"include_tests": 1}` dropped the tests, both with
@@ -133,7 +135,7 @@ pub(super) fn arg_bool(args: &serde_json::Value, key: &str, default: bool) -> Re
     }
 }
 
-/// [`arg_i64`] for fractional arguments (similarity thresholds).
+/// [`arg_u64`] for fractional arguments (similarity thresholds).
 pub(super) fn arg_f64(args: &serde_json::Value, key: &str, default: f64) -> Result<f64> {
     match &args[key] {
         serde_json::Value::Null => Ok(default),
