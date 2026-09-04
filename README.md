@@ -129,20 +129,28 @@ rather than dressed up.
 Call edges are resolved by name, so a few spellings produce no edge. These are
 known boundaries, not bugs to report:
 
-- **A call written through its own crate's full path.** In Rust,
-  `crate_name::module::Type::method()` is not matched to `method`, while a bare
-  `Type::method()` is. Measured on this repo at v0.132.0: `Database::open` has
-  173 caller edges and **none** of them come from the 53 call sites in
-  `tests/cli_e2e.rs` spelled `code_graph_mcp::storage::db::Database::open(...)`.
-  If a symbol looks less used than you expect, check whether its callers write it
-  fully qualified.
-- **Receiver-method calls** (`obj.method()`) produce no call edge. Cross-file
-  constant and type-position uses do not either, but they are not invisible —
-  they are carried as the `references` relation, which `find_references` returns
-  and `impact` counts separately as `value_references`. Both are why
-  `include_dead` results are candidates to verify rather than a verdict.
-- **Dynamic dispatch** — a call through a string name, a registry lookup, or a
-  function pointer has no name at the call site to resolve.
+- **A method call reached through a module path.** `module::Type::method()`
+  produces no call edge — the same whether the path starts with the crate name,
+  `crate::`, or a bare module. A bare `Type::method()` does resolve, and so does
+  a *free function* through the same kind of path: `my_crate::cli::cmd_grep()`
+  binds, which `path_qualifier_strips_own_crate_name` in
+  `tests/integration_call_qualifier.rs` exists to keep true. It is the `Type::`
+  segment in front of the method that drops the edge, not the length of the path.
+  Measured on this repo at v0.132.0: `Database::open` has 173 caller edges and
+  **none** of them come from the 53 call sites in `tests/cli_e2e.rs` spelled
+  `code_graph_mcp::storage::db::Database::open(...)`.
+- **A receiver call whose method name is shared by several types.** `obj.method()`
+  normally resolves: the receiver has no statically-known type, so the resolver
+  binds it when exactly one same-language method carries that name
+  (`receiver_call_resolves_unique_method`). When several types define the same
+  name it is dropped rather than fanned out
+  (`receiver_call_with_ambiguous_method_name_stays_unresolved`).
+- **Cross-file constant and type-position uses, callbacks, and function
+  pointers.** None of these are call edges, but none are invisible either: they
+  are carried as the `references` relation, which `find_references` returns and
+  `impact` reports separately as `value reference(s) — callbacks / fn-pointers /
+  type positions`. Together with the row above, this is why `include_dead`
+  results are candidates to verify rather than a verdict.
 
 ## Architecture
 
