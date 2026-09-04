@@ -153,6 +153,33 @@ pub(super) fn canonical_tool(name: &str) -> &str {
     }
 }
 
+/// The bound for `(tool, key)` as the published schema says it, e.g. `range 1-100`.
+///
+/// `mcp::tools` builds every count argument's `description` through this instead
+/// of typing the numbers a second time. That direction matters: the audit trail
+/// on this file already carries two cases where a restated bound and the enforced
+/// bound diverged — `get_call_graph.depth` advertised 20 against a traversal that
+/// stopped at 10, and the range table itself was written from the inline literals
+/// rather than from the constant. A published description is a third copy, read by
+/// a model that cannot check it, so it is derived here or it is not written.
+///
+/// A `(tool, key)` with no row is a caller bug, not a runtime condition:
+/// `ToolRegistry::new()` runs in every test binary, so the debug assertion fires
+/// the moment a description asks for a bound that no longer exists.
+pub(crate) fn count_range_hint(tool: &str, key: &str) -> String {
+    match count_range(tool, key) {
+        Some((lo, hi)) => format!("range {lo}-{hi}"),
+        None => {
+            debug_assert!(
+                false,
+                "{tool}.{key} has no COUNT_RANGES row, so its schema description \
+                 cannot state a bound"
+            );
+            String::new()
+        }
+    }
+}
+
 /// The clamp range for `(tool, key)`, or `None` when the argument is not clamped.
 pub(super) fn count_range(tool: &str, key: &str) -> Option<(u64, u64)> {
     let tool = canonical_tool(tool);
@@ -537,6 +564,54 @@ fn truncate_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every count argument a LISTED tool publishes has to state its bound, and
+    /// state it in the words [`COUNT_RANGES`] produces.
+    ///
+    /// The gap this closes: `v0.132.0` made the clamp visible in the RESPONSE
+    /// (`clamped_arguments`), which only helps a caller who already sent a value
+    /// too large. The schema is what the model reads before it picks a number, and
+    /// it named a default and no ceiling — `similar_top_k` said "default 5" for a
+    /// bound of 50, `depth` said "default 3" for a bound of 10.
+    ///
+    /// Direction matters: the guard walks the PUBLISHED schema, not this file's
+    /// source, and compares each description against the hint derived from the
+    /// row. So a hand-typed "max 100" that stops matching the table goes red, and
+    /// a new clamped argument on a listed tool trips the count below.
+    #[test]
+    fn every_published_count_argument_states_its_bound() {
+        let registry = crate::mcp::tools::ToolRegistry::new();
+        let mut checked = 0usize;
+        for tool in registry.list_tools() {
+            let name = tool.name.as_str();
+            let props = tool.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("tool '{name}' publishes no properties object"));
+            for (key, spec) in props {
+                if count_range(name, key).is_none() {
+                    continue;
+                }
+                let desc = spec["description"].as_str().unwrap_or_default();
+                let hint = count_range_hint(name, key);
+                assert!(
+                    desc.contains(&hint),
+                    "'{name}.{key}' is clamped to `{hint}` and its published \
+                     description does not say so: {desc:?}"
+                );
+                checked += 1;
+            }
+        }
+        // Vacuity floor. Eight of the eleven COUNT_RANGES rows belong to a tool in
+        // `tools/list`; the other three (`find_http_route.depth`,
+        // `dependency_graph.depth`, `find_similar_code.top_k`) are backends the
+        // client is never offered, so they have no description to check. A ninth
+        // published count means a new argument arrived without a bound in its text.
+        assert_eq!(
+            checked, 8,
+            "expected 8 published count arguments; a change to the tool surface \
+             must be reflected here rather than silently shrinking this guard"
+        );
+    }
 
     #[test]
     fn truncate_array_keeps_items_homogeneous_and_records_original_len() {

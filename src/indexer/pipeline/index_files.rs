@@ -2042,7 +2042,7 @@ pub(super) fn index_files(
         let batch_file_count = batch_parsed.len();
 
         // Update global_name_map: remove old entries for batch files, add new ones
-        for (_, entries) in global_name_map.iter_mut() {
+        for entries in global_name_map.values_mut() {
             entries.retain(|(_id, path, _lang)| !batch_file_paths.contains(path.as_str()));
         }
         global_name_map.retain(|_, entries| !entries.is_empty());

@@ -42,12 +42,15 @@ fn embedding_to_bytes(emb: &[f32]) -> &[u8] {
 }
 
 /// Bytes → f32 without a `bytemuck::cast_slice` (a SQLite BLOB is not guaranteed 4-byte
-/// aligned, which would PANIC the zero-copy cast). `chunks_exact` + `from_ne_bytes` is
-/// alignment-safe and pairs with the native-endian write above.
+/// aligned, which would PANIC the zero-copy cast). `as_chunks` + `from_ne_bytes` is
+/// alignment-safe and pairs with the native-endian write above; like the
+/// `chunks_exact(4)` it replaces, a trailing partial group is dropped.
 fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect()
 }
 
