@@ -575,11 +575,30 @@ mod tests {
     /// bound of 50, `depth` said "default 3" for a bound of 10.
     ///
     /// Direction matters: the guard walks the PUBLISHED schema, not this file's
-    /// source, and compares each description against the hint derived from the
-    /// row. So a hand-typed "max 100" that stops matching the table goes red, and
-    /// a new clamped argument on a listed tool trips the count below.
+    /// source, and compares each description's bound against the row NUMERICALLY.
+    /// The first version of this test asked `desc.contains(&hint)`, and that is a
+    /// guard that cannot go red where it matters most: `range 1-100` CONTAINS
+    /// `range 1-10`, so hand-typing a ceiling ten times the real one passed —
+    /// which is precisely the defect (`get_call_graph.depth` advertising a bound
+    /// the traversal never used) this whole disclosure exists to prevent.
     #[test]
     fn every_published_count_argument_states_its_bound() {
+        /// Every `range <lo>-<hi>` in the text, parsed. Not a substring check:
+        /// the numbers are compared as numbers, and finding two ranges in one
+        /// description is itself a failure.
+        fn published_ranges(desc: &str) -> Vec<(u64, u64)> {
+            desc.match_indices("range ")
+                .filter_map(|(at, marker)| {
+                    let tail = &desc[at + marker.len()..];
+                    let end = tail
+                        .find(|c: char| !c.is_ascii_digit() && c != '-')
+                        .unwrap_or(tail.len());
+                    let (lo, hi) = tail[..end].split_once('-')?;
+                    Some((lo.parse().ok()?, hi.parse().ok()?))
+                })
+                .collect()
+        }
+
         let registry = crate::mcp::tools::ToolRegistry::new();
         let mut checked = 0usize;
         for tool in registry.list_tools() {
@@ -588,15 +607,15 @@ mod tests {
                 .as_object()
                 .unwrap_or_else(|| panic!("tool '{name}' publishes no properties object"));
             for (key, spec) in props {
-                if count_range(name, key).is_none() {
+                let Some((lo, hi)) = count_range(name, key) else {
                     continue;
-                }
+                };
                 let desc = spec["description"].as_str().unwrap_or_default();
-                let hint = count_range_hint(name, key);
-                assert!(
-                    desc.contains(&hint),
-                    "'{name}.{key}' is clamped to `{hint}` and its published \
-                     description does not say so: {desc:?}"
+                assert_eq!(
+                    published_ranges(desc),
+                    vec![(lo, hi)],
+                    "'{name}.{key}' is clamped to {lo}-{hi}; its published \
+                     description must state that bound exactly once: {desc:?}"
                 );
                 checked += 1;
             }
