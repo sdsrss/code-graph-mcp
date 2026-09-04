@@ -41,8 +41,8 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
-                        "top_k": { "type": "number", "description": format!("Results count (default 20, {}). Alias: limit", count_range_hint("semantic_code_search", "top_k")) },
-                        "limit": { "type": "number", "description": format!("Alias for top_k (default 20, {})", count_range_hint("semantic_code_search", "limit")) },
+                        "top_k": { "type": "integer", "description": format!("Results count (default 20, {}). Alias: limit", count_range_hint("semantic_code_search", "top_k")) },
+                        "limit": { "type": "integer", "description": format!("Alias for top_k (default 20, {})", count_range_hint("semantic_code_search", "limit")) },
                         "language": { "type": "string", "description": "Filter by language" },
                         "node_type": { "type": "string", "description": "Filter by node type" },
                         "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" }
@@ -62,7 +62,7 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Function/method name. A call must carry symbol_name or route_path (mutually exclusive); a call naming neither is refused." },
                         "route_path": { "type": "string", "description": "HTTP route like 'GET /api/users' — traces from matched route handler(s) down. Mutually exclusive with symbol_name." },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both'); ignored when route_path is set (always 'callees')" },
-                        "depth": { "type": "number", "description": format!("Max depth (default 3, {}); a larger value is clamped and the response says so in clamped_arguments", count_range_hint("get_call_graph", "depth")) },
+                        "depth": { "type": "integer", "description": format!("Max depth (default 3, {}); a larger value is clamped and the response says so in clamped_arguments", count_range_hint("get_call_graph", "depth")) },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
                         "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
@@ -83,14 +83,14 @@ impl ToolRegistry {
                     "properties": {
                         "file_path": { "type": "string", "description": "File path (with symbol_name)" },
                         "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve). A call must carry symbol_name or node_id — file_path alone names a file, not a symbol, and is refused." },
-                        "node_id": { "type": "number", "description": "Node ID (alternative to file_path+symbol_name)" },
+                        "node_id": { "type": "integer", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers in references (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
                         "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "For include_impact: min caller-edge confidence counted toward risk (default 'inferred'). Folds the ambiguous by-name fan-out (a name shared by many defs) out of the blast radius; pass 'ambiguous' to count every resolved caller. `impact.ambiguous_callers_excluded` discloses what was folded." },
                         "include_similar": { "type": "boolean", "description": "Include embedding-similar nodes (default false; requires embed-model + indexed embeddings)" },
-                        "similar_top_k": { "type": "number", "description": format!("With include_similar: max similar results (default 5, {})", count_range_hint("get_ast_node", "similar_top_k")) },
-                        "context_lines": { "type": "number", "description": format!("Surrounding source lines to include (default 0, default 3 when using node_id; {})", count_range_hint("get_ast_node", "context_lines")) },
+                        "similar_top_k": { "type": "integer", "description": format!("With include_similar: max similar results (default 5, {})", count_range_hint("get_ast_node", "similar_top_k")) },
+                        "context_lines": { "type": "integer", "description": format!("Surrounding source lines to include (default 0, default 3 when using node_id; {})", count_range_hint("get_ast_node", "context_lines")) },
                         "compact": { "type": "boolean", "description": "Compact mode: type+signature+location only, no code_content (saves tokens)" }
                     },
                     // `ast_node.rs:200` rejects a call carrying neither
@@ -135,7 +135,7 @@ impl ToolRegistry {
                         // map is discoverable without a second round-trip.
                         "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves tokens)" },
                         "include_centrality": { "type": "boolean", "description": "Include architectural chokepoints (betweenness centrality — functions on the most shortest call paths; high score = structural bridge). Default false." },
-                        "centrality_limit": { "type": "number", "description": format!("With include_centrality: max ranked results (default 10, {})", count_range_hint("project_map", "centrality_limit")) }
+                        "centrality_limit": { "type": "integer", "description": format!("With include_centrality: max ranked results (default 10, {})", count_range_hint("project_map", "centrality_limit")) }
                     },
                     "required": []
                 }),
@@ -150,9 +150,9 @@ impl ToolRegistry {
                         "compact": { "type": "boolean", "description": "Compact mode: name+type+callers only, no signatures (saves tokens)" },
                         "include_deps": { "type": "boolean", "description": "When path is a single file: include outgoing/incoming file dependencies (default false)" },
                         "deps_direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "With include_deps: direction filter (default 'both')" },
-                        "deps_depth": { "type": "number", "description": format!("With include_deps: max transitive depth (default 2, {})", count_range_hint("module_overview", "deps_depth")) },
+                        "deps_depth": { "type": "integer", "description": format!("With include_deps: max transitive depth (default 2, {})", count_range_hint("module_overview", "deps_depth")) },
                         "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered. Results are candidates to verify: receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked, so a flagged symbol may still be used." },
-                        "dead_min_lines": { "type": "number", "description": "With include_dead: min line count to flag (default 3)" }
+                        "dead_min_lines": { "type": "integer", "description": "With include_dead: min line count to flag (default 3)" }
                     },
                     "required": ["path"]
                 }),
@@ -173,7 +173,7 @@ impl ToolRegistry {
                         "type": { "type": "string", "description": format!("Node type: {} (interface = trait)", crate::domain::TYPE_FILTER_HELP) },
                         "returns": { "type": "string", "description": "Return type substring filter" },
                         "params": { "type": "string", "description": "Parameter text substring filter" },
-                        "limit": { "type": "number", "description": format!("Max results (default 20, {})", count_range_hint("ast_search", "limit")) }
+                        "limit": { "type": "integer", "description": format!("Max results (default 20, {})", count_range_hint("ast_search", "limit")) }
                     },
                     // `ast_search.rs:46`: a query OR at least one typed
                     // filter. A bare `limit` is not a search.
