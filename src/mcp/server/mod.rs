@@ -3879,7 +3879,7 @@ function handleLogin(req: Request) {
     /// A parity table that enumerates only the sites already passing is the
     /// failure this repo has filed before — the rows below were RED when added.
     #[test]
-    fn negative_counts_are_refused_rather_than_defaulted() {
+    fn counts_refuse_negatives_and_fractions_rather_than_defaulting() {
         let project_dir = TempDir::new().unwrap();
         std::fs::write(
             project_dir.path().join("app.ts"),
@@ -3957,8 +3957,22 @@ function handleLogin(req: Request) {
                 "{tool}.{arg}: a negative count must be refused by name; got isError={is_error} text={text}"
             );
 
+            // Same row, fraction axis. `as_u64()` returns None for 3.5, so every
+            // one of these already refused it — what did NOT match was the
+            // published `"type": "number"`, which invited exactly this call. The
+            // axis is asserted here so the schema's new `integer` and the
+            // handler's behaviour are pinned to each other rather than agreeing
+            // by coincidence.
+            let mut fractional = base.clone();
+            fractional[*arg] = json!(3.5);
+            let (is_error, text) = call(tool, fractional);
+            assert!(
+                is_error && text.contains(*arg) && text.contains("integer"),
+                "{tool}.{arg}: a fractional count must be refused by name; got isError={is_error} text={text}"
+            );
+
             // Negative control on the same row: a well-formed value must not trip
-            // this complaint. It may still fail for unrelated reasons.
+            // either complaint. It may still fail for unrelated reasons.
             let mut typed = base.clone();
             typed[*arg] = json!(3);
             let (_, text) = call(tool, typed);

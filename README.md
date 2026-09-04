@@ -18,7 +18,7 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **Dead code detection** — Find unreferenced symbols with smart Orphan/Exported-Unused classification
 - **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
 - **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates. Smart event filtering skips metadata-only changes (chmod, xattr)
-- **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview). Every MCP tool also takes `compact: true`, which drops code bodies and signatures from the response; how much that saves depends on the tool and the repo, so no fixed figure is quoted here
+- **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview). Every MCP tool also takes `compact: true`, which drops code bodies from the response; what else it trims is per-tool (`get_ast_node` keeps the signature, `module_overview` drops it), and how much it saves depends on the tool and the repo, so no fixed figure is quoted here
 - **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`). Context reordered to prioritize structural relations over code for better embedding quality
 - **Self-healing** — Automatic SQLite corruption recovery with rebuild. Startup repair for incomplete indexing (Phase 3 failures)
 - **MCP protocol** — JSON-RPC 2.0 over stdio, plug-and-play with Claude Code, Cursor, Windsurf, and other MCP clients
@@ -136,9 +136,11 @@ known boundaries, not bugs to report:
   `tests/cli_e2e.rs` spelled `code_graph_mcp::storage::db::Database::open(...)`.
   If a symbol looks less used than you expect, check whether its callers write it
   fully qualified.
-- **Receiver-method calls and cross-file constant/type uses** are not edge-tracked,
-  which is why `include_dead` results are candidates to verify rather than a
-  verdict.
+- **Receiver-method calls** (`obj.method()`) produce no call edge. Cross-file
+  constant and type-position uses do not either, but they are not invisible —
+  they are carried as the `references` relation, which `find_references` returns
+  and `impact` counts separately as `value_references`. Both are why
+  `include_dead` results are candidates to verify rather than a verdict.
 - **Dynamic dispatch** — a call through a string name, a registry lookup, or a
   function pointer has no name at the call site to resolve.
 

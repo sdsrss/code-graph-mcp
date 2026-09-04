@@ -632,6 +632,48 @@ mod tests {
         );
     }
 
+    /// No published property may declare `number`, because none of them accept
+    /// one.
+    ///
+    /// Every numeric argument these 7 tools take is a count, a depth or an id,
+    /// and each reads through [`arg_u64`] / [`arg_opt_i64`], which call
+    /// `as_u64` / `as_i64` — `3.5` is refused. `"type": "number"` told the
+    /// caller otherwise on ten of the eleven; `find_references.node_id` was the
+    /// one that already said `integer`, which is why this reads as drift rather
+    /// than as a decision. The mismatch is the same shape as CON-15's: a
+    /// declaration the producer does not honour, differing only in which
+    /// direction the caller is misled.
+    ///
+    /// `f64` arguments do exist (`max_distance`), but only on tools that publish
+    /// no schema, so there is nothing here to exempt. Add one and this test is
+    /// where you say so.
+    #[test]
+    fn no_published_numeric_argument_declares_a_type_it_would_refuse() {
+        let registry = crate::mcp::tools::ToolRegistry::new();
+        let mut numeric = 0usize;
+        for tool in registry.list_tools() {
+            let name = tool.name.as_str();
+            let props = tool.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("tool '{name}' publishes no properties object"));
+            for (key, spec) in props {
+                match spec["type"].as_str() {
+                    Some("integer") => numeric += 1,
+                    Some("number") => panic!(
+                        "'{name}.{key}' is published as `number`, but the handler \
+                         reads it with as_u64/as_i64 and refuses 3.5. Declare \
+                         `integer`."
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            numeric, 11,
+            "vacuity floor: 11 numeric arguments are published across the 7 tools"
+        );
+    }
+
     #[test]
     fn truncate_array_keeps_items_homogeneous_and_records_original_len() {
         let items: Vec<serde_json::Value> = (0..50)
