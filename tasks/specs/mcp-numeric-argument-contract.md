@@ -1,6 +1,6 @@
 ---
-status: draft
-revision: 1
+status: implemented
+revision: 6
 ---
 
 # MCP 数值参数契约：范围披露、clamp 披露、负数策略统一
@@ -99,3 +99,27 @@ revision: 1
   success-criteria 1（范围从生产常量推导）因此不是风格要求而是正确性要求。
   同时补上「披露必须与行为一致」的守卫——此前守卫只比对表与 JSON，从不看结果，
   这正是让 P1 溜过的洞。
+- r6（2026-09-04）：**批 B 完成，spec 实现完毕**（`d163473` + `ee9c842`）。
+  success-criteria 1 与 4 达成，5 的 bench 项达成，status draft → implemented。
+  - **范围文字全部派生**，不是抄写：新增 `helpers::count_range_hint(tool, key)` 从
+    `COUNT_RANGES` 渲染 `range lo-hi`，`tools.rs` 的 8 个已发布计数参数各自 `format!` 调用它。
+    r5 警告的「批 B 若照抄旧值会把 1–20 写进 published schema」因此不可能发生——
+    `get_call_graph.depth` published 出来的是 `range 1-10`，与 `CALL_GRAPH_MAX_DEPTH` 同源。
+  - **守卫走已发布产物，不走源码文本**：`every_published_count_argument_states_its_bound`
+    遍历 `ToolRegistry::new()` 的 schema，逐个 property 对照它自己那行派生出的 hint。
+    变异复验：把 `ast_search.limit` 改回手写 "max 100" → 红。
+    vacuity 下限钉死 8（11 行里 3 行属未发布的后端工具）。
+  - **CON-13 落在 description**：四个工具各由**恰好一个** property 承载
+    `A call must carry …` 从句，且该从句必须点名每个分支。
+    `tools_list_shape_matches_what_each_handler_enforces` 从两半扩到三半（发布 / 强制 / 已有的 anyOf 禁令）。
+    变异复验两支：删掉分支名 → 红；整句删掉 → 红（0 != 1）。
+    注意不能把一个工具所有 description 拼起来判——`get_call_graph.direction` 本就写着
+    "route_path"，拼起来的守卫红不了。
+  - **routing-bench 前后**：基线 main@`120be43` run `33879459859` P@1=22/22 = 100.0%；
+    改后 branch@`ee9c842` run `33883568480` P@1=22/22 = 100.0%。零回归，均为真跑
+    （各约 2m13s API 时间，非 skip）。中间态 run `33882868385` 同为 22/22。
+  - 实现中自查抓到一条本批自引入的文案缺陷并单独修（`ee9c842`）：
+    「neither is refused」可读成「两个选项都不会被拒」，与规则相反；改为
+    「a call naming neither is refused」。属 v0.129.0 记过的「错误文案与实际相反」同类。
+  - **仍未覆盖**：六个 schema-less 工具（constraints 已声明其数值参数无处可写）；
+    `dead_min_lines` 无 clamp 故无范围可写，非缺口。
