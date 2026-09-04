@@ -250,16 +250,46 @@ jobs:
       # The bound is the STEP timeout only — no inner `timeout` per command. The
       # first version of this hardening wrapped both commands in `timeout 120`,
       # copying the budget from the ripgrep step, and killed the v0.122.1 arm64
-      # build with exit 124: ripgrep is ~2 MB while this pulls a ~40 MB cross
+      # build with exit 124: ripgrep is ~2 MB while this pulls a ~45 MB cross
       # toolchain, and the mirror was serving it fine, just not in two minutes.
-      # An inner timeout only earns its place inside a retry loop, bounding each
-      # attempt; there is no retry here, so it added nothing but a way to fail.
+      # An inner timeout only earns its place inside a retry loop bounding each
+      # attempt — so v0.133.0 added the retry rather than keep removing the
+      # timeout. On 2026-09-04 this step's TWIN in cache-warm.yml, byte-identical
+      # and running from the same push, died on the bare 15-minute ceiling with
+      # the mirror still feeding it (21 MB of `gcc-13-aarch64-linux-gnu` arrived
+      # over seven minutes, then the step was killed mid-download) while this
+      # copy passed. Nothing distinguished them but which mirror each runner drew
+      # from `/etc/apt/apt-mirrors.txt`, which is picked per invocation — so a
+      # fresh attempt is a fresh draw, and that is the only thing a retry buys
+      # here. It matters more on this side than on the warm side: cache-warm
+      # failing costs a cold build, this failing sits one job above an
+      # irreversible npm publish.
+      #
+      # Budget per the v0.122.1 lesson that a timeout must be sized to what it
+      # guards: a healthy mirror serves all 45 MB in well under a minute, so
+      # seven minutes is already the pathological case and three draws fit under
+      # the step ceiling with room for dpkg.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 15
+        timeout-minutes: 24
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 420 apt-get update && \
+               sudo timeout 420 apt-get install -y gcc-aarch64-linux-gnu; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::apt did not deliver the aarch64 toolchain in 3 attempts of 7 minutes"
+              exit 1
+            fi
+            # A kill mid-unpack can leave dpkg half-configured; the next attempt
+            # would then fail on that rather than on the mirror, which is a
+            # confusing second failure with a different cause.
+            sudo dpkg --configure -a || true
+            echo "::warning::apt attempt $attempt did not finish in 7 minutes; retrying against a fresh mirror draw"
+            sleep 15
+          done
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # `--features embed-model` keeps npm/npx/plugin users on the full hybrid

@@ -74,15 +74,32 @@ jobs:
 
       # Bounded for the same reason as the ripgrep step below — this is the other
       # apt call in this repo's CI, and an unbounded `apt-get update` is what ran
-      # three workflows into a hand-kill on 2026-08-19. Step timeout only, no
-      # inner per-command `timeout`: see the twin in release.yml for why the
-      # ripgrep step's 120s budget does not transfer to a ~40 MB toolchain.
+      # three workflows into a hand-kill on 2026-08-19. This step is the one that
+      # died on the bare 15-minute ceiling on 2026-09-04; its twin in release.yml
+      # carries the reasoning for the retry and the 7-minute per-attempt budget,
+      # and `the_arm64_cross_compile_install_is_identical_in_both_workflows`
+      # pins the two bodies together, so edit them as a pair.
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 15
+        timeout-minutes: 24
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 420 apt-get update && \
+               sudo timeout 420 apt-get install -y gcc-aarch64-linux-gnu; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::apt did not deliver the aarch64 toolchain in 3 attempts of 7 minutes"
+              exit 1
+            fi
+            # A kill mid-unpack can leave dpkg half-configured; the next attempt
+            # would then fail on that rather than on the mirror, which is a
+            # confusing second failure with a different cause.
+            sudo dpkg --configure -a || true
+            echo "::warning::apt attempt $attempt did not finish in 7 minutes; retrying against a fresh mirror draw"
+            sleep 15
+          done
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       # Same flags as the release build so the cached dep artifacts are the

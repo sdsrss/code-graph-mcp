@@ -1333,6 +1333,69 @@ fn release_and_cache_warm_workflows_do_not_drift() {
     }
 }
 
+/// The arm64 cross-compile install must be the SAME in both workflows.
+///
+/// The two copies are twins, and on 2026-09-04 that was the whole finding: from
+/// one push, `cache-warm.yml`'s copy died on the 15-minute ceiling with the
+/// mirror still feeding it while `release.yml`'s identical copy passed. Nothing
+/// separated them but which mirror each runner drew. So hardening one and not
+/// the other leaves the failure live on whichever side gets missed — and the
+/// side that matters is release.yml, which sits above an irreversible npm
+/// publish and is the copy nobody sees fail until a tag is already pushed.
+///
+/// Compares the step BODY, not just its presence: the earlier drift guard in
+/// this file pins toolchains, cache keys and gate commands, and would not have
+/// noticed one copy keeping a 15-minute bare ceiling while the other grew a
+/// retry.
+#[test]
+fn the_arm64_cross_compile_install_is_identical_in_both_workflows() {
+    fn step_body(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == "- name: Install cross-compilation tools")
+            .expect("no `Install cross-compilation tools` step in this workflow");
+        // Run to the next sibling step, ignoring comment lines so the two copies
+        // may explain themselves differently — the reasoning lives in
+        // release.yml and cache-warm.yml points at it.
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with("- name:"))
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    // Normalising CRLF is not cosmetic here: this test compares two files as
+    // text, and a Windows checkout would otherwise report every line unequal.
+    let read_lf = |p: std::path::PathBuf| -> String {
+        fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    };
+
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let release = step_body(&read_lf(wf.join("release.yml")));
+    let warm = step_body(&read_lf(wf.join("cache-warm.yml")));
+
+    assert!(
+        release.iter().any(|l| l.contains("timeout-minutes:")),
+        "vacuity floor: the scanned body does not even contain the step's own \
+         timeout, so this comparison stopped matching the workflow layout: \
+         {release:?}"
+    );
+    assert!(
+        release.iter().any(|l| l.contains("apt-get install")),
+        "vacuity floor: the scanned body contains no apt install: {release:?}"
+    );
+    assert_eq!(
+        release, warm,
+        "release.yml and cache-warm.yml install the arm64 cross toolchain \
+         differently. They are the same step against the same mirrors; harden \
+         or edit them as a pair."
+    );
+}
+
 /// Drift guard: every `github.ref` / `github.ref_name` EXPRESSION in release.yml
 /// must carry the `github.event.inputs.tag ||` fallback.
 ///
