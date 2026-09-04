@@ -372,14 +372,15 @@ fn tools_list_shape_matches_what_each_handler_enforces() {
         // the descriptions instead would pass on incidental mentions
         // (`get_call_graph.direction` already says "route_path" for its own
         // reasons), which is a guard that cannot go red.
-        let stating: Vec<(&str, &str)> = tool["inputSchema"]["properties"]
+        const CLAUSE: &str = "A call must carry";
+        let properties = tool["inputSchema"]["properties"]
             .as_object()
-            .unwrap_or_else(|| panic!("'{name}' publishes no properties object"))
+            .unwrap_or_else(|| panic!("'{name}' publishes no properties object"));
+        let stating: Vec<(&str, &str)> = properties
             .iter()
             .filter_map(|(key, spec)| {
                 let desc = spec["description"].as_str()?;
-                desc.contains("A call must carry")
-                    .then_some((key.as_str(), desc))
+                desc.contains(CLAUSE).then_some((key.as_str(), desc))
             })
             .collect();
         assert_eq!(
@@ -400,18 +401,35 @@ fn tools_list_shape_matches_what_each_handler_enforces() {
             "'{name}' states its one-of rule on '{holder}', which is not one of \
              {arms:?}; a caller reading the alternatives never sees it"
         );
-        for arm in arms {
-            assert!(
-                clause.contains(arm),
-                "'{name}' publishes a one-of clause that never names '{arm}', so a \
-                 caller reading the schema cannot tell it satisfies the \
-                 requirement: {clause:?}"
-            );
-        }
+        // The clause must name the arms and NOTHING ELSE. Checking only
+        // `contains(arm)` lets it OVER-state the rule: adding `file_path` to
+        // `get_ast_node`'s list passed, while the handler answers a bare
+        // `file_path` with "symbol_name is required when using file_path"
+        // (`ast_node.rs:209`). That is `ee9c842`'s defect from the other side --
+        // there the clause said less than the rule, here it says more, and a
+        // model believing it sends a call the server refuses.
+        //
+        // Only the requirement sentence counts: everything after the first `;`
+        // or em-dash is commentary that legitimately names other arguments.
+        let head = &clause[clause.find(CLAUSE).expect("clause was matched above")..];
+        let head = &head[..head.find([';', '—']).unwrap_or(head.len())];
+        let named: std::collections::BTreeSet<&str> = head
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|token| properties.contains_key(*token))
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = arms.iter().copied().collect();
+        assert_eq!(
+            named, expected,
+            "'{name}' publishes a one-of clause naming {named:?}, but the handler \
+             accepts exactly {expected:?}: {clause:?}"
+        );
 
-        // Half two: the requirement is ENFORCED. `compact` is a real argument for
-        // each of these and satisfies nothing: the call is well-formed and still
-        // names none of the alternatives.
+        // Half two: the requirement is ENFORCED. `compact` is a well-formed extra
+        // argument that satisfies nothing — the call parses and still names none
+        // of the alternatives. (It is a declared property on three of these four;
+        // `ast_search` does not publish one, where it lands in
+        // `ignored_arguments` instead. Either way it is not an arm, which is all
+        // this call needs to be.)
         let call = format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{name}","arguments":{{"compact":true}}}}}}"#
         );

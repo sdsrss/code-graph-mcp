@@ -42,7 +42,7 @@ impl ToolRegistry {
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
                         "top_k": { "type": "integer", "description": format!("Results count (default 20, {}). Alias: limit", count_range_hint("semantic_code_search", "top_k")) },
-                        "limit": { "type": "integer", "description": format!("Alias for top_k (default 20, {})", count_range_hint("semantic_code_search", "limit")) },
+                        "limit": { "type": "integer", "description": format!("Alias for top_k (default 20, {}); read only when top_k is absent, and discarded in silence when both are sent", count_range_hint("semantic_code_search", "limit")) },
                         "language": { "type": "string", "description": "Filter by language" },
                         "node_type": { "type": "string", "description": "Filter by node type" },
                         "compact": { "type": "boolean", "description": "Compact mode: signature+location only, no code (saves tokens)" }
@@ -62,7 +62,7 @@ impl ToolRegistry {
                         "symbol_name": { "type": "string", "description": "Function/method name. A call must carry symbol_name or route_path (mutually exclusive); a call naming neither is refused." },
                         "route_path": { "type": "string", "description": "HTTP route like 'GET /api/users' — traces from matched route handler(s) down. Mutually exclusive with symbol_name." },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both'); ignored when route_path is set (always 'callees')" },
-                        "depth": { "type": "integer", "description": format!("Max depth (default 3, {}); a larger value is clamped and the response says so in clamped_arguments", count_range_hint("get_call_graph", "depth")) },
+                        "depth": { "type": "integer", "description": format!("Max depth (default 3, {}); a larger value is clamped, and a successful response says so in clamped_arguments", count_range_hint("get_call_graph", "depth")) },
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
                         "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
