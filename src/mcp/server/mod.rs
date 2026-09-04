@@ -1,4 +1,8 @@
-mod helpers;
+// `pub(crate)` for one item only: `helpers::count_range_hint`, which
+// `mcp::tools` calls so the published schema text is DERIVED from
+// `COUNT_RANGES` instead of restating its numbers. Everything else in here
+// stays `pub(super)`.
+pub(crate) mod helpers;
 mod tools;
 
 use helpers::*;

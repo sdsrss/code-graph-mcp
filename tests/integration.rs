@@ -315,13 +315,19 @@ fn test_e2e_incremental_reindex() {
 /// accurate schema for that is `anyOf`, and publishing it is measurably not an
 /// option: for one build these four carried it and the client dropped exactly
 /// those four while keeping the three without it — see
-/// `no_tool_publishes_an_anyof_the_client_drops` in `mcp::tools`. So the
-/// constraint lives in the handler alone, and this pins BOTH halves of what is
-/// left: the wire stays free of the keyword that makes a tool disappear, and
-/// the handler keeps rejecting the call the schema can no longer describe.
+/// `no_tool_publishes_an_anyof_the_client_drops` in `mcp::tools`.
 ///
-/// The second half matters on its own. A requirement nobody enforces is the
-/// same defect as an unstated one, pointing the other way.
+/// So the constraint cannot live in the schema's KEYWORDS — but "cannot be
+/// expressed as `anyOf`" was read for a release as "cannot be published", and
+/// those are different claims. `description` is schema too, and it is the half
+/// the model actually reads. Each of the four now spells the disjunction there,
+/// and this pins all three halves of what is left: the wire stays free of the
+/// keyword that makes a tool disappear, the published text states the
+/// requirement, and the handler keeps rejecting the call.
+///
+/// The last two matter on their own, in opposite directions. A requirement
+/// nobody enforces is the same defect as an unstated one — and a requirement
+/// enforced but never published is how a caller finds out by being refused.
 #[test]
 fn tools_list_shape_matches_what_each_handler_enforces() {
     let project = TempDir::new().unwrap();
@@ -356,12 +362,47 @@ fn tools_list_shape_matches_what_each_handler_enforces() {
 
     let mut checked = 0usize;
     for (name, arms) in expected {
-        assert!(
-            tools.iter().any(|t| t["name"] == name),
-            "tools/list no longer advertises '{name}'"
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tools/list no longer advertises '{name}'"));
+
+        // Half one: the requirement is PUBLISHED. Exactly one property carries
+        // the clause, and that one property names every alternative — joining all
+        // the descriptions instead would pass on incidental mentions
+        // (`get_call_graph.direction` already says "route_path" for its own
+        // reasons), which is a guard that cannot go red.
+        let stating: Vec<(&str, &str)> = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("'{name}' publishes no properties object"))
+            .iter()
+            .filter_map(|(key, spec)| {
+                let desc = spec["description"].as_str()?;
+                desc.contains("A call must carry")
+                    .then_some((key.as_str(), desc))
+            })
+            .collect();
+        assert_eq!(
+            stating.len(),
+            1,
+            "'{name}' must state its one-of requirement in exactly one property \
+             description; found {}: {:?}",
+            stating.len(),
+            stating.iter().map(|(k, _)| *k).collect::<Vec<_>>()
         );
-        // `compact` is a real argument for each of these and satisfies nothing:
-        // the call is well-formed and still names none of the alternatives.
+        let (_, clause) = stating[0];
+        for arm in arms {
+            assert!(
+                clause.contains(arm),
+                "'{name}' publishes a one-of clause that never names '{arm}', so a \
+                 caller reading the schema cannot tell it satisfies the \
+                 requirement: {clause:?}"
+            );
+        }
+
+        // Half two: the requirement is ENFORCED. `compact` is a real argument for
+        // each of these and satisfies nothing: the call is well-formed and still
+        // names none of the alternatives.
         let call = format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{name}","arguments":{{"compact":true}}}}}}"#
         );
