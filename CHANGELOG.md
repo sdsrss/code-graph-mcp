@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.133.0
+
+**Upgrading:** one declaration changed, and it may make a client refuse locally
+what the server was already refusing.
+
+Ten numeric arguments were published as `"type": "number"` while their handlers
+have always read them with `as_u64`/`as_i64` — `top_k: 3.5` was refused before
+this release too. They now declare `"integer"`. A client that validates
+arguments against the schema will now reject a fractional value itself instead
+of sending it and getting an error back. Nothing that sends whole numbers
+changes. To defer, pin `0.132.0`.
+
+Everything else here is additive text: the bounds and the "one of these
+arguments is required" rules were always enforced, and are now written down
+where the caller reads them.
+
+### The schema now states the bound before you pick a number
+
+`0.132.0` made a clamp visible in the response. That helps a caller who has
+already sent a value too large. The schema is what a model reads *before* it
+picks one, and it named a default and no ceiling: `similar_top_k` said
+"default 5" against a bound of 50, `depth` said "default 3" against a bound of
+10, and `limit: 5000` looked like a number the tool would honour.
+
+All eight published count arguments now carry their range, and the text is
+derived from the same table the clamp enforces rather than typed a second time.
+This file's own history is the argument for that: `get_call_graph.depth` once
+advertised a ceiling of 20 against a traversal that stops at 10, so a restated
+bound is a copy that goes stale with nobody watching. A published description is
+read by a model that cannot check it, so it is derived or it is not written.
+
+### Four tools say which arguments they require
+
+`get_call_graph`, `get_ast_node`, `ast_search` and `find_references` each refuse
+a call that names none of their alternatives. The accurate JSON Schema for that
+is `anyOf`, and publishing it is measurably not an option — the client silently
+drops every tool carrying it, which is how `0.130.0` nearly shipped four dark
+tools. But "cannot be expressed as `anyOf`" is not "cannot be published":
+`description` is schema too, and it is the half the model actually reads. Each
+of the four now spells the requirement there, including the case a caller is
+most likely to get wrong — `get_ast_node` with a bare `file_path`, which names a
+file, not a symbol.
+
+`semantic_code_search.limit` also says what it does when `top_k` is sent as
+well: `top_k` wins and `limit` is discarded, which the response does not
+mention.
+
+### Documentation that was not true
+
+- The README's claim that compact JSON "saves 15-20% tokens" is gone. Traced, it
+  was worse than unsourced: the figure came from an old note about
+  `to_string_pretty`, not about the `compact` flag it was attached to.
+- A new "What the Graph Does Not See" section records the call-edge boundaries —
+  a method call reached through a module path, a receiver call whose method name
+  is shared by several types, and the uses that are carried as `references`
+  rather than calls. Each claim is measured; three earlier drafts of this section
+  stated wider rules than the measurements supported and were corrected before
+  release.
+
+### Guards
+
+Five guards were added or strengthened, and four of them were rewritten after a
+mutation showed they were green on wrong code: a range check defeated because
+`range 1-100` contains `range 1-10`; a refusal check satisfied by a successful
+payload's own field names; a range check that only looked at arguments which
+already had a bound, so an invented one was invisible; and a one-of check that
+verified the clause named every alternative but not that it named nothing else.
+
 ## 0.132.0
 
 **Upgrading:** one behaviour change you may need to act on, and one new field.
