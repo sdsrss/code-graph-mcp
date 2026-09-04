@@ -606,29 +606,43 @@ mod tests {
             let props = tool.input_schema["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("tool '{name}' publishes no properties object"));
+            // EVERY property, not just the ones with a row. Skipping the rowless
+            // ones is how the first version let a range be invented: a planted
+            // `range 1-10` on `dead_min_lines` — a published count that is NOT
+            // clamped, so the number would be a pure fabrication — was accepted,
+            // and so was one planted on a string property. The rule is symmetric,
+            // which also removes the need for an allowlist: state the row's bound
+            // if there is a row, state no bound if there is not.
             for (key, spec) in props {
-                let Some((lo, hi)) = count_range(name, key) else {
-                    continue;
-                };
                 let desc = spec["description"].as_str().unwrap_or_default();
+                let expected: Vec<(u64, u64)> = count_range(name, key).into_iter().collect();
                 assert_eq!(
                     published_ranges(desc),
-                    vec![(lo, hi)],
-                    "'{name}.{key}' is clamped to {lo}-{hi}; its published \
-                     description must state that bound exactly once: {desc:?}"
+                    expected,
+                    "'{name}.{key}': published range(s) must equal its COUNT_RANGES \
+                     row exactly, and a property with no row must state none — \
+                     otherwise the number is invented: {desc:?}"
                 );
-                checked += 1;
+                if !expected.is_empty() {
+                    checked += 1;
+                }
             }
         }
-        // Vacuity floor. Eight of the eleven COUNT_RANGES rows belong to a tool in
-        // `tools/list`; the other three (`find_http_route.depth`,
-        // `dependency_graph.depth`, `find_similar_code.top_k`) are backends the
-        // client is never offered, so they have no description to check. A ninth
-        // published count means a new argument arrived without a bound in its text.
+        // Vacuity floor over the CLAMPED ones. Eight of the eleven COUNT_RANGES
+        // rows belong to a tool in `tools/list`; the other three
+        // (`find_http_route.depth`, `dependency_graph.depth`,
+        // `find_similar_code.top_k`) are backends the client is never offered, so
+        // they have no description to check.
+        //
+        // This counts rows, not counts: `dead_min_lines` and the two `node_id`s
+        // are published integers with no row, and the loop above now checks them
+        // too — by requiring silence. The earlier wording here claimed a ninth
+        // published count would trip this number, which was never true.
         assert_eq!(
             checked, 8,
-            "expected 8 published count arguments; a change to the tool surface \
-             must be reflected here rather than silently shrinking this guard"
+            "expected 8 published arguments with a COUNT_RANGES row; a change to \
+             the tool surface must be reflected here rather than silently \
+             shrinking this guard"
         );
     }
 

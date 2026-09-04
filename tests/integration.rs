@@ -390,7 +390,16 @@ fn tools_list_shape_matches_what_each_handler_enforces() {
             stating.len(),
             stating.iter().map(|(k, _)| *k).collect::<Vec<_>>()
         );
-        let (_, clause) = stating[0];
+        let (holder, clause) = stating[0];
+        // …and it must sit on one of the alternatives. Moving `get_ast_node`'s
+        // clause verbatim onto `include_references` (a boolean) satisfied both
+        // the count and the arm-naming check while leaving `symbol_name` — the
+        // property a caller reads first — saying nothing about the requirement.
+        assert!(
+            arms.contains(&holder),
+            "'{name}' states its one-of rule on '{holder}', which is not one of \
+             {arms:?}; a caller reading the alternatives never sees it"
+        );
         for arm in arms {
             assert!(
                 clause.contains(arm),
