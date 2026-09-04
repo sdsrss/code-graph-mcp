@@ -59,7 +59,7 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "symbol_name": { "type": "string", "description": "Function/method name. A call must carry symbol_name or route_path (mutually exclusive); neither is refused." },
+                        "symbol_name": { "type": "string", "description": "Function/method name. A call must carry symbol_name or route_path (mutually exclusive); a call naming neither is refused." },
                         "route_path": { "type": "string", "description": "HTTP route like 'GET /api/users' — traces from matched route handler(s) down. Mutually exclusive with symbol_name." },
                         "direction": { "type": "string", "enum": ["callers", "callees", "both"], "description": "Direction (default 'both'); ignored when route_path is set (always 'callees')" },
                         "depth": { "type": "number", "description": format!("Max depth (default 3, {}); a larger value is clamped and the response says so in clamped_arguments", count_range_hint("get_call_graph", "depth")) },
@@ -186,7 +186,7 @@ impl ToolRegistry {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "symbol_name": { "type": "string", "description": "Symbol to find references for. A call must carry symbol_name or node_id; neither is refused." },
+                        "symbol_name": { "type": "string", "description": "Symbol to find references for. A call must carry symbol_name or node_id; a call naming neither is refused." },
                         "node_id": { "type": "integer", "description": "Exact node from a prior suggestion — overrides symbol_name. Use to disambiguate same-name defs in one file." },
                         "file_path": { "type": "string", "description": "Disambiguate same-name symbols across files" },
                         "relation": { "type": "string", "enum": ["calls", "imports", "inherits", "implements", "references", "exports", "routes_to", "all"], "description": "Relation type filter (default 'all')" },
