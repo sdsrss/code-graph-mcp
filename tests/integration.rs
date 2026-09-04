@@ -413,10 +413,22 @@ fn tools_list_shape_matches_what_each_handler_enforces() {
             .unwrap_or_default()
             .to_string()
             + parsed["error"]["message"].as_str().unwrap_or_default();
+        // Refusal first, and as its own assertion. Asking only "does the response
+        // text mention an arm" cannot go red for `ast_search`: a SUCCESSFUL
+        // payload carries "type" as a result field name, so the arm is satisfied
+        // by the answer the tool should not have given. Measured — with
+        // `ast_search.rs`'s check disabled the old single assertion stayed green.
+        // `isError` is the same signal the sibling numeric/boolean refusal guards
+        // in `mcp::server` assert on.
+        assert!(
+            parsed["result"]["isError"].as_bool().unwrap_or(false) || parsed.get("error").is_some(),
+            "'{name}' ANSWERED a call naming none of {arms:?} instead of refusing \
+             it: {parsed}"
+        );
         assert!(
             arms.iter().any(|a| text.contains(a)),
-            "'{name}' accepted a call naming none of {arms:?}, or refused without \
-             naming them — and the schema cannot warn the caller either: {parsed}"
+            "'{name}' refused a call naming none of {arms:?} without naming any of \
+             them, so the caller cannot tell what would satisfy it: {parsed}"
         );
         checked += 1;
     }
