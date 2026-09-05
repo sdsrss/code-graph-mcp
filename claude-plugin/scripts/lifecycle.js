@@ -1647,10 +1647,19 @@ function update() {
     settingsChanged = true;
   }
 
-  // 1. Update composite command path if version changed
+  // 1. Update composite command path if version changed.
+  //
+  // Same predicate as install()'s heal arm, not a bare string comparison: an
+  // exact mismatch is NOT staleness. Two copies of this plugin (plugin cache +
+  // global npm, or a dev checkout) derive different absolute paths for the SAME
+  // current composite, so rewriting on mismatch makes each surface take the slot
+  // back from the other. install() has carried the guard since that ping-pong
+  // was diagnosed; update() kept the string test, which reopened the pair for
+  // one round on every version bump and walked straight past the
+  // `statuslineDisplaced` stand-down (audit 2026-09-05 JS-08).
   if (isOurComposite(settings)) {
     const cmd = compositeCommand();
-    if (settings.statusLine.command !== cmd) {
+    if (settings.statusLine.command !== cmd && compositeSlotIsStale(settings.statusLine.command)) {
       settings.statusLine.command = cmd;
       settingsChanged = true;
     }

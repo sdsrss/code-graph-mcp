@@ -3633,7 +3633,9 @@ fn test_cli_impact_json() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert!(v["risk"].is_string());
     assert!(v["symbol"].is_string());
-    // value_references mirrors the MCP impact tool (CLI/MCP parity) — must be present.
+    // value_references is paired with `get_ast_node include_impact`
+    // (impact.value_references) — see test_get_ast_node_impact_reports_value_references,
+    // which is what makes this comment's parity claim true again (SURF-09).
     assert!(
         v["value_references"].is_number(),
         "CLI impact json must expose value_references like MCP"
@@ -9951,4 +9953,77 @@ fn test_cli_trace_route_parsing_matches_mcp() {
     assert_eq!(code2, 0, "real route should resolve; got:\n{out2}");
     let v2: serde_json::Value = serde_json::from_str(out2.trim()).unwrap();
     assert_eq!(v2["route"].as_str(), Some("/widgets"));
+}
+
+#[test]
+fn test_cli_similar_discloses_noise_filtered_candidates() {
+    // `similar` shortens its list with TWO filters and used to name only one.
+    // `--max-distance` drops the less-similar tail and says so; the test /
+    // module / `<external>` filter drops neighbours in silence. So 1-of-5 with
+    // no cutoff message read as "the index has nothing else", when in fact the
+    // neighbours were dropped by a filter that is not adjustable and was never
+    // mentioned — raising --max-distance would not have helped
+    // (audit 2026-09-05 SURF-06).
+    use code_graph_mcp::storage::queries;
+
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("app.rs"), "pub fn prod_alpha() {}\n").unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("tests/helpers.rs"),
+        "pub fn helper_one() {}\npub fn helper_two() {}\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let conn = db.conn();
+    conn.execute_batch(&code_graph_mcp::storage::schema::create_vec_tables_sql())
+        .unwrap();
+
+    // Hand-built vectors so this runs on the no-embed leg too: the CLI reads a
+    // STORED embedding for --node-id rather than embedding a query, so no model
+    // is involved. All three sit at the same point, so distance decides nothing
+    // and the noise filter is the only thing separating them.
+    let mut vectors = Vec::new();
+    for name in ["prod_alpha", "helper_one", "helper_two"] {
+        let n = queries::get_nodes_by_name(conn, name)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("fixture node {name} must be indexed"));
+        vectors.push((n.id, vec![0.1f32; 384]));
+    }
+    let seed = vectors[0].0;
+    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    drop(db);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "similar",
+            "--node-id",
+            &seed.to_string(),
+            "--top-k",
+            "5",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "similar should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("dropped as non-answers"),
+        "the two test-file neighbours were removed by a filter nothing named; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not adjustable"),
+        "and the message must not send the user to raise --max-distance, which \
+         would do nothing here; stderr:\n{stderr}"
+    );
 }

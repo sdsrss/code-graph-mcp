@@ -325,6 +325,7 @@ impl McpServer {
                 if include_impact {
                     self.append_impact_summary(
                         &mut result,
+                        n.id,
                         &n.name,
                         file_path,
                         &n.node_type,
@@ -489,6 +490,7 @@ impl McpServer {
         if include_impact {
             self.append_impact_summary(
                 &mut result,
+                node.id,
                 &node.name,
                 &file_path,
                 &node.node_type,
@@ -507,6 +509,7 @@ impl McpServer {
     pub(in crate::mcp::server) fn append_impact_summary(
         &self,
         result: &mut serde_json::Value,
+        node_id: i64,
         symbol_name: &str,
         file_path: &str,
         node_type: &str,
@@ -559,6 +562,36 @@ impl McpServer {
         }
         if let Some(warning) = cls.type_warning {
             impact["warning"] = json!(warning);
+        }
+        // Value references (REL_REFERENCES): callbacks, fn-pointers and
+        // type-position couplings the CALL graph does not see. The CLI's
+        // `impact` has reported this since v0.79 and its comment claims parity
+        // with this surface — a claim that stopped holding when the standalone
+        // `impact_analysis` tool was folded in here and the field went with it
+        // (audit 2026-09-05 SURF-09). Restored rather than the comment deleted:
+        // "what breaks if I rename this" is the question this summary exists to
+        // answer, and a callback coupling is the part caller counts cannot show.
+        //
+        // Scoped to THIS node, where the CLI dedups across every definition of
+        // the name: each surface counts what it resolved. `is_test_node`, not
+        // the name heuristic, so an inline `#[cfg(test)]` reference stays out of
+        // a production coupling signal.
+        let value_references = {
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            for r in crate::storage::queries::get_incoming_references(
+                self.db.conn(),
+                node_id,
+                Some(crate::domain::REL_REFERENCES),
+            )? {
+                if !crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
+                    seen.insert((r.name, r.file_path));
+                }
+            }
+            seen.len()
+        };
+        if value_references > 0 {
+            impact["value_references"] = json!(value_references);
         }
         if ambiguous_callers_excluded > 0 {
             impact["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);

@@ -538,7 +538,17 @@ function runDiagnostics({ checkOnly = false } = {}) {
       const failed = fire.results.filter(r => !r.ok).map(r => r.label).join(', ') || fire.error || 'unknown';
       results.push({ name: 'Hook firing', status: 'warn', detail: `did not fire: ${failed}` });
     }
-  } catch { /* probe failed — skip */ }
+  } catch (err) {
+    // Same stance as step 7 above, which learned it the hard way: dropping the
+    // row makes the table look complete while a check never ran, and doctor
+    // then exits 0 on a shorter all-green report. A probe that cannot run is
+    // itself a finding (audit 2026-09-05 JS-04).
+    results.push({
+      name: 'Hook firing',
+      status: 'warn',
+      detail: `probe could not run (${(err && err.message) || err}) — the registered hooks were NOT verified`,
+    });
+  }
 
   // 9. Global npm residue — the launcher's background install (or the user)
   //    may have `npm install -g`'d the shell + platform packages. Surface what
@@ -592,7 +602,16 @@ function runDiagnostics({ checkOnly = false } = {}) {
             : ` — no plugin-install marker; uninstall leaves them (remove: npm uninstall -g ${found.map((p) => p.name).join(' ')})`)),
       });
     }
-  } catch { /* probe failed — skip */ }
+  } catch (err) {
+    // Sibling of the step-8 arm above (JS-04). Here the row is conditional on
+    // `found.length`, so absence is ALREADY the normal "nothing installed"
+    // answer — which is exactly why a throw must not produce the same silence.
+    results.push({
+      name: 'Global npm packages',
+      status: 'warn',
+      detail: `probe could not run (${(err && err.message) || err}) — global npm residue was NOT checked`,
+    });
+  }
 
   return results;
 }

@@ -191,20 +191,44 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     let fetch_count = crate::domain::similar_fetch_count(top_k);
     let raw_results = queries::vector_search(conn, &embedding, fetch_count)?;
 
+    // Batch-fetch the surviving candidates, like the MCP twin
+    // (server/tools/advanced.rs): the per-candidate `get_node_by_id` +
+    // `get_file_path` pair below was two queries per row against a list that is
+    // already bounded and already known (audit 2026-09-05 SURF-06).
+    let candidate_ids: Vec<i64> = raw_results
+        .iter()
+        .filter(|(id, dist)| *id != node_id && *dist <= max_distance)
+        .map(|(id, _)| *id)
+        .collect();
+    // Owned map, not one of borrows: the loop below moves each survivor into
+    // `similar`, and `NodeResult` is not `Clone`. `remove` also makes a repeated
+    // id in `raw_results` impossible to double-count.
+    let mut node_map: std::collections::HashMap<i64, queries::NodeWithFile> =
+        queries::get_nodes_with_files_by_ids(conn, &candidate_ids)?
+            .into_iter()
+            .map(|nf| (nf.node.id, nf))
+            .collect();
+
     // Collect filtered results
     let mut similar: Vec<(queries::NodeResult, String, f64)> = Vec::new();
+    let mut noise_filtered = 0usize;
     for (id, distance) in &raw_results {
         if *id == node_id || *distance > max_distance {
             continue;
         }
-        let Some(node) = queries::get_node_by_id(conn, *id)? else {
+        let Some(nf) = node_map.remove(id) else {
             continue;
         };
-        let fp = queries::get_file_path(conn, node.file_id)?.unwrap_or_default();
-        if crate::domain::is_skippable_result(node.is_test, &node.node_type, &node.name, &fp) {
+        if crate::domain::is_skippable_result(
+            nf.node.is_test,
+            &nf.node.node_type,
+            &nf.node.name,
+            &nf.file_path,
+        ) {
+            noise_filtered += 1;
             continue;
         }
-        similar.push((node, fp, *distance));
+        similar.push((nf.node, nf.file_path, *distance));
         if similar.len() >= top_k as usize {
             break;
         }
@@ -223,6 +247,20 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             // than max_distance — the less-similar tail, not nearer ones.
             "[code-graph] {} result(s) within max_distance={} (< top_k={}); {} less-similar candidate(s) were beyond the cutoff. Raise --max-distance to widen.",
             similar.len(), max_distance, top_k, cutoff_dropped
+        );
+    }
+    // The OTHER filter that shortened this list. Reported separately and never
+    // summed into `cutoff_dropped`: raising --max-distance does nothing about a
+    // test-file neighbour, so a caller that cannot tell the two apart keeps
+    // widening a search that was never narrow (SURF-06, and the same
+    // one-cause-named-for-two shape as the empty-result disclosures elsewhere).
+    if (similar.len() as i64) < top_k && noise_filtered > 0 {
+        // (guarded by test_cli_similar_discloses_noise_filtered_candidates, which
+        // hand-inserts vectors so it runs on the no-embed leg — the MCP twin's
+        // assertion cannot, since that tool refuses without the feature)
+        eprintln!(
+            "[code-graph] {} candidate(s) within max_distance were dropped as non-answers (test symbols, module placeholders, <external> sentinels). That filter is not adjustable.",
+            noise_filtered
         );
     }
 

@@ -391,6 +391,23 @@ impl McpServer {
         let node_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
             nodes_with_files.iter().map(|nf| (nf.node.id, nf)).collect();
 
+        // NOT directly covered by a test on this surface: reaching this line needs
+        // a DB whose vec tables survived `Database::open`'s dim migration, which
+        // no fixture here manages. The identical disclosure IS covered on the CLI
+        // twin (test_cli_similar_discloses_noise_filtered_candidates, no-embed
+        // leg); this copy rides on that plus review. Said plainly rather than
+        // left to look tested.
+        //
+        // Two filters shorten this list and only ONE of them used to say so.
+        // `cutoff_dropped` reports what max_distance removed; `is_skippable_result`
+        // removed test / module / <external> neighbours in silence, so a result of
+        // 1-of-5 alongside "0 exceeded max_distance" read as "the index has
+        // nothing else" when in fact three neighbours were dropped by a filter
+        // nobody named (audit 2026-09-05 SURF-06). Counted inside the closure,
+        // which `take(top_k)` stops calling once the list is full — so the count
+        // covers exactly the candidates that were actually examined, and it is
+        // only reported on the short-result path where that equals all of them.
+        let mut noise_filtered = 0usize;
         let similar: Vec<serde_json::Value> = candidates
             .iter()
             .filter_map(|(id, distance)| {
@@ -401,6 +418,7 @@ impl McpServer {
                     &nf.node.name,
                     &nf.file_path,
                 ) {
+                    noise_filtered += 1;
                     return None;
                 }
                 let similarity = 1.0 / (1.0 + distance);
@@ -424,13 +442,27 @@ impl McpServer {
             "top_k": top_k,
             "max_distance": max_distance,
         });
-        if (similar.len() as i64) < top_k && cutoff_dropped > 0 {
-            out["cutoff_applied"] = json!(true);
-            out["cutoff_dropped"] = json!(cutoff_dropped);
-            out["hint"] = json!(format!(
-                "Fewer results than top_k ({}): {} candidate(s) exceeded max_distance={}. Raise max_distance to widen the search.",
-                top_k, cutoff_dropped, max_distance
-            ));
+        if (similar.len() as i64) < top_k {
+            if cutoff_dropped > 0 {
+                out["cutoff_applied"] = json!(true);
+                out["cutoff_dropped"] = json!(cutoff_dropped);
+                out["hint"] = json!(format!(
+                    "Fewer results than top_k ({}): {} candidate(s) exceeded max_distance={}. Raise max_distance to widen the search.",
+                    top_k, cutoff_dropped, max_distance
+                ));
+            }
+            // Reported separately from `cutoff_dropped`, never summed into it:
+            // they are different questions with different remedies. Raising
+            // max_distance does nothing about a test-file neighbour, and a
+            // caller that cannot tell them apart will keep widening a search
+            // that was never narrow.
+            if noise_filtered > 0 {
+                out["noise_filtered"] = json!(noise_filtered);
+                out["noise_filtered_note"] = json!(format!(
+                    "{} candidate(s) within max_distance were dropped as non-answers (test symbols, module placeholders, <external> sentinels). This filter is not adjustable.",
+                    noise_filtered
+                ));
+            }
         }
         Ok(out)
     }

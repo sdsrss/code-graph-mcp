@@ -1267,3 +1267,29 @@ test('silentFailureReason speaks only when the child did not speak for itself', 
   assert.equal(silentFailureReason(null), '');
   assert.equal(silentFailureReason({}), '');
 });
+
+// ── JS-04: a probe that cannot run is itself a finding ────────────────────
+//
+// Step 7 of runDiagnostics says exactly that, in a comment written after a
+// ReferenceError silently dropped the Hook-coverage row. Steps 8 and 9 kept
+// `catch { /* probe failed — skip */ }`, so the same class — a renamed export, a
+// broken require chain, an unreadable cache — made the "Hook firing" or "Global
+// npm packages" row VANISH and doctor exit 0 on a shorter, all-green table.
+test('a throwing probe leaves a warn row, it does not delete the row', () => {
+  const { runDiagnostics } = require('./doctor');
+  const lifecycle = require('./lifecycle');
+
+  const realVerify = lifecycle.verifyHooksFire;
+  lifecycle.verifyHooksFire = () => {
+    throw new ReferenceError('surveyHookCoverage is not defined');
+  };
+  try {
+    const rows = runDiagnostics({ checkOnly: true });
+    const row = rows.find((r) => r.name === 'Hook firing');
+    assert.ok(row, 'the row must survive a probe that threw — a missing row reads as "checked, fine"');
+    assert.equal(row.status, 'warn');
+    assert.match(row.detail, /could not run|ReferenceError/i, `got: ${row.detail}`);
+  } finally {
+    lifecycle.verifyHooksFire = realVerify;
+  }
+});

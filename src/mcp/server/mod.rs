@@ -2848,6 +2848,49 @@ function handleLogin(req: Request) {
         assert_eq!(result["type"], "function");
     }
 
+    #[test]
+    fn test_get_ast_node_impact_reports_value_references() {
+        // The CLI's `impact` has carried a comment since v0.79 saying its
+        // `value_references` count "mirrors the MCP impact tool … CLI/MCP
+        // parity". It stopped being true when the standalone `impact_analysis`
+        // tool was folded into `get_ast_node include_impact` — the fold dropped
+        // the field, and the CLI test that migrated over still asserts parity
+        // with a surface that no longer had it (audit 2026-09-05 SURF-09).
+        //
+        // The signal is callback / fn-pointer / type-position coupling the call
+        // graph misses, which is exactly what an agent asking "what breaks if I
+        // rename this" needs and cannot get from caller counts.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.rs"),
+            "pub fn caller() { register(handler); }\nfn register<F>(_f: F) {}\nfn handler() {}\n",
+        )
+        .unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({ "symbol_name": "handler", "include_impact": true }),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        let impact = &result["impact"];
+        assert!(
+            impact["value_references"].as_u64().unwrap_or(0) >= 1,
+            "a fn passed as a callback must surface value_references; got: {result}"
+        );
+        // The referencer references but never CALLS it, so the separation the
+        // CLI keeps must hold here too: a callback referencer is not a caller.
+        assert_eq!(
+            impact["direct_callers"].as_u64(),
+            Some(0),
+            "a value reference must not inflate the caller count; got: {result}"
+        );
+    }
+
     /// `file_path` + `symbol_name` cannot split two defs of the same name in one
     /// file, so it must say so instead of answering about the first one.
     ///

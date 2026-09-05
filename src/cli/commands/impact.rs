@@ -269,8 +269,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     // Value references (REL_REFERENCES): callbacks / fn-pointers / type-position
     // couplings the call graph misses. Prod sources, deduped by referencing symbol.
-    // Mirrors the MCP impact tool (server/tools/advanced.rs) so both surfaces report
-    // the same signal — CLI/MCP parity. NEVER folded into the caller counts above.
+    // Paired with `get_ast_node include_impact` (server/tools/ast_node.rs), which
+    // reports the same signal under `impact.value_references`. The pointer used to
+    // name `advanced.rs` and the standalone `impact_analysis` tool; that tool was
+    // folded into `get_ast_node` and the field went with it, so this comment
+    // claimed a parity that had quietly stopped existing until 2026-09-05 SURF-09
+    // restored it. Scope differs by surface and that is deliberate: this dedups
+    // across EVERY definition of the name, `get_ast_node` counts the one node it
+    // resolved. NEVER folded into the caller counts above.
     let value_references = {
         use std::collections::HashSet;
         let mut seen: HashSet<(String, String)> = HashSet::new();

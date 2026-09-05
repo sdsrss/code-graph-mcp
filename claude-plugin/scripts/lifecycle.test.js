@@ -1870,3 +1870,70 @@ test('corrupt-file backups are bounded', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── JS-08: install() and update() must agree on when to seize the slot ────
+//
+// install() takes the statusline slot back only when the sitting command is
+// actually STALE — twelve lines of comment there record why: two copies of this
+// plugin (plugin cache + global npm, or a dev checkout) derive different
+// absolute paths for the SAME current composite, and rewriting on a bare string
+// mismatch made each install() take the slot from the other, rewriting
+// settings.json every session. update() carried only the string comparison, so
+// every version bump reopened that pair for one round (audit 2026-09-05 JS-08).
+test('update() does not seize the statusline slot from a live sibling composite', (t) => {
+  const homeDir = mkHome(t);
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+
+  // A composite from the OTHER install surface: a real, existing script at a
+  // path with no plugin-cache version dir — which is exactly the shape of a
+  // global-npm install, and what makes compositeSlotIsStale answer "not stale".
+  const siblingDir = path.join(homeDir, 'npm-global', 'scripts');
+  fs.mkdirSync(siblingDir, { recursive: true });
+  const siblingScript = path.join(siblingDir, 'statusline-composite.js');
+  fs.writeFileSync(siblingScript, '// sibling install\n');
+  const siblingCmd = `node "${siblingScript}"`;
+
+  writeJson(manifestPath, {
+    version: '0.31.2',
+    installedAt: '2026-03-16T18:56:17.656Z',
+    updatedAt: '2026-05-23T16:46:39.353Z',
+    config: { statusLine: true },
+  });
+  writeJson(settingsPath, { statusLine: { type: 'command', command: siblingCmd } });
+
+  execFileSync(process.execPath, [lifecyclePath, 'update'], {
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+  });
+
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.equal(
+    after.statusLine.command, siblingCmd,
+    'update() must leave a live sibling composite alone — rewriting it is one half ' +
+    'of the settings.json ping-pong install() already refuses to start'
+  );
+});
+
+test('update() still heals a composite whose script is gone', (t) => {
+  // The other half: parity with install() must not turn into "never heal".
+  const homeDir = mkHome(t);
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const deadCmd = `node "${path.join(homeDir, 'gone', 'statusline-composite.js')}"`;
+
+  writeJson(manifestPath, {
+    version: '0.31.2',
+    installedAt: '2026-03-16T18:56:17.656Z',
+    updatedAt: '2026-05-23T16:46:39.353Z',
+    config: { statusLine: true },
+  });
+  writeJson(settingsPath, { statusLine: { type: 'command', command: deadCmd } });
+
+  execFileSync(process.execPath, [lifecyclePath, 'update'], {
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+  });
+
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.notEqual(after.statusLine.command, deadCmd, 'a dead path must still be replaced');
+  assert.match(after.statusLine.command, /statusline-composite/);
+});
