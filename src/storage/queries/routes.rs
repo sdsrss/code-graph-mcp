@@ -142,6 +142,142 @@ impl ModuleExport {
     }
 }
 
+/// "Is `n` part of the public surface this prefix should show?" — the per-file
+/// export rule, written ONCE.
+///
+/// Spliced into [`get_module_exports`] and, negated, into
+/// [`count_export_filtered_out`]. The two must partition the same candidate set
+/// exactly: a second hand-copied predicate would drift and the withheld count
+/// would start disagreeing with the list it annotates, which is worse than no
+/// count. Binds `?3 = REL_EXPORTS` and the outer `n` / `n.file_id`.
+///
+/// The SQL halves partitioning is necessary but not sufficient — the callers
+/// apply a further test-symbol filter on top. See [`count_export_filtered_out`]
+/// for how that second filter is mirrored into this query.
+const EXPORT_VISIBLE_PREDICATE: &str = "(
+               EXISTS (
+                   SELECT 1 FROM edges ex
+                   WHERE ex.target_id = n.id AND ex.relation = ?3
+               )
+               OR n.file_id NOT IN (
+                   SELECT en.file_id
+                   FROM edges ex2
+                   JOIN nodes en ON en.id = ex2.target_id
+                   WHERE ex2.relation = ?3
+               )
+               -- Methods of an exported class are public API too, but ESM emits an
+               -- export edge only for the class, never its methods — so in an
+               -- export-bearing (TS/JS) file they were dropped from overview /
+               -- module_overview, while Python/Rust/Go methods (files with no export
+               -- edges → the NOT IN branch above) showed. Include n when an exported
+               -- node in the SAME file owns it by qualified_name (`<owner>.<n.name>`,
+               -- exact so no LIKE-escaping of `_`/`%`). In practice only class members
+               -- get a dotted qualified_name (top-level symbols are bare), so this is
+               -- methods of exported classes. Kept LAST and file-bounded (cls filtered
+               -- by file_id + qualified_name, hitting idx_nodes_file, before the export
+               -- check) so this correlated lookup fires only for the few non-exported
+               -- rows in export-bearing files — never for no-export (Python/Rust/Go)
+               -- files, which the cheap materialized NOT IN branch short-circuits first.
+               OR EXISTS (
+                   SELECT 1 FROM nodes cls
+                   WHERE cls.file_id = n.file_id
+                     AND n.qualified_name = cls.qualified_name || '.' || n.name
+                     AND EXISTS (
+                         SELECT 1 FROM edges ex4
+                         WHERE ex4.target_id = cls.id AND ex4.relation = ?3
+                     )
+               )
+           )";
+
+/// Symbols under `dir_prefix` that [`get_module_exports`] withheld *because they
+/// are not exported* — the complement of [`EXPORT_VISIBLE_PREDICATE`] over the
+/// same candidate set — as `(display_name, file_path)` pairs.
+///
+/// Empty for Python/Rust/Go/CommonJS trees (no export edges → every symbol is
+/// visible). It is non-empty only where the filter actually narrows: an ESM
+/// file's private helpers. That case had no signal at all — `overview
+/// src/api/routes.js` on a 4-function file printed one line, and a reader with
+/// no way to know an export rule had run concluded the other three did not
+/// exist. The disclosure counts these; it does not print them, which would undo
+/// the filter.
+///
+/// Both callers drop test symbols from the VISIBLE half with
+/// `domain::is_test_symbol`, a name/path heuristic strictly wider than a bare
+/// `n.is_test = 0` column check. The withheld half has to apply the same rule or
+/// the two stop being halves of one thing, so the query filters on
+/// [`crate::domain::is_test_node_sql`] — the SQL mirror of that heuristic, held
+/// to it by the existing `test_is_test_node_sql_matches_rust` parity test.
+///
+/// The mirror, rather than counting rows in Rust: the withheld half is unbounded
+/// (every non-exported symbol in every export-bearing file), so shipping the rows
+/// back merely to filter and count them would transfer tens of thousands of
+/// pairs on a large ESM/TS monorepo — and under `NOT` those are exactly the rows
+/// that must evaluate the correlated concatenation subquery, so the expensive
+/// scan and the large transfer would land on the same call. A scalar keeps the
+/// cost where the old count had it; the parity test keeps the two predicates
+/// honest.
+///
+/// On this repository the test filter currently removes nothing, and the reason
+/// is worth recording so nobody reads it as a measured correction: the withheld
+/// set only ever holds rows from export-BEARING files, and this tree's
+/// test-shaped files either declare no exports — which makes their symbols
+/// visible, not withheld — or export a name the heuristic rejects.
+/// `claude-plugin/scripts` reports 96 with and without it. It earns its place
+/// where the shapes do meet: an export-bearing file on a test path with private
+/// helpers, which today's tree happens not to contain.
+///
+/// One asymmetry this does NOT close, deliberately: a symbol the heuristic
+/// rejects is in neither half, so `visible + withheld ≤ candidates`. Those are
+/// test symbols and belong in neither.
+pub fn count_export_filtered_out(conn: &Connection, dir_prefix: &str) -> Result<i64> {
+    use crate::domain::REL_EXPORTS;
+    let prefix_pattern = format!("{}%", escape_like(dir_prefix));
+    // DISTINCT on the same (qualified_name, file_path) key `get_module_exports`
+    // dedups by, so the withheld count and the shown set are in one unit.
+    let sql = format!(
+        "SELECT COUNT(DISTINCT COALESCE(n.qualified_name, n.name) || char(31) || f.path)
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE f.path LIKE ?1 ESCAPE '\\'
+           AND n.type != 'module'
+           AND n.name != '<module>'
+           AND NOT {test_filter}
+           AND f.path != '<external>'
+           AND NOT {EXPORT_VISIBLE_PREDICATE}",
+        test_filter = crate::domain::is_test_node_sql("n", "f"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // ?2 is unused by this query but the spliced predicate is written against
+    // ?3; bind a placeholder so the numbering matches the text.
+    let n: i64 = stmt.query_row(
+        rusqlite::params![&prefix_pattern, rusqlite::types::Null, REL_EXPORTS],
+        |row| row.get(0),
+    )?;
+    Ok(n)
+}
+
+/// One wording for "the export rule withheld N symbols", used by CLI `overview`
+/// and MCP `module_overview` alike so the two surfaces cannot describe the same
+/// filter differently.
+///
+/// It lives HERE, beside the rule it describes, and not in either surface: the
+/// layering guard (`no_forbidden_module_dependency_edges`) forbids `src/mcp` from
+/// reaching into `crate::cli`, and a sentence duplicated across the two surfaces
+/// is how they start disagreeing.
+/// The remedy names `grep` alone. `ast-search` was in an earlier draft and had
+/// to come out: it has no path or file filter, so `ast-search --type fn` answers
+/// repo-wide and clamped at 100 — it cannot be pointed at the module the note is
+/// about, which makes it advice that does not reach the thing it promises.
+pub fn export_filter_note(hidden: i64) -> String {
+    format!(
+        "{} not-exported {} hidden — files that declare explicit exports contribute only \
+         their exported symbols; use `code-graph-mcp grep '<name>' <path>` to reach the \
+         private ones",
+        hidden,
+        if hidden == 1 { "symbol" } else { "symbols" }
+    )
+}
+
 /// Get all exported symbols from files under a directory prefix.
 /// For JS/TS, uses explicit `exports` edges. For other languages (Rust, Go, Python, etc.),
 /// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
@@ -189,40 +325,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
            AND n.name != '<module>'
            AND n.is_test = 0
            AND f.path != '<external>'
-           AND (
-               EXISTS (
-                   SELECT 1 FROM edges ex
-                   WHERE ex.target_id = n.id AND ex.relation = ?3
-               )
-               OR n.file_id NOT IN (
-                   SELECT en.file_id
-                   FROM edges ex2
-                   JOIN nodes en ON en.id = ex2.target_id
-                   WHERE ex2.relation = ?3
-               )
-               -- Methods of an exported class are public API too, but ESM emits an
-               -- export edge only for the class, never its methods — so in an
-               -- export-bearing (TS/JS) file they were dropped from overview /
-               -- module_overview, while Python/Rust/Go methods (files with no export
-               -- edges → the NOT IN branch above) showed. Include n when an exported
-               -- node in the SAME file owns it by qualified_name (`<owner>.<n.name>`,
-               -- exact so no LIKE-escaping of `_`/`%`). In practice only class members
-               -- get a dotted qualified_name (top-level symbols are bare), so this is
-               -- methods of exported classes. Kept LAST and file-bounded (cls filtered
-               -- by file_id + qualified_name, hitting idx_nodes_file, before the export
-               -- check) so this correlated lookup fires only for the few non-exported
-               -- rows in export-bearing files — never for no-export (Python/Rust/Go)
-               -- files, which the cheap materialized NOT IN branch short-circuits first.
-               OR EXISTS (
-                   SELECT 1 FROM nodes cls
-                   WHERE cls.file_id = n.file_id
-                     AND n.qualified_name = cls.qualified_name || '.' || n.name
-                     AND EXISTS (
-                         SELECT 1 FROM edges ex4
-                         WHERE ex4.target_id = cls.id AND ex4.relation = ?3
-                     )
-               )
-           )
+           AND {EXPORT_VISIBLE_PREDICATE}
          ORDER BY caller_count DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -400,6 +503,62 @@ mod tests {
             2,
             "both same-named methods kept, not deduped: {render_qns:?}"
         );
+    }
+
+    /// `count_export_filtered_out` must be the exact complement of what
+    /// `get_module_exports` shows over the same candidate set — that is the whole
+    /// reason both splice `EXPORT_VISIBLE_PREDICATE` instead of each spelling the
+    /// rule. Reuses the `models.ts` shape: Animal + Animal.speak are exported and
+    /// shown; Helper + Helper.secret are private and withheld.
+    #[test]
+    fn test_count_export_filtered_out_complements_what_is_shown() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/models.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Animal', 'Animal', 1, 5, 'class Animal {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'speak', 'Animal.speak', 2, 3, 'speak() {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'models', 'models', 0, 0, '')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Helper', 'Helper', 6, 8, 'class Helper {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'secret', 'Helper.secret', 7, 7, 'secret() {}')", []).unwrap();
+
+        assert_eq!(
+            get_module_exports(conn, "src/models").unwrap().len(),
+            2,
+            "Animal + Animal.speak are the public half"
+        );
+        assert_eq!(
+            count_export_filtered_out(conn, "src/models").unwrap(),
+            2,
+            "Helper + Helper.secret are the withheld half — without this count the \
+             one-line output read as the whole file"
+        );
+    }
+
+    /// A tree with no export edges at all (Python / Rust / Go / CommonJS) shows
+    /// every symbol, so nothing is withheld and no disclosure may fire. A note on
+    /// a Rust repo would be pure noise — and false.
+    #[test]
+    fn test_count_export_filtered_out_is_zero_without_export_edges() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/lib.rs', 'h1', 0, 'rust', 0)", []).unwrap();
+        for (name, ty) in [
+            ("Engine", "struct"),
+            ("run", "function"),
+            ("tick", "function"),
+        ] {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, ?1, ?2, ?2, 1, 2, '')",
+                rusqlite::params![ty, name],
+            ).unwrap();
+        }
+        assert_eq!(get_module_exports(conn, "src/lib").unwrap().len(), 3);
+        assert_eq!(count_export_filtered_out(conn, "src/lib").unwrap(), 0);
     }
 
     #[test]

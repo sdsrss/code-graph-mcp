@@ -132,6 +132,17 @@ pub fn get_project_map(
         // Spliced, not hand-copied: these were two of the seven copies of the
         // test-classification rule, and keeping them inline is how they kept
         // one fix behind the shared version (see `domain::prod_filter_and`).
+        // No global LIMIT. The cap that matters is the per-directory one below
+        // (6 names); a repo-wide `LIMIT 200` capped the wrong axis — it kept the
+        // 200 most-called symbols in the PROJECT and then bucketed those into
+        // directories, so on any repo with more than ~200 called symbols the
+        // long tail of modules got zero key_symbols and printed a bare
+        // "src/cli/commands (22 files, 62 symbols)" with no names under it.
+        // Measured on this repo (1,847 called symbols): `src/cli/commands` kept
+        // 2 of its symbols because only those two cleared the global cut, while
+        // `<root>`, `scripts` and `bin` listed nothing at all — and "Modules:"
+        // is the discovery surface `map` exists for. Row count is bounded by the
+        // distinct called-symbol count, the same order as the census query above.
         let sql = format!(
             "SELECT n.name, f.path, COUNT(e.id) as cnt \
              FROM nodes n \
@@ -141,8 +152,7 @@ pub fn get_project_map(
                AND f.path != '<external>' \
                AND {filter} \
              GROUP BY n.id \
-             ORDER BY cnt DESC, n.name, f.path \
-             LIMIT 200",
+             ORDER BY cnt DESC, n.name, f.path",
             filter = crate::domain::prod_filter_and("n", "f"),
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -505,6 +515,84 @@ mod tests {
                 ("src/mod_b".to_string(), "src/mod_e".to_string()),
             ],
             "equal-import-count deps must be tie-broken by (from, to)"
+        );
+    }
+
+    /// Regression: `key_symbols` was filled from a repo-wide `LIMIT 200` over the
+    /// most-called symbols, then bucketed per directory — so the cap applied to
+    /// the project, not to the module. Past ~200 called symbols the tail modules
+    /// got nothing, and `map` printed "modname (N files, M symbols)" with no
+    /// names under it even though the module was full of called functions.
+    ///
+    /// 250 called symbols in `src/tail`, each with exactly one caller from
+    /// `src/head`, plus 250 hotter symbols in `src/head` — under the old query
+    /// every one of the 200 kept rows came from `src/head` and `src/tail` came
+    /// back empty.
+    #[test]
+    fn test_key_symbols_cap_is_per_module_not_repo_wide() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        for (fid, path) in [(1, "src/head/h.py"), (2, "src/tail/t.py")] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, ?2, 0, 'python', 0)",
+                rusqlite::params![path, format!("h{fid}")],
+            ).unwrap();
+        }
+        // Node ids: head_i → 1..=250, tail_i → 251..=500.
+        for i in 0..250 {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', ?1, ?1, 1, 3, '')",
+                rusqlite::params![format!("head_{i}")],
+            ).unwrap();
+        }
+        for i in 0..250 {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', ?1, ?1, 1, 3, '')",
+                rusqlite::params![format!("tail_{i}")],
+            ).unwrap();
+        }
+        for i in 0..250i64 {
+            // head_i gets 2 callers, tail_i gets 1 → every head symbol outranks
+            // every tail symbol in the global ORDER BY cnt DESC.
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
+                rusqlite::params![251 + i, 1 + i],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
+                rusqlite::params![252 + (i % 249), 1 + i],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
+                rusqlite::params![1 + i, 251 + i],
+            )
+            .unwrap();
+        }
+
+        let (modules, _, _, _) = get_project_map(conn).unwrap();
+        let tail = modules
+            .iter()
+            .find(|m| m.path == "src/tail")
+            .expect("src/tail module present");
+        assert!(
+            !tail.key_symbols.is_empty(),
+            "a module of 250 called functions must list key symbols; got none"
+        );
+        assert!(
+            tail.key_symbols.iter().all(|s| s.starts_with("tail_")),
+            "key_symbols must come from the module itself, got: {:?}",
+            tail.key_symbols
+        );
+        let head = modules
+            .iter()
+            .find(|m| m.path == "src/head")
+            .expect("src/head module present");
+        assert!(
+            head.key_symbols.len() <= 6,
+            "the per-module cap still applies, got {}",
+            head.key_symbols.len()
         );
     }
 }

@@ -30,6 +30,13 @@ pub fn cmd_surprising(project_root: &Path, args: SurprisingArgs) -> Result<()> {
         json: json_mode,
     } = args;
 
+    // `--limit 0` had NO floor at all: it returned an empty ranking and fell into
+    // the "No surprising connections found (try --include-tests)" branch below —
+    // a false diagnosis manufactured out of the user's own argument, which is
+    // worse than the silent clamps elsewhere. Same `.max(1)` reasoning as
+    // `centrality`, but disclosed.
+    let limit = floor_arg("--limit", limit, 1);
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 

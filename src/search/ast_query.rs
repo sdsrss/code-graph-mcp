@@ -63,11 +63,33 @@ pub enum HintStyle {
     Mcp,
 }
 
+/// The largest `limit` either surface will honour. Both clamp to it — the CLI in
+/// `cmd_ast_search`, MCP through the `("ast_search", "limit", 1, 100)` row of
+/// `COUNT_RANGES` — and [`HintStyle::limit_remedy`] reads it so the advice it
+/// prints cannot outlive the bound that is actually enforced.
+pub const MAX_LIMIT: usize = 100;
+
 impl HintStyle {
     fn limit_remedy(self, limit: usize) -> String {
+        // At the ceiling "raise the limit" is an instruction the caller cannot
+        // follow: `--limit 999` had already been clamped to 100 by the time this
+        // ran, so the answer said "clamped to 100" and "raise --limit" in the
+        // same breath. Name the remedy that still exists — narrowing the search.
+        if limit >= MAX_LIMIT {
+            return match self {
+                HintStyle::Cli => format!(
+                    "--limit {limit}, the maximum — narrow the query or add \
+                     --type/--returns/--params to reach the rest."
+                ),
+                HintStyle::Mcp => format!(
+                    "limit={limit}, the maximum — narrow `query` or add \
+                     type/returns/params filters to reach the rest."
+                ),
+            };
+        }
         match self {
-            HintStyle::Cli => format!("--limit {limit} — raise --limit"),
-            HintStyle::Mcp => format!("limit={limit} — raise `limit`"),
+            HintStyle::Cli => format!("--limit {limit} — raise --limit to see the rest."),
+            HintStyle::Mcp => format!("limit={limit} — raise `limit` to see the rest."),
         }
     }
     fn broaden_remedy(self, rows: i64) -> String {
@@ -115,10 +137,13 @@ pub fn hints(
         });
     }
     if outcome.truncated {
+        // The trailing clause belongs to the remedy, not to this template: at the
+        // ceiling the remedy is "narrow", and "narrow … to see the rest" is not
+        // the sentence that remedy ends with.
         let remedy = style.limit_remedy(limit);
         out.push(match outcome.matched_total {
-            Some(total) => format!("{total} symbols matched but {remedy} to see the rest."),
-            None => format!("More symbols matched than {remedy} to see the rest."),
+            Some(total) => format!("{total} symbols matched but {remedy}"),
+            None => format!("More symbols matched than {remedy}"),
         });
     }
     if outcome.fallback_used {
@@ -543,5 +568,32 @@ mod tests {
         assert!(mcp[0].contains("limit=5"), "got {mcp:?}");
         assert!(!mcp[0].contains("--limit"), "got {mcp:?}");
         assert_eq!(cli.len(), mcp.len());
+    }
+
+    /// At the ceiling, "raise the limit" is advice the caller cannot act on —
+    /// both surfaces clamp to [`MAX_LIMIT`] before this runs, so `--limit 999`
+    /// reached here as 100 and got told to raise it. Measured on this repo:
+    /// `ast-search --type fn --limit 999` printed "More symbols matched than
+    /// --limit 100 — raise --limit to see the rest."
+    #[test]
+    fn at_the_ceiling_the_remedy_is_narrowing_not_raising() {
+        let out = outcome_with(true, false, 0);
+        for (style, raise) in [
+            (HintStyle::Cli, "raise --limit"),
+            (HintStyle::Mcp, "raise `limit`"),
+        ] {
+            let h = hints(&out, Some("node"), MAX_LIMIT, style);
+            assert!(
+                !h[0].contains(raise),
+                "{style:?}: limit is already at the maximum; got {h:?}"
+            );
+            assert!(
+                h[0].contains("the maximum") && h[0].contains("narrow"),
+                "{style:?}: the surviving remedy is to narrow the search; got {h:?}"
+            );
+        }
+        // Below the ceiling the raise advice is still the right one.
+        let below = hints(&out, Some("node"), MAX_LIMIT - 1, HintStyle::Cli);
+        assert!(below[0].contains("raise --limit"), "got {below:?}");
     }
 }

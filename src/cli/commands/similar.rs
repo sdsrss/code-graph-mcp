@@ -31,7 +31,10 @@ pub struct SimilarArgs {
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
 pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
-    let top_k: i64 = args.top_k.unwrap_or(5).clamp(1, 100);
+    // Both spellings are named: `--top-k` is the declared flag and `--limit` its
+    // alias, so quoting either one alone tells half the callers that a flag they
+    // did not type was clamped.
+    let top_k: i64 = clamp_arg("--top-k (alias --limit)", args.top_k.unwrap_or(5), 1, 100);
     let max_distance: f64 = args.max_distance.unwrap_or(0.8);
     let json_mode = args.json;
     let node_id_arg: Option<i64> = args.node_id;

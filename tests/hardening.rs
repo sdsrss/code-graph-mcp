@@ -493,6 +493,85 @@ fn no_forbidden_module_dependency_edges() {
     );
 }
 
+/// Every CLI `--depth` bound must be DERIVED from the traversal cap, never typed.
+///
+/// The MCP side already learned this: `COUNT_RANGES` carried literal `20` rows
+/// for `get_call_graph.depth` and `find_http_route.depth` while
+/// `get_call_graph_filtered` has always stopped at `CALL_GRAPH_MAX_DEPTH` (10),
+/// so a `depth: 30` call answered `"applied": 20` and `"effective_max_depth": 10`
+/// in one object — and `0.132.0` fixed it by deriving the rows from the constant.
+///
+/// The CLI then repeated it verbatim: `impact` and `trace` clamped to a literal
+/// `20`, so `--depth 15` ran at 10 with nothing said and `--depth 99` was about
+/// to start *publishing* "valid range is 1..=10" as "1..=20". Disclosing a
+/// number the code never uses is worse than disclosing nothing, which is the
+/// whole reason the disclosure exists. Caught in pre-ship review of `0.134.0`,
+/// one commit before it shipped.
+///
+/// Scope: only the commands whose depth is capped AGAIN downstream. That set is
+/// read off the code — a file whose `--depth` reaches `get_call_graph_filtered`,
+/// directly or through `get_callers_with_route_info` — rather than from a
+/// hand-list that would go stale. `deps` and `affected` are deliberately out of
+/// scope: their depth flows into `file_closure`, which has no cap of its own, so
+/// their literal IS the enforcing bound rather than a restatement of one.
+///
+/// The scan is textual because the bug's shape is textual — a literal upper
+/// bound compiles perfectly well, so no type-level link can catch it.
+#[test]
+fn cli_depth_bounds_derive_from_the_traversal_cap() {
+    use std::fs;
+    use std::path::Path;
+
+    // Names meaning "this depth gets re-clamped by the call-graph traversal".
+    const CAPPED_BY_TRAVERSAL: &[&str] =
+        &["get_call_graph_filtered", "get_callers_with_route_info"];
+
+    let dir = Path::new("src/cli/commands");
+    let mut offenders = Vec::new();
+    let mut checked: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = fs::read_to_string(&path).unwrap();
+        if !CAPPED_BY_TRAVERSAL.iter().any(|n| src.contains(n)) {
+            continue;
+        }
+        for (i, line) in src.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || !trimmed.contains("clamp_arg(\"--depth\"") {
+                continue;
+            }
+            checked.push(path.display().to_string());
+            let upper = trimmed
+                .rsplit(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(");");
+            if upper.chars().all(|c| c.is_ascii_digit()) {
+                offenders.push(format!(
+                    "{}:{}: --depth clamped to the literal `{}`, but this command's depth is \
+                     re-clamped by the call-graph traversal — derive the bound from \
+                     CALL_GRAPH_MAX_DEPTH, or the disclosed range and the honoured range \
+                     drift apart: {}",
+                    path.display(),
+                    i + 1,
+                    upper,
+                    trimmed
+                ));
+            }
+        }
+    }
+    assert!(
+        checked.len() >= 2,
+        "expected at least the `impact` and `trace` --depth clamps to be in scope; \
+         found {checked:?} — the scan pattern has gone stale, not the code"
+    );
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
+
 /// `FORBIDDEN_EDGES` is a hand-written list, and a list stops covering the tree
 /// the moment somebody adds a module root to `src/`. Six roots went unscanned
 /// until the 2026-08-22 sweep noticed; nothing would have noticed the seventh.

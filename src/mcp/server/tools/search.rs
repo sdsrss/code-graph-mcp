@@ -718,7 +718,14 @@ fn explain_empty_results(
             "hint": format!(
                 "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
                 dropped_by_filter
-            )
+            ),
+            // The envelope contract ("ONE envelope on every path", see
+            // `finalize_search_results`) — this was the only branch that omitted
+            // both fields, so a caller reading `search_mode` had to special-case
+            // the filter-emptied answer. No `note` here: the cause is known and
+            // named, and it is the filter, not the missing vector channel.
+            "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+            "vector_available": vector_available
         });
     }
     // Same disclosure duty for the always-on filter: the query DID match,
@@ -770,13 +777,23 @@ fn explain_empty_results(
     } else {
         "Try broader terms, check spelling, or use different keywords. The index may need rebuilding if the codebase changed significantly."
     };
-    json!({
+    let mut out = json!({
         "results": [],
         "message": "No matching symbols found.",
         "hint": hint,
         "search_mode": if vector_available { "hybrid" } else { "fts_only" },
         "vector_available": vector_available
-    })
+    });
+    // The non-empty answer carries the degradation note; the EMPTY one did not,
+    // and empty is where it changes the reader's conclusion. On an FTS-only
+    // install this tool is keyword matching wearing the name `semantic_code_search`,
+    // so "check spelling / the index may need rebuilding" sends a caller to fix an
+    // index that is fine when the real cause is that the semantic channel never ran
+    // — the false-diagnosis class the branches above exist to avoid.
+    if !vector_available {
+        out["note"] = json!(fts_only_note());
+    }
+    out
 }
 
 /// Notice attached when a semantic-search result set has NO text anchor — FTS
@@ -791,6 +808,42 @@ fn explain_empty_results(
 /// in the corpus) while they returned relevant results. The message states the
 /// mechanic and explicitly does not claim the results are wrong.
 const VECTOR_ONLY_WARNING: &str = "No exact text matches — results are ranked by vector similarity alone (no keyword anchor). Vague or natural-language queries often land here yet still return relevant symbols, so judge by the results; if they miss, add a concrete identifier or use ast_search with type/returns/params filters.";
+
+/// The one wording for "this answer had no vector channel", shared by every
+/// branch that owes it.
+///
+/// Two histories meet here. "retry shortly" was printed unconditionally, so a
+/// machine whose download can never succeed got a wait-and-see message forever
+/// (issue #35) — hence the recorded last outcome. And `default = []`, so every
+/// `cargo install code-graph-mcp` runs a binary with no downloader AT ALL and was
+/// told, on every query, to wait for a background download that cannot start —
+/// hence the compile-time arm, which names the same cause `health-check` ("binary
+/// built without embed-model feature") and `similar` already name on that build.
+fn fts_only_note() -> String {
+    #[cfg(feature = "embed-model")]
+    let last = crate::embedding::model::EmbeddingModel::download_state_summary();
+    #[cfg(not(feature = "embed-model"))]
+    let last: Option<String> = None;
+    if !cfg!(feature = "embed-model") {
+        return "Embedding model not compiled in — results are FTS5-only (reduced semantic \
+                recall). This binary was built without the `embed-model` feature; no model \
+                download will happen. To enable vector search, reinstall with \
+                `cargo install code-graph-mcp --features embed-model` (npm/npx builds ship it), \
+                then restart the MCP server to backfill embeddings."
+            .to_string();
+    }
+    match last {
+        Some(s) => format!(
+            "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
+             Last model download: {}. Run `code-graph-mcp doctor` for detail.",
+            s
+        ),
+        None => "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
+                 The model auto-downloads in the background on first use; retry shortly, or \
+                 run `code-graph-mcp doctor` to check status."
+            .to_string(),
+    }
+}
 
 /// Build the response for an uncompressed semantic-search result set.
 ///
@@ -817,26 +870,7 @@ fn finalize_search_results(
     vector_available: bool,
 ) -> serde_json::Value {
     if !vector_available {
-        // "retry shortly" was printed unconditionally, so a machine whose
-        // download can never succeed got a wait-and-see message forever
-        // (issue #35). Name the actual last outcome when one was recorded.
-        #[cfg(feature = "embed-model")]
-        let last = crate::embedding::model::EmbeddingModel::download_state_summary();
-        #[cfg(not(feature = "embed-model"))]
-        let last: Option<String> = None;
-        let note = match last {
-            Some(s) => format!(
-                "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
-                 Last model download: {}. Run `code-graph-mcp doctor` for detail.",
-                s
-            ),
-            None => {
-                "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
-                     The model auto-downloads in the background on first use; retry shortly, or \
-                     run `code-graph-mcp doctor` to check status."
-                    .to_string()
-            }
-        };
+        let note = fts_only_note();
         return json!({
             "results": results,
             "search_mode": "fts_only",
@@ -1096,6 +1130,65 @@ mod tests {
         assert!(
             out.get("low_confidence_warning").is_none(),
             "FTS-only degradation is a separate signal from the vector-only warning"
+        );
+    }
+
+    /// `default = []`, so `cargo install code-graph-mcp` produces a binary with
+    /// no downloader at all. The degradation note used to tell that build, on
+    /// every single query, that "the model auto-downloads in the background on
+    /// first use; retry shortly" — an instruction that can never come true, and
+    /// the opposite of what `health-check` ("binary built without embed-model
+    /// feature") and `similar` print on the same binary.
+    #[cfg(not(feature = "embed-model"))]
+    #[test]
+    fn fts_only_note_does_not_promise_a_download_that_cannot_happen() {
+        let out = finalize_search_results(dummy_results(), 0.90, false, false, false);
+        let note = out["note"].as_str().unwrap_or_default();
+        // The empty answer owes the same note: "no matching symbols" on an
+        // FTS-only index reads as "this code does not exist" unless the response
+        // says the semantic channel never ran.
+        let empty = explain_empty_results("handle user login", false, 0, 0, None, false);
+        assert_eq!(
+            empty["note"].as_str(),
+            Some(note),
+            "empty and non-empty answers must carry the same degradation note, got: {empty}"
+        );
+        assert_eq!(empty["search_mode"], "fts_only");
+
+        // The filter-emptied arm returns EARLY, so the assertions above never
+        // reach it — it needs its own call (`dropped_by_filter > 0`). It was the
+        // one path with no `search_mode` / `vector_available` at all, against a
+        // doc-comment promising "ONE envelope on every path".
+        let filtered = explain_empty_results("widget", true, 7, 0, None, false);
+        assert_eq!(filtered["search_mode"], "fts_only");
+        assert_eq!(filtered["vector_available"], false);
+        assert_eq!(filtered["dropped_by_filter"], 7);
+        // No degradation note here: the cause is known and named, and it is the
+        // filter — not the missing vector channel.
+        assert!(
+            filtered.get("note").is_none(),
+            "the filter-emptied answer explains itself; got: {filtered}"
+        );
+        assert!(
+            !note.contains("auto-downloads") && !note.contains("retry shortly"),
+            "no download can start in a build without `embed-model`, got: {note}"
+        );
+        assert!(
+            note.contains("embed-model"),
+            "the note must name the missing feature — it is the only remedy, got: {note}"
+        );
+    }
+
+    /// The feature-compiled leg keeps the wait-and-see wording: there really is
+    /// a background downloader, so "retry shortly" is actionable there.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn fts_only_note_still_points_at_the_download_when_one_can_run() {
+        let out = finalize_search_results(dummy_results(), 0.90, false, false, false);
+        let note = out["note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("built without the `embed-model` feature"),
+            "this build HAS the feature; the not-compiled arm must not fire, got: {note}"
         );
     }
 }

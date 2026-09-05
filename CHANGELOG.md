@@ -1,5 +1,195 @@
 # Changelog
 
+## 0.134.0
+
+**Upgrading:** almost nothing to act on. Two response objects gain fields, ten
+CLI commands gain a stderr line on out-of-range arguments, and one message that
+could never be true is gone. No existing field changed shape or meaning.
+
+Two stdout changes, both additive lines: `overview` gains a trailing
+`(N not-exported symbols hidden — …)` on trees that declare exports, and
+`show --node-id N` gains a `[lines …, ±3 context]` annotation because that path
+defaults `context_lines` to 3. If you parse either command's output by line
+position, that is the whole of the upgrade. To defer, pin `0.133.0`.
+
+Everything here is a disclosure or a correction. Each one is a case where the
+tool knew something the caller needed and did not say it.
+
+### A message no build could act on
+
+`Cargo.toml` carries `default = []`, so `cargo install code-graph-mcp` produces
+a binary with no embedding model compiled in at all. On every query,
+`semantic_code_search` told that binary's users "the model auto-downloads in the
+background on first use; retry shortly". There is no downloader in that build.
+The advice could be followed forever without becoming true.
+
+The same binary's `health-check` has always printed the accurate line — "binary
+built without embed-model feature" — and so has `similar`. The one surface
+saying otherwise was the one an agent reads most often.
+
+`0.129.0` fixed the sibling case, where a machine whose download had *failed*
+got the same "retry shortly" forever and now gets the recorded outcome. The
+build that has no downloader was the other half of that bug, and it is the half
+`cargo install` lands on. The note now names the missing feature and the command
+that adds it.
+
+### The empty answer owed that note more than the full one
+
+A `semantic_code_search` that returns results carries the FTS-only degradation
+note. One that returns nothing did not, and instead offered "check spelling, or
+the index may need rebuilding" — a diagnosis of the wrong thing. On an FTS-only
+install a zero-result answer is most often the semantic channel never having
+run, and the index is fine. Empty is where that sentence changes the reader's
+conclusion, so it is the branch that most needed it.
+
+The filter-emptied branch also gained `search_mode` and `vector_available`. This
+file's own note on `finalize_search_results` promises "ONE envelope on every
+path"; that branch was the one path without them.
+
+### `code_content` and the line numbers beside it disagreed
+
+With `context_lines` set, the returned source spans more lines than the symbol
+does — that is the point of the argument. Both surfaces then published the
+*symbol's* `start_line` next to the *widened* text. A reader counting down from
+`start_line` landed on the wrong line by however much leading context there was,
+and could not compute the offset either, because both ends clamp at line 1 and
+at EOF.
+
+`read_snippet` had it worst: its `context_lines` defaults to 3, so the mismatch
+fired for callers who never asked for context.
+
+`get_ast_node` and `read_snippet` now return `content_start_line` /
+`content_end_line` when the text is wider than the symbol, and CLI `show` prints
+`[lines 3-10, ±2 context]` above the block. Both are omitted when the ranges
+agree, so a `context_lines: 0` response is byte-identical to before.
+
+They are also omitted wherever the content they describe is no longer there.
+Pre-ship review found two such places, both of which would have published the
+new field as a confident wrong answer: compact mode and the `compressed_node`
+path drop `code_content` outright, and the response-truncation layer cuts it —
+measured, a 263-line symbol came back as 112 delivered lines under a label
+saying 270. A field that exists to map `code_content` line 1 onto a file line is
+worse than useless beside a string that was cut. The truncation layer already
+recorded array cuts so `count` siblings could be reconciled; string cuts now
+carry the same duty.
+
+One default-output change: `show --node-id N` defaults `context_lines` to 3, so
+its plain output now carries the `[lines …]` annotation without being asked. A
+script parsing that command's output by line position needs the extra line.
+
+### The CLI's silent clamps
+
+`0.132.0` closed this on the MCP side and said so plainly under its own "Not
+covered": *"The CLI keeps its own copy of these bounds and still turns
+`--depth=-3` into 1 with no error and no disclosure."* This is that follow-up.
+
+`search`, `ast-search`, `impact`, `deps`, `trace`, `similar` and `affected` now
+print the clamp on stderr — from `ast-search --limit 999`, `--limit clamped to
+100 (requested 999) — valid range is 1..=100` — leaving `--json` stdout
+untouched. Where a flag has an alias the message names both spellings, since
+quoting one tells half the callers a flag they did not type was clamped.
+Clamping and disclosing
+are one call (`clamp_arg`), for the same reason the MCP side reads one table:
+the bound enforced and the bound reported cannot drift when a single expression
+produces both.
+
+`ast-search` was the sharp edge. `--limit 999` was clamped to 100 and then told
+the user to "raise `--limit` to see the rest" — advice that cannot be followed,
+printed to someone who had already tried. At the ceiling the remedy is now to
+narrow the query or add a filter, on both surfaces.
+
+Writing the disclosure exposed a second bug underneath it, exactly as it did on
+the MCP side in `0.132.0`. `impact` and `trace` clamped `--depth` to a literal
+20, while `get_call_graph_filtered` has always stopped at 10. So `--depth 15`
+ran at 10 and said nothing, and the new disclosure was about to start
+*publishing* the wrong ceiling — a number no query has ever used, which is worse
+than saying nothing. Both now derive the bound from `CALL_GRAPH_MAX_DEPTH`, the
+constant that enforces it, and a guard fails the build if a command whose depth
+is re-clamped downstream goes back to a literal. `deps` and `affected` keep
+their literal 10: their depth reaches `file_closure`, which has no cap of its
+own, so there the CLI's number is the enforcing one.
+
+Three more commands had the same silence and are now covered. `centrality
+--limit 0` and `callgraph --depth 0` quietly became 1; `surprising --limit 0`
+had no floor at all and answered "No surprising connections found (try
+--include-tests)" — a false diagnosis assembled from the caller's own argument,
+which is worse than the silent clamps this section is about. Arguments with a
+floor but no real ceiling get their own wording rather than being handed
+`u32::MAX`, so no message advertises a bound that is an integer-width artefact.
+
+`ast_search`'s ceiling is likewise no longer two unlinked `100`s: the published
+range and the at-ceiling wording now read the same constant, which is what the
+constant's own doc-comment already claimed.
+
+### `map` listed no symbols for most modules
+
+`map`'s key symbols came from a repo-wide `LIMIT 200` over the most-called
+symbols, bucketed into directories afterwards. The cap was on the wrong axis:
+past roughly 200 called symbols in a project, whole modules came back with
+nothing under their header — while "Modules:" is the section `map` exists to
+print.
+
+Measured on this repository at this commit (1,853 distinct called symbols), with
+the old `LIMIT 200` restored: `src/cli/commands` listed 3 of its 64 symbols,
+`src/mcp/server/tools` 1 of 40, `src/sandbox` 1 of 10, and `scripts` and
+`docs/skills/windows-compat/scripts` nothing at all. After the fix each of those
+lists up to the per-directory six.
+
+The per-directory cap of six was always the one that mattered and is unchanged.
+The removed cap only bounded rows transferred, not work done — the `GROUP BY`
+underneath it always scanned every call edge. Full `map` on this repository runs
+in ~44 ms per invocation including process start (5 runs, 0.219 s total).
+
+### `overview` showed half an ESM file without saying so
+
+A file that declares explicit exports contributes only its exported symbols —
+deliberate, and the right default for "what is this module's surface". Nothing
+said it was happening. `overview src/api/routes.js` on a four-function file
+printed one line, and its own documentation calls it a replacement for reading a
+large file, which is a promise the silent version could not keep.
+
+Both surfaces now report the withheld count: `3 not-exported symbols hidden`,
+with the reason and the command that reaches the private ones. It is exactly
+zero for Python, Rust, Go and CommonJS trees, which have no export edges and
+were never filtered. The visibility rule is written once and the count is its
+negation, so the number and the list it annotates cannot disagree; the
+test-symbol filter the surfaces apply on top is mirrored into the count through
+`is_test_node_sql`, whose agreement with the Rust predicate an existing parity
+test already pins.
+
+A failed count is reported as a failure, not as zero — `not_exported_unavailable`
+on the MCP side, a named stderr line on the CLI. Collapsing "the query errored"
+into "nothing was withheld" is the same silent-absence shape the rest of this
+release is about, and the first draft of this feature had it.
+
+### Two guards that were not guarding
+
+- `doc_cli_alignment` required a `src/` layout block in `CLAUDE.md`, a file this
+  repository does not track. It already skipped a missing one; it did not handle
+  a present one that is something else. `code-graph-mcp adopt` — which this
+  plugin runs at session start, including on this repository — writes its
+  steering block there, so any contributor with the plugin installed had
+  `cargo test` fail on a file the repo does not ship and their change never
+  touched.
+- `freshness_parity`'s source scanner mis-read `r"\\\\"` in
+  `tool_module_overview`: its escape test looked at one preceding character, so
+  the closing quote read as escaped and the scan stayed "inside a string" for
+  about thirty lines. It resynchronised where the brace count happened to come
+  out right — until a `"` inside a *comment* moved the resync point, at which
+  the function region ended sixty-six lines early and the drift-guard stopped
+  seeing `result["dead_code"]` at all. A guard against silent drops whose own
+  region detection depends on where the quotes in the prose fall is not a guard.
+  Raw strings and backslash runs are now handled, with a test per shape. The
+  allowlist parser had a smaller version of the same problem: a comma inside an
+  in-array comment swallowed the entry after it.
+
+### Not covered
+
+The CLI *discloses* an out-of-range count; it still clamps rather than refuses,
+where MCP refuses a negative outright since `0.132.0`. `--depth=-3` now prints
+`--depth clamped to 1 (requested -3)` and proceeds. Making the CLI refuse is a
+behaviour change for anything scripting those flags and is not bundled here.
+
 ## 0.133.0
 
 **Upgrading:** one declaration changed, and it may make a client refuse locally

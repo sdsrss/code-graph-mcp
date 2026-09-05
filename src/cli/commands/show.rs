@@ -328,8 +328,16 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     // are the main checkout's. Slicing the WORKTREE's bytes at
                     // those offsets prints whatever happens to sit on those lines
                     // on the other branch (audit 2026-08-02 FRS-4).
-                    if let Some(code) = read_source_context(&ctx.project_root, fp, node.start_line, node.end_line, context_lines) {
+                    if let Some((code, first, last)) = read_source_context(&ctx.project_root, fp, node.start_line, node.end_line, context_lines) {
                         obj["code_content"] = serde_json::json!(code);
+                        // `code_content` is wider than start_line..end_line here.
+                        // Publish the range it really covers (parity with MCP
+                        // get_ast_node); omitted when the two agree so the common
+                        // context_lines=0 envelope is byte-identical to before.
+                        if first != node.start_line || last != node.end_line {
+                            obj["content_start_line"] = serde_json::json!(first);
+                            obj["content_end_line"] = serde_json::json!(last);
+                        }
                     } else {
                         obj["code_content"] = serde_json::json!(node.code_content);
                     }
@@ -388,13 +396,24 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         if !compact {
             if context_lines > 0 {
                 // Same worktree-aware root as the JSON arm above (FRS-4).
-                if let Some(code) = read_source_context(
+                if let Some((code, first, last)) = read_source_context(
                     &ctx.project_root,
                     fp,
                     node.start_line,
                     node.end_line,
                     context_lines,
                 ) {
+                    // The header line above says `path:start-end` (the SYMBOL);
+                    // the block below is wider. Name the range actually printed,
+                    // or a reader counting down from `start` is off by the amount
+                    // of leading context.
+                    if first != node.start_line || last != node.end_line {
+                        writeln!(
+                            stdout,
+                            "  [lines {}-{}, ±{} context]",
+                            first, last, context_lines
+                        )?;
+                    }
                     for line in code.lines() {
                         writeln!(stdout, "  {}", line)?;
                     }
@@ -475,13 +494,22 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
 }
 
 /// Read source code with context lines from the project file system.
+///
+/// Returns the slice AND the 1-based inclusive line range it actually covers.
+/// The range is not decoration: with `context_lines > 0` the returned text spans
+/// more lines than the symbol's own `start_line..end_line`, and every consumer
+/// (the `--json` envelope, the text arm, MCP `get_ast_node`/`read_snippet`) used
+/// to publish the symbol's range next to the widened text — so anything counting
+/// lines from `start_line` landed on the wrong one. Clamped at both ends: the
+/// leading context stops at line 1 and the trailing context at EOF, so the
+/// caller cannot derive the true range from `context_lines` alone either.
 pub(crate) fn read_source_context(
     project_root: &Path,
     file_path: &str,
     start_line: i64,
     end_line: i64,
     context_lines: usize,
-) -> Option<String> {
+) -> Option<(String, i64, i64)> {
     use std::io::BufRead;
     let abs_path = project_root.join(file_path);
     let canonical = abs_path.canonicalize().ok()?;
@@ -505,7 +533,9 @@ pub(crate) fn read_source_context(
     if collected.is_empty() {
         return None;
     }
-    Some(collected.join("\n"))
+    let first = start as i64 + 1;
+    let last = start as i64 + collected.len() as i64;
+    Some((collected.join("\n"), first, last))
 }
 
 // --- trace subcommand ---

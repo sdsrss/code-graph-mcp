@@ -9,7 +9,8 @@ use super::*;
 pub struct ImpactArgs {
     /// Symbol name to analyze
     pub symbol: String,
-    // clamp(1,20) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    // The bound stays in the handler and is DERIVED from the traversal's own cap,
+    // not typed here; clap parse-errors (exit 2) on non-numeric.
     /// Max traversal depth (default: 3)
     #[arg(long, default_value_t = 3)]
     pub depth: i32,
@@ -42,7 +43,15 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         anyhow::bail!("Usage: code-graph-mcp impact <symbol> [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]");
     }
 
-    let depth: i32 = args.depth.clamp(1, 20);
+    // 1..=CALL_GRAPH_MAX_DEPTH, taken from the constant the traversal enforces
+    // rather than restated. The literal here was 20 while
+    // `get_call_graph_filtered` has always stopped at 10, so `--depth 15` ran at
+    // 10 with nothing said, and `--depth 99` would have disclosed a ceiling of
+    // 20 that no query ever used. That exact pair — an advertised 20 against a
+    // traversal that stops at 10 — is what `0.132.0` fixed on the MCP side by
+    // deriving `COUNT_RANGES` from this same constant; a disclosure naming a
+    // number the code never uses is worse than no disclosure.
+    let depth: i32 = clamp_arg("--depth", args.depth, 1, CALL_GRAPH_MAX_DEPTH);
     let json_mode = args.json;
     let explicit_file_owned: Option<String> = match args.file.as_deref() {
         Some(f) => Some(normalize_user_path(project_root, f)?),

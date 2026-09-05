@@ -36,7 +36,7 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
 
     let direction = crate::domain::normalize_dep_direction(args.direction.as_str())
         .ok_or_else(|| anyhow::anyhow!("--direction must be one of: outgoing, incoming, both"))?;
-    let depth: i32 = args.depth.clamp(1, 10);
+    let depth: i32 = clamp_arg("--depth", args.depth, 1, 10);
     let json_mode = args.json;
     let compact = args.compact;
 

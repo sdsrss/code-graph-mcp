@@ -233,6 +233,14 @@ fn compact_covered_keys(forwarder: &str) -> Vec<String> {
 }
 
 /// Extract the quoted keys from the `for key in [ ... ]` compact allowlist array.
+///
+/// Comment lines are stripped BEFORE splitting on `,`. Splitting first made a
+/// comma inside an in-array `//` comment fuse the comment with the entry that
+/// followed it, so that entry silently vanished from the parsed allowlist and the
+/// guard demanded a key the author had already added — a false failure with no
+/// way to see why from the message. The array holds only string literals, so
+/// pulling the quoted spans out is also what makes a bare prose fragment
+/// impossible to mistake for a key.
 fn compact_allowlist(compact_region: &str) -> Vec<String> {
     let anchor = "for key in [";
     let start = compact_region
@@ -243,8 +251,13 @@ fn compact_allowlist(compact_region: &str) -> Vec<String> {
         .find(']')
         .expect("unterminated compact allowlist array");
     after[..end]
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or("").trim())
+        .flat_map(|l| {
+            l.split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect::<Vec<_>>()
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -254,8 +267,18 @@ fn compact_allowlist(compact_region: &str) -> Vec<String> {
 /// (methods inside `impl` blocks) and to nested inner `fn` helpers — both of
 /// which defeat line-based boundary detection. Skips `//` line comments and
 /// `"…"` string literals so braces inside `format!("{}")` / error strings and
-/// `// { }` comments do not unbalance the count (the target fns contain no raw
-/// strings, block-comment braces, or char-literal braces — verified at authoring).
+/// `// { }` comments do not unbalance the count.
+///
+/// Raw strings are tracked, and that is not a hypothetical: `tool_module_overview`
+/// contains `r"\\\\"`, whose closing quote sits right after a backslash. The old
+/// `prev != b'\\'` escape test read that quote as escaped, so the scanner stayed
+/// "inside a string" for ~30 lines and every brace there went uncounted. It
+/// happened to resync where the count came out right — until a `"` in a COMMENT
+/// moved the resync point, at which case the region ended 66 lines early and the
+/// guard stopped seeing `result["dead_code"]` at all. A drift-guard whose region
+/// detection depends on where the quotes in the prose fall is not a guard, so
+/// both halves are handled properly here: `r"…"`/`r#"…"#` take no escapes, and an
+/// ordinary string's quote is escaped only after an ODD run of backslashes.
 fn fn_region<'a>(src: &'a str, name: &str) -> &'a str {
     let decl = format!("fn {}(", name);
     let start = src
@@ -270,8 +293,21 @@ fn fn_region<'a>(src: &'a str, name: &str) -> &'a str {
     let body_start = i;
     let mut depth = 0i32;
     let mut in_str = false;
+    // `None` = ordinary string; `Some(n)` = raw string closed by `"` + n `#`.
+    let mut raw_hashes: Option<usize> = None;
     let mut in_line_comment = false;
-    let mut prev = 0u8;
+    // True when the quote at `i` is escaped: an ODD number of backslashes
+    // immediately precedes it. `\\"` (an escaped BACKSLASH then the terminator)
+    // has two, so it closes — which is the case the old single-char test failed.
+    let escaped_quote = |bytes: &[u8], at: usize| -> bool {
+        let mut back = 0usize;
+        let mut j = at;
+        while j > 0 && bytes[j - 1] == b'\\' {
+            back += 1;
+            j -= 1;
+        }
+        back % 2 == 1
+    };
     while i < bytes.len() {
         let c = bytes[i];
         if in_line_comment {
@@ -279,13 +315,36 @@ fn fn_region<'a>(src: &'a str, name: &str) -> &'a str {
                 in_line_comment = false;
             }
         } else if in_str {
-            if c == b'"' && prev != b'\\' {
-                in_str = false;
+            if c == b'"' {
+                match raw_hashes {
+                    // Raw string: no escapes; needs `"` followed by N `#`.
+                    Some(n) => {
+                        let closes = (0..n).all(|k| bytes.get(i + 1 + k) == Some(&b'#'));
+                        if closes {
+                            in_str = false;
+                            raw_hashes = None;
+                            i += n;
+                        }
+                    }
+                    None => {
+                        if !escaped_quote(bytes, i) {
+                            in_str = false;
+                        }
+                    }
+                }
             }
         } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             in_line_comment = true;
         } else if c == b'"' {
             in_str = true;
+            // `r"`, `r#"`, `r##"` … — count the `#`s between the `r` and the quote.
+            let mut hashes = 0usize;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'#' {
+                hashes += 1;
+                j -= 1;
+            }
+            raw_hashes = (j > 0 && bytes[j - 1] == b'r').then_some(hashes);
         } else if c == b'{' {
             depth += 1;
         } else if c == b'}' {
@@ -294,10 +353,60 @@ fn fn_region<'a>(src: &'a str, name: &str) -> &'a str {
                 return &src[body_start..=i];
             }
         }
-        prev = c;
         i += 1;
     }
     &src[body_start..]
+}
+
+/// The scanner every guard in this file stands on must survive the literal
+/// shapes the sources it reads actually contain.
+///
+/// `tool_module_overview` holds `r"\\\\"`. Under the old single-char escape test
+/// its closing quote read as escaped, the scanner stayed "in a string" past the
+/// end of the fn, and the region it returned depended on where the next quote —
+/// in code OR in a comment — happened to fall. That is how a guard reports a key
+/// as uncovered that the allowlist already names, and, in the other direction,
+/// how it stops seeing a key that IS silently dropped. Both directions are pinned
+/// here, on inputs small enough to read.
+#[test]
+fn fn_region_survives_raw_strings_and_escaped_backslashes() {
+    // Raw string whose content ends in a backslash, then a real brace after it.
+    let raw = "fn f() { let p = r\"\\\\\\\\\"; if x { y(); } }\nfn g() { }";
+    assert_eq!(
+        fn_region(raw, "f"),
+        "{ let p = r\"\\\\\\\\\"; if x { y(); } }",
+        "a raw string ending in backslashes must not swallow the rest of the fn"
+    );
+    // Ordinary string ending in an ESCAPED backslash: `"a\\"` closes.
+    let esc = "fn f() { let s = \"a\\\\\"; if x { y(); } }\nfn g() { }";
+    assert_eq!(
+        fn_region(esc, "f"),
+        "{ let s = \"a\\\\\"; if x { y(); } }",
+        "an even backslash run leaves the quote unescaped, so the string closes"
+    );
+    // ...while a genuinely escaped quote (odd run) does NOT close: the `}` inside
+    // the literal must not be counted.
+    let inner = "fn f() { let s = \"a\\\"}\"; z(); }\nfn g() { }";
+    assert_eq!(
+        fn_region(inner, "f"),
+        "{ let s = \"a\\\"}\"; z(); }",
+        "an escaped quote keeps the string open, so the brace inside it is text"
+    );
+    // A quote inside a `//` comment must not shift anything.
+    let commented = "fn f() {\n // says \"hi\n if x { y(); }\n}\nfn g() { }";
+    assert!(
+        fn_region(commented, "f").ends_with("}\n}") || fn_region(commented, "f").contains("y();"),
+        "comment quotes must not truncate the region: {:?}",
+        fn_region(commented, "f")
+    );
+
+    // And the real file: the region must reach the producer's own last key.
+    let src = fs::read_to_string(OVERVIEW_SRC).expect("read overview.rs");
+    assert!(
+        fn_region(&src, "tool_module_overview").contains("\"dead_code\""),
+        "the producer region must span to its dead_code assignment — it is 200 lines \
+         past the r\"\\\\\\\\\" literal that used to end the scan early"
+    );
 }
 
 /// Returns full-envelope keys that compact neither forwards nor deliberately drops.
@@ -380,6 +489,35 @@ fn the_guard_reports_an_uncovered_key_in_every_shape_it_can_arrive_in() {
         uncovered_compact_keys(&covered_src).is_empty(),
         "a renamed-but-forwarded key must not be reported: {:?}",
         uncovered_compact_keys(&covered_src)
+    );
+
+    // A comment INSIDE the allowlist array must not eat the entry after it. The
+    // parser split on `,` before stripping comments, so a comma in the prose
+    // fused the comment with the next literal and that entry disappeared from
+    // the allowlist — the guard then reported a key the author HAD added, and
+    // the failure message pointed at the one place that already looked right.
+    let commented_allowlist = "
+        fn compact_module_overview(&self, full: &serde_json::Value) -> Result<Value> {
+            let mut result = json!({ \"path\": full[\"path\"] });
+            for key in [
+                \"hint\",
+                // forwarded because it matters, and because nothing else carries it
+                \"after_comment\",
+            ] { if let Some(v) = full.get(key) { result[key] = v.clone(); } }
+            Ok(result)
+        }";
+    let src = format!(
+        "fn tool_module_overview(&self) -> Result<Value> {{
+             let mut result = json!({{ \"path\": p, \"after_comment\": v }});
+             Ok(result)
+         }}
+         {commented_allowlist}"
+    );
+    assert!(
+        uncovered_compact_keys(&src).is_empty(),
+        "an entry that follows a comma-bearing comment is still in the allowlist; \
+         the guard saw {:?}",
+        uncovered_compact_keys(&src)
     );
 }
 

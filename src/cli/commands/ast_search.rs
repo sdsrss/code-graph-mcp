@@ -38,7 +38,12 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     let returns_filter = args.returns.as_deref();
     let params_filter = args.params.as_deref();
     let json_mode = args.json;
-    let limit: usize = args.limit.unwrap_or(20).clamp(1, 100);
+    let limit: usize = clamp_arg(
+        "--limit",
+        args.limit.unwrap_or(20),
+        1,
+        crate::search::ast_query::MAX_LIMIT,
+    );
 
     // Require either a query or at least one structural filter
     let has_filters = type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();

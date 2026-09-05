@@ -130,6 +130,18 @@ impl McpServer {
             cached
         } else {
             let exports = queries::get_module_exports(self.db.conn(), path)?;
+            // Symbols the per-file export rule withheld. `summary` says "N active
+            // + M inactive exports", which a caller reads as the file's whole
+            // symbol census — for an ESM file it is only its public half, and
+            // nothing in the response said so. Zero for Python/Rust/Go/CommonJS.
+            //
+            // The query filters on `is_test_node_sql`, the SQL mirror of the
+            // `is_test_symbol` call the visible half uses below, so one rule
+            // governs both halves. The Err is kept as an Err —
+            // `not_exported_unavailable` below, matching the
+            // `dependencies_unavailable` / `dead_code_unavailable` convention,
+            // because "count failed" is not "nothing hidden".
+            let not_exported = queries::count_export_filtered_out(self.db.conn(), path);
 
             // Filter out test functions — they add noise to module overviews
             let exports: Vec<_> = exports
@@ -237,6 +249,14 @@ impl McpServer {
                 "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
                     raw_path, active.len(), inactive.len(), files.len())
             });
+            match &not_exported {
+                Ok(0) => {}
+                Ok(n) => {
+                    result["not_exported_hidden"] = json!(n);
+                    result["not_exported_note"] = json!(queries::export_filter_note(*n));
+                }
+                Err(e) => result["not_exported_unavailable"] = json!(e.to_string()),
+            }
             if files.is_empty() {
                 result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
             }
@@ -385,6 +405,10 @@ impl McpServer {
         // dead-code section instead of silently dropping it. `dependencies` +
         // the two `*_unavailable` error variants are forwarded so `include_deps`/
         // `include_dead` payloads (and their failure disclosures) survive compact mode.
+        // `not_exported_*` is forwarded because compact mode drops the inactive
+        // NAMES — it is exactly where a partial symbol census is hardest to
+        // notice, so the export-filter disclosure has to survive here or it
+        // survives only where it is least needed.
         // Any new top-level key assigned onto `result` in tool_module_overview MUST be
         // added here (or to DELIBERATELY_COMPACTED in tests/freshness_parity.rs) —
         // the `compact_allowlist_covers_all_result_keys` drift-guard enforces this.
@@ -397,6 +421,9 @@ impl McpServer {
             "dependencies",
             "dependencies_unavailable",
             "dead_code_unavailable",
+            "not_exported_hidden",
+            "not_exported_note",
+            "not_exported_unavailable",
         ] {
             if let Some(v) = full.get(key) {
                 result[key] = v.clone();

@@ -653,14 +653,31 @@ fn module_layout_blocks_list_every_top_level_module() {
             }
             Err(e) => panic!("{label}: {e}"),
         };
-        checked_labels.push(label);
         // Only the fenced layout block, so a passing mention elsewhere in the
         // prose cannot stand in for a row in the map.
-        let block = text
+        let block = match text
             .split("src/\n")
             .nth(1)
             .and_then(|s| s.split("```").next())
-            .unwrap_or_else(|| panic!("{label} must contain an `src/` layout block"));
+        {
+            Some(b) => b,
+            // Same reasoning as the missing-file arm one branch up, and the same
+            // fix applied one step further: an untracked file may be PRESENT and
+            // still not be this document. `code-graph-mcp adopt` — which the
+            // plugin runs on SessionStart, including on this repo — writes its
+            // steering block to CLAUDE.md, so a contributor who has the plugin
+            // installed had `cargo test` go red on a file the repo does not ship
+            // and their change never touched. Absent and present-but-not-this
+            // are the same situation for an optional document.
+            None if !required => {
+                eprintln!(
+                    "skip: {label} has no `src/` layout block — untracked, and its content is \
+                     not this repo's to guarantee (e.g. a `code-graph-mcp adopt` block)"
+                );
+                continue;
+            }
+            None => panic!("{label} must contain an `src/` layout block"),
+        };
         let missing: Vec<&String> = actual
             .iter()
             .filter(|m| {
@@ -672,6 +689,22 @@ fn module_layout_blocks_list_every_top_level_module() {
                 !block.contains(&entry)
             })
             .collect();
+        // The `None` arm above catches only a file with no `src/\n` at all —
+        // `split("```").next()` never returns `None`, so it could not catch the
+        // case it was written for: an untracked CLAUDE.md that DOES contain
+        // `src/` somewhere (an adopt block, a user's own notes) still reached
+        // the assertion and failed on content this repo does not ship. For an
+        // optional document, a block that matches NOTHING is the same evidence
+        // as no block: it is not this document. Matching some but not all is
+        // still a real omission and still fails.
+        if !required && missing.len() == actual.len() {
+            eprintln!(
+                "skip: {label}'s `src/` block lists none of the modules — untracked, and its \
+                 content is not this repo's to guarantee (e.g. a `code-graph-mcp adopt` block)"
+            );
+            continue;
+        }
+        checked_labels.push(label);
         assert!(
             missing.is_empty(),
             "{label}'s src/ layout block omits {missing:?} — a reader (or an agent \

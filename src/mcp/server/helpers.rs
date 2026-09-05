@@ -133,7 +133,19 @@ pub(super) const COUNT_RANGES: &[(&str, &str, u64, u64)] = &[
     ("find_similar_code", "top_k", 1, 100),
     ("get_ast_node", "similar_top_k", 1, 50),
     ("get_ast_node", "context_lines", 0, 100),
-    ("ast_search", "limit", 1, 100),
+    // Derived, not restated — the same discipline as the two depth rows above.
+    // `MAX_LIMIT` is what `HintStyle::limit_remedy` compares against to decide
+    // whether "raise the limit" is still possible advice, and its doc-comment
+    // already claimed the two were linked while they were two independent
+    // literal `100`s. Raising this row alone would have made the at-ceiling
+    // wording fire at 100 against a real ceiling of 200 — the newly-added
+    // remedy becoming the false one it was written to replace.
+    (
+        "ast_search",
+        "limit",
+        1,
+        crate::search::ast_query::MAX_LIMIT as u64,
+    ),
     ("project_map", "centrality_limit", 1, 100),
     ("semantic_code_search", "top_k", 1, 100),
     ("semantic_code_search", "limit", 1, 100),
@@ -456,6 +468,14 @@ pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_j
     truncate_value_inner(value, budget, 0)
 }
 
+/// `(string key, sibling keys that stop being true if it is truncated)`.
+///
+/// A field that describes another field's CONTENT cannot outlive a cut to that
+/// content. Keep this list one entry per such pair; a sibling that merely sits
+/// next to a string (`file_path`, `name`) is unaffected and does not belong here.
+const STRING_TRUNCATION_INVALIDATES: &[(&str, &[&str])] =
+    &[("code_content", &["content_start_line", "content_end_line"])];
+
 fn truncate_value_inner(
     value: serde_json::Value,
     budget: usize,
@@ -492,6 +512,8 @@ fn truncate_value_inner(
             // sibling fields against what was actually returned.
             let mut array_truncations: serde_json::Map<String, serde_json::Value> =
                 serde_json::Map::new();
+            // Which large strings actually got cut — see `STRING_TRUNCATION_INVALIDATES`.
+            let mut truncated_strings: Vec<String> = Vec::new();
 
             let truncated: serde_json::Map<String, serde_json::Value> = map
                 .into_iter()
@@ -506,6 +528,7 @@ fn truncate_value_inner(
                             };
                             if s.len() > field_budget {
                                 let trunc = &s[..s.floor_char_boundary(field_budget.min(s.len()))];
+                                truncated_strings.push(k.clone());
                                 json!(format!("{}... [truncated, {} chars total]", trunc, s.len()))
                             } else {
                                 v
@@ -536,6 +559,25 @@ fn truncate_value_inner(
                 .collect();
 
             let mut final_map = truncated;
+            // A sibling that DESCRIBES a truncated string stops being true the
+            // moment the string is cut, so it goes with it. Same duty as
+            // `_array_truncations` (which exists so `count`/`total` siblings can
+            // be reconciled), applied to the string case.
+            //
+            // Live before this: `get_ast_node context_lines:5` on a 263-line
+            // symbol answered `content_start_line: 28`, `content_end_line: 297`
+            // beside a `code_content` this layer had cut from 12,396 chars to
+            // 5,779 — 112 delivered lines under a label claiming 270. The field
+            // exists precisely so a caller can map `code_content` line 1 onto a
+            // file line; leaving it beside a truncated string makes it a
+            // confident lie rather than a missing answer.
+            for (trunc_key, invalidated) in STRING_TRUNCATION_INVALIDATES {
+                if truncated_strings.iter().any(|k| k == trunc_key) {
+                    for k in *invalidated {
+                        final_map.remove(*k);
+                    }
+                }
+            }
             if !array_truncations.is_empty() {
                 final_map.insert(
                     "_array_truncations".to_string(),
@@ -712,6 +754,51 @@ mod tests {
         assert_eq!(trunc["original"], 50);
         assert_eq!(trunc["kept"].as_u64().unwrap() as usize, arr.len());
         assert_eq!(out["_truncated"], true);
+    }
+
+    /// A field describing a string's CONTENT must not survive that string being
+    /// cut. `content_start_line` / `content_end_line` exist so a caller can map
+    /// `code_content` line 1 onto a file line; once this layer truncates the
+    /// code, the mapping is wrong for every line past the cut.
+    ///
+    /// Live before the fix: `get_ast_node context_lines:5` on a 263-line symbol
+    /// returned `content_start_line: 28` / `content_end_line: 297` beside a
+    /// `code_content` cut from 12,396 chars to 5,779 — 112 delivered lines
+    /// labelled as 270.
+    #[test]
+    fn truncating_a_string_drops_the_siblings_that_described_it() {
+        let value = json!({
+            "code_content": "line\n".repeat(50_000),
+            "content_start_line": 28,
+            "content_end_line": 297,
+            "start_line": 33,
+            "end_line": 295,
+            "file_path": "src/cli/commands/similar.rs",
+        });
+        let out = truncate_large_strings(value, 50);
+        assert_eq!(out["_truncated"], true, "precondition: the string was cut");
+        assert!(
+            out.get("content_start_line").is_none() && out.get("content_end_line").is_none(),
+            "a range describing truncated content must not be published: {out}"
+        );
+        // The SYMBOL's own range is still true — it never described the string.
+        assert_eq!(out["start_line"], 33);
+        assert_eq!(out["end_line"], 295);
+        assert_eq!(out["file_path"], "src/cli/commands/similar.rs");
+    }
+
+    /// ...and an untruncated response keeps them, or the fix would just be a
+    /// deletion wearing a guard's clothes.
+    #[test]
+    fn an_untruncated_string_keeps_its_range_siblings() {
+        let value = json!({
+            "code_content": "fn f() {}\n",
+            "content_start_line": 41,
+            "content_end_line": 60,
+        });
+        let out = truncate_large_strings(value, 50);
+        assert_eq!(out["content_start_line"], 41);
+        assert_eq!(out["content_end_line"], 60);
     }
 
     #[test]

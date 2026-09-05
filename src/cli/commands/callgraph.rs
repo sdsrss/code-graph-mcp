@@ -56,7 +56,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
 
     let direction = crate::domain::normalize_call_direction(args.direction.as_str())
         .ok_or_else(|| anyhow::anyhow!("--direction must be one of: callers, callees, both"))?;
-    let depth: i32 = args.depth.max(1);
+    // Floor only, and disclosed: the CEILING is the traversal's and it announces
+    // itself ("⚠ depth capped to 10"), but `--depth 0` silently became 1 with
+    // nothing said — the same half-disclosed shape `impact` and `trace` had.
+    let depth: i32 = floor_arg("--depth", args.depth, 1);
     let json_mode = args.json;
     let compact = args.compact;
     let include_tests = args.include_tests;

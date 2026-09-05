@@ -79,6 +79,34 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         anyhow::bail!("[code-graph] No symbols found under: {}", raw_path);
     }
 
+    // How many symbols the per-file export rule withheld. Zero for
+    // Python/Rust/Go/CommonJS trees; non-zero only for ESM files with private
+    // helpers, where the unannotated output ("routes.js / function:
+    // authenticateSession" for a file holding four functions) reads as the whole
+    // file. `overview`'s own doc calls itself a replacement for Read on a large
+    // file, which is a promise the silent version could not keep.
+    //
+    // The query applies `is_test_node_sql`, the SQL mirror of the very
+    // `is_test_symbol` call `run_query` uses on the visible half, so both halves
+    // are filtered by one rule (parity pinned by `test_is_test_node_sql_matches_rust`).
+    //
+    // An Err is NOT folded into 0: "the query failed" and "nothing was withheld"
+    // are different facts, and collapsing them is the silent-absence class this
+    // release exists to close. Same shape as the `*_unavailable` fields.
+    let hidden_result = queries::count_export_filtered_out(conn, path_prefix);
+    // One sentence for all three output arms: the count when something was
+    // withheld, the failure when the count could not be taken, nothing when the
+    // export rule narrowed nothing (the Python/Rust/Go case — a note there would
+    // be noise, and false).
+    let disclosure: Option<String> = match &hidden_result {
+        Ok(0) => None,
+        Ok(n) => Some(queries::export_filter_note(*n)),
+        Err(e) => Some(format!(
+            "not-exported symbol count unavailable ({e}) — this listing may be \
+             narrower than the files it names"
+        )),
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -104,6 +132,14 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
             })
             .collect();
         writeln!(stdout, "{}", serde_json::to_string(&results)?)?;
+        // stderr, NOT a wrapper object: this command's `--json` contract is a bare
+        // array and every consumer indexes it directly, so switching shape when a
+        // repo happens to contain ESM would break them on a subset of inputs —
+        // a worse failure than the one being disclosed. Same split `clamp_arg`
+        // and `affected` use.
+        if let Some(msg) = &disclosure {
+            eprintln!("[code-graph] {}", msg);
+        }
         return Ok(());
     }
 
@@ -156,6 +192,9 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                 )?;
             }
         }
+        if let Some(msg) = &disclosure {
+            writeln!(stdout, "  ({})", msg)?;
+        }
         return Ok(());
     }
 
@@ -182,6 +221,9 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                 .collect();
             writeln!(stdout, "  {}: {}", typ, names.join(", "))?;
         }
+    }
+    if let Some(msg) = &disclosure {
+        writeln!(stdout, "({})", msg)?;
     }
 
     Ok(())

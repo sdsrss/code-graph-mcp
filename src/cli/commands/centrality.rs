@@ -33,7 +33,7 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     // an empty ranking and trip the "No chokepoints found (graph has no multi-hop
     // call paths)" branch below — a message that falsely blames the graph when the
     // user merely asked for zero rows.
-    let limit = limit.max(1);
+    let limit = floor_arg("--limit", limit, 1);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();

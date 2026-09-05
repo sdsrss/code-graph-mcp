@@ -58,8 +58,8 @@ pub use nodes::{
 };
 pub use project_map::{get_project_map, EntryPoint, HotFunction, ModuleDep, ModuleStats};
 pub use routes::{
-    fetch_route_metadata_map, find_routes_by_path, get_module_exports, CallerWithRouteInfo,
-    ModuleExport, RouteMatch,
+    count_export_filtered_out, export_filter_note, fetch_route_metadata_map, find_routes_by_path,
+    get_module_exports, CallerWithRouteInfo, ModuleExport, RouteMatch,
 };
 #[cfg(test)]
 pub use search::fts5_search_with_tests;

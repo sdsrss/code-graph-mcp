@@ -45,7 +45,10 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     let json_mode = args.json;
     let compact = args.compact;
     let node_type_filter = args.node_type.as_deref();
-    let limit: i64 = args.limit.unwrap_or(20).clamp(1, 100);
+    // `--top-k` is an alias of `--limit` here (the mirror of `similar`, where the
+    // canonical spelling is the other one) — name both so the message matches
+    // whichever the caller typed.
+    let limit: i64 = clamp_arg("--limit (alias --top-k)", args.limit.unwrap_or(20), 1, 100);
 
     // Validate --node-type up-front: unknown alias normalizes to an empty Vec
     // and silently filters every node away (see ast-search same fix).

@@ -9,7 +9,8 @@ use super::*;
 pub struct TraceArgs {
     /// Route to trace (e.g. "/api/login" or "POST /api/login")
     pub route: String,
-    // clamp(1,20) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    // The bound stays in the handler and is DERIVED from the traversal's own cap,
+    // not typed here; clap parse-errors (exit 2) on non-numeric.
     /// Max traversal depth
     #[arg(long, default_value_t = 3)]
     pub depth: i32,
@@ -44,7 +45,9 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         anyhow::bail!("Usage: code-graph-mcp trace <route> [--depth N] [--no-middleware] [--json]");
     }
 
-    let depth: i32 = args.depth.clamp(1, 20);
+    // Same derivation as `impact`: both feed `get_call_graph_filtered`, which
+    // caps at `CALL_GRAPH_MAX_DEPTH`. See the note there.
+    let depth: i32 = clamp_arg("--depth", args.depth, 1, CALL_GRAPH_MAX_DEPTH);
     let json_mode = args.json;
     let include_middleware = !args.no_middleware;
     // Hide test symbols from the recursive call chain by default, matching the MCP

@@ -2779,3 +2779,56 @@ fn replace_refuses_when_a_held_lock_file_has_a_hardlink() {
         "with no holder the replace must be allowed to proceed"
     );
 }
+
+/// `read_source_context` returns the range its text actually covers, and that
+/// range is what `content_start_line` / `content_end_line` publish.
+///
+/// This shipped in `0.134.0` with zero tests (pre-ship review, HIGH #2): the
+/// value comes from a `saturating_sub` and two `as i64` casts, and the whole
+/// point of the field is that a caller TRUSTS it to map `code_content` line 1
+/// onto a file line. Every edge is pinned here — both clamps and the middle —
+/// by asserting the returned first/last line numbers index the returned text's
+/// own first/last lines back to the real file.
+#[test]
+fn read_source_context_reports_the_range_it_actually_covers() {
+    use crate::cli::commands::show::read_source_context;
+    let root = tempfile::TempDir::new().unwrap();
+    // 10 numbered lines: line N reads "L{N}".
+    let body: String = (1..=10).map(|i| format!("L{i}\n")).collect();
+    std::fs::write(root.path().join("f.rs"), &body).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+
+    let check = |start: i64, end: i64, ctx: usize, want: (i64, i64)| {
+        let (text, first, last) = read_source_context(root.path(), "f.rs", start, end, ctx)
+            .unwrap_or_else(|| panic!("no content for {start}-{end} ±{ctx}"));
+        assert_eq!(
+            (first, last),
+            want,
+            "range for symbol {start}-{end} ±{ctx}; text was:\n{text}"
+        );
+        let got: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            got.len() as i64,
+            last - first + 1,
+            "line count must equal the reported span: {got:?}"
+        );
+        assert_eq!(got[0], lines[(first - 1) as usize], "first line mismatch");
+        assert_eq!(
+            *got.last().unwrap(),
+            lines[(last - 1) as usize],
+            "last line mismatch"
+        );
+    };
+
+    // Mid-file: context available on both sides, so the range widens by `ctx`.
+    check(5, 6, 2, (3, 8));
+    // Leading clamp: a symbol at line 1 cannot grow upward past it.
+    check(1, 2, 3, (1, 5));
+    // Trailing clamp: a symbol at EOF cannot grow downward past it.
+    check(9, 10, 3, (6, 10));
+    // Both clamps at once — asking for more context than the file has.
+    check(4, 5, 100, (1, 10));
+    // ctx = 0: the range IS the symbol, which is what makes the two fields
+    // omittable (and keeps a `context_lines: 0` response byte-identical).
+    check(4, 6, 0, (4, 6));
+}

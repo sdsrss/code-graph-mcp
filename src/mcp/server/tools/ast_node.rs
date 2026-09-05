@@ -5,6 +5,22 @@
 
 use super::super::*;
 
+/// Remove `content_start_line` / `content_end_line`.
+///
+/// MUST be called anywhere `code_content` is dropped from a response, because
+/// those two keys describe *that string* and nothing else. Compact mode and the
+/// token-threshold `compressed_node` path both strip the code and both kept the
+/// range, so `get_ast_node symbol_name:"cmd_similar" context_lines:5` answered
+/// `content_start_line: 28`, `content_end_line: 297`, `start_line: 33`,
+/// `end_line: 295` and a `message` telling the caller to Read `33-295` — three
+/// line ranges in one object, one of them describing a string that is not there.
+fn drop_content_range(result: &mut serde_json::Value) {
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("content_start_line");
+        obj.remove("content_end_line");
+    }
+}
+
 /// Outcome of refreshing the file a `node_id` lives in (CON-10).
 pub(in crate::mcp::server) enum NodeIdRefresh {
     /// Nothing was re-indexed, so the id still names what it named.
@@ -229,10 +245,17 @@ impl McpServer {
 
                 // Include source code: prefer context view, fall back to stored code_content
                 if context_lines > 0 {
-                    if let Some(code) =
+                    if let Some((code, first, last)) =
                         self.read_source_context(file_path, n.start_line, n.end_line, context_lines)
                     {
                         result["code_content"] = json!(code);
+                        // `code_content` spans more than start_line..end_line here.
+                        // Publish the range it really covers; omitted when the two
+                        // agree, so a context_lines=0 response is unchanged.
+                        if first != n.start_line || last != n.end_line {
+                            result["content_start_line"] = json!(first);
+                            result["content_end_line"] = json!(last);
+                        }
                     } else {
                         result["code_content"] = json!(n.code_content);
                     }
@@ -295,6 +318,7 @@ impl McpServer {
                         obj.remove("code_content");
                         obj.remove("context_string");
                     }
+                    drop_content_range(&mut result);
                     return Ok(result);
                 }
 
@@ -302,6 +326,7 @@ impl McpServer {
                 let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
                 if tokens > COMPRESSION_TOKEN_THRESHOLD {
                     result.as_object_mut().map(|obj| obj.remove("code_content"));
+                    drop_content_range(&mut result);
                     result["mode"] = json!("compressed_node");
                     result["message"] = json!(format!(
                         "Code content omitted ({} lines, ~{} tokens). Use Read tool on {}:{}-{} to view source.",
@@ -382,13 +407,20 @@ impl McpServer {
         if !compact {
             // Include source code: prefer context view when requested, fall back to stored code_content
             if context_lines > 0 {
-                if let Some(code) = self.read_source_context(
+                if let Some((code, first, last)) = self.read_source_context(
                     &file_path,
                     node.start_line,
                     node.end_line,
                     context_lines,
                 ) {
                     result["code_content"] = json!(code);
+                    // Same disclosure as the symbol_name arm. This is the
+                    // `read_snippet` path, where `context_lines` DEFAULTS to 3 —
+                    // so the mismatch fired without the caller asking for it.
+                    if first != node.start_line || last != node.end_line {
+                        result["content_start_line"] = json!(first);
+                        result["content_end_line"] = json!(last);
+                    }
                 } else {
                     result["code_content"] = json!(node.code_content);
                 }
@@ -556,13 +588,23 @@ impl McpServer {
 
     /// Read source code with context lines from the project file system.
     /// Uses BufReader to avoid loading entire file into memory.
+    ///
+    /// (See also [`drop_content_range`], which must be called anywhere the
+    /// `code_content` this produces is later removed.)
+    ///
+    /// Returns the slice AND the 1-based inclusive range it covers — see the CLI
+    /// twin in `cli::commands::show`. With `context_lines > 0` the text is wider
+    /// than the node's own `start_line..end_line`, and the response published only
+    /// the node's range beside it, so a caller mapping `code_content` line 1 onto
+    /// `start_line` was off by the leading context. Both ends clamp (line 1, EOF),
+    /// so `context_lines` alone does not let the caller reconstruct it.
     pub(in crate::mcp::server) fn read_source_context(
         &self,
         file_path: &str,
         start_line: i64,
         end_line: i64,
         context_lines: usize,
-    ) -> Option<String> {
+    ) -> Option<(String, i64, i64)> {
         use std::io::BufRead;
         let root = self.project_root.as_ref()?;
         let abs_path = root.join(file_path);
@@ -587,7 +629,9 @@ impl McpServer {
         if collected.is_empty() {
             return None;
         }
-        Some(collected.join("\n"))
+        let first = start as i64 + 1;
+        let last = start as i64 + collected.len() as i64;
+        Some((collected.join("\n"), first, last))
     }
 }
 
