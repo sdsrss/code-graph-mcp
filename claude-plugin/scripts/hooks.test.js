@@ -165,6 +165,97 @@ test('lifecycle.buildSettingsHookEntries covers PostToolUse Write|Edit + UserPro
   assert.ok(upsMatchers.length > 0, 'UserPromptSubmit must have at least one matcher');
 });
 
+// ── JS-03 (audit 2026-09-05): one budget, known to both halves ─────────────
+//
+// The registered `timeout` is the number Claude Code kills the hook at, and the
+// hook's own internal timeouts are what it spends against it. They were written
+// in two places that never referenced each other, and the sums did not fit —
+// pre-edit-guide could spend 12.5 s of a 4 s budget. Both now read
+// HOOK_TIMEOUT_SECONDS, and these pin every registration site to it: a bump
+// applied to only one of them fails here rather than in somebody's session.
+test('registered PreToolUse/PostToolUse/UserPromptSubmit timeouts come from HOOK_TIMEOUT_SECONDS', () => {
+  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  let checked = 0;
+  for (const [event, entries] of Object.entries(desired)) {
+    for (const entry of entries) {
+      for (const h of entry.hooks) {
+        const script = (h.command.match(/([a-z-]+\.js)/) || [])[1];
+        assert.ok(script, `${event}: no script name in command ${h.command}`);
+        assert.equal(h.timeout, HOOK_TIMEOUT_SECONDS[script],
+          `${event}/${script} registers timeout ${h.timeout}s but the table says ` +
+          `${HOOK_TIMEOUT_SECONDS[script]}s — the hook would spend against the wrong number`);
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, 6, `expected all six settings.json hooks; checked ${checked}`);
+});
+
+// The coupling the whole deadline mechanism rests on, and the one that can
+// break in silence: `armHookDeadline` looks the budget up by
+// `basename(process.argv[1])` and RETURNS QUIETLY on a table miss. So a renamed
+// hook file, a launcher wrapper, or a symlink with a different basename leaves
+// every child back on its own unclamped timeout with the whole suite green.
+// Both halves — the name a hook is invoked as, and the key it looks itself up
+// by — are asserted here against each other (pre-ship review 2026-09-05).
+test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a deadline', () => {
+  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const SCRIPT = /scripts[/\\]([A-Za-z0-9_-]+\.js)/;
+
+  const registered = new Set();
+  for (const entries of Object.values(buildSettingsHookEntries())) {
+    for (const entry of entries) {
+      for (const h of entry.hooks) {
+        const m = SCRIPT.exec(h.command);
+        assert.ok(m, `no script name in registered command: ${h.command}`);
+        registered.add(m[1]);
+      }
+    }
+  }
+  // SessionStart comes from the plugin manifest, not from lifecycle.js.
+  const manifest = fs.readFileSync(HOOKS_JSON, 'utf8');
+  for (const m of manifest.matchAll(new RegExp(SCRIPT.source, 'g'))) registered.add(m[1]);
+  assert.ok(registered.size >= 7, `only ${registered.size} hook scripts found: ${[...registered]}`);
+
+  for (const script of registered) {
+    assert.ok(
+      HOOK_TIMEOUT_SECONDS[script],
+      `${script} is registered as a hook but has no HOOK_TIMEOUT_SECONDS entry — ` +
+      `armHookDeadline would no-op for it and every child would run unclamped`
+    );
+  }
+
+  // `session-init.js` predates the helper and wraps its own main in a
+  // try/catch; hook-fail-open.js documents that it arms nothing and why. It is
+  // listed here so that fact stays a decision rather than an oversight.
+  const NOT_ARMED = new Set(['session-init.js']);
+  for (const script of registered) {
+    if (NOT_ARMED.has(script)) continue;
+    const src = fs.readFileSync(path.join(__dirname, script), 'utf8');
+    assert.match(
+      src, /installHookFailOpen|armHookDeadline/,
+      `${script} is registered with a ${HOOK_TIMEOUT_SECONDS[script]}s budget but never arms ` +
+      `a deadline, so its children cannot be clamped to it`
+    );
+  }
+});
+
+test('hooks.json SessionStart timeout matches HOOK_TIMEOUT_SECONDS', () => {
+  // SessionStart is the one event Claude Code loads from plugin-cache
+  // hooks.json, so its budget cannot be written by lifecycle.js — but the table
+  // is still the place the number is decided, and this is what keeps the two
+  // files from drifting apart the way the hooks' internal timeouts had.
+  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+  const cfg = loadHooks();
+  const entry = cfg.hooks.SessionStart[0].hooks[0];
+  assert.match(entry.command, /session-init\.js/);
+  assert.equal(entry.timeout, HOOK_TIMEOUT_SECONDS['session-init.js'],
+    'hooks.json and the budget table disagree about how long session-init.js gets');
+});
+
 test('lifecycle.buildSettingsHookEntries: every entry carries description marker', () => {
   // Description marker is the primary cleanup discriminator (immune to
   // path/env pollution per feedback_plugin_env_isolation.md). If an entry

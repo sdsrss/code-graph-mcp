@@ -24,6 +24,7 @@ const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
 const { hidden } = require('./proc-opts');
+const { remainingMs } = require('./hook-fail-open');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu
@@ -114,10 +115,17 @@ if (!symbol || symbol.length < 3) {
       const candidates = [...new Set(identifiers)]
         .filter(id => !skipWords.has(id.toLowerCase()))
         .sort((a, b) => b.length - a.length);
-      for (const candidate of candidates.slice(0, 5)) {
+      // Two candidates, not five. They are sorted most-specific-first, so the
+      // 3rd–5th were the least likely to resolve AND the ones that pushed this
+      // loop past the hook's whole 4 s budget (5 × 2000 ms here + 2500 ms of
+      // impact below); the impact query they starve is the hook's actual output
+      // (audit 2026-09-05 JS-03).
+      for (const candidate of candidates.slice(0, 2)) {
+        const budget = remainingMs(2000);
+        if (budget === null) break;
         try {
           const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], hidden({
-            cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+            cwd, timeout: budget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
             env: internalEnv,
           }));
           const grepResult = JSON.parse(raw);
@@ -170,6 +178,11 @@ try {
 const editedFile = (input.tool_input && input.tool_input.file_path) || '';
 const relFile = editedFile ? path.relative(cwd, editedFile) : '';
 let jsonResult;
+// Whatever is left of the registered 4 s, capped at this call's own 2500 ms.
+// `null` = the candidate loop above already spent the budget; running anyway is
+// what got the hook killed by Claude Code mid-Edit (audit 2026-09-05 JS-03).
+const impactBudget = remainingMs(2500);
+if (impactBudget === null) process.exit(0);
 try {
   const args = ['impact', symbol, '--json'];
   if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
@@ -177,7 +190,7 @@ try {
   // diverging from the findBinary() result the rest of the hook trusts).
   const raw = execFileSync(binary, args, hidden({
     cwd,
-    timeout: 2500,
+    timeout: impactBudget,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
     env: internalEnv,

@@ -143,6 +143,41 @@ function readJson(filePath) {
 const MAX_CORRUPT_BACKUPS = 5;
 
 /**
+ * Owner-only. What every file this module creates under `~/.claude` gets when
+ * there is no prior file whose bits to preserve, and what a `.corrupt-*` copy
+ * gets unconditionally: settings.json routinely carries an `env` block with API
+ * keys, and a backup of one is the same secret in a second file (audit
+ * 2026-09-05 JS-01).
+ */
+const SECRET_FILE_MODE = 0o600;
+
+/**
+ * Pin `target` at exactly `mode`, because neither route that creates our files
+ * does it on its own: `writeFileSync`'s `mode` option goes to `open(O_CREAT)`
+ * and is masked by umask (and ignored outright when the file already exists),
+ * and `copyFileSync` carries the SOURCE's bits.
+ *
+ * Reported, not swallowed: the whole point of the call is that the file may
+ * hold a key, so a permission we could not set is exactly the thing the user
+ * needs to hear about. The write itself has already succeeded — a failure here
+ * is a disclosure, not a reason to unwind it.
+ */
+function restrictMode(target, mode) {
+  try {
+    fs.chmodSync(target, mode);
+  } catch (err) {
+    // No return value: both call sites act on the stderr line, not on a bool,
+    // and a discarded success flag is an invitation to branch on it later
+    // without noticing that nothing ever did (pre-ship review 2026-09-05).
+    console.error(
+      `[code-graph] wrote ${target} but could not set its permissions to ` +
+      `0${mode.toString(8)} (${err.code || err.name}). If it contains an API key, ` +
+      `it may be readable by other users on this machine.`
+    );
+  }
+}
+
+/**
  * Delete all but the newest `MAX_CORRUPT_BACKUPS` copies of `filePath`.
  *
  * The copies are a safety net, and a safety net nobody ever empties is a leak:
@@ -180,9 +215,14 @@ function backupCorruptFile(filePath, raw) {
   const dest = `${filePath}.corrupt-${stamp}`;
   try {
     // Buffer, not string: see readJsonResult. A string here would re-encode.
-    if (Buffer.isBuffer(raw)) fs.writeFileSync(dest, raw);
-    else if (typeof raw === 'string') fs.writeFileSync(dest, Buffer.from(raw, 'utf8'));
-    else fs.copyFileSync(filePath, dest);
+    if (Buffer.isBuffer(raw)) fs.writeFileSync(dest, raw, { mode: SECRET_FILE_MODE });
+    else if (typeof raw === 'string') {
+      fs.writeFileSync(dest, Buffer.from(raw, 'utf8'), { mode: SECRET_FILE_MODE });
+    } else fs.copyFileSync(filePath, dest);
+    // Owner-only regardless of what the original was: up to MAX_CORRUPT_BACKUPS
+    // of these accumulate beside settings.json with its `env` block copied
+    // verbatim, so a 0644 original must not mint 0644 duplicates.
+    restrictMode(dest, SECRET_FILE_MODE);
     pruneCorruptBackups(filePath);
     return dest;
   } catch {
@@ -261,11 +301,23 @@ function readSettingsForWrite(pre) {
   return { settings: {}, backedUpTo: backup };
 }
 
+// Replace-by-rename loses the permission bits unless they are carried over
+// deliberately: the new inode is the TMP file's, created under our umask, so a
+// settings.json the user had put at 0600 came back 0644 on the first
+// install()/update()/cleanupDisabledStatusline() — with its `env` API keys in
+// it, silently, on a file we were only meant to add two hook entries to (audit
+// 2026-09-05 JS-01). Stat the original and restore its exact mode; when there
+// is no original, create owner-only rather than at whatever umask says.
 function writeJsonAtomic(filePath, data) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
+  let mode = null;
+  try { mode = fs.statSync(filePath).mode & 0o777; } catch { /* new file */ }
   const tmp = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: mode ?? SECRET_FILE_MODE });
+  // umask can only have cleared bits the original had, so chmod is what makes
+  // this preservation rather than tightening.
+  restrictMode(tmp, mode ?? SECRET_FILE_MODE);
   fs.renameSync(tmp, filePath);
 }
 
@@ -907,7 +959,13 @@ function removeHooksFromSettings(settings) {
 
 function buildSettingsHookEntries() {
   const root = PLUGIN_ROOT;
-  const scriptCmd = (name, timeout) => {
+  // The budget is read from the table the hooks THEMSELVES spend against
+  // (hook-fail-open.js), not written twice: a number registered here that the
+  // hook does not know about is the JS-03 shape — the hook overruns a limit it
+  // cannot see and Claude Code kills it mid-tool-call.
+  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+  const scriptCmd = (name) => {
+    const timeout = HOOK_TIMEOUT_SECONDS[name];
     const script = path.join(root, 'scripts', name);
     // POSIX: existence-guarded. After `/plugin uninstall`, CC may delete the
     // plugin-cache dir before our statusline teardown gets to strip these
@@ -924,16 +982,16 @@ function buildSettingsHookEntries() {
 
   return {
     PreToolUse: [
-      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Edit', hooks: [scriptCmd('pre-edit-guide.js', 4)] },
-      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Bash', hooks: [scriptCmd('pre-grep-guide.js', 3)] },
-      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Read', hooks: [scriptCmd('pre-read-guide.js', 3)] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Edit', hooks: [scriptCmd('pre-edit-guide.js')] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Bash', hooks: [scriptCmd('pre-grep-guide.js')] },
+      { description: SETTINGS_HOOK_DESC.preToolUse, matcher: 'Read', hooks: [scriptCmd('pre-read-guide.js')] },
     ],
     PostToolUse: [
-      { description: SETTINGS_HOOK_DESC.postToolUseEdit, matcher: 'Write|Edit', hooks: [scriptCmd('incremental-index.js', 10)] },
-      { description: SETTINGS_HOOK_DESC.postToolUseInject, matcher: 'Bash', hooks: [scriptCmd('post-grep-inject.js', 5)] },
+      { description: SETTINGS_HOOK_DESC.postToolUseEdit, matcher: 'Write|Edit', hooks: [scriptCmd('incremental-index.js')] },
+      { description: SETTINGS_HOOK_DESC.postToolUseInject, matcher: 'Bash', hooks: [scriptCmd('post-grep-inject.js')] },
     ],
     UserPromptSubmit: [
-      { description: SETTINGS_HOOK_DESC.userPromptSubmit, matcher: '', hooks: [scriptCmd('user-prompt-context.js', 5)] },
+      { description: SETTINGS_HOOK_DESC.userPromptSubmit, matcher: '', hooks: [scriptCmd('user-prompt-context.js')] },
     ],
   };
 }

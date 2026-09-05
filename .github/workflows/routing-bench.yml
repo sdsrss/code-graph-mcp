@@ -90,7 +90,7 @@ jobs:
           fi
           # Capture full output; tee so we can grep for the P@1 line below.
           set -o pipefail
-          cargo test --test routing_bench --no-default-features -- \
+          cargo test --locked --test routing_bench --no-default-features -- \
             --ignored --nocapture 2>&1 | tee bench-output.txt
 
       - name: Summarize P@1

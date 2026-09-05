@@ -1166,6 +1166,58 @@ fn test_incremental_index() {
     assert_eq!(bar.len(), 1);
 }
 
+/// A file whose HASH read fails must stay EXISTING on the non-cached path.
+///
+/// The end-to-end mirror of `test_scan_directory_cached_stat_failure_is_not_deletion`
+/// (merkle.rs), for the entry point that had no guard: `hash_files_parallel`
+/// warns and drops a file it cannot read, so the path fell out of
+/// `current_hashes` and `compute_diff` called a live file DELETED — Phase 0 then
+/// cascaded its nodes and its callers' edges away. Mode 0o000 on the file
+/// reproduces it exactly: the walk lists it, `metadata()` succeeds (the parent
+/// is still searchable), `File::open` fails with EACCES (audit 2026-09-05
+/// CORE-01).
+#[test]
+#[cfg(unix)]
+fn test_incremental_hash_failure_is_not_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    let a = project_dir.path().join("a.ts");
+    fs::write(&a, "function alpha() {}").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function beta() { alpha(); }",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(get_nodes_by_name(db.conn(), "alpha").unwrap().len(), 1);
+
+    fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+    let read_denied = fs::File::open(&a).is_err();
+    let stat_ok = fs::metadata(&a).is_ok();
+    let indexed = run_incremental_index(&db, project_dir.path(), None, None);
+    // Restore before unwrapping so a failure can't leave an unreadable file.
+    fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+    indexed.unwrap();
+
+    if !read_denied || !stat_ok {
+        // root (or an FS that ignores the mode) — the precondition this test
+        // needs does not hold here, and asserting anyway would pass for the
+        // wrong reason.
+        eprintln!("skipped: mode 0o000 did not deny the read (running as root?)");
+        return;
+    }
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "alpha").unwrap().len(),
+        1,
+        "a file that only failed to hash must not be treated as deleted — \
+         its nodes and its callers' edges go with it"
+    );
+}
+
 #[test]
 fn test_incremental_propagates_dirty_context() {
     let project_dir = TempDir::new().unwrap();

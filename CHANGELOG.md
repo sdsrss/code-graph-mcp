@@ -1,5 +1,187 @@
 # Changelog
 
+## 0.135.0
+
+**Upgrading:** one response shape changed, and only for an input that was
+already unanswerable. `get_ast_node` called with `file_path` + `symbol_name`
+used to return the *first* definition of that name in the file when the file
+held several. It now returns the ambiguity envelope — `{symbol, error,
+suggestions}`, the same one `find_references` has always returned for that
+input — with each candidate's `node_id`. Read `suggestions[].node_id` and call
+again with `node_id`. `read_snippet`, the same-shape alias, inherits this.
+
+How often that fires is worth knowing before you upgrade, because "overload" is
+not the common case. Measured against this repository's own index, 54 of 5239
+`(name, file)` pairs — 1.0% — now answer with the envelope, and most are neither
+overloads nor mistakes:
+
+- **`#[cfg]`-gated alternates.** `src/embedding/model.rs` defines
+  `EmbeddingModel`, `embed` and `embed_batch` twice each, once under
+  `#[cfg(feature = "embed-model")]` and once under `#[cfg(not(...))]`. Two real
+  definitions; the index holds both; which one you want is a question only you
+  can answer.
+- **Repeated headings in indexed Markdown.** This file has 101 nodes named
+  `Fixed`. `get_ast_node(file_path: "CHANGELOG.md", symbol_name: "Fixed")` used
+  to return the first and now returns five candidates and an error.
+- Genuine same-file overloads — two `impl` blocks each with `fn new` — which is
+  the case the fix was written for and the rarest of the three.
+
+To defer, pin `0.134.0`. Nothing else changed shape.
+
+Everything else is a fix with nothing to act on: an index that deleted files it
+had merely failed to read, a settings.json that came back world-readable, and
+hooks that spent more time than the budget they are killed at.
+
+### A file that could not be read was recorded as deleted
+
+`hash_files_parallel` drops any file whose read fails — it logs a warning and
+returns nothing for it — and the non-cached incremental path diffed that result
+directly against the stored hashes. So a transient `EIO`, an `EACCES` from a
+mode change, or a file rewritten while being read made the path vanish from the
+current set, `compute_diff` reported a live file as DELETED, and Phase 0
+cascaded its nodes and its callers' edges out of the index.
+
+The damage outlives the cause. The next run adds the file back as new, but the
+importers that re-resolved while it was missing may have bound to a same-named
+symbol elsewhere, and nothing re-examines them until they are edited themselves.
+
+The cached sibling — `run_incremental_index_cached` — has carried a guard for
+this since the stat-failure version of the same bug: it carries the stored hash
+forward for anything the directory walk saw, because the walk is the existence
+evidence and the read is not. The non-cached one had the same shape and no
+guard, and it is the one the server's startup drift check and CLI
+`incremental-index` actually run.
+
+It now delegates to the cached version with no cache, which hashes the whole
+tree exactly as before and inherits the guard. That deletes 55 lines of
+near-duplicate along the way. Measured on this repo (330 files), a no-op
+incremental run is unchanged within noise: 11.3–16.8 ms before, 12.4–12.7 ms
+after, over three alternating rounds of twenty runs.
+
+### An answer that picked one of two and mentioned neither
+
+Asked for `new` in a file with two `impl` blocks, `get_ast_node` returned
+whichever one sorted earliest by line number, presented as the answer. An agent
+reading a signature before editing it got a real function body with a real
+`node_id` — for the other overload.
+
+Every neighbouring surface already refused. `find_references` on the identical
+input returns candidates with `node_id`s. CLI `show --file` prints every match.
+`resolve.rs`, the module both surfaces share, uses "two `fn new()` in one file"
+as its worked example of the case that must not be silently merged. This was
+the one caller still doing it by hand, with `.find()`.
+
+It now returns the shared envelope. Same class as the CLI/MCP split verdict
+fixed in the 2026-06-03 audit, and the same remedy: one resolver, one answer.
+
+### `settings.json` came back at whatever the umask said
+
+`writeJsonAtomic` replaces by rename, so the file that lands is the temp file's
+inode with the temp file's permissions. A user who had run `chmod 600` on
+`~/.claude/settings.json` — which routinely carries an `env` block with API keys
+— got it back at 0644 on the first `install()`, `update()` or statusline
+cleanup, silently, from a write that was only meant to add two hook entries.
+
+The `.corrupt-*` backups were the same secret again: up to five copies of the
+same file, created at the umask default.
+
+The mode is now read off the original and restored onto the replacement before
+the rename; a file we create fresh is owner-only rather than umask-wide, and a
+`.corrupt-*` copy is 0600 unconditionally. `writeFileSync`'s `mode` option was
+not enough on its own — it is masked by the umask and ignored outright when the
+file already exists — and `copyFileSync` carries the *source's* bits, so all
+three paths chmod after writing. A permission that cannot be set is reported on
+stderr rather than swallowed: the write succeeded, and a key that may now be
+readable by other users is exactly what the person running it needs to hear.
+
+### The hooks outspent the budget they are killed at
+
+Every hook is registered with a timeout — 3 to 10 seconds — that Claude Code
+kills it at. Each hook's internal timeouts were sized on their own and run in
+series, and the sums did not fit: `pre-edit-guide` could spend five 2-second
+candidate greps plus a 2.5-second impact query against a 4-second budget, and
+`post-grep-inject` looped a 2-second callgraph over every symbol in the pattern
+before its show and grep fallbacks.
+
+Overrunning is not a missing hint. A PreToolUse hook killed by its timeout
+surfaces as a hook error on the user's own tool call.
+
+The registered budget and the hook's own spending are now one number:
+`HOOK_TIMEOUT_SECONDS` in `hook-fail-open.js`. `lifecycle.js` registers from it,
+the six hooks that use `installHookFailOpen` arm a process deadline from it on
+entry, and every child they spawn gets `min(its own timeout, what is left)` — or
+is skipped when nothing is left. `session-init.js` is the exception, and it is
+in "Not covered" below.
+The deadline subtracts `process.uptime()`, because the budget starts when Claude
+Code spawns the process and cold node startup is real time already spent
+(measured here at ~590 ms). `pre-edit-guide` also drops from five grep
+candidates to two: they are sorted most-specific-first, so the last three were
+both the least likely to resolve and the ones starving the impact query that is
+the hook's actual output.
+
+Measured with a binary that never returns: three serial answers took 6018 ms
+against a 3-second budget before, and 2008 ms after, with the same
+`unavailable` outcome each time.
+
+A timed-out child is now killed with `SIGKILL` rather than `SIGTERM`. These are
+read-only queries that hold no lock file worth unwinding, and the one we are
+giving up on is usually wedged on `index.lock` — where node's default sends
+`SIGTERM` and then waits.
+
+### CI could resolve dependencies the audit job never saw
+
+None of the 19 `cargo build/test/check/clippy/bench` invocations across the five
+workflows passed `--locked`. With `Cargo.toml` and `Cargo.lock` out of step,
+cargo re-resolves silently and writes a fresh lock into the runner's workspace —
+no failed step, no annotation. The `audit` job scans the *committed*
+`Cargo.lock`, so a release built that way ships against versions nothing
+audited.
+
+All 19 now pass `--locked`, and `tests/hardening.rs` fails the build on a
+twentieth that does not. The flag is deliberately absent from the `Makefile` and
+`scripts/pre-commit.sh`: a lockfile in flux is the normal state of local
+development.
+
+### Not covered
+
+**`session-init.js` — the largest overrun of the seven — is untouched.** The
+SessionStart hook is registered at 5 seconds and its six child processes carry
+15.5 seconds of serial timeouts between them. It predates `installHookFailOpen`
+and wraps its own main in a try/catch, so it arms no deadline and clamps no
+child. Wiring it is not mechanical: it means deciding, per child, whether an
+out-of-budget session start should skip a binary health check or a macOS
+quarantine probe, and that decision wants its own review rather than a place in
+this release.
+
+**The deadline does not cover everything a hook does before it.** `findBinary()`
+runs first in every hook and outside the mechanism entirely — its `which` probe
+has no timeout at all, and a cold cache can spend 5 seconds on a `--version`
+gate before `remainingMs` is consulted once. Warm, the whole thing costs about
+7 ms, so this is a first-run and post-upgrade concern rather than a steady-state
+one.
+
+**The deadline can also make a healthy hook answer nothing.** It subtracts
+node's own startup but not the time between Claude Code spawning the process and
+node starting, so it stays optimistic by that unmeasured amount; and the 400 ms
+it reserves for writing the answer is a chosen number, not a measured one. The
+sharp edge is a loaded machine: this repository has already measured cold node
+startup past 2 seconds under a full `cargo` build, and at that point a 3-second
+hook starts with its deadline in the past and declines every child. That is
+still better than being killed — a kill reaches the user as an error on their
+own tool call, an empty answer does not — but it trades "sometimes late" for
+"silently nothing" in a band that used to work.
+
+**The permission fix is `lifecycle.js` only.** `adopt.js` writes `CLAUDE.md`
+through the same replace-by-rename shape and still loses its mode; that file
+holds no secrets, which is why it waits. In the other direction, `writeJsonAtomic`
+now creates at 0600 across all its call sites, and two of those files —
+`installed_plugins.json` among them — belong to Claude Code rather than to this
+plugin. Same user, so nothing breaks; it is still this plugin choosing a mode on
+another program's file.
+
+`get_ast_node`'s ambiguity envelope caps its suggestions at five, matching every
+other surface that emits it. A file with 101 same-named definitions lists five.
+
 ## 0.134.0
 
 **Upgrading:** almost nothing to act on. Two response objects gain fields, ten

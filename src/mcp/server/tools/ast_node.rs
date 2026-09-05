@@ -228,7 +228,31 @@ impl McpServer {
         if nodes.is_empty() {
             return Err(anyhow!("File '{}' not found in index. Check that the path is relative to the project root and the file has been indexed.", file_path));
         }
-        let node = nodes.iter().find(|n| n.name == symbol_name);
+        // Every definition of the name in this file, not the first one.
+        //
+        // `find` handed back whichever overload sorted earliest by `start_line`
+        // and said nothing, so an agent asking for `new` in a file with two
+        // `impl` blocks got one `fn new` presented as THE answer and edited
+        // against it. The same input already refuses on the other surfaces:
+        // `find_references` returns node_id candidates, CLI `show --file` prints
+        // every match, and `resolve.rs` documents "two `fn new()` in one file"
+        // as the case that must not be silently merged (audit 2026-09-05
+        // SURF-02; same class as the 2026-06-03 #6 CLI/MCP split verdict).
+        let matching: Vec<_> = nodes.iter().filter(|n| n.name == symbol_name).collect();
+        if matching.len() > 1 {
+            let cands: Vec<crate::storage::queries::NameCandidate> = matching
+                .iter()
+                .map(|n| crate::storage::queries::NameCandidate {
+                    name: n.name.clone(),
+                    file_path: file_path.to_string(),
+                    node_type: n.node_type.clone(),
+                    node_id: n.id,
+                    start_line: n.start_line,
+                })
+                .collect();
+            return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
+        }
+        let node = matching.into_iter().next();
 
         match node {
             Some(n) => {

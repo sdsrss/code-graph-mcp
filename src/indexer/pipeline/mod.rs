@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::merkle::{compute_diff, scan_directory, scan_directory_cached, DirectoryCache};
+use crate::indexer::merkle::{compute_diff, scan_directory_cached, DirectoryCache};
 use crate::storage::db::Database;
 use crate::storage::queries::{get_all_file_hashes, get_dirty_node_ids};
 
@@ -394,66 +394,32 @@ pub fn apply_file_refreshes(
     Ok(())
 }
 
+/// Incremental index without a directory mtime cache: every directory is walked
+/// and every file re-hashed.
+///
+/// Delegates to [`run_incremental_index_cached`] with `dir_cache: None`, which
+/// hashes the whole tree (`scan_directory_cached` treats every directory as
+/// changed when there is no prior cache) — so the file set is the same one
+/// `scan_directory` produced, and the returned cache is discarded.
+///
+/// The delegation is the point, not a tidy-up. This function used to diff
+/// `scan_directory`'s output directly, and `hash_files_parallel` drops any file
+/// whose read failed (`warn!` + `None`) — a transient EIO/EACCES, or a file
+/// rewritten mid-read, made the path vanish from `current_hashes`, so
+/// `compute_diff` reported a live file as DELETED and Phase 0 cascaded its nodes
+/// and edges away. Importers then re-resolved against a name pool missing it and
+/// could bind to a same-named phantom, which no later re-index of the *file*
+/// repairs. The cached path already carried the stored hash forward for anything
+/// the walk saw (`DirectoryCache::seen_files`); this one had the same shape and
+/// no guard, and it is the production entry point for the server's startup drift
+/// check and the `incremental-index` CLI (audit 2026-09-05 CORE-01).
 pub fn run_incremental_index(
     db: &Database,
     project_root: &Path,
     model: Option<&EmbeddingModel>,
     progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
-    let start = std::time::Instant::now();
-    let stored_hashes = get_all_file_hashes(db.conn())?;
-    let current_hashes = scan_directory(project_root)?;
-    let diff = compute_diff(&stored_hashes, &current_hashes);
-
-    // Preserve <external> pseudo-file across incremental indexes
-    let deleted_files: Vec<String> = diff
-        .deleted_files
-        .into_iter()
-        .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
-        .collect();
-    let to_index = to_index_after_interrupt_check(
-        db,
-        [diff.new_files, diff.changed_files].concat(),
-        &current_hashes,
-    )?;
-
-    let dirty_node_ids = if !to_index.is_empty() {
-        collect_dirty_node_ids(db, &to_index)?
-    } else {
-        HashSet::new()
-    };
-
-    let result = index_files(
-        db,
-        project_root,
-        &to_index,
-        &current_hashes,
-        model,
-        &deleted_files,
-        progress,
-    )?;
-
-    if !dirty_node_ids.is_empty() {
-        // Heartbeat: context-string regeneration for dirty dependents runs after
-        // index_files' own finalize ticks and can take a while on wide fan-in.
-        if let Some(cb) = progress {
-            cb(IndexPhase::Finalizing, result.files_indexed, to_index.len());
-        }
-        regenerate_context_strings(db, &dirty_node_ids, model)?;
-    }
-
-    if result.files_indexed > 0 || !deleted_files.is_empty() {
-        tracing::info!(
-            "[incremental] {} files changed, {} deleted, {} nodes, {} edges, {:.1}s",
-            result.files_indexed,
-            deleted_files.len(),
-            result.nodes_created,
-            result.edges_created,
-            start.elapsed().as_secs_f64()
-        );
-    }
-
-    Ok(result)
+    run_incremental_index_cached(db, project_root, model, None, progress).map(|(result, _)| result)
 }
 
 /// Incremental index with directory mtime cache for faster scanning.

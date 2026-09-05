@@ -105,11 +105,41 @@ function resolveAnswerBinary(opts) {
   return binary || null;
 }
 
-/** One spawn, one options block, one `CODE_GRAPH_INTERNAL` stamp. */
+/**
+ * One spawn, one options block, one `CODE_GRAPH_INTERNAL` stamp.
+ *
+ * The timeout is the SMALLER of this call's own budget and whatever is left of
+ * the hook process's registered budget, because the callers run these in
+ * series: post-grep-inject loops callgraph over every symbol in the pattern
+ * before falling back to show and then grep, so three 2 s answers overran a 5 s
+ * hook and Claude Code killed it — which the user sees as a hook error on their
+ * own tool call, not as a missing hint (audit 2026-09-05 JS-03). Out of budget
+ * returns a synthetic timeout the exit-code table already reads as
+ * `unavailable`, so the caller degrades to the static path exactly as it does
+ * for a real timeout.
+ *
+ * `killSignal: 'SIGKILL'`: the child we are giving up on is most often one
+ * wedged waiting on `index.lock`, and node's `timeout` sends SIGTERM and then
+ * WAITS. It reads no stdin and holds no lock file worth unwinding — the same
+ * reasoning statusline.js and doctor.js already apply (see proc-opts.js).
+ */
 function runCg(binary, args, { cwd, timeoutMs }) {
+  const budget = require('./hook-fail-open').remainingMs(timeoutMs);
+  if (budget === null) {
+    // `error` is what classifyRun reads (→ `unavailable`); `budgetExhausted` is
+    // for the one caller that loops and must not mistake this for "that symbol
+    // did not resolve" — see runShowAnswer.
+    return {
+      error: new Error('hook budget exhausted'),
+      budgetExhausted: true,
+      status: null,
+      stdout: '',
+    };
+  }
   return spawnSync(binary, args, hidden({
     cwd,
-    timeout: timeoutMs,
+    timeout: budget,
+    killSignal: 'SIGKILL',
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -230,6 +260,15 @@ function runShowAnswer(opts = {}) {
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
       const res = runCg(binary, ['show', sym], { cwd, timeoutMs });
+      // Out of hook budget is not "this symbol did not resolve". This loop
+      // `continue`s past every failure and reports `no-hits` when none of the
+      // three produced output, so without this arm an exhausted budget reached
+      // recordRecommendation as a genuine empty result — and the whole reason
+      // `no-binary` is kept distinct from `unavailable` (see this function's
+      // docs) is that the deny funnel has to tell those causes apart. Nothing
+      // later in the loop can succeed either: the budget is gone for all three
+      // (pre-ship review 2026-09-05).
+      if (res.budgetExhausted) return { status: 'unavailable' };
       // A symbol that did not resolve is SKIPPED, not fatal — exit 1 included,
       // which is why this asks for `exitOneIsNoHits: false` and then treats
       // every non-`ok` verdict the same way.

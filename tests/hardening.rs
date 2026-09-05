@@ -1350,22 +1350,27 @@ fn release_and_cache_warm_workflows_do_not_drift() {
     //     job that no longer checks anything is worse than no gate at all: the
     //     pipeline still reports a green "Gate" and publishes to npm, which is
     //     irreversible. Each of these was a specific hole the audit found.
+    // `--locked` is part of the needle, not incidental: this gate is what stands
+    // between a tag and an irreversible publish, and a gate that re-resolves is
+    // checking a dependency set the committed Cargo.lock never described
+    // (audit 2026-09-05 ENG-01; `every_ci_cargo_invocation_is_locked` covers the
+    // rest of the workflows).
     for (needle, why) in [
         ("run: cargo fmt --check", "formatting"),
         (
-            "run: cargo clippy --no-default-features --all-targets -- -D warnings",
+            "run: cargo clippy --locked --no-default-features --all-targets -- -D warnings",
             "clippy on the default feature set",
         ),
         (
-            "run: cargo clippy --features embed-model --all-targets -- -D warnings",
+            "run: cargo clippy --locked --features embed-model --all-targets -- -D warnings",
             "clippy on the feature set release binaries actually ship",
         ),
         (
-            "run: cargo test --no-default-features",
+            "run: cargo test --locked --no-default-features",
             "the Rust test suite on the default (no-features) set — what `cargo install` users build (audit 2026-08-16 P1-18)",
         ),
         (
-            "run: cargo test --features embed-model",
+            "run: cargo test --locked --features embed-model",
             "the Rust test suite",
         ),
     ] {
@@ -1410,6 +1415,78 @@ fn release_and_cache_warm_workflows_do_not_drift() {
              so a command only the gate runs is a command the gate compiles cold."
         );
     }
+}
+
+/// Every cargo invocation in CI carries `--locked` (audit 2026-09-05 ENG-01).
+///
+/// Without it cargo silently RE-RESOLVES when `Cargo.toml` and `Cargo.lock`
+/// disagree and writes a new lock into the runner's workspace. Nothing goes red;
+/// the tag just ships a binary linked against versions the `audit` job — which
+/// scans the COMMITTED `Cargo.lock` — never saw. `--locked` turns that silence
+/// into a failed step, on the one file where the difference is auditable.
+///
+/// A test rather than a comment for the usual reason: the property is invisible
+/// per-line. A nineteenth invocation added without the flag looks exactly like
+/// the eighteen that have it, and the first evidence would be a release.
+#[test]
+fn every_ci_cargo_invocation_is_locked() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    // Subcommands that RESOLVE dependencies. `cargo fmt` and `cargo install`
+    // are excluded on purpose: fmt reads no lockfile, and the one `install`
+    // (cargo-audit) already pins its own.
+    // `publish` and `package` are listed although no workflow runs one today:
+    // this guard's whole job is to catch the invocation nobody remembers to add
+    // the flag to, and an omission here fails open (pre-ship review 2026-09-05).
+    const RESOLVING: &[&str] = &[
+        "build", "test", "check", "clippy", "bench", "run", "publish", "package",
+    ];
+    let mut unlocked: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    let mut files = 0usize;
+    for entry in fs::read_dir(&wf).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        // Both spellings: GitHub reads `.yaml` too, and skipping it here would
+        // let a whole workflow opt out of this guard by its file extension.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        files += 1;
+        let src = fs::read_to_string(&path).expect("read workflow");
+        for (i, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // A commented-out command is documentation, not a step.
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some(rest) = line.split("cargo ").nth(1) else {
+                continue;
+            };
+            let sub = rest.split_whitespace().next().unwrap_or("");
+            if !RESOLVING.contains(&sub) {
+                continue;
+            }
+            checked += 1;
+            if !line.contains("--locked") {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                unlocked.push(format!("{name}:{}: {}", i + 1, trimmed));
+            }
+        }
+    }
+    assert!(
+        files >= 5,
+        "only {files} workflow files found — the scan lost its grip"
+    );
+    assert!(
+        checked >= 19,
+        "only {checked} cargo invocations found across {files} workflows — the scan \
+         lost its grip and would pass vacuously"
+    );
+    assert!(
+        unlocked.is_empty(),
+        "these CI cargo invocations can silently re-resolve dependencies:\n  {}",
+        unlocked.join("\n  ")
+    );
 }
 
 /// The arm64 cross-compile install must be the SAME in both workflows.

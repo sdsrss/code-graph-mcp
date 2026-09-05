@@ -1608,6 +1608,92 @@ test('migrateOldPluginIds survives an unwritable installed_plugins.json', (t) =>
   );
 });
 
+// ── JS-01: permission bits survive our writes ───────────────────────────────
+//
+// `writeJsonAtomic` replaces by rename, so the file that ends up in place is
+// the TMP file's inode with the TMP file's mode. settings.json routinely holds
+// an `env` block with API keys and users chmod it 0600; every install/update
+// handed it back at umask default. The `.corrupt-*` copies are the same secret
+// again, up to MAX_CORRUPT_BACKUPS of them.
+test('writeJsonAtomic preserves the mode of the file it replaces', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX mode bits are not meaningful on Windows');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { writeJsonAtomic } = require('./lifecycle');
+  const target = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(target, { env: { ANTHROPIC_API_KEY: 'sk-secret' } });
+  fs.chmodSync(target, 0o600);
+
+  // Pin the umask: at 0o077 the pre-fix code would have produced 0600 by
+  // accident and this test would pass for the wrong reason.
+  const prevUmask = process.umask(0o022);
+  t.after(() => process.umask(prevUmask));
+  writeJsonAtomic(target, { env: { ANTHROPIC_API_KEY: 'sk-secret' }, hooks: {} });
+
+  assert.equal(
+    (fs.statSync(target).mode & 0o777).toString(8),
+    '600',
+    'a 0600 settings.json must not come back world-readable after we add a hook',
+  );
+});
+
+test('writeJsonAtomic creates a file the owner alone can read', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX mode bits are not meaningful on Windows');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { writeJsonAtomic } = require('./lifecycle');
+  const prevUmask = process.umask(0o022);
+  t.after(() => process.umask(prevUmask));
+  const target = path.join(homeDir, '.claude', 'settings.json');
+
+  writeJsonAtomic(target, { env: { ANTHROPIC_API_KEY: 'sk-secret' } });
+
+  assert.equal(
+    (fs.statSync(target).mode & 0o777).toString(8),
+    '600',
+    'with no prior file to copy bits from, default to owner-only, not umask',
+  );
+});
+
+test('backupCorruptFile copies are owner-only even when the original is not', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX mode bits are not meaningful on Windows');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { backupCorruptFile } = require('./lifecycle');
+  const prevUmask = process.umask(0o022);
+  t.after(() => process.umask(prevUmask));
+  const target = path.join(homeDir, '.claude', 'settings.json');
+  const raw = '{ "env": { "ANTHROPIC_API_KEY": "sk-secret" } ';
+  writeJson(target, {});
+  fs.writeFileSync(target, raw);
+  fs.chmodSync(target, 0o644);
+
+  const dest = backupCorruptFile(target, Buffer.from(raw, 'utf8'));
+  assert.ok(dest, 'the copy must be made');
+  assert.equal(fs.readFileSync(dest, 'utf8'), raw, 'bytes preserved verbatim');
+  assert.equal(
+    (fs.statSync(dest).mode & 0o777).toString(8),
+    '600',
+    'the backup is the same secret in a second file; it does not inherit 0644',
+  );
+
+  // The other arm: no `raw`, so it falls back to copyFileSync, which carries
+  // the SOURCE's bits (0644) unless we chmod after.
+  const copied = backupCorruptFile(target, undefined);
+  assert.ok(copied, 'the fs-level copy must be made');
+  assert.equal(
+    (fs.statSync(copied).mode & 0o777).toString(8),
+    '600',
+    'copyFileSync carries the source mode — the chmod after it is what pins 0600',
+  );
+});
+
 // ── JS-06: the uninstall sweep's report has THREE outcomes ──────────────────
 //
 // A project whose managed block the user already removed by hand comes back

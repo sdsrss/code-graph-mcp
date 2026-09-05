@@ -82,7 +82,7 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": {
                         "file_path": { "type": "string", "description": "File path (with symbol_name)" },
-                        "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve). A call must carry symbol_name or node_id — file_path alone names a file, not a symbol, and is refused." },
+                        "symbol_name": { "type": "string", "description": "Symbol name (with file_path, or alone for auto-resolve). A call must carry symbol_name or node_id — file_path alone names a file, not a symbol, and is refused. So is a name with several definitions in the one file (cfg-gated alternates, overloads, repeated headings): the reply lists their node_ids, pick one." },
                         "node_id": { "type": "integer", "description": "Node ID (alternative to file_path+symbol_name)" },
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers in references (default false)" },

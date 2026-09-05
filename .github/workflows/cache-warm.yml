@@ -105,7 +105,7 @@ jobs:
       # Same flags as the release build so the cached dep artifacts are the
       # ones release.yml actually links against.
       - name: Build (warm dependency cache)
-        run: cargo build --release --features embed-model --target ${{ matrix.target }}
+        run: cargo build --locked --release --features embed-model --target ${{ matrix.target }}
 
   # Primes release.yml's `gate` job (audit 2026-07-27 P1-3), which is the only
   # thing standing between a tag push and an irreversible npm publish. Same
@@ -170,17 +170,17 @@ jobs:
           exit 1
 
       - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
 
       - name: Clippy (embed-model)
-        run: cargo clippy --features embed-model --all-targets -- -D warnings
+        run: cargo clippy --locked --features embed-model --all-targets -- -D warnings
 
       - name: Test (no default features)
         # Mirrors release.yml gate's new no-default test leg (audit 2026-08-16
         # P1-18): the warm must run the same commands as the gate it primes, or
         # the gate pays a cold compile for the no-default test/bin targets on
         # every tag. Same cheap-first ordering as the gate.
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: Test (embed-model)
         # Mirrors ci.yml's embed-check job: without this the spawned `serve`
@@ -190,4 +190,4 @@ jobs:
         # irreversible npm publish, so it must not be the flakiest one.
         env:
           CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
-        run: cargo test --features embed-model
+        run: cargo test --locked --features embed-model

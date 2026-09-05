@@ -141,10 +141,10 @@ jobs:
       # embed-model is what release binaries ship, so gating only the default
       # set would leave the shipped configuration unchecked.
       - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
 
       - name: Clippy (embed-model)
-        run: cargo clippy --features embed-model --all-targets -- -D warnings
+        run: cargo clippy --locked --features embed-model --all-targets -- -D warnings
 
       # ── Test coverage of this gate vs ci.yml (audit 2026-08-16 P1-18) ────────
       # ci.yml runs `cargo test --no-default-features` on ubuntu + macos +
@@ -174,7 +174,7 @@ jobs:
         # no-default test/bin targets restore warm from the `release-gate` cache
         # (the two files' command sets are pinned together by
         # tests/hardening.rs::release_and_cache_warm_workflows_do_not_drift).
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: Test (embed-model)
         # Mirrors ci.yml's embed-check job: without this the spawned `serve`
@@ -184,7 +184,7 @@ jobs:
         # irreversible npm publish, so it must not be the flakiest one.
         env:
           CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
-        run: cargo test --features embed-model
+        run: cargo test --locked --features embed-model
 
   build:
     name: Build ${{ matrix.npm-pkg }}
@@ -297,7 +297,7 @@ jobs:
       # `cargo install` users a smaller binary; npm release explicitly opts
       # back in here so the user-visible npm contract is unchanged.
       - name: Build
-        run: cargo build --release --features embed-model --target ${{ matrix.target }}
+        run: cargo build --locked --release --features embed-model --target ${{ matrix.target }}
 
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

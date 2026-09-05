@@ -19,7 +19,87 @@
 //
 // EPIPE is silent by design. It means the consumer closed the pipe — Claude
 // Code moved on, or a `| head` upstream exited. There is nobody left to tell.
+// The budget Claude Code kills each hook at, in SECONDS — the single source for
+// both halves of that contract: `lifecycle.js` registers these numbers into
+// settings.json, and `remainingMs` below spends against them. `hooks.test.js`
+// pins both registration sites to this table so a bump in one cannot drift from
+// the other.
+//
+// `session-init.js` is here for its REGISTRATION only. It is registered from
+// `claude-plugin/hooks/hooks.json` (SessionStart is the one event Claude Code
+// loads from plugin-cache), it predates `installHookFailOpen` and wraps its own
+// main in a try/catch, so nothing arms a deadline for it and none of its six
+// child spawns clamp — 15.5 s of serial timeouts against the 5 s below. That is
+// the largest overrun of the seven and it is NOT fixed here; pre-ship review
+// 2026-09-05 finding 1, carried in the audit report as NEW-05. Wiring it means
+// deciding, per child, whether an out-of-budget SessionStart should skip a
+// binary health check or a quarantine probe, which is not a mechanical change.
+const HOOK_TIMEOUT_SECONDS = {
+  'pre-edit-guide.js': 4,
+  'pre-grep-guide.js': 3,
+  'pre-read-guide.js': 3,
+  'incremental-index.js': 10,
+  'post-grep-inject.js': 5,
+  'user-prompt-context.js': 5,
+  'session-init.js': 5,
+};
+
+// Left for the hook to render its answer and exit after the last child returns.
+const WRITE_RESERVE_MS = 400;
+
+// Wall-clock instant this process must be finished by, or null when nothing
+// armed one (a hook `require`d by a test, or an unlisted script).
+let deadlineAt = null;
+
+/**
+ * Arm the process deadline from the registered budget of `script`.
+ *
+ * The hooks' internal timeouts were each sized in isolation and run in SERIES:
+ * pre-edit-guide alone could spend 5 × 2000 ms of candidate greps plus 2500 ms
+ * of impact against a 4 s budget, and post-grep-inject looped callgraph over
+ * every symbol in the pattern before its show/grep fallbacks — 2–3× the budget
+ * either way. Nothing enforced the sum, so a binary wedged on `index.lock` got
+ * the hook killed by Claude Code, which surfaces to the user as a hook error on
+ * THEIR tool call (audit 2026-09-05 JS-03).
+ *
+ * `process.uptime()` is subtracted because the budget starts when Claude Code
+ * spawns us, not when this line runs: cold node startup is real time already
+ * spent, and on a loaded machine it is hundreds of milliseconds.
+ */
+function armHookDeadline(script) {
+  const seconds = HOOK_TIMEOUT_SECONDS[script];
+  if (!seconds) return;
+  deadlineAt = Math.floor(Date.now() + seconds * 1000 - process.uptime() * 1000 - WRITE_RESERVE_MS);
+}
+
+/**
+ * How long a child may run: `defaultMs`, or whatever is left of the budget.
+ *
+ * Returns `null` when there is nothing left — meaning DO NOT RUN, not "run
+ * unbounded". Callers must branch on it: node reads `timeout: 0` as no timeout
+ * at all, so a numeric zero here would turn the last child into the unbounded
+ * one, which is the exact failure this exists to prevent.
+ *
+ * Always an INTEGER. `child_process` validates `timeout` with
+ * `validateTimeout` and throws `ERR_OUT_OF_RANGE` on a fraction — and the one
+ * fractional term here (`process.uptime()`) made every spawn throw, which the
+ * runners' own try/catch turned into a silent `unavailable`: the hooks stopped
+ * answering and still exited 0. Caught by pre-grep-guide's e2e suite.
+ */
+function remainingMs(defaultMs) {
+  if (deadlineAt === null) return Math.floor(defaultMs);
+  const left = deadlineAt - Date.now();
+  if (left <= 0) return null;
+  return Math.floor(Math.min(defaultMs, left));
+}
+
+/** Test seam: drop any armed deadline so one test file can't leak into another. */
+function resetHookDeadline() {
+  deadlineAt = null;
+}
+
 function installHookFailOpen(label) {
+  armHookDeadline(require('path').basename(process.argv[1] || ''));
   const bail = (err) => {
     const code = (err && err.code) || (err && err.name) || 'Error';
     if (code !== 'EPIPE') {
@@ -46,4 +126,10 @@ function installHookFailOpen(label) {
   process.on('unhandledRejection', bail);
 }
 
-module.exports = { installHookFailOpen };
+module.exports = {
+  installHookFailOpen,
+  HOOK_TIMEOUT_SECONDS,
+  armHookDeadline,
+  remainingMs,
+  resetHookDeadline,
+};

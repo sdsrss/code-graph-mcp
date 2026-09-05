@@ -141,17 +141,17 @@ jobs:
       # change without anything going red — the bench exists to catch indexing
       # regressions and was itself unguarded.
       - name: Check
-        run: cargo check ${{ matrix.feature-flag }} --all-targets
+        run: cargo check --locked ${{ matrix.feature-flag }} --all-targets
 
       # --all-targets here too: without it clippy lints lib+bins only, so a
       # violation in tests/ or benches/ passes every PR and then reddens
       # release.yml's `gate` (which does pass --all-targets) AFTER the tag is
       # cut — the one place a lint failure costs a re-release.
       - name: Clippy
-        run: cargo clippy ${{ matrix.feature-flag }} --all-targets -- -D warnings
+        run: cargo clippy --locked ${{ matrix.feature-flag }} --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test ${{ matrix.feature-flag }}
+        run: cargo test --locked ${{ matrix.feature-flag }}
 
       # Criterion `--test` runs each benchmark ONCE and fails on panic: a
       # runtime smoke, not a timing gate (shared runners are far too noisy to
@@ -161,7 +161,7 @@ jobs:
       # the audit report; that needs a dedicated runner, not this step.
       - name: Bench smoke (criterion --test)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo bench ${{ matrix.feature-flag }} --bench indexing -- --test
+        run: cargo bench --locked ${{ matrix.feature-flag }} --bench indexing -- --test
 
   # The shipped binary is built `--features embed-model` (release.yml), but the
   # matrix above only exercises the FTS5-only default — so a regression in the
@@ -214,10 +214,10 @@ jobs:
       # --all-targets matches the no-embed leg (:92): without it the embed
       # feature's test and bench targets are never type-checked here.
       - name: Check
-        run: cargo check --features embed-model --all-targets
+        run: cargo check --locked --features embed-model --all-targets
 
       - name: Clippy
-        run: cargo clippy --features embed-model --all-targets -- -D warnings
+        run: cargo clippy --locked --features embed-model --all-targets -- -D warnings
 
       - name: Test
         # CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: the spawned `serve` integration tests
@@ -227,7 +227,7 @@ jobs:
         # self-skip without a cached model.
         env:
           CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
-        run: cargo test --features embed-model
+        run: cargo test --locked --features embed-model
 
   # Plugin/lifecycle/release-smoke tests are Node-based and OS-independent —
   # run once on Linux to avoid the 3× matrix blow-up.

@@ -2848,6 +2848,58 @@ function handleLogin(req: Request) {
         assert_eq!(result["type"], "function");
     }
 
+    /// `file_path` + `symbol_name` cannot split two defs of the same name in one
+    /// file, so it must say so instead of answering about the first one.
+    ///
+    /// The silent `find` (audit 2026-09-05 SURF-02) returned whichever overload
+    /// sorted earliest and looked like a definitive answer — while
+    /// `find_references` on the identical input already returned candidates and
+    /// CLI `show --file` already printed both.
+    #[test]
+    fn test_get_ast_node_file_symbol_discloses_same_file_overloads() {
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("overloads.rs"),
+            "struct A;\nstruct B;\nimpl A {\n    pub fn new() -> A { A }\n}\n\
+             impl B {\n    pub fn new() -> B { B }\n}\n",
+        )
+        .unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({ "file_path": "overloads.rs", "symbol_name": "new" }),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        assert_eq!(result["symbol"], "new", "got: {result}");
+        let err = result["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("Ambiguous symbol 'new'") && err.contains("node_id"),
+            "the shared ambiguity envelope, naming the selector that works; got: {result}"
+        );
+        let suggestions = result["suggestions"].as_array().expect("suggestions array");
+        assert_eq!(
+            suggestions.len(),
+            2,
+            "both overloads offered; got: {result}"
+        );
+        for s in suggestions {
+            assert!(
+                s["node_id"].as_i64().is_some_and(|id| id > 0),
+                "each candidate carries the node_id that splits it; got: {result}"
+            );
+            assert_eq!(s["file_path"], "overloads.rs");
+        }
+        assert!(
+            result["code_content"].is_null() && result["node_id"].is_null(),
+            "must not also answer as if one overload had been chosen; got: {result}"
+        );
+    }
+
     #[test]
     fn test_read_snippet_tool() {
         let project_dir = TempDir::new().unwrap();

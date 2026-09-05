@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const HERE = __dirname;
@@ -41,6 +42,99 @@ test('EPIPE is silent — the consumer already went away', () => {
   );
   assert.equal(res.status, 0);
   assert.equal(res.stderr, '', `nothing to report to a closed pipe; got: ${res.stderr}`);
+});
+
+// ── JS-03 (audit 2026-09-05): the process deadline ─────────────────────────
+//
+// Each hook's internal timeouts were sized alone and run in SERIES, so their
+// sum was 2–3× the budget Claude Code kills the hook at. Being killed is not a
+// missing hint: PreToolUse reports a hook error on the USER's tool call.
+
+test('remainingMs is bounded by the hook budget, not by the caller default', () => {
+  const res = runNode(
+    `const h = require('./hook-fail-open');
+     h.armHookDeadline('pre-grep-guide.js');   // registered budget: 3 s
+     console.log(JSON.stringify({ big: h.remainingMs(60000), small: h.remainingMs(50) }));`
+  );
+  assert.equal(res.status, 0, `stderr=${res.stderr}`);
+  const out = JSON.parse(res.stdout);
+  assert.ok(out.big > 0 && out.big <= 3000,
+    `a 60 s caller default must be cut to what is left of the 3 s budget; got ${out.big}`);
+  assert.equal(out.small, 50,
+    'a caller asking for less than the remainder keeps its own tighter bound');
+});
+
+test('remainingMs is an integer — child_process rejects a fractional timeout', () => {
+  // `process.uptime()` is fractional, so the first version of this returned
+  // 2565.27… and every `spawnSync` threw ERR_OUT_OF_RANGE. The runners catch
+  // their own exceptions, so the hooks went on exiting 0 while silently
+  // answering nothing — a regression that only pre-grep-guide's e2e suite saw.
+  const res = runNode(
+    `const h = require('./hook-fail-open');
+     h.armHookDeadline('pre-grep-guide.js');
+     const t = h.remainingMs(60000);
+     require('child_process').spawnSync(process.execPath, ['-e', '0'], { timeout: t });
+     console.log(String(Number.isInteger(t)));`
+  );
+  assert.equal(res.status, 0, `a fractional timeout throws here; stderr=${res.stderr}`);
+  assert.equal(res.stdout.trim(), 'true');
+});
+
+test('an unarmed process (a hook module under test) keeps the caller default', () => {
+  const res = runNode(
+    `console.log(String(require('./hook-fail-open').remainingMs(60000)));`
+  );
+  assert.equal(res.stdout.trim(), '60000',
+    'requiring a hook in a test must not clamp its spawns to a budget nobody armed');
+});
+
+test('remainingMs returns null — not 0 — once the budget is spent', () => {
+  const res = runNode(
+    `const h = require('./hook-fail-open');
+     h.armHookDeadline('pre-grep-guide.js');
+     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2800);
+     console.log(String(h.remainingMs(2000)));`
+  );
+  assert.equal(res.status, 0, `stderr=${res.stderr}`);
+  assert.equal(res.stdout.trim(), 'null',
+    'null means DO NOT RUN; a numeric 0 reads as "no timeout" to node, which is ' +
+    'exactly the unbounded child this guard exists to prevent');
+});
+
+test('serial answers stop spawning instead of outliving the hook budget', () => {
+  // The shape from post-grep-inject: callgraph over each symbol in the pattern,
+  // then show, then grep — each with cg-answer's own 2 s timeout, all inside a
+  // 3 s hook. Before the clamp, three hanging children spent ~6 s.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadline-test-'));
+  const stub = path.join(dir, 'hang.js');
+  fs.writeFileSync(stub, "#!/usr/bin/env node\n'use strict';\nsetTimeout(() => {}, 60000);\n");
+  fs.chmodSync(stub, 0o755);
+  try {
+    const env = { ...process.env };
+    // A sibling test file raises this for its own harness; the budget under
+    // test is the product default.
+    delete env._CG_ANSWER_TIMEOUT_MS;
+    const res = spawnSync(process.execPath, ['-e',
+      `const h = require('./hook-fail-open');
+       h.armHookDeadline('pre-grep-guide.js');
+       const { runGrepAnswer } = require('./cg-answer');
+       const t0 = Date.now();
+       const seen = [];
+       for (let i = 0; i < 3; i++) {
+         seen.push(runGrepAnswer({ cwd: process.cwd(), pattern: 'sym' + i,
+                                   binary: ${JSON.stringify(stub)} }).status);
+       }
+       console.log(JSON.stringify({ ms: Date.now() - t0, seen }));`
+    ], { cwd: HERE, encoding: 'utf8', env });
+    assert.equal(res.status, 0, `stderr=${res.stderr}`);
+    const out = JSON.parse(res.stdout);
+    assert.deepEqual(out.seen, ['unavailable', 'unavailable', 'unavailable'],
+      'a hanging binary degrades to the static path, armed or not');
+    assert.ok(out.ms < 3200,
+      `three hanging answers must not outlive the 3 s budget; took ${out.ms} ms`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('every registered hook entry point installs the fail-open handler', () => {

@@ -43,7 +43,7 @@ jobs:
       # Impact analysis needs only the AST graph, not embeddings — build without
       # the Candle ML stack for a much faster, lighter job.
       - name: Build (no-embed)
-        run: cargo build --release --no-default-features
+        run: cargo build --locked --release --no-default-features
 
       - name: Index repository
         run: ./target/release/code-graph-mcp incremental-index --quiet
