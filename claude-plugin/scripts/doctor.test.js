@@ -1163,3 +1163,81 @@ test('doctor tells the three update-state outcomes apart', () => {
   assert.equal(clean.status, 'ok');
   assert.match(clean.detail, /up-to-date/);
 });
+
+// ── JS-02: the updater's failure reason survives to doctor ────────────────
+//
+// auto-update.js is launched `detached` with `stdio: 'ignore'` on its main
+// trigger path (session-init.js), so all ~20 of its `console.error` refusals go
+// to /dev/null. Before this, the only trace was a count — "v9.9.9 failed to
+// install 5×" — which cannot distinguish a missing curl from a full disk from a
+// truncated CDN transfer.
+
+test('autoUpdateLastError renders a recorded failure, and nothing when there is none', () => {
+  const { autoUpdateLastError } = require('./doctor');
+  const rendered = autoUpdateLastError({
+    lastError: {
+      at: '2026-09-05T21:30:00.000Z',
+      stage: 'binary-checksum-mismatch',
+      message: 'Binary checksum mismatch (sha256): expected abc, got def — refusing to install.',
+    },
+  });
+  assert.match(rendered, /binary-checksum-mismatch/);
+  assert.match(rendered, /checksum mismatch/i);
+  assert.match(rendered, /2026-09-05 21:30 UTC/);
+
+  // No invented cause: these are all "nothing was recorded".
+  assert.equal(autoUpdateLastError({}), null);
+  assert.equal(autoUpdateLastError(null), null);
+  assert.equal(autoUpdateLastError({ lastError: { stage: 'x' } }), null, 'a stage with no message says nothing');
+});
+
+test('autoUpdateLastError is independent of autoUpdateNoOpReason', () => {
+  const { autoUpdateLastError, autoUpdateNoOpReason } = require('./doctor');
+  // One failed attempt parks nothing — the updater will retry next session — so
+  // "why is nothing happening" is legitimately null while the cause is known.
+  // Folding the two would lose the reason in exactly that case.
+  const oneFailure = {
+    updateAvailable: true, updateAttempts: 1,
+    lastError: { at: new Date().toISOString(), stage: 'curl-missing', message: 'Binary download skipped: curl not on PATH.' },
+  };
+  assert.equal(autoUpdateNoOpReason(oneFailure, {}), null);
+  assert.match(autoUpdateLastError(oneFailure) || '', /curl not on PATH/);
+});
+
+test('the suspended Auto-update row carries the reason, not just the count', () => {
+  const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
+  const { autoUpdateLastError } = require('./doctor');
+  const state = {
+    latestVersion: '9.9.9',
+    updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS,
+    lastError: { at: '2026-09-05T21:30:00.000Z', stage: 'binary-too-small', message: 'downloaded binary is 812 bytes' },
+  };
+  // Same composition runDiagnostics does for that row.
+  const detail = `v${state.latestVersion} failed to install ${state.updateAttempts}× — auto-retry throttled to once a day. `
+    + `${autoUpdateLastError(state)}. `;
+  assert.match(detail, /812 bytes/, 'the count alone is not a diagnosis');
+  assert.match(detail, /binary-too-small/);
+});
+
+test('noteUpdateFailure records a bounded reason and takeUpdateFailure clears it', () => {
+  const { noteUpdateFailure, takeUpdateFailure } = require('./auto-update');
+  takeUpdateFailure(); // drop anything a sibling test left behind
+
+  assert.equal(takeUpdateFailure(), null, 'nothing recorded → nothing to persist');
+
+  const returned = noteUpdateFailure('binary-promote-failed', 'Binary promote failed (ENOSPC): no space left');
+  assert.equal(returned, 'Binary promote failed (ENOSPC): no space left',
+    'returns the message so the call site prints exactly what it stored');
+
+  const taken = takeUpdateFailure();
+  assert.equal(taken.stage, 'binary-promote-failed');
+  assert.match(taken.message, /ENOSPC/);
+  assert.ok(!Number.isNaN(new Date(taken.at).getTime()), 'timestamp must be parseable');
+  assert.equal(takeUpdateFailure(), null, 'read-and-clear: a stale reason must not attach to the next attempt');
+
+  // `e.message` can carry a whole curl transcript and this lands in a JSON file
+  // read at every session start.
+  noteUpdateFailure('binary-download-failed', 'x'.repeat(5000));
+  assert.equal(takeUpdateFailure().message.length, 300);
+});

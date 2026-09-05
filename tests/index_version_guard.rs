@@ -283,7 +283,13 @@ fn extraction_and_schema_sources_match_recorded_fingerprints() {
     if obs.extraction_fp != rec_extraction_fp {
         let version_moved = obs.index_version.to_string() != rec_index_version;
         failures.push(format!(
-            "EXTRACTION SOURCES CHANGED (src/parser/**, src/indexer/pipeline/*.rs)\n\
+            // Name the WHOLE set. It listed only the first two globs while
+            // `extraction_sources()` has also folded in the three file-selection
+            // seams since `9045f4c` — so a comment-only edit to merkle.rs fired
+            // this guard against a path the message said it did not cover, and
+            // the reader's first move is to go looking for the real cause.
+            "EXTRACTION SOURCES CHANGED (src/parser/**, src/indexer/pipeline/*.rs, \
+             src/utils/config.rs, src/utils/gitignore.rs, src/indexer/merkle.rs)\n\
              \x20 recorded {rec_extraction_fp} at INDEX_VERSION {rec_index_version}\n\
              \x20 current  {} at INDEX_VERSION {}\n\
              \x20 {}\n\

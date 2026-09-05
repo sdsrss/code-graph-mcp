@@ -84,6 +84,13 @@ tree-sitter-dart-orchard = "0.3.2"
 tree-sitter-md = "0.3"
 tree-sitter-bash = "0.23.3"
 tree-sitter-json = "0.24.8"
+# Runtime, NOT test-only — audit 2026-09-05 ENG-06(a) proposed moving this to
+# [dev-dependencies] and that is wrong: `snapshot::create` / `snapshot::inspect`
+# (src/snapshot/mod.rs:31,161) stage into a `tempfile::tempdir()` before the
+# atomic rename, and both are shipped CLI subcommands (`snapshot create` /
+# `snapshot inspect`). Moving it fails the build with E0433. Recorded here
+# because the proposal came from a grep whose output was truncated at the test
+# call sites — the next round should not re-derive it.
 tempfile = "3"
 
 [build-dependencies]

@@ -12,10 +12,46 @@ const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-util
 const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
+const { installHookFailOpen, remainingMs } = require('./hook-fail-open');
 // Module scope on purpose: `detectHookDark` reads it inside a try/catch that
 // treats any throw as "nothing to conclude", so a lazy require in there would
 // turn a resolution failure into a silent disable (pre-tag review, JS-08).
 const { resolveProjectRoot } = require('./project-root');
+
+// ── SessionStart budget (audit 2026-09-05 NEW-05) ─────────────────────────
+//
+// Claude Code kills this hook at 5 s (`HOOK_TIMEOUT_SECONDS['session-init.js']`,
+// mirrored by hooks.json). Its blocking children were each sized alone and run
+// in SERIES: the darwin quarantine probe 3 s, `git log` 2 s, `health-check` 3 s,
+// `map --compact` 5 s, `git status` 1 s, `git diff` 1 s, `affected` 1.5 s and
+// `readBinaryVersion` 5 s — 21.5 s worst case. Nothing enforced the sum, so a
+// binary wedged on `index.lock` got the hook killed and took the SessionStart
+// output the user had already earned with it. JS-03 fixed the other six hooks;
+// this one was left because clamping it is a per-child decision, not a
+// mechanical edit.
+//
+// Every blocking child now spends `budgetFor(...)`, which returns null when the
+// budget is gone — meaning SKIP, never "run unbounded" (node reads `timeout: 0`
+// as no timeout at all).
+//
+// Two skips would otherwise fabricate a POSITIVE result, so they get their own
+// answer rather than folding into an existing bucket — the mistake NEW-09 fixed
+// in cg-answer, where "budget exhausted" arrived as `no-hits`:
+//   * a skipped freshness probe reports 'unknown', NOT 'fresh';
+//   * a skipped Gatekeeper probe reports `quarantine-probe-skipped`, NOT a
+//     silent "the binary runs".
+// The rest degrade to "nothing injected", which is a state they already reach
+// for ordinary reasons (no index, clean tree) and which claims nothing untrue.
+// `budgetSkipped` in the return value names whichever ones actually skipped, so
+// a starved SessionStart is legible to `doctor` and to tests instead of just
+// being quieter than usual.
+let budgetSkips = [];
+
+function budgetFor(label, defaultMs) {
+  const ms = remainingMs(defaultMs);
+  if (ms === null) budgetSkips.push(label);
+  return ms;
+}
 
 // v0.17.0 — quietHooks: unconditional quiet 默认。
 // 项目地图与 MEMORY.md plugin contract + on-demand `project_map` 工具高度重叠，
@@ -344,13 +380,19 @@ function syncLifecycleConfig() {
  * project where the MCP server isn't running, nothing else nudges a rebuild.
  * health-check carries the verdict in `index_version_stale`. Best-effort: any
  * failure → false (never force work off a bad probe).
+ *
+ * Returns true | false | null, where null means the SessionStart budget ran out
+ * before the probe could run. `false` says "asked, not stale"; conflating the
+ * two would let the caller report a freshness it never established.
  */
 function indexNeedsRevalidation(bin, cwd) {
+  const budget = budgetFor('health-check', 3000);
+  if (budget === null) return null;
   try {
     let out;
     try {
       out = execFileSync(bin, ['health-check', '--format', 'json'],
-        hidden({ cwd, timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] })).toString();
+        hidden({ cwd, timeout: budget, stdio: ['pipe', 'pipe', 'pipe'] })).toString();
     } catch (e) {
       // health-check exits non-zero on an unhealthy index but still writes JSON.
       out = ((e && e.stdout) || '').toString();
@@ -370,7 +412,10 @@ function indexNeedsRevalidation(bin, cwd) {
  *   1. git HEAD newer than index.db mtime — content drifted since last index.
  *   2. INDEX_VERSION mismatch (post-upgrade) — see indexNeedsRevalidation.
  *
- * Returns 'fresh' | 'refreshing' | 'skipped'.
+ * Returns 'fresh' | 'refreshing' | 'skipped' | 'unknown', where 'unknown' means
+ * the SessionStart budget ran out before either trigger could be evaluated —
+ * distinct from 'fresh' (both triggers asked and neither fired) and from
+ * 'skipped' (no binary / no index, so there was nothing to ask).
  */
 function ensureIndexFresh() {
   const { findBinary } = require('./find-binary');
@@ -387,19 +432,33 @@ function ensureIndexFresh() {
   if (!fs.existsSync(dbPath)) return 'skipped';
 
   let needsRefresh = false;
+  let unprobed = false;
   // Trigger 1: git HEAD newer than index mtime.
-  try {
-    const dbMtime = fs.statSync(dbPath).mtimeMs;
-    const gitTs = parseInt(
-      execSync('git log -1 --format=%ct', hidden({ cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })).trim()
-    ) * 1000;
-    if (gitTs > dbMtime) needsRefresh = true;
-  } catch { /* no git / not a repo — fall through to the version probe */ }
+  const gitBudget = budgetFor('git-log', 2000);
+  if (gitBudget === null) {
+    unprobed = true;
+  } else {
+    try {
+      const dbMtime = fs.statSync(dbPath).mtimeMs;
+      const gitTs = parseInt(
+        execSync('git log -1 --format=%ct', hidden({ cwd, timeout: gitBudget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })).trim()
+      ) * 1000;
+      if (gitTs > dbMtime) needsRefresh = true;
+    } catch { /* no git / not a repo — fall through to the version probe */ }
+  }
 
   // Trigger 2: INDEX_VERSION mismatch (only probe when mtime looked fresh).
-  if (!needsRefresh && indexNeedsRevalidation(bin, cwd)) needsRefresh = true;
+  if (!needsRefresh) {
+    const stale = indexNeedsRevalidation(bin, cwd);
+    if (stale === true) needsRefresh = true;
+    else if (stale === null) unprobed = true;
+  }
 
-  if (!needsRefresh) return 'fresh';
+  // No trigger fired. Whether that means "fresh" depends on whether anything
+  // was actually asked: with a spent budget this is a claim about an index
+  // nothing looked at, and 'fresh' is the one answer that would stop a caller
+  // from looking again.
+  if (!needsRefresh) return unprobed ? 'unknown' : 'fresh';
 
   const child = spawn(bin, ['incremental-index', '--quiet'], hidden({
     cwd,
@@ -463,8 +522,17 @@ function verifyBinary() {
 
   // On macOS, verify the binary can actually run (Gatekeeper may block it)
   if (process.platform === 'darwin') {
+    const budget = budgetFor('quarantine-probe', 3000);
+    if (budget === null) {
+      // Out of budget before the probe. The binary exists and is executable, so
+      // `available: false` here would be a false alarm that sends the user to
+      // `xattr -d` for nothing. But "it actually runs" is precisely what the
+      // probe establishes and we did not establish it — so say which half is
+      // unverified instead of returning the clean shape.
+      return { available: true, binary, issue: 'quarantine-probe-skipped' };
+    }
     try {
-      execFileSync(binary, ['--version'], hidden({ timeout: 3000, stdio: 'pipe' }));
+      execFileSync(binary, ['--version'], hidden({ timeout: budget, stdio: 'pipe' }));
     } catch (err) {
       const msg = (err.message || '') + (err.stderr ? err.stderr.toString() : '');
       if (msg.includes('quarantine') || msg.includes('not permitted') ||
@@ -499,7 +567,15 @@ function consistencyCheck(binary) {
   // Check 1: Binary version vs plugin version
   try {
     const pluginVersion = getPluginVersion();
-    const binaryVersion = readBinaryVersion(binary);
+    // The last child of the hook and the most expensive one (5s of its own
+    // against a 5s total). Skipping folds into `binaryVersion === null`, which
+    // this check already treats as "no comparison to make" — it only ever
+    // reports a MISMATCH, so a skip suppresses a warning rather than inventing
+    // an all-clear.
+    const versionBudget = budgetFor('binary-version', 5000);
+    const binaryVersion = versionBudget === null
+      ? null
+      : readBinaryVersion(binary, { timeoutMs: versionBudget });
     if (binaryVersion && binaryVersion !== pluginVersion) {
       issues.push({
         id: 'version-mismatch',
@@ -565,6 +641,10 @@ function samePath(a, b) {
 }
 
 function runSessionInit({ source } = {}) {
+  // Fresh per run: this is module state, and the test suite calls this function
+  // many times in one process. A carried-over array would report last run's
+  // skips as this one's.
+  budgetSkips = [];
   // GC the shared tmp dir before anything else, so it happens even on the
   // inactive / non-project early returns below — those sessions still wrote
   // cooldown flags on the way in. Cheap (one readdir + a stat per entry) and
@@ -775,6 +855,10 @@ function runSessionInit({ source } = {}) {
     autoUpdateLaunched, indexFreshness, mapInjected, recentImpactInjected, binaryCheck, consistencyIssues,
     quietHooks, adopted, autoAdopted: autoAdopt.attempted,
     hookFireWarn: !!hookFireWarn, hookDarkWarn: !!hookDarkWarn,
+    // Which children the 5s budget cut, in the order they were reached. Empty
+    // on every healthy run; non-empty is the only signal that this SessionStart
+    // did less than it looks like it did.
+    budgetSkipped: budgetSkips.slice(),
   };
 }
 
@@ -797,9 +881,15 @@ function injectProjectMap() {
     const bin = findBinary();
     if (!bin) return false;
 
+    // Skipping here degrades to "nothing injected", the same state a project
+    // with no index reaches — no false claim, just less context. Safe to fold
+    // (unlike the freshness/quarantine probes) because this dump is opt-in,
+    // off by default, and duplicates MEMORY.md plus the on-demand tool.
+    const mapBudget = budgetFor('map', 5000);
+    if (mapBudget === null) return false;
     const output = execFileSync(bin, ['map', '--compact'], hidden({
       cwd,
-      timeout: 5000,
+      timeout: mapBudget,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       // Hook-internal delivery, not a model conversion — keep record_cli_use from
@@ -846,16 +936,28 @@ function injectRecentImpact({ source } = {}) {
     // last commit. Timeouts tightened (finding #1): worst-case cap sum is now
     // status(1s) + HEAD~1(1s) + affected(1.5s) = 3.5s, comfortably under the 5s
     // SessionStart hook budget; the old 2+2+3=7s could get the whole hook killed.
-    const gitOpts = hidden({ cwd: sessionDir, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    // Each git call re-reads the budget and builds its own opts rather than
+    // sharing one object: the fallback `git diff` runs AFTER `git status` has
+    // already spent wall clock, so a timeout computed once would let the pair
+    // overshoot by up to its own value. `hidden(...)` stays inline at both call
+    // sites — windows-hide.test.js follows a `const x = hidden(...)` binding but
+    // not one returned from a helper, and that guard is right to be that strict.
     let changed = [];
     let isWip = false;
     try {
+      const statusMs = budgetFor('git-status', 1000);
+      if (statusMs === null) return false;
       changed = filterSourceFiles(parseGitStatusPaths(
-        execSync('git status --porcelain --untracked-files=all', gitOpts)));
+        execSync('git status --porcelain --untracked-files=all',
+          hidden({ cwd: sessionDir, timeout: statusMs, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }))));
       isWip = changed.length > 0;
       // Clean tree → fall back to what the last commit touched.
       if (!isWip) {
-        changed = filterSourceFiles(execSync('git diff --name-only HEAD~1 HEAD', gitOpts));
+        const diffMs = budgetFor('git-diff', 1000);
+        if (diffMs === null) return false;
+        changed = filterSourceFiles(
+          execSync('git diff --name-only HEAD~1 HEAD',
+            hidden({ cwd: sessionDir, timeout: diffMs, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })));
       }
     } catch {
       return false; // not a git repo / no commits — nothing to diff
@@ -870,10 +972,13 @@ function injectRecentImpact({ source } = {}) {
     const bin = findBinary();
     if (!bin) return false;
 
+    const affectedBudget = budgetFor('affected', 1500);
+    if (affectedBudget === null) return false;
+
     let affected;
     try {
       const raw = execFileSync(bin, ['affected', ...changed, '--json'], hidden({
-        cwd, timeout: 1500, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        cwd, timeout: affectedBudget, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
       }));
       affected = JSON.parse(raw);
@@ -998,6 +1103,12 @@ module.exports = {
 };
 
 if (require.main === module) {
+  // Arms the 5s deadline every `budgetFor` above spends against, and adds the
+  // async-throw coverage the try/catch below cannot reach (a rejected promise
+  // from a spawn or a read). Only here, never on `require`: the test suite
+  // calls `runSessionInit` in-process, where an armed deadline from a foreign
+  // argv[1] would clamp children against a budget nobody granted.
+  installHookFailOpen('SessionStart');
   // SessionStart passes {source:"startup"|"clear"|"compact"|"resume"} on stdin.
   // Best-effort + TTY-guarded: a hook gets piped JSON (EOF closes it), but a
   // manual `node session-init.js` in a terminal must not block on fd 0.

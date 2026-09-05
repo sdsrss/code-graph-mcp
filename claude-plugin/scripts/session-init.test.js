@@ -734,3 +734,106 @@ test('a missing binary on a fresh install reads as auto-install, not as a failed
   assert.match(optedOut, /npm install -g @sdsrs\/code-graph/);
   assert.match(optedOut, /CODE_GRAPH_NO_AUTO_UPDATE=1/);
 });
+
+// ── SessionStart budget (audit 2026-09-05 NEW-05) ─────────────────────────
+//
+// These assert OUTCOMES, not the clock. `resetHookDeadline(Date.now() - 1)`
+// arms an already-expired deadline so `remainingMs` returns null on the first
+// call, deterministically; a test that armed a real budget and waited it out
+// would be a clock race (the shape of the deadline-timing test removed in
+// v0.134.0).
+//
+// Two of these need a resolvable binary and this repo's CI checkout has none.
+// They call `t.skip()` with a reason rather than asserting something vacuously
+// true, so the gap shows up in the run output instead of reading as coverage.
+const { resetHookDeadline } = require('./hook-fail-open');
+
+function withSpentBudget(t) {
+  resetHookDeadline(Date.now() - 1);
+  t.after(() => resetHookDeadline());
+}
+
+test('a spent budget makes indexNeedsRevalidation report unknown, not "not stale"', (t) => {
+  // The stub reports a STALE index. With the budget gone the probe must not run
+  // at all — and must not answer `false`, which is the value it also returns for
+  // a healthy index and which would let ensureIndexFresh call the index 'fresh'.
+  const { bin, cwd } = stubHealthBin(t, {
+    json: JSON.stringify({ healthy: true, nodes: 5, index_version_stale: true }),
+  });
+  assert.equal(indexNeedsRevalidation(bin, cwd), true, 'precondition: the probe sees the stale index');
+
+  withSpentBudget(t);
+  assert.equal(
+    indexNeedsRevalidation(bin, cwd), null,
+    'budget-exhausted needs its own answer — `false` here is a freshness claim nothing verified'
+  );
+});
+
+test('a spent budget stops consistencyCheck spawning --version instead of running it unbounded', (t) => {
+  // Takes the binary path as an argument, so this one runs everywhere.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cc-budget-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'code-graph-mcp');
+  const marker = path.join(dir, 'spawned');
+  fs.writeFileSync(bin, [
+    '#!/usr/bin/env bash',
+    `touch "${marker}"`,
+    'if [ "$1" = "--version" ]; then echo "code-graph-mcp 0.0.1"; exit 0; fi',
+    'exit 0',
+  ].join('\n'));
+  fs.chmodSync(bin, 0o755);
+
+  assert.ok(consistencyCheck(bin).some(i => i.id === 'version-mismatch'),
+    'precondition: the stub reports a mismatched version');
+  assert.ok(fs.existsSync(marker), 'precondition: the check spawns the binary');
+  fs.rmSync(marker);
+
+  withSpentBudget(t);
+  const issues = consistencyCheck(bin);
+  assert.ok(!fs.existsSync(marker), 'must not spawn --version with no budget left');
+  assert.ok(!issues.some(i => i.id === 'version-mismatch'),
+    'a skipped check suppresses a warning; it must not report one it never made');
+});
+
+test('a spent budget makes ensureIndexFresh report unknown, never fresh', (t) => {
+  const { findBinary } = require('./find-binary');
+  if (!findBinary()) {
+    t.skip('needs a resolvable binary — ensureIndexFresh returns "skipped" before reaching the budget');
+    return;
+  }
+  // A real index that nothing looked at. 'fresh' is the one answer that would
+  // stop the server drift check and the CLI from looking again, so it is the
+  // one answer this path must not invent.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-budget-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.code-graph', 'index.db'), 'not a real db');
+
+  const origCwd = process.cwd();
+  process.chdir(dir);
+  try {
+    withSpentBudget(t);
+    assert.equal(ensureIndexFresh(), 'unknown');
+  } finally {
+    process.chdir(origCwd);
+  }
+});
+
+test('a spent budget leaves the macOS quarantine probe unverified rather than silently OK', (t) => {
+  const { findBinary } = require('./find-binary');
+  if (!findBinary()) {
+    t.skip('needs a resolvable binary — verifyBinary returns available:false before the darwin branch');
+    return;
+  }
+  const realPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+  t.after(() => Object.defineProperty(process, 'platform', realPlatform));
+
+  withSpentBudget(t);
+  const result = verifyBinary();
+  // `available` stays true: the binary exists and is executable, so `false`
+  // would send the user to `xattr -d` for nothing. But "it runs" is exactly
+  // what the probe establishes, and it did not run — so name that.
+  assert.equal(result.available, true);
+  assert.equal(result.issue, 'quarantine-probe-skipped');
+});

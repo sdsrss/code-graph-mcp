@@ -384,17 +384,25 @@ function runDiagnostics({ checkOnly = false } = {}) {
       // suspended, so offering it as a repair would print "✅ Update check
       // complete" and count a fix that cannot happen. Say what is true and hand
       // the user the manual route.
+      const last = autoUpdateLastError(state);
       results.push({
         name: 'Auto-update',
         status: 'warn',
+        // "failed to install 5×" was the whole diagnosis until JS-02: the count
+        // without the cause, for a chain whose every explanation had already
+        // been written to a discarded stderr. A user cannot tell a missing
+        // `curl` from a full disk from a blocked CDN out of a number.
         detail: `v${state.latestVersion} failed to install ${attempts}× — auto-retry throttled to once a day. `
+          + (last ? `${last}. ` : '')
           + 'Update manually: `npm install -g @sdsrs/code-graph` (or `/plugin update code-graph-mcp`)',
       });
     } else if (state && state.updateAvailable && state.binaryUpdated === false) {
+      const last = autoUpdateLastError(state);
       results.push({
         name: 'Auto-update',
         status: 'warn',
-        detail: `plugin v${state.latestVersion}, binary download incomplete`,
+        detail: `plugin v${state.latestVersion}, binary download incomplete`
+          + (last ? ` — ${last}` : ''),
         fixId: 'update-incomplete',
       });
     } else {
@@ -846,10 +854,35 @@ function autoUpdateNoOpReason(state = readUpdateState(), env = process.env) {
   return null;
 }
 
+/**
+ * What the updater's last failed attempt actually said, if it recorded one.
+ *
+ * Every refusal in auto-update.js prints to stderr, and the main trigger path
+ * spawns it `detached` with `stdio: 'ignore'` — so on the path that matters the
+ * explanation went to /dev/null and doctor could only re-run its own checks
+ * (audit 2026-09-05 JS-02). `lastError` is that explanation, persisted.
+ *
+ * Separate from `autoUpdateNoOpReason` on purpose: that answers "why is nothing
+ * happening" (suspended / throttled / switched off) and can be null while this
+ * is set — a single failed attempt records a reason without parking anything.
+ */
+function autoUpdateLastError(state = readUpdateState()) {
+  const e = state && state.lastError;
+  if (!e || !e.message) return null;
+  const when = e.at ? new Date(e.at) : null;
+  const stamp = when && !Number.isNaN(when.getTime()) ? ` on ${when.toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
+  return `last failure${stamp}${e.stage ? ` [${e.stage}]` : ''}: ${e.message}`;
+}
+
 function reportAutoUpdateNoOp(what) {
   console.log(`  ❌ ${what}`);
   const why = autoUpdateNoOpReason();
   if (why) console.log(`     Why: ${why}.`);
+  // Printed even when `why` is null: "nothing is parked" and "the last attempt
+  // failed for reason X" are different facts, and X is the one the user can act
+  // on (a missing curl, a full disk, a blocked CDN).
+  const last = autoUpdateLastError();
+  if (last) console.log(`     ${last}`);
   console.log('     Update manually: `npm install -g @sdsrs/code-graph` (or `/plugin update code-graph-mcp`)');
 }
 
@@ -1208,7 +1241,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason, autoUpdateLastError };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

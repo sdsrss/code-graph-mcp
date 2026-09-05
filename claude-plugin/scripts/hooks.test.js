@@ -228,12 +228,12 @@ test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a dead
     );
   }
 
-  // `session-init.js` predates the helper and wraps its own main in a
-  // try/catch; hook-fail-open.js documents that it arms nothing and why. It is
-  // listed here so that fact stays a decision rather than an oversight.
-  const NOT_ARMED = new Set(['session-init.js']);
+  // No exemptions. `session-init.js` held the last one until audit 2026-09-05
+  // NEW-05 wired it: it predated the helper, wrapped its own main in a
+  // try/catch, and ran 21.5 s of serial children against a 5 s budget — the
+  // largest overrun of the seven. An empty whitelist is the point; re-adding a
+  // name here means re-accepting an unclamped hook.
   for (const script of registered) {
-    if (NOT_ARMED.has(script)) continue;
     const src = fs.readFileSync(path.join(__dirname, script), 'utf8');
     assert.match(
       src, /installHookFailOpen|armHookDeadline/,

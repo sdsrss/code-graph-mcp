@@ -167,6 +167,43 @@ function saveState(state) {
   }
 }
 
+// ── Failure diagnostics ────────────────────────────────────
+//
+// The updater's main trigger is `launchBackgroundAutoUpdate` in session-init.js:
+// `spawn(..., { detached: true, stdio: 'ignore' })`. On that path EVERY
+// `console.error` in this file goes to /dev/null — the sha-sidecar refusal, the
+// size floor, the checksum mismatch, the promote EACCES, the repoint block. All
+// the user gets is the statusline's "⚠ update stuck" and a `doctor` that re-runs
+// its checks instead of reporting what already failed (audit 2026-09-05 JS-02).
+//
+// Recorded in memory and persisted by the ONE site that already writes state,
+// rather than a `saveState` at each rejection point: `CACHE_DIR` is
+// `~/.cache/code-graph` with no env seam, so a leaf function that persisted on
+// its own would have in-process unit tests writing into the developer's real
+// cache directory.
+let lastFailure = null;
+
+/** Record why the updater refused/failed. Returns `message` so call sites can
+ *  print the same string they store, instead of maintaining two copies. */
+function noteUpdateFailure(stage, message) {
+  lastFailure = {
+    at: new Date().toISOString(),
+    stage,
+    // Bounded: `e.message` can carry a whole curl transcript, and this lands in
+    // a JSON file read on every session start.
+    message: String(message == null ? '' : message).slice(0, 300),
+  };
+  return message;
+}
+
+/** Read-and-clear. The caller is about to persist it (or to record a success,
+ *  which must not leave the previous attempt's reason behind). */
+function takeUpdateFailure() {
+  const f = lastFailure;
+  lastFailure = null;
+  return f;
+}
+
 // ── Throttle ───────────────────────────────────────────────
 
 // The updater has given up on the current target release (MAX_UPDATE_ATTEMPTS
@@ -525,7 +562,8 @@ async function downloadBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate } 
   if (!latest || !latest.binaryUrl) return false;
   if (!needsUpdate(latest)) return false; // already at latest.version — no fetch
   if (!commandExists('curl')) {
-    console.error('[code-graph] Binary download skipped: curl not on PATH.');
+    console.error(`[code-graph] ${noteUpdateFailure('curl-missing',
+      'Binary download skipped: curl not on PATH.')}`);
     return false;
   }
 
@@ -569,14 +607,16 @@ async function downloadBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate } 
       }
     }
     if (!expectedSha) {
-      console.error(`[code-graph] Refusing to install: no sha256 sidecar for ${latest.binaryUrl} (fetched twice). The current binary is unchanged; the next update check will retry.`);
+      console.error(`[code-graph] ${noteUpdateFailure('binary-sha-sidecar-missing',
+        `Refusing to install: no sha256 sidecar for ${latest.binaryUrl} (fetched twice). The current binary is unchanged; the next update check will retry.`)}`);
       try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
       return false;
     }
 
     return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version, expectedSha);
   } catch (e) {
-    console.error(`[code-graph] Binary download failed: ${e.message}`);
+    console.error(`[code-graph] ${noteUpdateFailure('binary-download-failed',
+      `Binary download failed: ${e.message}`)}`);
     return false;
   }
 }
@@ -599,11 +639,10 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
     // burning one of MAX_UPDATE_ATTEMPTS with nothing on stderr to explain it.
     const stat = fs.statSync(binaryTmp);
     if (stat.size <= 1_000_000) {
-      console.error(
-        `[code-graph] Refusing to install: downloaded binary is ${stat.size} bytes — far below the ~1 MB floor, ` +
+      console.error(`[code-graph] ${noteUpdateFailure('binary-too-small',
+        `Refusing to install: downloaded binary is ${stat.size} bytes — far below the ~1 MB floor, ` +
         'so the transfer was truncated or the server returned an error page. ' +
-        'The current binary is unchanged; the next update check retries.'
-      );
+        'The current binary is unchanged; the next update check retries.')}`);
       return false;
     }
 
@@ -618,13 +657,15 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
     // a fail-closed `src/snapshot/install.rs` — and a warning printed to stderr
     // during a background auto-update is seen by nobody.
     if (!expectedSha256) {
-      console.error('[code-graph] No expected sha256 supplied — refusing to install an unverified binary.');
+      console.error(`[code-graph] ${noteUpdateFailure('binary-sha-missing',
+        'No expected sha256 supplied — refusing to install an unverified binary.')}`);
       try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
       return false;
     }
     const actualSha = sha256File(binaryTmp);
     if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
-      console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
+      console.error(`[code-graph] ${noteUpdateFailure('binary-checksum-mismatch',
+        `Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`)}`);
       return false;
     }
 
@@ -642,10 +683,9 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
       // Sibling of the size floor above: silent for the same reason and with the
       // same cost. `--version` failing to run at all (wrong arch, missing libc)
       // reads identically to a version mismatch without this.
-      console.error(
-        `[code-graph] Refusing to install: downloaded binary reports ${actualVersion ? `v${actualVersion}` : 'no runnable --version'}` +
-        `${expectedVersion ? `, expected v${expectedVersion}` : ''} — not installing it.`
-      );
+      console.error(`[code-graph] ${noteUpdateFailure('binary-version-unrunnable',
+        `Refusing to install: downloaded binary reports ${actualVersion ? `v${actualVersion}` : 'no runnable --version'}` +
+        `${expectedVersion ? `, expected v${expectedVersion}` : ''} — not installing it.`)}`);
       return false;
     }
 
@@ -658,7 +698,8 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
     // server is running), EBUSY, EXDEV. A bare `catch { return false }` made all
     // of them one indistinguishable failure that the caller counted as an
     // attempt and printed nothing about.
-    console.error(`[code-graph] Binary promote failed${e && e.code ? ` (${e.code})` : ''}: ${e && e.message}`);
+    console.error(`[code-graph] ${noteUpdateFailure('binary-promote-failed',
+      `Binary promote failed${e && e.code ? ` (${e.code})` : ''}: ${e && e.message}`)}`);
     return false;
   } finally {
     try {
@@ -706,7 +747,8 @@ async function downloadAndInstall(latest, {
   // Pre-flight: check required CLI tools before attempting any download
   const missingTools = ['curl', 'tar'].filter(cmd => !cmdExists(cmd));
   if (missingTools.length > 0) {
-    console.error(`[code-graph] Auto-update skipped: missing required tools: ${missingTools.join(', ')}. Install them to enable auto-updates.`);
+    console.error(`[code-graph] ${noteUpdateFailure('missing-tools',
+      `Auto-update skipped: missing required tools: ${missingTools.join(', ')}. Install them to enable auto-updates.`)}`);
     return { pluginUpdated: false, binaryUpdated: false };
   }
 
@@ -743,7 +785,8 @@ async function downloadAndInstall(latest, {
     // the user on their current, working plugin version; the binary update below
     // still runs.
     if (!latest.pluginTarballUrl) {
-      console.error(`[code-graph] Plugin update skipped: release ${latest.version} publishes no ${PLUGIN_ASSET_NAME} — refusing to install plugin code from an unverifiable source archive.`);
+      console.error(`[code-graph] ${noteUpdateFailure('plugin-tarball-absent',
+        `Plugin update skipped: release ${latest.version} publishes no ${PLUGIN_ASSET_NAME} — refusing to install plugin code from an unverifiable source archive.`)}`);
       return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
     }
     const tarballPath = path.join(tmpDir, PLUGIN_ASSET_NAME);
@@ -773,7 +816,8 @@ async function downloadAndInstall(latest, {
     }
     const actualSha = fs.existsSync(tarballPath) ? sha256File(tarballPath) : null;
     if (!expectedSha || !actualSha || expectedSha.toLowerCase() !== actualSha.toLowerCase()) {
-      console.error(`[code-graph] Plugin tarball integrity check failed (expected ${expectedSha || '<no sidecar>'}, got ${actualSha || '<no download>'}) — refusing to extract.`);
+      console.error(`[code-graph] ${noteUpdateFailure('plugin-tarball-integrity',
+        `Plugin tarball integrity check failed (expected ${expectedSha || '<no sidecar>'}, got ${actualSha || '<no download>'}) — refusing to extract.`)}`);
       return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
     }
 
@@ -946,7 +990,8 @@ async function downloadAndInstall(latest, {
 
     return { pluginUpdated, binaryUpdated, marketplaceRefreshed, repointBlocked };
   } catch (e) {
-    console.error(`[code-graph] Plugin download/extract failed: ${e.message}`);
+    console.error(`[code-graph] ${noteUpdateFailure('plugin-extract-failed',
+      `Plugin download/extract failed: ${e.message}`)}`);
     return { pluginUpdated: false, binaryUpdated: false, marketplaceRefreshed };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
@@ -1311,6 +1356,11 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
           latestVersion: latest.version,
           updateAvailable: true,
           updateAttempts: attempts,
+          // The suspension notice below says "N failed attempts" without ever
+          // saying what failed. Carry the last recorded reason forward so
+          // `doctor` can answer that; `healedMissing` above may have recorded a
+          // fresh one on the way in.
+          lastError: takeUpdateFailure() || state.lastError || null,
           // Stamp on ENTRY to suspension, then leave it alone: the retry clock
           // must measure time since we gave up, not time since the last check
           // (which every session would reset, making the retry unreachable).
@@ -1366,6 +1416,13 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
         suspendedAt: nextSuspendedAt,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
+        // The reason this attempt failed, or null once one succeeds. Every
+        // refusal above printed to a stderr nobody reads (detached, stdio
+        // 'ignore'); this is the only channel that survives to `doctor`.
+        // `takeUpdateFailure()` runs on BOTH arms so a stale reason from an
+        // earlier attempt in the same process can never be attributed to this
+        // one (JS-02).
+        lastError: (() => { const f = takeUpdateFailure(); return success ? null : (f || state.lastError || null); })(),
         binaryUpdated: result.binaryUpdated,
         marketplaceRefreshed: result.marketplaceRefreshed,
       };
@@ -1413,6 +1470,11 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       updateAttempts: 0,
       suspendedAt: null,
       rateLimited: false,
+      // Same reasoning one field up: the shell is current, so a stored reason
+      // describes an update that is no longer pending. Cleared unless the
+      // binary self-heal ON THIS PASS recorded a fresh one — that chain keeps
+      // its own budget and can still be failing while the shell is fine.
+      lastError: takeUpdateFailure() || null,
       binaryUpdated: selfHealedBinary || state.binaryUpdated,
       // The shell-update counters above reset because the shell IS current.
       // The BINARY heal keeps its own, un-reset budget — clearing it here is
@@ -1445,6 +1507,7 @@ module.exports = {
   selfHealGlobalPkgs, staleGlobalPkgs, globalPkgVersion, npmInstallGlobal,
   shouldHealGlobalsOnThrottle, inactiveNodeGlobalRelics,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,
+  noteUpdateFailure, takeUpdateFailure,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

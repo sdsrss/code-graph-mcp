@@ -241,6 +241,19 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20
+      - name: Syntax check every tracked .js
+        # There is no JS linter in this repo (deliberate: the npm package ships
+        # zero dependencies). `node --check` is the floor that replaces it, and
+        # until audit 2026-09-05 ENG-07 it ran ONLY from `make lint-js` and the
+        # pre-commit hook — so a contributor without the hook installed could
+        # land a file that does not parse.
+        #
+        # `node --test` below does NOT cover this: it loads *.test.js and
+        # whatever those require, so a parse error in a hook nothing requires
+        # (statusline-composite, session-init's callees) reaches users instead
+        # of CI. Same invocation as `make lint-js`, deliberately — two gates
+        # spelled differently is how they drift.
+        run: git ls-files '*.js' | xargs -n1 node --check
       - name: Plugin lifecycle tests
         # As of M10 this globs ALL *.test.js (see the run: step) minus two
         # documented exclusions, so new test files are never silently skipped.

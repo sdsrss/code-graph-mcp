@@ -25,15 +25,14 @@
 // pins both registration sites to this table so a bump in one cannot drift from
 // the other.
 //
-// `session-init.js` is here for its REGISTRATION only. It is registered from
-// `claude-plugin/hooks/hooks.json` (SessionStart is the one event Claude Code
-// loads from plugin-cache), it predates `installHookFailOpen` and wraps its own
-// main in a try/catch, so nothing arms a deadline for it and none of its six
-// child spawns clamp — 15.5 s of serial timeouts against the 5 s below. That is
-// the largest overrun of the seven and it is NOT fixed here; pre-ship review
-// 2026-09-05 finding 1, carried in the audit report as NEW-05. Wiring it means
-// deciding, per child, whether an out-of-budget SessionStart should skip a
-// binary health check or a quarantine probe, which is not a mechanical change.
+// `session-init.js` is registered from `claude-plugin/hooks/hooks.json` rather
+// than by `lifecycle.js` (SessionStart is the one event Claude Code loads from
+// plugin-cache), so `hooks.test.js` pins that file to this table too. It was
+// the last unclamped hook — 21.5 s of serial children against the 5 s below,
+// the largest overrun of the seven — until audit 2026-09-05 NEW-05 wired it.
+// Its skips are not uniform: see the budget block at the top of
+// `session-init.js` for which children may be dropped silently and which two
+// report a distinct result instead of a fabricated all-clear.
 const HOOK_TIMEOUT_SECONDS = {
   'pre-edit-guide.js': 4,
   'pre-grep-guide.js': 3,
@@ -93,9 +92,17 @@ function remainingMs(defaultMs) {
   return Math.floor(Math.min(defaultMs, left));
 }
 
-/** Test seam: drop any armed deadline so one test file can't leak into another. */
-function resetHookDeadline() {
-  deadlineAt = null;
+/**
+ * Test seam: drop any armed deadline so one test file can't leak into another.
+ *
+ * `at` (an absolute epoch ms) arms one directly instead. `armHookDeadline`
+ * derives its instant from `process.uptime()`, so a test that wants the
+ * budget-EXHAUSTED branch would otherwise have to wait out a real budget — a
+ * clock race dressed up as a test. Pass `Date.now() - 1` to make every
+ * `remainingMs` return null deterministically.
+ */
+function resetHookDeadline(at = null) {
+  deadlineAt = at === null ? null : Math.floor(at);
 }
 
 function installHookFailOpen(label) {

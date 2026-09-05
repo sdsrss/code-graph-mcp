@@ -12,12 +12,17 @@ const { hidden } = require('./proc-opts');
 // rejected by the same parse: a self-sustaining loop.
 const VERSION_OUTPUT_RE = /^code-graph-mcp\s+v?(\d+\.\d+\.\d+)/m;
 
-function readBinaryVersion(binaryPath) {
+function readBinaryVersion(binaryPath, { timeoutMs = 5000 } = {}) {
   try {
     const out = execFileSync(binaryPath, ['--version'], hidden({
-      // 5s: a cold exec of a freshly-written ~40MB binary (page-in, Windows AV
-      // scan) regularly exceeded the old 2s, misclassifying a good binary.
-      timeout: 5000,
+      // 5s default: a cold exec of a freshly-written ~40MB binary (page-in,
+      // Windows AV scan) regularly exceeded the old 2s, misclassifying a good
+      // binary. `timeoutMs` exists for callers running inside a hook budget —
+      // session-init spends what is LEFT of its 5s SessionStart allowance here,
+      // which is otherwise the single largest unclamped child in that hook
+      // (audit 2026-09-05 NEW-05). Must be an integer: `child_process`
+      // validates it and throws ERR_OUT_OF_RANGE on a fraction.
+      timeout: timeoutMs,
       stdio: ['pipe', 'pipe', 'pipe'],
     })).toString().trim();
     const match = out.match(VERSION_OUTPUT_RE);

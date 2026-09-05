@@ -324,6 +324,16 @@ fn warn_skipped_symlinks(skipped: &[String]) {
     }
 }
 
+/// Walk + hash in one call: every eligible file's path → content hash.
+///
+/// NO PRODUCTION CALLER since audit 2026-09-05 CORE-01. `run_incremental_index`
+/// used to diff this map directly, which is precisely how a transient read
+/// failure became a phantom deletion — `hash_files_parallel` drops the file, and
+/// the diff reads the gap as "deleted". It now delegates to
+/// `run_incremental_index_cached`, so the only remaining callers are this
+/// module's own tests. Kept because it is `pub`: removing it is a breaking
+/// change to the library surface, so it goes with a deliberate minor bump, not
+/// as a side effect of the fix that orphaned it.
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     Ok(hash_files_parallel(&walk_indexable_files(root)?))
 }
@@ -333,8 +343,10 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 /// A full index does not need pre-computed hashes: nothing is being diffed
 /// against, and the pipeline reads each file's bytes anyway to parse it. Hashing
 /// here first meant every file was read twice end to end (audit 2026-08-22
-/// P2-16). The incremental path still calls [`scan_directory`], where the hash
-/// IS the point — it is what `compute_diff` compares.
+/// P2-16). The incremental path does still hash — via [`scan_directory_cached`],
+/// where the hash IS the point, it is what `compute_diff` compares. (It called
+/// [`scan_directory`] until CORE-01 moved it; the hashing half of this contrast
+/// did not go away, it changed address.)
 pub fn walk_indexable_files(root: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
     // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
