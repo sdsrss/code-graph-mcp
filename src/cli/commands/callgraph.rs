@@ -188,26 +188,40 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Filter test callers unless --include-tests is set.
+    // Filter test nodes in BOTH directions unless --include-tests is set.
+    //
+    // This used to carry an extra `Direction::Callers` condition, so a
+    // test-named CALLEE was rendered whether or not the flag was passed —
+    // against the flag's own help ("Show test callers/callees") and against MCP
+    // `get_call_graph`, which has never had the direction condition
+    // (audit 2026-09-05 SURF-05).
+    //
+    // Counted per direction rather than in one bucket: `test_callers_hidden` is
+    // a published JSON field, and folding callees into it would make the name
+    // over-state what it counts — the failure mode this repo keeps fixing.
+    // `test_callees_hidden` is additive alongside it.
+    //
     // The seed (depth=0) is kept here because the human-readable renderer
     // below uses it as the tree root. The JSON path filters it separately
     // for parity with MCP `get_call_graph` (which excludes the seed).
-    let (display_nodes, test_count) = if include_tests {
-        (result.nodes.iter().collect::<Vec<_>>(), 0usize)
+    let (display_nodes, test_count, test_callee_count) = if include_tests {
+        (result.nodes.iter().collect::<Vec<_>>(), 0usize, 0usize)
     } else {
         let mut display = Vec::new();
         let mut tests = 0usize;
+        let mut test_callees = 0usize;
         for n in &result.nodes {
-            if n.depth > 0
-                && matches!(n.direction, crate::graph::query::Direction::Callers)
-                && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
-            {
-                tests += 1;
+            if n.depth > 0 && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) {
+                if matches!(n.direction, crate::graph::query::Direction::Callers) {
+                    tests += 1;
+                } else {
+                    test_callees += 1;
+                }
             } else {
                 display.push(n);
             }
         }
-        (display, tests)
+        (display, tests, test_callees)
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -235,6 +249,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         let mut output = serde_json::json!({ "results": results });
         if test_count > 0 {
             output["test_callers_hidden"] = serde_json::json!(test_count);
+        }
+        if test_callee_count > 0 {
+            output["test_callees_hidden"] = serde_json::json!(test_callee_count);
         }
         if result.limit_hit {
             output["limit_hit"] = serde_json::json!(true);
@@ -328,11 +345,18 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     render_subtree(&mut stdout, &children, root_id, "callers", compact)?;
     render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
 
-    if test_count > 0 {
+    if test_count > 0 || test_callee_count > 0 {
+        let mut parts: Vec<String> = Vec::new();
+        if test_count > 0 {
+            parts.push(format!("{test_count} test callers"));
+        }
+        if test_callee_count > 0 {
+            parts.push(format!("{test_callee_count} test callees"));
+        }
         writeln!(
             stdout,
-            "  ({} test callers hidden, use --include-tests to show)",
-            test_count
+            "  ({} hidden, use --include-tests to show)",
+            parts.join(" + ")
         )?;
     }
     if result.limit_hit {

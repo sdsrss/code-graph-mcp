@@ -9819,3 +9819,136 @@ fn rust_log_still_overrides_the_quiet_default() {
         "RUST_LOG must still override the --quiet default; stderr was:\n{stderr}"
     );
 }
+
+#[test]
+fn test_cli_callgraph_hides_test_callees_by_default() {
+    // `--include-tests` is documented as "Show test callers/callees (hidden by
+    // default)" and the MCP `get_call_graph` filters both directions
+    // (server/tools/callgraph.rs). The CLI renderer carried an extra
+    // `Direction::Callers` condition, so a test-named CALLEE was shown whether
+    // or not the flag was passed — the flag's own help text was the thing that
+    // was wrong (audit 2026-09-05 SURF-05).
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("app.ts"),
+        r#"
+function realWork() { return 1; }
+function test_helper() { return 2; }
+function entry() {
+    realWork();
+    test_helper();
+}
+"#,
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (out, _, code) = run_cli(&project, &["callgraph", "entry"]);
+    assert_eq!(code, 0, "callgraph should resolve `entry`; got code {code}");
+    assert!(
+        out.contains("realWork"),
+        "prod callee must appear; got:\n{out}"
+    );
+    assert!(
+        !out.contains("test_helper"),
+        "test callee must be hidden by default, same as the MCP surface; got:\n{out}"
+    );
+
+    let (out2, _, code2) = run_cli(&project, &["callgraph", "entry", "--include-tests"]);
+    assert_eq!(code2, 0);
+    assert!(
+        out2.contains("realWork") && out2.contains("test_helper"),
+        "--include-tests must show both; got:\n{out2}"
+    );
+}
+
+#[test]
+fn test_cli_report_dead_code_matches_the_dead_code_command() {
+    // `report` called `find_dead_code` directly while `dead-code` goes through
+    // `dead_code_report`, which applies `default_dead_code_ignores()`
+    // (claude-plugin/, benches/). Same index, same flags, two different answers —
+    // and `report` was the one that named files the dedicated command has
+    // deliberately excluded since it learned to (audit 2026-09-05 SURF-08).
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("claude-plugin/scripts")).unwrap();
+    // Long enough to clear the min_lines=3 floor both surfaces apply.
+    std::fs::write(
+        project.path().join("claude-plugin/scripts/orphan.ts"),
+        "function pluginOnlyOrphan() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/app.ts"),
+        "function srcOrphan() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (dead_out, _, dead_code_status) = run_cli(&project, &["dead-code"]);
+    assert_eq!(dead_code_status, 0, "dead-code should succeed:\n{dead_out}");
+    assert!(
+        !dead_out.contains("pluginOnlyOrphan"),
+        "precondition: dead-code applies the default ignores; got:\n{dead_out}"
+    );
+
+    let (report_out, _, report_status) = run_cli(&project, &["report"]);
+    assert_eq!(report_status, 0, "report should succeed:\n{report_out}");
+    assert!(
+        !report_out.contains("pluginOnlyOrphan"),
+        "report must apply the same ignores as `dead-code` on the same index; got:\n{report_out}"
+    );
+    assert!(
+        report_out.contains("srcOrphan") == dead_out.contains("srcOrphan"),
+        "the two surfaces must agree on a non-ignored orphan.\nreport:\n{report_out}\ndead-code:\n{dead_out}"
+    );
+}
+
+#[test]
+fn test_cli_trace_route_parsing_matches_mcp() {
+    // The CLI treated ANY token before the first space as an HTTP method, while
+    // MCP `parse_route_input` accepts only the seven real ones. So `trace
+    // "users list"` filtered a method named USERS and echoed `route: "list"` —
+    // an identifier the user never typed — in the JSON miss envelope, while the
+    // MCP surface searched the whole string (audit 2026-09-05 SURF-04).
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("server.ts"),
+        "const app = express();\napp.get('/widgets', (req, res) => { res.json([]); });\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // A non-method first token is part of the path, not a method filter.
+    let (out, _, code) = run_cli(&project, &["trace", "users list", "--json"]);
+    assert_eq!(code, 1, "no such route, so this is a miss");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+        panic!("trace --json must emit one JSON object ({e}); got:\n{out}");
+    });
+    assert_eq!(
+        v["route"].as_str(),
+        Some("users list"),
+        "the miss envelope must echo what the user asked for, not the half left \
+         after a bogus method split; got:\n{out}"
+    );
+
+    // A real method prefix still splits, on both surfaces.
+    let (out2, _, code2) = run_cli(&project, &["trace", "GET /widgets", "--json"]);
+    assert_eq!(code2, 0, "real route should resolve; got:\n{out2}");
+    let v2: serde_json::Value = serde_json::from_str(out2.trim()).unwrap();
+    assert_eq!(v2["route"].as_str(), Some("/widgets"));
+}

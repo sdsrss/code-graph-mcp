@@ -42,16 +42,40 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     // landed (audit 2026-08-02 FRS-5). Refreshing here rather than after the
     // other analyses also keeps the whole report on ONE index state instead of
     // mixing pre- and post-reindex counts.
+    // Through `dead_code_report`, the same entry point `dead-code` and MCP
+    // `find_dead_code` use — NOT `find_dead_code` directly. Calling the raw query
+    // skipped `default_dead_code_ignores()` (claude-plugin/, benches/), so the
+    // same index answered this command and `dead-code` differently and this was
+    // the surface naming files the dedicated command deliberately excludes
+    // (audit 2026-09-05 SURF-08).
+    let ignore_prefixes = crate::domain::default_dead_code_ignores();
     let run_dead = |conn: &rusqlite::Connection| {
-        crate::storage::queries::find_dead_code(conn, None, None, include_tests, 3, top as i64)
+        crate::storage::queries::dead_code_report(
+            conn,
+            None,
+            None,
+            include_tests,
+            3,
+            &ignore_prefixes,
+        )
     };
-    let mut dead = run_dead(conn)?;
-    let files: Vec<String> = dead.iter().map(|d| d.file_path.clone()).collect();
+    let mut dead_report = run_dead(conn)?;
+    let files: Vec<String> = dead_report
+        .items
+        .iter()
+        .map(|d| d.file_path.clone())
+        .collect();
     let freshness = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if freshness.any_changed {
-        dead = run_dead(conn)?;
+        dead_report = run_dead(conn)?;
     }
     freshness.disclose();
+    // `dead_code_report` scans a fixed 200 before filtering, so a `--top` above
+    // that is answered by the scan limit rather than by `--top`. Say so instead
+    // of returning a short list that looks complete.
+    let dead_scan_capped = top > 200 && dead_report.items.len() == 200;
+    dead_report.items.truncate(top);
+    let dead = &dead_report.items;
 
     let status = crate::storage::queries::get_index_status(conn, false)?;
 
@@ -108,6 +132,11 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
             "dead_code": dead.iter().map(|d| serde_json::json!({
                 "name": d.name, "type": d.node_type, "file": d.file_path, "line": d.start_line,
             })).collect::<Vec<_>>(),
+            // Same counts `dead-code` reports. Without them a caller cannot tell
+            // an empty section from one the ignore list emptied.
+            "dead_code_ignored": dead_report.ignored_count,
+            "dead_code_hidden_below_threshold": dead_report.hidden_below_threshold,
+            "dead_code_scan_capped": dead_scan_capped,
         });
         // Object-shaped envelope, so the in-band marker applies (the stderr note
         // from `disclose()` is invisible under `--json 2>/dev/null`).
@@ -184,11 +213,31 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     if dead.is_empty() {
         writeln!(stdout, "  (none)")?;
     }
-    for d in &dead {
+    for d in dead {
         writeln!(
             stdout,
             "  {} ({}) — {}:{}",
             d.name, d.node_type, d.file_path, d.start_line
+        )?;
+    }
+    if dead_report.ignored_count > 0 {
+        writeln!(
+            stdout,
+            "  ({} ignored by the default path filters)",
+            dead_report.ignored_count
+        )?;
+    }
+    if dead_report.hidden_below_threshold > 0 {
+        writeln!(
+            stdout,
+            "  ({} more below the 3-line threshold)",
+            dead_report.hidden_below_threshold
+        )?;
+    }
+    if dead_scan_capped {
+        writeln!(
+            stdout,
+            "  (scan capped at 200 candidates — --top {top} cannot be honored beyond that)"
         )?;
     }
 

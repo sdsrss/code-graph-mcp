@@ -61,29 +61,22 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     // impact / get_call_graph (v0.77 — trace was previously rank-0 show-all).
     // --min-confidence ambiguous restores every edge. Validated at entry, mirroring
     // cmd_callgraph.
-    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
-        None | Some("") => crate::domain::CONF_INFERRED,
-        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
-                c
-            )
-        })?,
-    };
+    // Shared validator, like cmd_callgraph / cmd_refs — this arm was a third
+    // hand-written copy of the same match (audit 2026-09-05 SURF-04).
+    let min_conf_tier: &'static str =
+        crate::domain::parse_min_confidence(args.min_confidence.as_deref(), "--min-confidence")?
+            .unwrap_or(crate::domain::CONF_INFERRED);
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Parse method filter (e.g., "POST /api/login" → method=POST, path=/api/login)
-    let (method_filter, path) = if let Some(idx) = route_path.find(' ') {
-        (
-            Some(route_path[..idx].to_uppercase()),
-            &route_path[idx + 1..],
-        )
-    } else {
-        (None, route_path)
-    };
+    // Parse method filter (e.g., "POST /api/login" → method=POST, path=/api/login).
+    // `domain::parse_route_input` is the same parser MCP `trace_http_chain` uses.
+    // The local copy this replaced took ANY token before the first space as a
+    // method, so `trace "users list"` filtered on a method named USERS and then
+    // reported `route: "list"` — a string the user never typed (SURF-04).
+    let (method_filter, path) = crate::domain::parse_route_input(route_path);
 
     use crate::domain::REL_ROUTES_TO;
     // Fetch + method-filter the route handlers. Wrapped so a query-time freshness
@@ -94,16 +87,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         // Filter by HTTP method if specified (parse metadata JSON for accurate matching)
         if let Some(ref method) = method_filter {
             rows.retain(|r| {
-                r.metadata.as_ref().is_some_and(|m| {
-                    serde_json::from_str::<serde_json::Value>(m)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("method")
-                                .and_then(|m| m.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .is_some_and(|rm| crate::domain::route_method_matches(&rm, method))
-                })
+                crate::domain::route_metadata_method_matches(r.metadata.as_deref(), method)
             });
         }
         Ok(rows)

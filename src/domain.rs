@@ -215,6 +215,48 @@ pub fn route_method_matches(stored: &str, requested: &str) -> bool {
         || stored.eq_ignore_ascii_case(requested)
 }
 
+/// The HTTP methods a `"<METHOD> <path>"` prefix may name.
+pub const ROUTE_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+
+/// Split `"GET /api/users"` into `(Some("GET"), "/api/users")`.
+///
+/// A first token that is not one of [`ROUTE_METHODS`] is part of the PATH, not a
+/// method: `"users list"` is `(None, "users list")`. The CLI used to treat any
+/// token before the first space as a method, so it filtered on a method named
+/// `USERS` and then echoed `"list"` back as the route the user had asked about
+/// — while the MCP surface searched the whole string. One parser now, because
+/// two spellings of "what did the user mean" is what produced that
+/// (audit 2026-09-05 SURF-04).
+pub fn parse_route_input(input: &str) -> (Option<String>, &str) {
+    let trimmed = input.trim();
+    if let Some(space_idx) = trimmed.find(' ') {
+        let prefix = trimmed[..space_idx].to_uppercase();
+        if ROUTE_METHODS.contains(&prefix.as_str()) {
+            return (Some(prefix), trimmed[space_idx..].trim());
+        }
+    }
+    (None, trimmed)
+}
+
+/// Does a route node's metadata JSON declare a method matching `requested`?
+///
+/// Takes the raw metadata string rather than a `RouteMatch` so it can live here:
+/// `domain` is the bottom layer and may not reach into `storage`
+/// (`hardening.rs` FORBIDDEN_EDGES). Both surfaces call it from their own
+/// `retain`, which is the only part that needs the storage type.
+pub fn route_metadata_method_matches(metadata: Option<&str>, requested: &str) -> bool {
+    metadata.is_some_and(|m| {
+        serde_json::from_str::<serde_json::Value>(m)
+            .ok()
+            .and_then(|v| {
+                v.get("method")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .is_some_and(|stored| route_method_matches(&stored, requested))
+    })
+}
+
 /// Canonicalize a dependency `--direction` / `direction` (outgoing|incoming|both).
 pub fn normalize_dep_direction(input: &str) -> Option<&'static str> {
     match input.to_lowercase().as_str() {

@@ -298,36 +298,25 @@ pub(super) fn arg_f64(args: &serde_json::Value, key: &str, default: f64) -> Resu
 }
 
 /// Parse route input like "GET /api/users" into (Some("GET"), "/api/users").
-/// If no method prefix, returns (None, original_path).
+///
+/// Thin alias for [`crate::domain::parse_route_input`], which is the single
+/// parser both surfaces use since the CLI's divergent copy was removed
+/// (audit 2026-09-05 SURF-04).
 pub(super) fn parse_route_input(input: &str) -> (Option<String>, &str) {
-    let trimmed = input.trim();
-    if let Some(space_idx) = trimmed.find(' ') {
-        let prefix = &trimmed[..space_idx];
-        let methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
-        if methods.contains(&prefix.to_uppercase().as_str()) {
-            return (Some(prefix.to_uppercase()), trimmed[space_idx..].trim());
-        }
-    }
-    (None, trimmed)
+    crate::domain::parse_route_input(input)
 }
 
 /// Filter route matches by HTTP method from metadata JSON.
+///
+/// The predicate itself lives in `domain` so the CLI can share it; only this
+/// `retain` over the storage type stays here.
 pub(super) fn filter_routes_by_method(
     rows: &mut Vec<queries::RouteMatch>,
     method: &Option<String>,
 ) {
     if let Some(method) = method {
         rows.retain(|r| {
-            r.metadata.as_ref().is_some_and(|m| {
-                serde_json::from_str::<serde_json::Value>(m)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("method")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .is_some_and(|rm| crate::domain::route_method_matches(&rm, method))
-            })
+            crate::domain::route_metadata_method_matches(r.metadata.as_deref(), method)
         });
     }
 }
