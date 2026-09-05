@@ -2028,3 +2028,41 @@ test('SEC-05: commands under the bound still rebase, probes and all', () => {
   assert.ok(calls > 0, 'a normal command must still probe');
   assert.equal(out, 'grep Symbol src/lib.rs', 'a normal command must still rebase');
 });
+
+// ── NEW-08: a starved hook must not be reported as a broken binary ────────
+//
+// The 400ms write reserve means a hook whose process started slowly (cold node
+// while the machine compiles) can have a deadline already in the past, and then
+// runs no children at all — deliberately, because being killed by Claude Code
+// surfaces as an error on the user's own tool call. What it must not do is
+// report that as the binary having "ran but failed": nothing ran, and the
+// binary is fine.
+test('the unavailable FYI names the budget, not a failed run, when the hook was starved', () => {
+  const { buildUnavailableFyi } = require('./pre-grep-guide');
+
+  const starved = buildUnavailableFyi('foo', 'unavailable', 'budget');
+  assert.match(starved, /no time left in the hook budget/);
+  assert.doesNotMatch(starved, /ran but failed/, 'nothing ran; do not blame the binary');
+
+  // The other two causes are unchanged.
+  assert.match(buildUnavailableFyi('foo', 'unavailable'), /ran but failed/);
+  assert.match(buildUnavailableFyi('foo', 'no-binary'), /binary not found/);
+  // `no-binary` outranks a reason: there was nothing to give time to.
+  assert.match(buildUnavailableFyi('foo', 'no-binary', 'budget'), /binary not found/);
+});
+
+test('a budget-exhausted answer carries reason:budget out of cg-answer', () => {
+  const { resetHookDeadline } = require('./hook-fail-open');
+  const { runGrepAnswer } = require('./cg-answer');
+  resetHookDeadline(Date.now() - 1);
+  try {
+    const r = runGrepAnswer({ cwd: process.cwd(), pattern: 'anything', binary: process.execPath });
+    assert.equal(r.status, 'unavailable');
+    assert.equal(
+      r.reason, 'budget',
+      'without this the caller cannot tell a starved hook from a broken binary'
+    );
+  } finally {
+    resetHookDeadline();
+  }
+});

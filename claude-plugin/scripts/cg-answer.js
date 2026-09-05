@@ -225,7 +225,13 @@ function runGrepAnswer(opts = {}) {
     // Older binaries exit 0 on no-match with NO_MATCH_PREFIX on stdout — that
     // shape resolves to 'no-hits' through isEmptyAnswer below.
     const verdict = classifyRun(res, { exitOneIsNoHits: true });
-    if (verdict !== 'ok') return { status: verdict };
+    // `reason` separates the two things `unavailable` covers. The binary failing
+    // and the binary never being given time are different facts, and the caller
+    // renders one of them to the user — "ran but failed" is simply untrue of a
+    // run that never started (audit 2026-09-05 NEW-08).
+    if (verdict !== 'ok') {
+      return { status: verdict, ...(res.budgetExhausted ? { reason: 'budget' } : {}) };
+    }
     const out = (res.stdout || '').trim();
     if (isEmptyAnswer(out)) {
       return { status: 'no-hits' };
@@ -276,7 +282,7 @@ function runShowAnswer(opts = {}) {
       // docs) is that the deny funnel has to tell those causes apart. Nothing
       // later in the loop can succeed either: the budget is gone for all three
       // (pre-ship review 2026-09-05).
-      if (res.budgetExhausted) return { status: 'unavailable' };
+      if (res.budgetExhausted) return { status: 'unavailable', reason: 'budget' };
       // A symbol that did not resolve is SKIPPED, not fatal — exit 1 included,
       // which is why this asks for `exitOneIsNoHits: false` and then treats
       // every non-`ok` verdict the same way.
@@ -376,7 +382,13 @@ function runCallgraphAnswer(opts = {}) {
     const res = runCg(binary, ['callgraph', symbol], { cwd, timeoutMs });
     // grep-parity exit codes: 1 = symbol not found (no graph node).
     const verdict = classifyRun(res, { exitOneIsNoHits: true });
-    if (verdict !== 'ok') return { status: verdict };
+    // `reason` separates the two things `unavailable` covers. The binary failing
+    // and the binary never being given time are different facts, and the caller
+    // renders one of them to the user — "ran but failed" is simply untrue of a
+    // run that never started (audit 2026-09-05 NEW-08).
+    if (verdict !== 'ok') {
+      return { status: verdict, ...(res.budgetExhausted ? { reason: 'budget' } : {}) };
+    }
     const out = (res.stdout || '').trim();
     // Only an edge-bearing tree is marginal over the grep the model already ran.
     if (isEmptyAnswer(out) ||

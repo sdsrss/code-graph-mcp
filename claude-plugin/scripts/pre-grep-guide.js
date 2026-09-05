@@ -642,8 +642,14 @@ function buildNoHitsFyi(pattern) {
 // only (PreToolUse exit-0 stdout → debug log, never the model); the operative
 // effect at the call site is the ALLOW (no deny emitted) so the raw grep runs
 // intact instead of a static deny that would hand the model nothing.
-function buildUnavailableFyi(pattern, status) {
-  const why = status === 'no-binary' ? 'binary not found' : 'ran but failed';
+function buildUnavailableFyi(pattern, status, reason) {
+  // Three causes, not two. A hook whose budget was already spent at startup
+  // (cold node on a loaded machine — see the reserve note in cg-answer.js)
+  // deliberately runs no children at all; calling that "ran but failed" blames
+  // the binary for something it was never asked to do (audit 2026-09-05 NEW-08).
+  const why = status === 'no-binary' ? 'binary not found'
+    : reason === 'budget' ? 'no time left in the hook budget'
+      : 'ran but failed';
   return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` unavailable (${why}) — raw grep proceeding.`;
 }
 
@@ -777,11 +783,16 @@ function runMain() {
     // static deny (the answer never ran → status stays the default 'unavailable')
     // — that path falls through to the v0.46 static deny below.
     if (answer.status !== 'hits' && !isAnswerDisabled()) {
-      recordRecommendation(root, { hook: 'grep', action: 'hint', fallthrough: answer.status });
+      recordRecommendation(root, {
+        hook: 'grep', action: 'hint', fallthrough: answer.status,
+        // So the funnel can tell a starved hook from a broken binary; both
+        // arrive as `unavailable` and only one of them means anything is wrong.
+        ...(answer.reason ? { fallthrough_reason: answer.reason } : {}),
+      });
       process.stdout.write(
         (answer.status === 'no-hits'
           ? buildNoHitsFyi(pattern)
-          : buildUnavailableFyi(pattern, answer.status)) + '\n');
+          : buildUnavailableFyi(pattern, answer.status, answer.reason)) + '\n');
       return;
     }
 

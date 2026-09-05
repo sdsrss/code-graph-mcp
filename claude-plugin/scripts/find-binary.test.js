@@ -653,3 +653,33 @@ test('clearCache also drops the in-process memo', (t) => {
   `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
   assert.deepEqual(JSON.parse(out), { cacheGone: true });
 });
+
+// ── NEW-07: the PATH probe must be bounded ────────────────────────────────
+//
+// `findBinary()` is the first thing every hook does, and its `which` lookup had
+// NO timeout — the one unbounded child process on the hook path, reached before
+// `remainingMs` has been called even once. A `which` against a wedged PATH
+// entry hung until Claude Code killed the hook, which the user sees as an error
+// on their own tool call.
+test('pathProbeTimeoutMs is always a positive integer, and never 0', () => {
+  const { pathProbeTimeoutMs, PATH_PROBE_TIMEOUT_MS, PATH_PROBE_MIN_MS } = require('./find-binary');
+
+  // No hook deadline armed (doctor, statusline, the launcher): unchanged default.
+  assert.equal(pathProbeTimeoutMs((d) => d), PATH_PROBE_TIMEOUT_MS);
+
+  // Budget exhausted. NOT 0: node reads `timeout: 0` as no timeout at all, so a
+  // numeric zero here would restore the unbounded call this replaced.
+  const exhausted = pathProbeTimeoutMs(() => null);
+  assert.ok(Number.isInteger(exhausted) && exhausted > 0, `got ${exhausted}`);
+  assert.equal(exhausted, PATH_PROBE_MIN_MS);
+
+  // Budget nearly gone: floored UP to the minimum, so the probe is always
+  // actually attempted — skipping it would make findBinary answer "no binary"
+  // for one that is on PATH, and a fabricated absence is the worse failure.
+  assert.equal(pathProbeTimeoutMs(() => 5), PATH_PROBE_MIN_MS);
+
+  // A fractional remainder must not reach child_process (ERR_OUT_OF_RANGE,
+  // which the caller's catch would report as "not on PATH").
+  assert.ok(Number.isInteger(pathProbeTimeoutMs(() => 1234.5)));
+  assert.equal(pathProbeTimeoutMs(() => 1234.5), 1234);
+});

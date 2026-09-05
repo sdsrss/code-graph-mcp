@@ -12,6 +12,27 @@ const PLATFORM = os.platform();
 const ARCH = os.arch();
 const CACHE_FILE = path.join(os.homedir(), '.cache', 'code-graph', 'binary-path');
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
+// PATH lookup bound (NEW-07). 2 s matches the sibling `npm root -g` probe; the
+// floor is what a budget-exhausted hook still gives it, because a `which` that
+// cannot answer in 250 ms was not going to rescue this hook anyway.
+const PATH_PROBE_TIMEOUT_MS = 2000;
+const PATH_PROBE_MIN_MS = 250;
+
+/**
+ * How long the PATH probe may run: the hook budget when one is armed, the
+ * default otherwise, never 0 and never fractional.
+ *
+ * Both edges matter. `timeout: 0` is read by node as NO TIMEOUT AT ALL — it
+ * would restore the exact unbounded call this replaced — and a fractional value
+ * makes `child_process` throw ERR_OUT_OF_RANGE, which the `catch` below would
+ * silently turn into "not on PATH" (bugfix #7's shape, in a function that runs
+ * before any hook has spent a millisecond).
+ */
+function pathProbeTimeoutMs(remaining = require('./hook-fail-open').remainingMs) {
+  const left = remaining(PATH_PROBE_TIMEOUT_MS);
+  const ms = left === null ? PATH_PROBE_MIN_MS : Math.floor(left);
+  return Math.max(ms, PATH_PROBE_MIN_MS);
+}
 const PLATFORM_PKG = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
 
 /**
@@ -471,9 +492,26 @@ function findBinaryUncached() {
   }
 
   // --- PATH lookup (last resort for intentionally installed binaries) ---
+  //
+  // BOUNDED. This was the one child process in the whole hook path with no
+  // timeout at all, and it runs BEFORE any hook has called `remainingMs` even
+  // once — `findBinary()` is the first thing every hook does (audit 2026-09-05
+  // NEW-07). A `which` against a wedged PATH entry (a dead NFS mount, an
+  // automounter) hangs until Claude Code kills the hook, which surfaces to the
+  // user as an error on THEIR tool call.
+  //
+  // Spends the hook budget when one is armed, floored at 250 ms so the probe is
+  // always actually attempted: skipping it outright would make `findBinary`
+  // answer "no binary" for one that is on PATH, and a fabricated absence is
+  // worse than a probe that ran out of time. Outside a hook `remainingMs`
+  // returns the default, so nothing changes for doctor / statusline / the
+  // launcher.
   try {
     const which = PLATFORM === 'win32' ? 'where' : 'which';
-    const found = execFileSync(which, [BINARY_NAME], hidden({ stdio: ['pipe', 'pipe', 'pipe'] }))
+    const found = execFileSync(which, [BINARY_NAME], hidden({
+      timeout: pathProbeTimeoutMs(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }))
       .toString().trim().split('\n')[0];
     const hit = gate.consider(found);
     if (hit) return hit;
@@ -513,6 +551,7 @@ module.exports = {
   getPackageVersion, compareVersions, isCachedBinaryFresh,
   detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
+  pathProbeTimeoutMs, PATH_PROBE_TIMEOUT_MS, PATH_PROBE_MIN_MS,
 };
 
 // Allow direct invocation for testing
