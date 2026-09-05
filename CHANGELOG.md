@@ -1,5 +1,215 @@
 # Changelog
 
+## 0.136.0
+
+**Upgrading:** two commands print less by default, and in both cases the old
+output was the thing that was wrong.
+
+`callgraph` now hides test **callees**, not just test callers. Its own flag says
+`--include-tests: Show test callers/callees (hidden by default)` and the MCP
+`get_call_graph` has always filtered both directions; only the CLI renderer
+carried an extra caller-only condition. If you were reading test callees out of
+`callgraph`, pass `--include-tests`. The hidden count is reported per direction:
+`test_callers_hidden` keeps its exact meaning and `test_callees_hidden` is new
+beside it, rather than one field quietly counting two things.
+
+`report`'s dead-code section now applies the same default path ignores as the
+`dead-code` command — `claude-plugin/` and `benches/`. It had been calling the
+raw query directly, so the same index answered the two commands differently and
+`report` was the surface naming files the dedicated command deliberately
+excludes. It also now carries the counts that came with sharing that entry
+point: `dead_code_ignored`, `dead_code_hidden_below_threshold`, and
+`dead_code_scan_capped` for the case where `--top` exceeds the 200-candidate
+scan and the scan limit, not `--top`, is what answered.
+
+To defer either, pin `0.135.0`.
+
+Everything else is additive or invisible. New response fields, none of which
+replace anything: `impact.value_references` on `get_ast_node include_impact`;
+`noise_filtered` / `noise_filtered_note` on `find_similar_code`;
+`test_callees_hidden` on CLI `callgraph`; `lastError` in
+`~/.cache/code-graph/update-state.json`; `fallthrough_reason` in
+`.code-graph/recommendations.jsonl`. New library export: `storage::db::savepoint_on`.
+
+### The last hook that never honoured the budget it is killed at
+
+Claude Code kills each hook at a registered timeout, and 0.135.0 gave six of the
+seven a process deadline that every child spends against. `session-init.js` —
+SessionStart — was left out, and it was the worst of them: seven blocking
+children whose timeout literals sum to 21.5 s against a budget of 5 s. Wiring it
+was held back because it is not a mechanical edit. Each child needs its own
+answer to "what should an out-of-budget SessionStart skip".
+
+Every child now spends what is left of the budget, and a child with nothing left
+is skipped rather than run unbounded. Two of those skips would otherwise have
+invented a positive result, so they answer differently instead of folding into
+an existing one:
+
+- `ensureIndexFresh` gained an `'unknown'` result. A freshness probe that never
+  ran used to return `'fresh'` — a claim about an index nothing looked at, and
+  the one answer that stops the server's drift check and the CLI from looking
+  again.
+- `verifyBinary` reports `issue: 'quarantine-probe-skipped'`. Reporting the
+  binary unavailable would send a macOS user to `xattr -d` for nothing; claiming
+  it runs is exactly what the probe establishes and did not.
+
+The remaining three degrade to "nothing injected", which is a state they already
+reach for ordinary reasons — no index, clean working tree — and which claims
+nothing untrue. `runSessionInit` returns `budgetSkipped` naming whichever ones
+were cut, so a starved SessionStart is legible instead of just quieter.
+
+`hooks.test.js`'s exemption list is now empty, which is the point: re-adding a
+name to it means re-accepting an unclamped hook.
+
+### The updater explained itself to a stream nobody reads
+
+`auto-update.js` is spawned `detached` with `stdio: 'ignore'`, so on the path
+that actually runs — SessionStart — all twelve of its refusals went to
+`/dev/null`. No sha256 sidecar, a truncated transfer, a checksum mismatch, a
+promote that hit `ENOSPC`: each burned one of five attempts and printed its
+diagnosis into nothing. What the user saw was the statusline's "update stuck"
+and a `doctor` that re-ran its own checks and reported a count —
+"v9.9.9 failed to install 5×" — which cannot distinguish a missing `curl` from
+a full disk from a blocked CDN.
+
+The reason is now persisted as `update-state.json`'s `lastError` and rendered by
+`doctor`, both in the suspended row and beside the no-op explanation. It is
+recorded in memory and written by the one site that already persists state:
+`CACHE_DIR` has no environment override, so a leaf function writing on its own
+would have unit tests writing into a developer's real cache directory.
+
+### Nine writers that could not have run inside a rebuild
+
+`rebuild_index` wraps the entire full index in one transaction. Nine writers
+underneath it opened their own with `unchecked_transaction` — a bare `BEGIN`,
+which nested is "cannot start a transaction within a transaction" and rolls back
+the whole rebuild rather than the one batch. Nothing reaches them from inside
+that transaction today, because every caller passes `model: None`; the signature
+invites `Some(model)` and the first caller to accept the invitation loses the
+rebuild.
+
+They now take savepoints, which nest and behave identically standalone.
+`storage::db::savepoint_on` is exported for the query layer, which holds a
+`&Connection` and so could not reach the existing `Database::savepoint`.
+
+Three of the nine were not on the list this started from. One of them,
+`ensure_embedding_cache_valid`, is reached from `index_files`, so it was inside
+the rebuild transaction already — a model change during a rebuild would have
+taken the rebuild with it. That is why the guard is a scan and not a list:
+`tests/hardening.rs` now fails on any `unchecked_transaction` under
+`src/indexer` or `src/storage/queries`.
+
+### Answers that were shorter than they looked
+
+Four surfaces let a filtered-down result read as an empty one.
+
+`find_similar_code` and CLI `similar` shorten their list with two filters and
+named one. `cutoff_dropped` reports what `max_distance` removed; the
+test/module/`<external>` filter removed neighbours in silence. So one result out
+of five, with nothing said about a cutoff, read as "the index has nothing else"
+— and raising `max_distance`, the only remedy on offer, does nothing about a
+test-file neighbour. The two counts are reported separately and never summed:
+they are different questions with different answers. The CLI also stops issuing
+two queries per candidate for data the MCP twin already batch-fetched.
+
+`doctor` dropped an entire row when its probe threw. A renamed export or a
+broken require chain made "Hook firing" or "Global npm packages" vanish, and
+doctor exited 0 on a shorter, all-green table. Step 7 of the same function
+already carried the rule, written after a `ReferenceError` silently removed the
+Hook-coverage row: a probe that cannot run is itself a finding.
+
+`doctor`'s repair arms discarded the exception. For most of them that was
+right — the children run with inherited output, so `cargo` and `npm` had
+already printed their diagnosis. The gap was the cases where that stream is
+empty: the child never started (`ENOENT`), or doctor killed it (`ETIMEDOUT`).
+There, "Build failed" was the whole explanation. The `chmod` arm inherits
+nothing at all, and its errno is the entire diagnosis — `EPERM`, `EROFS` and
+`ENOENT` are three different next steps.
+
+A hook whose budget was already spent at startup runs no children, deliberately:
+being killed by Claude Code surfaces as an error on the user's own tool call,
+which is worse. But it reported that as the binary having "ran but failed",
+which is untrue of a run that never started and blames a binary for something it
+was never asked to do.
+
+### Surfaces that answered the same question differently
+
+`trace` treated any token before the first space as an HTTP method, where the
+MCP tool accepts only the seven real ones. `trace "users list"` filtered on a
+method named `USERS` and then echoed `route: "list"` back in the miss envelope —
+a string the user never typed. Both surfaces now share one parser.
+
+`get_ast_node include_impact` reports `value_references` again. The CLI `impact`
+comment claiming parity with it was stale rather than invented: the field went
+away when the standalone `impact_analysis` tool was folded into `get_ast_node`,
+and the CLI test that migrated over kept asserting parity with a surface that no
+longer had it. Callback, fn-pointer and type-position coupling is the part of
+"what breaks if I rename this" that caller counts cannot show. Scope differs by
+surface on purpose: the CLI dedups across every definition of the name,
+`get_ast_node` counts the node it resolved.
+
+`update()` seized the statusline slot on a bare string mismatch while
+`install()` requires the sitting command to be actually stale. Two copies of
+this plugin derive different absolute paths for the same current composite, so
+every version bump reopened the settings.json ping-pong `install()` carries
+twelve lines of comment about — and walked past the displacement stand-down on
+the way.
+
+### The one unbounded child on the hook path
+
+`findBinary()` is the first thing every hook does, and its `which` lookup had no
+timeout at all — the only unbounded child process a hook could reach, running
+before the deadline helper has been called even once. A `which` against a wedged
+`PATH` entry (a dead NFS mount, an automounter) hung until Claude Code killed
+the hook, which the user sees as an error on their own tool call.
+
+It now spends the hook budget when one is armed, floored at 250 ms so the probe
+is always actually attempted. Skipping it outright would make `findBinary`
+answer "no binary" for one that is on `PATH`, and a fabricated absence is worse
+than a probe that ran out of time. Never zero, because node reads `timeout: 0`
+as no timeout at all — the exact call this replaced.
+
+### Smaller
+
+- `node --check` runs in CI. It is this repository's only JS syntax gate — there
+  is deliberately no linter — and it ran solely from `make` and the pre-commit
+  hook, so a contributor without the hook installed could land a file that does
+  not parse. `node --test` does not cover it: a parse error in a hook nothing
+  requires reaches users instead of CI.
+- `_CG_ANSWER_TIMEOUT_MS` is floored at its source. A fractional value makes
+  `child_process` throw `ERR_OUT_OF_RANGE`, which each answer runner catches and
+  turns into a silent "unavailable". No live defect — every consumer passed
+  through a helper that floors — which is the point: the property was held one
+  file away by a function with no obligation to keep holding it.
+- `merkle.rs` claimed the incremental path still calls `scan_directory`. It has
+  not since 0.135.0, and that function now has no production caller at all —
+  recorded next to it rather than removed, since removing a `pub` export is a
+  separate decision.
+- `index_version_guard`'s failure text named two of the five path groups it
+  fingerprints, which sends a comment-only edit looking for a cause it does not
+  have.
+
+### Not covered
+
+- `tempfile` stays a runtime dependency. Moving it to `dev-dependencies` was on
+  the list and is wrong: `snapshot create` and `snapshot inspect` stage into a
+  `tempfile::tempdir()`, and both are shipped subcommands. The refutation is
+  pinned in `Cargo.toml` so it is not re-derived from the same source.
+- The MCP copy of the `noise_filtered` disclosure has no direct test. The one
+  written could not be made to run — the tool gates on `db.vec_enabled()`, which
+  `Database::open`'s dimension migration turns off for every fixture tried — and
+  a test that cannot fail is worse than none. The CLI twin covers the same logic
+  on both feature legs.
+- Two of the SessionStart budget tests need a resolvable binary, which a bare CI
+  checkout does not have. They skip with a printed reason rather than asserting
+  something vacuously true, so on CI those two are not regression cover.
+- `findBinary`'s other probes still run outside the budget: `readBinaryVersion`
+  has a 5 s gate at six call sites and `npm root -g` has 2 s. Only the unbounded
+  one was addressed here.
+- Loop-level query duplication in `trace`, `refs`, `ast_node` and `search`, and
+  the four-to-five-way duplication of cache path strings across the plugin
+  scripts, are both known and unaddressed. Neither changes an answer.
+
 ## 0.135.0
 
 **Upgrading:** one response shape changed, and only for an input that was
