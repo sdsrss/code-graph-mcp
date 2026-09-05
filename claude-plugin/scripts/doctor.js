@@ -750,6 +750,30 @@ function buildBinaryFromSource(cmd) {
   return true;
 }
 
+/**
+ * The part of a failed child that its own output does NOT already show.
+ *
+ * The build / update / rebuild helpers all run `stdio: 'inherit'`, so a cargo
+ * error or an npm error is already on the user's terminal and repeating it here
+ * would be noise. What that stream cannot show is a child that never ran
+ * (`ENOENT` — cargo or node not on PATH) or one this process killed
+ * (`ETIMEDOUT`, `SIGTERM` — the 10-minute build budget): the inherited stream is
+ * empty and "Build failed" is then the whole explanation the user gets
+ * (audit 2026-09-05 JS-04). Returns '' when the child spoke for itself.
+ */
+function silentFailureReason(e) {
+  if (!e) return '';
+  if (e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM' || e.signal === 'SIGKILL') {
+    return ' — timed out; it was still running when the budget ran out';
+  }
+  if (e.code === 'ENOENT') {
+    return ' — the command is not on PATH';
+  }
+  // A non-zero exit means the child ran and printed its own diagnosis above.
+  if (typeof e.status === 'number') return '';
+  return e.code ? ` (${e.code})` : '';
+}
+
 /** Manual recovery for a binary we could not repair — the end of every failed arm. */
 function printBinaryRecovery() {
   console.log('     Reinstall: npm install -g @sdsrs/code-graph');
@@ -908,8 +932,8 @@ function runRepairs(results, {
           console.log('\n  Triggering binary update...');
           try {
             runAutoUpdate();
-          } catch {
-            console.log('  \u274c Update check failed — install manually');
+          } catch (e) {
+            console.log(`  \u274c Update check failed${silentFailureReason(e)} — install manually`);
             break;
           }
           // Exited 0 — which says nothing about whether the binary moved (see
@@ -941,8 +965,8 @@ function runRepairs(results, {
           buildBinary(buildCmd);
           console.log('  \u2705 Build complete');
           fixed++;
-        } catch {
-          console.log('  \u274c Build failed');
+        } catch (e) {
+          console.log(`  \u274c Build failed${silentFailureReason(e)}`);
         }
         break;
       }
@@ -959,8 +983,8 @@ function runRepairs(results, {
             buildBinary('cargo build --release --no-default-features');
             console.log('  \u2705 Build complete');
             fixed++;
-          } catch {
-            console.log('  \u274c Build failed');
+          } catch (e) {
+            console.log(`  \u274c Build failed${silentFailureReason(e)}`);
           }
         } else {
           console.log('    Install: npm install -g @sdsrs/code-graph');
@@ -992,8 +1016,8 @@ function runRepairs(results, {
               console.log('  ❌ Build failed');
               break;
             }
-          } catch {
-            console.log('  ❌ Build failed');
+          } catch (e) {
+            console.log(`  ❌ Build failed${silentFailureReason(e)}`);
             break;
           }
         } else {
@@ -1033,8 +1057,12 @@ function runRepairs(results, {
             fs.chmodSync(binary, 0o755);
             console.log(`\n  \u2705 Fixed permissions: chmod +x ${binary}`);
             fixed++;
-          } catch {
-            console.log(`\n  \u274c Could not fix permissions: ${binary}`);
+          } catch (e) {
+            // Nothing else here speaks: `chmodSync` inherits no stream, so the
+            // errno IS the diagnosis — EPERM (not the owner), EROFS (read-only
+            // mount) and ENOENT are three different next steps for the user.
+            console.log(`\n  \u274c Could not fix permissions: ${binary}` +
+              `${e && e.code ? ` (${e.code})` : ''}`);
           }
           if (os.platform() === 'darwin') {
             console.log(`  Also try: xattr -d com.apple.quarantine "${binary}"`);
@@ -1056,8 +1084,8 @@ function runRepairs(results, {
             }));
             console.log('  \u2705 Index rebuilt');
             fixed++;
-          } catch {
-            console.log('  \u274c Index rebuild failed');
+          } catch (e) {
+            console.log(`  \u274c Index rebuild failed${silentFailureReason(e)}`);
           }
         }
         break;
@@ -1067,8 +1095,8 @@ function runRepairs(results, {
         console.log('\n  Completing auto-update...');
         try {
           runAutoUpdate();
-        } catch {
-          console.log('  \u274c Update check failed');
+        } catch (e) {
+          console.log(`  \u274c Update check failed${silentFailureReason(e)}`);
           break;
         }
         // Same as the version-mismatch arm: exit 0 is not evidence. Re-read
@@ -1241,7 +1269,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason, autoUpdateLastError };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, binaryBrokenResolved, autoUpdateNoOpReason, autoUpdateLastError, silentFailureReason };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

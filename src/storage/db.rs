@@ -545,12 +545,7 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// the full-index pipeline be wrapped atomically by `rebuild_index` without
     /// changing its behavior when run directly.
     pub fn savepoint(&self, name: &'static str) -> Result<UncheckedSavepoint<'_>> {
-        self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-        Ok(UncheckedSavepoint {
-            conn: &self.conn,
-            name,
-            committed: false,
-        })
+        savepoint_on(&self.conn, name)
     }
 
     pub fn vec_enabled(&self) -> bool {
@@ -742,6 +737,25 @@ pub struct UncheckedSavepoint<'c> {
     conn: &'c Connection,
     name: &'static str,
     committed: bool,
+}
+
+/// [`Database::savepoint`] for code that holds only a `&Connection`.
+///
+/// The query layer in `storage::queries` takes connections, not the `Database`
+/// wrapper, so it could not reach the inherent method and kept issuing bare
+/// `BEGIN`s — which is fine standalone and fatal under `rebuild_index`'s
+/// enclosing transaction (audit 2026-09-05 CORE-02). Same contract as the
+/// method: `name` is interpolated verbatim and must never come from user input.
+pub fn savepoint_on<'c>(
+    conn: &'c Connection,
+    name: &'static str,
+) -> Result<UncheckedSavepoint<'c>> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    Ok(UncheckedSavepoint {
+        conn,
+        name,
+        committed: false,
+    })
 }
 
 impl UncheckedSavepoint<'_> {

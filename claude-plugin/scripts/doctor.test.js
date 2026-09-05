@@ -1241,3 +1241,29 @@ test('noteUpdateFailure records a bounded reason and takeUpdateFailure clears it
   noteUpdateFailure('binary-download-failed', 'x'.repeat(5000));
   assert.equal(takeUpdateFailure().message.length, 300);
 });
+
+// ── JS-04: a repair that fails silently must still say why ────────────────
+//
+// The build / update / rebuild helpers run `stdio: 'inherit'`, so a cargo or npm
+// error already reached the user's terminal — repeating it would be noise, and
+// that is why these arms discarded the exception in the first place. The gap is
+// the cases where the inherited stream is EMPTY: the child never started, or
+// this process killed it. Then "❌ Build failed" was the entire explanation.
+test('silentFailureReason speaks only when the child did not speak for itself', () => {
+  const { silentFailureReason } = require('./doctor');
+
+  // Child ran, printed its own diagnosis, exited non-zero → say nothing more.
+  assert.equal(silentFailureReason({ status: 1, code: 'ERR' }), '');
+  assert.equal(silentFailureReason({ status: 101 }), '');
+
+  // Child never started, or we killed it: the inherited stream showed nothing.
+  assert.match(silentFailureReason({ code: 'ENOENT' }), /not on PATH/);
+  assert.match(silentFailureReason({ code: 'ETIMEDOUT' }), /timed out/);
+  assert.match(silentFailureReason({ signal: 'SIGTERM' }), /timed out/);
+  // ETIMEDOUT arrives WITH a status on some platforms; the timeout is still the
+  // fact the user needs, so it must outrank the "child spoke" shortcut.
+  assert.match(silentFailureReason({ code: 'ETIMEDOUT', status: null }), /timed out/);
+
+  assert.equal(silentFailureReason(null), '');
+  assert.equal(silentFailureReason({}), '');
+});

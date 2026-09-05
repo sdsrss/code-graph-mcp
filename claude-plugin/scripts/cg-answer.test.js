@@ -398,3 +398,42 @@ test('every runner maps spawn outcomes the way it did before the hoist', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── NEW-02: a fractional timeout must never reach spawnSync ───────────────
+//
+// The regression from the JS-03 batch, re-armed at its source. A duration that
+// is finite and positive but FRACTIONAL makes `child_process` throw
+// ERR_OUT_OF_RANGE; each runner catches its own spawn, so the hook exits 0 with
+// `unavailable` and simply stops answering — the failure that only the e2e
+// suite saw while every helper unit test stayed green.
+//
+// Asserted on the CONSTANT, not through a spawn. `remainingMs` floors again on
+// the way to the child, so an end-to-end version of this test passes with or
+// without the floor here and would be pure decoration. The property this file
+// owes its callers is that the value it publishes is already an integer.
+test('_CG_ANSWER_TIMEOUT_MS is floored at the source, not left to remainingMs', () => {
+  const prev = process.env._CG_ANSWER_TIMEOUT_MS;
+  const reload = () => {
+    delete require.cache[require.resolve('./cg-answer')];
+    return require('./cg-answer').DEFAULT_TIMEOUT_MS;
+  };
+  try {
+    process.env._CG_ANSWER_TIMEOUT_MS = '30000.5';
+    const fractional = reload();
+    assert.ok(Number.isInteger(fractional), `published ${fractional}, which spawnSync rejects`);
+    assert.equal(fractional, 30000);
+
+    // Sub-millisecond overrides floor to 0, which node reads as NO TIMEOUT AT
+    // ALL — the unbounded child this whole mechanism exists to prevent. They
+    // must fall back to the default instead.
+    process.env._CG_ANSWER_TIMEOUT_MS = '0.4';
+    assert.equal(reload(), 2000);
+
+    process.env._CG_ANSWER_TIMEOUT_MS = 'not-a-number';
+    assert.equal(reload(), 2000);
+  } finally {
+    if (prev === undefined) delete process.env._CG_ANSWER_TIMEOUT_MS;
+    else process.env._CG_ANSWER_TIMEOUT_MS = prev;
+    delete require.cache[require.resolve('./cg-answer')];
+  }
+});

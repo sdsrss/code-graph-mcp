@@ -85,7 +85,7 @@ pub(super) fn regenerate_context_strings(
     dirty_ids: &HashSet<i64>,
     model: Option<&EmbeddingModel>,
 ) -> Result<()> {
-    let tx = db.conn().unchecked_transaction()?;
+    let tx = db.savepoint("sp_context_dirty")?;
     let id_vec: Vec<i64> = dirty_ids.iter().copied().collect();
     let all_edges = get_edges_batch(db.conn(), &id_vec)?;
     let all_nodes: HashMap<i64, (NodeResult, String, Option<String>)> = {
@@ -202,7 +202,7 @@ pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>
 
     // Update in DB within a transaction (avoids per-row fsync under autocommit)
     if !context_updates.is_empty() {
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("sp_context_updates")?;
         update_context_strings_batch(db.conn(), &context_updates)?;
         tx.commit()?;
 

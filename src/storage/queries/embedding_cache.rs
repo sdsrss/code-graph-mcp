@@ -134,11 +134,17 @@ pub fn ensure_embedding_cache_valid(conn: &Connection, model_id: &str) -> Result
                 "[embed-cache] Embedding model changed; clearing cache + node_vectors so \
                  every node re-embeds with the new model."
             );
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
+            // Savepoint, not a bare BEGIN: `ensure_embedding_cache_valid` is
+            // reached from `embed_and_store_batch` -> `build_context_strings_and_embed`
+            // -> `index_files`, i.e. from INSIDE the transaction `rebuild_index`
+            // wraps the full index in. A model change during a rebuild would
+            // otherwise abort the whole rebuild instead of clearing the cache
+            // (audit 2026-09-05 CORE-02; this site is not in the report's list).
+            let tx = crate::storage::db::savepoint_on(conn, "sp_embed_cache_invalidate")?;
+            conn.execute_batch(
                 "DROP TABLE IF EXISTS node_vectors; DROP TABLE IF EXISTS embedding_cache;",
             )?;
-            tx.execute_batch(&crate::storage::schema::create_vec_tables_sql())?;
+            conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())?;
             tx.commit()?;
             true
         }
@@ -262,7 +268,10 @@ pub fn seed_embedding_cache_from_vectors(conn: &Connection) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
-    let tx = conn.unchecked_transaction()?;
+    // Startup repair runs standalone today, but a savepoint behaves identically
+    // there and keeps this from being the next site to break when something
+    // wraps it (CORE-02).
+    let tx = crate::storage::db::savepoint_on(conn, "sp_seed_embed_cache")?;
     cache_put_embeddings(conn, &entries)?;
     tx.commit()?;
     Ok(entries.len())

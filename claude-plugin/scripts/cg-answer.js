@@ -33,9 +33,17 @@ const { hidden } = require('./proc-opts');
 // roughly one run in seven, while 12/12 isolated runs passed. An intermittently
 // red suite teaches people to re-run instead of read, which is the one habit
 // this whole audit is about.
+//
+// FLOORED AT THE SOURCE. `Number('1500.5')` is finite and positive, and
+// `child_process` rejects a fractional `timeout` with ERR_OUT_OF_RANGE — which
+// each runner's own try/catch turns into a silent `unavailable`, so the hook
+// exits 0 having answered nothing. That regression is what `remainingMs` was
+// hardened for; this value happens to pass through it today, which means the
+// property is currently held one file away by a function that has no obligation
+// to keep holding it (audit 2026-09-05 NEW-02).
 const DEFAULT_TIMEOUT_MS = (() => {
   const override = Number(process.env._CG_ANSWER_TIMEOUT_MS);
-  return Number.isFinite(override) && override > 0 ? override : 2000;
+  return Number.isFinite(override) && override >= 1 ? Math.floor(override) : 2000;
 })();
 // ~1000 tokens. A deny reason carrying more than this stops being an answer
 // and starts being a context tax.
@@ -385,4 +393,8 @@ function runCallgraphAnswer(opts = {}) {
 module.exports = {
   runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer,
   truncateAtLine, sanitizeSearchPath,
+  // Exported so the integer property can be asserted where it is ESTABLISHED.
+  // Asserting it end-to-end instead passes either way: `remainingMs` floors
+  // again downstream, so such a test cannot fail and proves nothing (NEW-02).
+  DEFAULT_TIMEOUT_MS,
 };

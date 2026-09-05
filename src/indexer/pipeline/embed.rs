@@ -62,7 +62,7 @@ pub fn embed_and_store_batch(
     if !cached.is_empty() {
         // insert_node_vectors_batch carries the orphan-race existence guard, so a hit for a
         // node deleted since the chunk was fetched is silently skipped (no orphan).
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("sp_embed_cached")?;
         insert_node_vectors_batch(db.conn(), &cached)?;
         tx.commit()?;
         embedded_ids.extend(cached.iter().map(|(id, _)| *id));
@@ -120,7 +120,7 @@ pub fn embed_and_store_batch(
                 .collect();
             if !vectors.is_empty() {
                 let cache_entries = cache_entries_for(&vectors);
-                let tx = db.conn().unchecked_transaction()?;
+                let tx = db.savepoint("sp_embed_sequential")?;
                 insert_node_vectors_batch(db.conn(), &vectors)?;
                 crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
                 tx.commit()?;
@@ -141,7 +141,7 @@ pub fn embed_and_store_batch(
 
     if !vectors.is_empty() {
         let cache_entries = cache_entries_for(&vectors);
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("sp_embed_batch")?;
         insert_node_vectors_batch(db.conn(), &vectors)?;
         crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
         tx.commit()?;

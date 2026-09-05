@@ -50,7 +50,10 @@ pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
+    // Savepoint, not `unchecked_transaction`: this runs standalone from the
+    // watcher AND (once anything passes a model down) inside `rebuild_index`'s
+    // enclosing transaction, where a bare BEGIN aborts the whole rebuild.
+    let tx = crate::storage::db::savepoint_on(conn, "sp_delete_node_vectors")?;
     {
         let mut del_stmt = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
         for id in ids {
@@ -106,29 +109,33 @@ fn allocated_vector_bytes(slots: i64) -> i64 {
 /// vectors stay exactly as they were. Orphans (a vector whose node is gone) are
 /// dropped in passing by the join — the same rows [`reap_orphan_vectors`] takes.
 pub fn compact_node_vectors(conn: &Connection) -> Result<usize> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+    // Savepoint for the same reason as `delete_node_vectors_batch`. The
+    // statements below run on `conn` directly: the savepoint is open on that
+    // same connection, so they are inside it either way — `UncheckedSavepoint`
+    // just does not re-export rusqlite's execute helpers.
+    let tx = crate::storage::db::savepoint_on(conn, "sp_compact_node_vectors")?;
+    conn.execute_batch(
         "DROP TABLE IF EXISTS temp.vec_compact;
          CREATE TEMP TABLE vec_compact(
              node_id   INTEGER PRIMARY KEY,
              embedding BLOB NOT NULL
          );",
     )?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO temp.vec_compact(node_id, embedding)
          SELECT v.node_id, v.embedding
          FROM node_vectors v
          JOIN nodes n ON n.id = v.node_id",
         [],
     )?;
-    tx.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
-    tx.execute_batch(&crate::storage::schema::create_vec_tables_sql())?;
-    let restored = tx.execute(
+    conn.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
+    conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())?;
+    let restored = conn.execute(
         "INSERT INTO node_vectors(node_id, embedding)
          SELECT node_id, embedding FROM temp.vec_compact",
         [],
     )?;
-    tx.execute_batch("DROP TABLE IF EXISTS temp.vec_compact;")?;
+    conn.execute_batch("DROP TABLE IF EXISTS temp.vec_compact;")?;
     tx.commit()?;
     Ok(restored)
 }
@@ -418,6 +425,28 @@ mod tests {
     use super::super::helpers::test_db;
     use super::super::nodes::{insert_node, NodeRecord};
     use super::*;
+
+    /// `rebuild_index` wraps the whole full-index pipeline in one transaction
+    /// (`src/mcp/server/mod.rs`), and these vector writers issue their own bare
+    /// `BEGIN`. Standalone that is fine; nested it is
+    /// "cannot start a transaction within a transaction", which aborts the
+    /// enclosing rebuild rather than the one batch. Nothing reaches them from
+    /// inside that transaction TODAY — every caller passes `model: None` — but
+    /// the signature invites `Some(model)` and the first caller to accept the
+    /// invitation loses the rebuild (audit 2026-09-05 CORE-02).
+    #[test]
+    fn vector_writers_nest_inside_an_enclosing_transaction() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+
+        let outer = conn.unchecked_transaction().unwrap();
+        delete_node_vectors_batch(conn, &[1, 2, 3])
+            .expect("delete_node_vectors_batch must nest, not BEGIN");
+        compact_node_vectors(conn).expect("compact_node_vectors must nest, not BEGIN");
+        outer.commit().unwrap();
+    }
 
     #[test]
     fn node_delete_reaps_vector_no_orphan_either_path() {

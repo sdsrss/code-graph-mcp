@@ -2716,3 +2716,90 @@ fn every_numeric_mcp_argument_is_clamped() {
          computation, a response, or an allocation."
     );
 }
+
+/// Nothing the full-index pipeline can reach may issue its own `BEGIN`.
+///
+/// `rebuild_index` (`src/mcp/server/mod.rs`) wraps the ENTIRE full index in one
+/// `unchecked_transaction`, so every writer below it must nest.
+/// `Connection::unchecked_transaction` always issues a bare `BEGIN`, which under
+/// that wrapper is "cannot start a transaction within a transaction" and rolls
+/// the whole rebuild back — not just the one batch. `Database::savepoint` /
+/// `storage::db::savepoint_on` nest, and behave identically when the same code
+/// runs standalone (SQLite auto-starts a transaction for an outermost
+/// SAVEPOINT).
+///
+/// Nine sites were converted for audit 2026-09-05 CORE-02. This guard exists
+/// because converting them without one leaves the tenth to reintroduce the bug
+/// in silence — the exact shape NEW-01 flagged for the `--locked` sweep. One of
+/// the nine (`ensure_embedding_cache_valid`) was NOT in the audit report's list
+/// and was found only by walking the call graph, which is the other reason a
+/// hand-maintained list is not the guard.
+///
+/// Scope is the two layers that run under the wrapper. `src/storage/db.rs` owns
+/// the migration/open path and `mcp/server` owns the wrapper itself; both are
+/// legitimately outermost and are out of scope here rather than allowlisted.
+#[test]
+fn pipeline_and_query_layers_never_begin_their_own_transaction() {
+    use std::path::Path;
+    fn collect_rs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    for root in ["src/indexer", "src/storage/queries"] {
+        collect_rs(Path::new(root), &mut files);
+    }
+    files.sort();
+    assert!(
+        files.len() >= 10,
+        "only {} files scanned — the roots moved and this guard went inert",
+        files.len()
+    );
+
+    // Positive control: a scanner that silently matches nothing (a renamed
+    // method, a `code_only` change) would pass this test forever.
+    assert!(
+        code_only("        let tx = conn.unchecked_transaction()?;")
+            .contains(".unchecked_transaction()"),
+        "the matcher no longer recognises the call it exists to find"
+    );
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        // Whole-file test modules (`#[cfg(test)] mod tests;` in the parent) have
+        // no in-file `#[cfg(test)]` to stop at, and they legitimately open an
+        // OUTER transaction to prove the nesting works.
+        if path.file_name().is_some_and(|f| f == "tests.rs") {
+            continue;
+        }
+        let src = fs::read_to_string(path).unwrap();
+        // Test modules sit at the end of these files and legitimately open an
+        // OUTER transaction to prove the nesting works. Stop at the first
+        // `#[cfg(test)]`; `code_only` drops comments and string bodies so a
+        // doc-comment mentioning the call is not an offender.
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        for (n, line) in body.lines().enumerate() {
+            if code_only(line).contains(".unchecked_transaction()") {
+                offenders.push(format!("{}:{}", path.display(), n + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these run under rebuild_index's transaction and would abort it with a bare BEGIN.\n\
+         Use `db.savepoint(\"sp_...\")`, or `storage::db::savepoint_on(conn, \"sp_...\")` \
+         where only a &Connection is held:\n  {}",
+        offenders.join("\n  ")
+    );
+}
