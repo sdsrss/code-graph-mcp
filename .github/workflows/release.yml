@@ -541,7 +541,11 @@ jobs:
             # with the publish-after-assets ordering below, a fetch blip fails
             # BEFORE npm publish (no half-release shipping a version whose
             # models.tar.gz 404s → FTS5-only).
-            curl -L --fail --retry 3 --retry-delay 2 -o models-pkg/$f \
+            # --max-time: curl has NO default transfer timeout and --retry does
+            # not fire on a connected-but-stalled transfer, so without it a
+            # stalled mirror holds the tag un-published until the 6-hour job
+            # ceiling. Same 300 s as the gate's copy of this loop above.
+            curl -L --fail --retry 3 --retry-delay 2 --max-time 300 -o models-pkg/$f \
               "$MODEL_BASE/$f"
           done
           sha256sum -c - <<'PINS'
@@ -770,8 +774,13 @@ jobs:
           set -eu
           work=$(mktemp -d); cd "$work"
           base="https://github.com/sdsrss/code-graph-mcp/releases/download/v${VERSION}"
-          curl -fL --retry 3 -o models.tar.gz "$base/models.tar.gz"
-          curl -fL --retry 3 -o models.tar.gz.sha256 "$base/models.tar.gz.sha256"
+          # --max-time for the same reason the two pre-publish fetches carry it:
+          # curl has no default transfer timeout and --retry does not fire on a
+          # connected-but-stalled transfer. This job runs AFTER npm publish, so a
+          # stall here does not hold a release back — it just burns runner time
+          # and leaves the post-publish verdict unreported until the job ceiling.
+          curl -fL --retry 3 --max-time 300 -o models.tar.gz "$base/models.tar.gz"
+          curl -fL --retry 3 --max-time 60 -o models.tar.gz.sha256 "$base/models.tar.gz.sha256"
           echo "$(cat models.tar.gz.sha256)  models.tar.gz" | sha256sum -c -
           mkdir -p models && tar xzf models.tar.gz -C models
           test -s models/model.safetensors

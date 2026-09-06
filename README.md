@@ -590,6 +590,7 @@ plugins' entries. An installer that reads exit codes must not treat it as
 | Variable | Set by | Purpose |
 |---|---|---|
 | `CODE_GRAPH_STATUSLINE_CWD` | statusline-composite | Forwards Claude Code's authoritative cwd to each statusline provider. |
+| `CODE_GRAPH_STATUSLINE_DEBUG` | test suite | Makes statusline-composite print why it dropped a provider instead of swallowing the error. Off by default so a broken third-party provider stays silent in a real statusline. |
 | `CODE_GRAPH_INSTALL_LOCK_HELD` | launcher | Tells a child that the parent already holds the install lock, so it does not deadlock. |
 | `CODE_GRAPH_AUTO_UPDATE_SILENT` | session-init | Runs the update check without console output. |
 | `CODE_GRAPH_NO_ANSWER_IN_DENY` | lifecycle | Keeps `cg-answer` out of the deny path. |

@@ -1701,6 +1701,82 @@ fn release_gate_runs_the_real_weight_tests_by_name() {
     );
 }
 
+/// Fold shell line continuations so a command split across physical lines is
+/// scanned as the one command it is.
+///
+/// Returns `(1-based line of the FIRST physical line, joined text)`. A
+/// commented-out command is documentation, not a step, and also terminates any
+/// continuation in progress — what was accumulated so far is still checked, so
+/// that direction fails closed.
+fn logical_shell_lines(src: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut acc: Option<(usize, String)> = None;
+    for (i, raw) in src.lines().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('#') {
+            out.extend(acc.take());
+            continue;
+        }
+        let (body, continues) = match trimmed.strip_suffix('\\') {
+            Some(b) => (b.trim_end(), true),
+            None => (trimmed, false),
+        };
+        match acc.as_mut() {
+            Some((_, s)) => {
+                s.push(' ');
+                s.push_str(body);
+            }
+            None => acc = Some((i + 1, body.to_string())),
+        }
+        if !continues {
+            out.extend(acc.take());
+        }
+    }
+    out.extend(acc.take());
+    out
+}
+
+/// Cargo subcommands that RESOLVE dependencies. `cargo fmt` and `cargo install`
+/// are excluded on purpose: fmt reads no lockfile, and the one `install`
+/// (cargo-audit) already pins its own.
+///
+/// `publish` and `package` are listed although no workflow runs one today: this
+/// guard's whole job is to catch the invocation nobody remembers to add the flag
+/// to, and an omission here fails open (pre-ship review 2026-09-05).
+const RESOLVING_SUBCOMMANDS: &[&str] = &[
+    "build", "test", "check", "clippy", "bench", "run", "publish", "package",
+];
+
+/// Every dependency-resolving cargo invocation in `src` that lacks `--locked`.
+///
+/// Returns `(invocations examined, offenders as (line, text))`. Each `cargo `
+/// occurrence is sliced from its own start to the start of the next one, so a
+/// chained `cargo build --locked && cargo test` is two invocations and the flag
+/// on the first cannot vouch for the second.
+fn unlocked_cargo_invocations(src: &str) -> (usize, Vec<(usize, String)>) {
+    let mut checked = 0usize;
+    let mut unlocked: Vec<(usize, String)> = Vec::new();
+    for (line_no, logical) in logical_shell_lines(src) {
+        let starts: Vec<usize> = logical.match_indices("cargo ").map(|(i, _)| i).collect();
+        for (n, &start) in starts.iter().enumerate() {
+            let end = starts.get(n + 1).copied().unwrap_or(logical.len());
+            let call = &logical[start..end];
+            let sub = call["cargo ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if !RESOLVING_SUBCOMMANDS.contains(&sub) {
+                continue;
+            }
+            checked += 1;
+            if !call.contains("--locked") {
+                unlocked.push((line_no, call.trim().to_string()));
+            }
+        }
+    }
+    (checked, unlocked)
+}
+
 /// Every cargo invocation in CI carries `--locked` (audit 2026-09-05 ENG-01).
 ///
 /// Without it cargo silently RE-RESOLVES when `Cargo.toml` and `Cargo.lock`
@@ -1710,20 +1786,11 @@ fn release_gate_runs_the_real_weight_tests_by_name() {
 /// into a failed step, on the one file where the difference is auditable.
 ///
 /// A test rather than a comment for the usual reason: the property is invisible
-/// per-line. A nineteenth invocation added without the flag looks exactly like
-/// the eighteen that have it, and the first evidence would be a release.
+/// per-line. A twenty-second invocation added without the flag looks exactly
+/// like the twenty-one that have it, and the first evidence would be a release.
 #[test]
 fn every_ci_cargo_invocation_is_locked() {
     let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
-    // Subcommands that RESOLVE dependencies. `cargo fmt` and `cargo install`
-    // are excluded on purpose: fmt reads no lockfile, and the one `install`
-    // (cargo-audit) already pins its own.
-    // `publish` and `package` are listed although no workflow runs one today:
-    // this guard's whole job is to catch the invocation nobody remembers to add
-    // the flag to, and an omission here fails open (pre-ship review 2026-09-05).
-    const RESOLVING: &[&str] = &[
-        "build", "test", "check", "clippy", "bench", "run", "publish", "package",
-    ];
     let mut unlocked: Vec<String> = Vec::new();
     let mut checked = 0usize;
     let mut files = 0usize;
@@ -1737,32 +1804,21 @@ fn every_ci_cargo_invocation_is_locked() {
         }
         files += 1;
         let src = fs::read_to_string(&path).expect("read workflow");
-        for (i, line) in src.lines().enumerate() {
-            let trimmed = line.trim_start();
-            // A commented-out command is documentation, not a step.
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            let Some(rest) = line.split("cargo ").nth(1) else {
-                continue;
-            };
-            let sub = rest.split_whitespace().next().unwrap_or("");
-            if !RESOLVING.contains(&sub) {
-                continue;
-            }
-            checked += 1;
-            if !line.contains("--locked") {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                unlocked.push(format!("{name}:{}: {}", i + 1, trimmed));
-            }
-        }
+        let (n, offenders) = unlocked_cargo_invocations(&src);
+        checked += n;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        unlocked.extend(
+            offenders
+                .into_iter()
+                .map(|(line, call)| format!("{name}:{line}: {call}")),
+        );
     }
     assert!(
         files >= 5,
         "only {files} workflow files found — the scan lost its grip"
     );
     assert!(
-        checked >= 19,
+        checked >= 21,
         "only {checked} cargo invocations found across {files} workflows — the scan \
          lost its grip and would pass vacuously"
     );
@@ -1771,6 +1827,203 @@ fn every_ci_cargo_invocation_is_locked() {
         "these CI cargo invocations can silently re-resolve dependencies:\n  {}",
         unlocked.join("\n  ")
     );
+}
+
+/// Negative control for [`every_ci_cargo_invocation_is_locked`]: an all-green
+/// workflow tree proves nothing unless the scanner can still see an offender.
+///
+/// Every case below is a shape the line-by-line scanner this replaced got wrong
+/// (audit 2026-09-05, ENG-01's fourth point — the report recorded only the first
+/// of them):
+///   * `--locked` on the continuation line → FALSE POSITIVE (fails closed, but
+///     it made the guard unusable with the wrapping style three workflows use);
+///   * the subcommand on the continuation line → FALSE NEGATIVE: `cargo \` left
+///     `\` as the "subcommand", which is not in the resolving list, so the whole
+///     invocation was invisible;
+///   * a second `cargo` chained after a locked first → FALSE NEGATIVE: the scan
+///     read one subcommand per line and `--locked` anywhere on it vouched for
+///     every call on that line.
+#[test]
+fn locked_scanner_reads_continuations_and_chains() {
+    // Offenders are matched by suffix, not equality: the exact text a scanner
+    // quotes back is cosmetic, and pinning it here would make this control fail
+    // on formatting before it reached the shapes it exists to cover.
+    let unlocked = |src: &str| -> Vec<String> {
+        unlocked_cargo_invocations(src)
+            .1
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect()
+    };
+    let checked = |src: &str| unlocked_cargo_invocations(src).0;
+    let reports = |src: &str, call: &str| {
+        let hits = unlocked(src);
+        assert_eq!(hits.len(), 1, "expected exactly one offender in {src:?}");
+        assert!(
+            hits[0].ends_with(call),
+            "offender {:?} should end with {call:?}",
+            hits[0]
+        );
+    };
+
+    // Plain, on one line: both directions.
+    assert!(unlocked("        run: cargo test --locked --no-default-features").is_empty());
+    reports(
+        "        run: cargo test --no-default-features",
+        "cargo test --no-default-features",
+    );
+
+    // The flag arriving on the continuation line is still the same invocation.
+    assert!(
+        unlocked("          cargo test \\\n            --locked --no-default-features").is_empty(),
+        "a `--locked` on the continuation line must count for the command it continues"
+    );
+
+    // …and so is the SUBCOMMAND arriving there. This one was invisible.
+    let split_sub = "          cargo \\\n            test --no-default-features";
+    assert_eq!(
+        checked(split_sub),
+        1,
+        "`cargo \\` + `test …` is one resolving invocation, not zero"
+    );
+    reports(split_sub, "cargo test --no-default-features");
+
+    // A chain: the flag on the first call must not vouch for the second.
+    let chained = "        run: cargo build --locked --release && cargo test --no-default-features";
+    assert_eq!(checked(chained), 2, "a chained line holds two invocations");
+    reports(chained, "cargo test --no-default-features");
+
+    // Exclusions still hold: comments are documentation, and the two
+    // subcommands that resolve nothing stay out of the count.
+    assert_eq!(checked("          # cargo test --no-default-features"), 0);
+    assert_eq!(checked("        run: cargo fmt --check"), 0);
+    assert_eq!(
+        checked("        run: cargo install --locked --version ^0.22 cargo-audit"),
+        0,
+        "`cargo-audit` is not a `cargo ` invocation and `install` does not resolve here"
+    );
+}
+
+/// Every `curl` in CI carries `--max-time` (audit 2026-09-05, ENG-03 neighbour).
+///
+/// curl has NO default transfer timeout, and `--retry` does not fire on a
+/// connected-but-stalled transfer — it retries failures, and a socket that
+/// accepts bytes at 1 byte/minute has not failed. The repo has already paid for
+/// this once: a stalled ripgrep mirror sat 29 minutes on the release critical
+/// path with the tag pushed and nothing published (2026-08-19).
+///
+/// Per-line and therefore invisible: a sixth `curl` added without the flag looks
+/// exactly like the five that have it, and the evidence arrives as a release
+/// that never finishes.
+#[test]
+fn every_ci_curl_has_a_transfer_timeout() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut untimed: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    let mut files = 0usize;
+    for entry in fs::read_dir(&wf).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        files += 1;
+        let src = fs::read_to_string(&path).expect("read workflow");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // Continuations matter here more than anywhere: every model fetch in
+        // this repo wraps the URL onto a second line.
+        for (line_no, logical) in logical_shell_lines(&src) {
+            if !logical.contains("curl ") {
+                continue;
+            }
+            checked += 1;
+            if !logical.contains("--max-time") {
+                untimed.push(format!("{name}:{line_no}: {}", logical.trim()));
+            }
+        }
+    }
+    assert!(
+        files >= 5,
+        "only {files} workflow files found — the scan lost its grip"
+    );
+    assert!(
+        checked >= 5,
+        "only {checked} curl invocations found across {files} workflows — the scan \
+         lost its grip and would pass vacuously"
+    );
+    assert!(
+        untimed.is_empty(),
+        "these CI downloads can stall indefinitely (curl has no default timeout \
+         and --retry does not fire on a stalled transfer):\n  {}",
+        untimed.join("\n  ")
+    );
+}
+
+/// ci.yml's daily `schedule:` exists for the `audit` job and nothing else.
+///
+/// `on: schedule` is WORKFLOW-scoped, not job-scoped. Adding it so `cargo audit`
+/// sees advisories published between two pushes (audit 2026-09-05 ENG-03) also
+/// enrolls the 3-OS test matrix, the embed leg and the Node suite in a nightly
+/// run nobody asked for — and nothing goes red, so the only evidence is the
+/// bill. The per-job `if:` gates are what keep the trigger narrow, and they are
+/// opt-OUT: a job added later inherits the cron by default.
+#[test]
+fn ci_schedule_runs_only_the_audit_job() {
+    const GATE: &str = "\n    if: github.event_name != 'schedule'\n";
+    const CRON_JOB: &str = "audit";
+    let ci = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .expect("read ci.yml");
+    assert!(
+        ci.contains("\n  schedule:\n"),
+        "ci.yml lost its `schedule:` trigger — `cargo audit` is back to seeing \
+         advisories only when someone pushes"
+    );
+
+    let jobs = &ci[ci.find("\njobs:\n").expect("ci.yml has no `jobs:` block")..];
+    // Job headers are the only lines at exactly two spaces of indentation.
+    let names: Vec<&str> = jobs
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("  ")?;
+            if rest.starts_with(' ') || rest.starts_with('#') {
+                return None;
+            }
+            let name = rest.strip_suffix(':')?;
+            (!name.is_empty() && !name.contains(' ')).then_some(name)
+        })
+        .collect();
+    assert!(
+        names.len() >= 5,
+        "only {} jobs found in ci.yml ({names:?}) — the scan lost its grip and \
+         would pass vacuously",
+        names.len()
+    );
+    assert!(
+        names.contains(&CRON_JOB),
+        "ci.yml has no `{CRON_JOB}` job ({names:?}) — it was renamed or moved, and \
+         the daily schedule now runs either nothing or everything"
+    );
+
+    for name in &names {
+        let gated = workflow_job(&ci, name).contains(GATE);
+        if *name == CRON_JOB {
+            assert!(
+                !gated,
+                "ci.yml `{name}` is gated out of `schedule` — the daily trigger \
+                 exists for this job alone, so gating it makes the cron a no-op \
+                 that still reports green"
+            );
+        } else {
+            assert!(
+                gated,
+                "ci.yml `{name}` runs on the daily `schedule:` trigger. Add\n \
+                 `{}` to the job, or move the cron out of this workflow.",
+                GATE.trim_matches('\n')
+            );
+        }
+    }
 }
 
 /// The arm64 cross-compile install must be the SAME in both workflows.

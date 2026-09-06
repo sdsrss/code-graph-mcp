@@ -5,6 +5,20 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # `cargo audit` only ever sees a new advisory when something triggers this
+  # workflow, so between two pushes the 419-package lock (the Candle stack is
+  # most of it) is unwatched: an advisory published on a Tuesday first surfaces
+  # on whatever day someone next happens to push, and a quiet week is a blind
+  # week (audit 2026-09-05 ENG-03). A daily run bounds that window at a day.
+  #
+  # `schedule` is WORKFLOW-scoped, not job-scoped, so every job below carries
+  # `if: github.event_name != 'schedule'` — without them this trigger would also
+  # run the 3-OS matrix, the embed leg and the plugin suite every night, and the
+  # only evidence would be the bill. tests/hardening.rs's
+  # `ci_schedule_runs_only_the_audit_job` keeps that true for jobs added later.
+  schedule:
+    # 05:23 UTC daily — odd minute, off the on-the-hour scheduler stampede.
+    - cron: '23 5 * * *'
 
 # Least privilege: every job here only reads the repo. Without an explicit block
 # a workflow inherits the repository's DEFAULT token permissions, which on many
@@ -20,6 +34,8 @@ jobs:
   # (no build), one runner.
   fmt:
     name: Rustfmt
+    # The daily `schedule:` above is for `audit` alone (see the trigger block).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -61,6 +77,8 @@ jobs:
   # feedback_ship_baseline_and_flakes).
   check:
     name: Check & Test (${{ matrix.os }}, ${{ matrix.feature-label }})
+    # The daily `schedule:` above is for `audit` alone (see the trigger block).
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -172,6 +190,8 @@ jobs:
   # Linux-only keeps the heavy Candle compile to a single runner.
   embed-check:
     name: Check & Test (ubuntu-latest, with-embed)
+    # The daily `schedule:` above is for `audit` alone (see the trigger block).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -233,6 +253,8 @@ jobs:
   # run once on Linux to avoid the 3× matrix blow-up.
   plugin-tests:
     name: Plugin & Lifecycle Tests
+    # The daily `schedule:` above is for `audit` alone (see the trigger block).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

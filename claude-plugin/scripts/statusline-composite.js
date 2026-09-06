@@ -140,7 +140,20 @@ function runProvider(command, needsStdin, stdin, id) {
     })).toString().trim();
 
     return out || null;
-  } catch { return null; }
+  } catch (err) {
+    // Swallowing is correct in production and stays the default: a third-party
+    // provider that throws must not take the user's whole statusline with it.
+    // But a swallowed error is also why `lifecycle.e2e.test.js`'s "issue #24"
+    // has gone intermittently red with nothing to go on — a dropped provider and
+    // a provider that printed nothing are the same observation from outside, so
+    // every diagnosis of it so far has been a guess. Opt-in, off unless the env
+    // var is set, so no shipped behavior changes.
+    if (process.env.CODE_GRAPH_STATUSLINE_DEBUG) {
+      const why = err && (err.code || err.message) ? (err.code || err.message) : String(err);
+      process.stderr.write(`[statusline] provider '${id}' dropped: ${why}\n`);
+    }
+    return null;
+  }
 }
 
 // Extract Claude Code's current working directory from the stdin JSON context.

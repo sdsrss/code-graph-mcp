@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const pluginRoot = path.resolve(__dirname, '..');
@@ -88,6 +88,23 @@ function runScript(homeDir, scriptPath, args = [], options = {}) {
     input: options.input,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString();
+}
+
+// Same spawn, but hands back STDERR too. `runScript` throws away stderr and
+// `execFileSync` only surfaces it on a non-zero exit — which is exactly the case
+// that never happens for a script whose whole job is to swallow provider errors
+// and still render. No timeout is passed: a fractional one silently kills
+// spawnSync (memory #7), and the caller here has no deadline to enforce.
+function runScriptCaptured(homeDir, scriptPath, args = [], options = {}) {
+  const env = { ...process.env, HOME: homeDir, USERPROFILE: homeDir, ...(options.env || {}) };
+  delete env.CLAUDE_PLUGIN_ROOT;
+  const r = spawnSync(process.execPath, [scriptPath, ...args], {
+    cwd: options.cwd || repoRoot,
+    env,
+    input: options.input,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  return { stdout: (r.stdout || '').toString(), stderr: (r.stderr || '').toString() };
 }
 
 test('lifecycle CLI handles install, disable self-heal, re-enable, and uninstall', (t) => {
@@ -208,9 +225,48 @@ test('composite expands a leading ~ in a _previous command instead of dropping i
     { id: '_previous', command: '~/.claude/utils/statusline.sh', needsStdin: true },
   ]);
 
-  const out = runScript(homeDir, compositeCli, [], { input: '{}' });
-  assert.match(out, /PREV-STATUSLINE-OK/,
-    'a _previous command using a leading ~ must be tilde-expanded, not silently dropped');
+  // CODE_GRAPH_STATUSLINE_DEBUG: this assertion has been intermittently red
+  // (measured 2/8 on an unmodified tree, 0/8 on another day — noise, not a
+  // trend) and carried NOTHING to diagnose it with, because runProvider's catch
+  // makes "the script failed to exec" and "the script printed nothing" the same
+  // observation from out here. The env var turns the swallowed error into a
+  // stderr line; the assertion below quotes it, so the next red names its own
+  // cause instead of restarting the guessing. Leading candidates, none yet
+  // observed: ETXTBSY (fits — write-then-exec, fails in ~70 ms like this one
+  // does), ENOENT, EACCES.
+  const { stdout, stderr } = runScriptCaptured(homeDir, compositeCli, [], {
+    input: '{}',
+    env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
+  });
+  assert.match(stdout, /PREV-STATUSLINE-OK/,
+    'a _previous command using a leading ~ must be tilde-expanded, not silently dropped'
+    + `\n  composite stderr: ${stderr.trim() || '(empty — the provider ran and printed nothing)'}`);
+});
+
+test('a dropped provider names its reason on stderr under CODE_GRAPH_STATUSLINE_DEBUG', (t) => {
+  // Positive control for the diagnostic the test above depends on. A debug
+  // channel that has never been observed to print is worth exactly as much as
+  // the silent catch it replaced: the next intermittent red would still arrive
+  // with "(empty)" and no way to tell an unset env var from a provider that
+  // really did run and print nothing.
+  const homeDir = mkHome(t);
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: '_previous', command: path.join(homeDir, 'nope', 'missing.sh'), needsStdin: true },
+  ]);
+
+  const on = runScriptCaptured(homeDir, compositeCli, [], {
+    input: '{}',
+    env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
+  });
+  assert.match(on.stderr, /\[statusline] provider '_previous' dropped: ENOENT/,
+    `a provider that cannot exec must say why when the debug var is set (stderr: ${JSON.stringify(on.stderr)})`);
+
+  // …and stays silent by default: this ships, and a user's statusline must not
+  // grow a diagnostic line because a third-party provider is broken.
+  const off = runScriptCaptured(homeDir, compositeCli, [], { input: '{}' });
+  assert.equal(off.stderr.includes('[statusline]'), false,
+    `the debug channel must be off unless asked for (stderr: ${JSON.stringify(off.stderr)})`);
 });
 
 test('expandTilde mirrors shell tilde expansion (only a leading ~ / ~/)', () => {
