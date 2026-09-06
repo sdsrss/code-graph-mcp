@@ -1800,9 +1800,15 @@ function readActiveProcessCmdlines() {
     // notes called it "the only unbounded child a hook could reach".
     //
     // Spends the hook budget when one is armed, floored so the probe is always
-    // attempted: this list only decides WHICH old cache versions are safe to
-    // delete, and an empty answer degrades to recency-only rather than to a
-    // wrong deletion.
+    // attempted.
+    //
+    // Be honest about the cost: an empty answer drops pruning back to
+    // recency-only, which is exactly the state this guard exists to escape —
+    // see cleanupOldCacheVersions, where pruning a version a live process is
+    // bound to breaks `/mcp` reconnect with MODULE_NOT_FOUND. So a timeout is a
+    // NEW route to the guard being off, not a free fallback. It is still the
+    // right trade: a `ps` slow enough to hit this is rare, and hanging the hook
+    // past its budget is a certain failure rather than a possible one.
     const { remainingMs } = require('./hook-fail-open');
     const budget = remainingMs(PS_PROBE_TIMEOUT_MS);
     return execFileSync('ps', ['-axww', '-o', 'command='], hidden({

@@ -493,10 +493,12 @@ function findBinaryUncached() {
 
   // --- PATH lookup (last resort for intentionally installed binaries) ---
   //
-  // BOUNDED. This was the one child process in the whole hook path with no
-  // timeout at all, and it runs BEFORE any hook has called `remainingMs` even
-  // once — `findBinary()` is the first thing every hook does (audit 2026-09-05
-  // NEW-07). A `which` against a wedged PATH entry (a dead NFS mount, an
+  // BOUNDED. This had no timeout at all, and it runs BEFORE any hook has called
+  // `remainingMs` even once — `findBinary()` is the first thing every hook does
+  // (audit 2026-09-05 NEW-07). It was called "the only unbounded child on the
+  // hook path" when it was fixed; the pre-ship review then found `ps` in
+  // `lifecycle.js`, so that was never true. Do not restore the superlative
+  // without re-deriving it. A `which` against a wedged PATH entry (a dead NFS mount, an
   // automounter) hangs until Claude Code kills the hook, which surfaces to the
   // user as an error on THEIR tool call.
   //

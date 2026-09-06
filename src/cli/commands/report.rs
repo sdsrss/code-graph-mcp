@@ -70,16 +70,13 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
         dead_report = run_dead(conn)?;
     }
     freshness.disclose();
-    // `dead_code_report` scans a fixed 200 before filtering, so a `--top` above
-    // that is answered by the scan limit rather than by `--top`. Say so instead
-    // of returning a short list that looks complete.
-    //
-    // `items.len()` alone is the POST-ignore count, so this read false in exactly
-    // the case the ignore list actually bit — the scan hit its ceiling, a
-    // candidate was ignored, `items.len() < 200`, and the truncation went back to
-    // being silent (pre-ship review 2026-09-06). Add the ignored rows back: the
-    // ceiling applies to what was fetched, not to what survived.
-    let dead_scan_capped = top > 200 && dead_report.items.len() + dead_report.ignored_count >= 200;
+    // `dead_code_report` fetches a fixed number of rows before filtering, so a
+    // `--top` above that is answered by the scan limit rather than by `--top`.
+    // Say so instead of returning a short list that looks complete. The flag
+    // comes from the report itself — reconstructing it out here from the
+    // post-filter counters was wrong twice over (pre-ship review 2026-09-06).
+    let dead_scan_capped =
+        top > crate::storage::queries::DEAD_CODE_SCAN_LIMIT as usize && dead_report.scan_capped;
     dead_report.items.truncate(top);
     let dead = &dead_report.items;
 

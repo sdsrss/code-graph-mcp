@@ -657,8 +657,9 @@ test('clearCache also drops the in-process memo', (t) => {
 // ── NEW-07: the PATH probe must be bounded ────────────────────────────────
 //
 // `findBinary()` is the first thing every hook does, and its `which` lookup had
-// NO timeout — the one unbounded child process on the hook path, reached before
-// `remainingMs` has been called even once. A `which` against a wedged PATH
+// NO timeout, reached before `remainingMs` has been called even once. (It was
+// first described as the only such call; `lifecycle.js`'s `ps` fallback was the
+// other one, found by the pre-ship review.) A `which` against a wedged PATH
 // entry hung until Claude Code killed the hook, which the user sees as an error
 // on their own tool call.
 test('pathProbeTimeoutMs is always a positive integer, and never 0', () => {

@@ -32,9 +32,10 @@ replace anything: `impact.value_references` on `get_ast_node include_impact`;
 `dead_code_scan_capped` on `report --json`; `lastError` in
 `~/.cache/code-graph/update-state.json`; `fallthrough_reason` in
 `.code-graph/recommendations.jsonl`. New library export:
-`storage::db::savepoint_on`. New stderr lines, all on paths that previously said
-nothing: CLI `similar` when the noise filter shortened its list, `doctor` when a
-probe could not run at all, and `report` for the dead-code counts above.
+`storage::db::savepoint_on`. New output on paths that previously said nothing:
+one stderr line from CLI `similar` when the noise filter shortened its list, and
+on stdout, `report`'s dead-code count lines and `doctor`'s row for a probe that
+could not run at all (which can turn a formerly all-green `doctor` yellow).
 
 `get_call_graph`'s `test_callers_filtered` had the same one-field-two-meanings
 problem the CLI is fixing here — it counted hidden callees too, so an agent
@@ -76,8 +77,9 @@ name to it means re-accepting an unclamped hook.
 ### The updater explained itself to a stream nobody reads
 
 `auto-update.js` is spawned `detached` with `stdio: 'ignore'`, so on the path
-that actually runs — SessionStart — its refusals went to `/dev/null`. No sha256 sidecar, a truncated transfer, a checksum mismatch, a
-promote that hit `ENOSPC`: each burned one of five attempts and printed its
+that actually runs — SessionStart — its refusals went to `/dev/null`. No sha256
+sidecar, a truncated transfer, a checksum mismatch, a promote that hit
+`ENOSPC`: each burned one of five attempts and printed its
 diagnosis into nothing. What the user saw was the statusline's "update stuck"
 and a `doctor` that re-ran its own checks and reported a count —
 "v9.9.9 failed to install 5×" — which cannot distinguish a missing `curl` from
@@ -166,11 +168,12 @@ every version bump reopened the settings.json ping-pong `install()` carries
 twelve lines of comment about — and walked past the displacement stand-down on
 the way.
 
-### The one unbounded child on the hook path
+### Two unbounded children on the hook path
 
 `findBinary()` is the first thing every hook does, and its `which` lookup had no
-timeout at all, running before the deadline helper has been called even once. A `which` against a wedged
-`PATH` entry (a dead NFS mount, an automounter) hung until Claude Code killed
+timeout at all, running before the deadline helper has been called even once. A
+`which` against a wedged `PATH` entry (a dead NFS mount, an automounter) hung
+until Claude Code killed
 the hook, which the user sees as an error on their own tool call.
 
 It now spends the hook budget when one is armed, floored at 250 ms so the probe
@@ -183,8 +186,12 @@ The independent pre-ship review found a second one: `lifecycle.js`'s `ps`
 fallback, which lists running command lines so `cleanupOldCacheVersions` knows
 which old plugin-cache versions are safe to delete. It is reached from
 SessionStart on the first session after every plugin update — the session this
-budget work is for — and it had no timeout either. Bounded the same way. An
-empty list degrades that cleanup to recency-only, not to a wrong deletion.
+budget work is for — and it had no timeout either. Bounded the same way, with
+the cost named rather than glossed: an empty list drops that pruning back to
+recency-only, which is the state the guard exists to escape (pruning a version a
+live process is bound to breaks `/mcp` reconnect). A timeout is a new route to
+the guard being off. It is still the better trade, because hanging the hook past
+its budget is a certain failure rather than a possible one.
 
 ### Smaller
 

@@ -21,7 +21,7 @@ mod vectors;
 
 pub use dead_code::{
     dead_code_report, find_dead_code, unindexed_path_prefix, validate_dead_code_type_filter,
-    DeadCodeItem, DeadCodeReport, DeadCodeResult,
+    DeadCodeItem, DeadCodeReport, DeadCodeResult, DEAD_CODE_SCAN_LIMIT,
 };
 pub use edges::{
     age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls,

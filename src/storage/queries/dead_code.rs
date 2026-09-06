@@ -372,6 +372,10 @@ pub struct DeadCodeItem {
 /// NOT recompute counts or the hidden-below-threshold probe. `items` preserves
 /// find_dead_code order (orphans and exported interleaved as returned); each
 /// surface can partition by `is_exported`.
+/// Rows the shared report fetches before filtering. Named because two things
+/// depend on it agreeing: `scan_capped` below, and every caller's `--top`.
+pub const DEAD_CODE_SCAN_LIMIT: i64 = 200;
+
 pub struct DeadCodeReport {
     pub items: Vec<DeadCodeItem>,
     pub orphan_count: usize,
@@ -381,6 +385,16 @@ pub struct DeadCodeReport {
     /// that a min_lines=1 probe (same path/type/ignore scope) would surface —
     /// so a "clean" result can disclose it was threshold-limited. 0 otherwise.
     pub hidden_below_threshold: usize,
+    /// The main scan hit its fixed 200-row fetch limit, so the answer is bounded
+    /// by that limit rather than by anything the caller asked for.
+    ///
+    /// Reported here rather than reconstructed by callers. `report` derived it
+    /// from `items.len()`, which is post-ignore and so read false in exactly the
+    /// case the ignore list bit; adding `ignored_count` back fixed that but
+    /// double-counted the min_lines=1 probe, which contributes to that counter
+    /// and has nothing to do with the main scan's ceiling. Only this function
+    /// knows the pre-filter count (pre-ship review 2026-09-06).
+    pub scan_capped: bool,
 }
 
 impl DeadCodeReport {
@@ -463,7 +477,14 @@ pub fn dead_code_report(
     min_lines: u32,
     ignore_prefixes: &[String],
 ) -> Result<DeadCodeReport> {
-    let raw = find_dead_code(conn, path, node_type, include_tests, min_lines, 200)?;
+    let raw = find_dead_code(
+        conn,
+        path,
+        node_type,
+        include_tests,
+        min_lines,
+        DEAD_CODE_SCAN_LIMIT,
+    )?;
     let pre_count = raw.len();
     let filtered: Vec<DeadCodeResult> = raw
         .into_iter()
@@ -523,6 +544,7 @@ pub fn dead_code_report(
         exported_count,
         ignored_count,
         hidden_below_threshold,
+        scan_capped: pre_count >= DEAD_CODE_SCAN_LIMIT as usize,
     })
 }
 
