@@ -303,6 +303,25 @@ test('a provider that FAILED mid-line is not salvaged, however it failed', (t) =
     + `whole one.\n  stdout: ${JSON.stringify(stdout)}\n  stderr: ${stderr.trim()}`);
   assert.match(stderr, /dropped:/,
     `and the debug channel must call it dropped, not recovered. stderr: ${stderr.trim()}`);
+
+  // Second route to the same gate, and the one that makes `status === 0`
+  // necessary rather than merely tidy: a provider that takes a SIGNAL mid-output
+  // reports code EPIPE with status null, so the looser `!err.status` test would
+  // have salvaged its fragment. Measured 6/6 across SIGTERM and SIGKILL.
+  const signalScript = path.join(homeDir, '.claude', 'utils', 'signal.sh');
+  fs.writeFileSync(signalScript, '#!/bin/sh\nprintf "SEGMENT-TWO | "\nkill -TERM $$\n');
+  fs.chmodSync(signalScript, 0o755);
+  writeJson(registryPath, [
+    { id: '_previous', command: signalScript, needsStdin: true },
+  ]);
+  const signalled = runScriptCaptured(homeDir, compositeCli, [], {
+    input: JSON.stringify({ cwd: homeDir, pad: 'x'.repeat(256 * 1024) }),
+    env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
+  });
+  assert.equal(signalled.stdout.includes('SEGMENT-TWO'), false,
+    'a provider killed by a signal mid-output reports EPIPE with status null; its '
+    + `fragment must not be salvaged.\n  stdout: ${JSON.stringify(signalled.stdout)}`
+    + `\n  stderr: ${signalled.stderr.trim()}`);
 });
 
 test('a dropped provider names its reason on stderr under CODE_GRAPH_STATUSLINE_DEBUG', (t) => {

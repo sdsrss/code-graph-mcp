@@ -161,11 +161,13 @@ function runProvider(command, needsStdin, stdin, id) {
     // for (pre-ship delta review 2026-09-06).
     //
     // `status === 0`, not `!status`: a signal-killed child reports `status:
-    // null`, which `!status` would wave through. Measured, that path does not
-    // reach here today — our own 3 s SIGKILL surfaces as ETIMEDOUT, not EPIPE,
-    // with `stdout: "PARTIAL-BEFORE-KILL |"` — but the explicit form does not
-    // depend on that staying true. Measured triple: clean → EPIPE/status 0/whole
-    // line; `exit 1` → EPIPE/status 1/half line; timeout → ETIMEDOUT/status null.
+    // null`, which `!status` would wave through — and that is a live path, not a
+    // defensive one. A provider that prints and then takes a signal while we
+    // still have stdin to write lands HERE, with `code: 'EPIPE'`, `status: null`
+    // and half a line; measured 6 runs of 6 across SIGTERM and SIGKILL. Only our
+    // OWN 3 s timeout misses this branch, surfacing as ETIMEDOUT instead.
+    // Measured set: clean → EPIPE / 0 / whole line; `exit 1` → EPIPE / 1 / half;
+    // self-signal → EPIPE / null / half; our timeout → ETIMEDOUT / null / half.
     const salvaged =
       err && err.code === 'EPIPE' && err.status === 0
         ? (err.stdout || '').toString().trim()
