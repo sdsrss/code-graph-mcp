@@ -276,6 +276,35 @@ test('a provider that never reads stdin keeps its output (EPIPE is not a failure
     + `its failure and must not discard it.\n  composite stderr: ${stderr.trim() || '(empty)'}`);
 });
 
+test('a provider that FAILED mid-line is not salvaged, however it failed', (t) => {
+  // The other half of the EPIPE fix, and the hole the first version of it had.
+  // A provider that genuinely fails can EPIPE too, and its stdout is partial by
+  // definition. Without gating the salvage on a clean exit, this script's half a
+  // line renders as if it were the whole thing — and renders differently run to
+  // run, because whether EPIPE or the non-zero exit is reported depends on the
+  // race. Measured before the gate was added: salvaged as "SEGMENT-ONE |".
+  const homeDir = mkHome(t);
+  const prevScript = path.join(homeDir, '.claude', 'utils', 'statusline.sh');
+  fs.mkdirSync(path.dirname(prevScript), { recursive: true });
+  fs.writeFileSync(prevScript, '#!/bin/sh\nset -e\nprintf "SEGMENT-ONE | "\nexit 1\n');
+  fs.chmodSync(prevScript, 0o755);
+
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: '_previous', command: prevScript, needsStdin: true },
+  ]);
+
+  const { stdout, stderr } = runScriptCaptured(homeDir, compositeCli, [], {
+    input: JSON.stringify({ cwd: homeDir, pad: 'x'.repeat(256 * 1024) }),
+    env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
+  });
+  assert.equal(stdout.includes('SEGMENT-ONE'), false,
+    'half a line from a provider that exited non-zero must not be rendered as a '
+    + `whole one.\n  stdout: ${JSON.stringify(stdout)}\n  stderr: ${stderr.trim()}`);
+  assert.match(stderr, /dropped:/,
+    `and the debug channel must call it dropped, not recovered. stderr: ${stderr.trim()}`);
+});
+
 test('a dropped provider names its reason on stderr under CODE_GRAPH_STATUSLINE_DEBUG', (t) => {
   // Positive control for the diagnostic the test above depends on. A debug
   // channel that has never been observed to print is worth exactly as much as

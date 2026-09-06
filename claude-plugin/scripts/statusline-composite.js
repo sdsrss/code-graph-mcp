@@ -153,10 +153,23 @@ function runProvider(command, needsStdin, stdin, id) {
     // discard happens as a timing race, which is what made
     // lifecycle.e2e.test.js's "issue #24" intermittent for two releases.
     // An empty stdout still falls through: nothing was produced, nothing to keep.
-    if (err && err.code === 'EPIPE') {
-      const salvaged = (err.stdout || '').toString().trim();
-      if (salvaged) return salvaged;
-    }
+    // Gated on a CLEAN exit. A provider that genuinely failed can EPIPE too, and
+    // its stdout is then partial by definition. Measured: a `set -e` script that
+    // prints one segment and exits 1 salvages as "SEGMENT-ONE |" — half a line,
+    // rendered as if whole, and rendering differently run to run depending on
+    // which side of the race it lands. `err.status` is 0 in the case this exists
+    // for (pre-ship delta review 2026-09-06).
+    //
+    // `status === 0`, not `!status`: a signal-killed child reports `status:
+    // null`, which `!status` would wave through. Measured, that path does not
+    // reach here today — our own 3 s SIGKILL surfaces as ETIMEDOUT, not EPIPE,
+    // with `stdout: "PARTIAL-BEFORE-KILL |"` — but the explicit form does not
+    // depend on that staying true. Measured triple: clean → EPIPE/status 0/whole
+    // line; `exit 1` → EPIPE/status 1/half line; timeout → ETIMEDOUT/status null.
+    const salvaged =
+      err && err.code === 'EPIPE' && err.status === 0
+        ? (err.stdout || '').toString().trim()
+        : '';
     // Swallowing is correct in production and stays the default: a third-party
     // provider that throws must not take the user's whole statusline with it.
     // But a swallowed error is also why `lifecycle.e2e.test.js`'s "issue #24"
@@ -165,17 +178,24 @@ function runProvider(command, needsStdin, stdin, id) {
     // every diagnosis of it so far has been a guess. Opt-in, off unless the env
     // var is set, so no shipped behavior changes.
     if (process.env.CODE_GRAPH_STATUSLINE_DEBUG) {
-      // Its own try/catch: `process.stderr.write` throws on a closed stderr, and
-      // this sits inside the catch that exists so a bad provider cannot take the
-      // statusline down. Unguarded, the throw escapes runProvider and past the
-      // provider loop in run(), which has none — a debug switch that kills the
-      // whole line is worse than no debug switch.
+      // Its own try/catch. On Linux this is belt-and-braces rather than
+      // load-bearing: a write to a closed stderr does NOT throw synchronously —
+      // measured both shapes, `fs.closeSync(2)` is a silent no-op and a piped
+      // reader that exits surfaces one tick later as an uncaughtException, which
+      // no try/catch here can see (hook-fail-open.js already handles that path
+      // and skips its own stderr write on EPIPE). It earns its place on Windows,
+      // where piped stderr writes are synchronous, and it costs nothing: this
+      // sits inside the catch that keeps a bad provider from taking the whole
+      // statusline down, so a debug switch must not be the thing that does.
       try {
         const why = err && (err.code || err.message) ? (err.code || err.message) : String(err);
-        process.stderr.write(`[statusline] provider '${id}' dropped: ${why}\n`);
+        // Report BOTH outcomes. Returning early on a salvage would make the
+        // channel silent on the exact failure it was built to diagnose.
+        const verb = salvaged ? 'recovered after' : 'dropped';
+        process.stderr.write(`[statusline] provider '${id}' ${verb}: ${why}\n`);
       } catch { /* diagnostics are best-effort; rendering is not */ }
     }
-    return null;
+    return salvaged || null;
   }
 }
 
