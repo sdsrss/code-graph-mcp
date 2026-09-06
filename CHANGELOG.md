@@ -27,15 +27,27 @@ To defer either, pin `0.135.0`.
 Everything else is additive or invisible. New response fields, none of which
 replace anything: `impact.value_references` on `get_ast_node include_impact`;
 `noise_filtered` / `noise_filtered_note` on `find_similar_code`;
-`test_callees_hidden` on CLI `callgraph`; `lastError` in
+`test_callees_hidden` on CLI `callgraph` and `test_callees_filtered` on MCP
+`get_call_graph`; `dead_code_ignored`, `dead_code_hidden_below_threshold` and
+`dead_code_scan_capped` on `report --json`; `lastError` in
 `~/.cache/code-graph/update-state.json`; `fallthrough_reason` in
-`.code-graph/recommendations.jsonl`. New library export: `storage::db::savepoint_on`.
+`.code-graph/recommendations.jsonl`. New library export:
+`storage::db::savepoint_on`. New stderr lines, all on paths that previously said
+nothing: CLI `similar` when the noise filter shortened its list, `doctor` when a
+probe could not run at all, and `report` for the dead-code counts above.
+
+`get_call_graph`'s `test_callers_filtered` had the same one-field-two-meanings
+problem the CLI is fixing here — it counted hidden callees too, so an agent
+reading it concluded a test caller existed. Caught by the independent pre-ship
+review, after the CHANGELOG had already named that surface as the one which got
+it right. It is split per direction now, on both surfaces, with the old field
+keeping its exact meaning.
 
 ### The last hook that never honoured the budget it is killed at
 
 Claude Code kills each hook at a registered timeout, and 0.135.0 gave six of the
 seven a process deadline that every child spends against. `session-init.js` —
-SessionStart — was left out, and it was the worst of them: seven blocking
+SessionStart — was left out, and it was the worst of them: eight blocking
 children whose timeout literals sum to 21.5 s against a budget of 5 s. Wiring it
 was held back because it is not a mechanical edit. Each child needs its own
 answer to "what should an out-of-budget SessionStart skip".
@@ -64,8 +76,7 @@ name to it means re-accepting an unclamped hook.
 ### The updater explained itself to a stream nobody reads
 
 `auto-update.js` is spawned `detached` with `stdio: 'ignore'`, so on the path
-that actually runs — SessionStart — all twelve of its refusals went to
-`/dev/null`. No sha256 sidecar, a truncated transfer, a checksum mismatch, a
+that actually runs — SessionStart — its refusals went to `/dev/null`. No sha256 sidecar, a truncated transfer, a checksum mismatch, a
 promote that hit `ENOSPC`: each burned one of five attempts and printed its
 diagnosis into nothing. What the user saw was the statusline's "update stuck"
 and a `doctor` that re-ran its own checks and reported a count —
@@ -158,8 +169,7 @@ the way.
 ### The one unbounded child on the hook path
 
 `findBinary()` is the first thing every hook does, and its `which` lookup had no
-timeout at all — the only unbounded child process a hook could reach, running
-before the deadline helper has been called even once. A `which` against a wedged
+timeout at all, running before the deadline helper has been called even once. A `which` against a wedged
 `PATH` entry (a dead NFS mount, an automounter) hung until Claude Code killed
 the hook, which the user sees as an error on their own tool call.
 
@@ -169,13 +179,21 @@ answer "no binary" for one that is on `PATH`, and a fabricated absence is worse
 than a probe that ran out of time. Never zero, because node reads `timeout: 0`
 as no timeout at all — the exact call this replaced.
 
+The independent pre-ship review found a second one: `lifecycle.js`'s `ps`
+fallback, which lists running command lines so `cleanupOldCacheVersions` knows
+which old plugin-cache versions are safe to delete. It is reached from
+SessionStart on the first session after every plugin update — the session this
+budget work is for — and it had no timeout either. Bounded the same way. An
+empty list degrades that cleanup to recency-only, not to a wrong deletion.
+
 ### Smaller
 
 - `node --check` runs in CI. It is this repository's only JS syntax gate — there
-  is deliberately no linter — and it ran solely from `make` and the pre-commit
-  hook, so a contributor without the hook installed could land a file that does
-  not parse. `node --test` does not cover it: a parse error in a hook nothing
-  requires reaches users instead of CI.
+  is deliberately no linter — and it ran solely from `make lint-js`, which
+  nothing invokes automatically: not CI, and not the pre-commit hook either. So
+  a file that does not parse could reach users through any route but a
+  hand-typed `make`. `node --test` does not cover it: a parse error in a hook
+  nothing requires is never loaded.
 - `_CG_ANSWER_TIMEOUT_MS` is floored at its source. A fractional value makes
   `child_process` throw `ERR_OUT_OF_RANGE`, which each answer runner catches and
   turns into a silent "unavailable". No live defect — every consumer passed
@@ -204,8 +222,8 @@ as no timeout at all — the exact call this replaced.
   checkout does not have. They skip with a printed reason rather than asserting
   something vacuously true, so on CI those two are not regression cover.
 - `findBinary`'s other probes still run outside the budget: `readBinaryVersion`
-  has a 5 s gate at six call sites and `npm root -g` has 2 s. Only the unbounded
-  one was addressed here.
+  has a 5 s gate at the five call sites it still owns (SessionStart's is the one
+  this release moved onto the budget) and `npm root -g` has 2 s.
 - Loop-level query duplication in `trace`, `refs`, `ast_node` and `search`, and
   the four-to-five-way duplication of cache path strings across the plugin
   scripts, are both known and unaddressed. Neither changes an answer.

@@ -2849,6 +2849,41 @@ function handleLogin(req: Request) {
     }
 
     #[test]
+    fn test_get_call_graph_counts_hidden_tests_per_direction() {
+        // `test_callers_filtered` counted BOTH directions with no direction
+        // condition, so a hidden test CALLEE was reported under a field that
+        // says callers. An agent reading `test_callers_filtered: 1` concludes a
+        // test caller exists. The CLI half of this pair was split per direction
+        // in 0.136.0; this is the same field on the surface the release notes
+        // point at as the reference (pre-ship review 2026-09-06 finding 1).
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function realWork() { return 1; }\nfunction test_helper() { return 2; }\n\
+             function entry() {\n    realWork();\n    test_helper();\n}\n",
+        )
+        .unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json("get_call_graph", json!({ "function_name": "entry" }));
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        assert!(
+            result["test_callers_filtered"].is_null(),
+            "`entry` has no test CALLERS — a callee must not be counted under that \
+             name; got: {result}"
+        );
+        assert_eq!(
+            result["test_callees_filtered"].as_u64(),
+            Some(1),
+            "the hidden test callee must be disclosed under its own name; got: {result}"
+        );
+    }
+
+    #[test]
     fn test_get_ast_node_impact_reports_value_references() {
         // The CLI's `impact` has carried a comment since v0.79 saying its
         // `value_references` count "mirrors the MCP impact tool … CLI/MCP

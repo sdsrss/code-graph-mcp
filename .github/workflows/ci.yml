@@ -244,9 +244,11 @@ jobs:
       - name: Syntax check every tracked .js
         # There is no JS linter in this repo (deliberate: the npm package ships
         # zero dependencies). `node --check` is the floor that replaces it, and
-        # until audit 2026-09-05 ENG-07 it ran ONLY from `make lint-js` and the
-        # pre-commit hook — so a contributor without the hook installed could
-        # land a file that does not parse.
+        # until audit 2026-09-05 ENG-07 it ran ONLY from `make lint-js` — which
+        # nothing invokes automatically. Not CI, and not the pre-commit hook
+        # either (checked: scripts/pre-commit.sh has no `node --check` and no
+        # `make`), so a file that does not parse could reach users through any
+        # route but a hand-typed `make`.
         #
         # `node --test` below does NOT cover this: it loads *.test.js and
         # whatever those require, so a parse error in a hook nothing requires

@@ -73,7 +73,13 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     // `dead_code_report` scans a fixed 200 before filtering, so a `--top` above
     // that is answered by the scan limit rather than by `--top`. Say so instead
     // of returning a short list that looks complete.
-    let dead_scan_capped = top > 200 && dead_report.items.len() == 200;
+    //
+    // `items.len()` alone is the POST-ignore count, so this read false in exactly
+    // the case the ignore list actually bit — the scan hit its ceiling, a
+    // candidate was ignored, `items.len() < 200`, and the truncation went back to
+    // being silent (pre-ship review 2026-09-06). Add the ignored rows back: the
+    // ceiling applies to what was fetched, not to what survived.
+    let dead_scan_capped = top > 200 && dead_report.items.len() + dead_report.ignored_count >= 200;
     dead_report.items.truncate(top);
     let dead = &dead_report.items;
 

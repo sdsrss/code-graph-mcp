@@ -881,11 +881,10 @@ async function downloadAndInstall(latest, {
         const why = installedRead.error
           ? (installedRead.error.code || installedRead.error.message)
           : 'it does not contain a JSON object';
-        console.error(
-          `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+        console.error(`[code-graph] ${noteUpdateFailure('repoint-registry-unreadable',
+          `plugin ${latest.version} is installed, but ${installedPath} ` +
           `could not be read (${why}) — its entry for this plugin still points at the ` +
-          'previous version. Run `/plugin update` or repair that file by hand.'
-        );
+          'previous version. Run `/plugin update` or repair that file by hand.')}`);
         repointBlocked = true;
       } else {
         let installed = installedRead.value;
@@ -905,12 +904,11 @@ async function downloadAndInstall(latest, {
               `to ${backup} first.`
             );
           } else {
-            console.error(
-              `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+            console.error(`[code-graph] ${noteUpdateFailure('repoint-lossy-no-backup',
+              `plugin ${latest.version} is installed, but ${installedPath} ` +
               'contains bytes that are not valid UTF-8 and no backup copy could be made — ' +
               'its entry for this plugin still points at the previous version. Rewriting it ' +
-              'would replace those bytes permanently. Run `/plugin update` after repairing it.'
-            );
+              'would replace those bytes permanently. Run `/plugin update` after repairing it.')}`);
             installed = null;
             repointBlocked = true;
           }
@@ -929,11 +927,10 @@ async function downloadAndInstall(latest, {
           // Present but not the shape we can write into (`[]`, or a truthy
           // non-array). Blocked, NOT skipped: a silent skip here would feed the
           // JS-02 treadmill through a new door.
-          console.error(
-            `[code-graph] plugin ${latest.version} is installed, but this plugin's entry in ` +
+          console.error(`[code-graph] ${noteUpdateFailure('repoint-entry-malformed',
+            `plugin ${latest.version} is installed, but this plugin's entry in ` +
             `${installedPath} is malformed (expected a non-empty array) — it still points at ` +
-            'the previous version. Run `/plugin update` or repair that file by hand.'
-          );
+            'the previous version. Run `/plugin update` or repair that file by hand.')}`);
           repointBlocked = true;
         }
         if (repointable) {
@@ -943,11 +940,10 @@ async function downloadAndInstall(latest, {
           try {
             writeJsonAtomic(installedPath, installed);
           } catch (err) {
-            console.error(
-              `[code-graph] plugin ${latest.version} is installed, but ${installedPath} ` +
+            console.error(`[code-graph] ${noteUpdateFailure('repoint-write-failed',
+              `plugin ${latest.version} is installed, but ${installedPath} ` +
               `could not be written (${err.code || err.name}) — its entry for this plugin ` +
-              'still points at the previous version. Run `/plugin update`.'
-            );
+              'still points at the previous version. Run `/plugin update`.')}`);
             repointBlocked = true;
           }
         }

@@ -253,14 +253,25 @@ impl McpServer {
                 }
             })
             .collect();
-        let test_callers_count = if include_tests {
-            0
+        // Counted PER DIRECTION. One bucket named `test_callers_filtered` was
+        // reporting hidden callees too, so an agent reading it concluded a test
+        // caller existed. The CLI twin was split in 0.136.0 for the same reason;
+        // this half was missed (pre-ship review 2026-09-06). `test_callers_filtered`
+        // keeps its exact meaning and `test_callees_filtered` is additive beside
+        // it, rather than a rename that would break readers of the old field.
+        let (test_callers_count, test_callees_count) = if include_tests {
+            (0usize, 0usize)
         } else {
-            results
-                .nodes
-                .iter()
-                .filter(|n| n.depth > 0 && is_test(n))
-                .count()
+            let mut callers = 0usize;
+            let mut callees = 0usize;
+            for n in results.nodes.iter().filter(|n| n.depth > 0 && is_test(n)) {
+                if matches!(n.direction, crate::graph::query::Direction::Callers) {
+                    callers += 1;
+                } else {
+                    callees += 1;
+                }
+            }
+            (callers, callees)
         };
 
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
@@ -374,6 +385,9 @@ impl McpServer {
         });
         if test_callers_count > 0 {
             result["test_callers_filtered"] = json!(test_callers_count);
+        }
+        if test_callees_count > 0 {
+            result["test_callees_filtered"] = json!(test_callees_count);
         }
         attach_truncation_flags(&mut result, results);
         attach_suppressed_ambiguous(&mut result, results);

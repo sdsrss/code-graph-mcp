@@ -1205,19 +1205,50 @@ test('autoUpdateLastError is independent of autoUpdateNoOpReason', () => {
 });
 
 test('the suspended Auto-update row carries the reason, not just the count', () => {
+  // Through the REAL row, not a re-composition of it. The first version of this
+  // test built the detail string itself and asserted against its own output, so
+  // it stayed green with the production change reverted — the one thing a test
+  // must not do (pre-ship review 2026-09-06). Same child-process shape as
+  // "doctor tells the three update-state outcomes apart" above, and for the same
+  // reason: CACHE_DIR is resolved at module load, so an in-process env swap
+  // after the require writes to one directory and reads from another.
+  const { spawnSync } = require('child_process');
   const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
-  const { autoUpdateLastError } = require('./doctor');
-  const state = {
-    latestVersion: '9.9.9',
-    updateAvailable: true,
-    updateAttempts: MAX_UPDATE_ATTEMPTS,
-    lastError: { at: '2026-09-05T21:30:00.000Z', stage: 'binary-too-small', message: 'downloaded binary is 812 bytes' },
-  };
-  // Same composition runDiagnostics does for that row.
-  const detail = `v${state.latestVersion} failed to install ${state.updateAttempts}× — auto-retry throttled to once a day. `
-    + `${autoUpdateLastError(state)}. `;
-  assert.match(detail, /812 bytes/, 'the count alone is not a diagnosis');
-  assert.match(detail, /binary-too-small/);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-suspend-'));
+  try {
+    const code = `
+      const fs = require('fs'), path = require('path');
+      const { CACHE_DIR } = require('./lifecycle');
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(CACHE_DIR, 'update-state.json'), JSON.stringify({
+        latestVersion: '9.9.9',
+        updateAvailable: true,
+        updateAttempts: ${MAX_UPDATE_ATTEMPTS},
+        lastError: {
+          at: '2026-09-05T21:30:00.000Z',
+          stage: 'binary-too-small',
+          message: 'downloaded binary is 812 bytes',
+        },
+      }));
+      const { runDiagnostics } = require('./doctor');
+      const row = runDiagnostics({ checkOnly: true }).find(r => r.name === 'Auto-update');
+      process.stdout.write(JSON.stringify(row));
+    `;
+    const res = spawnSync(process.execPath, ['-e', code], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    const row = JSON.parse(res.stdout);
+
+    assert.equal(row.status, 'warn');
+    assert.match(row.detail, /failed to install 5/, 'the count is still reported');
+    assert.match(row.detail, /812 bytes/, 'the count alone is not a diagnosis');
+    assert.match(row.detail, /binary-too-small/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('noteUpdateFailure records a bounded reason and takeUpdateFailure clears it', () => {

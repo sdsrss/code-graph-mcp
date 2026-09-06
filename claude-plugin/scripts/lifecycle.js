@@ -13,6 +13,11 @@ const OLD_PLUGIN_IDS = [
 ];
 const MARKETPLACE_NAME = 'code-graph-mcp';
 const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
+// Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
+// 2 s matches the other hook-path probes; the floor is what a budget-exhausted
+// hook still gives it, since an empty list degrades to recency-only.
+const PS_PROBE_TIMEOUT_MS = 2000;
+const PS_PROBE_MIN_MS = 250;
 // Always derive from __dirname — CLAUDE_PLUGIN_ROOT env var can leak from other
 // plugins when hooks run in shared process context (e.g. claude-mem-lite sets it
 // to its own marketplace path, polluting all subsequent settings.json hook processes).
@@ -1784,10 +1789,27 @@ function readActiveProcessCmdlines() {
   } catch { /* fall through to ps */ }
   try {
     const { execFileSync } = require('child_process');
+    // BOUNDED. Reached in-process from the SessionStart hook —
+    // runSessionInit -> syncLifecycleConfig -> update() ->
+    // cleanupOldCacheVersions -> here, unconditionally, on the first session
+    // after every plugin update, which is precisely the session the hook budget
+    // work targets. It carried no timeout, so a wedged `ps` (a stuck process
+    // table, a paused container) hung the hook until Claude Code killed it —
+    // which the user sees as an error on their own tool call. Found by pre-ship
+    // review 2026-09-06 after find-binary's `which` was fixed and the release
+    // notes called it "the only unbounded child a hook could reach".
+    //
+    // Spends the hook budget when one is armed, floored so the probe is always
+    // attempted: this list only decides WHICH old cache versions are safe to
+    // delete, and an empty answer degrades to recency-only rather than to a
+    // wrong deletion.
+    const { remainingMs } = require('./hook-fail-open');
+    const budget = remainingMs(PS_PROBE_TIMEOUT_MS);
     return execFileSync('ps', ['-axww', '-o', 'command='], hidden({
+      timeout: budget === null ? PS_PROBE_MIN_MS : Math.max(budget, PS_PROBE_MIN_MS),
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
     })).split('\n').filter(Boolean);
-  } catch { /* unsupported platform — caller falls back to recency-only */ }
+  } catch { /* unsupported platform, or out of time — caller falls back to recency-only */ }
   return [];
 }
 
