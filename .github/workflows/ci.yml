@@ -34,6 +34,8 @@ jobs:
   # (no build), one runner.
   fmt:
     name: Rustfmt
+    # Measured 15 s. No build; this only bounds a wedged checkout/toolchain.
+    timeout-minutes: 15
     # The daily `schedule:` above is for `audit` alone (see the trigger block).
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -77,6 +79,9 @@ jobs:
   # feedback_ship_baseline_and_flakes).
   check:
     name: Check & Test (${{ matrix.os }}, ${{ matrix.feature-label }})
+    # Measured 376-567 s warm (windows slowest). 45 leaves room for a cold
+    # cache compiling ~400 deps from scratch.
+    timeout-minutes: 45
     # The daily `schedule:` above is for `audit` alone (see the trigger block).
     if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
@@ -190,6 +195,9 @@ jobs:
   # Linux-only keeps the heavy Candle compile to a single runner.
   embed-check:
     name: Check & Test (ubuntu-latest, with-embed)
+    # Measured 379 s warm. Same 45 as `check`: the Candle stack is the heavy
+    # half of a cold build here.
+    timeout-minutes: 45
     # The daily `schedule:` above is for `audit` alone (see the trigger block).
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -253,6 +261,9 @@ jobs:
   # run once on Linux to avoid the 3× matrix blow-up.
   plugin-tests:
     name: Plugin & Lifecycle Tests
+    # Measured 74 s. Node only, but it spawns child processes — this bounds
+    # one of them wedging.
+    timeout-minutes: 20
     # The daily `schedule:` above is for `audit` alone (see the trigger block).
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -373,6 +384,9 @@ jobs:
   # transitive and not under our control until upstream replacements ship.
   audit:
     name: Cargo Audit (supply-chain CVE scan)
+    # Measured 22 s warm, but `cargo install cargo-audit` is minutes cold,
+    # and this job now also runs unattended on the daily schedule.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

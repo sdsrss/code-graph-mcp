@@ -1959,6 +1959,129 @@ fn every_ci_curl_has_a_transfer_timeout() {
     );
 }
 
+/// Every job name in a workflow file.
+///
+/// Job headers are the only lines at exactly two spaces of indentation inside
+/// the `jobs:` block — `on:` keys sit at the same depth, which is why the scan
+/// starts after `jobs:` and not at the top of the file.
+fn workflow_job_names(src: &str) -> Vec<&str> {
+    let Some(start) = src.find("\njobs:\n") else {
+        return Vec::new();
+    };
+    src[start..]
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("  ")?;
+            if rest.starts_with(' ') || rest.starts_with('#') {
+                return None;
+            }
+            let name = rest.strip_suffix(':')?;
+            (!name.is_empty() && !name.contains(' ')).then_some(name)
+        })
+        .collect()
+}
+
+/// Jobs in `src` with no job-level `timeout-minutes`.
+fn jobs_missing_timeout(src: &str) -> Vec<String> {
+    workflow_job_names(src)
+        .into_iter()
+        .filter(|name| !workflow_job(src, name).contains("\n    timeout-minutes:"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every CI job declares `timeout-minutes` (audit 2026-09-06).
+///
+/// GitHub's default is SIX HOURS. This repo has already paid for that default
+/// twice from one incident: on 2026-08-19 a stalled apt mirror held a release
+/// gate 29 minutes and a CI leg 40 before someone killed them by hand, and an
+/// earlier run rode the 6h ceiling to the end. Those were fixed with step-level
+/// timeouts on the step that stalled — which bounds that step and nothing else.
+///
+/// The property is invisible per job: 10 of the 13 jobs here had no bound at
+/// all, and a job that hangs looks exactly like a job that is slow until the
+/// ceiling arrives. Sizes are set from measured durations at each site, so this
+/// bounds a hang without turning a cold cache into a red release.
+#[test]
+fn every_ci_job_declares_a_timeout() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut unbounded: Vec<String> = Vec::new();
+    let mut jobs = 0usize;
+    let mut files = 0usize;
+    for entry in fs::read_dir(&wf).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        files += 1;
+        let src = fs::read_to_string(&path).expect("read workflow");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        jobs += workflow_job_names(&src).len();
+        unbounded.extend(
+            jobs_missing_timeout(&src)
+                .into_iter()
+                .map(|j| format!("{name}: {j}")),
+        );
+    }
+    assert!(
+        files >= 5,
+        "only {files} workflow files found — the scan lost its grip"
+    );
+    assert!(
+        jobs >= 13,
+        "only {jobs} jobs found across {files} workflows — the scan lost its grip \
+         and would pass vacuously"
+    );
+    assert!(
+        unbounded.is_empty(),
+        "these CI jobs fall back to GitHub's 6-hour default, so a hang is \
+         indistinguishable from slowness until the ceiling:\n  {}",
+        unbounded.join("\n  ")
+    );
+}
+
+/// Negative control for [`every_ci_job_declares_a_timeout`] and
+/// [`ci_schedule_runs_only_the_audit_job`]'s shared job scanner.
+#[test]
+fn job_scanner_finds_jobs_and_missing_timeouts() {
+    let wf = "\
+name: X
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # a comment at job depth is not a job
+  alpha:
+    name: Alpha
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+  beta:
+    name: Beta
+    runs-on: ubuntu-latest
+    steps:
+      - name: a step-level timeout is NOT a job bound
+        timeout-minutes: 3
+        run: echo hi
+";
+    assert_eq!(
+        workflow_job_names(wf),
+        vec!["alpha", "beta"],
+        "`on:` keys sit at job depth too and must not be counted as jobs"
+    );
+    assert_eq!(
+        jobs_missing_timeout(wf),
+        vec!["beta".to_string()],
+        "a step-level `timeout-minutes` (6-space indent) must not satisfy the \
+         job-level bound — it bounds one step, which is the gap this guard exists \
+         to close"
+    );
+}
+
 /// ci.yml's daily `schedule:` exists for the `audit` job and nothing else.
 ///
 /// `on: schedule` is WORKFLOW-scoped, not job-scoped. Adding it so `cargo audit`
@@ -1981,19 +2104,7 @@ fn ci_schedule_runs_only_the_audit_job() {
          advisories only when someone pushes"
     );
 
-    let jobs = &ci[ci.find("\njobs:\n").expect("ci.yml has no `jobs:` block")..];
-    // Job headers are the only lines at exactly two spaces of indentation.
-    let names: Vec<&str> = jobs
-        .lines()
-        .filter_map(|l| {
-            let rest = l.strip_prefix("  ")?;
-            if rest.starts_with(' ') || rest.starts_with('#') {
-                return None;
-            }
-            let name = rest.strip_suffix(':')?;
-            (!name.is_empty() && !name.contains(' ')).then_some(name)
-        })
-        .collect();
+    let names = workflow_job_names(&ci);
     assert!(
         names.len() >= 5,
         "only {} jobs found in ci.yml ({names:?}) — the scan lost its grip and \

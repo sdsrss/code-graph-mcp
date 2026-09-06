@@ -90,12 +90,15 @@ const DELIBERATELY_COMPACTED: &[&str] = &[
     "warning",
 ];
 
-/// Extract every `result["<key>"] =` assignment key found in `region`.
-fn assigned_result_keys(region: &str) -> Vec<String> {
+/// Extract every `<binding>["<key>"] =` assignment key found in `region`.
+///
+/// `binding` because the producers do not agree on a name: `tool_module_overview`
+/// and `tool_project_map` build `result`, `tool_find_similar_code` builds `out`.
+fn assigned_keys(region: &str, binding: &str) -> Vec<String> {
     let mut keys = Vec::new();
-    let marker = "result[\"";
+    let marker = format!("{binding}[\"");
     let mut rest = region;
-    while let Some(i) = rest.find(marker) {
+    while let Some(i) = rest.find(&marker) {
         let after = &rest[i + marker.len()..];
         if let Some(j) = after.find("\"]") {
             let key = &after[..j];
@@ -174,11 +177,11 @@ fn seed_literal_keys(region: &str, binding: &str) -> Vec<String> {
 /// the report names, alongside the seed literal and index assignment. Anchored on
 /// a `result` receiver so an unrelated `cache.insert(…)` in the same function is
 /// not mistaken for an envelope key.
-fn inserted_result_keys(region: &str) -> Vec<String> {
+fn inserted_keys(region: &str, binding: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut rest = region;
-    while let Some(i) = rest.find("result") {
-        let after = &rest[i + "result".len()..];
+    while let Some(i) = rest.find(binding) {
+        let after = &rest[i + binding.len()..];
         // Same statement only: an `insert` past a `;` belongs to something else.
         let stmt_end = after.find(';').unwrap_or(after.len());
         if let Some(k) = after[..stmt_end].find(".insert(\"") {
@@ -194,10 +197,10 @@ fn inserted_result_keys(region: &str) -> Vec<String> {
 
 /// Every top-level key the producer can put on the response envelope, in all
 /// three shapes it uses to do so.
-fn produced_envelope_keys(producer: &str) -> Vec<String> {
-    let mut keys = seed_literal_keys(producer, "result");
-    keys.extend(assigned_result_keys(producer));
-    keys.extend(inserted_result_keys(producer));
+fn produced_envelope_keys(producer: &str, binding: &str) -> Vec<String> {
+    let mut keys = seed_literal_keys(producer, binding);
+    keys.extend(assigned_keys(producer, binding));
+    keys.extend(inserted_keys(producer, binding));
     keys.sort();
     keys.dedup();
     keys
@@ -414,7 +417,7 @@ fn uncovered_compact_keys(overview_src: &str) -> Vec<String> {
     let producer = fn_region(overview_src, "tool_module_overview");
     let forwarder = fn_region(overview_src, "compact_module_overview");
     let covered = compact_covered_keys(forwarder);
-    let mut uncovered: Vec<String> = produced_envelope_keys(producer)
+    let mut uncovered: Vec<String> = produced_envelope_keys(producer, "result")
         .into_iter()
         .filter(|k| !covered.contains(k) && !DELIBERATELY_COMPACTED.contains(&k.as_str()))
         .collect();
@@ -1459,5 +1462,213 @@ fn cli_freshness_guard_detects_missing_refresh() {
         missing.iter().any(|h| h == "cmd_refs"),
         "negative control failed: neutralizing the refresh call should flag cmd_refs as missing, \
          but got {missing:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4th recurrence of the forwarder-drops-keys class, on `attach_similar`.
+//
+// `tool_find_similar_code` builds the full envelope; `attach_similar` is the
+// ONLY public path to it (`find_similar_code` is no longer a listed tool —
+// src/mcp/tools.rs asserts its absence — so every MCP caller reaches this code
+// through `get_ast_node include_similar`). The forwarder hand-picks `results`
+// and `hint`, which means the SURF-06 noise disclosure added on 2026-09-05
+// stops at the function boundary: the CLI twin prints it, the MCP caller gets a
+// short list and no reason. Same shape as the three guards above.
+// ---------------------------------------------------------------------------
+
+/// Build a project whose only vector neighbours are test-file symbols.
+///
+/// All three vectors are identical, so distance separates nothing and the noise
+/// filter is the only thing that can shorten the list. Vectors are hand-built
+/// (not embedded) so this runs on the no-embed leg: `find_similar_code` reads a
+/// STORED embedding for `node_id` rather than embedding a query, so no model is
+/// involved. Mirrors the CLI twin's fixture
+/// (cli_e2e.rs::test_cli_similar_discloses_noise_filtered_candidates).
+fn similar_noise_fixture() -> (TempDir, i64) {
+    use code_graph_mcp::storage::queries;
+
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("app.rs"), "pub fn prod_alpha() {}\n").unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+    fs::write(
+        project.path().join("tests/helpers.rs"),
+        "pub fn helper_one() {}\npub fn helper_two() {}\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let conn = db.conn();
+    // Created AFTER `Database::open`, which is what lets them survive its dim
+    // migration — the obstacle `advanced.rs` cited for having no fixture here.
+    conn.execute_batch(&code_graph_mcp::storage::schema::create_vec_tables_sql())
+        .unwrap();
+
+    let mut vectors = Vec::new();
+    for name in ["prod_alpha", "helper_one", "helper_two"] {
+        let n = queries::get_nodes_by_name(conn, name)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("fixture node {name} must be indexed"));
+        vectors.push((n.id, vec![0.1f32; 384]));
+    }
+    let seed = vectors[0].0;
+    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    drop(db);
+    (project, seed)
+}
+
+/// `get_ast_node include_similar` must say WHY the similar list came back short.
+///
+/// Without this the caller sees `similar: []` and reads it as "the index has
+/// nothing else" — the exact misreading SURF-06 existed to end. Raising
+/// `similar_top_k` would not have helped: the filter that removed them is not
+/// adjustable, and nothing on this surface said so.
+#[test]
+fn get_ast_node_include_similar_discloses_noise_filtered_neighbours() {
+    let (project, seed) = similar_noise_fixture();
+    let server = init_server(&project);
+    let resp = server
+        .handle_message(&tool_call_json(
+            "get_ast_node",
+            json!({ "node_id": seed, "include_similar": true, "similar_top_k": 5 }),
+        ))
+        .expect("get_ast_node should not error");
+    let out = parse_tool_result(&resp);
+
+    assert_eq!(
+        out["similar"].as_array().map(|a| a.len()),
+        Some(0),
+        "fixture precondition: both neighbours are test-file symbols, so the \
+         noise filter should empty the list. Got: {out}"
+    );
+    let disclosure = out
+        .as_object()
+        .expect("tool result is an object")
+        .iter()
+        .filter(|(k, _)| k.starts_with("similar"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        disclosure.contains("dropped as non-answers"),
+        "the two neighbours were removed by a filter nothing named on this \
+         surface. `tool_find_similar_code` sets `noise_filtered_note`; \
+         `attach_similar` must forward it. similar* keys were: {disclosure}"
+    );
+    assert!(
+        disclosure.contains("not adjustable"),
+        "and the message must not send the caller to raise similar_top_k, which \
+         would do nothing here. similar* keys were: {disclosure}"
+    );
+}
+
+const AST_NODE_SRC: &str = "src/mcp/server/tools/ast_node.rs";
+const ADVANCED_SRC: &str = "src/mcp/server/tools/advanced.rs";
+
+/// Envelope keys `attach_similar` deliberately does NOT forward, each with the
+/// reason it is not a hole. Anything not listed here and not forwarded is one.
+const SIMILAR_DELIBERATELY_DROPPED: &[(&str, &str)] = &[
+    // The caller passed this in; echoing it back at a nested key adds nothing.
+    ("query_node_id", "the caller's own argument"),
+    ("count", "`similar` is an array — the caller can count it"),
+    ("top_k", "the caller's own `similar_top_k` argument"),
+    (
+        "max_distance",
+        "not settable through get_ast_node; a fixed default",
+    ),
+    // These two are the STRUCTURED half of what `hint` already says in prose,
+    // and `hint` IS forwarded (as `similar_hint`). Forwarding the numbers too
+    // would be reasonable; not forwarding them leaves nothing unsaid.
+    (
+        "cutoff_applied",
+        "carried in prose by `hint` → `similar_hint`",
+    ),
+    (
+        "cutoff_dropped",
+        "carried in prose by `hint` → `similar_hint`",
+    ),
+];
+
+/// Keys `attach_similar` reads off the inner envelope (`v.get("k")`).
+fn similar_forwarded_keys(forwarder: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let marker = "v.get(\"";
+    let mut rest = forwarder;
+    while let Some(i) = rest.find(marker) {
+        let after = &rest[i + marker.len()..];
+        if let Some(j) = after.find('"') {
+            keys.push(after[..j].to_string());
+            rest = &after[j..];
+        } else {
+            break;
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn unforwarded_similar_keys(advanced_src: &str, ast_node_src: &str) -> Vec<String> {
+    let producer = fn_region(advanced_src, "tool_find_similar_code");
+    let forwarder = fn_region(ast_node_src, "attach_similar");
+    let forwarded = similar_forwarded_keys(forwarder);
+    let mut missing: Vec<String> = produced_envelope_keys(producer, "out")
+        .into_iter()
+        .filter(|k| {
+            !forwarded.contains(k) && !SIMILAR_DELIBERATELY_DROPPED.iter().any(|(d, _)| d == k)
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// 4th recurrence of the forwarder-drops-keys class, this one on `attach_similar`.
+///
+/// `find_similar_code` is not a listed tool, so this forwarder is the only path
+/// from `tool_find_similar_code`'s envelope to any caller: a key it does not
+/// copy is UNREACHABLE. That is how the SURF-06 noise disclosure shipped
+/// visible on the CLI and invisible on MCP — `noise_filtered_note` was set,
+/// then dropped one frame later, and `similar: []` was all the caller saw.
+#[test]
+fn attach_similar_forwards_every_key_find_similar_code_produces() {
+    let missing = unforwarded_similar_keys(
+        &fs::read_to_string(ADVANCED_SRC).expect("read advanced.rs"),
+        &fs::read_to_string(AST_NODE_SRC).expect("read ast_node.rs"),
+    );
+    assert!(
+        missing.is_empty(),
+        "tool_find_similar_code sets top-level key(s) {missing:?} that attach_similar \
+         never copies onto the get_ast_node result. `find_similar_code` is not a listed \
+         tool, so those keys reach nobody. Forward each in {AST_NODE_SRC}, or add it to \
+         SIMILAR_DELIBERATELY_DROPPED with the reason it is not a hole."
+    );
+}
+
+/// Negative control: the guard above is green, which proves nothing until the
+/// detector is shown to still see an omission. Neutralizes the forwarding loop
+/// in a COPY of the source — the working tree is never touched.
+#[test]
+fn attach_similar_guard_detects_a_dropped_key() {
+    let ast_node = fs::read_to_string(AST_NODE_SRC).expect("read ast_node.rs");
+    let broken = ast_node.replace(
+        "v.get(\"noise_filtered_note\")",
+        "None::<&serde_json::Value>",
+    );
+    assert_ne!(broken, ast_node, "negative control never mutated anything");
+    let missing = unforwarded_similar_keys(
+        &fs::read_to_string(ADVANCED_SRC).expect("read advanced.rs"),
+        &broken,
+    );
+    assert!(
+        missing.iter().any(|k| k == "noise_filtered_note"),
+        "removing the noise_filtered_note forward should flag it as unreachable, got {missing:?}"
     );
 }

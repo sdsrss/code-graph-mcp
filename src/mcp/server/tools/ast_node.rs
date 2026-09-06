@@ -633,6 +633,29 @@ impl McpServer {
                     if let Some(hint) = v.get("hint") {
                         result["similar_hint"] = hint.clone();
                     }
+                    // `find_similar_code` is not a listed tool (src/mcp/tools.rs
+                    // asserts its absence), so this forwarder is the ONLY way an
+                    // MCP caller reaches that envelope — anything it does not
+                    // copy is unreachable, not merely inconvenient. The noise
+                    // disclosure (audit 2026-09-05 SURF-06) stopped here: the
+                    // CLI twin printed "dropped as non-answers" while this
+                    // surface returned a bare `similar: []`, which reads as "the
+                    // index has nothing else" and sends the caller to raise
+                    // similar_top_k — a knob that cannot affect this filter.
+                    // Forwarded under the `similar_` prefix like `similar_hint`,
+                    // and kept SEPARATE from the cutoff numbers `hint` describes:
+                    // the two shortenings have different remedies. Written as
+                    // literal `v.get("…")` reads, not a (from, to) table, because
+                    // that is the shape
+                    // freshness_parity.rs::attach_similar_forwards_every_key_find_similar_code_produces
+                    // can verify — a table hides the key names from it and the
+                    // guard reports a forwarded key as unreachable.
+                    if let Some(n) = v.get("noise_filtered") {
+                        result["similar_noise_filtered"] = n.clone();
+                    }
+                    if let Some(note) = v.get("noise_filtered_note") {
+                        result["similar_noise_filtered_note"] = note.clone();
+                    }
                 }
                 Ok(())
             }

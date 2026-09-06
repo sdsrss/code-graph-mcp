@@ -38,6 +38,9 @@ permissions:
 jobs:
   bench:
     name: P@1 routing recall
+    # Measured ~3.5 min. This job calls an external LLM API, which is exactly
+    # the dependency that can accept a connection and then never answer.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     # Don't fail the whole workflow on transient API hiccups — the assertion
     # itself (in test code) is what we care about. Job summary still records

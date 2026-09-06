@@ -280,6 +280,11 @@ jobs:
   build:
     name: Build ${{ matrix.npm-pkg }}
     needs: gate
+    # Bounds a hang, not performance: measured 152-311 s warm across the five
+    # targets, and cache-warm.yml's twin of this matrix runs under 30. Double
+    # that, because a cold cross-compile is the slow case and a timeout that
+    # kills a release mid-flight is worse than the 6-hour default it replaces.
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -399,6 +404,9 @@ jobs:
   publish:
     name: Publish
     needs: build
+    # Measured 132 s. Generous because this job is irreversible once npm
+    # accepts the package — the bound exists for a wedged registry call.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     # `id-token: write` is what `npm publish --provenance` mints its attestation
     # with; without it the publish step FAILS rather than degrading, so the flag
@@ -660,6 +668,10 @@ jobs:
   smoke-verify:
     name: Post-publish smoke (${{ matrix.os }})
     needs: publish
+    # Measured 12-232 s. This job downloads the published tarball, so a
+    # stalled fetch is the shape being bounded (the curls carry --max-time
+    # too; this is the outer bound if something else wedges).
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
