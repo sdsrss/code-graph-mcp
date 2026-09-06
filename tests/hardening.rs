@@ -1823,9 +1823,19 @@ fn logical_shell_lines(src: &str) -> Vec<(usize, String)> {
 /// Pinned at the exact current number they turn every legitimate deletion of an
 /// already-compliant step into a failure whose message blames the scanner
 /// ("the scan lost its grip") for a scan that is working perfectly — measured on
-/// all three (pre-ship review 2026-09-06). The floor's job is to catch a scan
-/// that silently stopped matching, and a scan that broke does not lose three
-/// entries, it loses most of them.
+/// all three (pre-ship review 2026-09-06).
+///
+/// Lowering them is not free, and the honest accounting is this rather than the
+/// "a broken scan loses most of them" line that used to sit here. Measured
+/// against the real files, three plausible partial breakages give 21 (chain
+/// split lost — invisible to ANY floor), 18 (scanner reads only lines carrying a
+/// `run:` key) and 14 (the resolving list shrunk). A floor of 15 catches the
+/// third and misses the second; the old 21 caught it. No constant fixes that:
+/// catching an 18 needs 19+, which is re-pinning at today's count and reinstates
+/// the false failure. So the floors are a backstop against GROSS failure only,
+/// and the 18-shape is covered where it belongs — `split_sub` in
+/// [`locked_scanner_reads_continuations_and_chains`] is exactly a bare `cargo`
+/// line inside a `run: |` block, and fails deterministically.
 const CARGO_INVOCATION_FLOOR: usize = 15; // 21 today
 const CURL_INVOCATION_FLOOR: usize = 4; //  5 today
 const JOB_FLOOR: usize = 10; // 13 today
@@ -2164,8 +2174,10 @@ fn jobs_missing_schedule_gate(src: &str, cron_job: &str) -> Vec<String> {
                 let Some(rest) = l.strip_prefix("    ") else {
                     return false;
                 };
-                !rest.starts_with(' ')
-                    && rest.starts_with("if:")
+                // No `!rest.starts_with(' ')` guard: `starts_with("if:")` already
+                // excludes a deeper indent, and the extra clause read as if it
+                // were doing work (post-ship review 2026-09-06).
+                rest.starts_with("if:")
                     && rest.contains("github.event_name")
                     && rest.contains("!=")
                     && rest.contains("'schedule'")
