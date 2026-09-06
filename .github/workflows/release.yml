@@ -280,12 +280,14 @@ jobs:
   build:
     name: Build ${{ matrix.npm-pkg }}
     needs: gate
-    # Bounds a hang, not performance: measured 152-311 s warm across the five
-    # targets on v0.137.0, but 402 s for darwin-x64 on v0.133.0 — warm runs vary
-    # by more than a factor of two. cache-warm.yml's twin of this matrix runs
-    # under 30. Double that, because a cold cross-compile is the slow case and a
-    # timeout that kills a release mid-flight is worse than the 6-hour default
-    # it replaces.
+    # Bounds a hang, not performance. Measured 152-311 s warm across the five
+    # targets on v0.137.0 — but that is one release's spread, not the range.
+    # darwin-x64 alone took 399 s on v0.133.0 and 471 s at worst (run
+    # 33796410342), so the real variation across releases is nearer 3.5x than the
+    # 2x an earlier version of this comment claimed. cache-warm.yml's twin of
+    # this matrix runs under 30 min. 60 doubles that, because a cold
+    # cross-compile is the slow case and a timeout that kills a release
+    # mid-flight is worse than the 6-hour default it replaces.
     timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:

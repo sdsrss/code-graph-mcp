@@ -2038,7 +2038,7 @@ fn locked_scanner_reads_continuations_and_chains() {
 /// Same reason as [`MAX_JOB_TIMEOUT_MINUTES`]: presence is not the property.
 /// `--max-time 99999` satisfied a presence check while restoring exactly the
 /// unbounded behaviour the flag is there to prevent (pre-ship review
-/// 2026-09-06). 600 is double the largest value any fetch here uses.
+/// 2026-09-06). 600 is double the largest value any fetch here uses (300).
 const MAX_CURL_TIME_SECONDS: u32 = 600;
 
 /// Every `curl` invocation in `src` with no usable `--max-time`.
@@ -2049,22 +2049,30 @@ fn untimed_curl_invocations(src: &str) -> (usize, Vec<(usize, String)>) {
     let mut checked = 0usize;
     let mut untimed: Vec<(usize, String)> = Vec::new();
     for (line_no, logical) in logical_shell_lines(src) {
-        if !logical.contains("curl ") {
-            continue;
-        }
-        checked += 1;
-        let value: Option<u32> = logical
-            .split("--max-time")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|v| v.parse().ok());
-        match value {
-            Some(v) if v <= MAX_CURL_TIME_SECONDS => {}
-            Some(v) => untimed.push((
-                line_no,
-                format!("{} [--max-time {v} is not a bound]", logical.trim()),
-            )),
-            None => untimed.push((line_no, logical.trim().to_string())),
+        // Sliced per occurrence, exactly like the cargo scanner: a chained
+        // `curl --max-time 10 -o a URL && curl -o b URL` is TWO downloads, and
+        // reading the first `--max-time` on the line let the flag on the first
+        // vouch for the second. That asymmetry between the two scanners was
+        // deliberate work on one of them and an oversight on the other
+        // (post-ship review 2026-09-06, F3).
+        let starts: Vec<usize> = logical.match_indices("curl ").map(|(i, _)| i).collect();
+        for (n, &start) in starts.iter().enumerate() {
+            let end = starts.get(n + 1).copied().unwrap_or(logical.len());
+            let call = &logical[start..end];
+            checked += 1;
+            let value: Option<u32> = call
+                .split("--max-time")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|v| v.parse().ok());
+            match value {
+                Some(v) if v <= MAX_CURL_TIME_SECONDS => {}
+                Some(v) => untimed.push((
+                    line_no,
+                    format!("{} [--max-time {v} is not a bound]", call.trim()),
+                )),
+                None => untimed.push((line_no, call.trim().to_string())),
+            }
         }
     }
     (checked, untimed)
@@ -2193,12 +2201,19 @@ fn jobs_missing_schedule_gate(src: &str, cron_job: &str) -> Vec<String> {
 /// Presence alone is not the property. A guard that only checks for the key is
 /// satisfied by `timeout-minutes: 360` — GitHub's six-hour default written out
 /// longhand, i.e. the exact state the bound exists to leave (pre-ship review
-/// 2026-09-06, verified: rewriting two 45s to 360 passed). 90 is roughly double
-/// the largest value any job here needs.
+/// 2026-09-06, verified: rewriting two 45s to 360 passed). 90 is 1.5x the
+/// largest value any job here uses (60, release.yml `build`) — enough headroom
+/// for a cold cross-compile, still far below the 360 it must reject.
 const MAX_JOB_TIMEOUT_MINUTES: u32 = 90;
 
 /// Jobs in `src` with no usable job-level `timeout-minutes` — absent, or so
 /// large it is not a bound. Each entry is `(job, reason)`.
+///
+/// The value is comment-stripped before parsing: `timeout-minutes: 30  # bounds
+/// a hang` used to parse as unparseable and fail a job that is validly bounded —
+/// the same trailing-comment class already fixed on job headers and shell lines,
+/// missed on the value line (post-ship review 2026-09-06, F5). `${{ }}`, a
+/// quoted value and a value on the next line still fail closed, which is right.
 fn jobs_missing_timeout_reasons(src: &str) -> Vec<(String, String)> {
     workflow_job_names(src)
         .into_iter()
@@ -2210,6 +2225,7 @@ fn jobs_missing_timeout_reasons(src: &str) -> Vec<(String, String)> {
             let value: Option<u32> = body[at + "\n    timeout-minutes:".len()..]
                 .lines()
                 .next()
+                .map(strip_shell_comment)
                 .and_then(|v| v.trim().parse().ok());
             match value {
                 Some(v) if v > MAX_JOB_TIMEOUT_MINUTES => Some((
@@ -2404,6 +2420,48 @@ jobs:
         untimed.iter().any(|(_, c)| c.contains("is not a bound")),
         "--max-time 99999 restores the unbounded behaviour it exists to prevent; got {untimed:?}"
     );
+    // A chained second curl is a second download; the flag on the first must
+    // not vouch for it (post-ship review 2026-09-06, F3).
+    let (nc, chained_curl) = untimed_curl_invocations(
+        "        run: curl --max-time 10 -o a https://example.invalid/a && curl -o b https://example.invalid/b",
+    );
+    assert_eq!(nc, 2, "a chained line holds two downloads");
+    assert_eq!(
+        chained_curl.len(),
+        1,
+        "exactly the unbounded one is reported"
+    );
+    assert!(
+        chained_curl[0].1.contains("-o b"),
+        "got {:?}",
+        chained_curl[0].1
+    );
+    // …and the magnitude check must see the SECOND one's value too.
+    let (_, chained_huge) = untimed_curl_invocations(
+        "        run: curl --max-time 10 -o a https://example.invalid/a && curl --max-time 99999 -o b https://example.invalid/b",
+    );
+    assert_eq!(chained_huge.len(), 1, "got {chained_huge:?}");
+    assert!(chained_huge[0].1.contains("is not a bound"));
+
+    // A trailing comment on the VALUE line must not make a bounded job look
+    // unparseable — fail-closed, but a false failure on valid YAML (F5).
+    let commented_value = "\njobs:\n  a:\n    name: A\n    timeout-minutes: 30  # bounds a hang, not performance\n    runs-on: x\n";
+    assert_eq!(
+        jobs_missing_timeout(commented_value),
+        Vec::<String>::new(),
+        "a commented but valid timeout value must be accepted"
+    );
+    let commented_huge = commented_value.replace("timeout-minutes: 30 ", "timeout-minutes: 360 ");
+    assert_ne!(
+        commented_huge, commented_value,
+        "fixture edit did not apply"
+    );
+    assert_eq!(
+        jobs_missing_timeout(&commented_huge),
+        vec!["a".to_string()],
+        "…and stripping the comment must not blind the magnitude check"
+    );
+
     // A trailing comment must not satisfy the curl guard either.
     let (n2, untimed2) = untimed_curl_invocations(
         "        run: curl -fL -o x https://example.invalid/x  # --max-time via job timeout",
