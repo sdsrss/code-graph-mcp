@@ -200,7 +200,11 @@ jobs:
         # on a runner with no cached model, so both self-skip and report green
         # having executed nothing. CODE_GRAPH_REQUIRE_MODEL=1 makes that skip a
         # failure; the weights come from the same sha256-pinned `model-assets-v1`
-        # mirror release.yml uses, so nothing is fetched from HuggingFace.
+        # mirror release.yml uses, so nothing is downloaded here at all. Naming
+        # HuggingFace would name the wrong risk — the auto-download targets this
+        # repo's own release, not HF. What holds it shut is `spawn_model_download`
+        # returning early once a model is loaded and DISABLE_MODEL_DOWNLOAD
+        # short-circuiting before any thread spawns (mcp/server/mod.rs:1280-1300).
         #
         # They live HERE, on a cron, and not in release.yml's gate, because they
         # fail intermittently for a reason nobody has found: 2 runs in 6 against

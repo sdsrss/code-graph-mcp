@@ -1335,11 +1335,27 @@ fn release_and_cache_warm_workflows_do_not_drift() {
 
     // 4. The commands whose artifacts the cache holds must match. `cargo fmt` is
     //    excluded: it compiles nothing, so it cannot affect the cache contents.
-    let gate_builds: Vec<&str> = gate
-        .iter()
-        .filter_map(|l| l.strip_prefix("run: cargo "))
-        .filter(|c| !c.starts_with("fmt"))
-        .collect();
+    //
+    //    Both single-line `run: cargo …` directives AND cargo lines inside a
+    //    `run: |` block are collected. Matching only the directive form left a
+    //    hole running the wrong way: any future single-line step could be hidden
+    //    from this guard by wrapping it in a block scalar, silently. Note
+    //    `every_ci_cargo_invocation_is_locked` already splits on `cargo ` and so
+    //    does see block-scalar lines — the two guards disagreed about them until
+    //    now (pre-ship review 2026-09-06, finding 5).
+    let cargo_invocations = |directives: &[&str]| -> Vec<String> {
+        directives
+            .iter()
+            .filter_map(|l| {
+                l.strip_prefix("run: cargo ")
+                    .or_else(|| l.strip_prefix("cargo "))
+            })
+            .map(|c| c.trim_end_matches('\\').trim().to_string())
+            .filter(|c| !c.starts_with("fmt"))
+            .collect()
+    };
+    let gate_builds = cargo_invocations(&gate);
+    let warm_builds = cargo_invocations(&warm_gate);
     assert!(
         !gate_builds.is_empty(),
         "no `run: cargo` steps found in release.yml `gate` — the job was \
@@ -1407,12 +1423,35 @@ fn release_and_cache_warm_workflows_do_not_drift() {
          it under the same environment."
     );
 
-    for cmd in gate_builds {
+    // Gate-only cargo invocations, each with the reason it cannot cost a cold
+    // compile. An allowlist rather than a silent exemption: tightening the scan
+    // above to see block scalars would otherwise fail on steps that are
+    // legitimately exempt, and "it happens to be invisible to the parser" is not
+    // a reason anyone can check later.
+    const GATE_ONLY_CARGO: &[(&str, &str)] = &[(
+        "test --locked --features embed-model --lib --",
+        "the real-weight gate. Same feature set and the same targets as the \
+         `Test (embed-model)` step directly above it, so cargo has already built \
+         everything it needs — measured 13.4 s cold, 0.14 s warm.",
+    )];
+
+    for cmd in &gate_builds {
+        if let Some((_, why)) = GATE_ONLY_CARGO.iter().find(|(p, _)| cmd.starts_with(p)) {
+            assert!(
+                !warm_builds.iter().any(|w| w == cmd),
+                "`cargo {cmd}` is on the gate-only allowlist ({why}) but cache-warm.yml \
+                 `warm-gate` now runs it too — drop the allowlist entry rather than \
+                 keeping a stale exemption."
+            );
+            continue;
+        }
         assert!(
-            warm_gate.iter().any(|l| *l == format!("run: cargo {cmd}")),
+            warm_builds.iter().any(|w| w == cmd),
             "release.yml `gate` runs `cargo {cmd}` but cache-warm.yml `warm-gate` \
              does not. Lint and feature flags participate in cargo's fingerprint, \
-             so a command only the gate runs is a command the gate compiles cold."
+             so a command only the gate runs is a command the gate compiles cold. \
+             If it genuinely compiles nothing new, add it to GATE_ONLY_CARGO with \
+             the measurement that says so."
         );
     }
 }
@@ -1546,13 +1585,32 @@ fn release_gate_runs_the_real_weight_tests_by_name() {
             .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
             .replace("\r\n", "\n")
     };
-    // A name may be defined in either the integration target or the lib's own
-    // test module, since the split put one in each.
-    let sources = format!(
-        "{}{}",
-        read(root.join("tests/mcp_stdio_integration.rs")),
-        read(root.join("src/embedding/model.rs"))
-    );
+    // Resolve each name to the ONE file that must define it, rather than
+    // searching a concatenation of both. Two holes closed at once (pre-ship
+    // review 2026-09-06, finding 7):
+    //
+    //   - matching only the leaf after `rsplit("::")` let a MODULE move through.
+    //     Measured: rewriting the workflow to
+    //     `embedding::model::renamed_mod::test_embed_produces_correct_dims`
+    //     left this guard green while the real command ran `0 tests`.
+    //   - concatenating both sources let a name defined in either satisfy either
+    //     workflow, so a test moved between targets would not be noticed.
+    //
+    // A `::`-qualified name addresses a lib test by module path: everything
+    // before the last two segments is the file under `src/`, and the segment
+    // before the leaf is the enclosing `mod`. A bare name is an integration
+    // test in the stdio target.
+    let source_for = |name: &str| -> (std::path::PathBuf, Option<String>) {
+        let segments: Vec<&str> = name.split("::").collect();
+        if segments.len() < 2 {
+            return (root.join("tests/mcp_stdio_integration.rs"), None);
+        }
+        let file = format!("src/{}.rs", segments[..segments.len() - 2].join("/"));
+        (
+            root.join(file),
+            Some(segments[segments.len() - 2].to_string()),
+        )
+    };
 
     // The names sit between `--exact` and the next flag, across a line
     // continuation. Read them from the workflow rather than hard-coding them
@@ -1591,15 +1649,37 @@ fn release_gate_runs_the_real_weight_tests_by_name() {
              test(s) after `--exact`; parsed {names:?}"
         );
         for name in &names {
-            // The lib test is addressed by its module path; match on the leaf.
+            let (path, enclosing_mod) = source_for(name);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            // A missing file is itself the failure: it means the module chain in
+            // the workflow no longer maps to anything on disk.
+            assert!(
+                path.is_file(),
+                "{file} runs `--exact {name}`, whose module path points at {rel}, \
+                 which does not exist. cargo test exits 0 on a filter that matches \
+                 nothing, so this would ship as a green step that ran no \
+                 real-weight test at all."
+            );
+            let src = read(path.clone());
             let leaf = name.rsplit("::").next().unwrap_or(name);
             assert!(
-                sources.contains(&format!("fn {leaf}(")),
-                "{file} runs `--exact {name}`, which is not defined in \
-                 tests/mcp_stdio_integration.rs or src/embedding/model.rs. \
+                src.contains(&format!("fn {leaf}(")),
+                "{file} runs `--exact {name}`, but {rel} defines no `fn {leaf}`. \
                  cargo test exits 0 on a filter that matches nothing, so this \
                  would ship as a green step that ran no real-weight test at all."
             );
+            if let Some(m) = &enclosing_mod {
+                assert!(
+                    src.contains(&format!("mod {m}")),
+                    "{file} runs `--exact {name}`, but {rel} has no `mod {m}` — the \
+                     test moved modules. The leaf name alone would still match, and \
+                     the real command would run 0 tests."
+                );
+            }
             checked += 1;
         }
         assert!(

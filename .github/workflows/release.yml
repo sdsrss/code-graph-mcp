@@ -222,7 +222,12 @@ jobs:
         # publish job packages (see "Package model files"), so this step adds no
         # third-party dependency to the critical path. CODE_GRAPH_MODEL_DIR is the
         # loader's highest-priority location, so DISABLE_MODEL_DOWNLOAD stays on:
-        # nothing is fetched from HuggingFace here.
+        # nothing is downloaded here at all. Naming HuggingFace would name the
+        # wrong risk — the auto-download targets this repo's own release, not HF
+        # (src/embedding/model.rs). What actually holds it shut is
+        # `spawn_model_download` returning early once a model is loaded
+        # (mcp/server/mod.rs:1280-1282) and DISABLE_MODEL_DOWNLOAD short-circuiting
+        # before any thread spawns (:1291-1300).
         #
         # It compiles nothing the gate did not already compile, which is why it
         # needs no `warm-gate` twin the way the `run: cargo` steps above do.
