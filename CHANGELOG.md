@@ -1,5 +1,114 @@
 # Changelog
 
+## 0.138.0
+
+**Upgrading:** if your statusline used to flicker back to something shorter —
+losing the line you had before this plugin was installed, then getting it back
+on the next render — that stops. Nothing to do; upgrade and it is fixed. One MCP
+reply gains two fields, listed below. If you match `get_ast_node` responses
+against a fixed key set, pin `0.137.0`.
+
+### Your previous statusline was being dropped at random
+
+`install` captures whatever statusline you already had and re-runs it as the
+first provider in the composite. Every provider is handed the status payload on
+stdin — and a provider that does not read stdin exits before we finish writing
+it, which makes the write fail. The failure was treated as "this provider did
+not answer", so its output was thrown away. It had already produced that output
+in full.
+
+If your previous statusline was a script that ignores stdin — a static `echo`, a
+line built from environment variables — you lost it on some fraction of renders,
+with nothing logged. The fraction depends on how loaded the machine is, which is
+why it looked like nothing at all on an idle laptop.
+
+The write failing is our problem, not the provider's, and the provider's output
+is now kept — but only when the provider actually succeeded. A provider that
+fails can hit the same error, and its output is then genuinely half a line; that
+case is still dropped, because rendering half a line as a whole one, differently
+on each run depending on a race, would be a worse bug than the one being fixed.
+
+An honest note on how long this took to find: a test has been covering this exact
+path since 0.56.1 and going intermittently red, it was diagnosed twice as
+something else, and what finally named it was the debug channel below, on its
+first run.
+
+### A dropped provider can now say why
+
+`CODE_GRAPH_STATUSLINE_DEBUG=1` makes `statusline-composite` write the error code
+of a provider it dropped to stderr. Off by default and staying that way:
+swallowing is right in a statusline, where a broken third-party provider must not
+take the rest of the line down with it. But swallowing also made the bug above
+undiagnosable for two releases — a provider that could not run and a provider
+that printed nothing are the same observation from outside.
+
+### `get_ast_node include_similar` says why the list is short
+
+It returns `similar_noise_filtered` and `similar_noise_filtered_note` when
+neighbours were dropped as non-answers: test symbols, `<module>` placeholders,
+`<external>` sentinels. Until now that reply was a bare `similar: []`, which
+reads as "the index has nothing else" and sends you to raise `similar_top_k`, a
+knob that cannot affect the filter that removed them.
+
+The disclosure is not new — it shipped in 0.136.0, visible on the CLI and
+invisible on MCP. `find_similar_code` is no longer a listed tool, so the only
+path to its reply is `get_ast_node`, through a forwarder that copies a hand-picked
+set of keys. It copied two. A key it does not copy is not inconvenient, it is
+unreachable, so the field was set and dropped one frame later on every call.
+
+That is the fourth time this repo has shipped a key a forwarder silently declined
+to pass on. The first got a source-scanning guard in 0.100.0 and two more have
+been added since; this pair now has one, with a per-key list of what is
+deliberately not forwarded and why.
+
+### Every CI job now has a deadline
+
+Ten of thirteen had none, which means GitHub's default: six hours. This repo has
+already paid for that default — on 2026-08-19 a stalled apt mirror held a release
+gate 29 minutes and a CI leg 40 before someone killed them by hand, and the fix
+at the time bounded that one step. The three `curl` calls in `release.yml` that
+still lacked `--max-time` have it, and `cargo audit` now runs daily instead of
+only when someone happens to push a 419-package lockfile.
+
+None of that is visible from the outside, and it is in these notes for one
+reason: the guards written to keep it true did not work, and it took three review
+rounds to establish that. They passed on a job header with a trailing comment, on
+`timeout-minutes: 360` (the six-hour default written longhand), on
+`--max-time 99999`, on a comment claiming a flag that was absent, and on
+`cargo update`, which rewrites `Cargo.lock` and was missing from the list of
+subcommands the guard considers. A later round found that the fix for one of
+those had made another guard fail open, and the round after that found the fix
+for *that* had quietly widened what a job body contains.
+
+Every one of those was found by mutating the files and running the guards, never
+by reading them — which is the only way this class of bug is ever found, and the
+reason a guard with no negative control is worth about as much as a comment.
+Every shape above is now a test.
+
+### Not covered
+
+- **MCP `semantic_code_search` still does not disclose a consumed pool.** The
+  CLI half has said so since 0.137.0. The MCP half has the widening retry but
+  neither return path carries the signal: a short non-empty answer goes through
+  a function that is not passed the drop counts at all, and an empty one reports
+  the counts with advice ("broaden or clear the filter") that is wrong when what
+  emptied the pool was exhaustion rather than the filter. The data is all in
+  scope at the call site; what is not settled is which pool the numbers should
+  describe once the retry has replaced the first one.
+- **`mcp_startup_embeds_without_any_tool_call` is still unexplained.** Ten
+  real-weight pairings run locally for this release passed, 95–165 s against a
+  300 s budget, and the scheduled cache warm has run the pair once since the
+  0.137.0 split put it there, and passed — but nothing here touches the embedding
+  path, and 0 failures in 10 puts the 95% upper bound on the true rate at 26%.
+  It is not fixed; it did not happen.
+- Several shapes still slip past the CI guards and are documented rather than
+  closed: a fetch that is not `curl` (`wget`, `Invoke-WebRequest`), a command
+  behind a shell variable, and `cargo` invoked from a script under `scripts/`
+  rather than from a workflow. All are bounded by the new job timeouts, which is
+  the weaker but broader net.
+- The two `similar_noise_filtered*` fields have no MCP-side test for the
+  `cutoff_dropped` path they sit beside; that path is covered on the CLI only.
+
 ## 0.137.0
 
 **Upgrading:** one command can now return **more** rows for a query you already
