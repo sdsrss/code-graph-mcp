@@ -367,15 +367,16 @@ pub struct DeadCodeItem {
     pub is_exported: bool,
 }
 
+/// Rows the shared report fetches before filtering. Named because three things
+/// must agree on it: `scan_capped` below, every caller's `--top`, and the text
+/// the CLI prints when the cap is what answered.
+pub const DEAD_CODE_SCAN_LIMIT: i64 = 200;
+
 /// The single authoritative dead-code result both the CLI (`cmd_dead_code`) and
 /// MCP (`tool_find_dead_code`) format. Surfaces own their rendering; they must
 /// NOT recompute counts or the hidden-below-threshold probe. `items` preserves
 /// find_dead_code order (orphans and exported interleaved as returned); each
 /// surface can partition by `is_exported`.
-/// Rows the shared report fetches before filtering. Named because two things
-/// depend on it agreeing: `scan_capped` below, and every caller's `--top`.
-pub const DEAD_CODE_SCAN_LIMIT: i64 = 200;
-
 pub struct DeadCodeReport {
     pub items: Vec<DeadCodeItem>,
     pub orphan_count: usize,
@@ -504,7 +505,14 @@ pub fn dead_code_report(
     // (audit 2026-08-02 MED-4). The probe now splits: past-the-ignore-filter →
     // below_threshold, caught-by-ignore → ignored.
     let hidden_below_threshold = if filtered.is_empty() && ignored_count == 0 && min_lines > 1 {
-        let probe = find_dead_code(conn, path, node_type, include_tests, 1, 200)?;
+        let probe = find_dead_code(
+            conn,
+            path,
+            node_type,
+            include_tests,
+            1,
+            DEAD_CODE_SCAN_LIMIT,
+        )?;
         let (kept, ignored_short): (Vec<_>, Vec<_>) = probe
             .into_iter()
             .partition(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)));
@@ -2428,5 +2436,116 @@ mod tests {
         assert!(validate_dead_code_type_filter(Some("fucntion")).is_err());
         assert!(validate_dead_code_type_filter(Some("fn")).is_ok());
         assert!(validate_dead_code_type_filter(None).is_ok());
+    }
+
+    /// `scan_capped` must be a pure function of the MAIN scan.
+    ///
+    /// Both wrong implementations this field has already had are pinned out, and
+    /// each needs its OWN fixture — with only one of them, the other bug passes:
+    ///
+    /// * A post-filter count (`items.len()`) reads FALSE on fixture C, where the
+    ///   scan hit its ceiling and the ignore list then emptied the result. That
+    ///   is the shape any real repo produces, and it is the original bug.
+    /// * `items.len() + ignored_count` reads TRUE on fixture A, where the main
+    ///   scan fetched nothing at all: the `min_lines = 1` probe also feeds
+    ///   `ignored_count`, and nothing was truncated. That is the second bug,
+    ///   introduced while fixing the first.
+    ///
+    /// Fixture B is the positive case. Only `pre_count`, which just this
+    /// function can see, answers all three (pre-ship review 2026-09-06).
+    #[test]
+    fn dead_code_report_scan_capped_tracks_the_main_scan_only() {
+        let ignores = crate::domain::default_dead_code_ignores();
+
+        let seed = |path: &str, lines: i64, count: usize| {
+            let (db, tmp) = test_db();
+            {
+                let conn = db.conn();
+                let fid = upsert_file(
+                    conn,
+                    &FileRecord {
+                        path: path.into(),
+                        blake3_hash: "h".into(),
+                        last_modified: 1,
+                        language: Some("typescript".into()),
+                    },
+                )
+                .unwrap();
+                for i in 0..count {
+                    let start = (i as i64) * 20 + 1;
+                    insert_node(
+                        conn,
+                        &NodeRecord {
+                            file_id: fid,
+                            node_type: "function".into(),
+                            name: format!("orphan_{i}"),
+                            qualified_name: None,
+                            start_line: start,
+                            end_line: start + lines - 1,
+                            code_content: "function orphan() { ... }".into(),
+                            signature: None,
+                            doc_comment: None,
+                            context_string: None,
+                            name_tokens: None,
+                            return_type: None,
+                            param_types: None,
+                            is_test: false,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            (db, tmp)
+        };
+
+        // A. Nothing survives the main scan (every candidate is a 1-liner, below
+        //    min_lines=3), so `pre_count` is 0 and NOTHING was truncated. The
+        //    min_lines=1 probe then finds 200 and, because they sit under an
+        //    ignored prefix, adds all 200 to `ignored_count`. Any implementation
+        //    reading that counter calls this a capped scan. It is not one.
+        let (db_a, _tmp_a) = seed(
+            "claude-plugin/scripts/short.ts",
+            1,
+            DEAD_CODE_SCAN_LIMIT as usize,
+        );
+        let a = dead_code_report(db_a.conn(), None, None, false, 3, &ignores).unwrap();
+        assert!(a.items.is_empty(), "precondition: nothing clears min_lines");
+        assert!(
+            a.ignored_count >= DEAD_CODE_SCAN_LIMIT as usize,
+            "precondition: the probe must have filled ignored_count; got {}",
+            a.ignored_count
+        );
+        assert!(
+            !a.scan_capped,
+            "the main scan fetched 0 rows and truncated nothing — `ignored_count` \
+             is the probe's, not the scan's"
+        );
+
+        // B. The main scan really does hit its ceiling.
+        let (db_b, _tmp_b) = seed("src/app.ts", 9, DEAD_CODE_SCAN_LIMIT as usize + 5);
+        let b = dead_code_report(db_b.conn(), None, None, false, 3, &ignores).unwrap();
+        assert!(
+            b.scan_capped,
+            "200 rows fetched against a 200-row limit is a capped scan; got {} items",
+            b.items.len()
+        );
+
+        // C. Capped AND emptied by the ignore list — the original bug's shape,
+        //    and the one B cannot catch because B's candidates all survive.
+        let (db_c, _tmp_c) = seed(
+            "claude-plugin/scripts/long.ts",
+            9,
+            DEAD_CODE_SCAN_LIMIT as usize,
+        );
+        let c = dead_code_report(db_c.conn(), None, None, false, 3, &ignores).unwrap();
+        assert!(
+            c.items.is_empty(),
+            "precondition: the ignore filter empties a capped scan"
+        );
+        assert!(
+            c.scan_capped,
+            "the scan fetched its full limit before the ignore filter ran — a \
+             post-filter count cannot see that"
+        );
     }
 }

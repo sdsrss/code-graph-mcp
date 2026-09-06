@@ -31,11 +31,19 @@ replace anything: `impact.value_references` on `get_ast_node include_impact`;
 `get_call_graph`; `dead_code_ignored`, `dead_code_hidden_below_threshold` and
 `dead_code_scan_capped` on `report --json`; `lastError` in
 `~/.cache/code-graph/update-state.json`; `fallthrough_reason` in
-`.code-graph/recommendations.jsonl`. New library export:
-`storage::db::savepoint_on`. New output on paths that previously said nothing:
+`.code-graph/recommendations.jsonl`. New library exports:
+`storage::db::savepoint_on` and `storage::queries::DEAD_CODE_SCAN_LIMIT`, plus a
+`scan_capped` field on `DeadCodeReport`. New output on paths that previously said nothing:
 one stderr line from CLI `similar` when the noise filter shortened its list, and
 on stdout, `report`'s dead-code count lines and `doctor`'s row for a probe that
-could not run at all (which can turn a formerly all-green `doctor` yellow).
+could not run at all.
+
+That last one changes `doctor`'s **exit code**. A probe that threw used to drop
+its row, and `doctor` exited 0 on a table that looked complete; it now reports a
+`warn` row, which counts as unresolved and exits 1. If you have a check keying
+off `code-graph-mcp doctor`'s exit status, it will start failing on a machine
+where a probe cannot run — which is the point, but it is a new failure on
+unchanged machines. Nothing else in this release changes an exit code.
 
 `get_call_graph`'s `test_callers_filtered` had the same one-field-two-meanings
 problem the CLI is fixing here — it counted hidden callees too, so an agent

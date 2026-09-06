@@ -240,7 +240,8 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     if dead_scan_capped {
         writeln!(
             stdout,
-            "  (scan capped at 200 candidates — --top {top} cannot be honored beyond that)"
+            "  (scan capped at {} candidates — --top {top} cannot be honored beyond that)",
+            crate::storage::queries::DEAD_CODE_SCAN_LIMIT
         )?;
     }
 
