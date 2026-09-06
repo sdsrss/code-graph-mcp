@@ -274,6 +274,20 @@ impl McpServer {
             (callers, callees)
         };
 
+        // BOTH response shapes owe this disclosure. The rollup branch below builds
+        // its payload from scratch, so attaching the counts only on the flat path
+        // meant that above the compression threshold — a dense graph, exactly where
+        // one hidden test caller is hardest to notice — the agent was told nothing
+        // had been hidden (pre-ship review 2026-09-06, filed for this release).
+        let attach_test_filtered = |v: &mut serde_json::Value| {
+            if test_callers_count > 0 {
+                v["test_callers_filtered"] = json!(test_callers_count);
+            }
+            if test_callees_count > 0 {
+                v["test_callees_filtered"] = json!(test_callees_count);
+            }
+        };
+
         let est_tokens = crate::sandbox::compressor::estimate_json_tokens(&json!(all_nodes));
         if est_tokens > COMPRESSION_TOKEN_THRESHOLD {
             // File-level rollup: group by (file_path, direction), emit counts + a small
@@ -363,6 +377,7 @@ impl McpServer {
                     "total_count": callee_total,
                 },
             });
+            attach_test_filtered(&mut rollup);
             attach_truncation_flags(&mut rollup, results);
             attach_suppressed_ambiguous(&mut rollup, results);
             return Ok(rollup);
@@ -383,12 +398,7 @@ impl McpServer {
             "callees": callee_nodes,
             "callers": caller_nodes,
         });
-        if test_callers_count > 0 {
-            result["test_callers_filtered"] = json!(test_callers_count);
-        }
-        if test_callees_count > 0 {
-            result["test_callees_filtered"] = json!(test_callees_count);
-        }
+        attach_test_filtered(&mut result);
         attach_truncation_flags(&mut result, results);
         attach_suppressed_ambiguous(&mut result, results);
         Ok(result)

@@ -1122,6 +1122,231 @@ fn test_cli_health_check_unknown_flag_errors() {
 // search
 // ============================================================
 
+/// Project whose FTS pool for "widget" saturates before the one Python match is
+/// reached: 120 TS functions carry the term in their NAME (bm25 weight 5.0 via
+/// `name_tokens`) and one long Python function carries it once in its BODY
+/// (weight 2.0, diluted by 80 filler lines). Measured on this fixture: the
+/// Python match is not in the top 100, and IS in the top 400.
+///
+/// Both halves matter. An earlier attempt put the term in a SHORT Python body
+/// and the function ranked FIRST — bm25 normalizes by document length, so a
+/// weak-column match in a short document beats a strong-column match. The 80
+/// filler lines are what make the ordering a property of the fixture rather
+/// than a coincidence to be re-measured on every SQLite bump.
+fn setup_saturating_pool_project(distractors: usize) -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let mut pool = String::new();
+    for i in 0..distractors {
+        pool.push_str(&format!("function widgetHandler{i}() {{ return {i}; }}\n"));
+    }
+    std::fs::write(src.join("pool.ts"), &pool).unwrap();
+
+    let mut carrier = String::from("def carrier_box():\n");
+    for i in 0..80 {
+        carrier.push_str(&format!("    filler_{i} = {i}\n"));
+    }
+    carrier.push_str("    return widget\n");
+    std::fs::write(src.join("carrier.py"), &carrier).unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// SURF-03 (audit 2026-09-05): the CLI `search` had no pool-exhaustion retry,
+/// so a selective filter over a saturated pool returned NOTHING while telling
+/// the user to "broaden or clear the filter" — advice that cannot help, because
+/// the filter was never the problem: the match sat below the fetch cut. The MCP
+/// twin has widened once on exhaustion since the 2026-08-16 audit (P1-7); this
+/// is the last of the CLI/MCP pairs to be brought over.
+#[test]
+fn test_cli_search_retries_on_pool_exhaustion() {
+    // 120 distractors: they fill the first pool (100) and not the retry pool (400).
+    let project = setup_saturating_pool_project(120);
+
+    // limit 1 + a filter → fetch_count = max(1*16, 100) = 100, which the 120
+    // name-matching TS functions fill on their own.
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "search",
+            "widget",
+            "--language",
+            "python",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; got {stdout}"));
+    let results = v
+        .as_array()
+        .unwrap_or_else(|| panic!("a found match must render as the bare result array, got {v}"));
+    assert_eq!(
+        results.len(),
+        1,
+        "carrier_box matches and is reachable at fetch=400; the first pool just \
+         could not see it. Got {v}"
+    );
+    assert_eq!(results[0]["name"], "carrier_box");
+}
+
+/// The other half of SURF-03: the retry is bounded, so it can still come back
+/// short. When it does, the answer is under-returned and nothing on stdout says
+/// so — the empty case prints an envelope whose `filtered_out` count invites
+/// exactly the wrong fix ("broaden the filter"), and the non-empty case is a
+/// bare array indistinguishable from a complete one.
+#[test]
+fn test_cli_search_discloses_a_pool_the_retry_could_not_widen_past() {
+    // 420 distractors: enough to fill the RETRY pool (400) too, so the Python
+    // match stays below the cut even after the widening.
+    let project = setup_saturating_pool_project(420);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "search",
+            "widget",
+            "--language",
+            "python",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; got {stdout}"));
+    assert_eq!(
+        v["results"].as_array().map(|a| a.len()),
+        Some(0),
+        "this fixture must stay short even after the retry, or it is testing \
+         the previous case; got {v}"
+    );
+    assert_eq!(
+        v["pool_saturated"],
+        serde_json::json!(true),
+        "a consumed pool must be disclosed IN-BAND — under `--json 2>/dev/null` \
+         stdout is all the consumer sees; got {v}"
+    );
+    assert!(
+        stderr.contains("consumed before the limit was filled"),
+        "the prose must say the pool ran out, not only that the filter dropped \
+         rows — the filter is not what removed the match. stderr: {stderr}"
+    );
+}
+
+/// Regression: the exhaustion retry must not outrun the freshness resync.
+///
+/// `refresh_files_if_stale` is bounded by the files of the pool handed to it, and
+/// the retry REPLACES that pool with a wider one. Ordered wrong, the widened pool
+/// carries files the resync never saw, so `search` returns their pre-edit
+/// `start_line`/`end_line` — off by exactly the edit size — with
+/// `outcome.disclose()` already printed (pre-ship review 2026-09-06, measured at
+/// `start_line` 1 where the truth was 11). The match here is reachable ONLY
+/// through the retry, so this exercises that pool and not the first one.
+#[test]
+fn test_cli_search_retry_pool_is_freshness_checked() {
+    let project = setup_saturating_pool_project(120);
+    let args = [
+        "search",
+        "widget",
+        "--language",
+        "python",
+        "--limit",
+        "1",
+        "--json",
+    ];
+
+    let (before, stderr, code) = run_cli(&project, &args);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let s1 = json_start_line(&before, "carrier_box");
+
+    prepend_pad(&project, "src/carrier.py", 10);
+
+    // Control arm: with the resync disabled the answer MUST stay stale. Without
+    // it, a test that never reached the resync at all would pass just as happily
+    // as one that reached it and got the right answer.
+    let (red, _, _) = run_cli_env(&project, &args, &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(
+        json_start_line(&red, "carrier_box"),
+        s1,
+        "budget 0 must stay stale, or this test is not exercising the resync: {red}"
+    );
+
+    let (after, _, _) = run_cli(&project, &args);
+    assert_eq!(
+        json_start_line(&after, "carrier_box"),
+        s1 + 10,
+        "a match reached through the RETRY pool must still carry post-edit line \
+         numbers: {after}"
+    );
+}
+
+/// Regression: an empty answer whose pool was consumed by noise disclosed nothing.
+///
+/// The in-band disclosure hung off `filtered && dropped_by_filter > 0`, so it was
+/// unreachable whenever the drops were noise rather than the user's own filter —
+/// and that is the case where a bare `[]` reads most strongly as "this repo has
+/// no such code", because there is no filter for the user to broaden either
+/// (pre-ship review 2026-09-06).
+#[test]
+fn test_cli_search_discloses_a_pool_emptied_by_noise() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // `test_*` in a NON-test file: `is_test` is 0 in the DB, so fts5_search's SQL
+    // `n.is_test = 0` keeps them in the pool, and the Rust-side name heuristic
+    // then drops every one as noise. The pool comes back full (80 for an
+    // unfiltered --limit 20) and is emptied entirely.
+    let mut pool = String::new();
+    for i in 0..150 {
+        pool.push_str(&format!(
+            "function test_widgetzz_h{i}() {{ return {i}; }}\n"
+        ));
+    }
+    std::fs::write(src.join("pool.ts"), &pool).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["search", "widgetzz", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; got {stdout}"));
+    assert_eq!(
+        v["results"].as_array().map(|a| a.len()),
+        Some(0),
+        "fixture must actually come back empty; got {v}"
+    );
+    assert_eq!(
+        v["pool_saturated"],
+        serde_json::json!(true),
+        "a pool that came back full and was emptied must say so IN-BAND — stdout \
+         is all a `--json 2>/dev/null` consumer sees; got {v}"
+    );
+    assert!(
+        v["noise_skipped"].as_u64().unwrap_or(0) > 0,
+        "the envelope must name the drop that emptied it; got {v}"
+    );
+    assert!(
+        stderr.contains("dropped as noise"),
+        "the prose must not tell the user to broaden a filter they never set. \
+         stderr: {stderr}"
+    );
+}
+
 #[test]
 fn test_cli_search() {
     let project = setup_indexed_project();

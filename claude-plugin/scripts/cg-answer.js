@@ -336,7 +336,13 @@ function runOverviewAnswer(opts = {}) {
     // green against it.
     const verdict = classifyRun(res, { exitOneIsNoHits: false });
     if (verdict !== 'ok') {
-      return { status: verdict };
+      // Same arm as the three sibling runners: an exhausted hook budget reaches
+      // `classifyRun` as a synthetic timeout, so without this it is reported as
+      // a bare `unavailable` — indistinguishable from a wedged or broken binary.
+      // This runner is the read-fanout hint's only answer path, and its budget is
+      // the one most often already spent (pre-read runs after a SessionStart that
+      // already burned six children), so it is the worst place to lose the cause.
+      return { status: verdict, ...(res.budgetExhausted ? { reason: 'budget' } : {}) };
     }
     const out = (res.stdout || '').trim();
     if (isEmptyAnswer(out)) return { status: 'no-hits' };

@@ -390,3 +390,43 @@ test('trackReadAndMaybeHint: top-level and outside-root paths never fire', () =>
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('trackReadAndMaybeHint: a spent budget records fallthrough_reason:budget beside reason:unavailable', () => {
+  // `reason` must KEEP its three-value enum (no-binary / unavailable / no-hits):
+  // src/cli/usage.rs:448 scores `reason:"unavailable"` as an inconclusive
+  // follow-up, so widening that field would silently re-file every budget skip
+  // as "the inline answer was insufficient" — the opposite of the truth. The
+  // cause rides alongside in `fallthrough_reason`, the field pre-grep-guide.js
+  // already established for exactly this (audit 2026-09-05, §六).
+  //
+  // `_CG_ANSWER_BINARY` is set to a path that is never spawned: an exhausted
+  // budget short-circuits inside runCg before any child starts.
+  const { resetHookDeadline } = require('./hook-fail-open');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-budget-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  process.env._CG_ANSWER_BINARY = path.join(root, 'never-spawned');
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  resetHookDeadline(Date.now() - 1);
+  try {
+    let fired = false;
+    for (let i = 0; i < 5; i++) {
+      fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
+    }
+    assert.equal(fired, true, '5th same-dir read must still fire the hint');
+    const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const last = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(last.answered, false);
+    assert.equal(last.reason, 'unavailable',
+      'the aggregator-scored enum must not change value');
+    assert.equal(last.fallthrough_reason, 'budget',
+      'a hint that went quiet because the budget was spent must not read as a broken binary');
+  } finally {
+    resetHookDeadline();
+    process.stdout.write = origWrite;
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

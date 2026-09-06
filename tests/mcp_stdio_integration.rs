@@ -8,9 +8,61 @@
 //!   - SQL caller_count filtering produces the same shape MCP clients see (R4/R5)
 //!   - find_references explanatory error for test-only symbols (A fix)
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How much of a spawned server's stderr to keep for diagnostics. Reading
+/// continues past this — the point is that the pipe never fills, not that every
+/// line is kept.
+const STDERR_RETAIN: usize = 256 * 1024;
+
+/// Drain a spawned server's stderr on a thread, retaining a bounded prefix.
+///
+/// Every `serve` spawn in this file pipes stderr and then takes only `stdout`,
+/// so nothing ever read the stderr pipe. A pipe nobody reads has a ~64 KiB
+/// kernel buffer and the child blocks forever on the write that fills it, so
+/// this is a latent deadlock — and the diagnostics that would identify it are
+/// sitting in the very pipe nobody read.
+///
+/// **It is not the cause of the intermittent failure that prompted it**, and the
+/// comment here said otherwise until it was measured: a `serve` on a 360-node
+/// fixture writes **164 bytes** of stderr in 75 s (three INFO lines — model
+/// loaded, session started, session ended), three orders of magnitude short of
+/// filling the buffer. The pipe-full hypothesis is refuted for the default log
+/// level; it would only bite under something like `RUST_LOG=debug`.
+///
+/// Kept anyway, for the two things it does deliver: the latent deadlock is real
+/// if log volume ever grows, and a failing assertion can now print what the
+/// server said instead of failing silently. The intermittent
+/// `0 vectors after 300 s` seen by an independent reviewer (2 runs in 6, both
+/// `mcp_startup_embeds_without_any_tool_call` running second) remains
+/// **unexplained** — not slowness, not weights, not this (pre-ship review
+/// 2026-09-06).
+fn drain_child_stderr(child: &mut Child) -> Arc<Mutex<Vec<u8>>> {
+    let mut pipe = child.stderr.take().expect("stderr piped");
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    // Poisoning is irrelevant here: this is a diagnostic buffer,
+                    // and dropping the read would reintroduce the block.
+                    let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() < STDERR_RETAIN {
+                        let room = STDERR_RETAIN - guard.len();
+                        guard.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
+        }
+    });
+    buf
+}
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -156,6 +208,26 @@ struct McpClient {
     next_id: i64,
     reader: BufReader<std::process::ChildStdout>,
     init_response: Value,
+    /// Kept so a failing assertion can say what the server was doing. See
+    /// `drain_child_stderr` for why the pipe must be read at all.
+    ///
+    /// The DRAIN matters on both feature legs — an unread pipe deadlocks the
+    /// child regardless — but the retained bytes are only read by the
+    /// `embed-model` backfill assertion, so without that feature this field and
+    /// the accessor below are dead code, and this crate builds tests with
+    /// warnings denied.
+    #[cfg_attr(not(feature = "embed-model"), allow(dead_code))]
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl McpClient {
+    /// The server's stderr so far — for failure messages, so a hung or silent
+    /// server is diagnosable instead of just late.
+    #[cfg_attr(not(feature = "embed-model"), allow(dead_code))]
+    fn stderr_tail(&self) -> String {
+        let buf = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 }
 
 impl McpClient {
@@ -173,6 +245,7 @@ impl McpClient {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn mcp server");
+        let stderr = drain_child_stderr(&mut child);
         let stdout = child.stdout.take().expect("stdout piped");
         let reader = BufReader::new(stdout);
         let mut client = Self {
@@ -180,6 +253,7 @@ impl McpClient {
             next_id: 1,
             reader,
             init_response: Value::Null,
+            stderr,
         };
 
         // Initialize handshake — required before tools/list or tools/call
@@ -341,6 +415,9 @@ fn mcp_force_plugin_mcp_overrides_non_project_gate() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp server");
+    // Same reason as McpClient::spawn — an unread stderr pipe deadlocks the
+    // child once its 64 KiB buffer fills. See drain_child_stderr.
+    let _stderr = drain_child_stderr(&mut child);
     let stdout = child.stdout.take().expect("stdout piped");
     let mut reader = BufReader::new(stdout);
     let stdin = child.stdin.as_mut().expect("stdin piped");
@@ -722,6 +799,39 @@ fn mcp_find_dead_code_rejects_unknown_node_type() {
 #[cfg(feature = "embed-model")]
 const EMBED_POLL_BUDGET: Duration = Duration::from_secs(300);
 
+/// Are real model weights loadable? Gate for the only two tests in this repo that
+/// exercise embedding end to end with real weights rather than a synthetic seam.
+///
+/// Both used to `eprintln!("[skip] …")` and return. A passing test's stderr is
+/// captured, so that skip was invisible: the `embed-check` job, the release gate
+/// and `cache-warm` all set `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` on a runner
+/// with no cached model, so both tests reported green having executed nothing,
+/// and the first real-weight check in the whole pipeline was `smoke-verify` —
+/// which `needs: publish` (audit 2026-09-05 ENG-02).
+///
+/// Asserting on bare `CI` (the shape `has_ripgrep` uses in cli_e2e.rs) would be
+/// wrong here: CI disables the download deliberately, so that assert would
+/// redden every run. `CODE_GRAPH_REQUIRE_MODEL=1` instead lets the one job that
+/// actually provides weights demand that they be there — and turns the skip red
+/// for it alone, which is the whole point of the flag.
+#[cfg(feature = "embed-model")]
+fn embedding_model_available() -> bool {
+    let present = code_graph_mcp::embedding::model::EmbeddingModel::load()
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        present || std::env::var_os("CODE_GRAPH_REQUIRE_MODEL").is_none(),
+        "CODE_GRAPH_REQUIRE_MODEL=1 is set but the embedding model did not load — \
+         the two real-weight backfill regressions would have skipped silently, \
+         which is the state this flag exists to make impossible"
+    );
+    if !present {
+        eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
+    }
+    present
+}
+
 /// Regression: an "edit-only" session that issues NO code-graph tool call must
 /// still get its index embedded. The embedding backfill used to be kicked off
 /// only by `consume_startup_index_result()`, which runs on an incoming MCP
@@ -735,18 +845,7 @@ fn mcp_startup_embeds_without_any_tool_call() {
     use code_graph_mcp::storage::db::Database;
     use code_graph_mcp::storage::queries::count_nodes_with_vectors;
 
-    // Coverage note: CI's `embed-check` job now runs `cargo test --features embed-model`,
-    // but with CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1 (set by McpClient::spawn AND the job),
-    // so the server never auto-fetches weights. This test therefore still runs only
-    // where the model is ALREADY cached (a local `cargo test --features embed-model`);
-    // in CI it skips. It needs real weights to observe embedding; skip loudly when
-    // absent rather than false-fail.
-    if code_graph_mcp::embedding::model::EmbeddingModel::load()
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
+    if !embedding_model_available() {
         return;
     }
 
@@ -792,10 +891,23 @@ fn mcp_startup_embeds_without_any_tool_call() {
         }
     }
 
+    // The server's own log is the difference between "the backfill is slow" and
+    // "the backfill never started", and this assertion used to report neither —
+    // it fired with the diagnostics still sitting unread in a pipe (see
+    // `drain_child_stderr`).
+    //
+    // Triage for whoever catches the intermittent `0 vectors` failure, from the
+    // 11 log lines a healthy run emits (pre-ship review 2026-09-06):
+    //   - no `[model] Using custom model`  → the server never saw CODE_GRAPH_MODEL_DIR
+    //   - `loaded successfully`, no `[embed]` → the backfill never started; this is
+    //     the strand class this test exists to catch
+    //   - `[embed] N embedded` but 0 vectors → a write/commit problem, not embedding
     assert!(
         embedded > 0,
-        "startup index must embed nodes with NO tool call; got {embedded} vectors after {:?}",
-        EMBED_POLL_BUDGET
+        "startup index must embed nodes with NO tool call; got {embedded} vectors after {:?}\n\
+         --- server stderr ---\n{}",
+        EMBED_POLL_BUDGET,
+        client.stderr_tail()
     );
 }
 
@@ -811,12 +923,7 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     use code_graph_mcp::storage::db::Database;
     use code_graph_mcp::storage::queries::{count_nodes_with_vectors, count_unembedded_nodes};
 
-    if code_graph_mcp::embedding::model::EmbeddingModel::load()
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
+    if !embedding_model_available() {
         return;
     }
 
@@ -1075,6 +1182,9 @@ fn mcp_oversized_multibyte_message_does_not_kill_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp server");
+    // Same reason as McpClient::spawn — an unread stderr pipe deadlocks the
+    // child once its 64 KiB buffer fills. See drain_child_stderr.
+    let _stderr = drain_child_stderr(&mut child);
     let stdout = child.stdout.take().expect("stdout piped");
     let mut reader = BufReader::new(stdout);
     let mut stdin = child.stdin.take().expect("stdin piped");
@@ -1139,6 +1249,9 @@ fn mcp_oversized_line_beyond_2x_max_drains_fully_no_spurious_error() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp server");
+    // Same reason as McpClient::spawn — an unread stderr pipe deadlocks the
+    // child once its 64 KiB buffer fills. See drain_child_stderr.
+    let _stderr = drain_child_stderr(&mut child);
     let stdout = child.stdout.take().expect("stdout piped");
     let mut reader = BufReader::new(stdout);
     let mut stdin = child.stdin.take().expect("stdin piped");

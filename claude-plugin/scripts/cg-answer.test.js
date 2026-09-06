@@ -437,3 +437,38 @@ test('_CG_ANSWER_TIMEOUT_MS is floored at the source, not left to remainingMs', 
     delete require.cache[require.resolve('./cg-answer')];
   }
 });
+
+// ── budget exhaustion must stay distinguishable from a broken binary ──────
+// A spent hook budget degrades to `unavailable` — the same word a wedged or
+// missing-at-runtime binary produces. `reason:'budget'` is what separates
+// them, and it is what makes NEW-08's failure mode ("a healthy hook answers
+// nothing under load") countable instead of invisible. Three of the four
+// runners set it; `runOverviewAnswer` did not, so the read-fanout hint — the
+// one surface whose budget is spent by a SessionStart that already ran six
+// children — was exactly the one that could not say why it went quiet.
+//
+// `resetHookDeadline(Date.now() - 1)` is the documented seam for this branch:
+// arming a real budget and waiting it out is a clock race, not a test.
+test('every runner names a spent budget as reason:budget, not a bare unavailable', () => {
+  const { resetHookDeadline } = require('./hook-fail-open');
+  const bin = stubBinary();
+  resetHookDeadline(Date.now() - 1);
+  try {
+    let checked = 0;
+    for (const [name, call] of [
+      ['grep', () => runGrepAnswer({ cwd: stubDir, binary: bin, pattern: 'anySymbol' })],
+      ['show', () => runShowAnswer({ cwd: stubDir, binary: bin, symbols: ['anySymbol'] })],
+      ['overview', () => runOverviewAnswer({ cwd: stubDir, binary: bin, dir: 'src' })],
+      ['callgraph', () => runCallgraphAnswer({ cwd: stubDir, binary: bin, symbol: 'anySymbol' })],
+    ]) {
+      const r = call();
+      assert.equal(r.status, 'unavailable', `${name}: a spent budget degrades to unavailable`);
+      assert.equal(r.reason, 'budget',
+        `${name}: … and must say WHY, or a spent budget reads as a broken binary`);
+      checked++;
+    }
+    assert.equal(checked, 4, 'vacuity floor: all four runners were exercised');
+  } finally {
+    resetHookDeadline();
+  }
+});

@@ -1417,6 +1417,210 @@ fn release_and_cache_warm_workflows_do_not_drift() {
     }
 }
 
+/// `(basename, sha256)` for every model-asset pin line in a workflow.
+///
+/// Reads the `sha256sum -c` heredocs. Free function rather than a closure so the
+/// guard below can run it on a deliberately tampered copy and prove it can fail —
+/// a pin-equality assertion that has never been shown to reject anything is
+/// indistinguishable from one that reads the wrong lines.
+fn model_asset_pins(workflow: &str) -> Vec<(String, String)> {
+    const ASSETS: [&str; 3] = ["model.safetensors", "tokenizer.json", "config.json"];
+    let mut pins = Vec::new();
+    for line in workflow.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(hash), Some(path)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if parts.next().is_some()
+            || hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if let Some(asset) = ASSETS.iter().find(|a| path.ends_with(**a)) {
+            pins.push(((*asset).to_string(), hash.to_string()));
+        }
+    }
+    pins
+}
+
+/// Every job that downloads `model-assets-v1` pins the SAME bytes.
+///
+/// Three copies now: release.yml's gate (the cheap pre-publish real-weight
+/// check), release.yml's publish job (which packages `models.tar.gz`), and
+/// cache-warm.yml's backfill regressions. A re-cut of that release updates one
+/// copy at a time, and drift is invisible in the worst direction — the gate
+/// would certify bytes that are not the bytes shipped, with every job green
+/// (audit 2026-09-05 ENG-02; pre-ship review 2026-09-06).
+#[test]
+fn release_model_pins_agree_across_jobs() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let read = |name: &str| -> String {
+        std::fs::read_to_string(wf.join(name))
+            .unwrap_or_else(|e| panic!("read {name}: {e}"))
+            .replace("\r\n", "\n")
+    };
+    let release = read("release.yml");
+    let mut pins = model_asset_pins(&release);
+    pins.extend(model_asset_pins(&read("cache-warm.yml")));
+
+    // Vacuity floor: three assets × three download sites. If a job stops
+    // pinning, or the heredoc shape changes so these lines stop parsing, this
+    // fails rather than passing over an empty list.
+    assert_eq!(
+        pins.len(),
+        9,
+        "expected 3 pinned model assets in each of the 3 jobs that download them; \
+         got {pins:?}"
+    );
+
+    for asset in ["model.safetensors", "tokenizer.json", "config.json"] {
+        let hashes: Vec<&String> = pins
+            .iter()
+            .filter(|(a, _)| a == asset)
+            .map(|(_, h)| h)
+            .collect();
+        assert_eq!(hashes.len(), 3, "{asset}: expected 3 pins, got {hashes:?}");
+        assert!(
+            hashes.iter().all(|h| *h == hashes[0]),
+            "{asset} is pinned to more than one hash ({hashes:?}): a job would \
+             verify bytes other than the ones packaged for users"
+        );
+    }
+
+    // Prove the check can reject. Flipping one nibble of the first pin must be
+    // caught; without this the assertions above pass just as happily against a
+    // parser that returns two copies of the same line.
+    //
+    // The replacement nibble is chosen against the current one rather than being
+    // the literal '0': a hash that already starts with '0' would make the
+    // "tamper" a no-op, and this self-check would then fail on a CORRECT pin —
+    // reddening the suite on the day someone re-cuts `model-assets-v1` and the
+    // weights happen to hash that way, with a message blaming the parser. One in
+    // sixteen re-cuts (pre-ship review, 2026-09-06).
+    //
+    // Tampering is applied to release.yml alone, which carries two of the three
+    // copies by itself (gate + publish), so one flipped nibble is enough to make
+    // them disagree.
+    let first = &pins[0].1;
+    let flipped = if first.starts_with('0') { '1' } else { '0' };
+    let tampered = release.replacen(first.as_str(), &format!("{flipped}{}", &first[1..]), 1);
+    let tampered_pins = model_asset_pins(&tampered);
+    let mismatched = tampered_pins
+        .iter()
+        .filter(|(a, _)| *a == pins[0].0)
+        .map(|(_, h)| h)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatched.len(),
+        2,
+        "release.yml alone must still carry two copies for this self-check to \
+         mean anything; got {mismatched:?}"
+    );
+    assert_ne!(
+        mismatched[0], mismatched[1],
+        "the guard must see a one-nibble difference between release.yml's two \
+         pin blocks"
+    );
+}
+
+/// Every `--exact` test name in a real-weight CI step actually exists.
+///
+/// `cargo test <filter>` exits 0 when the filter matches nothing — measured on
+/// this repo: `0 passed … EXIT=0`. So a rename would silently restore the exact
+/// state these steps exist to end: green having executed nothing, with
+/// `CODE_GRAPH_REQUIRE_MODEL` powerless because its assert lives inside a test
+/// that never runs. Both steps assert an `N passed` line at run time; this
+/// asserts the names at build time, so the break surfaces in a local
+/// `cargo test` instead of in a release (pre-ship review, 2026-09-06).
+///
+/// Covers both halves of the split: release.yml's gate runs the cheap
+/// load-and-embed check before publish, and cache-warm.yml's cron runs the two
+/// intermittently-failing backfill regressions off the critical path.
+#[test]
+fn release_gate_runs_the_real_weight_tests_by_name() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |p: std::path::PathBuf| -> String {
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    };
+    // A name may be defined in either the integration target or the lib's own
+    // test module, since the split put one in each.
+    let sources = format!(
+        "{}{}",
+        read(root.join("tests/mcp_stdio_integration.rs")),
+        read(root.join("src/embedding/model.rs"))
+    );
+
+    // The names sit between `--exact` and the next flag, across a line
+    // continuation. Read them from the workflow rather than hard-coding them
+    // here, or this guard pins a copy instead of the thing that runs.
+    let names_after_exact = |yaml: &str| -> Vec<String> {
+        let mut names = Vec::new();
+        let mut after_exact = false;
+        for tok in yaml.split_whitespace() {
+            if tok == "--exact" {
+                after_exact = true;
+                continue;
+            }
+            if !after_exact {
+                continue;
+            }
+            if tok == "\\" {
+                continue;
+            }
+            if tok.starts_with('-') {
+                after_exact = false;
+                continue;
+            }
+            names.push(tok.to_string());
+        }
+        names
+    };
+
+    let mut checked = 0usize;
+    for (file, expected_count) in [("release.yml", 1usize), ("cache-warm.yml", 2usize)] {
+        let yaml = read(wf.join(file));
+        let names = names_after_exact(&yaml);
+        assert_eq!(
+            names.len(),
+            expected_count,
+            "expected {file}'s real-weight step to name exactly {expected_count} \
+             test(s) after `--exact`; parsed {names:?}"
+        );
+        for name in &names {
+            // The lib test is addressed by its module path; match on the leaf.
+            let leaf = name.rsplit("::").next().unwrap_or(name);
+            assert!(
+                sources.contains(&format!("fn {leaf}(")),
+                "{file} runs `--exact {name}`, which is not defined in \
+                 tests/mcp_stdio_integration.rs or src/embedding/model.rs. \
+                 cargo test exits 0 on a filter that matches nothing, so this \
+                 would ship as a green step that ran no real-weight test at all."
+            );
+            checked += 1;
+        }
+        assert!(
+            yaml.contains(&format!("test result: ok\\. {expected_count} passed")),
+            "{file}'s real-weight step must assert that its test(s) actually RAN. \
+             Naming them is not enough: a filter matching zero tests still exits 0."
+        );
+    }
+    assert_eq!(
+        checked, 3,
+        "vacuity floor: 1 gate test + 2 cron tests must all have been checked"
+    );
+
+    let release = read(wf.join("release.yml"));
+    assert!(
+        release.contains("test result: ok\\. 1 passed"),
+        "release.yml's real-weight step must assert that its test actually RAN. \
+         Naming them is not enough: a filter matching zero tests still exits 0."
+    );
+}
+
 /// Every cargo invocation in CI carries `--locked` (audit 2026-09-05 ENG-01).
 ///
 /// Without it cargo silently RE-RESOLVES when `Cargo.toml` and `Cargo.lock`

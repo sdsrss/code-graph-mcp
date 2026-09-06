@@ -1228,6 +1228,27 @@ mod tests {
     #[test]
     fn test_embed_produces_correct_dims() {
         let model = EmbeddingModel::load().unwrap();
+        // This is the CHEAP real-weight check, and the release gate is what runs
+        // it: do the weights we are about to publish load and produce a usable
+        // vector at all? Without this assert it passes by doing nothing whenever
+        // no model is cached — the same silent no-op that let the whole pipeline
+        // reach `npm publish` with zero real-weight coverage (audit 2026-09-05
+        // ENG-02).
+        //
+        // The thorough half — the two backfill regressions in
+        // tests/mcp_stdio_integration.rs — is deliberately NOT on the release
+        // path: they fail intermittently (2 runs in 6 against real weights,
+        // `0 vectors after 300 s`, passing in 51 s alone) for a reason nobody has
+        // found yet. Not slowness: the budget is per test and each finished well
+        // inside it even pinned to 2 cores. An unexplained 2-in-6 in front of an
+        // irreversible publish is a coin flip, so those two run on the cache-warm
+        // cron instead (pre-ship review 2026-09-06).
+        assert!(
+            model.is_some() || std::env::var_os("CODE_GRAPH_REQUIRE_MODEL").is_none(),
+            "CODE_GRAPH_REQUIRE_MODEL=1 is set but the embedding model did not \
+             load — this check would have passed by doing nothing, which is the \
+             state that flag exists to make impossible"
+        );
         if let Some(model) = model {
             let embedding = model
                 .embed("function validateToken handles JWT auth")

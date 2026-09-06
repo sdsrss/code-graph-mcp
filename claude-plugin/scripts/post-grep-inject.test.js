@@ -700,3 +700,44 @@ test('the two grep hooks keep separate cooldown flags after sharing one implemen
   // helper is what keeps that true rather than a coincidence of two copies.
   assert.equal(pre.commandHash(cmd), post.commandHash(cmd));
 });
+
+test('e2e: a spent hook budget records fallthrough_reason:budget, not a bare unavailable', () => {
+  // The skip shape neither of the two above covers: the hook was HEALTHY and
+  // ran out of time. This one records as `unavailable` — the same word a wedged
+  // or broken binary produces — so without a cause the funnel cannot see
+  // NEW-08's failure mode (a fine hook that deterministically answers nothing
+  // once uptime eats the reserve) at all.
+  //
+  // Costs ~4.6 s by construction and cannot be made cheaper: exhausting a 5 s
+  // budget takes 5 s of real time. Driven the way the budget is really spent
+  // (JS-03's serial runs) rather than by poking the deadline — a stub that never
+  // returns makes the first runner burn the budget, and every later one in the
+  // callgraph → show → grep chain then finds it gone.
+  //
+  // The per-call timeout is deliberately ABOVE the 5 s hook budget. At 2500 ms
+  // this test failed for the wrong reason: two calls consumed 2500 + ~2050 ms,
+  // the second was killed by its own timeout at the exact instant the budget
+  // ran out, and no third call ever started — so the run reported `unavailable`
+  // with no cause and the assertion below would have been measuring a real
+  // timeout, not an exhausted budget. Clamping the FIRST call to whatever is
+  // left makes the SECOND deterministically hit `remainingMs() === null`.
+  const uniq = `PostBudget${Date.now()}`;
+  const fixture = e2eFixture(`setTimeout(() => {}, 60000);`);
+  const cmd = `echo go && grep "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, { _CG_ANSWER_TIMEOUT_MS: '9000' });
+    assert.equal(res.status, 0, 'a starved hook still exits 0 — it degrades, it does not fail');
+    assert.equal(res.stdout.trim(), '', 'nothing was answered, so nothing may be injected');
+    const recs = fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.action, 'inject');
+    assert.equal(rec.answered, false);
+    assert.equal(rec.reason, 'unavailable',
+      'the enum src/cli/usage.rs:448 scores must keep its value');
+    assert.equal(rec.fallthrough_reason, 'budget',
+      'a starved hook must be distinguishable from a broken binary');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});

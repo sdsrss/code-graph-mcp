@@ -191,3 +191,64 @@ jobs:
         env:
           CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
         run: cargo test --locked --features embed-model
+
+      - name: Real-weight backfill regressions
+        # The THOROUGH half of the real-weight coverage (audit 2026-09-05
+        # ENG-02). These two observe embedding backfill end to end — they are the
+        # ones that caught "vectors stranded at 2%" and "stuck at 99%" — and the
+        # step above cannot run them: it sets CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1
+        # on a runner with no cached model, so both self-skip and report green
+        # having executed nothing. CODE_GRAPH_REQUIRE_MODEL=1 makes that skip a
+        # failure; the weights come from the same sha256-pinned `model-assets-v1`
+        # mirror release.yml uses, so nothing is fetched from HuggingFace.
+        #
+        # They live HERE, on a cron, and not in release.yml's gate, because they
+        # fail intermittently for a reason nobody has found: 2 runs in 6 against
+        # real weights, both `0 vectors after 300 s` from the startup test, which
+        # passes in 51 s alone. Not slowness — EMBED_POLL_BUDGET is per test and
+        # each finished well inside it even pinned to 2 cores; the weights and an
+        # unread stderr pipe were measured and ruled out too. An unexplained
+        # 2-in-6 in front of an irreversible npm publish is a coin flip that
+        # blocks every release; here a red run is a finding (pre-ship review
+        # 2026-09-06). Expect reds until the defect is found — that visibility is
+        # the point. The gate keeps the cheap check —
+        # `test_embed_produces_correct_dims`, 1.36 s — so "the weights we are
+        # about to publish load and embed" is still answered BEFORE publish.
+        #
+        # `timeout-minutes` bounds the whole step: two per-test 300 s poll budgets
+        # plus a download, with room for a slow runner, and no risk of a wedged
+        # embed loop holding the cron open.
+        timeout-minutes: 25
+        env:
+          CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
+          CODE_GRAPH_REQUIRE_MODEL: '1'
+        run: |
+          mkdir -p warm-models
+          MODEL_BASE="https://github.com/${{ github.repository }}/releases/download/model-assets-v1"
+          for f in model.safetensors tokenizer.json config.json; do
+            # --max-time: curl has no default transfer timeout and --retry does
+            # not fire on a connected-but-stalled transfer.
+            curl -L --fail --retry 3 --retry-delay 2 --max-time 300 -o warm-models/$f \
+              "$MODEL_BASE/$f"
+          done
+          # Same three pins as release.yml's two copies; kept in step by
+          # tests/hardening.rs::release_model_pins_agree_across_jobs.
+          sha256sum -c - <<'PINS'
+          53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  warm-models/model.safetensors
+          be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  warm-models/tokenizer.json
+          953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  warm-models/config.json
+          PINS
+          export CODE_GRAPH_MODEL_DIR="$PWD/warm-models"
+          # `--exact` + a count assertion: `cargo test <substring>` exits 0 on
+          # ZERO matches, so a rename would silently restore "green, having run
+          # nothing". Names are pinned to the source by
+          # tests/hardening.rs::release_gate_runs_the_real_weight_tests_by_name.
+          cargo test --locked --features embed-model --test mcp_stdio_integration -- \
+            --exact mcp_startup_embeds_without_any_tool_call \
+            mcp_periodic_backfill_embeds_out_of_band_nodes \
+            --test-threads=1 > warm-embed.log 2>&1 || { cat warm-embed.log; exit 1; }
+          cat warm-embed.log
+          grep -qE '^test result: ok\. 2 passed' warm-embed.log || {
+            echo "::error::the real-weight backfill regressions did not both run — see the log above"
+            exit 1
+          }

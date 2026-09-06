@@ -536,6 +536,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
+| `CODE_GRAPH_REQUIRE_MODEL=1` | Test-only: make the embedding tests FAIL when no model can be loaded instead of self-skipping. Set by the release gate and the cache-warm cron, which supply pinned weights — without it those tests pass by doing nothing on any runner with no cached model. |
 | `CODE_GRAPH_MAX_FILE_SIZE=<bytes>` | Skip files larger than this (default 1 MiB). |
 | `CODE_GRAPH_MAX_CODE_LEN=<bytes>` | Truncate stored per-node source at this length. |
 | `CODE_GRAPH_PARSE_TIMEOUT_MS=<ms>` | Per-file parse timeout. |

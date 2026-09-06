@@ -186,6 +186,92 @@ jobs:
           CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
         run: cargo test --locked --features embed-model
 
+      - name: Real-weight embedding gate
+        # ENG-02 (audit 2026-09-05). Every embedding test in this repo self-skips
+        # when no model is loadable, and EVERY leg that compiles them (ci.yml
+        # embed-check, cache-warm, and the step directly above) sets
+        # CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1 on a runner with no cached model.
+        # They reported green having executed nothing, so the first real-weight
+        # check in the entire pipeline was `smoke-verify` — which declares
+        # `needs: publish`, i.e. AFTER the irreversible npm publish.
+        #
+        # What runs here is the CHEAP half: load the weights we are about to ship
+        # and embed one string (1.36 s measured). CODE_GRAPH_REQUIRE_MODEL=1 turns
+        # its absent-weights no-op into a failure, so it cannot pass by doing
+        # nothing.
+        #
+        # The THOROUGH half — mcp_startup_embeds_without_any_tool_call and
+        # mcp_periodic_backfill_embeds_out_of_band_nodes, which observe backfill
+        # end to end — is deliberately NOT here, because they fail intermittently
+        # and nobody yet knows why: 2 runs in 6 against real weights, both of them
+        # `0 vectors after 300 s` from the startup test, which passes in 51 s when
+        # run alone.
+        #
+        # It is NOT slowness, and the earlier version of this comment said it was.
+        # EMBED_POLL_BUDGET is per test, not per pair, and each test finished well
+        # inside it even pinned to 2 cores; the 424 s wall time of a failing run is
+        # 300 s of the poll loop finding nothing plus setup and teardown, i.e. the
+        # same zero-vector failure rather than a timing one. The weights and an
+        # unread stderr pipe were also measured and ruled out.
+        #
+        # An unexplained 2-in-6 in front of an irreversible publish is a coin flip
+        # that blocks every release, so those two run on the cache-warm cron
+        # instead, where a red run is a finding (pre-ship review 2026-09-06).
+        #
+        # Weights come from the same sha256-pinned `model-assets-v1` mirror the
+        # publish job packages (see "Package model files"), so this step adds no
+        # third-party dependency to the critical path. CODE_GRAPH_MODEL_DIR is the
+        # loader's highest-priority location, so DISABLE_MODEL_DOWNLOAD stays on:
+        # nothing is fetched from HuggingFace here.
+        #
+        # It compiles nothing the gate did not already compile, which is why it
+        # needs no `warm-gate` twin the way the `run: cargo` steps above do.
+        # Bounds a wedged download or a hung load: this sits in front of an
+        # irreversible publish, so a fast attributed red beats burning the job's
+        # 30-minute cap. Same hygiene as the ripgrep step above. Measured green
+        # path is well under a minute (1.36 s of test plus the fetch).
+        timeout-minutes: 10
+        env:
+          CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
+          CODE_GRAPH_REQUIRE_MODEL: '1'
+        run: |
+          mkdir -p gate-models
+          MODEL_BASE="https://github.com/${{ github.repository }}/releases/download/model-assets-v1"
+          for f in model.safetensors tokenizer.json config.json; do
+            # --max-time: curl has NO default transfer timeout and --retry does
+            # not fire on a connected-but-stalled transfer. This file already
+            # records what that costs on the critical path — the ripgrep step
+            # above sat 29 minutes on a stalled mirror with the tag pushed and
+            # nothing published (2026-08-19), which is why it carries `timeout`.
+            curl -L --fail --retry 3 --retry-delay 2 --max-time 300 -o gate-models/$f \
+              "$MODEL_BASE/$f"
+          done
+          # Same three pins as "Package model files"; kept in sync by
+          # tests/hardening.rs::release_model_pins_agree_across_jobs.
+          sha256sum -c - <<'PINS'
+          53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  gate-models/model.safetensors
+          be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  gate-models/tokenizer.json
+          953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  gate-models/config.json
+          PINS
+          export CODE_GRAPH_MODEL_DIR="$PWD/gate-models"
+          # Named EXACTLY, and the count asserted afterwards, because
+          # `cargo test <substring>` exits 0 when the filter matches NOTHING —
+          # measured: "0 passed … EXIT=0". A rename, an `#[ignore]`, or a move to
+          # another test target would put this step straight back into the state
+          # it exists to end: green, having executed nothing, with
+          # CODE_GRAPH_REQUIRE_MODEL powerless because its assert lives inside a
+          # test that never runs. The name is also pinned to the source by
+          # tests/hardening.rs::release_gate_runs_the_real_weight_tests_by_name,
+          # so a rename fails a local `cargo test` before it can reach a tag.
+          cargo test --locked --features embed-model --lib -- \
+            --exact embedding::model::tests::test_embed_produces_correct_dims \
+            --test-threads=1 > gate-embed.log 2>&1 || { cat gate-embed.log; exit 1; }
+          cat gate-embed.log
+          grep -qE '^test result: ok\. 1 passed' gate-embed.log || {
+            echo "::error::the real-weight embedding gate did not run its test — see the log above"
+            exit 1
+          }
+
   build:
     name: Build ${{ matrix.npm-pkg }}
     needs: gate

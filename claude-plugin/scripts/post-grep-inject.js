@@ -316,6 +316,13 @@ function runMain() {
       ...(pattern ? { pattern } : {}),
       fallthrough: answer.status,
       reason: answer.status,
+      // Sub-divides `unavailable` without touching it: a starved hook and a
+      // wedged binary arrive under the same word and only one of them means
+      // something is broken. It cannot ride in `reason` — src/cli/usage.rs:448
+      // scores `reason:"unavailable"` as an inconclusive follow-up, so a new
+      // value there would silently re-file every budget skip as "the inline
+      // answer was insufficient". Same field pre-grep-guide.js:790 uses.
+      ...(answer.reason ? { fallthrough_reason: answer.reason } : {}),
       // Attribute the skip to the mode that burned the attempt — the LAST mode
       // tried, so a callgraph miss that fell through to grep is charged to grep,
       // matching the fallback order above. Without this the aggregator files

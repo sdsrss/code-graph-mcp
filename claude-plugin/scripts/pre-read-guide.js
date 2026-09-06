@@ -192,7 +192,15 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     // 'no-binary' (delivered overview dark — binary missing) vs 'unavailable'
     // (binary ran but failed/timed out) vs 'no-hits'. Mirrors pre-grep-guide
     // so the read-fanout funnel can tell a dark flagship apart from no result.
+    //
+    // `fallthrough_reason` sub-divides 'unavailable' rather than replacing it:
+    // a spent hook budget and a wedged binary are the same word here, and only
+    // the former is the healthy-hook-answers-nothing case NEW-08 traded a kill
+    // for. It cannot go in `reason` — src/cli/usage.rs:448 scores
+    // `reason:"unavailable"` as an inconclusive follow-up, so a new value there
+    // would re-file every budget skip as "the answer was insufficient".
     ...(answered ? {} : { reason: answer.status }),
+    ...(answered || !answer.reason ? {} : { fallthrough_reason: answer.reason }),
   });
   // Compound-grep sibling sweep: emit via the PreToolUse allow+additionalContext
   // envelope (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in

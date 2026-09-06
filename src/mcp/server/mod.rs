@@ -4930,6 +4930,54 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// Regression: the rollup branch dropped the test-filtered disclosure.
+    /// `get_call_graph` hides test callers/callees by default and says how many
+    /// under `test_callers_filtered` / `test_callees_filtered` — but only on the
+    /// flat path. Above `COMPRESSION_TOKEN_THRESHOLD` the rollup payload is built
+    /// from scratch with just `rollups` + `total_count`, so on exactly the dense
+    /// graphs where one hidden test caller is hardest to notice, the agent is told
+    /// nothing was hidden at all. Pre-existing, not a 0.136.0 regression — the
+    /// pre-ship review filed it against this surface.
+    #[test]
+    fn test_call_graph_rollup_discloses_filtered_tests() {
+        let project_dir = TempDir::new().unwrap();
+        // 100 prod callers clears the 2000-token rollup threshold while the whole
+        // graph (104 rows: hub + 100 prod + 3 test) stays under CALL_GRAPH_ROW_LIMIT
+        // (200). Saturating that cap instead would make WHICH callers come back
+        // arbitrary, and the three test callers could land outside it — the
+        // assertion below would then be measuring the cap, not the disclosure.
+        let mut code = String::from("function hub() {}\n");
+        for i in 0..100 {
+            code.push_str(&format!("function caller_{i}() {{ hub(); }}\n"));
+        }
+        for i in 0..3 {
+            code.push_str(&format!("function test_caller_{i}() {{ hub(); }}\n"));
+        }
+        std::fs::write(project_dir.path().join("dense.ts"), &code).unwrap();
+
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({ "function_name": "hub", "direction": "callers", "depth": 1 }),
+        );
+        let resp = server.handle_message(&req).unwrap();
+        let result = parse_tool_result(&resp);
+
+        assert_eq!(
+            result["mode"], "rollup_call_graph",
+            "fixture must trip the rollup branch, got mode={:?}",
+            result["mode"]
+        );
+        assert_eq!(
+            result["test_callers_filtered"].as_u64(),
+            Some(3),
+            "the rollup payload must carry the same hidden-test disclosure the flat \
+             path carries; got {result}"
+        );
+    }
+
     #[test]
     fn test_ast_node_compression() {
         let project_dir = TempDir::new().unwrap();
