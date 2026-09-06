@@ -2155,11 +2155,20 @@ fn jobs_missing_schedule_gate(src: &str, cron_job: &str) -> Vec<String> {
             // had (pre-ship review 2026-09-06).
             let body = workflow_job(src, name);
             let gated = body.lines().any(|l| {
-                let t = l.trim();
-                t.starts_with("if:")
-                    && t.contains("github.event_name")
-                    && t.contains("!=")
-                    && t.contains("'schedule'")
+                // Anchored at EXACTLY four spaces — job level. Trimming instead
+                // let a STEP-level `if:` (six spaces) satisfy a job-level gate,
+                // which is the same hole `jobs_missing_timeout_reasons` guards
+                // against explicitly for step-level `timeout-minutes`. It was
+                // introduced by the widening that accepts the `${{ }}` spelling
+                // and caught by the post-ship review (2026-09-06, F1).
+                let Some(rest) = l.strip_prefix("    ") else {
+                    return false;
+                };
+                !rest.starts_with(' ')
+                    && rest.starts_with("if:")
+                    && rest.contains("github.event_name")
+                    && rest.contains("!=")
+                    && rest.contains("'schedule'")
             });
             !gated
         })
@@ -2341,6 +2350,26 @@ jobs:
         jobs_missing_schedule_gate(&expr_gated, "alpha"),
         vec!["gamma".to_string()],
         "the expression spelling of the gate is the same gate and must be accepted"
+    );
+    // …but a STEP-level `if:` is not a job-level gate. Same shape as the
+    // step-level `timeout-minutes` case above, and the widening that accepted
+    // the expression spelling briefly reopened it (post-ship review 2026-09-06).
+    // The `if:` must be a step's own key (eight spaces here), not a list-item
+    // head: `      - if: …` trims to `- if: …`, which no spelling of the check
+    // matches, so a fixture written that way proves nothing either way. Checked
+    // — the first version of this control passed with the anchor removed.
+    let step_gated = wf.replace(
+        "      - name: a step-level timeout is NOT a job bound\n",
+        "      - name: a step-level gate is NOT a job gate\n        if: github.event_name != 'schedule'\n",
+    );
+    assert_ne!(step_gated, wf, "fixture edit did not apply");
+    assert!(
+        step_gated.contains("\n        if: github.event_name"),
+        "the fixture's `if:` must sit at STEP depth (eight spaces) as its own key"
+    );
+    assert!(
+        jobs_missing_schedule_gate(&step_gated, "alpha").contains(&"beta".to_string()),
+        "a six-space `if:` gates one STEP; the job still runs on the cron"
     );
 
     // Presence is not the property: a bound written as GitHub's own 6-hour
