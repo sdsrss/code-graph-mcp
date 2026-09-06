@@ -1237,10 +1237,15 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
     // reasoned it fails closed; it does for the positive `contains` assertions,
     // not for the negative one added in the same round — measured).
     //
-    // Consequence, stated because it is a real trade: a comment written between
-    // two jobs is now absorbed into the PRECEDING job's body. Harmless for every
-    // assertion here, which look for indented keys a one-line comment cannot
-    // spell.
+    // Stepping over comments to find the boundary would otherwise pull the NEXT
+    // job's header block into this one — measured, six bodies grew and
+    // `ci.yml/check` gained the token `npm publish` purely from `embed-check`'s
+    // documentation. No assertion here flipped, but only two of the four were
+    // immune for the reason first claimed ("keys a comment cannot spell"); the
+    // others happened to filter `#` themselves, and the natural next assertion,
+    // `body.contains("some text")`, would have been satisfiable by the following
+    // job's prose (pre-ship delta review 2026-09-06). So the trailing comment
+    // block is trimmed back off rather than documented as a hazard.
     let end = rest
         .match_indices("\n  ")
         .find(|(i, _)| {
@@ -1250,7 +1255,18 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
         })
         .map(|(i, _)| i + 1)
         .unwrap_or(rest.len());
-    &rest[..end]
+    let mut cut = end;
+    while cut > 0 {
+        let head = rest[..cut].trim_end_matches('\n');
+        let last_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let last = head[last_start..].trim();
+        if last.is_empty() || last.starts_with('#') {
+            cut = last_start;
+        } else {
+            break;
+        }
+    }
+    &rest[..cut]
 }
 
 /// Drift guard: `release.yml`'s cache-consuming jobs and the `cache-warm.yml`
@@ -2371,6 +2387,20 @@ jobs:
     assert!(
         !workflow_job(commented, "audit").contains("name: Next"),
         "the body must still stop at the NEXT JOB, not run on into it"
+    );
+    // …and it must not absorb the next job's DOCUMENTATION either. Stepping over
+    // comments to find the boundary made six real job bodies grow by up to 19
+    // lines of the following job's header block, which turns the natural
+    // assertion `body.contains("…")` into one the neighbour's prose can satisfy.
+    let documented = "\njobs:\n  audit:\n    name: Cargo Audit\n    runs-on: ubuntu-latest\n\n  # Publishes to npm. Irreversible.\n  # Second line of the same block.\n  publish:\n    name: Publish\n";
+    let audit_body = workflow_job(documented, "audit");
+    assert!(
+        !audit_body.contains("npm"),
+        "the following job's comment block leaked into this body: {audit_body:?}"
+    );
+    assert!(
+        audit_body.contains("runs-on: ubuntu-latest"),
+        "trimming the trailing comments must not eat the job's own last line: {audit_body:?}"
     );
 }
 
