@@ -1228,10 +1228,26 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
         .map(|i| after_anchor + i + 1)
         .unwrap_or(yaml.len());
     let rest = &yaml[start..];
-    // Next line beginning with exactly two spaces then a non-space.
+    // Next line beginning with exactly two spaces then a non-space — but NOT a
+    // comment. A comment written at job depth INSIDE a job body used to end the
+    // slice there, and for a negative assertion that is fail-OPEN: with
+    // `  # …` sitting above `    needs:`, the body came back as just the `name:`
+    // line and `!body.contains("\n    needs:")` was true while `needs:` was
+    // right there (pre-ship review 2026-09-06 flagged this as untested and
+    // reasoned it fails closed; it does for the positive `contains` assertions,
+    // not for the negative one added in the same round — measured).
+    //
+    // Consequence, stated because it is a real trade: a comment written between
+    // two jobs is now absorbed into the PRECEDING job's body. Harmless for every
+    // assertion here, which look for indented keys a one-line comment cannot
+    // spell.
     let end = rest
         .match_indices("\n  ")
-        .find(|(i, _)| rest.as_bytes().get(i + 3).is_some_and(|c| *c != b' '))
+        .find(|(i, _)| {
+            rest.as_bytes()
+                .get(i + 3)
+                .is_some_and(|c| *c != b' ' && *c != b'#')
+        })
         .map(|(i, _)| i + 1)
         .unwrap_or(rest.len());
     &rest[..end]
@@ -2340,6 +2356,21 @@ jobs:
         untimed2.len(),
         1,
         "the flag is absent; a comment is not the flag"
+    );
+
+    // A comment written at JOB depth inside a body must not end the body. The
+    // `needs:` assertion in `ci_schedule_runs_only_the_audit_job` is a NEGATIVE
+    // one, so a truncated slice there passes while the dependency it forbids
+    // sits just past the cut — fail-OPEN, measured before this was fixed.
+    let commented = "\njobs:\n  audit:\n    name: Cargo Audit\n  # a note at job depth\n    needs: [check]\n    runs-on: ubuntu-latest\n  next:\n    name: Next\n";
+    assert!(
+        workflow_job(commented, "audit").contains("\n    needs:"),
+        "a job-depth comment truncated the body and hid `needs:`; slice was {:?}",
+        workflow_job(commented, "audit")
+    );
+    assert!(
+        !workflow_job(commented, "audit").contains("name: Next"),
+        "the body must still stop at the NEXT JOB, not run on into it"
     );
 }
 
