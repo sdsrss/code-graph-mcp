@@ -141,6 +141,22 @@ function runProvider(command, needsStdin, stdin, id) {
 
     return out || null;
   } catch (err) {
+    // EPIPE is OUR failure to deliver, not the provider's failure to answer.
+    // `execFileSync` writes `input` into the child's stdin; a provider that
+    // exits without reading it (a static `echo`, an env-var-only line) makes
+    // that write fail — and by then the child has already produced its output
+    // in full. Discarding it drops the user's original statusline for a reason
+    // that has nothing to do with the provider. `_previous` is registered with
+    // needsStdin unconditionally true (lifecycle.js), so every such user is
+    // exposed. Measured: 10/10 EPIPE with a payload past the pipe buffer and
+    // the child's stdout complete in 10 of 10; on ordinary payloads the same
+    // discard happens as a timing race, which is what made
+    // lifecycle.e2e.test.js's "issue #24" intermittent for two releases.
+    // An empty stdout still falls through: nothing was produced, nothing to keep.
+    if (err && err.code === 'EPIPE') {
+      const salvaged = (err.stdout || '').toString().trim();
+      if (salvaged) return salvaged;
+    }
     // Swallowing is correct in production and stays the default: a third-party
     // provider that throws must not take the user's whole statusline with it.
     // But a swallowed error is also why `lifecycle.e2e.test.js`'s "issue #24"
@@ -149,8 +165,15 @@ function runProvider(command, needsStdin, stdin, id) {
     // every diagnosis of it so far has been a guess. Opt-in, off unless the env
     // var is set, so no shipped behavior changes.
     if (process.env.CODE_GRAPH_STATUSLINE_DEBUG) {
-      const why = err && (err.code || err.message) ? (err.code || err.message) : String(err);
-      process.stderr.write(`[statusline] provider '${id}' dropped: ${why}\n`);
+      // Its own try/catch: `process.stderr.write` throws on a closed stderr, and
+      // this sits inside the catch that exists so a bad provider cannot take the
+      // statusline down. Unguarded, the throw escapes runProvider and past the
+      // provider loop in run(), which has none — a debug switch that kills the
+      // whole line is worse than no debug switch.
+      try {
+        const why = err && (err.code || err.message) ? (err.code || err.message) : String(err);
+        process.stderr.write(`[statusline] provider '${id}' dropped: ${why}\n`);
+      } catch { /* diagnostics are best-effort; rendering is not */ }
     }
     return null;
   }

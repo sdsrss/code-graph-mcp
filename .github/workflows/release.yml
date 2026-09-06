@@ -281,9 +281,11 @@ jobs:
     name: Build ${{ matrix.npm-pkg }}
     needs: gate
     # Bounds a hang, not performance: measured 152-311 s warm across the five
-    # targets, and cache-warm.yml's twin of this matrix runs under 30. Double
-    # that, because a cold cross-compile is the slow case and a timeout that
-    # kills a release mid-flight is worse than the 6-hour default it replaces.
+    # targets on v0.137.0, but 402 s for darwin-x64 on v0.133.0 — warm runs vary
+    # by more than a factor of two. cache-warm.yml's twin of this matrix runs
+    # under 30. Double that, because a cold cross-compile is the slow case and a
+    # timeout that kills a release mid-flight is worse than the 6-hour default
+    # it replaces.
     timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
@@ -550,9 +552,15 @@ jobs:
             # BEFORE npm publish (no half-release shipping a version whose
             # models.tar.gz 404s → FTS5-only).
             # --max-time: curl has NO default transfer timeout and --retry does
-            # not fire on a connected-but-stalled transfer, so without it a
-            # stalled mirror holds the tag un-published until the 6-hour job
-            # ceiling. Same 300 s as the gate's copy of this loop above.
+            # not fire on a connected-but-stalled transfer. It is PER ATTEMPT,
+            # not per operation: measured, `--retry 3 --max-time 10` against a
+            # dribbling server exited after 47 s (4 attempts + 1+2+4 s backoff),
+            # so this loop's worst case is 3 files x (4 x 300 + 6) ~= 60 min.
+            # What actually bounds that is this job's `timeout-minutes: 30`; the
+            # flag turns an infinite stall into a finite one, and the job bound
+            # turns the finite one into a fast failure. Both are load-bearing.
+            # Either way it fails BEFORE `npm publish` below, so a stall costs a
+            # re-run, never a half-release.
             curl -L --fail --retry 3 --retry-delay 2 --max-time 300 -o models-pkg/$f \
               "$MODEL_BASE/$f"
           done
@@ -786,11 +794,13 @@ jobs:
           set -eu
           work=$(mktemp -d); cd "$work"
           base="https://github.com/sdsrss/code-graph-mcp/releases/download/v${VERSION}"
-          # --max-time for the same reason the two pre-publish fetches carry it:
+          # --max-time for the same reason the pre-publish fetches carry it:
           # curl has no default transfer timeout and --retry does not fire on a
-          # connected-but-stalled transfer. This job runs AFTER npm publish, so a
-          # stall here does not hold a release back — it just burns runner time
-          # and leaves the post-publish verdict unreported until the job ceiling.
+          # connected-but-stalled transfer. Per ATTEMPT, so with --retry 3 the
+          # real ceiling is ~4x this plus backoff; the operation-level bound is
+          # this job's `timeout-minutes: 30`. This job runs AFTER npm publish, so
+          # a stall here holds no release back — it burns runner time and leaves
+          # the post-publish verdict unreported.
           curl -fL --retry 3 --max-time 300 -o models.tar.gz "$base/models.tar.gz"
           curl -fL --retry 3 --max-time 60 -o models.tar.gz.sha256 "$base/models.tar.gz.sha256"
           echo "$(cat models.tar.gz.sha256)  models.tar.gz" | sha256sum -c -

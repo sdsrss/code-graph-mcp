@@ -225,15 +225,15 @@ test('composite expands a leading ~ in a _previous command instead of dropping i
     { id: '_previous', command: '~/.claude/utils/statusline.sh', needsStdin: true },
   ]);
 
-  // CODE_GRAPH_STATUSLINE_DEBUG: this assertion has been intermittently red
-  // (measured 2/8 on an unmodified tree, 0/8 on another day — noise, not a
-  // trend) and carried NOTHING to diagnose it with, because runProvider's catch
-  // makes "the script failed to exec" and "the script printed nothing" the same
-  // observation from out here. The env var turns the swallowed error into a
-  // stderr line; the assertion below quotes it, so the next red names its own
-  // cause instead of restarting the guessing. Leading candidates, none yet
-  // observed: ETXTBSY (fits — write-then-exec, fails in ~70 ms like this one
-  // does), ENOENT, EACCES.
+  // CODE_GRAPH_STATUSLINE_DEBUG: this assertion was intermittently red for two
+  // releases and carried NOTHING to diagnose it with, because runProvider's
+  // catch made "the script failed to exec" and "the script printed nothing" the
+  // same observation from out here. The env var turns the swallowed error into
+  // a stderr line and the assertion quotes it — and on its first use it named
+  // the cause as **EPIPE**, refuting the ETXTBSY guess this comment used to
+  // carry. The fix is in runProvider; the deterministic version of the same
+  // failure is the test above. This one stays as the small-payload (racing)
+  // shape, so a regression that only survives at 256 KiB still fails here.
   const { stdout, stderr } = runScriptCaptured(homeDir, compositeCli, [], {
     input: '{}',
     env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
@@ -241,6 +241,39 @@ test('composite expands a leading ~ in a _previous command instead of dropping i
   assert.match(stdout, /PREV-STATUSLINE-OK/,
     'a _previous command using a leading ~ must be tilde-expanded, not silently dropped'
     + `\n  composite stderr: ${stderr.trim() || '(empty — the provider ran and printed nothing)'}`);
+});
+
+test('a provider that never reads stdin keeps its output (EPIPE is not a failure)', (t) => {
+  // execFileSync WRITES `input` to the child's stdin. A provider that exits
+  // without reading it makes that write fail with EPIPE — after the child has
+  // already produced its output in full — and the catch in runProvider used to
+  // discard it. `_previous` is registered with needsStdin unconditionally true
+  // (lifecycle.js:1377), so any user whose prior statusline is a script that
+  // ignores stdin (a static echo, an env-var-only line) loses it.
+  //
+  // Sized past the pipe buffer to make the race deterministic: measured 0/10
+  // EPIPE at 64 KiB and 10/10 at 256 KiB, with the child's stdout complete in
+  // 10 of 10. On ordinary small payloads the same discard happens as a timing
+  // race instead — an independent reviewer measured 9/20 on this very test
+  // while the machine was loaded, which is what "issue #24" has been all along.
+  const homeDir = mkHome(t);
+  const prevScript = path.join(homeDir, '.claude', 'utils', 'statusline.sh');
+  fs.mkdirSync(path.dirname(prevScript), { recursive: true });
+  fs.writeFileSync(prevScript, '#!/bin/sh\necho "PREV-STATUSLINE-OK"\n');
+  fs.chmodSync(prevScript, 0o755);
+
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: '_previous', command: prevScript, needsStdin: true },
+  ]);
+
+  const { stdout, stderr } = runScriptCaptured(homeDir, compositeCli, [], {
+    input: JSON.stringify({ cwd: homeDir, pad: 'x'.repeat(256 * 1024) }),
+    env: { CODE_GRAPH_STATUSLINE_DEBUG: '1' },
+  });
+  assert.match(stdout, /PREV-STATUSLINE-OK/,
+    'the provider ran and printed its line; failing to hand it OUR stdin is not '
+    + `its failure and must not discard it.\n  composite stderr: ${stderr.trim() || '(empty)'}`);
 });
 
 test('a dropped provider names its reason on stderr under CODE_GRAPH_STATUSLINE_DEBUG', (t) => {

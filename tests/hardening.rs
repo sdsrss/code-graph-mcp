@@ -1212,11 +1212,21 @@ fn yaml_directives(block: &str) -> Vec<&str> {
 /// same two-space indent (or EOF). Textual on purpose — the repo has no YAML
 /// dev-dependency and the properties below are all lexical.
 fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
-    let header = format!("\n  {job}:\n");
-    let start = yaml
-        .find(&header)
-        .unwrap_or_else(|| panic!("job `{job}` not found — it was renamed or removed"))
-        + header.len();
+    // Anchored on the header WITHOUT its newline, because the line may carry a
+    // trailing YAML comment (`  build: # …`). Matching `"\n  {job}:\n"` made
+    // such a job unfindable — same blind spot `workflow_job_names` had, and
+    // fixing only that one turned a silent miss into a panic (pre-ship review
+    // 2026-09-06, finding 2). The `:` is part of the anchor so `build` does not
+    // match `buildx`.
+    let anchor = format!("\n  {job}:");
+    let at = yaml
+        .find(&anchor)
+        .unwrap_or_else(|| panic!("job `{job}` not found — it was renamed or removed"));
+    let after_anchor = at + anchor.len();
+    let start = yaml[after_anchor..]
+        .find('\n')
+        .map(|i| after_anchor + i + 1)
+        .unwrap_or(yaml.len());
     let rest = &yaml[start..];
     // Next line beginning with exactly two spaces then a non-space.
     let end = rest
@@ -1701,6 +1711,34 @@ fn release_gate_runs_the_real_weight_tests_by_name() {
     );
 }
 
+/// Drop a trailing shell comment, respecting quotes.
+///
+/// Both scanners below used to treat a whole line as command text, which cuts
+/// both ways and both ways were measured (pre-ship review 2026-09-06):
+/// `curl … # --max-time handled by the job timeout` passed the curl guard with
+/// the flag genuinely absent, and `run: echo ok  # was cargo test before` FAILED
+/// the `--locked` guard on a line that runs no cargo at all.
+///
+/// Quote-aware because this repo really has `echo "## Routing Bench"` and
+/// `${REF_NAME#v}`: a naive cut at the first `#` would truncate both. Only a `#`
+/// that is outside quotes AND starts a word begins a comment.
+fn strip_shell_comment(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let (mut in_single, mut in_double) = (false, false);
+    let mut prev_is_space = true; // start of line counts as a word boundary
+    for c in line.chars() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double && prev_is_space => break,
+            _ => {}
+        }
+        out.push(c);
+        prev_is_space = c.is_whitespace();
+    }
+    out.trim_end().to_string()
+}
+
 /// Fold shell line continuations so a command split across physical lines is
 /// scanned as the one command it is.
 ///
@@ -1712,8 +1750,9 @@ fn logical_shell_lines(src: &str) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut acc: Option<(usize, String)> = None;
     for (i, raw) in src.lines().enumerate() {
-        let trimmed = raw.trim();
-        if trimmed.starts_with('#') {
+        let trimmed = strip_shell_comment(raw.trim());
+        let trimmed = trimmed.as_str();
+        if trimmed.is_empty() && raw.trim().starts_with('#') {
             out.extend(acc.take());
             continue;
         }
@@ -1743,8 +1782,24 @@ fn logical_shell_lines(src: &str) -> Vec<(usize, String)> {
 /// `publish` and `package` are listed although no workflow runs one today: this
 /// guard's whole job is to catch the invocation nobody remembers to add the flag
 /// to, and an omission here fails open (pre-ship review 2026-09-05).
+/// `update` is here for a different reason than the rest: it does not merely
+/// resolve, it REWRITES `Cargo.lock`, so an un-`--locked` `cargo update -p x` in
+/// CI is the strongest form of the thing this guard exists to stop. It was
+/// missing from the original list (pre-ship review 2026-09-06).
+/// Anti-vacuity floors, set BELOW today's counts on purpose.
+///
+/// Pinned at the exact current number they turn every legitimate deletion of an
+/// already-compliant step into a failure whose message blames the scanner
+/// ("the scan lost its grip") for a scan that is working perfectly — measured on
+/// all three (pre-ship review 2026-09-06). The floor's job is to catch a scan
+/// that silently stopped matching, and a scan that broke does not lose three
+/// entries, it loses most of them.
+const CARGO_INVOCATION_FLOOR: usize = 15; // 21 today
+const CURL_INVOCATION_FLOOR: usize = 4; //  5 today
+const JOB_FLOOR: usize = 10; // 13 today
+
 const RESOLVING_SUBCOMMANDS: &[&str] = &[
-    "build", "test", "check", "clippy", "bench", "run", "publish", "package",
+    "build", "test", "check", "clippy", "bench", "run", "publish", "package", "update",
 ];
 
 /// Every dependency-resolving cargo invocation in `src` that lacks `--locked`.
@@ -1818,9 +1873,12 @@ fn every_ci_cargo_invocation_is_locked() {
         "only {files} workflow files found — the scan lost its grip"
     );
     assert!(
-        checked >= 21,
-        "only {checked} cargo invocations found across {files} workflows — the scan \
-         lost its grip and would pass vacuously"
+        checked >= CARGO_INVOCATION_FLOOR,
+        "only {checked} cargo invocations found across {files} workflows, below the \
+         floor of {CARGO_INVOCATION_FLOOR}. If the scan broke, fix it; if you \
+         deliberately removed CI cargo steps, lower the floor in the same commit \
+         and say why — the floor exists so a broken scan cannot pass vacuously, \
+         not to freeze the step count."
     );
     assert!(
         unlocked.is_empty(),
@@ -1893,6 +1951,35 @@ fn locked_scanner_reads_continuations_and_chains() {
     assert_eq!(checked(chained), 2, "a chained line holds two invocations");
     reports(chained, "cargo test --no-default-features");
 
+    // `cargo update` REWRITES Cargo.lock, so it is the strongest case for the
+    // flag and was missing from the resolving list entirely.
+    reports(
+        "        run: cargo update -p serde",
+        "cargo update -p serde",
+    );
+
+    // A TRAILING comment is not command text — both directions were measured
+    // slipping through (pre-ship review 2026-09-06).
+    assert_eq!(
+        checked("        run: echo ok  # was cargo test before"),
+        0,
+        "a comment mentioning cargo must not be scanned as a cargo invocation"
+    );
+    reports(
+        "        run: cargo test --no-default-features  # --locked handled elsewhere",
+        "cargo test --no-default-features",
+    );
+    // …but a `#` inside quotes is not a comment. This repo really ships
+    // `echo \"## Routing Bench\"` and `${REF_NAME#v}`.
+    assert_eq!(
+        strip_shell_comment(r###"echo "## Routing Bench" $(date)  # trailing"###),
+        r###"echo "## Routing Bench" $(date)"###
+    );
+    assert_eq!(
+        strip_shell_comment(r##"echo "VERSION=${REF_NAME#v}" >> $GITHUB_ENV"##),
+        r##"echo "VERSION=${REF_NAME#v}" >> $GITHUB_ENV"##
+    );
+
     // Exclusions still hold: comments are documentation, and the two
     // subcommands that resolve nothing stay out of the count.
     assert_eq!(checked("          # cargo test --no-default-features"), 0);
@@ -1902,6 +1989,43 @@ fn locked_scanner_reads_continuations_and_chains() {
         0,
         "`cargo-audit` is not a `cargo ` invocation and `install` does not resolve here"
     );
+}
+
+/// The largest `--max-time` that still counts as a bound, in seconds.
+///
+/// Same reason as [`MAX_JOB_TIMEOUT_MINUTES`]: presence is not the property.
+/// `--max-time 99999` satisfied a presence check while restoring exactly the
+/// unbounded behaviour the flag is there to prevent (pre-ship review
+/// 2026-09-06). 600 is double the largest value any fetch here uses.
+const MAX_CURL_TIME_SECONDS: u32 = 600;
+
+/// Every `curl` invocation in `src` with no usable `--max-time`.
+///
+/// Continuations matter here more than anywhere: every model fetch in this repo
+/// wraps the URL onto a second line.
+fn untimed_curl_invocations(src: &str) -> (usize, Vec<(usize, String)>) {
+    let mut checked = 0usize;
+    let mut untimed: Vec<(usize, String)> = Vec::new();
+    for (line_no, logical) in logical_shell_lines(src) {
+        if !logical.contains("curl ") {
+            continue;
+        }
+        checked += 1;
+        let value: Option<u32> = logical
+            .split("--max-time")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse().ok());
+        match value {
+            Some(v) if v <= MAX_CURL_TIME_SECONDS => {}
+            Some(v) => untimed.push((
+                line_no,
+                format!("{} [--max-time {v} is not a bound]", logical.trim()),
+            )),
+            None => untimed.push((line_no, logical.trim().to_string())),
+        }
+    }
+    (checked, untimed)
 }
 
 /// Every `curl` in CI carries `--max-time` (audit 2026-09-05, ENG-03 neighbour).
@@ -1930,26 +2054,23 @@ fn every_ci_curl_has_a_transfer_timeout() {
         files += 1;
         let src = fs::read_to_string(&path).expect("read workflow");
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        // Continuations matter here more than anywhere: every model fetch in
-        // this repo wraps the URL onto a second line.
-        for (line_no, logical) in logical_shell_lines(&src) {
-            if !logical.contains("curl ") {
-                continue;
-            }
-            checked += 1;
-            if !logical.contains("--max-time") {
-                untimed.push(format!("{name}:{line_no}: {}", logical.trim()));
-            }
-        }
+        let (n, offenders) = untimed_curl_invocations(&src);
+        checked += n;
+        untimed.extend(
+            offenders
+                .into_iter()
+                .map(|(line, call)| format!("{name}:{line}: {call}")),
+        );
     }
     assert!(
         files >= 5,
         "only {files} workflow files found — the scan lost its grip"
     );
     assert!(
-        checked >= 5,
-        "only {checked} curl invocations found across {files} workflows — the scan \
-         lost its grip and would pass vacuously"
+        checked >= CURL_INVOCATION_FLOOR,
+        "only {checked} curl invocations found across {files} workflows, below the \
+         floor of {CURL_INVOCATION_FLOOR}. Broken scan, or a deliberate removal \
+         that should lower the floor in the same commit."
     );
     assert!(
         untimed.is_empty(),
@@ -1975,18 +2096,88 @@ fn workflow_job_names(src: &str) -> Vec<&str> {
             if rest.starts_with(' ') || rest.starts_with('#') {
                 return None;
             }
-            let name = rest.strip_suffix(':')?;
+            // A trailing YAML comment is part of the header line, and `newjob:
+            // # added later` is exactly the spelling of the case both callers
+            // exist to catch. Without this the header parsed to nothing, the
+            // job was invisible to the scan, and both guards stayed green while
+            // it ran unbounded on the nightly cron (pre-ship review 2026-09-06,
+            // finding 2 — found by mutation, not by review).
+            let name = rest.split('#').next()?.trim_end().strip_suffix(':')?;
             (!name.is_empty() && !name.contains(' ')).then_some(name)
         })
         .collect()
 }
 
-/// Jobs in `src` with no job-level `timeout-minutes`.
-fn jobs_missing_timeout(src: &str) -> Vec<String> {
+/// Jobs in `src` that would run on a workflow-scoped `schedule:` trigger —
+/// everything except `cron_job` that lacks the opt-out `if:` gate.
+fn jobs_missing_schedule_gate(src: &str, cron_job: &str) -> Vec<String> {
     workflow_job_names(src)
         .into_iter()
-        .filter(|name| !workflow_job(src, name).contains("\n    timeout-minutes:"))
+        .filter(|name| {
+            if *name == cron_job {
+                return false;
+            }
+            // Both spellings. `if: ${{ github.event_name != 'schedule' }}` is
+            // equivalent in Actions, and matching only the bare form reported a
+            // job that IS gated and told the author to add the gate it already
+            // had (pre-ship review 2026-09-06).
+            let body = workflow_job(src, name);
+            let gated = body.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with("if:")
+                    && t.contains("github.event_name")
+                    && t.contains("!=")
+                    && t.contains("'schedule'")
+            });
+            !gated
+        })
         .map(str::to_string)
+        .collect()
+}
+
+/// The largest job-level `timeout-minutes` that still counts as a bound.
+///
+/// Presence alone is not the property. A guard that only checks for the key is
+/// satisfied by `timeout-minutes: 360` — GitHub's six-hour default written out
+/// longhand, i.e. the exact state the bound exists to leave (pre-ship review
+/// 2026-09-06, verified: rewriting two 45s to 360 passed). 90 is roughly double
+/// the largest value any job here needs.
+const MAX_JOB_TIMEOUT_MINUTES: u32 = 90;
+
+/// Jobs in `src` with no usable job-level `timeout-minutes` — absent, or so
+/// large it is not a bound. Each entry is `(job, reason)`.
+fn jobs_missing_timeout_reasons(src: &str) -> Vec<(String, String)> {
+    workflow_job_names(src)
+        .into_iter()
+        .filter_map(|name| {
+            let body = workflow_job(src, name);
+            let Some(at) = body.find("\n    timeout-minutes:") else {
+                return Some((name.to_string(), "no job-level timeout-minutes".to_string()));
+            };
+            let value: Option<u32> = body[at + "\n    timeout-minutes:".len()..]
+                .lines()
+                .next()
+                .and_then(|v| v.trim().parse().ok());
+            match value {
+                Some(v) if v > MAX_JOB_TIMEOUT_MINUTES => Some((
+                    name.to_string(),
+                    format!("timeout-minutes: {v} is not a bound (cap {MAX_JOB_TIMEOUT_MINUTES})"),
+                )),
+                Some(_) => None,
+                None => Some((
+                    name.to_string(),
+                    "timeout-minutes is unparseable".to_string(),
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Names only, for the callers that just need the set.
+fn jobs_missing_timeout(src: &str) -> Vec<String> {
+    jobs_missing_timeout_reasons(src)
+        .into_iter()
+        .map(|(n, _)| n)
         .collect()
 }
 
@@ -2029,9 +2220,10 @@ fn every_ci_job_declares_a_timeout() {
         "only {files} workflow files found — the scan lost its grip"
     );
     assert!(
-        jobs >= 13,
-        "only {jobs} jobs found across {files} workflows — the scan lost its grip \
-         and would pass vacuously"
+        jobs >= JOB_FLOOR,
+        "only {jobs} jobs found across {files} workflows, below the floor of \
+         {JOB_FLOOR}. Broken scan, or a deliberate removal that should lower the \
+         floor in the same commit."
     );
     assert!(
         unbounded.is_empty(),
@@ -2067,18 +2259,87 @@ jobs:
       - name: a step-level timeout is NOT a job bound
         timeout-minutes: 3
         run: echo hi
+  gamma: # a trailing comment does not hide a job
+    name: Gamma
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
 ";
     assert_eq!(
         workflow_job_names(wf),
-        vec!["alpha", "beta"],
-        "`on:` keys sit at job depth too and must not be counted as jobs"
+        vec!["alpha", "beta", "gamma"],
+        "`on:` keys sit at job depth too and must not be counted as jobs; a \
+         trailing YAML comment on a job header must not hide the job (pre-ship \
+         review 2026-09-06, finding 2)"
     );
     assert_eq!(
         jobs_missing_timeout(wf),
-        vec!["beta".to_string()],
+        vec!["beta".to_string(), "gamma".to_string()],
         "a step-level `timeout-minutes` (6-space indent) must not satisfy the \
          job-level bound — it bounds one step, which is the gap this guard exists \
-         to close"
+         to close — and a comment-suffixed header must still be checked"
+    );
+
+    // Schedule gating, same fixture: no job carries the gate, so with `alpha` as
+    // the cron job the other two are exposed — including the one whose header
+    // ends in a comment.
+    assert_eq!(
+        jobs_missing_schedule_gate(wf, "alpha"),
+        vec!["beta".to_string(), "gamma".to_string()],
+        "a job with no `if:` gate runs on a workflow-scoped cron, and a trailing \
+         comment on its header must not hide it"
+    );
+    let gated = wf.replace(
+        "  beta:\n    name: Beta\n",
+        "  beta:\n    name: Beta\n    if: github.event_name != 'schedule'\n",
+    );
+    assert_eq!(
+        jobs_missing_schedule_gate(&gated, "alpha"),
+        vec!["gamma".to_string()],
+        "adding the gate to `beta` must remove exactly `beta` — proving the check \
+         reads the gate rather than counting jobs"
+    );
+    // The `${{ }}` spelling is equivalent in Actions. Rejecting it produced a
+    // failure telling the author to add a gate that was already there.
+    let expr_gated = wf.replace(
+        "  beta:\n    name: Beta\n",
+        "  beta:\n    name: Beta\n    if: ${{ github.event_name != 'schedule' }}\n",
+    );
+    assert_eq!(
+        jobs_missing_schedule_gate(&expr_gated, "alpha"),
+        vec!["gamma".to_string()],
+        "the expression spelling of the gate is the same gate and must be accepted"
+    );
+
+    // Presence is not the property: a bound written as GitHub's own 6-hour
+    // default is not a bound (pre-ship review 2026-09-06 verified 360 passing).
+    let huge = wf.replace("    timeout-minutes: 5\n", "    timeout-minutes: 360\n");
+    let reasons = jobs_missing_timeout_reasons(&huge);
+    assert!(
+        reasons
+            .iter()
+            .any(|(j, why)| j.as_str() == "alpha" && why.contains("not a bound")),
+        "timeout-minutes: 360 is the default it replaces, not a bound; got {reasons:?}"
+    );
+
+    // Same for --max-time.
+    let (n, untimed) = untimed_curl_invocations(
+        "        run: curl -fL --retry 3 --max-time 99999 -o x https://example.invalid/x",
+    );
+    assert_eq!(n, 1);
+    assert!(
+        untimed.iter().any(|(_, c)| c.contains("is not a bound")),
+        "--max-time 99999 restores the unbounded behaviour it exists to prevent; got {untimed:?}"
+    );
+    // A trailing comment must not satisfy the curl guard either.
+    let (n2, untimed2) = untimed_curl_invocations(
+        "        run: curl -fL -o x https://example.invalid/x  # --max-time via job timeout",
+    );
+    assert_eq!(n2, 1);
+    assert_eq!(
+        untimed2.len(),
+        1,
+        "the flag is absent; a comment is not the flag"
     );
 }
 
@@ -2116,25 +2377,37 @@ fn ci_schedule_runs_only_the_audit_job() {
         "ci.yml has no `{CRON_JOB}` job ({names:?}) — it was renamed or moved, and \
          the daily schedule now runs either nothing or everything"
     );
+    // Also covered synthetically by `job_scanner_finds_jobs_and_missing_timeouts`,
+    // which is where the trailing-comment header and the cron-job-gated-out case
+    // are exercised without touching the real file.
+    assert!(
+        jobs_missing_schedule_gate(&ci, CRON_JOB).is_empty(),
+        "these ci.yml jobs run on the daily `schedule:` trigger: {:?}. Add\n \
+         `{}` to each, or move the cron out of this workflow.",
+        jobs_missing_schedule_gate(&ci, CRON_JOB),
+        GATE.trim_matches('\n')
+    );
 
-    for name in &names {
-        let gated = workflow_job(&ci, name).contains(GATE);
-        if *name == CRON_JOB {
-            assert!(
-                !gated,
-                "ci.yml `{name}` is gated out of `schedule` — the daily trigger \
-                 exists for this job alone, so gating it makes the cron a no-op \
-                 that still reports green"
-            );
-        } else {
-            assert!(
-                gated,
-                "ci.yml `{name}` runs on the daily `schedule:` trigger. Add\n \
-                 `{}` to the job, or move the cron out of this workflow.",
-                GATE.trim_matches('\n')
-            );
-        }
-    }
+    let cron_body = workflow_job(&ci, CRON_JOB);
+    assert!(
+        !cron_body.contains(GATE),
+        "ci.yml `{CRON_JOB}` is gated out of `schedule` — the daily trigger \
+         exists for this job alone, so gating it makes the cron a no-op that \
+         still reports green"
+    );
+    // …and it must not DEPEND on a job that is gated out. GitHub skips a job
+    // whose `needs:` was skipped, so `needs: [check]` here would make every
+    // scheduled run skip the audit and still conclude success: the CVE window
+    // reopens and the only evidence is a green checkmark. No ci.yml job declares
+    // `needs:` today — both pre-ship reviewers found this hole independently by
+    // mutation, and both mutations passed the guard as it stood (2026-09-06).
+    assert!(
+        !cron_body.contains("\n    needs:"),
+        "ci.yml `{CRON_JOB}` declares `needs:`. Every other job here is gated out \
+         of the daily `schedule:` trigger, and a job whose dependency is skipped \
+         is skipped too — so the cron would run nothing and still report green. \
+         Drop the dependency, or gate `{CRON_JOB}` and move the cron elsewhere."
+    );
 }
 
 /// The arm64 cross-compile install must be the SAME in both workflows.
