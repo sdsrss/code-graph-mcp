@@ -1,5 +1,165 @@
 # Changelog
 
+## 0.137.0
+
+**Upgrading:** one command can now return **more** rows for a query you already
+run, and the old answer was the wrong one.
+
+CLI `search` widens its candidate pool once when the first one came back full
+and the post-fetch filters consumed it before `--limit` was filled. Until now it
+stopped at the first pool, so a match that sat below the fetch cut was reported
+as absent — and when a `--language` / `--node-type` filter was active, reported
+with the advice "Broaden or clear the filter", which cannot help, because the
+filter was not what removed it. MCP `semantic_code_search` has widened on
+exhaustion since 0.117.0; this is the CLI half of that pair. A query that was
+not starved retrieves byte-identically and pays nothing: the widening needs a
+full pool, an unfilled limit, and something actually dropped, or it does not
+run. If you have output pinned against the old short answer, pin `0.136.0`.
+
+The same command now says so when it is *still* short after widening. A
+non-empty short answer gets one stderr line naming how many of `--limit` came
+back and how big the pool was; `--json` stdout stays a bare array there.
+
+**An empty answer now carries that disclosure on stdout**, which is a shape
+change: `search --json` already returned an object rather than `[]` when your
+filter removed every match, and it now does so in a second case — when the pool
+came back full and was emptied, whichever kind of drop emptied it. Previously
+that case printed a bare `[]` and said nothing, which is precisely where `[]`
+reads hardest as "this repo has no such code": there is no filter to broaden,
+because the drops were the always-on noise skip. The envelope carries
+`pool_saturated`, plus `noise_skipped` in the new case and the existing
+`filtered_out` / `filter` in the old one. If you parse `search --json` output as
+a list and do not handle the object form, pin `0.136.0`.
+
+Everything else is additive. `get_call_graph`'s rollup payload
+(`mode: rollup_call_graph`) now carries `test_callers_filtered` /
+`test_callees_filtered`, which it had been dropping — see below. Hook telemetry
+in `.code-graph/recommendations.jsonl` gains `fallthrough_reason` on two more
+hooks (`read` hints and `grep` injects; `pre-grep-guide` already wrote it).
+`CODE_GRAPH_REQUIRE_MODEL=1` is a new opt-in for CI and local runs: it turns the
+real-weight embedding tests' self-skip into a failure.
+
+### The release gate stopped taking "skipped" for an answer
+
+Two tests exercise embedding end to end with real model weights rather than a
+synthetic seam — the ones that caught "vectors stranded at 2%" and "stuck at
+99%". Both self-skip when no model is loadable, and every leg that compiles them
+sets `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` on a runner with no cached model. So
+they reported green having executed nothing, on branch CI, on the scheduled
+cache warm, and on the release gate — and the first real-weight check in the
+whole pipeline was `smoke-verify`, which declares `needs: publish`. It ran after
+the npm publish it was meant to protect.
+
+The coverage is now split by cost, because the two thorough tests turned out to
+be the wrong thing to put in front of an irreversible publish: **they fail
+intermittently, and nobody yet knows why.** An independent reviewer running them
+as a pair against real weights saw 2 failures in 6 runs, both
+`mcp_startup_embeds_without_any_tool_call` reporting `0 vectors after 300 s`
+while passing in 51 s when run alone.
+
+Zero vectors, not few — `PERIODIC_BACKFILL_SECS` is 60, so that window spans
+five backfill ticks with nothing embedded, which is not slowness. Three
+candidate explanations have been eliminated: the weights (the sibling test
+embedded successfully in the same process seconds earlier, and the pinned
+sha256s match), the poll budget (it is per test, and pinned to 2 cores each of
+the pair finished well inside its own 300 s — the 424 s wall time of a failing
+run is 300 s of polling nothing plus setup, the same zero-vector failure rather
+than a slow one), and an unread stderr pipe blocking the child (a spawned server
+writes 164 bytes of stderr in 75 s — three orders of magnitude short of filling
+it). A gate that fails one release in three on an unexplained defect is worse
+than no gate.
+
+So the **gate** runs the cheap half: load the weights that are about to be
+published and embed one string — `test_embed_produces_correct_dims`, 1.36 s,
+now with `CODE_GRAPH_REQUIRE_MODEL=1` so it cannot pass by doing nothing, which
+is what it did on every runner without a cached model. That answers the question
+ENG-02 actually asked, before publish. The two backfill regressions move to the
+**cache-warm cron**, with the same flag and a 25-minute step cap, where a slow
+run costs nothing and a red one is a finding rather than a blocked release.
+Expect that cron to be red some of the time until the defect above is found —
+that visibility is the point, and this is the first time these two run with real
+weights anywhere in CI. They have always been runnable locally; no automated leg
+ever supplied them weights.
+
+Their stderr is now drained rather than piped into a buffer nobody read, and the
+failing assertion prints it. That does not fix the intermittent failure — the
+measurement above rules the pipe out as its cause — but it removes a latent
+deadlock and means the next failure arrives with the server's own log attached
+instead of silently.
+
+Both steps fetch weights from the same sha256-pinned `model-assets-v1` mirror
+the publish job already packages, so no third-party dependency joins the release
+path. The downloads carry `--max-time 300`: curl has no default transfer timeout
+and `--retry` does not fire on a connected-but-stalled transfer, which is how an
+earlier step on this same critical path once sat 29 minutes with a tag already
+pushed and nothing published.
+
+Two things had to be nailed down before either step could be trusted, both of
+them instances of the failure they exist to prevent. `cargo test <substring>`
+exits 0 when the filter matches **nothing** — so a rename would have restored
+the exact "green, having run nothing" state, with `CODE_GRAPH_REQUIRE_MODEL`
+powerless because its assert lives inside a test that never runs. Each step now
+names its tests with `--exact` and asserts an `N passed` line, and a guard
+(`release_gate_runs_the_real_weight_tests_by_name`) pins those names to the
+source so a rename fails a local `cargo test` instead of a release. And the same
+three sha256s are now pinned in three places across two workflow files, so a
+second guard (`release_model_pins_agree_across_jobs`) asserts every copy agrees
+— running itself against a deliberately tampered copy, because an equality
+assertion that has never been shown to reject anything is indistinguishable from
+one reading the wrong lines.
+
+### A dense call graph stopped saying nothing was hidden
+
+`get_call_graph` hides test callers and callees by default and discloses the
+counts. Above the compression threshold it returns a file-level rollup built
+from scratch, and that payload carried neither field — so on exactly the dense
+graphs where a single hidden test caller is hardest to notice, the answer said
+nothing had been hidden at all. Pre-existing, not a regression of 0.136.0's
+per-direction split; both response shapes now attach the counts through one
+helper instead of one of them doing it inline.
+
+### A starved hook and a broken binary stopped looking the same
+
+When a hook spends its registered budget, `cg-answer`'s runners degrade to
+`unavailable` — the same word a wedged or missing binary produces. Three of the
+four carried `reason: 'budget'` to tell those apart; `runOverviewAnswer` did
+not, and it backs the read-fanout hint, whose budget is the one most often
+already spent. Both consumers dropped the cause too, recording `reason` alone.
+The cause now rides in `fallthrough_reason` beside an unchanged `reason`,
+deliberately: `src/cli/usage.rs` scores `reason:"unavailable"` as an
+inconclusive follow-up, and a new value in that field would have silently
+re-filed every budget skip as "the inline answer was insufficient".
+
+### Not covered
+
+- SURF-07 (in-loop queries) and JS-05 (repeated cache-path strings) from the
+  2026-09-05 audit are still not done. Neither fixes correctness.
+- The MCP-side pool-exhaustion retry still has no direct test. The two added
+  here cover the CLI half only.
+- `mcp_startup_embeds_without_any_tool_call` fails intermittently — 2 in 6 runs
+  when paired with its sibling, `0 vectors after 300 s`, passing in 51 s alone.
+  Unexplained: not slowness, not the weights, not the unread stderr pipe (each
+  measured and ruled out above). It is why the pair is on the cache-warm cron
+  rather than the release gate. If it is a product bug it is the "vectors never
+  move" strand these tests were written for — surfaced by running them as a pair
+  against real weights, which no automated leg had ever done.
+- `lifecycle.e2e.test.js`'s "issue #24" (`composite expands a leading ~ in a
+  _previous command…`) is flaky, and CI does see it. Measured on an untouched
+  `b8c58b1` worktree on an idle machine: **2 red in 8** runs of serial
+  `make test-js` — the same invocation `ci.yml` and `release.yml` use, and
+  `release.yml` runs it before publish. So it predates this release and can
+  redden a release run on its own. The file in isolation is clean (3/3), so it
+  only fails as part of the whole suite; the failing runs complete the test in
+  under 70 ms, which rules out the 3 s provider timeout and points at one of the
+  paths in `runProvider` that return null fast. Not root-caused, and not this
+  release's to fix — recorded so the next red run is not misread as a
+  regression. This release also adds a test that spends 4.6 s exhausting a 5 s
+  hook budget (the floor for that scenario); whether that changes the flake's
+  rate was not established either way.
+- The `--locked` CI guard added in 0.135.0 matches line by line, so a
+  `cargo test \` continuation that puts the flag on the next line would be
+  reported as missing it. Fail-closed, and no workflow is written that way today.
+
 ## 0.136.0
 
 **Upgrading:** two commands print less by default, and in both cases the old
