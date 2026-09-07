@@ -744,12 +744,30 @@ test('the version gate clamps every candidate probe, re-reading the budget each 
 // Source-level because that is where the defect is: a literal reads fine and
 // behaves correctly in every unit test.
 test('no child spawned from find-binary.js runs on an unbudgeted timeout', () => {
-  const src = fs.readFileSync(path.join(__dirname, 'find-binary.js'), 'utf8');
+  const raw = fs.readFileSync(path.join(__dirname, 'find-binary.js'), 'utf8');
+  // Scan CODE, not prose. Two doc comments in this file quote `timeout: 0` while
+  // explaining why it is forbidden, and a scanner that counts those is the
+  // ENG-27 shape — the metrics script's JS cycle detector reads `require()`
+  // inside comments as a real edge to this day. Rough strip is enough for a
+  // guard; a false NEGATIVE here would need a timeout hidden inside a string.
+  const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
 
-  const literals = (src.match(/^\s*timeout:\s*\d+/gm) || []);
+  // Anchorless and constant-aware. The first version anchored at `^\\s*`, which
+  // matched neither `{ timeout: 2000, … }` on a shared line nor
+  // `timeout: PATH_PROBE_TIMEOUT_MS` — and with zero matches in the file it
+  // passed trivially, so it asserted nothing (delta review 2026-09-07).
+  const LITERAL_TIMEOUT = /timeout:\s*(?:\d+|[A-Z][A-Z0-9_]*)/g;
+  const literals = (src.match(LITERAL_TIMEOUT) || []);
   assert.deepEqual(literals, [],
-    `every child must take its timeout from pathProbeTimeoutMs()/versionProbeTimeoutMs(); ` +
-    `found ${literals.join(', ')}`);
+    `every child must take its timeout from pathProbeTimeoutMs()/versionProbeTimeoutMs() — ` +
+    `a raw constant is the same unbudgeted spawn. Found ${literals.join(', ')}`);
+  // Positive control: the pattern really does catch what it is here to catch,
+  // in both the shared-line and the named-constant spellings.
+  for (const bad of ['const o = { timeout: 2000, encoding: "utf8" };',
+                     'execFileSync(x, y, { timeout: PATH_PROBE_TIMEOUT_MS });']) {
+    assert.ok(LITERAL_TIMEOUT.test(bad), `the scan misses \`${bad}\` — it would pass on a real regression`);
+    LITERAL_TIMEOUT.lastIndex = 0;
+  }
 
   // `readBinaryVersion` defaults to 5s internally, so calling it without an
   // explicit timeoutMs is the same defect wearing a helper's clothes.

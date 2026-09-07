@@ -392,11 +392,14 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         // And re-run the ambiguity gate against the refreshed index: the
         // re-index can have added a same-name definition, and merging two
         // definitions' references into one total is the SURF-17 defect on a
-        // different path.
+        // different path. Disclose the refresh FIRST — this gate exits the
+        // process, and the partial-refresh disclosure is about the same run
+        // (delta review 2026-09-07).
+        outcome.disclose();
         target.reject_if_ambiguous(conn, symbol, json_mode)?;
         target_ids = target.resolve(conn, symbol)?;
         if target_ids.is_empty() {
-            outcome.disclose();
+            // Already disclosed above, before the exiting gate.
             // Empty-JSON contract, same envelope as the other not-found exits.
             if json_mode {
                 print_refs_notfound_json(symbol);
@@ -410,8 +413,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         let (a, c) = build_refs(conn, &target_ids)?;
         all_refs = a;
         conf_filtered = c;
+    } else {
+        // The `any_changed` arm above already disclosed, before its exiting
+        // ambiguity gate.
+        outcome.disclose();
     }
-    outcome.disclose();
 
     if json_mode {
         let items: Vec<serde_json::Value> = all_refs

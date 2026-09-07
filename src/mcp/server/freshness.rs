@@ -268,8 +268,16 @@ impl McpServer {
         // is this function's own doing, the tool cannot see that it is happening,
         // and `find_references`' own pre-refresh re-resolution is exactly what
         // makes the second pass believe the file is already fresh.
+        //
+        // Gated on the two tools that actually READ `node_id`
+        // (`tools/refs.rs`, `tools/advanced.rs::tool_find_similar_code`). The
+        // other eight ignore a stray one and say so via `ignored_arguments` —
+        // an envelope that said both "your node_id was ignored" and "your
+        // node_id is dead" would be worse than silence (delta review
+        // 2026-09-07).
         let node_identity = args
             .get("node_id")
+            .filter(|_| matches!(name, "find_references" | "find_similar_code"))
             .and_then(|v| v.as_i64())
             .and_then(|nid| {
                 crate::storage::queries::get_node_with_file_by_id(self.db.conn(), nid)
@@ -326,8 +334,9 @@ impl McpServer {
             value
         };
 
-        // The caller's id is dead either way; the re-dispatch would otherwise
-        // swallow the disclosure the first pass attached.
+        // The caller's id is dead either way, and only this layer can know it:
+        // the re-dispatch rebuilds the envelope from scratch, so a disclosure
+        // attached inside the tool would not survive.
         if renumbered_to.is_some() || node_id_gone {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("node_id_renumbered".to_string(), json!(true));
@@ -337,9 +346,14 @@ impl McpServer {
                          your node_id named is no longer in its file. The answer below predates \
                          that re-index; re-resolve with get_ast_node or ast_search."
                     } else {
+                        // NOT "use the node_id in this response": `find_references`
+                        // publishes no node_id for the TARGET — the only ones in its
+                        // envelope belong to the callers it found, and an agent that
+                        // followed that advice would re-query a caller (delta review
+                        // 2026-09-07).
                         "Files in this result were re-indexed to answer your call, which renumbered \
-                         their nodes. The node_id you passed is no longer valid; use the node_id in \
-                         this response, or re-resolve with get_ast_node or ast_search."
+                         their nodes. The node_id you passed is dead — re-resolve the symbol with \
+                         get_ast_node(symbol_name, file_path) or ast_search before using an id again."
                     }
                 ));
             }

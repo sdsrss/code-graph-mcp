@@ -6413,6 +6413,77 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// The `Ok(None)` arm of the wrapper's re-resolution: the symbol the caller's
+    /// node_id named is GONE from the re-indexed source. Re-dispatching would
+    /// answer about whatever inherited the id, which is the whole defect — so the
+    /// pre-refresh answer is kept and the id is declared dead.
+    ///
+    /// Delta review 2026-09-07 measured that this branch had no coverage: changed
+    /// to `Ok(None) => {}` the entire 1770-test suite still passed, while the
+    /// wrapper re-dispatched with a dead id.
+    #[test]
+    fn test_result_refresh_keeps_the_pre_refresh_answer_when_the_symbol_is_deleted() {
+        let project = TempDir::new().unwrap();
+        let target = project.path().join("z_target.rs");
+        let refsite = project.path().join("a_ref.rs");
+        // A reference in the DEFINITION's own file, so that file lands in the
+        // result set and therefore gets refreshed — the wrapper only re-resolves
+        // when it actually refreshed something, and only result files are ever
+        // refreshed. A fixture whose only reference lives elsewhere never
+        // re-indexes the definition's file and so never reaches this branch
+        // (measured while writing this test).
+        std::fs::write(
+            &target,
+            "pub fn gone_helper() {}\npub fn gone_local() { gone_helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(&refsite, "pub fn gone_caller() { gone_helper(); }\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let node_id = ast_node_call(
+            &server,
+            json!({ "symbol_name": "gone_helper", "file_path": "z_target.rs" }),
+        )["node_id"]
+            .as_i64()
+            .unwrap();
+
+        close_other_freshness_paths(&mut server);
+        // The symbol the id names is DELETED, and a second file is edited so the
+        // result-set refresh still fires and reaches the re-dispatch decision.
+        std::fs::write(&target, "pub fn gone_local() {}\n").unwrap();
+        std::fs::write(
+            &refsite,
+            "// edited\npub fn gone_caller() { gone_helper(); }\n",
+        )
+        .unwrap();
+
+        let out = find_refs_call(&server, json!({ "node_id": node_id }));
+        assert_ne!(
+            out["symbol"],
+            json!("gone_local"),
+            "the deleted symbol's id must not be answered as the symbol that \
+             inherited it: {out}"
+        );
+        assert_eq!(
+            out["symbol"],
+            json!("gone_helper"),
+            "the pre-refresh answer is kept — it is at least about the right \
+             symbol: {out}"
+        );
+        assert_eq!(
+            out["node_id_renumbered"],
+            json!(true),
+            "and the caller must be told the id is dead: {out}"
+        );
+        assert!(
+            out["node_id_renumbered_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("no longer in its file")),
+            "the note must name the DELETED case, not the renumbered one: {out}"
+        );
+    }
+
     /// SURF-17's MCP half. The envelope is the shared one from
     /// `crate::resolve`, not a fifth hand-written wording — a caller comparing
     /// two tools' verdicts for one symbol must not have to tell a wording

@@ -82,6 +82,15 @@ impl McpServer {
             // and can capture the identity before any refresh runs — and which
             // covers `find_similar_code`'s node_id arm at the same time.
             //
+            // That covers strictly less than re-resolving here would, and the
+            // difference is deliberate: the wrapper only acts when it actually
+            // refreshed a RESULT file, so editing the definition's own file
+            // while nothing in it references the target refreshes nothing and
+            // discloses nothing. That is `main`'s behaviour, and the price of
+            // not re-indexing the file whose ids the re-dispatch is about to
+            // reuse. `get_ast_node` has no re-dispatch and so keeps the wider
+            // coverage (delta review 2026-09-07).
+            //
             // Unjoined lookup on purpose: a node whose `files` row is missing
             // still answers here (see the batching note further down), and the
             // joined variant would turn it into an error.
