@@ -6332,13 +6332,25 @@ app.post('/api/login', handleLogin);
         assert_eq!(
             out["node_id_renumbered"],
             json!(true),
-            "the id the caller passed is dead — same disclosure get_ast_node makes: {out}"
+            // `get_ast_node` reports the same FACT under different keys
+            // (`note`, and no live id) because it is not re-dispatched and can
+            // answer with the renumbered node directly. `freshness_parity.rs`
+            // has no guard tying the two spellings together (delta review
+            // round 4, 2026-09-07).
+            "the id the caller passed is dead: {out}"
         );
         assert!(
             out["node_id_now"].as_i64().is_some_and(|id| id != node_id),
             "and the LIVE id must be handed back, because this envelope publishes \
              no other id for the target: {out}"
         );
+        // Every key the note NAMES must exist in the envelope it is attached to.
+        // Three review rounds in a row found a note pointing at something the
+        // response does not carry ("use the node_id in this response" when the
+        // only ids belong to callers; `get_ast_node(symbol_name, file_path)`
+        // when neither is published). A rename of `node_id_now` in the note
+        // alone would otherwise stay green (delta review round 4, 2026-09-07).
+        assert_named_keys_exist(&out, "node_id_renumbered_note");
 
         // Anti-vacuity: the id really was reused, so the assertion above is
         // about identity re-resolution and not about an index that happened to
@@ -6416,6 +6428,33 @@ app.post('/api/login', handleLogin);
             "and the answer must be the post-edit one — the whole point of the \
              re-dispatch is fresh line numbers: {out}"
         );
+    }
+
+    /// Assert that every `backticked` identifier in `note_key`'s string is a
+    /// real key of `envelope`. A note is the one part of a response nothing
+    /// type-checks, and this repository has shipped three of them naming keys
+    /// that were not there.
+    fn assert_named_keys_exist(envelope: &serde_json::Value, note_key: &str) {
+        let note = envelope[note_key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{note_key} missing: {envelope}"));
+        let named: Vec<&str> = note
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "the note names no key at all — this check would be vacuous: {note}"
+        );
+        for key in named {
+            assert!(
+                envelope.get(key).is_some(),
+                "the note points at `{key}`, which is not a key of the response it \
+                 is attached to: {envelope}"
+            );
+        }
     }
 
     /// The `Ok(None)` arm of the wrapper's re-resolution: the symbol the caller's
