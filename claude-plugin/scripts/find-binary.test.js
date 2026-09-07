@@ -747,16 +747,37 @@ test('no child spawned from find-binary.js runs on an unbudgeted timeout', () =>
   const raw = fs.readFileSync(path.join(__dirname, 'find-binary.js'), 'utf8');
   // Scan CODE, not prose. Two doc comments in this file quote `timeout: 0` while
   // explaining why it is forbidden, and a scanner that counts those is the
-  // ENG-27 shape — the metrics script's JS cycle detector reads `require()`
-  // inside comments as a real edge to this day. Rough strip is enough for a
-  // guard; a false NEGATIVE here would need a timeout hidden inside a string.
-  const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+  // ENG-27 shape — the metrics script's JS cycle detector still reads
+  // `require()` inside comments as a real edge.
+  //
+  // ONE left-to-right pass over an alternation of string | block comment | line
+  // comment, so whichever opens FIRST wins. Two sequential replaces do not: the
+  // first version stripped block comments before line comments, so the `/*` in
+  // the `node/*/lib/node_modules` glob inside a `//` comment (find-binary.js:178)
+  // opened a fake block comment and deleted ~36 lines of real source — including
+  // the whole body of `isNativeBinary`. A planted `timeout: 2000` in that span
+  // was MISSED while the identical line 20 lines later was caught (delta review
+  // round 3, 2026-09-07). A guard that deletes the code it is scanning is worse
+  // than no guard, because it reports success.
+  const src = raw.replace(
+    /(["'`])(?:\\[\s\S]|(?!\1)[^\\])*\1|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+    (m) => (m.startsWith('/*') || m.startsWith('//') ? '' : m),
+  );
+  // The strip must not eat executable source. `isNativeBinary` sits inside the
+  // span the previous version deleted, so its presence is the direct control.
+  for (const anchor of ['function isNativeBinary', 'function nvmNodeModulesDirs',
+                        'function findBinaryUncached']) {
+    assert.ok(src.includes(anchor),
+      `the comment strip deleted real source (${anchor} is gone) — every scan below is vacuous`);
+  }
 
   // Anchorless and constant-aware. The first version anchored at `^\\s*`, which
   // matched neither `{ timeout: 2000, … }` on a shared line nor
   // `timeout: PATH_PROBE_TIMEOUT_MS` — and with zero matches in the file it
   // passed trivially, so it asserted nothing (delta review 2026-09-07).
-  const LITERAL_TIMEOUT = /timeout:\s*(?:\d+|[A-Z][A-Z0-9_]*)/g;
+  // `[A-Z][A-Z0-9_]+` needs a SECOND uppercase/digit/underscore, so a named
+  // constant matches and `timeout: Math.min(a, b)` does not.
+  const LITERAL_TIMEOUT = /timeout:\s*(?:\d+|[A-Z][A-Z0-9_]+\b)/g;
   const literals = (src.match(LITERAL_TIMEOUT) || []);
   assert.deepEqual(literals, [],
     `every child must take its timeout from pathProbeTimeoutMs()/versionProbeTimeoutMs() — ` +
@@ -768,6 +789,9 @@ test('no child spawned from find-binary.js runs on an unbudgeted timeout', () =>
     assert.ok(LITERAL_TIMEOUT.test(bad), `the scan misses \`${bad}\` — it would pass on a real regression`);
     LITERAL_TIMEOUT.lastIndex = 0;
   }
+  // …and does not fire on a computed one, or the guard becomes noise nobody can act on.
+  assert.ok(!LITERAL_TIMEOUT.test('{ timeout: Math.min(a, b) }'), 'false positive on a computed timeout');
+  LITERAL_TIMEOUT.lastIndex = 0;
 
   // `readBinaryVersion` defaults to 5s internally, so calling it without an
   // explicit timeoutMs is the same defect wearing a helper's clothes.

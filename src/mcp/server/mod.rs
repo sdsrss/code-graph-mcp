@@ -6334,6 +6334,11 @@ app.post('/api/login', handleLogin);
             json!(true),
             "the id the caller passed is dead — same disclosure get_ast_node makes: {out}"
         );
+        assert!(
+            out["node_id_now"].as_i64().is_some_and(|id| id != node_id),
+            "and the LIVE id must be handed back, because this envelope publishes \
+             no other id for the target: {out}"
+        );
 
         // Anti-vacuity: the id really was reused, so the assertion above is
         // about identity re-resolution and not about an index that happened to
@@ -6475,6 +6480,21 @@ app.post('/api/login', handleLogin);
             out["node_id_renumbered"],
             json!(true),
             "and the caller must be told the id is dead: {out}"
+        );
+        assert!(
+            out.get("node_id_now").is_none(),
+            "there is no live id to hand back for a deleted symbol: {out}"
+        );
+        // The kept answer is the PRE-refresh one, so its line numbers are the
+        // pre-edit ones. Asserting the symbol alone would not distinguish
+        // "kept the old answer" from "re-dispatched and got lucky" — under the
+        // `Ok(None) => {}` mutation the re-dispatch errors and falls back to
+        // this same value, so the disclosure is what turns red there and this
+        // is what pins the content.
+        assert_eq!(
+            out["references"][0]["start_line"].as_i64(),
+            Some(1),
+            "pre-edit line number — the answer predates the refresh: {out}"
         );
         assert!(
             out["node_id_renumbered_note"]

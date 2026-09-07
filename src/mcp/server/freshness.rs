@@ -64,6 +64,16 @@ const RESULT_REFRESH_BUSY_TIMEOUT_MS: u32 = crate::indexer::resync::RESYNC_BUSY_
 /// Connection default set by `Database::open` — what the guard restores.
 const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5000;
 
+/// Why an id-addressed re-dispatch was abandoned. Two different facts: the
+/// symbol is provably absent from the re-indexed file, or the re-resolution
+/// itself failed and we know nothing. Reporting the second as the first is a
+/// claim the lookup did not establish.
+#[derive(Clone, Copy)]
+enum GoneReason {
+    Absent,
+    Unresolvable,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResultRefreshOutcome {
     pub(super) refreshed: usize,
@@ -271,10 +281,14 @@ impl McpServer {
         //
         // Gated on the two tools that actually READ `node_id`
         // (`tools/refs.rs`, `tools/advanced.rs::tool_find_similar_code`). The
-        // other eight ignore a stray one and say so via `ignored_arguments` —
-        // an envelope that said both "your node_id was ignored" and "your
-        // node_id is dead" would be worse than silence (delta review
-        // 2026-09-07).
+        // other eight ignore a stray one, and telling those callers their
+        // node_id is dead would be worse than silence — for the five listed
+        // tools it would contradict the `ignored_arguments: ["node_id"]` in the
+        // same envelope, and for `find_dead_code` / `trace_http_chain` /
+        // `find_http_route` it would be the ONLY thing said about an argument
+        // that was ignored, because `note_ignored_arguments` looks the tool up
+        // in `registry.list_tools()` and those three are not listed (delta
+        // review round 3, 2026-09-07).
         let node_identity = args
             .get("node_id")
             .filter(|_| matches!(name, "find_references" | "find_similar_code"))
@@ -288,7 +302,7 @@ impl McpServer {
 
         let outcome = self.reindex_stale_result_files(&root, &paths);
         let mut renumbered_to: Option<i64> = None;
-        let mut node_id_gone = false;
+        let mut node_id_gone: Option<GoneReason> = None;
         let mut value = if outcome.refreshed > 0 {
             // Line numbers/snippets in the old result are now wrong; re-run once.
             // A failing re-run keeps the first (stale) answer rather than turning
@@ -312,14 +326,17 @@ impl McpServer {
                     // would answer about whatever now holds the id, so keep the
                     // pre-refresh answer — which is at least about the right
                     // symbol — and say the id is dead.
-                    Ok(None) => node_id_gone = true,
+                    Ok(None) => node_id_gone = Some(GoneReason::Absent),
+                    // Same decision, different fact: we do not KNOW the symbol is
+                    // absent, only that we could not re-resolve it. Saying it is
+                    // gone would be a claim the lookup did not establish.
                     Err(e) => {
                         tracing::warn!("[fresh] re-resolving node_id {} failed: {}", nid, e);
-                        node_id_gone = true;
+                        node_id_gone = Some(GoneReason::Unresolvable);
                     }
                 }
             }
-            if node_id_gone {
+            if node_id_gone.is_some() {
                 value
             } else {
                 match self.dispatch_tool(name, &fresh_args) {
@@ -337,25 +354,36 @@ impl McpServer {
         // The caller's id is dead either way, and only this layer can know it:
         // the re-dispatch rebuilds the envelope from scratch, so a disclosure
         // attached inside the tool would not survive.
-        if renumbered_to.is_some() || node_id_gone {
+        if renumbered_to.is_some() || node_id_gone.is_some() {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("node_id_renumbered".to_string(), json!(true));
-                obj.insert("node_id_renumbered_note".to_string(), json!(
-                    if node_id_gone {
-                        "Files in this result were re-indexed to answer your call, and the symbol \
-                         your node_id named is no longer in its file. The answer below predates \
-                         that re-index; re-resolve with get_ast_node or ast_search."
-                    } else {
-                        // NOT "use the node_id in this response": `find_references`
-                        // publishes no node_id for the TARGET — the only ones in its
-                        // envelope belong to the callers it found, and an agent that
-                        // followed that advice would re-query a caller (delta review
-                        // 2026-09-07).
-                        "Files in this result were re-indexed to answer your call, which renumbered \
-                         their nodes. The node_id you passed is dead — re-resolve the symbol with \
-                         get_ast_node(symbol_name, file_path) or ast_search before using an id again."
-                    }
-                ));
+                // The live id, IN the envelope, so the note has something to
+                // point at that is true for both tools. `find_similar_code`
+                // already publishes `query_node_id`; `find_references` publishes
+                // no id for the target at all, and an earlier version of this
+                // note told the caller to "use the node_id in this response" —
+                // which there means a CALLER's id (delta review, 2026-09-07).
+                if let Some(new_id) = renumbered_to {
+                    obj.insert("node_id_now".to_string(), json!(new_id));
+                }
+                obj.insert(
+                    "node_id_renumbered_note".to_string(),
+                    json!(match node_id_gone {
+                        Some(GoneReason::Absent) =>
+                            "Files in this result were re-indexed to answer your call, and the \
+                             symbol your node_id named is no longer in its file. The answer below \
+                             predates that re-index; re-resolve with get_ast_node or ast_search.",
+                        Some(GoneReason::Unresolvable) =>
+                            "Files in this result were re-indexed to answer your call, and your \
+                             node_id could not be re-resolved against the new index. The answer \
+                             below predates that re-index; re-resolve with get_ast_node or \
+                             ast_search.",
+                        None =>
+                            "Files in this result were re-indexed to answer your call, which \
+                             renumbered their nodes. The node_id you passed is dead — the live one \
+                             is in `node_id_now`.",
+                    }),
+                );
             }
         }
 
