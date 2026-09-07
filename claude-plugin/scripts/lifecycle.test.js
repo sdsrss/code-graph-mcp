@@ -1308,7 +1308,20 @@ test('uninstall removes plugin-installed global packages (marker present)', (t) 
   assert.deepEqual(r.globalPkgsRemaining, []);
   assert.deepEqual(r.adoptedProjects, ['/proj/a', '/proj/b'],
     'adoption inventory read before the cache wipe');
-  assert.equal(fs.existsSync(cacheDir), false, 'cache dir removed');
+  // JS-17 (audit 2026-09-07): this used to assert the whole cache dir was gone,
+  // registry included — which is the data loss, not the contract. A NON-EMPTY
+  // registry is the only record of which repos still carry a managed block, and
+  // the guidance printed immediately after this tells the user to re-run with
+  // --unadopt-all. So it survives, and NOTHING else does: the global-install
+  // marker seeded above is residue and its removal is what this assertion
+  // still proves.
+  assert.deepEqual(
+    fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [],
+    ['adopted-projects.json'],
+    'the adoption registry is the only thing allowed to outlive the cache wipe');
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(cacheDir, 'adopted-projects.json'), 'utf8')),
+    ['/proj/a', '/proj/b'], 'and it must survive intact');
 });
 
 test('uninstall leaves user-installed globals alone without marker; --purge-global overrides', (t) => {
@@ -1516,6 +1529,53 @@ test('uninstall --unadopt-all sweeps every registered adopted project', (t) => {
   assert.deepEqual(r.adoptedProjects, [], 'registry re-read shows nothing left to hand-clean');
   assert.equal(fs.existsSync(path.join(proj, 'CLAUDE.md')), false, 'managed CLAUDE.md removed (we created it)');
   assert.equal(fs.existsSync(path.join(proj, '.claude', 'plugin_code_graph_mcp.md')), false, 'detail file removed');
+});
+
+// JS-17 (audit 2026-09-07). `uninstall()` without `--unadopt-all` wiped
+// CACHE_DIR wholesale — adopted-projects.json with it — and THEN told the user
+// "Clean all at once: re-run with --unadopt-all". The second run read an empty
+// registry, reported `unadopted: []`, and every other repo kept its managed
+// CLAUDE.md block with nothing left that knew where they were. That is exactly
+// the data loss `removeCacheResidue()` was written to prevent, and its own
+// comment claimed `uninstall()` routed through it (it did not).
+test('uninstall without --unadopt-all keeps the registry the follow-up command needs', (t) => {
+  const homeDir = mkHome(t);
+  writeJson(path.join(homeDir, '.claude', 'settings.json'), {});
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-js17-'));
+  t.after(() => fs.rmSync(proj, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(proj, '.git'));
+
+  const script = `
+    const fs = require('fs');
+    const adoptMod = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+    const { uninstall } = require(${JSON.stringify(lifecyclePath)});
+    const a = adoptMod.adopt({ cwd: ${JSON.stringify(proj)} });
+    // The path the CLI arm prints guidance for: uninstall FIRST, unadopt after.
+    const first = uninstall({ scanGlobalPkgs: () => [], runNpm: () => true });
+    const registryFile = adoptMod.adoptedRegistryFile();
+    const survived = fs.existsSync(registryFile);
+    const listed = survived ? JSON.parse(fs.readFileSync(registryFile, 'utf8')) : null;
+    // Now do what both the CLI and lifecycle tell the user to do next.
+    const second = uninstall({ unadoptAll: true, scanGlobalPkgs: () => [], runNpm: () => true });
+    process.stdout.write(JSON.stringify({
+      adopted: a.ok, firstSaw: first.adoptedProjects.length, survived, listed,
+      swept: second.unadopted,
+    }));
+  `;
+  const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+  }).toString());
+
+  assert.equal(r.adopted, true, 'fixture precondition: the project was adopted');
+  assert.equal(r.firstSaw, 1, 'fixture precondition: the first uninstall saw a non-empty registry');
+  assert.equal(r.survived, true,
+    'the registry is the ONLY record of which repos carry a managed block, and the very ' +
+    'next line of guidance tells the user to re-run with --unadopt-all');
+  assert.deepEqual(r.listed, [proj], 'and it must still name the project');
+  assert.equal(r.swept.length, 1, 'the follow-up --unadopt-all must find something to sweep');
+  assert.equal(r.swept[0].cleaned, true, 'and must actually clean it');
+  assert.equal(fs.existsSync(path.join(proj, 'CLAUDE.md')), false,
+    'the managed CLAUDE.md is gone — otherwise the block was stranded in the user\'s repo');
 });
 
 // --- migrateOldPluginIds failure arms (audit 2026-08-22 P2-10) -------------

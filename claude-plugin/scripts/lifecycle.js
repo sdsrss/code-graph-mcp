@@ -1616,8 +1616,18 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
     }
   }
 
-  // 6. Remove cache directory
-  try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
+  // 6. Remove cache directory — through `removeCacheResidue()`, not a bare
+  // rmSync (JS-17, audit 2026-09-07). Without `--unadopt-all` the sweep above
+  // does not run, so the registry is still NON-EMPTY here and a wholesale wipe
+  // strands every managed block — while step 8's own guidance, and `cli.js`,
+  // tell the user their next move is `--unadopt-all`, which then reads an
+  // absent registry and reports nothing to clean. `adoptedProjects` was
+  // captured at 5.5 for the RETURN value; that capture never protected the
+  // file. With `--unadopt-all` the sweep leaves the registry empty (or holding
+  // only projects whose CLAUDE.md could not be rewritten, which is exactly what
+  // must survive), and `removeCacheResidue` preserves only a non-empty one, so
+  // the clean case still leaves nothing behind.
+  try { removeCacheResidue(); } catch { /* ok */ }
 
   // 6.5. The shared tmp dir (cooldown flags, read-fanout state, interrupted
   // `update-*` staging). Nothing in it outlives an uninstall, and the periodic
@@ -1954,12 +1964,14 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // of which repos carry a managed CLAUDE.md block. Wiping it strands every block
 // — `uninstall({unadoptAll:true})` afterwards reads an empty registry, reports
 // `unadopted: []`, and the blocks stay in the user's repos with nothing left
-// that knows where they are. `uninstall()` captures the list before calling
-// here; `cleanupDisabledStatusline` does not, and by this function's own comment
-// that is the ONE path guaranteed to run after `/plugin uninstall`. So the
-// preservation belongs here, at the wipe, rather than at each caller — the same
-// "fix it at the shared layer, not per surface" the <external> query filter
-// needed.
+// that knows where they are. No caller can be trusted to protect it first:
+// `cleanupDisabledStatusline` cannot (it is the ONE path guaranteed to run after
+// a CC `/plugin uninstall`, and it has no list), and `uninstall()` did not —
+// it captured the list for its RETURN value and then wiped the file with a bare
+// rmSync, which is the JS-17 data loss (audit 2026-09-07); it routes through
+// here now. So the preservation belongs here, at the wipe, rather than at each
+// caller — the same "fix it at the shared layer, not per surface" the
+// <external> query filter needed.
 function removeCacheResidue() {
   // Path comes from adopt.js rather than a second spelling of the basename —
   // a literal here would silently stop matching the day adopt.js renames it,
