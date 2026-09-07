@@ -6346,6 +6346,73 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// SURF-32 / the SURF-16 pre-ship blocker. `find_references` is in
+    /// `RESULT_REFRESH_TOOLS`, so `refresh_result_set` re-dispatches it with the
+    /// caller's ORIGINAL args when any result file was stale. Re-resolving the
+    /// node_id inside the first dispatch re-indexes the TARGET's file, which
+    /// frees its ids — so a second stale file elsewhere in the result triggers a
+    /// re-dispatch whose `node_id` has since been reused, and the second pass
+    /// finds that file already fresh and answers about the wrong symbol.
+    ///
+    /// The fixture needs TWO files for exactly that reason: the branch's
+    /// single-file test cannot reach the re-dispatch at all, because the first
+    /// dispatch leaves the only result file fresh.
+    #[test]
+    fn test_find_references_by_id_survives_the_result_set_re_dispatch() {
+        let project = TempDir::new().unwrap();
+        // `z_target.rs` sorts last, so it is indexed last and holds the highest
+        // rowids — the ones a re-index of that file frees and re-hands-out.
+        let target = project.path().join("z_target.rs");
+        let refsite = project.path().join("a_ref.rs");
+        std::fs::write(&target, "pub fn surf32_helper() {}\n").unwrap();
+        std::fs::write(&refsite, "pub fn surf32_caller() { surf32_helper(); }\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let node_id = ast_node_call(
+            &server,
+            json!({ "symbol_name": "surf32_helper", "file_path": "z_target.rs" }),
+        )["node_id"]
+            .as_i64()
+            .unwrap();
+
+        close_other_freshness_paths(&mut server);
+        // BOTH files edited: the target's file is what the node_id arm refreshes,
+        // and the reference's file is what is still stale when the result-set
+        // refresh runs — which is what makes it re-dispatch.
+        std::fs::write(
+            &target,
+            "pub fn surf32_zeta_a() {}\npub fn surf32_zeta_b() { surf32_zeta_a(); }\n\
+             pub fn surf32_helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &refsite,
+            "// edited\npub fn surf32_caller() { surf32_helper(); }\n",
+        )
+        .unwrap();
+
+        let out = find_refs_call(&server, json!({ "node_id": node_id }));
+        assert_eq!(
+            out["symbol"],
+            json!("surf32_helper"),
+            "the re-dispatch must not answer about whatever inherited the id: {out}"
+        );
+        let names: Vec<&str> = out["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no references array: {out}"))
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["surf32_caller"], "{out}");
+        assert_eq!(
+            out["references"][0]["start_line"].as_i64(),
+            Some(2),
+            "and the answer must be the post-edit one — the whole point of the \
+             re-dispatch is fresh line numbers: {out}"
+        );
+    }
+
     /// SURF-17's MCP half. The envelope is the shared one from
     /// `crate::resolve`, not a fifth hand-written wording — a caller comparing
     /// two tools' verdicts for one symbol must not have to tell a wording

@@ -157,9 +157,13 @@ function globalNodeModulesCandidates() {
 
   // 4. Last resort: ask npm directly. Slow (~50-200ms) but most accurate when
   //    user has a non-standard prefix. Cached at the disk-cache layer above.
+  // Budget-aware like the sibling probes in this file (JS-23 / pre-ship review
+  // 2026-09-07): this runs on the same `findBinaryUncached()` chain, and every
+  // hook calls `findBinary()` before it consults its own budget. `remainingMs`
+  // returns the default unchanged when nothing armed a deadline.
   try {
     const npm = npmInvocation(['root', '-g'], {
-      timeout: 2000,
+      timeout: pathProbeTimeoutMs(),
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf8',
     });
@@ -214,7 +218,9 @@ function isCachedBinaryFresh(cachedPath, pkgVersion, knownVersion) {
   // `knownVersion` lets the caller skip the `--version` spawn when the cache
   // entry already recorded it AND the file has not changed since — see
   // `readCacheEntry`. Absent, behaviour is exactly as before.
-  const cacheVer = knownVersion || readBinaryVersion(cachedPath);
+  // Clamped: this fires whenever the cache stamp mismatches — i.e. right after
+  // an auto-update, on the hook path (JS-23 / pre-ship review 2026-09-07).
+  const cacheVer = knownVersion || readBinaryVersion(cachedPath, { timeoutMs: versionProbeTimeoutMs() });
   if (!cacheVer) return true;
   return compareVersions(cacheVer, pkgVersion) >= 0;
 }
@@ -271,7 +277,9 @@ function writeCacheEntry(binPath) {
       CACHE_FILE,
       JSON.stringify({
         path: binPath,
-        version: readBinaryVersion(binPath) || null,
+        // Clamped: this is on the COLD-CACHE path, which is exactly the case
+        // JS-23 is about (pre-ship review 2026-09-07).
+        version: readBinaryVersion(binPath, { timeoutMs: versionProbeTimeoutMs() }) || null,
         stamp: binaryStamp(binPath),
       })
     );

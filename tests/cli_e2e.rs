@@ -10945,3 +10945,56 @@ fn show_refs_reports_a_failed_edge_query_instead_of_an_empty_call_list() {
         "no call list may be published from a query that did not run: {out}"
     );
 }
+
+/// Pre-ship review 2026-09-07: the SURF-17 gate ran on the PRE-refresh index
+/// only, so a re-index that ADDED a same-name definition put the merge right
+/// back — visible as the same command answering twice, differently. The run
+/// that performs the refresh merged and exited 0; the next run saw the fresh
+/// index, gated, and exited 1.
+#[test]
+fn refs_with_file_re_gates_ambiguity_after_the_refresh() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // One `dup` at index time…
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct A;\nimpl A { pub fn dup(&self) {} }\n\
+         pub fn use_a(a: &A) { a.dup(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // …a second one appears on disk before the next query. The refresh `refs`
+    // runs over its own result set is what puts it in the index.
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct A;\npub struct B;\nimpl A { pub fn dup(&self) {} }\n\
+         impl B { pub fn dup(&self) {} }\n\
+         pub fn use_a(a: &A) { a.dup(); }\npub fn use_b(b: &B) { b.dup(); }\n",
+    )
+    .unwrap();
+
+    let args = ["refs", "dup", "--file", "src/lib.rs", "--json"];
+    let (first, _e1, code1) = run_cli(&project, &args);
+    let (second, _e2, code2) = run_cli(&project, &args);
+    assert_eq!(
+        code1, code2,
+        "the same command must not answer twice, differently. \
+         first (the run that refreshed):\n{first}\nsecond:\n{second}"
+    );
+    assert_eq!(
+        code1, 1,
+        "two same-name definitions in one file must be refused on BOTH runs: {first}"
+    );
+    let v: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("Ambiguous symbol")),
+        "{first}"
+    );
+}

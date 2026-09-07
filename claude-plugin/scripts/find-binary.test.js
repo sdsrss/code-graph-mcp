@@ -734,3 +734,30 @@ test('the version gate clamps every candidate probe, re-reading the budget each 
     'each candidate must be clamped to what is LEFT, not to a fresh default — ' +
     'six candidates at the 5s default is 30s of children in front of a 5s hook');
 });
+
+// The commit that clamped the version gate claimed "the two stretches of hook
+// time outside the budget" and left three more in this same file: the
+// `npm root -g` probe, `isCachedBinaryFresh`'s `--version` spawn (fires right
+// after an auto-update) and `writeCacheEntry`'s (on the cold-cache path the fix
+// was about). Every hook calls findBinary() before it consults its own budget,
+// so an unclamped child here is spent before the hook has spent anything.
+// Source-level because that is where the defect is: a literal reads fine and
+// behaves correctly in every unit test.
+test('no child spawned from find-binary.js runs on an unbudgeted timeout', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'find-binary.js'), 'utf8');
+
+  const literals = (src.match(/^\s*timeout:\s*\d+/gm) || []);
+  assert.deepEqual(literals, [],
+    `every child must take its timeout from pathProbeTimeoutMs()/versionProbeTimeoutMs(); ` +
+    `found ${literals.join(', ')}`);
+
+  // `readBinaryVersion` defaults to 5s internally, so calling it without an
+  // explicit timeoutMs is the same defect wearing a helper's clothes.
+  const calls = [...src.matchAll(/readBinaryVersion\(([^;]*?)\)/gs)].map((m) => m[0]);
+  const unbudgeted = calls.filter((c) => !c.includes('timeoutMs'));
+  assert.deepEqual(unbudgeted, [],
+    `readBinaryVersion defaults to a fresh 5s; pass versionProbeTimeoutMs(). Found: ${unbudgeted.join(' | ')}`);
+
+  // Anti-vacuity: the scan finds the call sites at all.
+  assert.ok(calls.length >= 2, `expected the version probes to be found, got ${calls.length}`);
+});

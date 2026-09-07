@@ -255,21 +255,95 @@ impl McpServer {
             return value;
         }
 
+        // An id-addressed call cannot be re-dispatched with the id the caller
+        // passed (SURF-32, pre-ship review 2026-09-07). `nodes.id` is a rowid
+        // alias with no AUTOINCREMENT, so the re-index below frees ids that the
+        // re-insert hands back out — and the tools in this list that accept a
+        // `node_id` (`find_references`, `find_similar_code`) would then answer
+        // about whichever symbol inherited it, under the name the caller asked
+        // for. Capture the identity BEFORE the refresh; the id is the only thing
+        // that stops being true across it.
+        //
+        // Fixing it here rather than in each tool is deliberate: the re-dispatch
+        // is this function's own doing, the tool cannot see that it is happening,
+        // and `find_references`' own pre-refresh re-resolution is exactly what
+        // makes the second pass believe the file is already fresh.
+        let node_identity = args
+            .get("node_id")
+            .and_then(|v| v.as_i64())
+            .and_then(|nid| {
+                crate::storage::queries::get_node_with_file_by_id(self.db.conn(), nid)
+                    .ok()
+                    .flatten()
+                    .map(|nf| (nid, nf))
+            });
+
         let outcome = self.reindex_stale_result_files(&root, &paths);
+        let mut renumbered_to: Option<i64> = None;
+        let mut node_id_gone = false;
         let mut value = if outcome.refreshed > 0 {
             // Line numbers/snippets in the old result are now wrong; re-run once.
             // A failing re-run keeps the first (stale) answer rather than turning
             // a working query into an error — disclosed below.
-            match self.dispatch_tool(name, args) {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    tracing::warn!("[fresh] re-run of {} after refresh failed: {}", name, e);
-                    value
+            let mut fresh_args = args.clone();
+            if let Some((nid, nf)) = &node_identity {
+                match crate::resolve::reresolve_node_by_identity(
+                    self.db.conn(),
+                    &nf.file_path,
+                    &nf.node.name,
+                    nf.node.qualified_name.as_deref(),
+                    &nf.node.node_type,
+                ) {
+                    Ok(Some(c)) => {
+                        if c.node.id != *nid {
+                            renumbered_to = Some(c.node.id);
+                            fresh_args["node_id"] = json!(c.node.id);
+                        }
+                    }
+                    // The symbol is gone from the re-indexed source. Re-dispatching
+                    // would answer about whatever now holds the id, so keep the
+                    // pre-refresh answer — which is at least about the right
+                    // symbol — and say the id is dead.
+                    Ok(None) => node_id_gone = true,
+                    Err(e) => {
+                        tracing::warn!("[fresh] re-resolving node_id {} failed: {}", nid, e);
+                        node_id_gone = true;
+                    }
+                }
+            }
+            if node_id_gone {
+                value
+            } else {
+                match self.dispatch_tool(name, &fresh_args) {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        tracing::warn!("[fresh] re-run of {} after refresh failed: {}", name, e);
+                        value
+                    }
                 }
             }
         } else {
             value
         };
+
+        // The caller's id is dead either way; the re-dispatch would otherwise
+        // swallow the disclosure the first pass attached.
+        if renumbered_to.is_some() || node_id_gone {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("node_id_renumbered".to_string(), json!(true));
+                obj.insert("node_id_renumbered_note".to_string(), json!(
+                    if node_id_gone {
+                        "Files in this result were re-indexed to answer your call, and the symbol \
+                         your node_id named is no longer in its file. The answer below predates \
+                         that re-index; re-resolve with get_ast_node or ast_search."
+                    } else {
+                        "Files in this result were re-indexed to answer your call, which renumbered \
+                         their nodes. The node_id you passed is no longer valid; use the node_id in \
+                         this response, or re-resolve with get_ast_node or ast_search."
+                    }
+                ));
+            }
+        }
 
         let stale_kept = outcome.failed + outcome.skipped_over_budget + unchecked;
         if stale_kept > 0 {

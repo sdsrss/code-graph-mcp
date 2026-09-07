@@ -113,6 +113,51 @@ impl RefsTarget {
                 .collect(),
         })
     }
+
+    /// Re-apply the SURF-17 ambiguity gate against the current index state.
+    ///
+    /// The gate that ran during initial resolution is not enough: the refresh in
+    /// between can have ADDED a same-name definition, and the `Name` arms above
+    /// would then merge two definitions' references into one total — exactly the
+    /// silent merge SURF-17 removed, reappearing on the post-refresh path. It is
+    /// observable as the same command giving two verdicts on two consecutive
+    /// runs: the run that performs the refresh answers `exit 0` with a merged
+    /// list, the next one answers `exit 1 Ambiguous` (pre-ship review
+    /// 2026-09-07).
+    ///
+    /// Never fires for `Node` / `Orphan`: a node_id IS the disambiguator, and
+    /// refusing one would leave the caller no escape hatch at all.
+    fn reject_if_ambiguous(
+        &self,
+        conn: &rusqlite::Connection,
+        symbol: &str,
+        json_mode: bool,
+    ) -> Result<()> {
+        let cands: Vec<queries::NameCandidate> = match self {
+            RefsTarget::Node { .. } | RefsTarget::Orphan(_) => return Ok(()),
+            RefsTarget::Name {
+                file_path: Some(fp),
+            } => queries::get_nodes_by_file_path(conn, fp)?
+                .into_iter()
+                .filter(|n| n.name == symbol)
+                .map(|n| queries::NameCandidate {
+                    name: n.name,
+                    file_path: fp.clone(),
+                    node_type: n.node_type,
+                    node_id: n.id,
+                    start_line: n.start_line,
+                })
+                .collect(),
+            // Same predicate the pre-refresh path used, so the two cannot drift.
+            RefsTarget::Name { file_path: None } => {
+                crate::resolve::detect_ambiguity(conn, symbol)?.unwrap_or_default()
+            }
+        };
+        if cands.len() > 1 {
+            emit_exact_ambiguity(symbol, &cands, json_mode);
+        }
+        Ok(())
+    }
 }
 
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
@@ -207,8 +252,13 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             // same input as ambiguous. That is the 2026-06-03 #6 shape (one
             // input, two surfaces, opposite verdicts) `crate::resolve` exists to
             // prevent, and the bare-name arm below has carried this gate since
-            // audit 2026-08-02 P1-6. `--node-id` is the escape hatch, and the
-            // shared message names it.
+            // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; note the
+            // shared same-file message points at `show --node-id <N>` rather
+            // than at this command's own `--node-id`, because it is written for
+            // callgraph/impact, which have no such flag. The node_ids it lists
+            // are the ones to pass here (pre-ship review 2026-09-07 — an earlier
+            // version of this comment claimed the message names `refs --node-id`,
+            // which it does not).
             if matched.len() > 1 {
                 let cands: Vec<queries::NameCandidate> = matched
                     .iter()
@@ -339,6 +389,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         // may now point at whatever inherited them. Look the targets up again
         // BEFORE re-running the rollup — re-running it with the stale ids is
         // what answered `zeta_b` under the name `helper`.
+        // And re-run the ambiguity gate against the refreshed index: the
+        // re-index can have added a same-name definition, and merging two
+        // definitions' references into one total is the SURF-17 defect on a
+        // different path.
+        target.reject_if_ambiguous(conn, symbol, json_mode)?;
         target_ids = target.resolve(conn, symbol)?;
         if target_ids.is_empty() {
             outcome.disclose();
