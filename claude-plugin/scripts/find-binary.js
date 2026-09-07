@@ -33,6 +33,34 @@ function pathProbeTimeoutMs(remaining = require('./hook-fail-open').remainingMs)
   const ms = left === null ? PATH_PROBE_MIN_MS : Math.floor(left);
   return Math.max(ms, PATH_PROBE_MIN_MS);
 }
+
+// `readBinaryVersion`'s own default. Kept here as the number this module asks
+// for so the clamp below is expressed against the same figure the callee would
+// have used on its own.
+const VERSION_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * How long ONE `--version` probe in the discovery chain may run (JS-23, audit
+ * 2026-09-07).
+ *
+ * The version gate execs the candidate binary, and `findBinary()` walks up to
+ * six candidates — so a chain of default 5 s probes is 30 s of children on the
+ * first thing every hook does, all of it BEFORE the hook has consulted its
+ * budget even once. Cold cache (first install, a version bump,
+ * `auto-update.clearCache()`) is exactly when the chain is longest and every
+ * candidate is a cold page-in.
+ *
+ * Same shape and the same two edges as `pathProbeTimeoutMs`: never 0 (node
+ * reads `timeout: 0` as no timeout), never fractional (ERR_OUT_OF_RANGE, which
+ * `readBinaryVersion`'s catch would report as "no version" → a good binary
+ * judged stale). With no deadline armed — doctor, statusline, the launcher —
+ * it returns the unchanged 5 s default.
+ */
+function versionProbeTimeoutMs(remaining = require('./hook-fail-open').remainingMs) {
+  const left = remaining(VERSION_PROBE_TIMEOUT_MS);
+  const ms = left === null ? PATH_PROBE_MIN_MS : Math.floor(left);
+  return Math.max(ms, PATH_PROBE_MIN_MS);
+}
 const PLATFORM_PKG = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
 
 /**
@@ -396,13 +424,19 @@ function findPlatformBinary() {
  * gracefully on a slightly-old binary than on "offline", and the stale-binary
  * self-heal in auto-update.js re-downloads shortly anyway.
  */
-function createVersionGate(pkgVersion, { readVersion = readBinaryVersion } = {}) {
+function createVersionGate(
+  pkgVersion,
+  { readVersion = readBinaryVersion, probeTimeoutMs = versionProbeTimeoutMs } = {},
+) {
   let bestStale = null;
   return {
     consider(bin) {
       if (!isNativeBinary(bin)) return null;
       if (!pkgVersion) return bin;
-      const ver = readVersion(bin);
+      // Re-read per candidate, not once for the gate: the budget shrinks as the
+      // chain walks, and the point is that candidate six cannot still ask for a
+      // fresh 5 s (JS-23).
+      const ver = readVersion(bin, { timeoutMs: probeTimeoutMs() });
       if (!ver || compareVersions(ver, pkgVersion) >= 0) return bin;
       if (!bestStale || compareVersions(ver, bestStale.ver) > 0) bestStale = { bin, ver };
       return null;
@@ -554,6 +588,7 @@ module.exports = {
   detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
   pathProbeTimeoutMs, PATH_PROBE_TIMEOUT_MS, PATH_PROBE_MIN_MS,
+  versionProbeTimeoutMs, VERSION_PROBE_TIMEOUT_MS,
 };
 
 // Allow direct invocation for testing

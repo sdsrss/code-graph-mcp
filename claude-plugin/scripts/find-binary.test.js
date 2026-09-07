@@ -684,3 +684,53 @@ test('pathProbeTimeoutMs is always a positive integer, and never 0', () => {
   assert.ok(Number.isInteger(pathProbeTimeoutMs(() => 1234.5)));
   assert.equal(pathProbeTimeoutMs(() => 1234.5), 1234);
 });
+
+// --- JS-23 (audit 2026-09-07): the version gate spends the hook budget -------
+//
+// `findBinary()` is the first thing every hook does, and the discovery chain
+// version-gates up to six candidates by EXECING each one with `--version`.
+// `readBinaryVersion`'s default is 5 s per call, so a cold cache (first
+// install, a version bump, `auto-update.clearCache()`) put up to 30 s of
+// children in front of a 3–5 s hook — all of it before `remainingMs` had been
+// consulted once. `pathProbeTimeoutMs` had already closed the sibling `which`
+// hole (NEW-07); this was the larger one next to it.
+
+test('versionProbeTimeoutMs is a positive integer and honours the budget', () => {
+  const { versionProbeTimeoutMs, VERSION_PROBE_TIMEOUT_MS, PATH_PROBE_MIN_MS } = require('./find-binary');
+
+  // Nothing armed (doctor, statusline, the launcher, the CLI): unchanged.
+  assert.equal(versionProbeTimeoutMs((d) => d), VERSION_PROBE_TIMEOUT_MS);
+
+  // Budget exhausted. NOT 0 — node reads `timeout: 0` as no timeout at all.
+  const exhausted = versionProbeTimeoutMs(() => null);
+  assert.ok(Number.isInteger(exhausted) && exhausted > 0, `got ${exhausted}`);
+  assert.equal(exhausted, PATH_PROBE_MIN_MS);
+
+  // Nearly gone: floored UP, so the probe is still attempted — refusing to
+  // check a version turns a current binary into an unverifiable one.
+  assert.equal(versionProbeTimeoutMs(() => 5), PATH_PROBE_MIN_MS);
+
+  // Mid-budget passes through, and a fraction never reaches child_process
+  // (ERR_OUT_OF_RANGE, which readBinaryVersion's catch reports as "no version"
+  // → a good binary judged stale → re-download loop).
+  assert.equal(versionProbeTimeoutMs(() => 1200), 1200);
+  assert.equal(versionProbeTimeoutMs(() => 1234.5), 1234);
+});
+
+test('the version gate clamps every candidate probe, re-reading the budget each time', (t) => {
+  const asked = [];
+  const versions = new Map();
+  let left = 1000;
+  const gate = createVersionGate('9.9.9', {
+    readVersion: (bin, opts) => { asked.push(opts && opts.timeoutMs); return versions.get(bin) ?? null; },
+    // Stand-in for a shrinking hook budget.
+    probeTimeoutMs: () => { left -= 400; return left; },
+  });
+  const mk = (v) => mkGateBinary(t, v, versions);
+
+  gate.consider(mk('1.0.0'));
+  gate.consider(mk('1.0.0'));
+  assert.deepEqual(asked, [600, 200],
+    'each candidate must be clamped to what is LEFT, not to a fresh default — ' +
+    'six candidates at the 5s default is 30s of children in front of a 5s hook');
+});

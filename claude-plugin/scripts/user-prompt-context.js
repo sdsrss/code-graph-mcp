@@ -8,6 +8,21 @@
 // would swallow the test's own failures.
 if (require.main === module) require('./hook-fail-open').installHookFailOpen('UserPromptSubmit');
 
+// Default per-child allowance, spent through the hook budget below.
+const CHILD_TIMEOUT_MS = 3000;
+
+/**
+ * How long ONE child of this hook may run: the default when nothing armed a
+ * deadline (a test importing this module), or whatever is LEFT of the
+ * UserPromptSubmit budget. `null` means the budget is exhausted — do not run.
+ *
+ * Exported so the three states are testable; `run()` below is a closure over
+ * the resolved binary and cannot be reached from a test (JS-18).
+ */
+function childBudgetMs() {
+  return require('./hook-fail-open').remainingMs(CHILD_TIMEOUT_MS);
+}
+
 // UserPromptSubmit hook: inject relevant code-graph RESULTS based on user's intent.
 // Strategy: PUSH structural context (not suggestions) that Grep/Read cannot provide.
 // This is a CODE INDEX — only inject structural code context (impact, overview, callgraph).
@@ -518,9 +533,18 @@ function runMain() {
   if (!binary) return;
 
   function run(args) {
+    // JS-18 (audit 2026-09-07): spend the UserPromptSubmit budget, don't ask
+    // for a fresh 3 s. This file armed a deadline at line 1 and then never
+    // consulted it — the literal here plus the `findBinary()` chain above ran
+    // outside it, so a cold cache had the hook killed by Claude Code and the
+    // user saw a hook error on THEIR prompt. `null` means the budget is gone:
+    // do not run (node reads `timeout: 0` as no timeout at all). Returning ''
+    // lands on the same "nothing to say" path as an empty result.
+    const budget = childBudgetMs();
+    if (budget === null) return '';
     return execFileSync(binary, args, hidden({
       cwd,
-      timeout: 3000,
+      timeout: budget,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildRunEnv(),
@@ -553,4 +577,4 @@ if (require.main === module) {
   runMain();
 }
 
-module.exports = { COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv };
+module.exports = { COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv, childBudgetMs, CHILD_TIMEOUT_MS };

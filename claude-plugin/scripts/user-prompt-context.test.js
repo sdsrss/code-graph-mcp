@@ -751,7 +751,16 @@ test('run() wires buildRunEnv() into execFileSync (no phantom use-event leak)', 
   const src = fs.readFileSync(path.join(__dirname, 'user-prompt-context.js'), 'utf8');
   const i = src.indexOf('function run(');
   assert.ok(i >= 0, 'run() helper present');
-  assert.match(src.slice(i, i + 320), /env:\s*buildRunEnv\(\)/);
+  // Scoped to run()'s BODY, not to a byte count. The window used to be
+  // `slice(i, i + 320)`, which is a proxy for "inside run()" that a comment can
+  // invalidate — JS-18 added the budget lines and this guard went red on a
+  // change that did not touch `env:` at all.
+  const end = src.indexOf('\n  }\n', i);
+  assert.ok(end > i, 'run() no longer ends at a 2-space-indented brace — repoint the guard');
+  const body = src.slice(i, end);
+  assert.match(body, /env:\s*buildRunEnv\(\)/);
+  assert.equal((body.match(/function /g) || []).length, 1,
+    'the slice must hold run() and nothing else — a second `function` means it ran past the brace');
 });
 
 // ── End-to-end: binary resolution, cooldown timing, flag scoping ──────────
@@ -960,3 +969,53 @@ test('the documented UserPromptSubmit field drives the hook; message still works
     );
     assert.equal(empty.stdout.trim(), '', 'an empty payload must inject nothing');
   });
+
+// --- JS-18 (audit 2026-09-07): this hook armed a budget and never spent it ---
+//
+// Line 1 installs `installHookFailOpen('UserPromptSubmit')`, which arms a 5 s
+// deadline — and then the file contained ZERO `remainingMs` call sites: the
+// child ran on a literal `timeout: 3000` behind a `findBinary()` chain that was
+// also unclamped (JS-23). On a cold cache the hook was reliably killed by
+// Claude Code, which the user sees as a hook error on their own prompt.
+test('the hook spends its UserPromptSubmit budget instead of a fresh literal (JS-18)', () => {
+  const { childBudgetMs, CHILD_TIMEOUT_MS } = require('./user-prompt-context');
+  const { resetHookDeadline } = require('./hook-fail-open');
+
+  try {
+    // Nothing armed (a test importing the module, or a manual invocation):
+    // unchanged default.
+    resetHookDeadline();
+    assert.equal(childBudgetMs(), CHILD_TIMEOUT_MS);
+
+    // Budget larger than the default: the default still caps it, so this change
+    // cannot make a child run LONGER than it used to.
+    resetHookDeadline(Date.now() + 60_000);
+    assert.equal(childBudgetMs(), CHILD_TIMEOUT_MS);
+
+    // Budget smaller than the default: the child gets what is left, as an
+    // integer (`child_process` throws ERR_OUT_OF_RANGE on a fraction, which
+    // this hook's outer catch would swallow into silence).
+    resetHookDeadline(Date.now() + 900);
+    const tight = childBudgetMs();
+    assert.ok(Number.isInteger(tight) && tight > 0 && tight <= 900, `got ${tight}`);
+
+    // Exhausted: null means DO NOT RUN. Not 0 — node reads `timeout: 0` as no
+    // timeout at all, which is the unbounded child this exists to prevent.
+    resetHookDeadline(Date.now() - 1);
+    assert.equal(childBudgetMs(), null);
+  } finally {
+    resetHookDeadline();
+  }
+});
+
+test('no child of this hook carries a hard-coded timeout (JS-18)', () => {
+  // The literal is the defect, so the guard reads the source rather than the
+  // helper: re-introducing `timeout: 3000` anywhere in the exec options would
+  // pass every behavioural test above while restoring the overrun.
+  const src = fs.readFileSync(path.join(__dirname, 'user-prompt-context.js'), 'utf8');
+  const literals = src.match(/^\s*timeout:\s*\d+/gm) || [];
+  assert.deepEqual(literals, [],
+    `every child must take its timeout from childBudgetMs(); found ${literals.join(', ')}`);
+  assert.match(src, /timeout: budget/,
+    'the exec options must read the budget variable');
+});
