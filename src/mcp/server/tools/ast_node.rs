@@ -43,7 +43,14 @@ impl McpServer {
     /// same file. Identity here is (file_path, qualified_name or name, type),
     /// which is what the tool's own "re-resolve by symbol_name + file_path" error
     /// message already tells callers to do by hand.
-    fn refresh_node_file_and_reresolve(&self, node_id: i64) -> Result<NodeIdRefresh> {
+    ///
+    /// Shared with `find_references` (SURF-16, audit 2026-09-07): that tool held
+    /// the caller's id across the result-set refresh and answered with whatever
+    /// symbol inherited it, so both node_id surfaces now re-resolve the same way.
+    pub(in crate::mcp::server) fn refresh_node_file_and_reresolve(
+        &self,
+        node_id: i64,
+    ) -> Result<NodeIdRefresh> {
         let Some(nf) = queries::get_node_with_file_by_id(self.db.conn(), node_id)? else {
             // Unknown id: leave the miss to `ast_node_by_id`, whose error already
             // explains rebuild-scoped ids and how to re-resolve.

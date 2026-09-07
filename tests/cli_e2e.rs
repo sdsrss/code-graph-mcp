@@ -10551,3 +10551,202 @@ fn test_cli_similar_repatches_line_numbers_without_losing_the_neighbour() {
         "and its line number must be the post-edit one; got {after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SURF-16 (audit 2026-09-07, P0): `refs` holds node ids across the freshness
+// refresh it runs itself.
+//
+// `nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
+// AUTOINCREMENT — so an incremental re-index deletes the file's rows and the
+// re-insert REUSES the freed ids. `cmd_refs` resolved `target_ids` before
+// `refresh_files_if_stale` and then re-ran the rollup with the SAME ids, so
+// after the refresh it answered with another symbol's references under the
+// name it had resolved first. `show --node-id` re-resolves by identity
+// (CON-10, `resolve::reresolve_node_by_identity`); `refs` was the surface that
+// did not.
+//
+// Both arms are covered: `--node-id` (identity re-resolution) and the bare-name
+// arm (re-run the by-name lookup). A fix to one leaves the other answering the
+// wrong symbol, so neither test stands in for the other.
+// ---------------------------------------------------------------------------
+
+/// `src/lib.rs` where `helper`'s only caller lives in the SAME file — which is
+/// what makes the refresh `refs` performs on its own result set re-index the
+/// very file whose ids it is holding.
+fn setup_refs_renumber_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn helper() {}\n\npub fn main_entry() { helper(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// Insert two functions ABOVE the symbols under test. The re-index assigns ids
+/// in file order, so the ids the caller is still holding land on these.
+/// `zeta_b` calls `zeta_a`, giving the reused id a reference set that is
+/// distinguishable from `helper`'s — an insertion of two *unreferenced*
+/// functions would make the bug read as an empty list, which is also what a
+/// broken query looks like.
+fn insert_zeta_pair(project: &TempDir) {
+    let p = project.path().join("src/lib.rs");
+    let content = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(
+        &p,
+        format!("pub fn zeta_a() {{}}\n\npub fn zeta_b() {{ zeta_a(); }}\n\n{content}"),
+    )
+    .unwrap();
+}
+
+/// Reference names from a `refs --json` envelope, in envelope order.
+fn refs_names(out: &str) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    v["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `references` array: {out}"))
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn refs_by_node_id_answers_the_symbol_the_id_named_before_the_refresh() {
+    let project = setup_refs_renumber_project();
+
+    let (out, stderr, code) = run_cli(&project, &["show", "helper", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let helper_id = v[0]["node_id"].as_i64().unwrap_or_else(|| {
+        panic!("fixture precondition: `show helper` must yield a node_id: {out}")
+    });
+
+    insert_zeta_pair(&project);
+
+    // This is the first command after the edit, so THIS run performs the
+    // refresh that renumbers the ids — the bug needs the refresh to happen
+    // inside the invocation under test, not before it.
+    let (out, stderr, code) = run_cli(
+        &project,
+        &["refs", "--node-id", &helper_id.to_string(), "--json"],
+    );
+    assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        v["symbol"].as_str(),
+        Some("helper"),
+        "the envelope names the symbol the caller's id pointed at: {out}"
+    );
+    assert_eq!(
+        refs_names(&out),
+        vec!["main_entry".to_string()],
+        "`helper` is called only by `main_entry`. Any other list means the \
+         post-refresh rollup ran against a REUSED id and answered about a \
+         different symbol under `helper`'s name: {out}"
+    );
+
+    // Anti-vacuity: the id really was reused. Read AFTER the assertion above so
+    // this probe cannot be the run that refreshes the index. If this fails the
+    // fixture stopped renumbering and the test above proves nothing.
+    let (shown, _e, c) = run_cli(
+        &project,
+        &["show", "--node-id", &helper_id.to_string(), "--json"],
+    );
+    assert_eq!(c, 0, "{shown}");
+    let sv: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+    assert_ne!(
+        sv[0]["name"].as_str(),
+        Some("helper"),
+        "fixture precondition: node_id {helper_id} must have been reused by another \
+         symbol after the re-index, or the assertion above is vacuous: {shown}"
+    );
+}
+
+#[test]
+fn refs_by_name_re_resolves_the_name_after_the_refresh() {
+    let project = setup_refs_renumber_project();
+    // Warm the index the same way a real session would, then edit.
+    let (_o, _e, code) = run_cli(&project, &["refs", "helper", "--json"]);
+    assert_eq!(code, 0);
+
+    insert_zeta_pair(&project);
+
+    let (out, stderr, code) = run_cli(&project, &["refs", "helper", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}\nstdout:\n{out}");
+    assert_eq!(
+        refs_names(&out),
+        vec!["main_entry".to_string()],
+        "the bare-name arm resolved `helper`'s ids BEFORE the refresh and re-ran \
+         the rollup with them afterwards; the ids now name the inserted functions: {out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["total_references"].as_u64(), Some(1), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// SURF-17 (audit 2026-09-07, P1): `refs <sym> --file` silently merged every
+// same-name definition in that file into one reference list, while MCP
+// `find_references` refused the same input as ambiguous — the 2026-06-03 #6
+// shape (one input, two surfaces, opposite verdicts) that `crate::resolve`
+// exists to prevent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refs_with_file_reports_same_file_multi_defs_as_ambiguous() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct A;\npub struct B;\n\
+         impl A { pub fn dup(&self) {} }\n\
+         impl B { pub fn dup(&self) {} }\n\
+         pub fn use_a(a: &A) { a.dup(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // Precondition: the file really does hold two `dup` definitions, or the
+    // ambiguity assertion below would pass on a single-definition file.
+    let (shown, _e, c) = run_cli(&project, &["show", "dup", "--file", "src/lib.rs", "--json"]);
+    assert_eq!(c, 0, "{shown}");
+    let sv: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+    assert_eq!(
+        sv.as_array().map(|a| a.len()),
+        Some(2),
+        "fixture precondition: two same-name defs in one file: {shown}"
+    );
+
+    let (out, stderr, code) = run_cli(&project, &["refs", "dup", "--file", "src/lib.rs", "--json"]);
+    assert_eq!(
+        code, 1,
+        "same-file multi-def must be refused, not merged — MCP find_references \
+         already refuses this exact input. stdout:\n{out}\nstderr:\n{stderr}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("not JSON: {e}\n{out}"));
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("Ambiguous symbol")),
+        "the envelope must carry the shared ambiguity message: {out}"
+    );
+    let sugg = v["suggestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no suggestions: {out}"));
+    assert_eq!(sugg.len(), 2, "both definitions must be offered: {out}");
+    assert!(
+        sugg.iter().all(|s| s["node_id"].as_i64().is_some()),
+        "each suggestion needs the node_id that disambiguates it: {out}"
+    );
+}

@@ -6260,6 +6260,147 @@ app.post('/api/login', handleLogin);
         assert_eq!(out["name"], json!("con10_removed"), "{out}");
     }
 
+    /// Helper: one `find_references` call, parsed.
+    fn find_refs_call(server: &McpServer, args: serde_json::Value) -> serde_json::Value {
+        let resp = server
+            .handle_message(&tool_call_json("find_references", args))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// SURF-16 (audit 2026-09-07). `find_references` is the SECOND node_id
+    /// surface and it did not follow CON-10's rule: it read the name from the
+    /// caller's id, then let the result-set refresh re-index the file (the
+    /// references usually live in it) and re-ran the rollup with the same,
+    /// now-reused id. The envelope kept the original name and listed another
+    /// symbol's references — a rename audit's worst possible failure mode,
+    /// because it looks like an answer.
+    #[test]
+    fn test_find_references_by_id_answers_the_symbol_the_id_named_before_the_refresh() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(
+            &file,
+            "fn surf16_helper() {}\nfn surf16_main() { surf16_helper(); }\n",
+        )
+        .unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let node_id = ast_node_call(
+            &server,
+            json!({ "symbol_name": "surf16_helper", "file_path": "a.rs" }),
+        )["node_id"]
+            .as_i64()
+            .unwrap();
+
+        close_other_freshness_paths(&mut server);
+        // Two functions inserted ABOVE: the re-index assigns their ids first, so
+        // the id the caller is holding lands on one of them. `zeta_b` calls
+        // `zeta_a`, so the reused id has a reference set that is distinguishable
+        // from `surf16_helper`'s — inserting unreferenced functions would make
+        // the bug read as an empty list, which is also what a broken query
+        // looks like.
+        let body = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(
+            &file,
+            format!("fn surf16_zeta_a() {{}}\nfn surf16_zeta_b() {{ surf16_zeta_a(); }}\n{body}"),
+        )
+        .unwrap();
+
+        let out = find_refs_call(&server, json!({ "node_id": node_id }));
+        assert_eq!(
+            out["symbol"],
+            json!("surf16_helper"),
+            "the envelope names the symbol the caller's id pointed at: {out}"
+        );
+        let names: Vec<&str> = out["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no references array: {out}"))
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["surf16_main"],
+            "`surf16_helper` is called only by `surf16_main`. Any other list means the \
+             rollup ran against a REUSED id: {out}"
+        );
+        assert_eq!(
+            out["node_id_renumbered"],
+            json!(true),
+            "the id the caller passed is dead — same disclosure get_ast_node makes: {out}"
+        );
+
+        // Anti-vacuity: the id really was reused, so the assertion above is
+        // about identity re-resolution and not about an index that happened to
+        // keep the numbering. Read last, so this probe is not the refresh.
+        let shown = ast_node_call(&server, json!({ "node_id": node_id }));
+        assert_ne!(
+            shown["name"],
+            json!("surf16_helper"),
+            "fixture precondition: node_id {node_id} must have been reused by another symbol: {shown}"
+        );
+    }
+
+    /// SURF-17's MCP half. The envelope is the shared one from
+    /// `crate::resolve`, not a fifth hand-written wording — a caller comparing
+    /// two tools' verdicts for one symbol must not have to tell a wording
+    /// difference from a verdict difference.
+    #[test]
+    fn test_find_references_same_file_multi_def_uses_the_shared_ambiguity_envelope() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(
+            &file,
+            "pub struct A;\npub struct B;\nimpl A { pub fn surf17_dup(&self) {} }\n\
+             impl B { pub fn surf17_dup(&self) {} }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let out = find_refs_call(
+            &server,
+            json!({ "symbol_name": "surf17_dup", "file_path": "a.rs" }),
+        );
+        assert_eq!(
+            out["error"].as_str(),
+            Some(
+                crate::resolve::ambiguity_message(
+                    "surf17_dup",
+                    &[
+                        queries::NameCandidate {
+                            name: "surf17_dup".into(),
+                            file_path: "a.rs".into(),
+                            node_type: "function".into(),
+                            node_id: 0,
+                            start_line: 3,
+                        },
+                        queries::NameCandidate {
+                            name: "surf17_dup".into(),
+                            file_path: "a.rs".into(),
+                            node_type: "function".into(),
+                            node_id: 0,
+                            start_line: 4,
+                        },
+                    ],
+                    crate::resolve::Surface::Mcp,
+                )
+                .as_str()
+            ),
+            "the message must be byte-identical to the shared renderer's: {out}"
+        );
+        assert_eq!(
+            out["suggestions"].as_array().map(|a| a.len()),
+            Some(2),
+            "both definitions must be offered with their node_ids: {out}"
+        );
+    }
+
     /// CON-01's gate still binds on this branch: `skip_indexing` means no write
     /// handle and no resync, so the caller knowingly gets the pre-edit row.
     #[test]

@@ -51,6 +51,70 @@ pub(crate) fn print_refs_notfound_json(symbol: &str) {
     );
 }
 
+/// How to find the reference targets AGAIN once a refresh has renumbered the
+/// index (SURF-16, audit 2026-09-07).
+///
+/// `nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
+/// AUTOINCREMENT — so the incremental re-index `refs` runs on its own result set
+/// deletes the file's rows and the re-insert REUSES the freed ids. Any id
+/// resolved before `refresh_files_if_stale` can therefore name a DIFFERENT
+/// symbol after it, and re-running the rollup with those ids answers about that
+/// other symbol under the name resolution settled on first. `show --node-id`
+/// already re-resolves by identity (CON-10); this is the same rule for `refs`.
+enum RefsTarget {
+    /// `--node-id`. Identity is (file_path, name, qualified_name, type) — the
+    /// key [`crate::resolve::reresolve_node_by_identity`] uses, shared with
+    /// `show --node-id` and MCP `get_ast_node` so the three cannot disagree
+    /// about which symbol an id survived as.
+    Node {
+        file_path: String,
+        qualified_name: Option<String>,
+        node_type: String,
+    },
+    /// `--node-id` naming a row with no `files` row. The node_id arm reaches
+    /// those deliberately (it looks the id up unjoined), and they have no file
+    /// path to re-resolve against — but a file refresh cannot free an id that
+    /// belongs to no file either, so the caller's id stays exactly valid.
+    Orphan(i64),
+    /// A name resolution already settled, optionally scoped to one file. Cheap
+    /// to redo, and redoing it is what keeps the answer attached to the name.
+    Name { file_path: Option<String> },
+}
+
+impl RefsTarget {
+    /// Re-find the target ids for `symbol` against the current index state.
+    /// Empty means the symbol is gone from the re-indexed source.
+    fn resolve(&self, conn: &rusqlite::Connection, symbol: &str) -> Result<Vec<i64>> {
+        Ok(match self {
+            RefsTarget::Node {
+                file_path,
+                qualified_name,
+                node_type,
+            } => crate::resolve::reresolve_node_by_identity(
+                conn,
+                file_path,
+                symbol,
+                qualified_name.as_deref(),
+                node_type,
+            )?
+            .map(|c| vec![c.node.id])
+            .unwrap_or_default(),
+            RefsTarget::Orphan(id) => vec![*id],
+            RefsTarget::Name {
+                file_path: Some(fp),
+            } => queries::get_nodes_by_file_path(conn, fp)?
+                .into_iter()
+                .filter(|n| n.name == symbol)
+                .map(|n| n.id)
+                .collect(),
+            RefsTarget::Name { file_path: None } => queries::get_node_ids_by_name(conn, symbol)?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+        })
+    }
+}
+
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
 pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     let explicit_file_owned: Option<String> = match args.file.as_deref() {
@@ -89,7 +153,13 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     if node_id_arg.is_some() && explicit_file.is_some() {
         eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
     }
-    let (target_ids, symbol): (Vec<i64>, String) = if let Some(nid) = node_id_arg {
+    let (mut target_ids, symbol, target): (Vec<i64>, String, RefsTarget) = if let Some(nid) =
+        node_id_arg
+    {
+        // Deliberately the UNJOINED lookup: a node whose `files` row is missing
+        // still answers here, and the joined variant would turn it into a miss.
+        // The identity for the post-refresh re-resolution comes from the joined
+        // query separately, and its absence is what `Orphan` records.
         let node = match queries::get_node_by_id(conn, nid)? {
             Some(n) => n,
             None => {
@@ -101,7 +171,15 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 std::process::exit(1);
             }
         };
-        (vec![nid], node.name)
+        let target = match queries::get_node_with_file_by_id(conn, nid)? {
+            Some(nwf) => RefsTarget::Node {
+                file_path: nwf.file_path,
+                qualified_name: nwf.node.qualified_name,
+                node_type: nwf.node.node_type,
+            },
+            None => RefsTarget::Orphan(nid),
+        };
+        (vec![nid], node.name, target)
     } else {
         let raw_symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
@@ -113,11 +191,8 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
 
         if let Some(fp) = file_path {
             let nodes = queries::get_nodes_by_file_path(conn, fp)?;
-            let matched: Vec<i64> = nodes
-                .iter()
-                .filter(|n| n.name == base)
-                .map(|n| n.id)
-                .collect();
+            let matched: Vec<&queries::NodeResult> =
+                nodes.iter().filter(|n| n.name == base).collect();
             if matched.is_empty() {
                 // Empty-JSON contract: emit a parseable envelope, not empty stdout.
                 if json_mode {
@@ -126,7 +201,34 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
                 std::process::exit(1);
             }
-            (matched, base.to_string())
+            // SURF-17 (audit 2026-09-07): a file selector cannot split same-file
+            // overloads, so merging them produced ONE reference total for TWO
+            // symbols — silently, while MCP `find_references` refused the very
+            // same input as ambiguous. That is the 2026-06-03 #6 shape (one
+            // input, two surfaces, opposite verdicts) `crate::resolve` exists to
+            // prevent, and the bare-name arm below has carried this gate since
+            // audit 2026-08-02 P1-6. `--node-id` is the escape hatch, and the
+            // shared message names it.
+            if matched.len() > 1 {
+                let cands: Vec<queries::NameCandidate> = matched
+                    .iter()
+                    .map(|n| queries::NameCandidate {
+                        name: n.name.clone(),
+                        file_path: fp.to_string(),
+                        node_type: n.node_type.clone(),
+                        node_id: n.id,
+                        start_line: n.start_line,
+                    })
+                    .collect();
+                emit_exact_ambiguity(base, &cands, json_mode);
+            }
+            (
+                matched.iter().map(|n| n.id).collect(),
+                base.to_string(),
+                RefsTarget::Name {
+                    file_path: Some(fp.to_string()),
+                },
+            )
         } else {
             // Exact-name ambiguity guard — shared with callgraph/impact and the
             // MCP twin via crate::resolve so every surface gives ONE answer for
@@ -146,6 +248,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         (
                             resolved_ids.into_iter().map(|(id, _)| id).collect(),
                             resolved,
+                            RefsTarget::Name { file_path: None },
                         )
                     }
                     CliFuzzyResolution::Ambiguous(cands) => {
@@ -181,6 +284,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 (
                     ids.into_iter().map(|(id, _)| id).collect(),
                     base.to_string(),
+                    RefsTarget::Name { file_path: None },
                 )
             }
         }
@@ -212,22 +316,43 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // The rule itself lives in `resolve::rollup_incoming_references`, shared with
     // MCP `find_references` (ARC-03). `skip_tests: false` — `refs` shows every
     // usage site, because a rename has to reach the tests too.
-    let build_refs =
-        |conn: &rusqlite::Connection| -> Result<(Vec<queries::IncomingReference>, usize)> {
-            let rollup = crate::resolve::rollup_incoming_references(
-                conn,
-                &target_ids,
-                relation_filter,
-                min_confidence,
-                false,
-            )?;
-            Ok((rollup.refs, rollup.confidence_filtered))
-        };
-    let (mut all_refs, mut conf_filtered) = build_refs(conn)?;
+    //
+    // The ids are passed in rather than captured, because the refresh below
+    // invalidates them: see [`RefsTarget`].
+    let build_refs = |conn: &rusqlite::Connection,
+                      ids: &[i64]|
+     -> Result<(Vec<queries::IncomingReference>, usize)> {
+        let rollup = crate::resolve::rollup_incoming_references(
+            conn,
+            ids,
+            relation_filter,
+            min_confidence,
+            false,
+        )?;
+        Ok((rollup.refs, rollup.confidence_filtered))
+    };
+    let (mut all_refs, mut conf_filtered) = build_refs(conn, &target_ids)?;
     let files: Vec<String> = all_refs.iter().map(|r| r.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
-        let (a, c) = build_refs(conn)?;
+        // SURF-16: the re-index just freed and reused node ids, so `target_ids`
+        // may now point at whatever inherited them. Look the targets up again
+        // BEFORE re-running the rollup — re-running it with the stale ids is
+        // what answered `zeta_b` under the name `helper`.
+        target_ids = target.resolve(conn, symbol)?;
+        if target_ids.is_empty() {
+            outcome.disclose();
+            // Empty-JSON contract, same envelope as the other not-found exits.
+            if json_mode {
+                print_refs_notfound_json(symbol);
+            }
+            eprintln!(
+                "[code-graph] '{}' is no longer in the re-indexed source — nothing to report.",
+                symbol
+            );
+            std::process::exit(1);
+        }
+        let (a, c) = build_refs(conn, &target_ids)?;
         all_refs = a;
         conf_filtered = c;
     }

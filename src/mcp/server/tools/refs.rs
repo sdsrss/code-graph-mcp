@@ -2,6 +2,7 @@
 //! for struct/enum/trait/class targets where method-qualified calls aren't tracked.
 
 use super::super::*;
+use super::ast_node::NodeIdRefresh;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_find_references(
@@ -64,7 +65,43 @@ impl McpServer {
         }
 
         // Resolve symbol to node_id(s)
+        let mut node_id_renumbered = false;
         let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
+            // SURF-16 (audit 2026-09-07): a node_id is only meaningful against
+            // the index state the CALLER saw. `find_references` is in
+            // `RESULT_REFRESH_TOOLS`, so a refresh runs over its result set and
+            // re-dispatches this tool with the SAME args — and an incremental
+            // re-index deletes the file's rows, freeing ids the re-insert then
+            // REUSES. Refreshing the id's own file here and re-resolving by
+            // identity is the rule `get_ast_node` already follows, and it also
+            // leaves the target's file fresh, so the common case (the references
+            // live in the file that was edited) no longer re-dispatches at all.
+            let nid = if should_skip_indexing(args)? {
+                nid
+            } else {
+                match self.refresh_node_file_and_reresolve(nid)? {
+                    NodeIdRefresh::Unchanged => nid,
+                    NodeIdRefresh::Renumbered(new_id) => {
+                        node_id_renumbered = true;
+                        new_id
+                    }
+                    NodeIdRefresh::Gone { name, file_path } => {
+                        return Ok(json!({
+                            "error": "Symbol no longer present after refresh",
+                            "node_id": nid,
+                            "name": name,
+                            "file_path": file_path,
+                            "note": "The file changed on disk and was re-indexed before this \
+                                     answer; the symbol this node_id named is not in the new \
+                                     index. Re-resolve with find_references(symbol_name, \
+                                     file_path) or ast_search.",
+                        }));
+                    }
+                }
+            };
+            // Unjoined on purpose: a node whose `files` row is missing still
+            // answers here (see the batching note further down), and the joined
+            // lookup would turn it into an error.
             let node = queries::get_node_by_id(self.db.conn(), nid)?
                 .ok_or_else(|| anyhow!("node_id {} not found in index", nid))?;
             (vec![nid], node.name)
@@ -86,28 +123,26 @@ impl McpServer {
             }
             // Multi-def in same file — report ambiguity with node_ids and start_lines
             // so callers can pick the specific definition.
+            //
+            // Shape and wording from `crate::resolve`, not hand-written here.
+            // This was the fifth site emitting an ambiguity envelope and the
+            // fourth wording (`resolve::ambiguity_response`'s own doc names the
+            // other four), so a caller comparing two tools' answers for one
+            // symbol could not tell a wording difference from a verdict
+            // difference — SURF-17, audit 2026-09-07.
             if matching.len() > 1 {
-                let suggestions: Vec<_> = nodes
+                let cands: Vec<queries::NameCandidate> = nodes
                     .iter()
                     .filter(|n| n.name == symbol_name)
-                    .map(|n| {
-                        json!({
-                            "name": n.name,
-                            "file_path": fp,
-                            "type": n.node_type,
-                            "node_id": n.id,
-                            "start_line": n.start_line,
-                        })
+                    .map(|n| queries::NameCandidate {
+                        name: n.name.clone(),
+                        file_path: fp.to_string(),
+                        node_type: n.node_type.clone(),
+                        node_id: n.id,
+                        start_line: n.start_line,
                     })
                     .collect();
-                return Ok(json!({
-                    "symbol": symbol_name,
-                    "error": format!(
-                        "Ambiguous symbol '{}' in '{}': {} definitions in the same file. Pass node_id to select one.",
-                        symbol_name, fp, suggestions.len()
-                    ),
-                    "suggestions": suggestions,
-                }));
+                return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
             }
             (matching, symbol_name.to_string())
         } else {
@@ -336,6 +371,18 @@ impl McpServer {
                     "confidence_filtered".to_string(),
                     json!(confidence_filtered),
                 );
+            }
+        }
+        // Same disclosure `get_ast_node` makes on the same event: the id the
+        // caller passed is dead once the refresh re-indexed its file, and a
+        // caller that keeps using it gets a different symbol's references.
+        if node_id_renumbered {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("node_id_renumbered".to_string(), json!(true));
+                obj.insert("note".to_string(), json!(
+                    "This file was re-indexed to answer your call, which renumbered its nodes. \
+                     The node_id you passed is no longer valid; re-resolve with get_ast_node or ast_search."
+                ));
             }
         }
         if is_type_def {
