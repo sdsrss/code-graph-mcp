@@ -308,7 +308,14 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let results: Vec<serde_json::Value> = nodes_with_paths.iter().map(|(node, fp)| {
+        // SURF-18 (audit 2026-09-07): the closure returns a Result and the
+        // collect propagates it. It used to swallow every edge-query failure
+        // with `unwrap_or_default()`, which turned "the query failed" into
+        // "this symbol has no callers" and then into `Impact: LOW` — a safety
+        // endorsement manufactured out of a database error. `cmd_impact` runs
+        // the identical query with `?`, and the LOW-on-a-typo version of this
+        // same hazard is what `impact.rs:102-112` was fixed for.
+        let results: Vec<serde_json::Value> = nodes_with_paths.iter().map(|(node, fp)| -> Result<serde_json::Value> {
             let mut obj = serde_json::json!({
                 "node_id": node.id,
                 "type": node.node_type,
@@ -348,8 +355,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             if include_refs {
                 use crate::domain::REL_CALLS;
                 let include_tests = args.include_tests;
-                let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
-                let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+                let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS)?;
+                let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS)?;
                 obj["calls"] = serde_json::json!(callees.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
                 let filtered_callers: Vec<_> = if include_tests {
                     callers.iter().collect()
@@ -368,7 +375,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let caller_set = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK).unwrap_or_default();
+                let caller_set = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK)?;
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
                 let cls = crate::graph::impact::classify_impact(&caller_set.callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
@@ -393,8 +400,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     obj["impact"]["callers_truncated_note"] = serde_json::json!(note);
                 }
             }
-            obj
-        }).collect();
+            Ok(obj)
+        }).collect::<Result<Vec<_>>>()?;
         writeln!(stdout, "{}", serde_json::to_string(&results)?)?;
         return Ok(());
     }
@@ -439,10 +446,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         if include_refs {
             use crate::domain::REL_CALLS;
             let include_tests = args.include_tests;
-            let callees =
-                queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
-            let callers =
-                queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+            // SURF-18: `?`, not `unwrap_or_default()` — see the JSON arm above.
+            let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS)?;
+            let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS)?;
             if !callees.is_empty() {
                 writeln!(stdout, "  Calls:")?;
                 for (name, file) in &callees {
@@ -475,8 +481,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 Some(fp.as_str()),
                 3,
                 SHOW_IMPACT_MIN_CONF_RANK,
-            )
-            .unwrap_or_default();
+            )?;
             let is_function_like = crate::domain::is_function_node_type(&node.node_type);
             let cls = crate::graph::impact::classify_impact(
                 &caller_set.callers,

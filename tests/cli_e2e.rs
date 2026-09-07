@@ -10841,3 +10841,107 @@ fn impact_stays_silent_when_the_traversal_was_complete() {
     );
     assert!(v.get("callers_truncated_note").is_none(), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// SURF-18 (audit 2026-09-07, P1): `show --refs / --impact` swallowed every
+// edge-query failure with `unwrap_or_default()`. An empty caller set is what
+// `classify_impact` turns into `Impact: LOW`, so a database error came back as
+// a safety endorsement — the exact hazard `impact.rs:102-112` was fixed for on
+// the typo path, reappearing on the DB-error path of the sibling command.
+// `cmd_impact` runs the identical query with `?`.
+// ---------------------------------------------------------------------------
+
+/// Break the edge queries without touching anything symbol resolution needs:
+/// `nodes` and `files` stay intact, so `show` still resolves the symbol and
+/// only the caller/callee lookups fail.
+///
+/// A plain `DROP`/`RENAME` is not enough — `Database::open` runs
+/// `CREATE TABLE IF NOT EXISTS edges`, so the next command silently gets an
+/// EMPTY edges table and the command succeeds with zero callers, which is the
+/// very reading this test has to distinguish itself from. The decoy keeps the
+/// columns the schema's indexes and the v8→v9 `confidence` migration need (so
+/// the DB still opens) and drops only `relation`, which every edge query names.
+fn break_edges_table(project: &TempDir) {
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE edges RENAME TO edges_moved_by_test;\n\
+         CREATE TABLE edges (\n\
+             id INTEGER PRIMARY KEY,\n\
+             source_id INTEGER NOT NULL,\n\
+             target_id INTEGER NOT NULL,\n\
+             relation_renamed_by_test TEXT NOT NULL,\n\
+             metadata TEXT,\n\
+             confidence TEXT NOT NULL DEFAULT 'extracted'\n\
+         );",
+    )
+    .unwrap();
+}
+
+#[test]
+fn show_impact_reports_a_failed_query_instead_of_calling_it_low_risk() {
+    let project = setup_saturating_callers_project(4);
+
+    // Precondition: with the table intact this symbol has callers and the
+    // command succeeds — so the failure below is the broken table, not the
+    // fixture.
+    let (ok_out, _e, ok_code) = run_cli(&project, &["show", "hot_target", "--impact", "--json"]);
+    assert_eq!(ok_code, 0, "{ok_out}");
+    let okv: serde_json::Value = serde_json::from_str(ok_out.trim()).unwrap();
+    assert_eq!(
+        okv[0]["impact"]["direct_callers"].as_u64(),
+        Some(4),
+        "fixture precondition: four real callers: {ok_out}"
+    );
+
+    break_edges_table(&project);
+
+    // Anti-vacuity: the DB still OPENS and symbol resolution still works, so
+    // the failures below are the edge queries and not a database that stopped
+    // loading. Without this the test would pass against any breakage at all.
+    let (plain, perr, pcode) = run_cli(&project, &["show", "hot_target", "--json"]);
+    assert_eq!(
+        pcode, 0,
+        "the injected breakage must be scoped to the edge queries. stdout:\n{plain}\nstderr:\n{perr}"
+    );
+    assert!(plain.contains("hot_target"), "{plain}");
+
+    let (out, stderr, code) = run_cli(&project, &["show", "hot_target", "--impact", "--json"]);
+    assert_ne!(
+        code, 0,
+        "a failed caller query must not be rendered as a risk verdict. \
+         stdout:\n{out}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !out.contains("\"risk_level\""),
+        "no risk_level may be published from a query that did not run: {out}"
+    );
+
+    // The text arm is the one a human reads, and it printed `Impact: LOW`.
+    let (text, terr, tcode) = run_cli(&project, &["show", "hot_target", "--impact"]);
+    assert_ne!(tcode, 0, "stdout:\n{text}\nstderr:\n{terr}");
+    assert!(
+        !text.contains("Impact: LOW"),
+        "the text arm endorsed the symbol as low-risk off a database error: {text}"
+    );
+}
+
+#[test]
+fn show_refs_reports_a_failed_edge_query_instead_of_an_empty_call_list() {
+    let project = setup_saturating_callers_project(4);
+    break_edges_table(&project);
+
+    let (out, stderr, code) = run_cli(&project, &["show", "hot_target", "--refs", "--json"]);
+    assert_ne!(
+        code, 0,
+        "an unreadable edges table must not read as `called_by: []`. \
+         stdout:\n{out}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !out.contains("\"called_by\""),
+        "no call list may be published from a query that did not run: {out}"
+    );
+}
