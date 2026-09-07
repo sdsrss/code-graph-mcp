@@ -10750,3 +10750,94 @@ fn refs_with_file_reports_same_file_multi_defs_as_ambiguous() {
         "each suggestion needs the node_id that disambiguates it: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CORE-11 (audit 2026-09-07, P1): the caller traversal behind `impact` stops at
+// CALL_GRAPH_ROW_LIMIT, and `get_callers_with_route_info` dropped that fact.
+// `callgraph --direction callers` said `limit_hit: true` while `impact` on the
+// same symbol printed "78 callers" with no key saying the number was a floor —
+// and risk / affected_files are computed from that same truncated set.
+// ---------------------------------------------------------------------------
+
+/// A file with more callers of `hot_target` than the traversal will return.
+fn setup_saturating_callers_project(callers: usize) -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut body = String::from("pub fn hot_target() {}\n");
+    for i in 0..callers {
+        body.push_str(&format!("pub fn caller_{i}() {{ hot_target(); }}\n"));
+    }
+    std::fs::write(src.join("lib.rs"), body).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+#[test]
+fn impact_discloses_that_its_caller_traversal_was_truncated() {
+    let over = code_graph_mcp::graph::query::CALL_GRAPH_ROW_LIMIT + 20;
+    let project = setup_saturating_callers_project(over);
+
+    // Precondition: the sibling surface over the SAME traversal already says
+    // truncated. That is the asymmetry this test exists to close, so it is read
+    // rather than assumed.
+    let (cg, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "hot_target",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let cgv: serde_json::Value = serde_json::from_str(cg.trim()).unwrap();
+    assert_eq!(
+        cgv["limit_hit"].as_bool(),
+        Some(true),
+        "fixture precondition: {over} callers must saturate the traversal: {cg}"
+    );
+
+    let (out, stderr, code) = run_cli(&project, &["impact", "hot_target", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        v["callers_truncated"].as_bool(),
+        Some(true),
+        "one traversal, two surfaces: callgraph says truncated, impact must not \
+         publish the same partial set as a total: {out}"
+    );
+    assert!(
+        v["callers_truncated_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("FLOOR")),
+        "the note must say what the numbers mean: {out}"
+    );
+    // The human arm carries it too — the JSON arm is not the only reader.
+    let (text, _e, c) = run_cli(&project, &["impact", "hot_target"]);
+    assert_eq!(c, 0);
+    assert!(
+        text.contains("FLOOR"),
+        "the text arm discloses it as well: {text}"
+    );
+}
+
+#[test]
+fn impact_stays_silent_when_the_traversal_was_complete() {
+    // Negative control for the test above: a small graph must publish no
+    // truncation key at all, or the disclosure would be noise that means
+    // nothing.
+    let project = setup_saturating_callers_project(3);
+    let (out, stderr, code) = run_cli(&project, &["impact", "hot_target", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        v.get("callers_truncated").is_none(),
+        "nothing was cut, so the envelope must not claim a truncation: {out}"
+    );
+    assert!(v.get("callers_truncated_note").is_none(), "{out}");
+}

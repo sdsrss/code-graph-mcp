@@ -264,9 +264,13 @@ fn edge_coverage_intra_class_method_call_resolves() {
     for file in ["src/svc.ts", "src/svc.py"] {
         let callers = get_callers_with_route_info(db.conn(), "helper", Some(file), 3, 0).unwrap();
         assert!(
-            callers.iter().any(|c| c.name == "handle"),
+            callers.callers.iter().any(|c| c.name == "handle"),
             "intra-class call handle→helper must resolve in {file}; got {:?}",
-            callers.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            callers
+                .callers
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
     }
 }

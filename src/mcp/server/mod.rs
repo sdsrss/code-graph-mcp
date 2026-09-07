@@ -6401,6 +6401,58 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
+    /// `direct_callers` and `affected_files` from the same truncatable caller
+    /// traversal `get_call_graph` reports `limit_hit` for — and reported them
+    /// as totals.
+    #[test]
+    fn test_get_ast_node_impact_discloses_a_truncated_caller_traversal() {
+        let over = crate::graph::query::CALL_GRAPH_ROW_LIMIT + 20;
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        let mut body = String::from("pub fn core11_hot() {}\n");
+        for i in 0..over {
+            body.push_str(&format!("pub fn core11_c{i}() {{ core11_hot(); }}\n"));
+        }
+        std::fs::write(&file, body).unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let out = ast_node_call(
+            &server,
+            json!({ "symbol_name": "core11_hot", "file_path": "a.rs", "include_impact": true }),
+        );
+        assert_eq!(
+            out["impact"]["callers_truncated"],
+            json!(true),
+            "the traversal saturated, so every count in this object is a floor: {out}"
+        );
+        assert!(
+            out["impact"]["callers_truncated_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("FLOOR")),
+            "{out}"
+        );
+
+        // Negative control: a small graph must publish no truncation key.
+        let small = TempDir::new().unwrap();
+        std::fs::write(
+            small.path().join("a.rs"),
+            "pub fn core11_hot() {}\npub fn core11_c0() { core11_hot(); }\n",
+        )
+        .unwrap();
+        let s2 = McpServer::new_test_with_project(small.path());
+        s2.ensure_indexed().unwrap();
+        let quiet = ast_node_call(
+            &s2,
+            json!({ "symbol_name": "core11_hot", "file_path": "a.rs", "include_impact": true }),
+        );
+        assert!(
+            quiet["impact"].get("callers_truncated").is_none(),
+            "nothing was cut — claiming a truncation here would make the flag noise: {quiet}"
+        );
+    }
+
     /// CON-01's gate still binds on this branch: `skip_indexing` means no write
     /// handle and no resync, so the caller knowingly gets the pre-edit row.
     #[test]

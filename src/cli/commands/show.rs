@@ -368,9 +368,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK).unwrap_or_default();
+                let caller_set = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK).unwrap_or_default();
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
-                let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
+                let cls = crate::graph::impact::classify_impact(&caller_set.callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
                     "risk_level": cls.risk_level,
                     "direct_callers": cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
@@ -383,6 +383,14 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // callgraph's test_callers_hidden / project_map's test_caller_count).
                 if cls.test_count > 0 {
                     obj["impact"]["test_callers_filtered"] = serde_json::json!(cls.test_count);
+                }
+                // CORE-11: same disclosure as `cmd_impact` and MCP get_ast_node.
+                // This is the third consumer of the same truncatable traversal;
+                // leaving one silent recreates the "two surfaces, one traversal,
+                // different stories" split the flag exists to close.
+                if let Some(note) = caller_set.truncation_note() {
+                    obj["impact"]["callers_truncated"] = serde_json::json!(true);
+                    obj["impact"]["callers_truncated_note"] = serde_json::json!(note);
                 }
             }
             obj
@@ -461,7 +469,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             }
         }
         if include_impact {
-            let callers = crate::graph::routes::get_callers_with_route_info(
+            let caller_set = crate::graph::routes::get_callers_with_route_info(
                 conn,
                 &node.name,
                 Some(fp.as_str()),
@@ -470,7 +478,11 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             )
             .unwrap_or_default();
             let is_function_like = crate::domain::is_function_node_type(&node.node_type);
-            let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
+            let cls = crate::graph::impact::classify_impact(
+                &caller_set.callers,
+                "behavior",
+                is_function_like,
+            );
             writeln!(
                 stdout,
                 "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
@@ -486,6 +498,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     "  ({} test callers excluded from the risk count)",
                     cls.test_count
                 )?;
+            }
+            if let Some(note) = caller_set.truncation_note() {
+                writeln!(stdout, "  ⚠ {}", note)?;
             }
         }
     }

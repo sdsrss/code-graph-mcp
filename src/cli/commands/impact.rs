@@ -201,7 +201,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
-    let mut callers = crate::graph::routes::get_callers_with_route_info(
+    let mut caller_set = crate::graph::routes::get_callers_with_route_info(
         conn,
         symbol,
         file_filter,
@@ -218,12 +218,12 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             .iter()
             .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
             .collect();
-        for c in &callers {
+        for c in &caller_set.callers {
             files.push(c.file_path.clone());
         }
         let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
         if outcome.any_changed {
-            callers = crate::graph::routes::get_callers_with_route_info(
+            caller_set = crate::graph::routes::get_callers_with_route_info(
                 conn,
                 symbol,
                 file_filter,
@@ -235,6 +235,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         outcome.disclose();
         outcome
     };
+    let callers = &caller_set.callers;
     // Ambiguous callers folded out of the blast radius by the confidence floor,
     // counted across the whole returned frontier (seed direct + every kept
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
@@ -261,7 +262,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let is_function_like = symbol_nodes
         .iter()
         .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
-    let impact = crate::graph::impact::classify_impact(&callers, change_type, is_function_like);
+    let impact = crate::graph::impact::classify_impact(callers, change_type, is_function_like);
     let prod_callers = &impact.prod_callers;
     let routes = &impact.route_callers;
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
@@ -332,6 +333,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 ambiguous_callers_excluded
             ));
         }
+        // CORE-11: the traversal these numbers come from can stop early. Same
+        // rule as `ambiguous_callers_excluded` directly above — a number that
+        // is a floor must not be published as a total.
+        if let Some(note) = caller_set.truncation_note() {
+            result["callers_truncated"] = serde_json::json!(true);
+            result["callers_truncated_note"] = serde_json::json!(note);
+        }
         fresh_outcome.attach_partial(&mut result);
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
@@ -356,6 +364,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             "  ⚠ {} ambiguous by-name caller(s) excluded from risk — actual blast radius may be larger; use --min-confidence ambiguous to include",
             ambiguous_callers_excluded
         )?;
+    }
+    if let Some(note) = caller_set.truncation_note() {
+        writeln!(stdout, "  ⚠ {}", note)?;
     }
     if value_references > 0 {
         writeln!(

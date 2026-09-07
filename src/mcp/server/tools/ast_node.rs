@@ -543,14 +543,21 @@ impl McpServer {
         node_type: &str,
         min_confidence_rank: u8,
     ) -> Result<()> {
-        let callers = crate::graph::routes::get_callers_with_route_info(
+        let caller_set = crate::graph::routes::get_callers_with_route_info(
             self.db.conn(),
             symbol_name,
             Some(file_path),
             3,
             min_confidence_rank,
         )?;
-        let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+        // Read the provenance before consuming the set — the note is about the
+        // traversal, not about the rows that survived the depth filter.
+        let truncation_note = caller_set.truncation_note();
+        let callers: Vec<_> = caller_set
+            .callers
+            .into_iter()
+            .filter(|c| c.depth > 0)
+            .collect();
         // Direct ambiguous callers folded out of the risk count by the floor —
         // disclosed (not silently dropped) so a hidden real caller never
         // under-states risk; min_confidence:"ambiguous" includes them.
@@ -587,6 +594,15 @@ impl McpServer {
         });
         if cls.test_count > 0 {
             impact["test_callers_filtered"] = json!(cls.test_count);
+        }
+        // CORE-11: the traversal these counts come from can stop at the row
+        // limit, and every number in this object is then a floor. `get_call_graph`
+        // discloses the same event via `attach_truncation_flags`; this surface
+        // dropped it, so one traversal answered "truncated" on one tool and a
+        // bare total on the other.
+        if let Some(note) = truncation_note {
+            impact["callers_truncated"] = json!(true);
+            impact["callers_truncated_note"] = json!(note);
         }
         if let Some(warning) = cls.type_warning {
             impact["warning"] = json!(warning);
