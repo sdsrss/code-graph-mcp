@@ -103,13 +103,10 @@ pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
         // node (which stays `node_vectors IS NULL` and sorts first by caller-count) would
         // be re-fetched at the head of every batch and spin the loop forever.
         let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // Ranked once, not once per batch — see `UnembeddedQueue` (CORE-13).
+        let mut queue = wrap_index_busy(queries::UnembeddedQueue::new(db.conn()))?;
         loop {
-            let exclude: Vec<i64> = failed.iter().copied().collect();
-            let chunk = wrap_index_busy(queries::get_unembedded_nodes_excluding(
-                db.conn(),
-                64,
-                &exclude,
-            ))?;
+            let chunk = wrap_index_busy(queue.next_chunk(db.conn(), 64, &failed))?;
             if chunk.is_empty() {
                 break;
             }

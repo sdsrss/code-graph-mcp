@@ -68,5 +68,5 @@ pub use vectors::{
     compact_node_vectors, compact_node_vectors_if_wasteful, count_nodes_with_vectors,
     count_unembedded_nodes, delete_node_vectors_batch, get_node_embedding, get_unembedded_nodes,
     get_unembedded_nodes_excluding, insert_node_vector, insert_node_vectors_batch,
-    reap_orphan_vectors, vec_slot_occupancy, vector_search,
+    reap_orphan_vectors, vec_slot_occupancy, vector_search, UnembeddedQueue,
 };

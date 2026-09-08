@@ -262,6 +262,139 @@ pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64,
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// The backfill worklist: every unembedded node once, in the same
+/// most-referenced-first order [`get_unembedded_nodes`] produces, ranked ONCE
+/// instead of once per batch.
+///
+/// Why this type exists (CORE-13). Both backfill loops asked for "the top N
+/// unembedded nodes by inbound degree" and then embedded them, over and over.
+/// `LIMIT` cannot make that cheap: the ranking is a `GROUP BY` over every node
+/// with a `LEFT JOIN` onto every edge, and the whole thing must be computed and
+/// sorted before the first row can be returned. Measured on django/django
+/// (48,084 nodes, 262,463 edges, 47,324 embeddable): 57 ms per call, and the
+/// loop makes 740 of them — **42 s of SQL before any inference runs at all**,
+/// which is the entire cost of a backfill whose embedding cache is warm. Ranking
+/// once costs 54 ms and serving a batch from the snapshot costs 1 ms: ~42 s ->
+/// ~0.8 s.
+///
+/// The snapshot does not weaken the two properties the loops rely on:
+///
+/// * **Freshness.** Every batch is still re-checked against `node_vectors` when
+///   its context strings are fetched, so a node another process embedded in the
+///   meantime is dropped rather than re-embedded.
+/// * **Termination.** The loops stop on an empty chunk. Exhausting the snapshot
+///   is not "empty" — the queue rebuilds once and keeps going, so nodes that
+///   became embeddable mid-run are picked up. Only a rebuild that yields nothing
+///   new reports empty.
+pub struct UnembeddedQueue {
+    ranked: Vec<i64>,
+    pos: usize,
+    /// True while the current snapshot has not yielded a single row since it was
+    /// built. Walking a whole freshly-built snapshot without producing anything
+    /// is what "there is no work left" looks like; without this the queue would
+    /// rebuild forever against a poison set.
+    barren: bool,
+}
+
+impl UnembeddedQueue {
+    pub fn new(conn: &Connection) -> Result<Self> {
+        let mut q = Self {
+            ranked: Vec::new(),
+            pos: 0,
+            barren: true,
+        };
+        q.rebuild(conn)?;
+        Ok(q)
+    }
+
+    fn rebuild(&mut self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT n.id
+             FROM nodes n
+             LEFT JOIN node_vectors nv ON n.id = nv.node_id
+             LEFT JOIN edges e ON e.target_id = n.id
+             WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL
+             GROUP BY n.id
+             ORDER BY COUNT(e.target_id) DESC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        self.ranked = rows.collect::<Result<Vec<_>, _>>()?;
+        self.pos = 0;
+        self.barren = true;
+        Ok(())
+    }
+
+    /// Next batch of at most `limit` nodes, skipping `exclude`, in rank order.
+    /// Empty means the work is done.
+    pub fn next_chunk(
+        &mut self,
+        conn: &Connection,
+        limit: usize,
+        exclude: &std::collections::HashSet<i64>,
+    ) -> Result<Vec<(i64, String)>> {
+        // Chunked because the id list is bound as parameters; the callers pass
+        // 32 and 64, so this never actually splits today.
+        let limit = limit.min(super::helpers::MAX_IN_PARAMS);
+        loop {
+            if self.pos >= self.ranked.len() {
+                if self.barren {
+                    return Ok(Vec::new());
+                }
+                self.rebuild(conn)?;
+                if self.ranked.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+            let mut ids: Vec<i64> = Vec::with_capacity(limit);
+            while self.pos < self.ranked.len() && ids.len() < limit {
+                let id = self.ranked[self.pos];
+                self.pos += 1;
+                if !exclude.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            let rows = self.fetch(conn, &ids)?;
+            if !rows.is_empty() {
+                self.barren = false;
+                return Ok(rows);
+            }
+            // Every id in this window has gained a vector since the snapshot.
+            // Keep walking rather than reporting done.
+        }
+    }
+
+    /// Context strings for `ids`, dropping any that gained a vector or lost
+    /// their context string since the snapshot, returned in `ids` order.
+    fn fetch(&self, conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, String)>> {
+        let placeholders = super::helpers::make_placeholders(1, ids.len());
+        let sql = format!(
+            "SELECT n.id, n.context_string
+             FROM nodes n
+             LEFT JOIN node_vectors nv ON n.id = nv.node_id
+             WHERE n.id IN ({placeholders})
+               AND nv.node_id IS NULL
+               AND n.context_string IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let found: std::collections::HashMap<i64, String> =
+            rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect();
+        // Rank order is the whole point of the ranking — preserve it rather than
+        // letting the IN-list come back in rowid order.
+        Ok(ids
+            .iter()
+            .filter_map(|id| found.get(id).map(|cs| (*id, cs.clone())))
+            .collect())
+    }
+}
+
 /// Like [`get_unembedded_nodes`] but skips `exclude` node IDs in SQL. The backfill loops
 /// pass the set of nodes that failed to embed THIS run so the same hot-path-first poison
 /// node isn't re-fetched at the head of every batch (which would starve the embeddable
@@ -1236,5 +1369,192 @@ mod tests {
         assert!(get_unembedded_nodes_excluding(conn, 10, &ids)
             .unwrap()
             .is_empty());
+    }
+
+    /// Build `n` unembedded nodes in one file, node i having `n - i` inbound
+    /// edges so the rank order is exactly the insertion order.
+    fn ranked_fixture(conn: &rusqlite::Connection, n: usize) -> Vec<i64> {
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(
+                insert_node(
+                    conn,
+                    &NodeRecord {
+                        file_id: fid,
+                        node_type: "function".into(),
+                        name: format!("f{i}"),
+                        qualified_name: None,
+                        start_line: i as i64 + 1,
+                        end_line: i as i64 + 1,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: Some(format!("ctx{i}")),
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        // Inbound degree descending in insertion order: node i gets n - i edges,
+        // each from a distinct source so `idx_edges_unique` admits them.
+        for (i, target) in ids.iter().enumerate() {
+            for (k, source) in ids.iter().take(n - i).enumerate() {
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+                     VALUES (?1, ?2, 'calls', ?3)",
+                    rusqlite::params![source, target, format!("m{i}-{k}")],
+                )
+                .unwrap();
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn the_queue_hands_out_the_same_nodes_in_the_same_order_as_the_per_batch_query() {
+        // The equivalence this refactor rests on: ranking once must not change
+        // WHICH nodes get embedded or in WHAT order, only how often the ranking
+        // is computed.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = ranked_fixture(conn, 20);
+
+        let old = get_unembedded_nodes(conn, ids.len()).unwrap();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+        let mut new = Vec::new();
+        let none = std::collections::HashSet::new();
+        loop {
+            let chunk = queue.next_chunk(conn, 3, &none).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            // Embed as we go, exactly as both real loops do. Without this the
+            // drain never ends — and that is true of the per-batch query it
+            // replaces too: a caller that neither embeds nor excludes is handed
+            // the same top-ranked nodes forever, which is why `failed` exists.
+            for (id, _) in &chunk {
+                insert_node_vector(conn, *id, &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+            }
+            new.extend(chunk);
+        }
+        assert_eq!(
+            old, new,
+            "the queue must drain to the same (id, context_string) sequence the per-batch query produced"
+        );
+    }
+
+    #[test]
+    fn the_queue_picks_up_work_that_appears_while_it_is_draining() {
+        // The property a plain snapshot gets wrong. The loops that own this
+        // queue stop on the first empty chunk, so a queue that reported "done"
+        // at the end of its first snapshot would silently leave every node that
+        // became embeddable mid-run without a vector — invisible, because the
+        // run reports success.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = ranked_fixture(conn, 4);
+        let none = std::collections::HashSet::new();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+
+        // Drain the original four, embedding each so it cannot come back.
+        let mut drained = 0usize;
+        while drained < ids.len() {
+            let chunk = queue.next_chunk(conn, 2, &none).unwrap();
+            assert!(!chunk.is_empty(), "queue went empty before draining");
+            for (id, _) in &chunk {
+                insert_node_vector(conn, *id, &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+            }
+            drained += chunk.len();
+        }
+
+        // A new embeddable node appears AFTER the snapshot was taken.
+        let latecomer = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: 1,
+                node_type: "function".into(),
+                name: "latecomer".into(),
+                qualified_name: None,
+                start_line: 999,
+                end_line: 999,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("ctx-late".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+
+        let chunk = queue.next_chunk(conn, 2, &none).unwrap();
+        assert_eq!(
+            chunk.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![latecomer],
+            "exhausting the snapshot must rebuild, not report done"
+        );
+        insert_node_vector(conn, latecomer, &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+        assert!(
+            queue.next_chunk(conn, 2, &none).unwrap().is_empty(),
+            "and once a rebuild yields nothing, the queue reports done"
+        );
+    }
+
+    #[test]
+    fn a_node_embedded_by_someone_else_is_dropped_rather_than_re_embedded() {
+        // Freshness: the snapshot is a worklist, not a promise. Each batch is
+        // re-checked against node_vectors when its context strings are fetched.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = ranked_fixture(conn, 6);
+        let none = std::collections::HashSet::new();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+
+        // Someone embeds the top-ranked pair before the queue serves them.
+        insert_node_vector(conn, ids[0], &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+        insert_node_vector(conn, ids[1], &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+
+        let chunk = queue.next_chunk(conn, 2, &none).unwrap();
+        assert!(
+            !chunk.iter().any(|(id, _)| *id == ids[0] || *id == ids[1]),
+            "already-embedded nodes must not be handed out again: {chunk:?}"
+        );
+        assert_eq!(
+            chunk.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![ids[2], ids[3]],
+            "and the queue keeps walking rather than returning a short/empty chunk"
+        );
+    }
+
+    #[test]
+    fn excluding_every_node_terminates_instead_of_spinning() {
+        // The poison-node guard the loops depend on: they stop only on an empty
+        // chunk, so a queue that kept rebuilding past a fully-excluded set would
+        // hang the backfill.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = ranked_fixture(conn, 5);
+        let all: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+        assert!(queue.next_chunk(conn, 2, &all).unwrap().is_empty());
+        assert!(queue.next_chunk(conn, 2, &all).unwrap().is_empty());
     }
 }

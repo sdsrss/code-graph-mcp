@@ -259,9 +259,10 @@ impl McpServer {
         // starve the embeddable nodes behind it — we advance past it instead of stopping.
         let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
+        // Ranked once, not once per batch — see `UnembeddedQueue` (CORE-13).
+        let mut queue = queries::UnembeddedQueue::new(db.conn())?;
         loop {
-            let exclude: Vec<i64> = failed.iter().copied().collect();
-            let chunk = queries::get_unembedded_nodes_excluding(db.conn(), EMBED_BATCH, &exclude)?;
+            let chunk = queue.next_chunk(db.conn(), EMBED_BATCH, &failed)?;
             if chunk.is_empty() {
                 break;
             }
