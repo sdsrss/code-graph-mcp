@@ -1,5 +1,94 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading:** two printed remedies change, and one teardown message changes
+shape. Nothing else here is user-visible.
+
+`code-graph-mcp adopt` prints a different `Reverse:` hint. It named the bare
+`code-graph-mcp unadopt`, which a `/plugin install` never puts on your PATH
+(issue #41) — the same defect 0.141.0 fixed in the SessionStart announcement and
+missed in the printer the adoption itself produces. It now names the script:
+`node "<path>/claude-plugin/scripts/adopt.js" unadopt`. Longer on an npm-global
+install, runnable on all of them. Scripted output that matched the old string
+needs updating; nothing else about `adopt` / `unadopt` changed.
+
+The sweep that runs when the plugin is uninstalled had the same defect in the
+message it prints for repos it could NOT clean: it sent you to
+`code-graph-mcp unadopt`, in another repository, at some later time. It now tells
+you what to delete instead of what to run — the block from the line beginning
+`<!-- code-graph-mcp:begin` through `<!-- code-graph-mcp:end -->`, plus
+`.claude/plugin_code_graph_mcp.md`. Instructions you act on later, elsewhere,
+should not depend on a tool still being installed.
+
+`INDEX_VERSION` is NOT bumped. The indexer changes are scoping and scheduling
+only. No existing index needs rebuilding.
+
+### The read after an edit cost two seconds on a large repository
+
+Editing one file and then running any read command re-ran three set-based passes
+over every cross-file `calls`/`references` edge in the graph. On django/django
+(3,453 files, 48,084 nodes, 262,463 edges) that was 674 ms of a 1,054 ms command
+— and it is on the path of every hook and every agent query, not a batch job.
+
+The audit item this closes blamed the whole-graph name map loaded per run.
+Instrumented, that map is 50 ms. The cost was `run_global_edge_post_passes`:
+2d-bind 177 ms, 2d-prune 207 ms, 2e-confidence 290 ms.
+
+Those passes now reconsider only what a run could have disturbed — edges
+touching a changed file on either side, plus, for the confidence pass alone
+(whose input is a count of same-name nodes across the whole graph), edges whose
+target name changed how many nodes share it. That third set is derived by
+counting before and after rather than accumulated as the run goes: this
+pipeline's bookkeeping has twice cost real edges, and a count diff cannot miss a
+channel a hand-maintained list forgets.
+
+Each predicate is one string spent by both the global and the scoped driver, so
+the two cannot label the same edge differently. Full indexes, and any run over 64
+files, stay global — that is the base case the incremental argument rests on.
+
+Measured on the same corpus and edit against the 0.141.0 binary, seven runs
+each: median 1,079 ms -> 513 ms. The graph is unchanged: a full index plus a
+one-file edit plus a deletion produce byte-identical results from both binaries
+— 262,038 edges and 48,073 nodes compared through names and paths, confidence
+and metadata included.
+
+### The embedding backfill spent 39 seconds ranking the same list
+
+Both backfill loops asked for "the top N unembedded nodes by inbound degree",
+embedded them, and asked again. `LIMIT` cannot make that cheap: the ranking is a
+`GROUP BY` over every node joined onto every edge, computed and sorted in full
+before the first row exists. At django scale that is 52 ms per call and 740
+calls — 38.7 s of SQL before any inference runs, which is the entire cost of a
+backfill whose embedding cache is warm.
+
+The worklist is now ranked once and served by id: 0.13 s for the same drain.
+Which nodes get embedded, and in what order, is unchanged — pinned by a test
+that drains the new queue against the old query and requires the same sequence.
+
+### Issue #41, again
+
+0.141.0 fixed the two printers that spent a bare `code-graph-mcp` on an install
+that has no such binary. There were three. `adopt.js`'s own result printer — what
+you see running the adopt script by hand — still named it, and so did the
+uninstall sweep's failure notice. Both are covered above; the two remedies that
+hand a user an `unadopt` command now come from one function, so a third printer
+cannot drift from them.
+
+### Not covered
+
+**JS-33 is still not in a release.** `removeCacheResidue()` preserves the
+adopted-projects registry by reading it into memory, deleting the cache
+directory, and writing it back; a failure on that last write loses the record of
+which repos carry a managed block, and the function still returns success. A
+rename-aside fix was written and withdrawn for the second time. Pre-ship review
+reproduced a defect underneath it: the inter-process lock unlinks a stale lock by
+path without checking it is still the file it inspected, so two peers can both
+take it — demonstrated end to end, destroying the registry while both callers
+returned success. That race is older than the fix and lives in a primitive the
+updater also uses, but the fix would have made an irreversible deletion depend on
+it. The next attempt starts with the lock. Behaviour is unchanged from 0.141.0.
+
 ## 0.141.0
 
 **Upgrading:** two MCP response fields narrow. `get_call_graph`'s `suggestions`
