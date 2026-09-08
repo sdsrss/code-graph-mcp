@@ -10,7 +10,7 @@ const {
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
+const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
 const { installHookFailOpen, remainingMs } = require('./hook-fail-open');
@@ -557,34 +557,12 @@ function verifyBinary() {
   return { available: true, binary };
 }
 
-/**
- * The `unadopt` invocation to hand the user, spelled so their shell can run it.
- *
- * Issue #41: the reporter drives this plugin through `/plugin install` only and
- * has no `code-graph-mcp` on PATH, so every remedy this hook printed spent a
- * bare name their shell answers with "command not found".
- *
- * The obvious repair — print the binary `verifyBinary()` resolved — is WRONG,
- * and a pre-ship review caught it as a net regression. `unadopt` is one of the
- * three JS-dispatched subcommands (`main.rs`: doctor / adopt / unadopt): the
- * native binary re-execs `claude-plugin/scripts/adopt.js`, which it locates via
- * `$_FIND_BINARY_ROOT` or a path relative to its own exe. The plugin's cached
- * binary at ~/.cache/code-graph/bin has no such neighbour, so
- * `<cache>/code-graph-mcp unadopt` exits 1 with "adopt.js not found" —
- * reproduced. Worse, npm-global users reach adopt.js today through the
- * `bin/cli.js` shim that sets `_FIND_BINARY_ROOT`, so printing a resolved
- * platform-package binary would BREAK a path that currently works.
- *
- * So point at the script itself. `adopt.js` carries its own
- * `require.main === module` arm (`node adopt.js unadopt`), and this file is its
- * neighbour in every install layout — plugin cache, npm package, dev checkout —
- * because both are shipped inside `claude-plugin/scripts/`. `__dirname` is
- * therefore the one locator that cannot be wrong. Quoted, since a plugin cache
- * path under a home directory with a space is otherwise not runnable as printed.
- */
-function unadoptCommand() {
-  return `node ${JSON.stringify(path.join(__dirname, 'adopt.js'))} unadopt`;
-}
+// `unadoptCommand` now lives in adopt.js (issue #41's rationale travels with
+// it). It moved because THIS file was not the only printer handing a user that
+// command — adopt.js's own `formatResult` prints a `Reverse:` line too, and it
+// was still spending the bare name after 0.141.0 fixed the announcement below.
+// Two spellings of one remedy is what let that survive; re-exported here so the
+// name stays importable from this module.
 
 /**
  * Lightweight consistency checks — called from runSessionInit().

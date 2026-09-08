@@ -844,6 +844,37 @@ function unadopt({ cwd, home } = {}) {
   };
 }
 
+/**
+ * The `unadopt` invocation to hand the user, spelled so their shell can run it.
+ *
+ * Issue #41: the reporter drives this plugin through `/plugin install` only and
+ * has no `code-graph-mcp` on PATH, so every remedy printed with the bare name is
+ * answered by their shell with "command not found".
+ *
+ * The obvious repair — print the binary `verifyBinary()` resolved — is WRONG,
+ * and a pre-ship review caught it as a net regression. `unadopt` is one of the
+ * three JS-dispatched subcommands (`main.rs`: doctor / adopt / unadopt): the
+ * native binary re-execs this file, which it locates via `$_FIND_BINARY_ROOT`
+ * or a path relative to its own exe. The plugin's cached binary at
+ * ~/.cache/code-graph/bin has no such neighbour, so `<cache>/code-graph-mcp
+ * unadopt` exits 1 with "adopt.js not found" — reproduced. Worse, npm-global
+ * users reach this file today through the `bin/cli.js` shim that sets
+ * `_FIND_BINARY_ROOT`, so printing a resolved platform-package binary would
+ * BREAK a path that currently works.
+ *
+ * So point at this script. It carries its own `require.main === module` arm, and
+ * `__filename` is the one locator that cannot be wrong in any install layout —
+ * plugin cache, npm package, dev checkout. Quoted, since a plugin cache path
+ * under a home directory with a space is otherwise not runnable as printed.
+ *
+ * Lives here rather than in session-init.js (0.141.0's home for it) because
+ * BOTH printers that hand a user this command must agree, and the other one is
+ * `formatResult` directly below — the site 0.141.0's sweep missed.
+ */
+function unadoptCommand() {
+  return `node ${JSON.stringify(__filename)} unadopt`;
+}
+
 function formatResult(action, result) {
   if (!result.ok && result.reason === 'windows-not-supported') {
     return '[code-graph] adopt/unadopt are POSIX-only on this build. ' +
@@ -881,7 +912,7 @@ function formatResult(action, result) {
     lines.push(`[code-graph] Detail table → ${result.detailPath}`);
     lines.push('[code-graph] CLAUDE.md is git-tracked — commit the block, or gitignore');
     lines.push('[code-graph]   .claude/plugin_code_graph_mcp.md (a generated copy) as you prefer.');
-    lines.push('[code-graph] Reverse:  code-graph-mcp unadopt');
+    lines.push(`[code-graph] Reverse:  ${unadoptCommand()}`);
     lines.push('[code-graph] Opt out:  CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env');
     return lines.join('\n');
   }
@@ -934,7 +965,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
+  adopt, unadopt, memoryDir, formatResult, unadoptCommand, stripSentinelBlock,
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,

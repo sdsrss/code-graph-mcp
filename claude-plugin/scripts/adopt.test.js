@@ -34,6 +34,7 @@ const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, migrateLegacyMemoryDir,
+  formatResult, unadoptCommand,
   SENTINEL_BEGIN, SENTINEL_END, MANAGED_BY, TEMPLATE_PATH, TARGET_NAME,
   PROJECT_MARKERS,
 } = require('./adopt');
@@ -1431,4 +1432,36 @@ test('migrateLegacyMemoryDir still deletes a real legacy detail file', () => {
     assert.strictEqual(res.legacyDetailRemoved, true, 'a real legacy file IS removed');
     assert.ok(!fs.existsSync(legacy));
   } finally { sb.cleanup(); }
+});
+
+test('the adopt printer names an unadopt command the reader can actually run', () => {
+  // Issue #41, sibling site. 0.141.0 fixed the SessionStart announcement's
+  // `Reverse:` line (session-init.js, pinned by session-init.test.js) but left
+  // this one — the printer behind `node adopt.js` and `bin/cli.js adopt` —
+  // spending the bare binary name. A plugin-only install has no
+  // `code-graph-mcp` on PATH, so the way out of an adoption printed by the
+  // adoption itself was "command not found", which is the whole defect the
+  // issue reported.
+  const out = formatResult('adopt', {
+    ok: true,
+    created: true,
+    claudeMdPath: '/proj/CLAUDE.md',
+    detailPath: '/proj/.claude/plugin_code_graph_mcp.md',
+  });
+  const line = out.split('\n').find((l) => l.includes('Reverse:'));
+  assert.ok(line, 'the adopt printer still offers a Reverse: hint');
+  assert.match(line, /Reverse:\s+node "[^"]*adopt\.js" unadopt/,
+    'the reverse hint must name the script, not a bare binary name');
+  assert.ok(!/Reverse:\s+code-graph-mcp\b/.test(line),
+    'the bare-name spelling is the unrunnable one');
+});
+
+test('both unadopt hints resolve to the same command', () => {
+  // Negative control against fixing the string in one place: the two printers
+  // that hand a user this command must agree byte for byte, and the path they
+  // name must be the adopt.js that is actually running.
+  const fromSessionInit = require('./session-init').unadoptCommand();
+  assert.strictEqual(unadoptCommand(), fromSessionInit);
+  assert.strictEqual(unadoptCommand(),
+    `node ${JSON.stringify(path.join(__dirname, 'adopt.js'))} unadopt`);
 });
