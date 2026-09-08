@@ -39,6 +39,7 @@ const {
   classifyBlock,
   pickBlockPattern,
   translateBreToRg,
+  extractCgFlags,
   extractSearchPath,
   normalizeCommandPaths,
   rebaseRelativePaths,
@@ -265,9 +266,33 @@ function runMain() {
   // ~1KB context tax. Only a grep that found NOTHING (or an unreadable output —
   // no regression on older CC) proceeds: then cg's structural answer (the real
   // location / cross-file callers a failed grep never showed) is genuinely additive.
-  if (grepFoundPattern(extractGrepOutput(input), rawPattern)) return;
-  const pattern = translateBreToRg(segment, rawPattern);
-  const searchPath = sanitizeSearchPath(extractSearchPath(segment));
+  // v0.144 — RECORD the suppression instead of returning silently. PreToolUse
+  // stopped denying compound commands in this release, which moves a measured
+  // 27% of former denies (23 of 85 in this repo's own log carried `tail:true`,
+  // every one of them `answered:true`) onto this path — and this `return` is
+  // where they end when the model's own grep hit. That was the right trade only
+  // if it stays visible: an unrecorded skip makes the whole class disappear from
+  // the funnel, so "the compound case is covered by the inject" becomes a claim
+  // nobody can check after ship. Pre-ship review found this before release.
+  if (grepFoundPattern(extractGrepOutput(input), rawPattern)) {
+    recordRecommendation(root, {
+      hook: 'grep-inject', action: 'skip', reason: 'grep-hit-redundant',
+      ...(rawPattern ? { pattern: rawPattern } : {}),
+    });
+    return;
+  }
+  const flags = extractCgFlags(segment);
+  // `-F` means the user asked for a LITERAL pattern, so the BRE→rust-regex
+  // unescape must not also run: `grep -F 'x\|y'` searches for `x\|y`, and
+  // unescaping it to `x|y` searches for something else (verified against GNU
+  // grep: `grep -Fc 'x\|y'` is 1 and `grep -Fc 'x|y'` is 0 on the same file).
+  const pattern = flags.includes('-F') ? rawPattern : translateBreToRg(segment, rawPattern);
+  // RAW path, not `sanitizeSearchPath`: buildGrepArgs splits `tests/*.mjs` into
+  // scope + `-g`. The deny path got that in this release and this one did not,
+  // while the same release routed MORE traffic here — so `grep -rln "X"
+  // tests/*.mjs && echo done` ran without `-l` and against all of `tests/`,
+  // exactly the infidelity the deny path had just stopped committing.
+  const searchPath = extractSearchPath(segment);
   let answer = { status: 'unavailable' };
   let answeredMode = block.mode;
 
@@ -293,11 +318,11 @@ function runMain() {
       answer = runShowAnswer({ cwd: root, symbols: block.symbols });
       if (answer.status !== 'hits' && pattern) {
         answeredMode = 'grep';
-        answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+        answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
       }
     } else if (pattern) {
       answeredMode = 'grep';
-      answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+      answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
     }
   }
 

@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 'use strict';
+// Dropped before anything runs: the teardown probe below redirects HOME, and
+// `claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude` — for a developer who
+// exports it (the documented multi-profile setup) the variable would WIN over
+// the redirect and the probe would act on the live config. Pinned by
+// `js_test_files_neutralize_claude_config_dir` in tests/hardening.rs.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
@@ -59,7 +67,7 @@ test('README tells npm users to tear down before uninstalling', () => {
   );
 });
 
-test('the teardown command the docs name actually exists', () => {
+test('the teardown command the docs name actually exists', (t) => {
   // Negative control against documenting a command that was renamed away: the
   // CLI must really dispatch an `uninstall` subcommand.
   //
@@ -70,8 +78,24 @@ test('the teardown command the docs name actually exists', () => {
   // testing the wrong thing. `--help` returns before any destructive work; a
   // subcommand that stopped being intercepted would be forwarded to the binary,
   // which has no `uninstall`, so this exits non-zero instead.
+  //
+  // Sandboxed cwd AND home, though `--help` returns first (pre-ship review): the
+  // command one line below this comment is the real teardown dispatcher, and it
+  // deletes `~/.cache/code-graph`, strips code-graph hooks from
+  // `~/.claude/settings.json` and unadopts the project in cwd. That it is
+  // harmless today rests entirely on the `--help` guard being the FIRST
+  // statement in cli-entry.js's `uninstall` arm — one refactor away from this
+  // suite tearing down the developer's own machine. The predecessor grep could
+  // never do that; §8.V3 says a session-modified destructive path is sandboxed,
+  // not reasoned about. Both HOME and USERPROFILE, because `os.homedir()` reads
+  // the latter on Windows.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'uninstall-contract-'));
+  t.after(() => { try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* gone */ } });
   const out = execFileSync(process.execPath, [path.join(ROOT, 'bin/cli.js'), 'uninstall', '--help'],
-    { cwd: ROOT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    {
+      cwd: home, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
   assert.match(
     out,
     /USAGE:\n\s+code-graph-mcp uninstall/,

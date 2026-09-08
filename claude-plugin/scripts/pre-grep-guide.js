@@ -270,12 +270,14 @@ function classifyBlock(cmd) {
 // spelling. Verified against the built binary rather than against help text:
 // `-l` prints bare paths, `-c` prints `path:count` exactly as `grep -c` does.
 //
-// Everything absent from this map is absent on purpose. `-r`/`-R` (cg is always
-// recursive), `-n` (cg always prints line numbers) and `-H`/`-h` (cg always
-// prints paths) have no cg spelling because cg already behaves that way;
-// forwarding them would be an unknown-argument error. `-L`/`-v`/`--exclude*`
-// never arrive here — UNANSWERABLE_FLAGS sends them to the hint tier — and
-// `-A/-B/-C` are routed to show-mode or hint before this runs.
+// Everything absent from this map is absent on purpose. `-r`/`-R`, `-n` and
+// `-H` ARE accepted by cg as grep-parity no-ops (it is always recursive and
+// always prints path and line number), so forwarding them would be harmless
+// rather than an error — they are simply nothing to say. `-h` is NOT the same
+// flag in the two tools: cg reads it as `--help`, so forwarding it would print
+// usage instead of searching. `-L`/`-v`/`--exclude*` never arrive here —
+// UNANSWERABLE_FLAGS sends them to the hint tier — and `-A/-B/-C` are routed to
+// show-mode or hint before this runs.
 const CG_SHORT_FLAGS = { i: '-i', w: '-w', F: '-F', l: '-l', c: '-c' };
 const CG_LONG_FLAGS = {
   '--ignore-case': '-i',
@@ -284,6 +286,20 @@ const CG_LONG_FLAGS = {
   '--files-with-matches': '-l',
   '--count': '-c',
 };
+// Flags that carry a VALUE and select which files are searched. All three spell
+// the same filter cg spells `-g` / `-t`, and dropping one silently widens the
+// answer to files the user excluded — the defect this whole flag map exists to
+// stop. `rg`'s spellings matter because rg is a folded verb: `rg -g '*.rs' Sym
+// src/` reached the answer as a bare `grep Sym src/`. cg takes `-g` repeatably,
+// so every occurrence is forwarded rather than only the first.
+const CG_VALUE_FLAGS = {
+  '--include': '-g',   // grep
+  '--glob': '-g',      // rg
+  '--type': '-t',      // rg
+};
+// Short forms of the value-carrying flags, by tool. `-g` and `-t` are rg-only;
+// grep has no short spelling for `--include`.
+const CG_VALUE_SHORT = { g: '-g', t: '-t' };
 // Canonical emission order, so the argv (and therefore the printed command) is a
 // function of WHICH flags were given, never of the order the user typed them.
 const CG_FLAG_ORDER = ['-i', '-w', '-F', '-l', '-c'];
@@ -305,30 +321,48 @@ function extractCgFlags(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
   const toks = firstShellClause(cmd).replace(VERB_STRIP, '').trim().split(/\s+/);
   const found = new Set();
-  let glob;
+  const filters = [];  // [cgFlag, value] pairs, in the order the user wrote them
+  const unquote = (s) => (s || '').replace(/^["']|["']$/g, '');
+  const addFilter = (flag, value) => {
+    if (!value) return;
+    // `-g '*.rs' -g '*.rs'` is one filter written twice; cg would honour both
+    // identically, but the printed command should not look like a mistake.
+    if (!filters.some(([f, v]) => f === flag && v === value)) filters.push([flag, value]);
+  };
   for (let i = 0; i < toks.length; i++) {
     const tok = toks[i];
     if (!tok || tok[0] === '"' || tok[0] === "'" || tok[0] !== '-') continue;
     if (tok.startsWith('--')) {
       const eq = tok.indexOf('=');
       const name = eq === -1 ? tok : tok.slice(0, eq);
-      // grep's `--include` is a filename glob — cg spells the same filter `-g`.
-      if (name === '--include') {
-        const raw = eq === -1 ? toks[i + 1] : tok.slice(eq + 1);
-        const val = (raw || '').replace(/^["']|["']$/g, '');
-        if (val && !glob) glob = val;
+      if (CG_VALUE_FLAGS[name]) {
+        addFilter(CG_VALUE_FLAGS[name], unquote(eq === -1 ? toks[i + 1] : tok.slice(eq + 1)));
+        if (eq === -1) i++;  // the value was a separate token — do not rescan it
         continue;
       }
       if (CG_LONG_FLAGS[name]) found.add(CG_LONG_FLAGS[name]);
       continue;
     }
-    // A short cluster: `-rln` is r + l + n, and only `l` has a cg spelling.
-    for (const ch of tok.slice(1)) {
+    // A short cluster: `-rln` is r + l + n, and only `l` has a cg spelling. A
+    // value-carrying short flag ends the cluster and takes what follows —
+    // attached (`-g*.rs`) or as the next token (`-g '*.rs'`).
+    const letters = tok.slice(1);
+    let consumed = false;
+    for (let k = 0; k < letters.length; k++) {
+      const ch = letters[k];
+      if (CG_VALUE_SHORT[ch]) {
+        const attached = letters.slice(k + 1);
+        addFilter(CG_VALUE_SHORT[ch], attached ? unquote(attached) : unquote(toks[i + 1]));
+        if (!attached) { i++; }
+        consumed = true;
+        break;
+      }
       if (CG_SHORT_FLAGS[ch]) found.add(CG_SHORT_FLAGS[ch]);
     }
+    if (consumed) continue;
   }
   const out = CG_FLAG_ORDER.filter((f) => found.has(f));
-  if (glob) out.push('-g', glob);
+  for (const [flag, value] of filters) out.push(flag, value);
   return out;
 }
 
@@ -804,7 +838,17 @@ function runMain() {
   // of an answered deny (inline answer ignored → fall-through) from a deeper
   // drill-down. undefined when there's no identifier-like pattern (unquoted / prose
   // grep) → omitted from the event, so the funnel stays back-compatible.
-  const grepPattern = translateBreToRg(cmd, pickBlockPattern(cmd));
+  // `-F` asks for a LITERAL pattern, and the BRE→rust-regex unescape must not
+  // also run on it: `grep -F 'x\|y'` searches for the five characters `x\|y`,
+  // while the unescaped `x|y` is a different string (GNU grep on a file holding
+  // the literal: `grep -Fc 'x\|y'` is 1, `grep -Fc 'x|y'` is 0). Before this
+  // release the flag was dropped entirely, so the answer was merely broader;
+  // forwarding `-F` without this guard would make it search the wrong text.
+  const cgFlags = extractCgFlags(cmd);
+  const rawGrepPattern = pickBlockPattern(cmd);
+  const grepPattern = cgFlags.includes('-F')
+    ? rawGrepPattern
+    : translateBreToRg(cmd, rawGrepPattern);
 
   // v0.48 — deliberate escape: record it (funnel visibility) and stay silent.
   // Before GREP_HEAD accepted bare KEY=VALUE prefixes these were invisible.
@@ -825,8 +869,15 @@ function runMain() {
 
   // classifyDeny, not classifyBlock: a command with a top-level `;`/`&&` tail is
   // never denied, because cancelling it would cancel the tail too. Those run and
-  // are answered by post-grep-inject instead. Recorded so the funnel can see how
-  // often the permission-neutral route now carries this traffic.
+  // are answered by post-grep-inject instead.
+  //
+  // The record is `observe` because that is the shape the Rust aggregator
+  // already scores; `compound: true` rides along for JSONL grep, and no counter
+  // reads it today (`usage.rs` folds every `observe` into one total). Two things
+  // that follow, so nobody reads more into it than it carries: this does NOT
+  // give the funnel a compound-route rate without a new counter, and a compound
+  // re-grep right after an answered deny now scores as `observe` rather than
+  // `sustained_after_answer`, which slightly flatters the deny cohort.
   const block = isBlockDisabled() ? null : classifyDeny(cmd);
   if (!block && !isBlockDisabled() && classifyBlock(cmd)) {
     recordRecommendation(root, {
@@ -849,7 +900,7 @@ function runMain() {
     // out of argv (the exit-1 shape sanitizeSearchPath was added for) and what
     // stops the answer from quietly searching files the user excluded.
     const searchPath = extractSearchPath(cmd);
-    const flags = extractCgFlags(cmd);
+    const flags = cgFlags;  // computed once above, beside the -F pattern guard
     // ONE argv, used to run the child AND to render the command the deny prints.
     const args = buildGrepArgs({ pattern, searchPath, flags });
     let answeredMode = block.mode;

@@ -128,7 +128,11 @@ it fires on the exemption its own message advertises (`D=$(mktemp -d) … rm -rf
 3. `grep -rn "Sym" tests/*.mjs` runs with scope `tests` and `-g '*.mjs'`, both
    shown.
 4. No deny message can carry a compound-tail NOTE, because no deny can carry a
-   tail. The tail-note apparatus goes with it.
+   `;`/`&&` tail. The tail-note apparatus goes with it. **Not** a claim that a
+   deny discards nothing: `grep … | wc -l` is still denied whole and answered
+   with hits rather than a count. Pipes were never counted as tails and never
+   carried the NOTE, so that is unchanged rather than regressed — but success
+   criterion 1 is about `;`/`&&` only, and r1 overstated it.
 
 ## Open questions
 
@@ -136,7 +140,18 @@ it fires on the exemption its own message advertises (`D=$(mktemp -d) … rm -rf
   in-context answer whenever post-grep-inject's redundancy gate suppresses the
   inject. That is the intended trade — the gate suppresses precisely when the
   model's own grep already printed the hits, which it now actually gets to run.
+  r2: sized at 27% of denies (23 of 85 carrying `tail:true` in this repo's log,
+  all `answered:true`) and made measurable rather than merely argued — the skip
+  now records `grep-inject/skip/grep-hit-redundant`.
 
 # Change log
 
 - r1 (2026-09-08): drafted from the three-red-block field report at `9567b09`.
+- r2 (2026-09-08): pre-ship review round 1. Two HIGH, both about the path the
+  change ROUTES TRAFFIC INTO rather than the path it edited: the redundancy skip
+  was silent (unmeasurable after ship), and post-grep-inject never received the
+  flag/glob fidelity fix, so a newly-allowed `grep -rln … tests/*.mjs && echo`
+  ran the unfixed answer. Also implemented the `-F` constraint this spec already
+  stated and had not built, mapped ripgrep's `--glob`/`-g`/`-t`, made
+  `--include` repeatable, and corrected four claims (in the flag-map comment,
+  the CHANGELOG, and criterion 4) that were false as written.

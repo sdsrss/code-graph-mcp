@@ -358,6 +358,50 @@ function runHook(cmd, fixture, extraEnv = {}, cwdOverride, toolOutput) {
   });
 }
 
+// ── Pre-ship review of the v0.144 grep-guard change ─────────────────────────
+// PreToolUse stopped denying compound commands, which routes a measured 27% of
+// former denies (23 of 85 in this repo's own log carried `tail:true`) onto this
+// hook. Two consequences were found before release: the redundancy skip made
+// that whole class invisible to the funnel, and the flag/glob fidelity fix had
+// been applied only to the deny path — so the newly-routed traffic ran the
+// UNFIXED answer.
+
+test('e2e: the redundancy skip is RECORDED, not silent', (t) => {
+  const uniq = `InjSkip${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('cg out\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    // The model's own grep already surfaced the symbol → the inject is redundant.
+    const res = runHook(cmd, fixture, {}, undefined, `src/foo.rs:12  fn ${uniq}()`);
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', 'a redundant inject must still not be emitted');
+    const rec = JSON.parse(fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
+    assert.equal(rec.hook, 'grep-inject');
+    assert.equal(rec.action, 'skip');
+    assert.equal(rec.reason, 'grep-hit-redundant');
+    assert.equal(rec.pattern, uniq);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the inject honours the grep\'s flags and glob, like the deny path', (t) => {
+  const uniq = `InjFlag${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  // A miss, so the inject is additive and actually fires.
+  const cmd = `grep -rln "${uniq}" tests/*.mjs && echo done`;
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, '');
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`ARGV\\[grep -l ${uniq} tests -g \\*\\.mjs\\]`),
+      `the inject dropped -l and widened the glob while the deny path kept both: ${ctx}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 // The command-hash tail of an inject cooldown flag. The full name is
 // `.code-graph-postinject-<cwdHash>-<commandHash>` (post-grep-inject.js
 // `flagPath`), and matching the TAIL alone is what makes this independent of the

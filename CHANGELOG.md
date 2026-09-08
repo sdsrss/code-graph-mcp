@@ -38,14 +38,37 @@ gone with the deny it apologised for.
 tests/*.mjs` asked for a file list from `.mjs` files. The deny printed
 `code-graph-mcp grep "applyTierFilter|tier:" tests` and delivered 25+ hit lines
 from all of `tests/`: every flag was dropped, and the glob was truncated to its
-parent directory. `-i -w -F -l -c` and `--include=GLOB` now carry through
-(`--include` and a globbed path both become `-g`), and the argv the child runs
-is the same array the printed command is rendered from, so the two cannot
-disagree again. The same command now answers with
+parent directory. `-i -w -F -l -c` now carry through, as do the three flags that select which
+files are searched — grep's `--include` and ripgrep's `--glob`/`-g` become cg's
+`-g`, ripgrep's `-t` stays `-t`, and every occurrence is forwarded rather than
+only the first. A globbed path argument becomes the same `-g` filter instead of
+being widened to its parent directory. The argv the child runs is the same array
+the printed command is rendered from, so the two cannot disagree again. The
+reported command now answers with
 `code-graph-mcp grep -l applyTierFilter tests -g '*.mjs'`.
 
-Neither behaviour is configurable and no opt-out changed; `CODE_GRAPH_NO_INJECT=1`
-still turns off the PostToolUse answer that now covers the compound case.
+`-F` is the one flag that changes the pattern as well as the search: it means
+the pattern is literal, so the BRE-to-Rust-regex unescape no longer runs
+alongside it. `grep -F 'x\|y'` searches for `x\|y`, not `x|y`.
+
+`-c` is forwarded but is not identical to grep's: cg prints `path:count` per
+file where GNU `grep -c PATTERN file` prints a bare number for a single named
+file. `-n`, `-r`/`-R` and `-H` are not forwarded because cg already behaves that
+way; `-h` is deliberately not forwarded, because cg reads it as `--help`.
+
+**What the compound case costs you.** The PostToolUse hook that now handles those
+commands suppresses itself when your own grep already printed the symbol — that
+gate exists because an audit found every such injection was ignored. So for a
+compound grep that HITS, you get your grep's output and no AST context, where
+before you got the AST answer and no grep. In this repository's own logs that is
+27% of denies (23 of 85). The skip is now recorded, so the trade is measurable
+rather than asserted. A compound grep that MISSES still gets the answer, and
+`CODE_GRAPH_NO_INJECT=1` turns that off.
+
+One case is unchanged and still discards something: `grep … | wc -l` is denied
+whole, and the answer is hits rather than a count. Pipes were never flagged as
+dropped tails, so nothing regressed here — but the deny is not equivalent to
+what you asked for, and that is now written down rather than implied.
 
 ### Issue #41, the actual fix
 

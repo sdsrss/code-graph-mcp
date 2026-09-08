@@ -187,6 +187,34 @@ test('plugin-only: doctor rejects unknown flags with its own parser', posixOnly,
   assert.match(r.stderr, /doctor: unknown argument\(s\): --check-onlyy/);
 });
 
+// Pre-ship review: the self-exec hazard the isNativeBinary directory check
+// exists to prevent was pinned only by a unit test — the sandbox above installs
+// a minimal PATH, so the launcher's own directory was never a discovery
+// candidate end to end. Here it is FIRST on PATH, which is exactly what Claude
+// Code does. `which code-graph-mcp` therefore answers with the launcher, and the
+// discovery chain must still reach the real binary past it.
+//
+// The timeout is the anti-recursion assertion: a launcher that resolves itself
+// re-execs forever and this call never returns.
+test('plugin-only: the launcher first on PATH still resolves past itself', posixOnly, (t) => {
+  const box = mkPluginOnly(t);
+  const binDir = path.dirname(box.launcher);
+  let r;
+  try {
+    r = {
+      status: 0,
+      stdout: execFileSync(process.execPath, [box.launcher, 'callgraph', 'someSymbol'], {
+        cwd: box.cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...box.env, PATH: `${binDir}:${box.env.PATH}` },
+        timeout: 30000,
+      }),
+    };
+  } catch (e) { r = { status: e.status, stdout: e.stdout || '', stderr: e.stderr || '' }; }
+  assert.match(r.stdout, /REACHED_THE_BINARY callgraph someSymbol/,
+    `the launcher did not reach the stub; if it resolved ITSELF this is the symptom. stdout=${r.stdout}`);
+  assert.equal(r.status, 3);
+});
+
 test('plugin-only: adopt is answered without consulting the binary', posixOnly, (t) => {
   const r = runPluginOnly(mkPluginOnly(t), ['adopt', '--help']);
   assert.doesNotMatch(r.stdout + r.stderr, /REACHED_THE_BINARY/);

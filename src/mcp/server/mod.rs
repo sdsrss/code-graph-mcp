@@ -58,6 +58,13 @@ const _: () = assert!(
     INSTRUCTIONS_NOISY.len() <= 1500,
     "MCP noisy instructions exceed 1500-byte budget; Claude Code will truncate."
 );
+// The quiet variant had no budget at all, and it grew in the same edit that grew
+// the noisy one (pre-ship review). It is a one-line pointer, so 400 is generous
+// and still catches anyone turning it back into prose.
+const _: () = assert!(
+    INSTRUCTIONS_QUIET.len() <= 400,
+    "MCP quiet instructions exceed 400-byte budget; it is meant to be one line."
+);
 
 /// Arguments the handlers genuinely HONOR but the published schema does not
 /// declare — `("*", arg)` for every tool, `(tool_name, arg)` for one.

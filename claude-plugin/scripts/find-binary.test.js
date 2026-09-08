@@ -332,6 +332,26 @@ test('the plugin launcher is never resolved as the native binary', () => {
   assert.equal(isCachedBinaryFresh(launcher, '0.25.0'), false);
 });
 
+// Pre-ship review reproduced the gap the directory check above still left: it
+// names only the copy THIS module was loaded from, so on a machine carrying both
+// `npm i -g @sdsrs/code-graph` and the Claude Code plugin, the npm entry's PATH
+// tier resolved the PLUGIN's launcher as the binary — accepted by the gate and
+// written into the shared `~/.cache/code-graph/binary-path`, costing an extra
+// node process per call and cache thrash between the two copies.
+test('another copy of the plugin is rejected as the binary too, by its .cmd sibling', (t) => {
+  const other = mkDir(t, 'other-plugin-bin-');
+  const launcher = path.join(other, BINARY_NAME);
+  fs.writeFileSync(launcher, "#!/usr/bin/env node\nrequire('../scripts/cli-entry').main();\n");
+  if (process.platform !== 'win32') fs.chmodSync(launcher, 0o755);
+  // The marker: `claude-plugin/bin/` always ships both spellings, and nothing
+  // that ships a real native binary ships a `.cmd` beside it.
+  assert.equal(createVersionGate(null).consider(launcher), launcher,
+    'without the sibling the name alone is accepted — this is the hazard being pinned');
+  fs.writeFileSync(path.join(other, 'code-graph-mcp.cmd'), '@echo off\n');
+  assert.equal(createVersionGate(null).consider(launcher), null);
+  assert.equal(isCachedBinaryFresh(launcher, '0.25.0'), false);
+});
+
 // ── unsupportedPlatformHint (actionable message for tails with no prebuilt binary) ──
 
 test('unsupportedPlatformHint flags Alpine/musl with a source/glibc-image hint', () => {

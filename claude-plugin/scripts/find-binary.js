@@ -229,7 +229,19 @@ function isNativeBinary(candidate) {
   try {
     if (!fs.existsSync(candidate)) return false;
     const realPath = fs.realpathSync(candidate);
-    if (path.dirname(realPath) === launcherDir()) return false;
+    const dir = path.dirname(realPath);
+    // Our OWN launcher directory, and — pre-ship review — any OTHER copy's.
+    // Matching only `launcherDir()` covers the copy this module was loaded from,
+    // so a machine with BOTH `npm i -g` and the plugin had the npm entry's PATH
+    // tier resolve the PLUGIN's launcher as the binary: accepted by the gate,
+    // written into the shared `~/.cache/code-graph/binary-path`, and thereafter
+    // one extra node process per call plus cache thrash between the two copies.
+    // The `.cmd` sibling is the marker because it is what makes a directory a
+    // launcher directory: `claude-plugin/bin/` always ships both spellings, and
+    // nothing that ships an actual native binary ships a `.cmd` beside it.
+    // Not a magic-byte test on purpose — see the note in tasks/specs.
+    if (dir === launcherDir()) return false;
+    if (fs.existsSync(path.join(dir, 'code-graph-mcp.cmd'))) return false;
     return path.basename(realPath) === BINARY_NAME;
   } catch {
     return false;

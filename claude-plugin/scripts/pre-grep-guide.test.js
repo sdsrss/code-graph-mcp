@@ -1179,6 +1179,33 @@ test('extractCgFlags: only the grep\'s own clause, never a tail command\'s flags
   assert.deepEqual(extractCgFlags('grep -rn "Sym" src/; ls -l /tmp'), []);
 });
 
+// Pre-ship review: three filter-dropping gaps of the class this map exists to
+// close. rg is a FOLDED verb, so its spellings must map too — `rg -g '*.rs' Sym
+// src/` reached the answer as a bare `grep Sym src/`, silently widening the
+// scope under copy that claims equivalence.
+test('extractCgFlags: rg glob/type spellings map, short and long, attached and separate', () => {
+  assert.deepEqual(extractCgFlags(`rg -g '*.rs' "some_symbol" src/`), ['-g', '*.rs']);
+  assert.deepEqual(extractCgFlags(`rg --glob '*.rs' "some_symbol" src/`), ['-g', '*.rs']);
+  assert.deepEqual(extractCgFlags(`rg --glob='*.rs' "some_symbol" src/`), ['-g', '*.rs']);
+  assert.deepEqual(extractCgFlags(`rg -t rust "some_symbol" src/`), ['-t', 'rust']);
+  assert.deepEqual(extractCgFlags(`rg -g'*.rs' "some_symbol" src/`), ['-g', '*.rs'], 'attached value');
+});
+
+test('extractCgFlags: --include is repeatable, not collapsed to the first', () => {
+  assert.deepEqual(
+    extractCgFlags(`grep -rn --include "*.rs" --include "*.py" "some_symbol" src/`),
+    ['-g', '*.rs', '-g', '*.py']);
+  assert.deepEqual(
+    extractCgFlags(`grep -rn --include '*.rs' --include '*.rs' "some_symbol" src/`),
+    ['-g', '*.rs'], 'the same filter written twice is one filter');
+});
+
+test('extractCgFlags: a value token is not rescanned as a flag cluster', () => {
+  // `-g` consumes the next token; without that, a value like `-x.rs` would be
+  // read as a flag cluster on the following pass.
+  assert.deepEqual(extractCgFlags(`rg -i -g '*.rs' "some_symbol" src/`), ['-i', '-g', '*.rs']);
+});
+
 test('buildNoHitsFyi: names the pattern and says raw grep proceeds', () => {
   const fyi = buildNoHitsFyi('GhostSymbol');
   assert.match(fyi, /GhostSymbol/);
@@ -1366,6 +1393,39 @@ test('e2e: -l reaches the answer binary AND the printed command', () => {
       `the answer ran without -l, so it returned hits where a file list was asked for: ${reason}`);
     assert.match(reason, /code-graph-mcp grep -l /,
       'the printed command must show the flag that actually ran');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// Pre-ship review: the spec listed this as a Constraint and the code did not
+// implement it. `-F` says the pattern is literal, so the BRE unescape must not
+// also run — checked against GNU grep on a file holding the literal `x\|y`:
+// `grep -Fc 'x\|y'` is 1, `grep -Fc 'x|y'` is 0. Before this release the flag
+// was dropped and the answer was merely broader; forwarding `-F` without this
+// makes the "equivalent" search a different string.
+test('e2e: -F forwards the flag AND leaves the literal pattern unescaped', (t) => {
+  const uniq = `StubLit${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const cmd = `grep -rF "${uniq}\\|other_symbol" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, new RegExp(`ARGV\\[grep -F ${uniq}\\\\\\|other_symbol src/\\]`),
+      `-F must forward and must not unescape: ${reason}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
+  const uniq = `StubBre${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const cmd = `grep -rn "${uniq}\\|other_symbol" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.match(out.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`ARGV\\[grep ${uniq}\\|other_symbol src/\\]`));
   } finally {
     cleanupFixture(fixture, cmd);
   }
