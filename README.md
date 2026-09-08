@@ -528,6 +528,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_NO_AUTO_UPDATE=1` | Never check GitHub for a new release. |
 | `CODE_GRAPH_NO_AUTO_ADOPT=1` | Do not write the steering block into a project's `CLAUDE.md` on SessionStart. |
 | `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Keep hand edits to the generated steering block — it is otherwise refreshed to the current template. |
+| `CODE_GRAPH_NO_GITIGNORE=1` | Never touch `.gitignore` — not even to add the `.code-graph/` entry. |
 | `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |

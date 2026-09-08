@@ -20,7 +20,15 @@ use crate::domain::CODE_GRAPH_DIR;
 ///
 /// Shared by both index-creating entry points — the MCP server's
 /// `from_project_root` and the CLI index commands — so the two cannot drift.
+///
+/// Set `CODE_GRAPH_NO_GITIGNORE=1` to disable this entirely — for a user whose
+/// own ignore rules (e.g. a global `core.excludesFile`) already cover
+/// `.code-graph/`, the unconditional append otherwise touches every repo the
+/// tool runs in, including ones they don't own.
 pub(crate) fn ensure_code_graph_dir_ignored(project_root: &Path) {
+    if std::env::var("CODE_GRAPH_NO_GITIGNORE").ok().as_deref() == Some("1") {
+        return;
+    }
     let gitignore_path = project_root.join(".gitignore");
     let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
     // Match both `.code-graph` and `.code-graph/` spellings, so a user who wrote
@@ -118,5 +126,55 @@ mod tests {
                 "existing {existing:?} entry must be recognized, got: {content:?}"
             );
         }
+    }
+
+    /// `CODE_GRAPH_NO_GITIGNORE=1` disables the write entirely — for a user
+    /// whose own ignore rules already cover `.code-graph/`, so the tool never
+    /// touches `.gitignore` at all, not even to create it.
+    ///
+    /// In-process `set_var`/`remove_var`, following the pattern already used
+    /// at `src/cli/tests.rs:733` and `src/indexer/resync.rs:454`: no other
+    /// test in the crate reads or writes `CODE_GRAPH_NO_GITIGNORE`, so this is
+    /// safe under `cargo test`'s parallel test threads (each thread shares the
+    /// process env, but nothing else touches this uniquely-named variable).
+    /// The prior value is restored before the positive control runs, so a
+    /// panic in either half cannot leak the override into the other tests in
+    /// this module or into `test_from_project_root_creates_db`.
+    #[test]
+    fn the_env_switch_suppresses_the_write() {
+        const VAR: &str = "CODE_GRAPH_NO_GITIGNORE";
+        let prior = std::env::var(VAR).ok();
+        std::env::set_var(VAR, "1");
+
+        let root = tempfile::TempDir::new().unwrap();
+        ensure_code_graph_dir_ignored(root.path());
+        assert!(
+            !root.path().join(".gitignore").exists(),
+            "no .gitignore should be created while the switch is set"
+        );
+
+        let existing_root = tempfile::TempDir::new().unwrap();
+        let p = existing_root.path().join(".gitignore");
+        std::fs::write(&p, "node_modules/\n").unwrap();
+        ensure_code_graph_dir_ignored(existing_root.path());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "node_modules/\n",
+            "an existing .gitignore must be left untouched"
+        );
+
+        match prior {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+
+        // Positive control: with the switch unset, a sibling repo still gets
+        // the entry, so the assertions above are not green by inaction.
+        let control_root = tempfile::TempDir::new().unwrap();
+        ensure_code_graph_dir_ignored(control_root.path());
+        assert_eq!(
+            std::fs::read_to_string(control_root.path().join(".gitignore")).unwrap(),
+            ".code-graph/\n"
+        );
     }
 }
