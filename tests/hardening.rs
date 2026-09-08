@@ -3913,8 +3913,11 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
                 line.contains(BARE_BEGIN_OK) || (n > 0 && raw[n - 1].contains(BARE_BEGIN_OK));
             // Only the associated-function spelling can be excused at all.
             // `.unchecked_transaction()` has a savepoint available in every
-            // position, so there is no argument to make for it.
-            if marked && code.contains(BARE_BEGIN[1]) {
+            // position, so there is no argument to make for it — and a line
+            // carrying BOTH spellings is not excused either, or a marker earned
+            // by the `new_unchecked` half would launder the method half sitting
+            // beside it (CodeRabbit on PR #46).
+            if marked && code.contains(BARE_BEGIN[1]) && !code.contains(BARE_BEGIN[0]) {
                 continue;
             }
             offenders.push(format!("{}:{}", path.display(), n + 1));

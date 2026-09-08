@@ -4849,18 +4849,21 @@ fn deleting_the_duplicate_puts_the_untouched_edge_back() {
 }
 
 #[test]
-fn a_name_moving_across_languages_hides_the_drift_from_the_name_scope() {
+fn a_name_moving_across_languages_still_enters_the_drift_scope() {
+    // Regression test for a divergence found in pre-ship review 2026-09-08.
+    //
     // `cg_namecount` — the input Phase 2e classifies from — is keyed
-    // (name, LANGUAGE). `snapshot_scope_name_counts` /
-    // `scope_names_from_count_drift` count `GROUP BY n.name` only. So a run that
-    // moves a name from a Python file to a JavaScript file inside its own scope
-    // leaves the name-only count UNCHANGED (1 before, 1 after) while the
-    // (helper, python) count really did fall from 2 to 1.
+    // (name, LANGUAGE), but `snapshot_scope_name_counts` /
+    // `scope_names_from_count_drift` USED to count `GROUP BY n.name` alone. A run
+    // that moves a name from a Python file to a JavaScript file inside its own
+    // scope then left the name-only count unchanged (1 before, 1 after) while the
+    // (helper, python) count really fell from 2 to 1, so `helper` never entered
+    // `cg_scope_names`.
     //
     // The edge that has to be relabelled runs between two files the run never
-    // opened, so neither file arm reaches it, and the name arm does not carry
-    // `helper` because no drift was observed. Incremental keeps `ambiguous`;
-    // a rebuild of the same tree says `inferred`.
+    // opened, so neither file arm reaches it — the name arm is the only thing
+    // that can. Both count queries are keyed (name, language) now; this asserts
+    // the incremental result matches the rebuild, which it did not before.
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let src = project_dir.path().join("src");
@@ -4905,7 +4908,7 @@ fn a_name_moving_across_languages_hides_the_drift_from_the_name_scope() {
         edge_of(&inc).as_deref(),
         Some("inferred"),
         "the python `helper` count fell 2 -> 1, so the untouched b.py -> a.py edge must be \
-         reclassified — but the drift snapshot groups by name only, so `helper` never \
-         entered cg_scope_names: {inc:?}"
+         reclassified; if this fails, the drift snapshot has stopped keying on \
+         (name, language) and `helper` is no longer entering cg_scope_names: {inc:?}"
     );
 }

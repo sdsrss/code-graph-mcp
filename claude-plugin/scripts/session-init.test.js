@@ -372,9 +372,9 @@ test('the adoption remedies name a command this install can actually run', (t) =
   // shape. The first version of this test stubbed findBinary to `/bin/true` and
   // asserted the string — it stayed green while the real command exited 1 with
   // "adopt.js not found" on every install layout except a dev checkout.
-  const m = res.stderr.match(/Reverse:\s+(node "[^"]+" unadopt)/);
+  const m = res.stderr.match(/Reverse:\s+(node '[^']+' unadopt)/);
   assert.ok(m, `the Reverse hint must be present and quoted; stderr was:\n${res.stderr}`);
-  const script = m[1].match(/"([^"]+)"/)[1];
+  const script = m[1].match(/'([^']+)'/)[1];
   assert.ok(fs.existsSync(script), `the hint points at a file that does not exist: ${script}`);
   assert.equal(path.basename(script), 'adopt.js',
     `unadopt is JS-dispatched — the hint must name adopt.js, not a binary that ` +
@@ -399,7 +399,7 @@ test('the adoption remedies name a command this install can actually run', (t) =
   assert.equal(ran.status, 0,
     `the printed command must RUN, not just read well. stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`);
 
-  assert.match(res.stderr, /`node "[^"]+adopt\.js" unadopt`/,
+  assert.match(res.stderr, /`node '[^']+adopt\.js' unadopt`/,
     `the unrecorded-registry remedy must be the same runnable command; stderr was:\n${res.stderr}`);
 });
 
@@ -423,7 +423,7 @@ test('the remedy does not change when no binary resolved', (t) => {
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /Reverse:\s+node "[^"]+adopt\.js" unadopt/,
+  assert.match(res.stderr, /Reverse:\s+node '[^']+adopt\.js' unadopt/,
     `no binary must not degrade the hint; stderr was:\n${res.stderr}`);
 });
 

@@ -34,7 +34,7 @@ const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, migrateLegacyMemoryDir,
-  formatResult, unadoptCommand,
+  formatResult, unadoptCommand, shellQuote,
   SENTINEL_BEGIN, SENTINEL_END, MANAGED_BY, TEMPLATE_PATH, TARGET_NAME,
   PROJECT_MARKERS,
 } = require('./adopt');
@@ -1450,7 +1450,7 @@ test('the adopt printer names an unadopt command the reader can actually run', (
   });
   const line = out.split('\n').find((l) => l.includes('Reverse:'));
   assert.ok(line, 'the adopt printer still offers a Reverse: hint');
-  assert.match(line, /Reverse:\s+node "[^"]*adopt\.js" unadopt/,
+  assert.match(line, /Reverse:\s+node '[^']*adopt\.js' unadopt/,
     'the reverse hint must name the script, not a bare binary name');
   assert.ok(!/Reverse:\s+code-graph-mcp\b/.test(line),
     'the bare-name spelling is the unrunnable one');
@@ -1463,5 +1463,20 @@ test('both unadopt hints resolve to the same command', () => {
   const fromSessionInit = require('./session-init').unadoptCommand();
   assert.strictEqual(unadoptCommand(), fromSessionInit);
   assert.strictEqual(unadoptCommand(),
-    `node ${JSON.stringify(path.join(__dirname, 'adopt.js'))} unadopt`);
+    `node '${path.join(__dirname, 'adopt.js')}' unadopt`);
+});
+
+test('the printed unadopt command survives a path a shell would otherwise expand', () => {
+  // CodeRabbit on PR #46. `JSON.stringify` emits DOUBLE quotes, and a POSIX
+  // shell expands `$`, backticks and `$(...)` inside those — so an install path
+  // holding any of them would be rewritten, or executed, when the user pastes
+  // the line we told them to run. This is a command we hand to a human to paste.
+  assert.strictEqual(shellQuote('/a/b$(whoami)/c'), "'/a/b$(whoami)/c'");
+  assert.strictEqual(shellQuote('/a/`id`/c'), "'/a/`id`/c'");
+  assert.strictEqual(shellQuote('/a/$HOME/c'), "'/a/$HOME/c'");
+  // A literal single quote is the one character single-quoting cannot carry:
+  // close, escape, reopen.
+  assert.strictEqual(shellQuote("/it's/here"), "'/it'\\''s/here'");
+  // And the real command is quoted the same way.
+  assert.match(unadoptCommand(), /^node '.*adopt\.js' unadopt$/);
 });

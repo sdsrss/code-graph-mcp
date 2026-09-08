@@ -871,8 +871,19 @@ function unadopt({ cwd, home } = {}) {
  * BOTH printers that hand a user this command must agree, and the other one is
  * `formatResult` directly below — the site 0.141.0's sweep missed.
  */
+function shellQuote(value) {
+  // SINGLE quotes, not JSON.stringify. `JSON.stringify` emits DOUBLE quotes, and
+  // a POSIX shell still expands `$`, backticks and `$(...)` inside those — so a
+  // path holding any of them would be rewritten, or executed, when the user
+  // pastes the line we printed. Single quotes are literal for everything except
+  // `'` itself, which is closed, escaped and reopened. POSIX-only is fine here:
+  // `platformGuard()` refuses adopt on win32, so this string never targets cmd
+  // or PowerShell. (CodeRabbit on PR #46; inherited from the 0.141.0 spelling.)
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function unadoptCommand() {
-  return `node ${JSON.stringify(__filename)} unadopt`;
+  return `node ${shellQuote(__filename)} unadopt`;
 }
 
 function formatResult(action, result) {
@@ -965,7 +976,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  adopt, unadopt, memoryDir, formatResult, unadoptCommand, stripSentinelBlock,
+  adopt, unadopt, memoryDir, formatResult, unadoptCommand, shellQuote, stripSentinelBlock,
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
