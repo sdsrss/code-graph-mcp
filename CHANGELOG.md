@@ -1,13 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.144.0
 
-**Upgrading:** nothing to do, and one thing starts working. On a plugin install
-`code-graph-mcp` is now a command your shell can find. No index change, no
-config change, no managed-block rewrite — the `CLAUDE.md` block and the detail
-doc keep the `~/.cache/code-graph/bin/…` fallback they have carried since
-0.141.0, because Claude Code drops a plugin's PATH entry when the plugin path
-contains shell metacharacters, and older versions never added it.
+**Upgrading:** nothing to do, and two things change on their own.
+
+On a plugin install `code-graph-mcp` becomes a command your shell can find —
+that is the whole of issue #41, and it needs no action from you. No index
+change, no config change, no managed-block rewrite: the `CLAUDE.md` block and
+the detail doc keep the `~/.cache/code-graph/bin/…` fallback they have carried
+since 0.141.0, because Claude Code drops a plugin's PATH entry when the plugin
+path contains shell metacharacters, and older versions never added it.
+
+The behaviour change worth knowing about is the second one: **a `grep` with a
+`;` or `&&` tail is no longer denied.** It runs whole, and the AST answer that
+used to arrive inside the deny now arrives from the PostToolUse hook — except
+when your own grep already found the symbol, where nothing is added. That is a
+real reduction in steering for about 27% of what used to be denied, bought in
+exchange for the command not being cancelled; the section below states the cost
+and the measurement. `code-graph-mcp stats` readers: one follow-up rate shifts,
+also described below.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.143.0`, or `cargo install
+code-graph-mcp --version 0.143.0`; plugin users can set the version in the
+marketplace entry. Reverting restores the old deny behaviour and removes the
+launcher from PATH — nothing migrates in either direction. `INDEX_VERSION` is
+not bumped and no index needs rebuilding.
+
+`CODE_GRAPH_NO_INJECT=1` turns off the PostToolUse answer; `CODE_GRAPH_NO_BLOCK_GREP=1`
+turns off the deny tier entirely. Neither is new.
 
 ### The grep guard's red denies: one that shouldn't fire, and two that lied
 
