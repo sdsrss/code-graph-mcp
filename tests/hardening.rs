@@ -3844,13 +3844,37 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
         files.len()
     );
 
+    // Two spellings of one bare BEGIN. `Transaction::new_unchecked` was the
+    // blind spot: the guard named the METHOD, so the associated-function form
+    // walked past it inside the very directories this scan claims to cover
+    // (audit 2026-09-07 CORE-14, recorded there as read-only). Mutation-verified
+    // 2026-09-08: with only `.unchecked_transaction()` matched, planting
+    // `Transaction::new_unchecked(conn, Immediate)` in `src/indexer/` left this
+    // test GREEN.
+    const BARE_BEGIN: [&str; 2] = [".unchecked_transaction()", "Transaction::new_unchecked"];
+
     // Positive control: a scanner that silently matches nothing (a renamed
     // method, a `code_only` change) would pass this test forever.
     assert!(
-        code_only("        let tx = conn.unchecked_transaction()?;")
-            .contains(".unchecked_transaction()"),
+        code_only("        let tx = conn.unchecked_transaction()?;").contains(BARE_BEGIN[0]),
         "the matcher no longer recognises the call it exists to find"
     );
+    assert!(
+        code_only("    let tx = rusqlite::Transaction::new_unchecked(conn, Immediate)?;")
+            .contains(BARE_BEGIN[1]),
+        "the matcher no longer recognises the associated-function spelling"
+    );
+
+    // The two sites that need IMMEDIATE and cannot use a SAVEPOINT to get it.
+    // Both are reached only from `spawn_startup_repair`'s own thread and
+    // connection, never from inside `rebuild_index`'s transaction, so neither
+    // can abort an enclosing one. Listed rather than pattern-excused: a new
+    // bare BEGIN must argue for itself here, in this file, where the reason is
+    // read alongside the rule.
+    const IMMEDIATE_EXEMPT: [&str; 2] = [
+        "src/storage/queries/vectors.rs",
+        "src/storage/queries/embedding_cache.rs",
+    ];
 
     let mut offenders = Vec::new();
     for path in &files {
@@ -3869,10 +3893,22 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
             Some(i) => &src[..i],
             None => &src[..],
         };
+        let exempt = IMMEDIATE_EXEMPT
+            .iter()
+            .any(|e| path.to_string_lossy().replace('\\', "/").ends_with(e));
         for (n, line) in body.lines().enumerate() {
-            if code_only(line).contains(".unchecked_transaction()") {
-                offenders.push(format!("{}:{}", path.display(), n + 1));
+            let code = code_only(line);
+            if !BARE_BEGIN.iter().any(|pat| code.contains(pat)) {
+                continue;
             }
+            // An exempt FILE is not an exempt method: the exemption exists for
+            // the IMMEDIATE-behaviour sites, and `.unchecked_transaction()` in
+            // one of those files would still be an ordinary bare BEGIN with a
+            // savepoint available.
+            if exempt && code.contains(BARE_BEGIN[1]) {
+                continue;
+            }
+            offenders.push(format!("{}:{}", path.display(), n + 1));
         }
     }
 
