@@ -1232,8 +1232,11 @@ test('extractCgFlags: rg-only short value flags are not read out of ag or grep',
 });
 
 test('extractCgFlags: --type long form maps for every folded verb', () => {
-  // The long spellings are unambiguous, so they are NOT gated on the verb —
-  // only the short forms are. Round 2 found only the short `-t` asserted.
+  // Only the SHORT forms are gated on the verb. Not because the long spellings
+  // are unambiguous — round 3 corrected that reason — but because no other
+  // folded verb has them: `grep --glob` and `ag --type` are errors, so a command
+  // spelling one would never have run. Mapping them costs nothing and the gate
+  // would only add a way to get it wrong.
   assert.deepEqual(extractCgFlags(`rg --type rust "some_symbol" src/`), ['-t', 'rust']);
   assert.deepEqual(extractCgFlags(`rg --type=rust "some_symbol" src/`), ['-t', 'rust']);
 });
@@ -1291,6 +1294,18 @@ function runHook(cmd, fixture, cwdOverride) {
 // byte, and matching the prefix would re-create the bug below.
 function cooldownFlagTail(cmd) {
   return `-${commandHash(cmd)}`;
+}
+
+// Every recommendation row the hooks wrote for this fixture, parsed. Returns []
+// when nothing was written at all, so a caller can filter by hook without
+// distinguishing "no rows" from "no file".
+function readRecs(fixture) {
+  let raw;
+  try {
+    raw = fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim();
+  } catch { return []; }
+  return raw ? raw.split('\n').map((l) => JSON.parse(l)) : [];
 }
 
 function cleanupFixture(fixture, cmd) {
@@ -1448,6 +1463,35 @@ test('e2e: -F forwards the flag AND leaves the literal pattern unescaped', (t) =
   } finally {
     cleanupFixture(fixture, cmd);
   }
+});
+
+// Round 3: the -F guard's CALL SITE was unpinned in both hooks — reverting it to
+// `flags.includes('-F')` stayed green, because no test had `-F` appear as a
+// VALUE. `--include -F` is the witness: the filename glob is the string `-F`.
+test('e2e: a `-F` sitting in a VALUE position does not trigger the literal guard', (t) => {
+  const uniq = `StubFVal${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const cmd = `grep -rn --include -F "${uniq}\\|other_symbol" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    // -F is --include's value here, so the BRE unescape MUST still run.
+    assert.match(reason, new RegExp(`ARGV\\[grep -g -F ${uniq}\\|other_symbol src/\\]`),
+      `the guard fired on a filename glob and left the pattern escaped: ${reason}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// Round 3 regression: gating the short -g/-t map on `rg` left `ag -g PAT` looking
+// like an ordinary content grep, so the hook denied it and answered with matching
+// LINES. ag's `-g` searches FILENAMES — a different question — and cg has no
+// filename-search mode, so it belongs in the hint tier and the user's ag runs.
+test('classifyBlock: `ag -g` is a filename search, not a foldable content grep', () => {
+  assert.equal(classifyBlock('ag -g "some_symbol" src/'), null);
+  assert.equal(classifyBlock('ag -ig "some_symbol" src/'), null, 'inside a cluster too');
+  assert.notEqual(classifyBlock('ag "some_symbol" src/'), null, 'plain ag still folds');
+  assert.notEqual(classifyBlock(`rg -g '*.rs' "some_symbol" src/`), null, "rg's -g is a filter");
 });
 
 test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
@@ -1657,12 +1701,18 @@ test('e2e: compound `grep …; sed` → no deny, recorded as compound so the fun
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
     assert.equal(res.stdout.trim(), '', `expected no decision; got ${res.stdout}`);
-    const recs = fsE2e.readFileSync(
-      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
-    const rec = JSON.parse(recs.trim().split('\n').pop());
-    assert.equal(rec.action, 'observe');
-    assert.equal(rec.compound, true);
-    assert.equal(rec.pattern, uniq, 'the pattern still fingerprints the search for the funnel');
+    // Round 3: the GREP side records nothing. The `observe compound:true` row it
+    // used to write double-counted with post-grep-inject's own observe for the
+    // same Bash call, in a counter documented as the model's raw search fan-out.
+    // The PostToolUse rows are what make the compound route visible.
+    //
+    // Asserted on `hook:'grep'` rows specifically, not on the file: this command
+    // carries a `sed` range read, and the read-fanout tracker at the top of
+    // runMain writes its own `hook:'read'` row for that — pre-existing, and
+    // nothing to do with the compound decision.
+    const grepRows = readRecs(fixture).filter((r) => r.hook === 'grep');
+    assert.deepEqual(grepRows, [],
+      'the PreToolUse grep side must not write a row for a command it merely allows');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1689,10 +1739,8 @@ test('e2e: compound cmd + answer failure → grep ALLOWED, whole command runs in
     // the user (whole command intact), one fewer child process, and it no longer
     // depends on the binary happening to be broken.
     assert.equal(res.stdout.trim(), '');
-    const rec = JSON.parse(fsE2e.readFileSync(
-      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
-    assert.equal(rec.action, 'observe');
-    assert.equal(rec.compound, true);
+    assert.deepEqual(readRecs(fixture).filter((r) => r.hook === 'grep'), [],
+      'no PreToolUse grep row for an allowed compound — see the test above');
   } finally {
     cleanupFixture(fixture, cmd);
   }

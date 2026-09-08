@@ -425,6 +425,22 @@ test('e2e: the inject\'s show-mode fallback to grep also carries the flags', (t)
   }
 });
 
+test('e2e: the inject\'s -F guard is not fooled by `-F` in a VALUE position', (t) => {
+  const uniq = `InjFVal${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'grep') process.exit(1);\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `echo x && grep -rn --include -F "${uniq}\\|other_symbol" src/`;
+  try {
+    const ctx = JSON.parse(runHook(cmd, fixture, {}, undefined, '').stdout)
+      .hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`ARGV\\[grep -g -F ${uniq}\\|other_symbol src/\\]`),
+      `-F here is --include's value; the BRE unescape must still run: ${ctx}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: the inject honours -F — flag forwarded, pattern left literal', (t) => {
   const uniq = `InjLit${Date.now()}`;
   const fixture = e2eFixture(

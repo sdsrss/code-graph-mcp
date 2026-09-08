@@ -248,6 +248,7 @@ function classifyBlock(cmd) {
   // must not disqualify the answerable head grep).
   const clause = firstShellClause(cmd);
   if (UNANSWERABLE_FLAGS.test(clause)) return null;  // intent the answer can't honor
+  if (isAgFilenameSearch(clause)) return null;       // a filename search, not a content one
   if (MARKER_ONLY.test(clause)) return null;         // bare TODO/FIXME — no cg equivalent
   const patterns = extractPatterns(clause);
   if (patterns.length === 0) return null;         // unquoted pattern — conservative, hint
@@ -306,6 +307,28 @@ const CG_VALUE_FLAGS = {
 // argument.) grep has no short spelling for `--include`.
 const CG_VALUE_SHORT = { g: '-g', t: '-t' };
 const RG_VERB = /(?:^|\s)rg$/;
+const AG_VERB = /(?:^|\s)ag$/;
+
+/**
+ * `ag -g PATTERN` searches FILENAMES, not file contents.
+ *
+ * Round 2 gated the short `-g`/`-t` map on ripgrep so ag's spellings would stop
+ * being folded into cg arguments the user never wrote. Round 3 found what that
+ * left behind: with the fabricated argument gone, `ag -g some_symbol src/` is a
+ * plain answerable content grep as far as `classifyBlock` is concerned, so the
+ * hook now DENIES it and answers with matching LINES — a different question
+ * from the one asked. Before round 2 the fabricated `-g some_symbol` matched no
+ * file, the answer came back empty and the deny degraded to an allow; the bug
+ * was accidentally its own safety valve.
+ *
+ * cg has no filename-search mode, so this belongs in the hint tier with the
+ * other intents the answer cannot honor: the user's `ag` runs untouched.
+ */
+function isAgFilenameSearch(clause) {
+  if (typeof clause !== 'string') return false;
+  if (!AG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '')) return false;
+  return /(?:^|\s)-[a-zA-Z]*g[a-zA-Z]*(?:\s|$)/.test(clause.replace(VERB_STRIP, ''));
+}
 
 /**
  * The boolean flags in an `extractCgFlags` result, without the VALUES.
@@ -903,23 +926,17 @@ function runMain() {
 
   // classifyDeny, not classifyBlock: a command with a top-level `;`/`&&` tail is
   // never denied, because cancelling it would cancel the tail too. Those run and
-  // are answered by post-grep-inject instead.
+  // are answered by post-grep-inject instead — which is also where they are
+  // RECORDED.
   //
-  // The record is `observe` because that is the shape the Rust aggregator
-  // already scores; `compound: true` rides along for JSONL grep, and no counter
-  // reads it today (`usage.rs` folds every `observe` into one total). Two things
-  // that follow, so nobody reads more into it than it carries: this does NOT
-  // give the funnel a compound-route rate without a new counter, and a compound
-  // re-grep right after an answered deny now scores as `observe` rather than
-  // `sustained_after_answer`, which slightly flatters the deny cohort.
+  // Round 1 added an `observe compound:true` row here. Round 2 showed no counter
+  // reads the field, and round 3 showed the row double-counts: a head-grep
+  // compound whose grep hits writes this row AND post-grep-inject's redundancy
+  // observe, so one Bash call became two entries in a counter `usage.rs`
+  // documents as the model's raw search fan-out. The post-side rows carry
+  // strictly more (they say what happened to the answer), so this side stays
+  // silent — exactly as it did before the compound change.
   const block = isBlockDisabled() ? null : classifyDeny(cmd);
-  if (!block && !isBlockDisabled() && classifyBlock(cmd)) {
-    recordRecommendation(root, {
-      hook: 'grep', action: 'observe', compound: true,
-      ...(grepPattern ? { pattern: grepPattern } : {}),
-    });
-    return;
-  }
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the

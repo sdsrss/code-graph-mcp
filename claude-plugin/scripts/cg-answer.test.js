@@ -238,6 +238,17 @@ test('runGrepAnswer: flags reach argv in cg spelling, ahead of the pattern', () 
   assert.match(r.text, /args=\["grep","-i","-l","fts5_search","src\/"\]/);
 });
 
+// Round 3: `hasGlobFlag` was pinned by nothing — reverting it to a plain
+// `flags.includes('-g')` left every JS test green. The witness needs `-g` to
+// appear as a VALUE, which only happens for a value-carrying flag.
+test('buildGrepArgs: a `-g` sitting in a VALUE position does not suppress the path glob', () => {
+  // `rg -t -g "sym" src/*.rs` — here `-g` is the VALUE of `-t`, not a glob flag.
+  assert.deepEqual(
+    buildGrepArgs({ pattern: 'sym', searchPath: 'src/*.rs', flags: ['-t', '-g'] }),
+    ['grep', '-t', '-g', 'sym', 'src', '-g', '*.rs'],
+    'the path-derived glob must survive a value that merely spells -g');
+});
+
 test('buildGrepArgs: an --include-derived -g wins over one derived from the path', () => {
   // Both spell the same filter and cg takes one; the explicit `--include` is the
   // one the user typed, so a path glob must not append a second -g beside it.

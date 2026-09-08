@@ -296,31 +296,39 @@ function runMain() {
   // excludes it from the recommendation total. `reason` distinguishes this skip
   // from the cooldown observes when grepping the JSONL; no counter reads it.
   //
-  // KNOWN CONSEQUENCE, measured rather than reasoned. The funnel scores only the
-  // IMMEDIATELY-next event after an answered deny, so making a previously-
-  // invisible grep visible moves that window onto it. On a three-line log
-  // (answered deny → this record → unanswered deny) `stats --json` reports
-  // total 2, observe 1, researched_after_answer 1, fallthrough_after_answer 0;
-  // without the middle line, fallthrough_after_answer is 1 and the rate is 1.0.
-  // That is the existing rule applied to an event that genuinely happened — the
-  // model DID run a search — not a new distortion, but it does mean
-  // `fallthrough_rate` is not comparable across this version boundary for
-  // sequences containing a compound grep. For a head-grep compound the arm was
-  // already being consumed by pre-grep-guide's own `observe`; the newly-affected
-  // shape is `echo x && grep …`, which recorded nothing before.
-  if (grepFoundPattern(extractGrepOutput(input), rawPattern)) {
-    recordRecommendation(root, {
-      hook: 'grep', action: 'observe', reason: 'grep-hit-redundant',
-      ...(rawPattern ? { pattern: rawPattern } : {}),
-    });
-    return;
-  }
+  // KNOWN CONSEQUENCE, measured rather than reasoned — and round 3 corrected
+  // round 2's version of this paragraph, which described the wrong branch. The
+  // funnel scores only the IMMEDIATELY-next event after an answered deny, and
+  // `usage.rs` tests SAME-PATTERN first. So on the shape this record actually
+  // measures — a re-grep of the denied pattern — the outcome is unchanged
+  // (`fallthrough_after_answer` 1, rate 1.0, because a verbatim re-grep is
+  // fall-through whether it is spelled as this observe or as the deny that used
+  // to follow it). Only when the compound grep searches a DIFFERENT pattern does
+  // the window move onto it: there the rate goes 1.0 → 0.0, since a different
+  // query is not evidence the answer failed. `total` is unaffected either way
+  // (`observe` is excluded). Measured on the built binary, both branches.
   const flags = extractCgFlags(segment);
   // `-F` means the user asked for a LITERAL pattern, so the BRE→rust-regex
   // unescape must not also run: `grep -F 'x\|y'` searches for `x\|y`, and
   // unescaping it to `x|y` searches for something else (verified against GNU
   // grep: `grep -Fc 'x\|y'` is 1 and `grep -Fc 'x|y'` is 0 on the same file).
   const pattern = cgFlagSet(flags).has('-F') ? rawPattern : translateBreToRg(segment, rawPattern);
+  // The redundancy gate matches against the model's OWN grep output, which
+  // carries the pattern as the user wrote it → `rawPattern`. The RECORD carries
+  // the translated `pattern`, because that is the vocabulary every sibling
+  // record uses (pre-grep-guide's deny and observe, this file's two injects) and
+  // the funnel compares those strings for equality. Round 2 recorded the raw
+  // form: a deny of `"fn foo\|fn bar"` files `fn foo|fn bar` while the follow-up
+  // filed `fn foo\|fn bar`, so a verbatim re-grep scored neutral instead of
+  // fall-through. Round 1's record never reached that comparison at all (wrong
+  // hook name), so promoting it in is what exposed the mismatch.
+  if (grepFoundPattern(extractGrepOutput(input), rawPattern)) {
+    recordRecommendation(root, {
+      hook: 'grep', action: 'observe', reason: 'grep-hit-redundant',
+      ...(pattern ? { pattern } : {}),
+    });
+    return;
+  }
   // RAW path, not `sanitizeSearchPath`: buildGrepArgs splits `tests/*.mjs` into
   // scope + `-g`. The deny path got that in this release and this one did not,
   // while the same release routed MORE traffic here — so `grep -rln "X"

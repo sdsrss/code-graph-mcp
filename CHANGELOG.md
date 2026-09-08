@@ -67,11 +67,18 @@ rather than asserted. A compound grep that MISSES still gets the answer, and
 
 **If you read `code-graph-mcp stats`:** that new record makes a grep visible to
 the funnel that used to leave no trace, and the funnel scores only the
-immediately-next event after an answered deny. So a sequence of answered deny →
-compound grep → follow-up now attributes the window to the compound grep
-(`observe`) instead of the follow-up, and `fallthrough_rate` is not comparable
-across this boundary for those sequences. Measured on a three-line log: rate 1.0
-before, 0.0 after; `total` is unaffected because `observe` is excluded from it.
+immediately-next event after an answered deny. Measured on three-line logs
+(answered deny → compound grep → follow-up), `total` is unaffected in every case
+because `observe` is excluded from it, and the follow-up rate depends on what
+the compound grep searched for:
+
+- it re-greps the pattern that was denied → `fallthrough_rate` stays 1.0. A
+  verbatim re-search is fall-through however it is spelled.
+- it searches something else → the window moves onto it and the rate goes to
+  0.0, because a different query is not evidence the answer failed.
+
+So the rate is comparable across this boundary for the first case and not for
+the second.
 
 One case is unchanged and still discards something: `grep … | wc -l` is denied
 whole, and the answer is hits rather than a count. Pipes were never flagged as
