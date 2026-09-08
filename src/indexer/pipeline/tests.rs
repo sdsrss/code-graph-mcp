@@ -629,7 +629,11 @@ fn test_prune_keeps_edge_when_caller_content_truncated() {
     insert_edge(conn, run_ok, save_b, REL_IMPORTS, None).unwrap();
     insert_edge(conn, run_ok, save_a, REL_CALLS, None).unwrap();
 
-    let removed = super::resolve::prune_import_contradicted_call_edges(&db).unwrap();
+    let removed = super::resolve::prune_import_contradicted_call_edges(
+        &db,
+        &super::resolve::PostPassScope::Global,
+    )
+    .unwrap();
 
     let edge_exists = |src: i64, tgt: i64| -> bool {
         conn.query_row(
@@ -4692,5 +4696,154 @@ fn test_query_time_refresh_preserves_an_interrupted_run_marker() {
         run_marker(&db).as_deref(),
         Some("1"),
         "a single-file query-time refresh must leave the interrupted-run marker standing"
+    );
+}
+
+/// Like `graph_projection`, but carries `confidence`.
+///
+/// The existing projection deliberately stops at (path, name, relation, target,
+/// metadata), so every incremental-converges-to-rebuild test in this file is
+/// blind to a confidence divergence — the one thing Phase 2e writes. The scoped
+/// post-passes are exactly the code that could produce one, so they get a
+/// projection that can see it.
+fn graph_projection_with_confidence(db: &Database) -> Vec<(String, String, String, String)> {
+    let mut edges: Vec<(String, String, String, String)> = db
+        .conn()
+        .prepare(
+            "SELECT sf.path || ':' || sn.name, e.relation, tf.path || ':' || tn.name,
+                    COALESCE(e.confidence, '<null>')
+             FROM edges e
+             JOIN nodes sn ON sn.id = e.source_id
+             JOIN files sf ON sf.id = sn.file_id
+             JOIN nodes tn ON tn.id = e.target_id
+             JOIN files tf ON tf.id = tn.file_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    edges.sort();
+    edges
+}
+
+#[test]
+fn a_third_file_reclassifies_an_edge_between_two_files_it_never_touched() {
+    // The completeness case for `PostPassScope::Files`, and the only one the
+    // file arms cannot reach.
+    //
+    // `b.py` calls `helper()` bare and `a.py` defines it — one definition, so
+    // Phase 2e labels that cross-file edge `inferred`. Adding a SECOND `helper`
+    // in `c.py` makes the name ambiguous, and the edge that has to be relabelled
+    // runs between two files this run did not open. Only the name arm — the
+    // names whose node count moved — can see it.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let before = graph_projection_with_confidence(&db);
+    let edge_of = |rows: &[(String, String, String, String)]| -> Option<String> {
+        rows.iter()
+            .find(|(s, r, t, _)| s == "src/b.py:caller" && r == REL_CALLS && t == "src/a.py:helper")
+            .map(|(_, _, _, c)| c.clone())
+    };
+    assert_eq!(
+        edge_of(&before).as_deref(),
+        Some("inferred"),
+        "precondition: one definition of `helper`, so the cross-file call is inferred, not ambiguous: {before:?}"
+    );
+
+    // The only file this run sees is c.py. a.py and b.py are byte-identical.
+    fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+    assert_eq!(
+        edge_of(&inc).as_deref(),
+        Some("ambiguous"),
+        "a second `helper` appeared, so the untouched b.py -> a.py edge must be reclassified: {inc:?}"
+    );
+    // Compared on the edges the incremental index HOLDS, not on the whole set.
+    //
+    // A rebuild of this tree also carries `b.py:caller -> c.py:helper`: a bare
+    // call fans out to every same-name candidate, and the incremental run never
+    // re-resolves b.py because b.py did not change. That divergence is older
+    // than this scope and independent of it — forcing `PostPassScope::Global`
+    // reproduces it unchanged — so it is not this test's subject. Asserting the
+    // full set here would pin a known-wrong incremental shape as expected.
+    for row in &inc {
+        let (s, r, t, c) = row;
+        let same = full
+            .iter()
+            .find(|(fs_, fr, ft, _)| fs_ == s && fr == r && ft == t);
+        assert!(
+            same.is_some(),
+            "incremental produced an edge the rebuild does not have: {row:?}"
+        );
+        assert_eq!(
+            &same.unwrap().3,
+            c,
+            "same edge, different confidence than a rebuild: {row:?} vs {:?}",
+            same.unwrap()
+        );
+    }
+}
+
+#[test]
+fn deleting_the_duplicate_puts_the_untouched_edge_back() {
+    // The other direction, and the reason the name scope is a symmetric
+    // difference rather than "names this run inserted": removing the second
+    // definition has to move the same untouched edge back to `inferred`. A scope
+    // built only from what a run ADDS would leave it permanently `ambiguous`,
+    // which the confidence floor then hides from callgraph/impact.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+    fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let start = graph_projection_with_confidence(&db);
+    assert!(
+        start.iter().any(|(s, r, t, c)| s == "src/b.py:caller"
+            && r == REL_CALLS
+            && t == "src/a.py:helper"
+            && c == "ambiguous"),
+        "precondition: two definitions, so the call is ambiguous: {start:?}"
+    );
+
+    fs::remove_file(src.join("c.py")).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+    assert!(
+        inc.iter().any(|(s, r, t, c)| s == "src/b.py:caller"
+            && r == REL_CALLS
+            && t == "src/a.py:helper"
+            && c == "inferred"),
+        "the duplicate is gone, so the untouched edge must go back to inferred: {inc:?}"
+    );
+    assert_eq!(
+        inc, full,
+        "an incrementally grown index must carry the same confidences as a rebuild of the same tree"
     );
 }

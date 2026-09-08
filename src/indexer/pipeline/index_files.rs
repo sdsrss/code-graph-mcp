@@ -91,6 +91,16 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// falls below it and a real indexing run does not.
 const STATS_REFRESH_MIN_FILES: usize = 50;
 
+/// Above this many files in one run, the post-passes stop trying to bound
+/// themselves and just go global.
+///
+/// The scope costs two restricted `GROUP BY`s and a temp table; it pays for
+/// itself when the run touches a handful of files, which is every query-time
+/// refresh and every file-watcher flush. It stops paying when the changed set
+/// approaches the graph — and a full index MUST be `Global` regardless, since it
+/// is the base case every later incremental run's completeness argument assumes.
+const SCOPED_POST_PASS_MAX_FILES: usize = 64;
+
 // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
 struct FilePreParsed {
     rel_path: String,
@@ -1884,6 +1894,35 @@ pub(super) fn index_files(
     // cross-file edges were durably committed, and a wrongly-cheap answer here
     // is the silent edge-loss class this marker exists to close. The escalated
     // run clears the marker, so the cost is one full pass, not a loop.
+    // How much of the graph the three global post-passes will have to
+    // reconsider at the end of this run. Decided HERE, before Phase 0 touches
+    // anything, because the `Files` scope needs a same-name node count taken
+    // while the graph is still in its pre-run state.
+    //
+    // A big run does not bother: past ~a batch of files the scope stops bounding
+    // anything, and a full index must run `Global` anyway — it is the base case
+    // the incremental induction rests on (see `PostPassScope`).
+    let post_pass_scope = if files.len() + delete_paths.len() > SCOPED_POST_PASS_MAX_FILES {
+        super::resolve::PostPassScope::Global
+    } else {
+        let conn = db.conn();
+        super::resolve::drop_scope_temps(conn)?;
+        conn.execute_batch("CREATE TEMP TABLE cg_scope_paths (path TEXT PRIMARY KEY);")?;
+        {
+            let mut stmt =
+                conn.prepare("INSERT OR IGNORE INTO cg_scope_paths (path) VALUES (?1)")?;
+            for p in files.iter().chain(delete_paths.iter()) {
+                stmt.execute([p])?;
+            }
+            // The `<external>` pseudo-file earns its place: sentinels are minted
+            // and reaped mid-run, and each one moves the count for a name that
+            // real edges in unchanged files point at.
+            stmt.execute([crate::domain::EXTERNAL_FILE_PATH])?;
+        }
+        super::resolve::snapshot_scope_name_counts(conn)?;
+        super::resolve::PostPassScope::Files
+    };
+
     let has_work = !files.is_empty() || !delete_paths.is_empty();
     if has_work {
         crate::storage::queries::set_meta(
@@ -2233,7 +2272,19 @@ pub(super) fn index_files(
         if all_indexed.len() + delete_paths.len() >= STATS_REFRESH_MIN_FILES {
             db.refresh_query_stats();
         }
-        let post = run_global_edge_post_passes(db)?;
+        // Finish the scope now that the run's writes are done: file ids are
+        // current, and the name-count drift is measurable against the snapshot
+        // taken before Phase 0.
+        if !matches!(post_pass_scope, super::resolve::PostPassScope::Global) {
+            super::resolve::build_scope_files(db.conn())?;
+            let names = super::resolve::scope_names_from_count_drift(db.conn())?;
+            tracing::debug!(
+                "[index] post-pass scope: {} file(s), {} name(s) whose node count moved",
+                all_indexed.len() + delete_paths.len(),
+                names
+            );
+        }
+        let post = run_global_edge_post_passes(db, &post_pass_scope)?;
         total_edges_created += post.bound;
         total_edges_created = total_edges_created.saturating_sub(post.pruned);
     }
@@ -2261,6 +2312,13 @@ pub(super) fn index_files(
         finalize_tick();
         let _ = db.run_optimize();
     }
+
+    // The scope's temp tables live on a connection the MCP server keeps for the
+    // whole session, so they are dropped here rather than left for the next run
+    // to overwrite. The next run drops them again on entry anyway: this one can
+    // return early on `?`, and a stale `cg_scope_paths` would silently scope the
+    // NEXT run to the previous one's files.
+    super::resolve::drop_scope_temps(db.conn())?;
 
     let stats = IndexStats {
         files_skipped_size: counters.size.load(AtomicOrdering::Relaxed),
@@ -3262,7 +3320,10 @@ struct GlobalPostPassCounts {
 ///
 /// The caller decides WHETHER to run them (they are a guaranteed no-op when the
 /// batch changed nothing); this decides what they do.
-fn run_global_edge_post_passes(db: &Database) -> Result<GlobalPostPassCounts> {
+fn run_global_edge_post_passes(
+    db: &Database,
+    scope: &super::resolve::PostPassScope,
+) -> Result<GlobalPostPassCounts> {
     // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
     // import in the caller's file binds them to. `refine_ambiguous_targets`
     // picks the path-closest same-name node, which can be the wrong file when
@@ -3270,7 +3331,7 @@ fn run_global_edge_post_passes(db: &Database) -> Result<GlobalPostPassCounts> {
     // by the prune below, so without this bind the call would be left with no
     // edge at all. Insert the import-bound edge first, then let the prune remove
     // the contradicted proximity edge — together they repoint the call.
-    let bound = bind_calls_to_imported_targets(db)?;
+    let bound = bind_calls_to_imported_targets(db, scope)?;
     if bound > 0 {
         tracing::info!(
             "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
@@ -3284,7 +3345,7 @@ fn run_global_edge_post_passes(db: &Database) -> Result<GlobalPostPassCounts> {
     // so a bare `save()` in a file that does `from db import save` must bind to
     // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
     // caller. Removes those false positives without touching the correct edge.
-    let pruned = prune_import_contradicted_call_edges(db)?;
+    let pruned = prune_import_contradicted_call_edges(db, scope)?;
     if pruned > 0 {
         tracing::info!(
             "[index] Phase 2d: pruned {} import-contradicted call edges",
@@ -3296,7 +3357,7 @@ fn run_global_edge_post_passes(db: &Database) -> Result<GlobalPostPassCounts> {
     // `calls`/`references` edges to inferred/ambiguous; every precise edge keeps
     // the column default `extracted`. Purely additive metadata — no edge
     // added or removed.
-    let downgraded = classify_edge_confidence(db)?;
+    let downgraded = classify_edge_confidence(db, scope)?;
     if downgraded > 0 {
         tracing::info!(
             "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",

@@ -405,7 +405,150 @@ fn drop_imports_temp(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
+/// Which slice of the graph the three global post-passes have to reconsider.
+///
+/// They are set-based passes over EVERY cross-file `calls`/`references` edge, and
+/// they run on every indexing run — including the one-file refresh a read command
+/// triggers when it notices a stale file. Measured on django/django (3,453 files,
+/// 48,084 nodes, 262,463 edges) with a single file edited and `show` as the next
+/// command: `run_global_edge_post_passes` took 674 ms of that command's 1,054 ms
+/// (2d-bind 177, 2d-prune 207, 2e-confidence 290), while the whole-graph name map
+/// audit item CORE-06 blamed cost 50 ms. The scan is what costs, not the writes:
+/// suppressing no-op UPDATEs saved 65 ms of the 290.
+///
+/// `Files` bounds that scan. It is NOT an approximation — see the completeness
+/// argument on [`PostPassScope::Files`].
+pub(super) enum PostPassScope {
+    /// Reconsider every edge. A full index, a large batch, or any run whose
+    /// effect we cannot bound. Also the base case the `Files` induction rests on.
+    Global,
+    /// Reconsider only edges that touch `temp.cg_scope_files` on either side, or
+    /// whose TARGET NAME is in `temp.cg_scope_names`.
+    ///
+    /// Completeness, per pass — each reads only these inputs:
+    ///
+    /// * 2d-bind and 2d-prune read the caller file's own nodes and import edges
+    ///   plus the target node's name and id. All of those change only when the
+    ///   caller's file or the target's file was re-indexed this run, so the two
+    ///   file arms cover them. An edge inserted mid-run by the pending sweep or
+    ///   the deferred pass has its target in a file this run indexed (that is why
+    ///   it resolved), or its source there (that is why it was re-extracted).
+    /// * 2e-confidence additionally reads `COUNT(*)` of same-name, same-language
+    ///   nodes — a GLOBAL input. A node appearing or vanishing anywhere flips the
+    ///   confidence of edges between two files that did not change, so the name
+    ///   arm carries exactly the names whose count moved. That set is DERIVED by
+    ///   counting before and after (see `scope_names_from_count_drift`) rather
+    ///   than accumulated as the run goes: this pipeline's bookkeeping has twice
+    ///   cost real edges (INDEX_VERSION v58, v61), and a count diff cannot miss a
+    ///   channel the way a hand-maintained list can — `<external>` sentinels
+    ///   minted or reaped mid-run land in it for free.
+    ///
+    /// The induction: a full index runs `Global`, so the graph starts consistent;
+    /// every incremental run then repairs exactly what it disturbed.
+    Files,
+}
+
+impl PostPassScope {
+    /// The join-order barrier that makes a scope actually bound the work.
+    ///
+    /// SQLite will not drive from a temp table it has no statistics for: with a
+    /// plain `JOIN` the planner opened `idx_edges_relation` and scanned all
+    /// 171,981 `calls` edges, then used the scope as a bloom filter — 122 ms even
+    /// when the scope was EMPTY. `CROSS JOIN` fixes the order, the plan becomes
+    /// `SCAN cg_scope_files` → `idx_nodes_file` → `idx_edges_source_rel`, and the
+    /// same statement takes 1.5 ms. Every arm below therefore spells its joins
+    /// `CROSS JOIN`, in scope-first order, deliberately.
+    fn is_global(&self) -> bool {
+        matches!(self, PostPassScope::Global)
+    }
+}
+
+/// Snapshot same-name/same-language node counts for the paths a run is about to
+/// touch. Call before the run mutates anything; pair with
+/// [`scope_names_from_count_drift`] after.
+///
+/// Restricted to `temp.cg_scope_paths` (this run's files, its deletions, and
+/// `<external>`) because nodes outside those files are not reachable by anything
+/// the run does — so their counts cannot move, and counting all 48,084 of them
+/// would spend the 29 ms this is meant to save.
+pub(super) fn snapshot_scope_name_counts(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_namecount_before;
+         CREATE TEMP TABLE cg_namecount_before AS
+           SELECT n.name AS nm, COUNT(*) AS cnt
+           FROM nodes n
+           JOIN files f ON f.id = n.file_id
+           JOIN cg_scope_paths p ON p.path = f.path
+           GROUP BY n.name;
+         CREATE INDEX cg_namecount_before_k ON cg_namecount_before(nm);",
+    )?;
+    Ok(())
+}
+
+/// Build `temp.cg_scope_names` — the names whose node count actually moved.
+///
+/// A name is in the set when its count differs between the snapshot and now, in
+/// EITHER direction: a name that vanished (its file was deleted, or the symbol
+/// was renamed away) drops other files' edges from `ambiguous` back to
+/// `inferred`, which is as much a change as gaining one.
+pub(super) fn scope_names_from_count_drift(conn: &rusqlite::Connection) -> Result<usize> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_namecount_after;
+         CREATE TEMP TABLE cg_namecount_after AS
+           SELECT n.name AS nm, COUNT(*) AS cnt
+           FROM nodes n
+           JOIN files f ON f.id = n.file_id
+           JOIN cg_scope_paths p ON p.path = f.path
+           GROUP BY n.name;
+         CREATE INDEX cg_namecount_after_k ON cg_namecount_after(nm);
+         DROP TABLE IF EXISTS temp.cg_scope_names;
+         CREATE TEMP TABLE cg_scope_names AS
+           SELECT b.nm AS nm FROM cg_namecount_before b
+             LEFT JOIN cg_namecount_after a ON a.nm = b.nm
+             WHERE a.cnt IS NOT b.cnt
+           UNION
+           SELECT a.nm AS nm FROM cg_namecount_after a
+             LEFT JOIN cg_namecount_before b ON b.nm = a.nm
+             WHERE b.cnt IS NOT a.cnt;
+         CREATE INDEX cg_scope_names_k ON cg_scope_names(nm);
+         DROP TABLE IF EXISTS temp.cg_namecount_before;
+         DROP TABLE IF EXISTS temp.cg_namecount_after;",
+    )?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM cg_scope_names", [], |r| r.get(0))?;
+    Ok(n as usize)
+}
+
+/// Resolve `temp.cg_scope_paths` to the file ids those paths hold NOW.
+///
+/// After the run, not before: re-indexing a file can hand it a new row, and a
+/// deleted path has no row at all — which is correct, since its nodes are gone
+/// and the edges that pointed into them come back through the name arm.
+pub(super) fn build_scope_files(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_scope_files;
+         CREATE TEMP TABLE cg_scope_files AS
+           SELECT f.id AS fid FROM files f JOIN cg_scope_paths p ON p.path = f.path;
+         CREATE INDEX cg_scope_files_k ON cg_scope_files(fid);",
+    )?;
+    Ok(())
+}
+
+/// Drop everything the scope machinery created.
+pub(super) fn drop_scope_temps(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_scope_paths;
+         DROP TABLE IF EXISTS temp.cg_scope_files;
+         DROP TABLE IF EXISTS temp.cg_scope_names;
+         DROP TABLE IF EXISTS temp.cg_namecount_before;
+         DROP TABLE IF EXISTS temp.cg_namecount_after;",
+    )?;
+    Ok(())
+}
+
+pub(super) fn bind_calls_to_imported_targets(
+    db: &Database,
+    scope: &PostPassScope,
+) -> Result<usize> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
 
     // Bind in ONE set-based statement. This used to SELECT the pairs and then
@@ -448,8 +591,20 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
     conn.execute_batch(
         "CREATE INDEX cg_unique_imports_k ON cg_unique_imports(import_file, import_name);",
     )?;
-    let inserted = {
-        let mut stmt = conn.prepare(
+    // The predicate is one string, spent by both drivers, because the two must
+    // agree by construction — a scoped copy that drifted from the global one is
+    // the "two surfaces, one question, two answers" shape this codebase keeps
+    // paying for. Only the FROM clause ahead of it changes.
+    const BIND_PREDICATE: &str = "
+             WHERE e.relation = ?1
+               AND (e.metadata IS NULL OR e.metadata = '')
+               AND e.source_id <> it.import_target_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM nodes ln
+                   WHERE ln.file_id = sn.file_id AND ln.name = tn.name
+               )";
+    let sql = if scope.is_global() {
+        format!(
             "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
              SELECT DISTINCT e.source_id, it.import_target_id, ?2, NULL
              FROM edges e
@@ -458,14 +613,38 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
              JOIN cg_unique_imports it
                ON it.import_file = sn.file_id
               AND it.import_name = tn.name
-             WHERE e.relation = ?1
-               AND (e.metadata IS NULL OR e.metadata = '')
-               AND e.source_id <> it.import_target_id
-               AND NOT EXISTS (
-                   SELECT 1 FROM nodes ln
-                   WHERE ln.file_id = sn.file_id AND ln.name = tn.name
-               )",
-        )?;
+             {BIND_PREDICATE}"
+        )
+    } else {
+        // Two arms: the caller moved, or the callee moved. CROSS JOIN order is
+        // load-bearing (see PostPassScope::is_global).
+        format!(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+             SELECT DISTINCT src_id, tgt_id, ?2, NULL FROM (
+               SELECT e.source_id AS src_id, it.import_target_id AS tgt_id
+               FROM cg_scope_files s
+               CROSS JOIN nodes sn ON sn.file_id = s.fid
+               CROSS JOIN edges e ON e.source_id = sn.id
+               CROSS JOIN nodes tn ON tn.id = e.target_id
+               CROSS JOIN cg_unique_imports it
+                 ON it.import_file = sn.file_id
+                AND it.import_name = tn.name
+               {BIND_PREDICATE}
+               UNION
+               SELECT e.source_id AS src_id, it.import_target_id AS tgt_id
+               FROM cg_scope_files s
+               CROSS JOIN nodes tn ON tn.file_id = s.fid
+               CROSS JOIN edges e ON e.target_id = tn.id
+               CROSS JOIN nodes sn ON sn.id = e.source_id
+               CROSS JOIN cg_unique_imports it
+                 ON it.import_file = sn.file_id
+                AND it.import_name = tn.name
+               {BIND_PREDICATE}
+             )"
+        )
+    };
+    let inserted = {
+        let mut stmt = conn.prepare(&sql)?;
         stmt.execute(rusqlite::params![REL_CALLS, REL_CALLS])?
     };
     conn.execute_batch("DROP TABLE IF EXISTS temp.cg_unique_imports;")?;
@@ -499,15 +678,14 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
 ///   to a DIFFERENT node AND does not import this target.
 ///
 /// Returns the number of edges removed.
-pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usize> {
+pub(super) fn prune_import_contradicted_call_edges(
+    db: &Database,
+    scope: &PostPassScope,
+) -> Result<usize> {
     use crate::domain::REL_CALLS;
     let conn = db.conn();
     build_imports_temp(conn, true)?;
-    let removed = conn.execute(
-        "DELETE FROM edges WHERE id IN (
-            SELECT e.id FROM edges e
-            JOIN nodes sn ON sn.id = e.source_id
-            JOIN nodes tn ON tn.id = e.target_id
+    const PRUNE_PREDICATE: &str = "
             WHERE e.relation = ?1
               AND (e.metadata IS NULL OR e.metadata = '')
               AND tn.file_id <> sn.file_id
@@ -539,10 +717,36 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
                   SELECT 1 FROM cg_imports i2
                   WHERE i2.fid = sn.file_id
                     AND i2.tid = e.target_id
-              )
-        )",
-        rusqlite::params![REL_CALLS],
-    )?;
+              )";
+    let sql = if scope.is_global() {
+        format!(
+            "DELETE FROM edges WHERE id IN (
+            SELECT e.id FROM edges e
+            JOIN nodes sn ON sn.id = e.source_id
+            JOIN nodes tn ON tn.id = e.target_id
+            {PRUNE_PREDICATE}
+        )"
+        )
+    } else {
+        format!(
+            "DELETE FROM edges WHERE id IN (
+            SELECT e.id
+            FROM cg_scope_files s
+            CROSS JOIN nodes sn ON sn.file_id = s.fid
+            CROSS JOIN edges e ON e.source_id = sn.id
+            CROSS JOIN nodes tn ON tn.id = e.target_id
+            {PRUNE_PREDICATE}
+            UNION
+            SELECT e.id
+            FROM cg_scope_files s
+            CROSS JOIN nodes tn ON tn.file_id = s.fid
+            CROSS JOIN edges e ON e.target_id = tn.id
+            CROSS JOIN nodes sn ON sn.id = e.source_id
+            {PRUNE_PREDICATE}
+        )"
+        )
+    };
+    let removed = conn.execute(&sql, rusqlite::params![REL_CALLS])?;
     drop_imports_temp(conn)?;
     Ok(removed)
 }
@@ -564,7 +768,7 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
 /// Idempotent: re-running recomputes from current node state, so an `inferred`
 /// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
 /// back when it is removed). Returns the number of edges downgraded.
-pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
+pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> Result<usize> {
     use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES};
     let conn = db.conn();
     build_imports_temp(conn, false)?;
@@ -579,10 +783,14 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
            GROUP BY n.name, f.language;
          CREATE INDEX cg_namecount_k ON cg_namecount(nm, lang);",
     )?;
-    let downgraded = conn.execute(
-        "UPDATE edges
-         SET confidence = CASE
-                 WHEN namecount.cnt > 1
+    // The classification itself — one expression, spent by every driver below.
+    // `nc` is the same-name/same-language count; `e`, `src`, `tgt` are the edge
+    // and its two endpoints. Kept as one constant because a scoped copy that
+    // drifted from the global one would label the same edge two ways depending
+    // on how the index happened to be grown, which is the incremental-vs-rebuild
+    // divergence class this pipeline has paid for twice already.
+    const CONF_CASE: &str = "CASE
+                 WHEN nc.cnt > 1
                       -- ... UNLESS the caller's file explicitly imports THIS exact
                       -- target. An import binds the bare name to one node, so the
                       -- edge is import-resolved (v0.59 bind_calls_to_imported_targets),
@@ -606,19 +814,76 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
                       -- `chain` / `recv` are NOT exempt: they resolve by method
                       -- uniqueness or fall back to bare, so a duplicate name there is
                       -- genuinely ambiguous. NULL metadata (bare) also stays eligible.
-                      AND (json_extract(edges.metadata, '$.q') IS NULL
-                           OR json_extract(edges.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
-                 THEN ?3 ELSE ?4 END
-         FROM nodes AS src, nodes AS tgt, files AS tf, cg_namecount AS namecount
-         WHERE edges.source_id = src.id
-           AND edges.target_id = tgt.id
-           AND tf.id = tgt.file_id
-           AND src.file_id <> tgt.file_id
-           AND edges.relation IN (?1, ?2)
-           AND namecount.nm = tgt.name
-           AND namecount.lang IS tf.language",
+                      AND (json_extract(e.metadata, '$.q') IS NULL
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
+                 THEN ?3 ELSE ?4 END";
+    const CONF_WHERE: &str = "
+             WHERE e.relation IN (?1, ?2)
+               AND src.file_id <> tgt.file_id";
+    // Which edges to reconsider. The scoped form is three arms — the caller
+    // moved, the callee moved, or the callee's NAME changed how many nodes
+    // share it. Only the third needs `cg_scope_names`, and only this pass has
+    // a globally-varying input that makes it necessary.
+    let driver = if scope.is_global() {
+        format!(
+            "SELECT e.id AS eid, {CONF_CASE} AS conf
+             FROM edges e
+             JOIN nodes src ON src.id = e.source_id
+             JOIN nodes tgt ON tgt.id = e.target_id
+             JOIN files tf ON tf.id = tgt.file_id
+             JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
+             {CONF_WHERE}"
+        )
+    } else {
+        format!(
+            "SELECT eid, conf FROM (
+               SELECT e.id AS eid, {CONF_CASE} AS conf
+               FROM cg_scope_files s
+               CROSS JOIN nodes src ON src.file_id = s.fid
+               CROSS JOIN edges e ON e.source_id = src.id
+               CROSS JOIN nodes tgt ON tgt.id = e.target_id
+               CROSS JOIN files tf ON tf.id = tgt.file_id
+               CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
+               {CONF_WHERE}
+               UNION
+               SELECT e.id AS eid, {CONF_CASE} AS conf
+               FROM cg_scope_files s
+               CROSS JOIN nodes tgt ON tgt.file_id = s.fid
+               CROSS JOIN edges e ON e.target_id = tgt.id
+               CROSS JOIN nodes src ON src.id = e.source_id
+               CROSS JOIN files tf ON tf.id = tgt.file_id
+               CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
+               {CONF_WHERE}
+               UNION
+               SELECT e.id AS eid, {CONF_CASE} AS conf
+               FROM cg_scope_names sname
+               CROSS JOIN nodes tgt ON tgt.name = sname.nm
+               CROSS JOIN edges e ON e.target_id = tgt.id
+               CROSS JOIN nodes src ON src.id = e.source_id
+               CROSS JOIN files tf ON tf.id = tgt.file_id
+               CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
+               {CONF_WHERE}
+             )"
+        )
+    };
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_conf;")?;
+    conn.execute_batch("CREATE TEMP TABLE cg_conf (eid INTEGER PRIMARY KEY, conf TEXT);")?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO cg_conf (eid, conf) {driver}"),
         rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED],
     )?;
+    // Write only where the label actually moves. The join above is what costs;
+    // suppressing the no-op writes is worth 65 ms of 290 on the django corpus,
+    // and it makes the returned count mean "edges whose confidence CHANGED"
+    // rather than "edges the pass looked at" — the number the log line claims.
+    let downgraded = conn.execute(
+        "UPDATE edges
+            SET confidence = (SELECT c.conf FROM cg_conf c WHERE c.eid = edges.id)
+          WHERE id IN (SELECT eid FROM cg_conf)
+            AND confidence IS NOT (SELECT c.conf FROM cg_conf c WHERE c.eid = edges.id)",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_conf;")?;
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_namecount;
          DROP TABLE IF EXISTS temp.cg_imports;",
@@ -1232,7 +1497,7 @@ mod tests {
                 // The bare call currently points at the WRONG same-name node.
                 insert_edge(conn, run, decoy_helper, REL_CALLS, None).unwrap();
 
-                let inserted = bind_calls_to_imported_targets(&db).unwrap();
+                let inserted = bind_calls_to_imported_targets(&db, &PostPassScope::Global).unwrap();
 
                 let mut stmt = conn
                     .prepare(
@@ -1393,7 +1658,7 @@ mod tests {
             let j = insert_node(conn, &node("J", f2)).unwrap();
             insert_edge(conn, i, j, REL_REFERENCES, None).unwrap();
 
-            let downgraded = classify_edge_confidence(&db).unwrap();
+            let downgraded = classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(
                 downgraded, 3,
                 "3 cross-file calls/refs edges downgraded (C->D, E->F, I->J)"
@@ -1452,7 +1717,7 @@ mod tests {
             let mod_main = insert_node(conn, &node("<module>", f_main)).unwrap();
             insert_edge(conn, mod_main, proc_helpers, REL_IMPORTS, None).unwrap();
 
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(
                 conf_of(conn, run, proc_helpers, REL_CALLS), "inferred",
                 "import-corroborated call to a duplicate-named target must be inferred, not ambiguous",
@@ -1468,7 +1733,7 @@ mod tests {
                 )
                 .unwrap();
             insert_edge(conn, caller2, proc_other, REL_CALLS, None).unwrap();
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(
                 conf_of(conn, caller2, proc_other, REL_CALLS),
                 "ambiguous",
@@ -1510,7 +1775,7 @@ mod tests {
             let g = insert_node(conn, &node("G", f1)).unwrap();
             insert_edge(conn, g, v_target, REL_CALLS, None).unwrap();
 
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(conf_of(conn, e, v_target, REL_CALLS), "inferred",
                 "a stype-qualifier-resolved edge to a duplicate-named target must stay inferred, not ambiguous");
             assert_eq!(
@@ -1533,7 +1798,7 @@ mod tests {
             let t = insert_node(conn, &node("foo", f2)).unwrap();
             insert_node(conn, &node("foo", f3)).unwrap();
             insert_edge(conn, e, t, REL_CALLS, Some(r#"{"q":"path","v":"b"}"#)).unwrap();
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(
                 conf_of(conn, e, t, REL_CALLS),
                 "inferred",
@@ -1557,16 +1822,16 @@ mod tests {
             let dup = insert_node(conn, &node("F", f3)).unwrap();
             insert_edge(conn, e, f_target, REL_CALLS, None).unwrap();
 
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous");
             // re-run, no change → still ambiguous (stable)
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous");
 
             // remove the duplicate node → name now unique → inferred on re-run
             conn.execute("DELETE FROM nodes WHERE id=?1", [dup])
                 .unwrap();
-            classify_edge_confidence(&db).unwrap();
+            classify_edge_confidence(&db, &PostPassScope::Global).unwrap();
             assert_eq!(
                 conf_of(conn, e, f_target, REL_CALLS),
                 "inferred",
