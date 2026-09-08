@@ -310,6 +310,28 @@ test('isCachedBinaryFresh: file basename mismatch → not fresh', (t) => {
   assert.equal(isCachedBinaryFresh(wrongName, '0.25.0'), false);
 });
 
+// The launcher this plugin puts on PATH is NAMED `code-graph-mcp`, so the
+// basename test two tests up accepts it — and `which code-graph-mcp` (the PATH
+// tier) plus `<_FIND_BINARY_ROOT>/bin` (the bundled tier, which
+// mcp-launcher.js:19 points at the plugin root) would both hand it back as the
+// binary. It resolves the binary through this same function, so accepting it
+// makes the launcher exec the launcher.
+//
+// The existence assert is load-bearing: on a missing file `isNativeBinary`
+// returns false for the wrong reason and the rejection below would pass
+// vacuously at every value of the guard it is meant to pin.
+test('the plugin launcher is never resolved as the native binary', () => {
+  const launcher = path.resolve(__dirname, '..', 'bin', BINARY_NAME);
+  assert.ok(
+    fs.existsSync(launcher),
+    `${launcher} is missing — see cli-entry.test.js; this guard is vacuous without it`
+  );
+  // pkgVersion null → the gate returns any candidate isNativeBinary accepts,
+  // so null here is the predicate's verdict and nothing else's.
+  assert.equal(createVersionGate(null).consider(launcher), null);
+  assert.equal(isCachedBinaryFresh(launcher, '0.25.0'), false);
+});
+
 // ── unsupportedPlatformHint (actionable message for tails with no prebuilt binary) ──
 
 test('unsupportedPlatformHint flags Alpine/musl with a source/glibc-image hint', () => {

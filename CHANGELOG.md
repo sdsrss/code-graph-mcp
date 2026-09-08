@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading:** nothing to do, and one thing starts working. On a plugin install
+`code-graph-mcp` is now a command your shell can find. No index change, no
+config change, no managed-block rewrite — the `CLAUDE.md` block and the detail
+doc keep the `~/.cache/code-graph/bin/…` fallback they have carried since
+0.141.0, because Claude Code drops a plugin's PATH entry when the plugin path
+contains shell metacharacters, and older versions never added it.
+
+### Issue #41, the actual fix
+
+Twice now this project has answered "the plugin prints commands you cannot run"
+by rewriting the printed strings. 0.141.0 fixed the `CLAUDE.md` block and the
+SessionStart announcement; 0.142.0 fixed the two printers they missed. The name
+itself was never made runnable, so every one of those fixes was an apology.
+
+Claude Code puts `<plugin-root>/bin` on the Bash tool's PATH for every enabled
+plugin — the entry is added whether or not the directory exists. This plugin
+shipped no `bin/`, so the entry pointed at nothing. That is the whole defect:
+the door was open the entire time.
+
+There is now a launcher at `claude-plugin/bin/code-graph-mcp`, so the bare name
+resolves on a `/plugin install` with no `npm i -g` anywhere. Verified end to end
+with only the PATH entry Claude Code already adds: `--version`, `health-check`,
+the query subcommands, and `adopt` / `unadopt` / `uninstall` / `doctor` all run
+under the bare name.
+
+`doctor` needed a second fix to get there. It was forwarded to the binary, which
+re-execs a `doctor.js` it looks for beside itself — fine for a source build and
+for the npm package, and never true for the install this launcher exists for,
+where the binary is the downloaded one in `~/.cache/code-graph/bin/` and answers
+`doctor.js not found. Looked in: …`. It is now answered in JS, through the same
+`runDoctorCli` the other two doctor entry points already share, so the three
+cannot drift on flag parsing or exit codes.
+
+The MCP `instructions` field — `INSTRUCTIONS_NOISY` and `INSTRUCTIONS_QUIET`,
+injected into the system prompt of every session — was the surface neither
+earlier fix touched, and it is the one that leads with
+``Fastest path is the CLI via Bash … `code-graph-mcp callgraph X` ``. It now
+carries the same fallback sentence the other three surfaces have had since
+0.141.0. (1083 bytes; the compile-time truncation budget is 1500.)
+
+Two supporting changes, neither user-visible on its own:
+
+- The npm bin entry and the plugin launcher dispatch through one module,
+  `claude-plugin/scripts/cli-entry.js`. The defect 0.142.0 shipped was two
+  printers of one string drifting apart; two dispatchers for `adopt` and
+  `uninstall` would be that defect over a destructive path.
+- `find-binary.js` no longer accepts anything in the plugin's own `bin/` as the
+  native binary. The launcher has to *be* named `code-graph-mcp` for PATH to
+  find it, which is exactly what the discovery chain's basename test looks for —
+  both the `which` tier and the bundled-`bin/` tier would have handed the
+  launcher back as the binary, and the launcher resolves the binary by asking
+  that same chain.
+
 ## 0.143.0
 
 **Upgrading:** nothing to do. `INDEX_VERSION` is not bumped and no index needs

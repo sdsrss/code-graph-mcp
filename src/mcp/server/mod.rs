@@ -31,7 +31,7 @@ mod backfill;
 mod freshness;
 use freshness::RESULT_REFRESH_TOOLS;
 
-pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`.";
+pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`; if the bare name does not resolve, `~/.cache/code-graph/bin/code-graph-mcp`.";
 
 /// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
 /// Claude Code the MCP tools are deferred (a ToolSearch load must precede the
@@ -47,6 +47,7 @@ pub const INSTRUCTIONS_NOISY: &str = concat!(
     "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
     "Still Grep for exact strings/regex; still Read files you will edit.\n",
     "Diagnostics: `code-graph-mcp health-check`.\n",
+    "If your shell answers \"command not found\", this install's copy is at `~/.cache/code-graph/bin/code-graph-mcp` \u{2014} same subcommands.\n",
     "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
 );
 

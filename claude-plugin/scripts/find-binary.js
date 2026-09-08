@@ -190,11 +190,46 @@ function nvmNodeModulesDirs(base = path.join(os.homedir(), '.nvm', 'versions', '
     .filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
 }
 
+/**
+ * The plugin's own `bin/`, resolved once through realpath (plugin caches can sit
+ * behind a symlinked home) and remembered.
+ *
+ * Claude Code puts this directory on the Bash tool's PATH, and the file in it is
+ * NAMED `code-graph-mcp` — that is the whole point of it (issue #41). See
+ * `isNativeBinary` for why that name has to be excluded here.
+ */
+let launcherDirMemo;
+function launcherDir() {
+  if (launcherDirMemo === undefined) {
+    const dir = path.resolve(__dirname, '..', 'bin');
+    try { launcherDirMemo = fs.realpathSync(dir); } catch { launcherDirMemo = dir; }
+  }
+  return launcherDirMemo;
+}
+
+/**
+ * Is this candidate the native binary, as opposed to a wrapper that resolves it?
+ *
+ * The basename test is what rejects the npm shim: `npm i -g` installs
+ * `code-graph-mcp` as a symlink whose realpath is `.../bin/cli.js`, and running
+ * that instead of the binary would make the wrapper spawn itself.
+ *
+ * The plugin launcher is the same hazard under a name the basename test cannot
+ * catch, because PATH resolution requires it to BE `code-graph-mcp`. Two tiers
+ * of the discovery chain offer it: the PATH probe (`which code-graph-mcp`) and
+ * the bundled-`bin/` tier, which `mcp-launcher.js` points at the plugin root.
+ * It resolves the binary by calling `findBinary()` — so accepting it here is a
+ * launcher that execs the launcher, and a `binary-path` cache entry that
+ * remembers to keep doing it. Excluded by directory rather than by content
+ * (a magic-byte test would be the more general guard and would reject the
+ * planted fixtures this module's own suite is built on).
+ */
 function isNativeBinary(candidate) {
   if (!candidate) return false;
   try {
     if (!fs.existsSync(candidate)) return false;
     const realPath = fs.realpathSync(candidate);
+    if (path.dirname(realPath) === launcherDir()) return false;
     return path.basename(realPath) === BINARY_NAME;
   } catch {
     return false;

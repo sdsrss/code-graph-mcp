@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 // npm 7 REMOVED the `preuninstall` / `postuninstall` lifecycle scripts. This
 // package declared `preuninstall` anyway, and `engines.node >= 16` means npm 8
@@ -61,11 +62,20 @@ test('README tells npm users to tear down before uninstalling', () => {
 test('the teardown command the docs name actually exists', () => {
   // Negative control against documenting a command that was renamed away: the
   // CLI must really dispatch an `uninstall` subcommand.
-  const cli = fs.readFileSync(path.join(ROOT, 'bin/cli.js'), 'utf8');
+  //
+  // Asserted by RUNNING it, not by grepping the entry point for the shape of its
+  // `if`. This guard read `bin/cli.js` for `sub === "uninstall"` and went red when
+  // the dispatcher moved to claude-plugin/scripts/cli-entry.js with the behaviour
+  // intact — a guard that a refactor can break while the contract holds was
+  // testing the wrong thing. `--help` returns before any destructive work; a
+  // subcommand that stopped being intercepted would be forwarded to the binary,
+  // which has no `uninstall`, so this exits non-zero instead.
+  const out = execFileSync(process.execPath, [path.join(ROOT, 'bin/cli.js'), 'uninstall', '--help'],
+    { cwd: ROOT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
   assert.match(
-    cli,
-    /sub === "uninstall"/,
-    'bin/cli.js no longer intercepts an `uninstall` subcommand, so the README instruction ' +
+    out,
+    /USAGE:\n\s+code-graph-mcp uninstall/,
+    'the CLI no longer intercepts an `uninstall` subcommand, so the README instruction ' +
       'and this whole teardown path are broken.'
   );
 });

@@ -575,8 +575,15 @@ test('§2.1 bin/cli.js exists and is executable entry point', () => {
   assert.ok(fs.existsSync(BIN_CLI), 'bin/cli.js must exist');
   const content = fs.readFileSync(BIN_CLI, 'utf8');
   assert.match(content, /^#!\/usr\/bin\/env node/, 'Must have node shebang');
-  assert.match(content, /find-binary/, 'Must use find-binary for resolution');
-  assert.match(content, /spawn/, 'Must spawn binary as child process');
+  // Resolution and spawning moved into claude-plugin/scripts/cli-entry.js, which
+  // the plugin's own PATH launcher (claude-plugin/bin/code-graph-mcp) shares —
+  // one dispatcher so the two command names cannot drift. This entry must still
+  // reach it, and it must still be the thing that resolves and spawns.
+  assert.match(content, /cli-entry/, 'Must delegate to the shared CLI dispatcher');
+  const entry = fs.readFileSync(
+    path.join(ROOT, 'claude-plugin/scripts/cli-entry.js'), 'utf8');
+  assert.match(entry, /find-binary/, 'Must use find-binary for resolution');
+  assert.match(entry, /spawn/, 'Must spawn binary as child process');
 });
 
 test('§2.1b bin/cli.js: adopt/unadopt --help is side-effect-free', () => {

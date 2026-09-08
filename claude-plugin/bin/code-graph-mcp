@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * The plugin's `code-graph-mcp` on PATH.
+ *
+ * Claude Code adds `<plugin-root>/bin` to the Bash tool's PATH for every
+ * enabled plugin. This plugin shipped no such directory, so the PATH entry
+ * pointed at nothing and every steering surface that printed the bare name —
+ * the CLAUDE.md block's six rows, the MCP `instructions` field, the `unadopt`
+ * escape hatch — printed a command the user's shell answered with "command not
+ * found" (issue #41). A `/plugin install` downloads the native binary to
+ * `~/.cache/code-graph/bin/` and resolves it internally; nothing ever put a
+ * name in front of it.
+ *
+ * Deliberately a Node script and not a symlink to that cached binary: the
+ * binary is fetched at runtime, after this file is already on PATH, so a
+ * symlink would be dangling exactly when a new user first types the command.
+ * This can explain itself instead — and it reaches `adopt` / `unadopt` /
+ * `uninstall`, which are JS-dispatched and have no counterpart in the binary.
+ *
+ * No logic lives here. See scripts/cli-entry.js for why there is one dispatcher
+ * behind both PATH names, and for why this entry point passes no
+ * `findBinaryRoot`.
+ */
+require('../scripts/cli-entry').main();
