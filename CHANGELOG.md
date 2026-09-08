@@ -9,6 +9,44 @@ doc keep the `~/.cache/code-graph/bin/…` fallback they have carried since
 0.141.0, because Claude Code drops a plugin's PATH entry when the plugin path
 contains shell metacharacters, and older versions never added it.
 
+### The grep guard's red denies: one that shouldn't fire, and two that lied
+
+Reported as three red error blocks during ordinary work. Two were the same
+defect in the PreToolUse grep hook.
+
+**A compound command is no longer denied.** `grep -n "X" tests/foo.rs | head;
+echo "---"; sed -n '1190,1250p' tests/foo.rs` was denied whole. The answer
+covered the grep; the `sed` range read — the thing wanted next — was discarded,
+and the deny said so in a NOTE telling you to re-issue it. The hook had detected
+that tail since 0.50 and spent it entirely on the apology.
+
+Its own rule already settled this: a grep naming two or more paths is downgraded
+to a hint because a first-path-only answer is "an incomplete substitute". A
+discarded `; sed` is the same incompleteness. And the permission-neutral route
+was already built — `post-grep-inject` exists for compound greps, walks every
+top-level segment, and has no head-is-grep exclusion; those commands simply
+never reached it because the deny fired first. The asymmetry that produced was
+invisible from outside: `echo x && grep Sym tests/` ran whole and got its answer
+injected, while `grep Sym tests/ && echo x` went red and lost the `echo`.
+
+Commands with a `;` or `&&` tail now produce no hook output at all. `|` and `||`
+still deny — a pipe is one pipeline the answer replaces, and the `||` branch
+would not have run given the answer carried hits. The compound-tail NOTE is
+gone with the deny it apologised for.
+
+**The "AST-aware equivalent" now is one.** `grep -rln "applyTierFilter\|tier:"
+tests/*.mjs` asked for a file list from `.mjs` files. The deny printed
+`code-graph-mcp grep "applyTierFilter|tier:" tests` and delivered 25+ hit lines
+from all of `tests/`: every flag was dropped, and the glob was truncated to its
+parent directory. `-i -w -F -l -c` and `--include=GLOB` now carry through
+(`--include` and a globbed path both become `-g`), and the argv the child runs
+is the same array the printed command is rendered from, so the two cannot
+disagree again. The same command now answers with
+`code-graph-mcp grep -l applyTierFilter tests -g '*.mjs'`.
+
+Neither behaviour is configurable and no opt-out changed; `CODE_GRAPH_NO_INJECT=1`
+still turns off the PostToolUse answer that now covers the compound case.
+
 ### Issue #41, the actual fix
 
 Twice now this project has answered "the plugin prints commands you cannot run"

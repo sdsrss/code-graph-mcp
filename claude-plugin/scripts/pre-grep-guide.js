@@ -48,7 +48,7 @@ const fs = require('fs');
 const path = require('path');
 const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, sanitizeSearchPath, buildGrepArgs, formatCgCommand } = require('./cg-answer');
 
 // --- Pure logic (testable) ---
 
@@ -266,6 +266,99 @@ function classifyBlock(cmd) {
   return { mode: 'grep' };
 }
 
+// Flags of the user's grep that `code-graph-mcp grep` can honor, in its own
+// spelling. Verified against the built binary rather than against help text:
+// `-l` prints bare paths, `-c` prints `path:count` exactly as `grep -c` does.
+//
+// Everything absent from this map is absent on purpose. `-r`/`-R` (cg is always
+// recursive), `-n` (cg always prints line numbers) and `-H`/`-h` (cg always
+// prints paths) have no cg spelling because cg already behaves that way;
+// forwarding them would be an unknown-argument error. `-L`/`-v`/`--exclude*`
+// never arrive here — UNANSWERABLE_FLAGS sends them to the hint tier — and
+// `-A/-B/-C` are routed to show-mode or hint before this runs.
+const CG_SHORT_FLAGS = { i: '-i', w: '-w', F: '-F', l: '-l', c: '-c' };
+const CG_LONG_FLAGS = {
+  '--ignore-case': '-i',
+  '--word-regexp': '-w',
+  '--fixed-strings': '-F',
+  '--files-with-matches': '-l',
+  '--count': '-c',
+};
+// Canonical emission order, so the argv (and therefore the printed command) is a
+// function of WHICH flags were given, never of the order the user typed them.
+const CG_FLAG_ORDER = ['-i', '-w', '-F', '-l', '-c'];
+
+/**
+ * The grep's flags, translated to cg's.
+ *
+ * Until v0.144 the answer ran `['grep', pattern, scope]` and the deny printed
+ * the same three tokens, so every flag was dropped in both places at once — a
+ * `grep -rln` deny announced "the AST-aware equivalent already ran for you"
+ * above a command that was not the equivalent and returned hit lines where a
+ * file list was asked for (field report 2026-09-08).
+ *
+ * Scanning rules that matter: only the grep's OWN clause (a tail command's
+ * `-l` is not this grep's), and a token that STARTS quoted is an argument, not
+ * a flag — `grep "-l" src/` searches for the string `-l`.
+ */
+function extractCgFlags(cmd) {
+  if (!cmd || typeof cmd !== 'string') return [];
+  const toks = firstShellClause(cmd).replace(VERB_STRIP, '').trim().split(/\s+/);
+  const found = new Set();
+  let glob;
+  for (let i = 0; i < toks.length; i++) {
+    const tok = toks[i];
+    if (!tok || tok[0] === '"' || tok[0] === "'" || tok[0] !== '-') continue;
+    if (tok.startsWith('--')) {
+      const eq = tok.indexOf('=');
+      const name = eq === -1 ? tok : tok.slice(0, eq);
+      // grep's `--include` is a filename glob — cg spells the same filter `-g`.
+      if (name === '--include') {
+        const raw = eq === -1 ? toks[i + 1] : tok.slice(eq + 1);
+        const val = (raw || '').replace(/^["']|["']$/g, '');
+        if (val && !glob) glob = val;
+        continue;
+      }
+      if (CG_LONG_FLAGS[name]) found.add(CG_LONG_FLAGS[name]);
+      continue;
+    }
+    // A short cluster: `-rln` is r + l + n, and only `l` has a cg spelling.
+    for (const ch of tok.slice(1)) {
+      if (CG_SHORT_FLAGS[ch]) found.add(CG_SHORT_FLAGS[ch]);
+    }
+  }
+  const out = CG_FLAG_ORDER.filter((f) => found.has(f));
+  if (glob) out.push('-g', glob);
+  return out;
+}
+
+/**
+ * The deny gate, as runMain applies it — strictly narrower than classifyBlock.
+ *
+ * classifyBlock answers "can the inline answer cover this grep". Denying asks
+ * something else: "may we cancel the WHOLE command". A top-level `;`/`&&` tail
+ * makes those different questions, because the deny cancels a `sed`/`wc`/`echo`
+ * the answer says nothing about. Until v0.144 the tail was detected and spent on
+ * a NOTE apologising for the loss; the deny fired anyway.
+ *
+ * It is the same incompleteness the ≥2-named-paths rule above already refuses to
+ * deny on ("only DENY when the inline grep answer can cover the SAME scope"),
+ * and the fallback was already built: post-grep-inject.js is a PostToolUse hook
+ * for compound greps whose segment walk has no head-is-grep exclusion, carries
+ * its own redundancy gate, and uses a distinct cooldown prefix. These commands
+ * reach it as soon as they are allowed to run.
+ *
+ * `|` and `||` are NOT tails: a pipe is one pipeline that the answer replaces
+ * whole, and the `||` branch would not have run given the answer carried hits.
+ *
+ * classifyBlock itself is deliberately left alone — post-grep-inject calls it
+ * per SEGMENT, where a top-level tail cannot exist by construction.
+ */
+function classifyDeny(cmd) {
+  if (extractUnansweredTail(cmd)) return null;
+  return classifyBlock(cmd);
+}
+
 function shouldBlock(cmd) {
   return classifyBlock(cmd) !== null;
 }
@@ -393,27 +486,12 @@ function extractUnansweredTail(cmd) {
   return null;
 }
 
-// Shared deny-copy footer for the unanswered compound tail. Budget-conscious:
-// two lines, verbatim command so the model can re-issue without thinking.
-// Wording is path-neutral — it must stay true for BOTH the answered deny
-// ("grep half answered, tail wasn't") and the static fallback (nothing was).
-// Head-line marker paired with the NOTE below: the NOTE sits at the END of a
-// long deny message and Claude Code's transcript view folds long tool errors,
-// so a human reading the truncated view saw a clean "answered" deny with no
-// clue the compound's tail was dropped (2026-07-18: two such denies were
-// misdiagnosed as product bugs). The model gets the full reason either way.
-function tailFlagSuffix(tail) {
-  return tail ? ' (compound tail NOT run — see NOTE at end)' : '';
-}
-
-function appendUnansweredTailNote(lines, tail) {
-  if (!tail) return;
-  const shown = tail.length > 300 ? tail.slice(0, 300) + '…' : tail;
-  lines.push(
-    'NOTE: the rest of this compound command (after the grep) did NOT run — re-issue it separately:',
-    `$ ${shown}`,
-  );
-}
+// v0.144 — the compound-tail apparatus that lived here is GONE, together with
+// the deny it apologised for. It was a head-line marker plus a closing NOTE
+// telling the model to re-issue the `; sed …` the deny had just cancelled, and
+// the honest version of that message is not to cancel it: `classifyDeny` now
+// refuses to deny a command with a top-level tail at all, so no deny reaching
+// these builders can carry one. `extractUnansweredTail` survives as that gate.
 
 // v0.47.0 — pull the first source-tree path token out of the denied command so
 // the inline answer can scope its search the same way the raw grep would have.
@@ -547,22 +625,20 @@ function buildHint() {
   ].join('\n');
 }
 
-function buildBlockReason(unansweredTail) {
+function buildBlockReason() {
   // Shown to Claude via PreToolUse `decision: block` reason. Must give a
   // concrete alternate command Claude can re-issue without further thinking.
   // v0.49 — NO escape-hatch line anywhere in deny copy: the daagu 2026-06-12
   // night proved even the "THIS command only" scoping reads as a teachable
   // permanent prefix (adopted in 8s, reused 11×, incl. on the exact identifier
   // searches this hook targets). The env opt-out stays documented in README.
-  const lines = [
-    `[code-graph] Raw \`grep -rn\` on indexed source — denied by code-graph hook.${tailFlagSuffix(unansweredTail)}`,
+  return [
+    '[code-graph] Raw `grep -rn` on indexed source — denied by code-graph hook.',
     'Use the AST-aware equivalent (returns containing fn/module per hit, repo-wide):',
     '  code-graph-mcp grep "<pattern>" [paths...]      # AST context per hit; -F literal, -i, -w, -l, -C N, --max-count 0',
     '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
     '  code-graph-mcp callgraph SYMBOL                 # callers + callees',
-  ];
-  appendUnansweredTailNote(lines, unansweredTail);
-  return lines.join('\n');
+  ].join('\n');
 }
 
 // v0.47.0 — deny WITH the answer inline. Hint-only had ~0% transfer and a bare
@@ -572,10 +648,15 @@ function buildBlockReason(unansweredTail) {
 // advertising the bypass taught it a permanent prefix within 5 seconds (daagu
 // 2026-06-11: one deny → 14 bypassed greps). The static deny keeps a scoped
 // escape because there we give no answer.
-function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail) {
-  const cmdShown = `code-graph-mcp grep "${pattern}"${searchPath ? ` ${searchPath}` : ''}`;
+// `cmdShown` is rendered by the caller from the SAME argv array it handed the
+// child process (cg-answer.buildGrepArgs → formatCgCommand). It used to be
+// re-assembled here from `(pattern, searchPath)` alone, which is how a deny came
+// to print `code-graph-mcp grep "X" tests` above an answer that had actually run
+// with different arguments — the flags nobody forwarded, and a glob silently
+// widened to its parent directory.
+function buildBlockReasonWithAnswer(cmdShown, answer) {
   const lines = [
-    `[code-graph] Raw \`grep\` on indexed source — denied; the AST-aware equivalent already ran for you:${tailFlagSuffix(unansweredTail)}`,
+    '[code-graph] Raw `grep` on indexed source — denied; the AST-aware equivalent already ran for you:',
     `$ ${cmdShown}`,
     answer.text,
   ];
@@ -591,7 +672,6 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail)
   // (deny-with-answer already satisfies in-place, 5/5 in the daagu replay). The
   // engagement nudge is kept only where it pays — the pre-edit impact summary,
   // a true before-you-edit reconciliation moment. Re-add here only behind an A/B.
-  appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
 
@@ -599,9 +679,9 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail)
 // context flags (-A/-B/-C = "show me the body"); the answer IS the bodies,
 // fetched via `code-graph-mcp show`. answer.text already carries per-symbol
 // `$ code-graph-mcp show <sym>` headers.
-function buildShowDenyReason(answer, unansweredTail) {
+function buildShowDenyReason(answer) {
   const lines = [
-    `[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:${tailFlagSuffix(unansweredTail)}`,
+    '[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:',
     answer.text,
   ];
   if (answer.truncated) {
@@ -610,7 +690,6 @@ function buildShowDenyReason(answer, unansweredTail) {
   lines.push('Use these directly instead of re-running the search.');
   // NOTE (v0.63): forced-ack salience trialed + removed here too — see
   // buildBlockReasonWithAnswer. The definitions are already delivered.
-  appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
 
@@ -744,7 +823,18 @@ function runMain() {
 
   markCooldown(rawCmd, root);
 
-  const block = isBlockDisabled() ? null : classifyBlock(cmd);
+  // classifyDeny, not classifyBlock: a command with a top-level `;`/`&&` tail is
+  // never denied, because cancelling it would cancel the tail too. Those run and
+  // are answered by post-grep-inject instead. Recorded so the funnel can see how
+  // often the permission-neutral route now carries this traffic.
+  const block = isBlockDisabled() ? null : classifyDeny(cmd);
+  if (!block && !isBlockDisabled() && classifyBlock(cmd)) {
+    recordRecommendation(root, {
+      hook: 'grep', action: 'observe', compound: true,
+      ...(grepPattern ? { pattern: grepPattern } : {}),
+    });
+    return;
+  }
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the
@@ -754,19 +844,24 @@ function runMain() {
     // falling back to the grep answer, then the static deny.
     let answer = { status: 'unavailable' };
     const pattern = grepPattern; // computed once above; reused for the answer + deny fingerprint
-    // v0.48 — glob-truncated once, shared by the run and the deny message
-    // (a literal `dir/*.py` argv made rg exit 1 → answered:false static deny).
-    const searchPath = sanitizeSearchPath(extractSearchPath(cmd));
+    // The path is passed RAW (globs and all). buildGrepArgs splits `tests/*.mjs`
+    // into scope `tests` + `-g '*.mjs'`, which is both what keeps a literal glob
+    // out of argv (the exit-1 shape sanitizeSearchPath was added for) and what
+    // stops the answer from quietly searching files the user excluded.
+    const searchPath = extractSearchPath(cmd);
+    const flags = extractCgFlags(cmd);
+    // ONE argv, used to run the child AND to render the command the deny prints.
+    const args = buildGrepArgs({ pattern, searchPath, flags });
     let answeredMode = block.mode;
     if (!isAnswerDisabled()) {
       if (block.mode === 'show') {
         answer = runShowAnswer({ cwd: root, symbols: block.symbols });
         if (answer.status !== 'hits' && pattern) {
           answeredMode = 'grep';
-          answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+          answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
         }
       } else if (pattern) {
-        answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+        answer = runGrepAnswer({ cwd: root, pattern, searchPath, flags });
       }
     }
 
@@ -802,9 +897,6 @@ function runMain() {
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
     const answered = answer.status === 'hits';
-    // v0.50 — flag the unanswered `;`/`&&` tail. Extracted from rawCmd: its
-    // paths are valid in the model's shell cwd, where the re-issue will run.
-    const unansweredTail = extractUnansweredTail(rawCmd);
     recordRecommendation(root, {
       hook: 'grep', action: 'deny', answered,
       // pattern fingerprints the denied search so the funnel can score a verbatim
@@ -817,19 +909,16 @@ function runMain() {
       // 'unavailable' (binary ran but failed/timed out). Without this the two
       // are indistinguishable in the funnel ("broken" looks like "no hits").
       ...(answered ? {} : { reason: answer.status }),
-      // tail segments compound-command denies — lets the funnel compare
-      // re-issue behavior for denies that carried a tail note.
-      ...(unansweredTail ? { tail: true } : {}),
     });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
         permissionDecisionReason: !answered
-          ? buildBlockReason(unansweredTail)
+          ? buildBlockReason()
           : answeredMode === 'show'
-            ? buildShowDenyReason(answer, unansweredTail)
-            : buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail),
+            ? buildShowDenyReason(answer)
+            : buildBlockReasonWithAnswer(formatCgCommand(args), answer),
       },
     }) + '\n');
     return;
@@ -853,6 +942,8 @@ module.exports = {
   shouldHint,
   shouldBlock,
   classifyBlock,         // v0.49 — intent-aware block tiers
+  classifyDeny,          // v0.144 — the deny gate: block-tier AND nothing discarded
+  extractCgFlags,        // v0.144 — the grep's flags in cg's spelling
   splitTopLevelSegments, // compound-grep — quote-aware top-level segment splitter (PostToolUse reuse)
   firstShellClause,      // v0.96 — grep's own clause (up to first top-level separator)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction

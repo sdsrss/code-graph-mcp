@@ -11,7 +11,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer, truncateAtLine } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer, truncateAtLine,
+        splitSearchPathGlob, buildGrepArgs, formatCgCommand } = require('./cg-answer');
 
 // Stub "binary": a node script that reacts to its first real arg so one stub
 // covers hits / no-hits / error / timeout cases.
@@ -215,12 +216,46 @@ test('sanitizeSearchPath: clean path unchanged; leading glob drops scope; falsy 
   assert.equal(sanitizeSearchPath(undefined), undefined);
 });
 
-test('runGrepAnswer: glob searchPath is truncated before spawn (defensive layer)', () => {
+test('runGrepAnswer: a globbed searchPath becomes scope + -g, never a literal path arg', () => {
+  // The defensive property is unchanged — a literal `src/storage/*.rs` in argv is
+  // a guaranteed nonzero exit, so it must not survive as one path token. v0.144
+  // changed where the glob goes: dropping it searched every file type in the
+  // directory, so it is now the `-g` filter the user actually wrote.
   const r = runGrepAnswer({
     cwd: stubDir, pattern: 'fts5_search', searchPath: 'src/storage/*.rs', binary: stubBinary(),
   });
   assert.equal(r.status, 'hits');
-  assert.match(r.text, /args=\["grep","fts5_search","src\/storage"\]/);
+  assert.match(r.text, /args=\["grep","fts5_search","src\/storage","-g","\*\.rs"\]/);
+  assert.doesNotMatch(r.text, /"src\/storage\/\*\.rs"/);
+});
+
+test('runGrepAnswer: flags reach argv in cg spelling, ahead of the pattern', () => {
+  const r = runGrepAnswer({
+    cwd: stubDir, pattern: 'fts5_search', searchPath: 'src/', flags: ['-i', '-l'],
+    binary: stubBinary(),
+  });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /args=\["grep","-i","-l","fts5_search","src\/"\]/);
+});
+
+test('buildGrepArgs: an --include-derived -g wins over one derived from the path', () => {
+  // Both spell the same filter and cg takes one; the explicit `--include` is the
+  // one the user typed, so a path glob must not append a second -g beside it.
+  assert.deepEqual(
+    buildGrepArgs({ pattern: 'x', searchPath: 'src/*.rs', flags: ['-g', '*.py'] }),
+    ['grep', '-g', '*.py', 'x', 'src']);
+});
+
+test('splitSearchPathGlob: leading glob keeps the filter and drops the scope', () => {
+  assert.deepEqual(splitSearchPathGlob('*.py'), { scope: undefined, glob: '*.py' });
+  assert.deepEqual(splitSearchPathGlob('src/storage'), { scope: 'src/storage' });
+  assert.deepEqual(splitSearchPathGlob('src/**/*.rs'), { scope: 'src', glob: '**/*.rs' });
+});
+
+test('formatCgCommand: quotes exactly what a shell would need quoted', () => {
+  assert.equal(formatCgCommand(['grep', '-l', 'sym', 'src/', '-g', '*.mjs']),
+    "code-graph-mcp grep -l sym src/ -g '*.mjs'");
+  assert.equal(formatCgCommand(['grep', "it's"]), "code-graph-mcp grep 'it'\\''s'");
 });
 
 // ── runShowAnswer (v0.49) — show-mode deny bodies ────────────────────

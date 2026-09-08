@@ -41,6 +41,8 @@ const {
   shouldHint,
   shouldBlock,
   classifyBlock,
+  classifyDeny,
+  extractCgFlags,
   splitTopLevelSegments,
   firstShellClause,
   countNamedPaths,
@@ -991,18 +993,38 @@ test('v0.96: extractPatterns ignores a quoted string in a compound tail', () => 
 
 // ── v0.47.0 deny-with-answer: message builders + env gate ───────────
 
+// v0.144 — the builder takes the RENDERED command, not `(pattern, searchPath)`
+// to re-assemble one from. It re-assembled, which is how the deny came to print
+// a command that was not the one that ran: no flags, and a glob widened to its
+// parent. `cg()` here renders it the way runMain does, from the same argv
+// builder the child process is given.
+const { buildGrepArgs, formatCgCommand } = require('./cg-answer');
+const cg = (pattern, searchPath, flags) =>
+  formatCgCommand(buildGrepArgs({ pattern, searchPath, flags }));
+
 test('buildBlockReasonWithAnswer: embeds results and command', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
+  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
     status: 'hits', text: 'src/storage/db.rs:42  fn fts5_search()', truncated: false,
   });
   assert.match(reason, /already ran/);
-  assert.match(reason, /code-graph-mcp grep "fts5_search" src\/storage\//);
+  assert.match(reason, /code-graph-mcp grep fts5_search src\/storage\//);
   assert.match(reason, /src\/storage\/db\.rs:42/);
   assert.doesNotMatch(reason, /truncated/);
 });
 
+test('deny copy prints the command that actually ran, flags and glob included', () => {
+  // The whole point of the signature change: this string and the child's argv
+  // are the same array. A `-l` grep on `tests/*.mjs` must print BOTH.
+  const args = buildGrepArgs({ pattern: 'applyTierFilter', searchPath: 'tests/*.mjs', flags: ['-l'] });
+  assert.deepEqual(args, ['grep', '-l', 'applyTierFilter', 'tests', '-g', '*.mjs']);
+  const reason = buildBlockReasonWithAnswer(formatCgCommand(args), {
+    status: 'hits', text: 'tests/a.mjs', truncated: false,
+  });
+  assert.match(reason, /code-graph-mcp grep -l applyTierFilter tests -g '\*\.mjs'/);
+});
+
 test('buildBlockReasonWithAnswer: NEVER advertises the bypass (v0.48 — one deny taught a 14-grep permanent prefix)', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
+  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
     status: 'hits', text: 'hit', truncated: false,
   });
   assert.doesNotMatch(reason, /CODE_GRAPH_NO_BLOCK_GREP/);
@@ -1012,7 +1034,7 @@ test('buildBlockReasonWithAnswer: no salience restatement — answer is already 
   // A forced "name the hit you will act on" line was trialed and removed: the
   // answer is delivered, so restatement is performative friction. Keep the deny
   // copy to delivery + the plain "use directly" nudge only.
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
+  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/storage/'), {
     status: 'hits', text: 'hit', truncated: false,
   });
   assert.doesNotMatch(reason, /name the hit you will act on/i);
@@ -1025,14 +1047,14 @@ test('buildShowDenyReason: no salience restatement (v0.63 removed)', () => {
 });
 
 test('buildBlockReasonWithAnswer: no searchPath → command has no path arg', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', undefined, {
+  const reason = buildBlockReasonWithAnswer(cg('fts5_search', undefined), {
     status: 'hits', text: 'hit', truncated: false,
   });
-  assert.match(reason, /code-graph-mcp grep "fts5_search"\n/);
+  assert.match(reason, /code-graph-mcp grep fts5_search\n/);
 });
 
 test('buildBlockReasonWithAnswer: truncated flag adds marker', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+  const reason = buildBlockReasonWithAnswer(cg('fts5_search', 'src/'), {
     status: 'hits', text: 'hit', truncated: true,
   });
   assert.match(reason, /truncated/);
@@ -1070,72 +1092,91 @@ test('extractUnansweredTail: trailing separator with nothing after → no tail',
   assert.equal(extractUnansweredTail('grep -rn "Foo" src/;'), null);
 });
 
-test('buildBlockReasonWithAnswer: compound tail → note says the rest did NOT run', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/', {
-    status: 'hits', text: 'hit', truncated: false,
-  }, "sed -n '1,60p' tests/server.test.mjs");
-  assert.match(reason, /did NOT run/);
-  assert.match(reason, /sed -n '1,60p' tests\/server\.test\.mjs/);
-});
-
-test('buildBlockReasonWithAnswer: no tail → no compound note', () => {
-  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/', {
-    status: 'hits', text: 'hit', truncated: false,
-  });
-  assert.doesNotMatch(reason, /did NOT run/);
-});
-
-test('buildShowDenyReason: compound tail → note says the rest did NOT run', () => {
-  const reason = buildShowDenyReason(
-    { status: 'hits', text: 'fn body', truncated: false },
-    'cargo test -q');
-  assert.match(reason, /did NOT run/);
-  assert.match(reason, /cargo test -q/);
-});
-
-test('buildShowDenyReason: no tail → no compound note', () => {
-  const reason = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
-  assert.doesNotMatch(reason, /did NOT run/);
-});
-
-test('buildBlockReason: compound tail → static deny also flags the unanswered tail', () => {
-  const reason = buildBlockReason("sed -n '1,60p' tests/server.test.mjs");
-  assert.match(reason, /did NOT run/);
-  assert.match(reason, /sed -n '1,60p' tests\/server\.test\.mjs/);
-});
-
-test('buildBlockReason: no tail → unchanged static deny', () => {
+test('buildBlockReason: the static deny stands alone', () => {
   const reason = buildBlockReason();
   assert.match(reason, /denied by code-graph hook/);
-  assert.doesNotMatch(reason, /did NOT run/);
 });
 
-test('deny copy: compound tail flagged on the FIRST line of all three builders', () => {
-  // The re-issue NOTE sits at the END of a long deny message; Claude Code's
-  // transcript view truncates long tool errors, so a human reading the folded
-  // view saw "answered" with no clue a tail was dropped (2026-07-18 field
-  // misdiagnosis: two compound denies read as product bugs). The model sees the
-  // full reason either way — the head-line marker is for the truncated view.
-  const tail = "sed -n '100,150p' lib/x.mjs";
-  const answered = buildBlockReasonWithAnswer('fts5_search', 'src/', {
-    status: 'hits', text: 'hit', truncated: false,
-  }, tail);
-  assert.match(answered.split('\n')[0], /compound tail NOT run — see NOTE at end/);
-  const show = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false }, tail);
-  assert.match(show.split('\n')[0], /compound tail NOT run — see NOTE at end/);
-  const staticDeny = buildBlockReason(tail);
-  assert.match(staticDeny.split('\n')[0], /compound tail NOT run — see NOTE at end/);
-});
-
-test('deny copy: no tail → no head-line marker in any builder', () => {
-  const answered = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+// v0.144 — the six tests that used to sit here pinned a "the rest of this
+// compound command did NOT run — re-issue it separately" NOTE, and a head-line
+// marker for the folded transcript view. Both were apologies for a deny that
+// should not have fired: `classifyDeny` no longer denies a command with a
+// top-level tail, so no deny can carry one and there is nothing to apologise
+// for. What replaces them is the gate itself (`classifyDeny` unit tests) and the
+// e2e that watches a `&&` command produce no hook output at all.
+//
+// This is the residual guard: whatever a builder is handed, it must not grow the
+// apology back. A deny that says "I threw away half your command" is a deny that
+// should have been an allow.
+test('no deny builder can produce a compound-tail apology', () => {
+  const answered = buildBlockReasonWithAnswer(cg('fts5_search', 'src/'), {
     status: 'hits', text: 'hit', truncated: false,
   });
-  assert.doesNotMatch(answered, /compound tail NOT run/);
   const show = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
-  assert.doesNotMatch(show, /compound tail NOT run/);
-  const staticDeny = buildBlockReason();
-  assert.doesNotMatch(staticDeny, /compound tail NOT run/);
+  for (const reason of [answered, show, buildBlockReason()]) {
+    assert.doesNotMatch(reason, /did NOT run/);
+    assert.doesNotMatch(reason, /compound tail/);
+    assert.doesNotMatch(reason, /re-issue it separately/);
+  }
+});
+
+// ── The deny gate: a deny may not discard half the command ──────────────────
+//
+// classifyBlock answers "can the inline answer cover this grep". classifyDeny
+// answers the question runMain actually asks: "may we deny the WHOLE command".
+// A `;`/`&&` tail makes those different questions — the answer covers the grep
+// and the tail is thrown away — which is the same incompleteness the ≥2-path
+// downgrade already refuses to deny on. post-grep-inject picks these up
+// permission-neutrally once they are allowed to run.
+
+test('classifyDeny: a `;` tail is not deniable, the same grep alone is', () => {
+  const grepOnly = 'grep -rn "fts5_search" src/';
+  assert.notEqual(classifyBlock(grepOnly), null, 'fixture must be block-tier to begin with');
+  assert.notEqual(classifyDeny(grepOnly), null);
+  assert.equal(classifyDeny(`${grepOnly}; sed -n '1,60p' src/foo.rs`), null);
+});
+
+test('classifyDeny: an `&&` tail is not deniable', () => {
+  assert.equal(classifyDeny('grep -rn "fts5_search" src/ && wc -l src/foo.rs'), null);
+});
+
+test('classifyDeny: `|` and `||` still deny — neither discards a command', () => {
+  // A pipe is one pipeline: the answer replaces the whole of it. `||` is the
+  // on-failure branch, which would not have run given the answer carried hits.
+  assert.notEqual(classifyDeny('grep -rn "fts5_search" src/ | head -20'), null);
+  assert.notEqual(classifyDeny('grep -rn "fts5_search" src/ || echo none'), null);
+});
+
+test('classifyDeny: a tail cannot resurrect a grep classifyBlock already refused', () => {
+  // Not-deniable for the older reason (two named paths) stays not-deniable.
+  assert.equal(classifyDeny('grep -rn "fts5_search" src/a.rs src/b.rs'), null);
+});
+
+// ── Flag fidelity: the printed "equivalent" must be equivalent ──────────────
+
+test('extractCgFlags: short clusters decompose, unsupported letters are dropped', () => {
+  // -r (cg is always recursive) and -n (cg always prints line numbers) have no
+  // cg spelling and must not be forwarded; -l is the whole point of the command.
+  assert.deepEqual(extractCgFlags('grep -rln "Sym" src/'), ['-l']);
+  assert.deepEqual(extractCgFlags('grep -i -w "Sym" src/'), ['-i', '-w']);
+  assert.deepEqual(extractCgFlags('grep -rc "Sym" src/'), ['-c']);
+  assert.deepEqual(extractCgFlags('grep -rn "Sym" src/'), []);
+});
+
+test('extractCgFlags: long forms map to the same cg flags, once', () => {
+  assert.deepEqual(extractCgFlags('grep --ignore-case --files-with-matches "Sym" src/'),
+    ['-i', '-l']);
+  assert.deepEqual(extractCgFlags('grep -i --ignore-case "Sym" src/'), ['-i'],
+    'a flag spelled both ways must not be passed twice');
+});
+
+test('extractCgFlags: --include becomes -g, both spellings', () => {
+  assert.deepEqual(extractCgFlags("grep -rn --include='*.py' \"Sym\" src/"), ['-g', '*.py']);
+  assert.deepEqual(extractCgFlags('grep -rn --include *.py "Sym" src/'), ['-g', '*.py']);
+});
+
+test('extractCgFlags: only the grep\'s own clause, never a tail command\'s flags', () => {
+  assert.deepEqual(extractCgFlags('grep -rn "Sym" src/; ls -l /tmp'), []);
 });
 
 test('buildNoHitsFyi: names the pattern and says raw grep proceeds', () => {
@@ -1253,6 +1294,93 @@ test('e2e: denied grep with stub hits → deny JSON embeds the answer + records 
     // An answered deny carries no failure reason — the field is reserved for
     // the not-answered fallback so 'no-binary' vs 'unavailable' stays legible.
     assert.equal(rec.reason, undefined);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// ── The field report's three red blocks, end to end ─────────────────────────
+
+test('e2e: a `&&` tail is not denied — the hook stays silent so the whole command runs', () => {
+  const uniq = `StubTail${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  // `wc`, not the reporter's `sed`: a sed range read also drives the read-fanout
+  // tracker at the top of runMain, and this assertion is about the deny gate.
+  // The reporter's exact shape is the test below.
+  const cmd = `grep -rn "${uniq}" src/ && wc -l src/foo.rs`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '',
+      `the hook emitted output for a compound command; denying it would discard ` +
+      `\`wc -l src/foo.rs\`. stdout=${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the reported `grep …; sed …` shape is not denied', () => {
+  const uniq = `StubSed${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -n "${uniq}" src/foo.rs | head; echo "---"; sed -n '1190,1250p' src/foo.rs`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = res.stdout.trim();
+    if (!out) return;                       // silent is the intended outcome
+    let parsed = null;
+    try { parsed = JSON.parse(out); } catch { return; }  // an FYI line, not a decision
+    assert.notEqual(parsed.hookSpecificOutput && parsed.hookSpecificOutput.permissionDecision,
+      'deny', `denied the reported shape — the echo and sed would be discarded: ${out}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a piped grep still denies — a pipe discards no command', () => {
+  const uniq = `StubPipe${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -rn "${uniq}" src/ | head -20`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// The stub echoes its own argv, so these assert what the binary was actually
+// asked for — not merely what the deny copy claims it was asked for. The two
+// drifting apart is the defect being fixed.
+const ARGV_STUB =
+  `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`;
+
+test('e2e: -l reaches the answer binary AND the printed command', () => {
+  const uniq = `StubEll${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const cmd = `grep -rln "${uniq}" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, new RegExp(`ARGV\\[grep -l ${uniq} src/\\]`),
+      `the answer ran without -l, so it returned hits where a file list was asked for: ${reason}`);
+    assert.match(reason, /code-graph-mcp grep -l /,
+      'the printed command must show the flag that actually ran');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: a globbed path becomes scope + -g, not a silently widened scope', () => {
+  const uniq = `StubGlob${Date.now()}`;
+  const fixture = e2eFixture(ARGV_STUB);
+  const cmd = `grep -rn "${uniq}" tests/*.mjs`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, new RegExp(`ARGV\\[grep ${uniq} tests -g \\*\\.mjs\\]`),
+      `the answer searched all of tests/ instead of its .mjs files: ${reason}`);
+    assert.match(reason, /-g '\*\.mjs'/, 'the printed command must show the glob it honoured');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1403,7 +1531,12 @@ test('e2e: CODE_GRAPH_NO_ANSWER_IN_DENY=1 → static deny even when stub would h
   }
 });
 
-test('e2e: compound `grep …; sed` → deny answers grep AND flags the unanswered sed tail', () => {
+// v0.144 — this test used to assert the deny fired and flagged the dropped tail
+// (`rec.tail === true`). It now asserts the opposite outcome for the same input,
+// because flagging a discarded `sed` was never the fix for discarding it. The
+// funnel record changes with it: `observe`/`compound`, meaning the command ran
+// and post-grep-inject owns the answer.
+test('e2e: compound `grep …; sed` → no deny, recorded as compound so the funnel sees it', () => {
   const uniq = `StubTail${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
@@ -1413,18 +1546,13 @@ test('e2e: compound `grep …; sed` → deny answers grep AND flags the unanswer
     fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, /src\/foo\.rs:7/);            // grep half answered
-    assert.match(reason, /did NOT run/);               // tail flagged honestly
-    assert.match(reason, /sed -n '100,160p' src\/foo\.rs/); // verbatim re-issue line
-    // funnel: the deny record marks that a tail note was carried
+    assert.equal(res.stdout.trim(), '', `expected no decision; got ${res.stdout}`);
     const recs = fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
     const rec = JSON.parse(recs.trim().split('\n').pop());
-    assert.equal(rec.action, 'deny');
-    assert.equal(rec.tail, true);
+    assert.equal(rec.action, 'observe');
+    assert.equal(rec.compound, true);
+    assert.equal(rec.pattern, uniq, 'the pattern still fingerprints the search for the funnel');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1444,14 +1572,17 @@ test('e2e: compound cmd + answer failure → grep ALLOWED, whole command runs in
     fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
-    // No deny JSON — the whole compound command proceeds, tail included.
-    assert.throws(() => JSON.parse(res.stdout));
-    assert.match(res.stdout, /unavailable \(ran but failed\)/);
+    // v0.144 — the outcome this test names is now reached one step earlier and
+    // for a better reason. It used to require the answer to RUN and FAIL before
+    // the compound was allowed; the tail alone now settles it, so cg is never
+    // spawned and stdout carries no `unavailable` breadcrumb. Same guarantee for
+    // the user (whole command intact), one fewer child process, and it no longer
+    // depends on the binary happening to be broken.
+    assert.equal(res.stdout.trim(), '');
     const rec = JSON.parse(fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
-    assert.equal(rec.action, 'hint');
-    assert.equal(rec.fallthrough, 'unavailable');
-    assert.equal(rec.tail, undefined);   // nothing dropped → no tail flag
+    assert.equal(rec.action, 'observe');
+    assert.equal(rec.compound, true);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1854,7 +1985,12 @@ test('e2e: bypassed grep is silent but recorded as action:bypass', () => {
   }
 });
 
-test('e2e: glob path arg → answer runs against the glob-truncated dir', () => {
+test('e2e: glob path arg → scope plus -g, and a literal glob still never reaches argv', () => {
+  // The literal-glob-in-argv failure this guards (rg exit 1 → answered:false) is
+  // still guarded: `src/storage/*.rs` must not appear as one path token. What
+  // changed is where the glob goes. Truncating to `src/storage` silently searched
+  // the .py and .toml files beside the .rs ones and printed a command claiming
+  // that wider scope; `-g '*.rs'` is the filter the user actually wrote.
   const uniq = `GlobTrunc${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('args=' + JSON.stringify(process.argv.slice(2)) + '\\n');`);
@@ -1864,8 +2000,9 @@ test('e2e: glob path arg → answer runs against the glob-truncated dir', () => 
     const res = runHook(cmd, fixture);
     const out = JSON.parse(res.stdout);
     assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason,
-      new RegExp(`args=\\["grep","${uniq}","src/storage"\\]`));
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, new RegExp(`args=\\["grep","${uniq}","src/storage","-g","\\*\\.rs"\\]`));
+    assert.doesNotMatch(reason, /"src\/storage\/\*\.rs"/, 'a literal glob must never be a path arg');
   } finally {
     cleanupFixture(fixture, cmd);
   }

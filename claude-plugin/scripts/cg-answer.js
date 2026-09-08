@@ -98,6 +98,75 @@ function sanitizeSearchPath(searchPath) {
 }
 
 /**
+ * The same split, but keeping the half `sanitizeSearchPath` throws away.
+ *
+ * Widening `tests/*.mjs` to `tests` keeps rg from exiting 1, and for years that
+ * was the whole story — but the deny then PRINTS the widened command above an
+ * answer covering files the user excluded (field report 2026-09-08: a
+ * `tests/*.mjs` grep answered with 25+ hits from all of `tests/`). The glob has
+ * a faithful destination: `code-graph-mcp grep -g <glob>`, which matches
+ * basename-style across nested directories.
+ *
+ * `{scope, glob}`, either of which may be undefined: `tests/*.mjs` →
+ * `{scope:'tests', glob:'*.mjs'}`, `src/**` + `/*.rs` → `{scope:'src',
+ * glob:'**\/*.rs'}`, a leading glob (`*.py`) → `{scope:undefined,
+ * glob:'*.py'}` (repo-wide, filtered), no glob → `{scope:<path>}`.
+ */
+function splitSearchPathGlob(searchPath) {
+  if (!searchPath || typeof searchPath !== 'string') return {};
+  const segs = searchPath.split('/');
+  const i = segs.findIndex((s) => /[*?[\]{}]/.test(s));
+  if (i === -1) return { scope: searchPath };
+  const scope = segs.slice(0, i).join('/') || undefined;
+  const glob = segs.slice(i).join('/') || undefined;
+  return { scope, glob };
+}
+
+/**
+ * The argv for the grep answer — the ONE place the answer's shape is decided.
+ *
+ * Both the child process and the command string the deny prints are built from
+ * this array, because two renderings of one command are two things that drift:
+ * v0.142.0 shipped a fix for two printers of a single `unadopt` string that had
+ * done exactly that. Here the drift was live and user-visible in a different
+ * form — the printed command never carried the grep's flags at all, so a
+ * `grep -l` deny announced a file-list command and delivered hit lines.
+ *
+ * `flags` are already translated to cg spellings by the caller
+ * (pre-grep-guide.extractCgFlags). A `-g` among them came from `--include` and
+ * wins over one derived from the path: the user spelled that filter explicitly.
+ */
+function buildGrepArgs({ pattern, searchPath, flags = [] } = {}) {
+  const { scope, glob } = splitSearchPathGlob(searchPath);
+  const args = ['grep', ...flags, pattern];
+  if (scope) args.push(scope);
+  if (glob && !flags.includes('-g')) args.push('-g', glob);
+  return args;
+}
+
+// Render an argv as the command a human can paste. Single-quote anything that
+// would not survive a shell verbatim — the glob especially, which is the whole
+// point of passing it (`-g *.mjs` unquoted is expanded by the user's shell).
+// Characters that survive a shell verbatim. A glob does not, which is the whole
+// reason the argument is worth quoting: `-g *.mjs` unquoted is expanded by the
+// reader's own shell before cg ever sees it.
+const SHELL_SAFE_ARG = /^[A-Za-z0-9_.,:@%+=/-]+$/;
+// POSIX single-quote escape: close, emit an escaped quote, reopen.
+const SQ_ESCAPED = "'\\''";
+
+function formatCgCommand(args) {
+  // Deliberately no nested template literal, and no regex holding a quote.
+  // windows-hide.test.js masks literals with a character scanner that pairs
+  // backticks like any other quote, so a `${…`…`…}` inside a template closes the
+  // outer one early and swallows the rest of the file — which took all three of
+  // THIS file's spawn call sites out of that guard's view until it was written
+  // this way. Code a guard cannot parse is code the guard is not checking.
+  const shown = args.map((a) =>
+    (SHELL_SAFE_ARG.test(a) ? a : "'" + a.split("'").join(SQ_ESCAPED) + "'"));
+  return 'code-graph-mcp ' + shown.join(' ');
+}
+
+/**
  * The four runners below each spawned the binary and mapped the result by hand
  * — the same fifteen lines, four times (audit 2026-08-29 ARC-07). Hoisted into
  * three pieces, with the one genuine difference between them made a PARAMETER
@@ -206,6 +275,7 @@ function runGrepAnswer(opts = {}) {
     cwd,
     pattern,
     searchPath,
+    flags = [],
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxBytes = DEFAULT_MAX_BYTES,
   } = opts;
@@ -216,11 +286,10 @@ function runGrepAnswer(opts = {}) {
     const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
 
-    // Defensive re-sanitize: callers should pass a clean path, but a glob
-    // reaching argv is a guaranteed nonzero exit (see sanitizeSearchPath).
-    const scope = sanitizeSearchPath(searchPath);
-    const args = ['grep', pattern];
-    if (scope) args.push(scope);
+    // buildGrepArgs does the glob split itself, so a caller that passes a raw
+    // `dir/*.py` still cannot put a literal glob into argv (the guaranteed
+    // nonzero exit sanitizeSearchPath exists for) — it becomes scope + `-g`.
+    const args = buildGrepArgs({ pattern, searchPath, flags });
     const res = runCg(binary, args, { cwd, timeoutMs });
     // Older binaries exit 0 on no-match with NO_MATCH_PREFIX on stdout — that
     // shape resolves to 'no-hits' through isEmptyAnswer below.
@@ -411,6 +480,9 @@ function runCallgraphAnswer(opts = {}) {
 module.exports = {
   runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer,
   truncateAtLine, sanitizeSearchPath,
+  // The one argv builder + its renderer, so the deny copy and the child process
+  // cannot describe different commands.
+  splitSearchPathGlob, buildGrepArgs, formatCgCommand,
   // Exported so the integer property can be asserted where it is ESTABLISHED.
   // Asserting it end-to-end instead passes either way: `remainingMs` floors
   // again downstream, so such a test cannot fail and proves nothing (NEW-02).
