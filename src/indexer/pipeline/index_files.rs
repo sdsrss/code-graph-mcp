@@ -2272,38 +2272,44 @@ pub(super) fn index_files(
         if all_indexed.len() + delete_paths.len() >= STATS_REFRESH_MIN_FILES {
             db.refresh_query_stats();
         }
-        // A run whose deferred pass or pending sweep produced edges goes GLOBAL,
-        // whatever the file count said.
-        //
-        // `restore_inbound_edges` deliberately SKIPS sources that are in this
-        // run and requeues the rest, and `resolve_deferred_relations` re-binds
-        // the target BY NAME against the whole tree. So such a run can create an
-        // `imports` edge whose source and target are both files it never opened
-        // — which moves `cg_imports` / `cg_unique_imports` for a file no arm of
-        // the scope reaches. 2e survives that (the requeue implies a node-count
-        // change inside a scope file, so the name arm carries it), but 2d-bind
-        // and 2d-prune have no name arm and no equivalent, and the completeness
-        // argument's first bullet claimed an invariant that does not hold here
-        // (pre-ship review 2026-09-08, HIGH; no reproducer landed, so this is
-        // the conservative reading rather than a fix to a demonstrated bug).
-        //
-        // Cheap where it matters: the interactive one-file refresh this whole
-        // change exists for resolves nothing deferred and sweeps nothing pending
-        // in the ordinary case, so it keeps the scoped path.
-        let post_pass_scope = if deferred_edges > 0 || pending_resolved > 0 {
-            super::resolve::PostPassScope::Global
-        } else {
-            post_pass_scope
-        };
         // Finish the scope now that the run's writes are done: file ids are
         // current, and the name-count drift is measurable against the snapshot
         // taken before Phase 0.
         if !matches!(post_pass_scope, super::resolve::PostPassScope::Global) {
-            super::resolve::build_scope_files(db.conn())?;
+            // Drift FIRST, against the paths the snapshot actually covered.
             let names = super::resolve::scope_names_from_count_drift(db.conn())?;
+
+            // THEN widen the file arms by every source the deferred pass
+            // touched. `restore_inbound_edges` deliberately SKIPS sources that
+            // are in this run and requeues the rest, and the deferred pass
+            // re-binds by NAME against the whole tree — so it can mint an
+            // `imports` edge whose source is a file this run never opened,
+            // moving `cg_unique_imports` for a file no arm would otherwise
+            // reach. 2e survives that through the name arm; 2d-bind and
+            // 2d-prune have no name arm (pre-ship review 2026-09-08).
+            //
+            // This closes it by construction rather than by argument. The first
+            // attempt sent any run with deferred edges to Global, and measuring
+            // it showed why that was wrong: an ordinary one-file edit on the
+            // django corpus defers 609 edges, so EVERY interactive refresh took
+            // the global path and the whole change was inert — 1.08 s, the
+            // number it was written to remove. Widening by the touched sources
+            // costs a handful of file ids instead.
+            let deferred_sources: std::collections::BTreeSet<&str> =
+                deferred.iter().map(|d| d.rel_path.as_str()).collect();
+            if !deferred_sources.is_empty() {
+                let conn = db.conn();
+                let mut stmt =
+                    conn.prepare("INSERT OR IGNORE INTO cg_scope_paths (path) VALUES (?1)")?;
+                for path in &deferred_sources {
+                    stmt.execute([path])?;
+                }
+            }
+            super::resolve::build_scope_files(db.conn())?;
             tracing::debug!(
-                "[index] post-pass scope: {} file(s), {} name(s) whose node count moved",
+                "[index] post-pass scope: {} run file(s) + {} deferred source(s), {} name(s) whose node count moved",
                 all_indexed.len() + delete_paths.len(),
+                deferred_sources.len(),
                 names
             );
         }

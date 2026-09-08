@@ -433,10 +433,16 @@ pub(super) enum PostPassScope {
     ///   cover — but NOT only then, and an earlier version of this comment
     ///   claimed otherwise. `restore_inbound_edges` skips sources that are in
     ///   the run and requeues the rest, and the deferred pass re-binds by NAME
-    ///   against the whole tree, so a run can mint an `imports` edge between two
-    ///   files it never opened. Neither pass has a name arm, so `index_files`
-    ///   sends any run that produced deferred or pending edges down `Global`
-    ///   instead of trying to bound it (pre-ship review 2026-09-08).
+    ///   against the whole tree, so a run can mint an `imports` edge whose
+    ///   source is a file it never opened. Neither pass has a name arm, so
+    ///   `index_files` adds every deferred relation's source path to
+    ///   `cg_scope_files` before the passes run (pre-ship review 2026-09-08).
+    ///   Reviewers could not turn the gap into a divergence — 15 differential
+    ///   rounds over a 159-file corpus and a targeted fixture both came back
+    ///   byte-identical, because the requeue moves the import and the calls
+    ///   through the same name pool with the same refiner, so a non-unique
+    ///   import cannot make bind fire — but the scope now covers it by
+    ///   construction rather than by that argument.
     /// * 2e-confidence additionally reads `COUNT(*)` of same-name, same-language
     ///   nodes — a GLOBAL input. A node appearing or vanishing anywhere flips the
     ///   confidence of edges between two files that did not change, so the name
@@ -444,8 +450,15 @@ pub(super) enum PostPassScope {
     ///   counting before and after (see `scope_names_from_count_drift`) rather
     ///   than accumulated as the run goes: this pipeline's bookkeeping has twice
     ///   cost real edges (INDEX_VERSION v58, v61), and a count diff cannot miss a
-    ///   channel the way a hand-maintained list can — `<external>` sentinels
-    ///   minted or reaped mid-run land in it for free.
+    ///   channel the way a hand-maintained list can. `<external>` is in the
+    ///   counted paths for completeness, not because it is load-bearing:
+    ///   `mint_external_sentinels` writes that files row with
+    ///   `language = "external"` and `cg_namecount` is keyed (name, language),
+    ///   so a sentinel's count can only ever reach edges whose TARGET is itself
+    ///   a sentinel — and sentinel names are unique inside `<external>`, so that
+    ///   count never exceeds 1 and those edges are always `inferred`. Including
+    ///   it only widens the drift set, which is the safe direction (pre-ship
+    ///   review 2026-09-08).
     ///
     /// The induction: a full index runs `Global`, so the graph starts consistent;
     /// every incremental run then repairs exactly what it disturbed.
