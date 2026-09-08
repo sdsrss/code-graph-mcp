@@ -327,7 +327,33 @@ const AG_VERB = /(?:^|\s)ag$/;
 function isAgFilenameSearch(clause) {
   if (typeof clause !== 'string') return false;
   if (!AG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '')) return false;
-  return /(?:^|\s)-[a-zA-Z]*g[a-zA-Z]*(?:\s|$)/.test(clause.replace(VERB_STRIP, ''));
+  // A TOKEN scan, not a regex over the whole clause (round 4 of pre-ship
+  // review). The first spelling of this guard matched `-g` only when it was
+  // whitespace-delimited, so `ag -g"some_symbol" src/` — the attached form
+  // `extractCgFlags` twelve lines below explicitly handles — still reached the
+  // deny and was answered with content lines. Scanning the raw clause instead
+  // had the mirror-image fault: a `-g` inside a quoted pattern
+  // (`ag "some_symbol -g x" src/`) demoted a real content search. Same
+  // flag-name-in-a-value-position class the sibling repairs fixed with
+  // cgFlagSet/hasGlobFlag, so this uses the same convention: a token that
+  // STARTS quoted is an argument, never a flag.
+  // Quoted spans are blanked BEFORE tokenizing, not skipped after: a quoted
+  // argument can contain whitespace, so `ag "some_symbol -g x" src/` splits into
+  // three tokens and the middle one looks exactly like a flag. Blanking leaves
+  // an attached value's flag behind (`-g"x"` → `-g`), which is what we want.
+  const scan = clause.replace(VERB_STRIP, '').replace(/"[^"]*"|'[^']*'/g, ' ');
+  for (const tok of scan.trim().split(/\s+/)) {
+    if (!tok || tok[0] !== '-') continue;
+    if (tok.startsWith('--')) {
+      if (/^--(?:filename-pattern|file-search-regex)(?:=|$)/.test(tok)) return true;
+      continue;
+    }
+    // Short cluster: ag's `-g` takes a value, so it ends the cluster — an
+    // attached value (`-g'x'`, `-g=x`) or the next token. Capital `-G` is a
+    // different ag flag (limit by filename) and must NOT match.
+    if (/^-[a-zA-Z]*g/.test(tok)) return true;
+  }
+  return false;
 }
 
 /**
@@ -794,7 +820,16 @@ function translateBreToRg(cmd, pattern) {
   const verb = (cmd.match(GREP_HEAD) || [])[1];
   // git grep speaks BRE like plain grep; rg/ag are already extended-regex.
   if (!verb || !/grep$/.test(verb)) return pattern;
-  if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(cmd)) {
+  // The grep's OWN clause, not the whole command. This was the one flag check
+  // in this module that v0.96 did not clause-scope, and round 4 of pre-ship
+  // review found what it costs: `grep -rln "a\|b" src/ | xargs -P4 wc -l` read
+  // the tail's `-P4` as "this grep speaks Perl regex", so the pattern was left
+  // escaped. On its own that is a wrong dialect decision; it also desynchronised
+  // the two hooks, because post-grep-inject passes a SEGMENT here while the deny
+  // path passes the whole command — the same pattern then filed under two
+  // spellings and the funnel scored a verbatim re-grep as neutral.
+  const clause = firstShellClause(cmd);
+  if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(clause)) {
     return pattern;
   }
   return pattern.replace(/\\([|(){}+?])/g, '$1');
@@ -933,9 +968,16 @@ function runMain() {
   // reads the field, and round 3 showed the row double-counts: a head-grep
   // compound whose grep hits writes this row AND post-grep-inject's redundancy
   // observe, so one Bash call became two entries in a counter `usage.rs`
-  // documents as the model's raw search fan-out. The post-side rows carry
-  // strictly more (they say what happened to the answer), so this side stays
-  // silent — exactly as it did before the compound change.
+  // documents as the model's raw search fan-out. The post-side rows carry more
+  // (they say what happened to the answer), so this side stays silent — exactly
+  // as it did before the compound change.
+  //
+  // One configuration where that leaves NO trace, named because round 4 caught
+  // the claim overstated: under `CODE_GRAPH_NO_INJECT=1` the post side does not
+  // run either, so a first-run compound is invisible to the funnel. A repeat
+  // within 60 s still lands in the cooldown `observe` branch above. A kill
+  // switch silencing the hook that carries the telemetry is coherent; silently
+  // claiming coverage it does not have is not.
   const block = isBlockDisabled() ? null : classifyDeny(cmd);
   if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the

@@ -1232,11 +1232,14 @@ test('extractCgFlags: rg-only short value flags are not read out of ag or grep',
 });
 
 test('extractCgFlags: --type long form maps for every folded verb', () => {
-  // Only the SHORT forms are gated on the verb. Not because the long spellings
-  // are unambiguous — round 3 corrected that reason — but because no other
-  // folded verb has them: `grep --glob` and `ag --type` are errors, so a command
-  // spelling one would never have run. Mapping them costs nothing and the gate
-  // would only add a way to get it wrong.
+  // Only the SHORT forms are gated on the verb, and the reason has now been
+  // wrong twice — round 3 said "unambiguous", round 4 disproved "no other verb
+  // has them" by pointing at ugrep, which ships as /usr/bin/grep on some
+  // machines and DOES take `--glob`. The honest reason is narrower: where
+  // another verb spells `--glob`/`--type` at all, it means the same thing (a
+  // filename/type filter), so forwarding it to cg's `-g`/`-t` is right rather
+  // than merely harmless. The short forms are gated because there the SPELLINGS
+  // collide with different meanings (ag's `-g` searches filenames).
   assert.deepEqual(extractCgFlags(`rg --type rust "some_symbol" src/`), ['-t', 'rust']);
   assert.deepEqual(extractCgFlags(`rg --type=rust "some_symbol" src/`), ['-t', 'rust']);
 });
@@ -1492,6 +1495,34 @@ test('classifyBlock: `ag -g` is a filename search, not a foldable content grep',
   assert.equal(classifyBlock('ag -ig "some_symbol" src/'), null, 'inside a cluster too');
   assert.notEqual(classifyBlock('ag "some_symbol" src/'), null, 'plain ag still folds');
   assert.notEqual(classifyBlock(`rg -g '*.rs' "some_symbol" src/`), null, "rg's -g is a filter");
+});
+
+test('classifyBlock: every spelling of `ag -g`, and nothing that merely looks like it', () => {
+  // Round 4: the first guard matched `-g` only whitespace-delimited, so the
+  // ATTACHED spellings still reached the deny and were answered with content
+  // lines — the shape extractCgFlags itself documents.
+  for (const cmd of ['ag -g"some_symbol" src/', "ag -g'some_symbol' src/",
+    'ag -g=some_symbol src/', 'ag --filename-pattern "some_symbol" src/']) {
+    assert.equal(classifyBlock(cmd), null, cmd);
+  }
+  // …and the mirror-image fault a whole-clause regex would have: a `-g` that is
+  // not a flag of this command must not demote a real content search.
+  assert.notEqual(classifyBlock('ag "some_symbol -g x" src/'), null,
+    '-g inside the quoted pattern is not a flag');
+  assert.notEqual(classifyBlock('ag -G "some_symbol" src/'), null,
+    'capital -G is a different ag flag');
+});
+
+// Round 4: the ONE flag check in this module that v0.96 left unscoped. A `-P`/`-E`
+// in a tail is not this grep's dialect, and reading it as one both leaves the
+// pattern wrongly escaped and desynchronises the two hooks' telemetry (the deny
+// path passes the whole command here, post-grep-inject passes a segment).
+test('translateBreToRg: -E/-P in a TAIL is not this grep\'s dialect', () => {
+  assert.equal(translateBreToRg('grep -rn "a\\|b" src/ | xargs -P4 wc -l', 'a\\|b'), 'a|b');
+  assert.equal(translateBreToRg("grep -rn \"a\\|b\" src/ | sed -E 's/a/b/'", 'a\\|b'), 'a|b');
+  assert.equal(translateBreToRg('grep -rnE "a\\|b" src/', 'a\\|b'), 'a\\|b',
+    "the grep's OWN -E still suppresses the unescape");
+  assert.equal(translateBreToRg('grep -rn "a\\|b" src/', 'a\\|b'), 'a|b');
 });
 
 test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {

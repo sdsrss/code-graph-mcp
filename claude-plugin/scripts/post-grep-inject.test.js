@@ -366,6 +366,25 @@ function runHook(cmd, fixture, extraEnv = {}, cwdOverride, toolOutput) {
 // been applied only to the deny path — so the newly-routed traffic ran the
 // UNFIXED answer.
 
+// Round 4: repair #2 of round 3 — filing the TRANSLATED pattern so the deny and
+// the skip agree — was pinned by nothing; reverting it to `rawPattern` left the
+// whole suite green. The funnel compares those strings for equality, so a BRE
+// pattern is the witness.
+test('e2e: the skip files the same pattern spelling the deny would have', (t) => {
+  const uniq = `InjAlign${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('cg out\\n');`);
+  const cmd = `grep -rn "${uniq}\\|other_symbol" src/ && echo done`;
+  try {
+    runHook(cmd, fixture, {}, undefined, `src/foo.rs:12  ${uniq}`);
+    const rec = JSON.parse(fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
+    assert.equal(rec.pattern, `${uniq}|other_symbol`,
+      'the BRE alternation must be filed unescaped, as every sibling record files it');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: the redundancy skip is RECORDED, not silent', (t) => {
   const uniq = `InjSkip${Date.now()}`;
   const fixture = e2eFixture(`process.stdout.write('cg out\\n');`);
