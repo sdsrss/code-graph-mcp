@@ -377,10 +377,18 @@ test('e2e: the redundancy skip is RECORDED, not silent', (t) => {
     assert.equal(res.stdout.trim(), '', 'a redundant inject must still not be emitted');
     const rec = JSON.parse(fs.readFileSync(
       path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
-    assert.equal(rec.hook, 'grep-inject');
-    assert.equal(rec.action, 'skip');
     assert.equal(rec.reason, 'grep-hit-redundant');
     assert.equal(rec.pattern, uniq);
+    // The load-bearing half, and what round 2 caught round 1 getting wrong. The
+    // Rust aggregator (src/cli/usage.rs) clears the funnel's `armed` flag on
+    // EVERY line but only scores hooks it knows, so an invented hook name eats
+    // the arm set by the preceding answered deny without scoring it — the first
+    // version of this record used `hook:'grep-inject'`/`action:'skip'` and took
+    // `fallthrough_rate` from 1.0 to 0.0 on a crafted log. `action` must also be
+    // one the aggregator excludes from the recommendation total, or every skip
+    // inflates `tool_calls_per_rec` across releases.
+    assert.equal(rec.hook, 'grep', 'must be a hook the aggregator scores');
+    assert.equal(rec.action, 'observe', 'must be an action the aggregator excludes from total');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -397,6 +405,37 @@ test('e2e: the inject honours the grep\'s flags and glob, like the deny path', (
     const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
     assert.match(ctx, new RegExp(`ARGV\\[grep -l ${uniq} tests -g \\*\\.mjs\\]`),
       `the inject dropped -l and widened the glob while the deny path kept both: ${ctx}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the inject\'s show-mode fallback to grep also carries the flags', (t) => {
+  const uniq = `InjShowFb${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'grep') process.exit(1);\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `echo x && grep -iA3 "fn ${uniq}" src/`;
+  try {
+    const ctx = JSON.parse(runHook(cmd, fixture, {}, undefined, '').stdout)
+      .hookSpecificOutput.additionalContext;
+    assert.match(ctx, /ARGV\[grep -i /, `the fallback dropped -i: ${ctx}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: the inject honours -F — flag forwarded, pattern left literal', (t) => {
+  const uniq = `InjLit${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] !== 'grep') process.exit(1);\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `echo x && grep -rF "${uniq}\\|other_symbol" src/`;
+  try {
+    const ctx = JSON.parse(runHook(cmd, fixture, {}, undefined, '').stdout)
+      .hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`ARGV\\[grep -F ${uniq}\\\\\\|other_symbol src/\\]`),
+      `the inject unescaped a literal pattern or dropped -F: ${ctx}`);
   } finally {
     cleanupFixture(fixture, cmd);
   }

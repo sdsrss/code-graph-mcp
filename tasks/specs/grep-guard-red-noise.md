@@ -155,3 +155,25 @@ it fires on the exemption its own message advertises (`D=$(mktemp -d) … rm -rf
   stated and had not built, mapped ripgrep's `--glob`/`-g`/`-t`, made
   `--include` repeatable, and corrected four claims (in the flag-map comment,
   the CHANGELOG, and criterion 4) that were false as written.
+- r3 (2026-09-08): pre-ship review round 2, on r2's own repairs — one HIGH, in
+  the fix added to make the trade measurable. r2 invented
+  `hook:'grep-inject'/action:'skip'`; `aggregate_recommendations_jsonl` clears
+  the funnel's arm on every line but scores only `grep`/`read`, so the record ate
+  the arm without scoring, and `skip` was outside the `observe`/`use` exclusions
+  so it inflated the recommendation total. Now `hook:'grep'/action:'observe'`,
+  which the aggregator both scores and excludes from the total. The arm is still
+  consumed — that is the documented "immediately-next event" rule meeting an
+  event that now exists — and the measured effect is written into the CHANGELOG
+  rather than left for a reader of `stats` to discover.
+  Also: `cgFlagSet`/`hasGlobFlag` so a flag VALUE can no longer be membership-
+  tested as a flag (`rg -t -g "x" src/*.rs` had dropped the path glob, and
+  `grep --include -F …` had fired the literal guard on a filename glob); the
+  short `-g`/`-t` mapping is now gated on the `rg` verb, because ag spells both
+  differently; and three sibling call sites plus the `.cmd` exit line got the
+  tests that were missing — every one of them had been a green mutation.
+  Two claims corrected: the r2 motivating example `rg -g '*.rs' Sym src/` was
+  never folded at all (`extractPatterns` collects only QUOTED arguments, so
+  `classifyBlock` is null); the real case needs a quoted pattern. And a `-F`
+  deny now records the RAW pattern where it recorded the unescaped form before,
+  so the same-pattern comparison in the funnel mis-scores logs spanning both
+  versions — narrow (`-F` plus BRE escapes only), noted rather than fixed.

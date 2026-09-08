@@ -297,9 +297,36 @@ const CG_VALUE_FLAGS = {
   '--glob': '-g',      // rg
   '--type': '-t',      // rg
 };
-// Short forms of the value-carrying flags, by tool. `-g` and `-t` are rg-only;
-// grep has no short spelling for `--include`.
+// Short forms of the value-carrying flags. RIPGREP ONLY, and the verb is
+// checked: `ag -t Sym src/` means "all text files" and takes no value, and ag's
+// `-g` prints matching FILENAMES rather than filtering — mapping either would
+// hand cg an argument the user never wrote. (Round 2 of pre-ship review; the
+// symptom was mild — cg exits 2 on an unknown file type, the answer degrades to
+// `unavailable` and the deny becomes an allow — but it is a fabricated
+// argument.) grep has no short spelling for `--include`.
 const CG_VALUE_SHORT = { g: '-g', t: '-t' };
+const RG_VERB = /(?:^|\s)rg$/;
+
+/**
+ * The boolean flags in an `extractCgFlags` result, without the VALUES.
+ *
+ * The result is a flat argv fragment (`['-i','-g','*.rs']`), which is what
+ * `buildGrepArgs` needs — but it means a membership test sees value tokens too.
+ * Round 2 of pre-ship review found both live consequences: `rg -t -g "sym"
+ * src/*.rs` yields `['-t','-g']`, whose bare `includes('-g')` made buildGrepArgs
+ * drop the path-derived glob and widen the scope — the exact defect this change
+ * exists to fix — and `grep --include -F "sym" src/` yields `['-g','-F']`, where
+ * `-F` is a filename glob and firing the literal-pattern guard on it is wrong.
+ */
+function cgFlagSet(flags) {
+  const out = new Set();
+  for (let i = 0; i < (flags || []).length; i++) {
+    const f = flags[i];
+    if (f === '-g' || f === '-t') { i++; continue; }  // skip its value
+    out.add(f);
+  }
+  return out;
+}
 // Canonical emission order, so the argv (and therefore the printed command) is a
 // function of WHICH flags were given, never of the order the user typed them.
 const CG_FLAG_ORDER = ['-i', '-w', '-F', '-l', '-c'];
@@ -319,7 +346,9 @@ const CG_FLAG_ORDER = ['-i', '-w', '-F', '-l', '-c'];
  */
 function extractCgFlags(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
-  const toks = firstShellClause(cmd).replace(VERB_STRIP, '').trim().split(/\s+/);
+  const clause = firstShellClause(cmd);
+  const isRg = RG_VERB.test((clause.match(GREP_HEAD) || [])[1] || '');
+  const toks = clause.replace(VERB_STRIP, '').trim().split(/\s+/);
   const found = new Set();
   const filters = [];  // [cgFlag, value] pairs, in the order the user wrote them
   const unquote = (s) => (s || '').replace(/^["']|["']$/g, '');
@@ -350,9 +379,14 @@ function extractCgFlags(cmd) {
     let consumed = false;
     for (let k = 0; k < letters.length; k++) {
       const ch = letters[k];
-      if (CG_VALUE_SHORT[ch]) {
+      if (isRg && CG_VALUE_SHORT[ch]) {
         const attached = letters.slice(k + 1);
         addFilter(CG_VALUE_SHORT[ch], attached ? unquote(attached) : unquote(toks[i + 1]));
+        // Consume the value token so the next pass cannot read it as a flag
+        // cluster: `rg -g -i 'sym' src/` must be `-g` with value `-i`, not `-g`
+        // plus a phantom `-i` (round 2 of pre-ship review — the test that named
+        // this property used a quoted value, which the quote guard already
+        // skipped, so it passed with the increment removed).
         if (!attached) { i++; }
         consumed = true;
         break;
@@ -846,7 +880,7 @@ function runMain() {
   // forwarding `-F` without this guard would make it search the wrong text.
   const cgFlags = extractCgFlags(cmd);
   const rawGrepPattern = pickBlockPattern(cmd);
-  const grepPattern = cgFlags.includes('-F')
+  const grepPattern = cgFlagSet(cgFlags).has('-F')
     ? rawGrepPattern
     : translateBreToRg(cmd, rawGrepPattern);
 
@@ -995,6 +1029,7 @@ module.exports = {
   classifyBlock,         // v0.49 — intent-aware block tiers
   classifyDeny,          // v0.144 — the deny gate: block-tier AND nothing discarded
   extractCgFlags,        // v0.144 — the grep's flags in cg's spelling
+  cgFlagSet,             // v0.144 — the boolean flags of that result, without values
   splitTopLevelSegments, // compound-grep — quote-aware top-level segment splitter (PostToolUse reuse)
   firstShellClause,      // v0.96 — grep's own clause (up to first top-level separator)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction

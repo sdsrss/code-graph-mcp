@@ -23,16 +23,20 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Po
 //
 // Reuses the PreToolUse pure predicates wholesale (feedback_hook_class_bug_sweep —
 // no inline copies of the grep gate): splitTopLevelSegments + classifyBlock pick
-// the foldable segment; pickBlockPattern / translateBreToRg / extractSearchPath +
-// sanitizeSearchPath + runGrepAnswer / runShowAnswer run the exact same answer the
-// deny path would have. Best-effort: any miss (no hits / unavailable / no binary)
+// the foldable segment; pickBlockPattern / translateBreToRg / extractCgFlags +
+// extractSearchPath + runGrepAnswer / runShowAnswer run the exact same answer the
+// deny path would have — including its flags and glob scope, which this hook did
+// NOT carry until v0.144 even as the deny path stopped taking these commands. Best-effort: any miss (no hits / unavailable / no binary)
 // exits silently with NO injection — an enhancement, never a new failure mode.
 
 const fs = require('fs');
 const path = require('path');
 const { cgTmpDir, cwdHash, makeCooldown } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, sanitizeSearchPath } = require('./cg-answer');
+// `sanitizeSearchPath` is deliberately NOT imported any more: this hook passes
+// the RAW path so buildGrepArgs can split a glob into scope + `-g` instead of
+// widening it away. Leaving the require behind would read as "still used".
+const { runGrepAnswer, runShowAnswer, runCallgraphAnswer } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
 const {
   splitTopLevelSegments,
@@ -40,6 +44,7 @@ const {
   pickBlockPattern,
   translateBreToRg,
   extractCgFlags,
+  cgFlagSet,
   extractSearchPath,
   normalizeCommandPaths,
   rebaseRelativePaths,
@@ -274,9 +279,38 @@ function runMain() {
   // if it stays visible: an unrecorded skip makes the whole class disappear from
   // the funnel, so "the compound case is covered by the inject" becomes a claim
   // nobody can check after ship. Pre-ship review found this before release.
+  // `hook:'grep'` and `action:'observe'`, NOT a new hook name — round 2 of
+  // pre-ship review caught round 1 inventing `hook:'grep-inject'/action:'skip'`
+  // and thereby breaking the metric this record was added to protect.
+  // `aggregate_recommendations_jsonl` (src/cli/usage.rs) clears `armed` on EVERY
+  // line it reads, but only scores lines whose hook is `grep`/`read`, so an
+  // unrecognized hook consumed the arm set by the preceding answered deny
+  // without scoring it — measured on a crafted log: one such line between an
+  // answered deny and its follow-up took `fallthrough_rate` from 1.0 to 0.0.
+  // `skip` was also absent from the `observe`/`use`/`live_impact` exclusions, so
+  // it inflated `s.total` and shifted `tool_calls_per_rec` across releases.
+  //
+  // `observe` is the honest bucket as well as the safe one: the grep ran and
+  // produced its own hits, so nothing was recommended. The aggregator already
+  // reads it as "acting on the answer — neither sustained nor fall-through" and
+  // excludes it from the recommendation total. `reason` distinguishes this skip
+  // from the cooldown observes when grepping the JSONL; no counter reads it.
+  //
+  // KNOWN CONSEQUENCE, measured rather than reasoned. The funnel scores only the
+  // IMMEDIATELY-next event after an answered deny, so making a previously-
+  // invisible grep visible moves that window onto it. On a three-line log
+  // (answered deny → this record → unanswered deny) `stats --json` reports
+  // total 2, observe 1, researched_after_answer 1, fallthrough_after_answer 0;
+  // without the middle line, fallthrough_after_answer is 1 and the rate is 1.0.
+  // That is the existing rule applied to an event that genuinely happened — the
+  // model DID run a search — not a new distortion, but it does mean
+  // `fallthrough_rate` is not comparable across this version boundary for
+  // sequences containing a compound grep. For a head-grep compound the arm was
+  // already being consumed by pre-grep-guide's own `observe`; the newly-affected
+  // shape is `echo x && grep …`, which recorded nothing before.
   if (grepFoundPattern(extractGrepOutput(input), rawPattern)) {
     recordRecommendation(root, {
-      hook: 'grep-inject', action: 'skip', reason: 'grep-hit-redundant',
+      hook: 'grep', action: 'observe', reason: 'grep-hit-redundant',
       ...(rawPattern ? { pattern: rawPattern } : {}),
     });
     return;
@@ -286,7 +320,7 @@ function runMain() {
   // unescape must not also run: `grep -F 'x\|y'` searches for `x\|y`, and
   // unescaping it to `x|y` searches for something else (verified against GNU
   // grep: `grep -Fc 'x\|y'` is 1 and `grep -Fc 'x|y'` is 0 on the same file).
-  const pattern = flags.includes('-F') ? rawPattern : translateBreToRg(segment, rawPattern);
+  const pattern = cgFlagSet(flags).has('-F') ? rawPattern : translateBreToRg(segment, rawPattern);
   // RAW path, not `sanitizeSearchPath`: buildGrepArgs splits `tests/*.mjs` into
   // scope + `-g`. The deny path got that in this release and this one did not,
   // while the same release routed MORE traffic here — so `grep -rln "X"

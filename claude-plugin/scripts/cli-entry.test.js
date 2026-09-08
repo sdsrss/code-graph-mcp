@@ -61,6 +61,20 @@ test('the plugin ships a launcher at the path Claude Code puts on PATH', () => {
   assert.ok(fs.existsSync(LAUNCHER_CMD), `${LAUNCHER_CMD} is missing — Windows PATHEXT needs it`);
 });
 
+// Round 2: nothing pinned the exit-code propagation, so deleting the line was a
+// green mutation. A source assertion rather than an execution one — this suite
+// runs on POSIX and cmd.exe is not available to prove it the honest way; what
+// CAN be pinned is that the line is present and last, which is where cmd.exe
+// requires it.
+test('the .cmd launcher propagates the exit code, on its last line', () => {
+  const lines = fs.readFileSync(LAUNCHER_CMD, 'utf8')
+    .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  assert.equal(lines[lines.length - 1].toLowerCase(), 'exit /b %errorlevel%',
+    'without this a non-zero `doctor` or a failed search looks like success to a wrapper');
+  assert.ok(lines.some((l) => /^node "%~dp0code-graph-mcp"/.test(l)),
+    'the .cmd must run the launcher beside it, not a second copy of its logic');
+});
+
 test('the launcher is executable', { skip: process.platform === 'win32' && 'POSIX mode bits' }, () => {
   const mode = fs.statSync(LAUNCHER).mode;
   assert.ok(

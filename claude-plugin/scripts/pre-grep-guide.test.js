@@ -43,6 +43,7 @@ const {
   classifyBlock,
   classifyDeny,
   extractCgFlags,
+  cgFlagSet,
   splitTopLevelSegments,
   firstShellClause,
   countNamedPaths,
@@ -1201,9 +1202,40 @@ test('extractCgFlags: --include is repeatable, not collapsed to the first', () =
 });
 
 test('extractCgFlags: a value token is not rescanned as a flag cluster', () => {
-  // `-g` consumes the next token; without that, a value like `-x.rs` would be
-  // read as a flag cluster on the following pass.
+  // Round 2: the first version of this test used a QUOTED value, which the
+  // `tok[0] === "'"` guard already skips — so it stayed green with the `i++`
+  // removed and pinned nothing. An unquoted, flag-shaped value is the witness.
+  assert.deepEqual(extractCgFlags(`rg -g -i 'some_symbol' src/`), ['-g', '-i'],
+    "`-i` here is -g's VALUE, not a flag of its own");
   assert.deepEqual(extractCgFlags(`rg -i -g '*.rs' "some_symbol" src/`), ['-i', '-g', '*.rs']);
+  assert.deepEqual(extractCgFlags(`grep --include -F "some_symbol" src/`), ['-g', '-F'],
+    "`-F` here is --include's VALUE");
+});
+
+test('cgFlagSet: membership sees the boolean flags, never a value', () => {
+  // `flags` is a flat argv fragment, so a value can equal a flag name. Both
+  // consumers (the -F literal guard, buildGrepArgs' glob check) must not be
+  // fooled by one.
+  assert.equal(cgFlagSet(['-g', '-F']).has('-F'), false, "--include's value is not -F");
+  assert.equal(cgFlagSet(['-F', '-g', '*.rs']).has('-F'), true);
+  assert.equal(cgFlagSet(['-t', '-g']).has('-g'), false, "-t's value is not -g");
+  assert.equal(cgFlagSet(['-i', '-g', '*.rs']).has('-i'), true);
+});
+
+test('extractCgFlags: rg-only short value flags are not read out of ag or grep', () => {
+  // `ag -t` means "all text files" and takes no value; ag's `-g` prints matching
+  // filenames. Mapping either fabricates an argument the user never wrote.
+  assert.deepEqual(extractCgFlags(`ag -t "some_symbol" src/`), []);
+  assert.deepEqual(extractCgFlags(`ag -g "some_symbol" src/`), []);
+  assert.deepEqual(extractCgFlags(`grep -t "some_symbol" src/`), []);
+  assert.deepEqual(extractCgFlags(`rg -t rust "some_symbol" src/`), ['-t', 'rust']);
+});
+
+test('extractCgFlags: --type long form maps for every folded verb', () => {
+  // The long spellings are unambiguous, so they are NOT gated on the verb —
+  // only the short forms are. Round 2 found only the short `-t` asserted.
+  assert.deepEqual(extractCgFlags(`rg --type rust "some_symbol" src/`), ['-t', 'rust']);
+  assert.deepEqual(extractCgFlags(`rg --type=rust "some_symbol" src/`), ['-t', 'rust']);
 });
 
 test('buildNoHitsFyi: names the pattern and says raw grep proceeds', () => {
@@ -1426,6 +1458,24 @@ test('e2e: without -F the BRE alternation is still unescaped for cg', (t) => {
     const out = JSON.parse(runHook(cmd, fixture).stdout);
     assert.match(out.hookSpecificOutput.permissionDecisionReason,
       new RegExp(`ARGV\\[grep ${uniq}\\|other_symbol src/\\]`));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// Round 2: `flags` reached the show-mode FALLBACK call site in neither hook's
+// test, so dropping it there was a green mutation in both. The stub refuses
+// `show` so the fallback is the path under test.
+test('e2e: the show-mode fallback to grep also carries the flags', (t) => {
+  const uniq = `StubShowFb${Date.now()}`;
+  const fixture = e2eFixture(
+    `if (process.argv[2] === 'show') process.exit(1);\n` +
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `grep -iA3 "fn ${uniq}" src/`;
+  try {
+    const out = JSON.parse(runHook(cmd, fixture).stdout);
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, /ARGV\[grep -i /, `the fallback dropped -i: ${reason}`);
   } finally {
     cleanupFixture(fixture, cmd);
   }

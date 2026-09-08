@@ -140,8 +140,24 @@ function buildGrepArgs({ pattern, searchPath, flags = [] } = {}) {
   const { scope, glob } = splitSearchPathGlob(searchPath);
   const args = ['grep', ...flags, pattern];
   if (scope) args.push(scope);
-  if (glob && !flags.includes('-g')) args.push('-g', glob);
+  // `hasGlobFlag`, not `flags.includes('-g')`: `flags` is a flat argv fragment,
+  // so a VALUE can equal a flag name. `rg -t -g "sym" src/*.rs` yields
+  // `['-t','-g']` — `-g` there is the VALUE of `-t` — and the bare membership
+  // test dropped the path-derived glob, widening `src/*.rs` to `src`. That is
+  // the defect this function exists to fix, reintroduced one layer up (round 2
+  // of pre-ship review).
+  if (glob && !hasGlobFlag(flags)) args.push('-g', glob);
   return args;
+}
+
+// True when `flags` carries a real `-g` (an explicit `--include`/`--glob`), as
+// opposed to the string `-g` sitting in a value position.
+function hasGlobFlag(flags) {
+  for (let i = 0; i < (flags || []).length; i++) {
+    if (flags[i] === '-g') return true;
+    if (flags[i] === '-t') i++;  // skip its value
+  }
+  return false;
 }
 
 // Render an argv as the command a human can paste. Single-quote anything that
