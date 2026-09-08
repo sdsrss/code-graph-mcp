@@ -21,6 +21,7 @@ const MARKETPLACE_NAME = 'code-graph-mcp';
 // here: `CACHE_DIR` and `INSTALL_LOCK_FILE` are exported and still are;
 // `MANIFEST_FILE` is module-private and always was, so nothing importable moved.
 const { CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
+const { tryAcquireLock } = require('./install-lock');
 // Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
 // 2 s matches the other hook-path probes; the floor is what a budget-exhausted
 // hook still gives it, since an empty list degrades to recency-only.
@@ -1980,35 +1981,116 @@ function removeCacheResidue() {
   // absent, empty, or already fully unadopted (the normal SessionStart teardown
   // order, which unadopts first) strands nothing, and re-creating CACHE_DIR to
   // hold `[]` would just be new residue.
-  let registryPath = null;
-  let registry = null;
-  try {
-    registryPath = require('./adopt').adoptedRegistryFile();
-    const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
-    if (raw) {
-      let parsed = null;
-      let usable = true;
-      try { parsed = JSON.parse(raw.toString('utf8')); } catch { usable = false; }
-      // Preserve a NON-EMPTY list (projects still carry a block) and anything we
-      // could not READ as a list. The unusable case used to fall into the same
-      // "nothing to preserve" catch as a missing file — the strictly worse
-      // outcome, since a registry we cannot parse is the one whose contents we
-      // are least able to reconstruct, and the sweep above deliberately skips it
-      // rather than guessing. Only a genuinely EMPTY array strands nothing and
-      // is allowed to go with the cache dir.
-      if (!usable || !Array.isArray(parsed) || parsed.length) registry = raw;
-    }
-  } catch { /* POSIX-only helper or an unreadable path — nothing to preserve */ }
-  try {
-    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
-  } catch { return false; }
-  if (registryPath && registry) {
-    try {
-      fs.mkdirSync(path.dirname(registryPath), { recursive: true });
-      fs.writeFileSync(registryPath, registry);
-    } catch { /* best-effort: the binary is still reclaimed */ }
+  // JS-33. This used to read the registry into MEMORY, wipe, and write it back.
+  // The bytes existed in exactly one place — this process's heap — for the whole
+  // window, so a failure on the write lost the only record of which repos carry
+  // a managed block, and the function still returned success. It is now
+  // rename-aside: after the rename the bytes are on disk under a name the wipe
+  // cannot reach, so every later step is recoverable and a crash is recoverable
+  // by the NEXT run rather than by nothing.
+  //
+  // The stash and the lock sit in the PARENT of CACHE_DIR, deliberately. A
+  // sibling inside it would be deleted by the very `rmSync` it is there to
+  // survive — the mistake an earlier attempt at this fix shipped.
+  const reclaimLock = path.join(path.dirname(CACHE_DIR), '.code-graph-reclaim.lock');
+  const stash = path.join(path.dirname(CACHE_DIR), '.code-graph-adopted-projects.reclaim');
+
+  // Mutual exclusion FIRST, before even deciding whether anything needs
+  // preserving. Two concurrent reclaims are what destroyed the registry in the
+  // withdrawn version of this fix: peer A renames the registry aside, peer B
+  // then reads "no registry, nothing to preserve" and wipes — and B's wipe can
+  // land after A has restored, taking the restored file with it. Deciding under
+  // the lock closes that window, and it is why the `busy` arm returns without
+  // wiping rather than falling through to a lock-free wipe.
+  const lock = tryAcquireLock(reclaimLock);
+  if (!lock.ok) {
+    // busy: a peer is reclaiming this same directory — it will finish the job,
+    // and racing it is exactly the bug. unavailable: no mutual exclusion is
+    // possible here at all, so a destructive step must not assume it has any.
+    // Either way this call removed nothing, which is what `false` says.
+    return false;
   }
-  return true;
+  try {
+    let registryPath = null;
+    try {
+      registryPath = require('./adopt').adoptedRegistryFile();
+    } catch { /* POSIX-only helper — nothing to preserve */ }
+
+    // Crash recovery, before anything else: a stash with no registry beside it
+    // is a previous run that died between the rename and the restore. Put it
+    // back first, so this run's own preserve/discard decision reads the real
+    // registry rather than concluding there is nothing to keep.
+    if (registryPath && fs.existsSync(stash) && !fs.existsSync(registryPath)) {
+      try {
+        fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+        fs.renameSync(stash, registryPath);
+      } catch { /* leave it; the decision below simply sees no registry */ }
+    }
+
+    let stashed = false;
+    if (registryPath) {
+      try {
+        const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
+        if (raw) {
+          let parsed = null;
+          let usable = true;
+          try { parsed = JSON.parse(raw.toString('utf8')); } catch { usable = false; }
+          // Preserve a NON-EMPTY list (projects still carry a block) and
+          // anything we could not READ as a list. The unusable case used to fall
+          // into the same "nothing to preserve" catch as a missing file — the
+          // strictly worse outcome, since a registry we cannot parse is the one
+          // whose contents we are least able to reconstruct, and the sweep
+          // deliberately skips it rather than guessing. Only a genuinely EMPTY
+          // array strands nothing and is allowed to go with the cache dir.
+          if (!usable || !Array.isArray(parsed) || parsed.length) {
+            fs.renameSync(registryPath, stash);
+            stashed = true;
+          }
+        }
+      } catch {
+        // Could not read or could not move it. Preserving is the whole point, so
+        // do NOT wipe on a guess — that is the data loss this function exists to
+        // prevent, and the cache costs a re-download, not a record nothing else
+        // holds.
+        if (!stashed) return false;
+      }
+    }
+
+    try {
+      fs.rmSync(CACHE_DIR, { recursive: true, force: true });
+    } catch {
+      // Put it back before giving up, so a failed reclaim leaves the tree as it
+      // was found rather than with the registry parked under a dot-name.
+      if (stashed) {
+        try {
+          fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+          fs.renameSync(stash, registryPath);
+        } catch { /* the next run's crash recovery restores it */ }
+      }
+      return false;
+    }
+
+    if (stashed) {
+      try {
+        fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+        fs.renameSync(stash, registryPath);
+      } catch {
+        // The bytes are still at `stash`, and the next call restores them.
+        // Reporting `true` is accurate: the cache WAS reclaimed, and unlike the
+        // version this replaces, nothing was lost.
+        //
+        // Take back the directory the mkdir above just created, though: leaving
+        // a freshly-made empty CACHE_DIR behind would contradict the `true` this
+        // returns and hand the next `isPluginUninstalled` probe a directory that
+        // exists for no reason. rmdir removes it only while it is empty, so a
+        // partial restore is never destroyed by this.
+        try { fs.rmdirSync(path.dirname(registryPath)); } catch { /* not empty, or never made */ }
+      }
+    }
+    return true;
+  } finally {
+    lock.release();
+  }
 }
 
 module.exports = {

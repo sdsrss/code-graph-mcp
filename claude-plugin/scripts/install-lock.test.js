@@ -9,7 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { acquireLock } = require('./install-lock');
+const { acquireLock, tryAcquireLock } = require('./install-lock');
 
 function mkLockPath(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lock-'));
@@ -52,4 +52,48 @@ test('fresh unreadable lock is respected (treated as held)', (t) => {
   const lockPath = mkLockPath(t);
   fs.writeFileSync(lockPath, 'not-json'); // fresh mtime, no pid to probe
   assert.equal(acquireLock(lockPath), null);
+});
+
+test('tryAcquireLock separates "a peer holds it" from "it could not be created"', (t) => {
+  // `acquireLock`'s single `null` conflates the two, and a caller about to
+  // destroy something needs opposite behaviour in each: a peer holding the lock
+  // means the work is already being done and standing down is safe, while an
+  // uncreatable lock means NO mutual exclusion exists here and a destructive
+  // step must not assume it has any. removeCacheResidue() is that caller.
+  const lockPath = mkLockPath(t);
+
+  const held = tryAcquireLock(lockPath);
+  assert.equal(held.ok, true, 'a free lock is taken');
+
+  const contended = tryAcquireLock(lockPath);
+  assert.equal(contended.ok, false);
+  assert.equal(contended.reason, 'busy', 'a live holder reads as busy, not as a failure');
+  held.release();
+
+  // Unavailable: the lock's parent cannot be made a directory, because a
+  // regular file already occupies that path. The reason has to come from the
+  // syscall — an existsSync afterwards could not tell this apart from a peer
+  // that created the file between our call and our check.
+  const blocker = path.join(path.dirname(lockPath), 'blocker');
+  fs.writeFileSync(blocker, 'not a directory');
+  const broken = tryAcquireLock(path.join(blocker, 'nested', 'install.lock'));
+  assert.equal(broken.ok, false);
+  assert.equal(broken.reason, 'unavailable', 'a lock that cannot exist is not "busy"');
+  assert.ok(broken.error, 'and it carries the errno that said so');
+});
+
+test('acquireLock keeps its contract on top of tryAcquireLock', (t) => {
+  // One implementation, two entry points: the wrapper must not develop its own
+  // idea of which errno counts as held.
+  const lockPath = mkLockPath(t);
+  const first = acquireLock(lockPath);
+  assert.ok(first && typeof first.release === 'function');
+  assert.equal(acquireLock(lockPath), null, 'busy still reads as null');
+  first.release();
+  const blocker = path.join(path.dirname(lockPath), 'blocker2');
+  fs.writeFileSync(blocker, 'not a directory');
+  assert.equal(
+    acquireLock(path.join(blocker, 'nested', 'install.lock')), null,
+    'and so does unavailable',
+  );
 });

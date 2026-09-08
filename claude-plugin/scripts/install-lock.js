@@ -25,24 +25,55 @@ function lockIsStale(lockPath, staleMs) {
 }
 
 /**
- * Try to take the lock. Returns `{ release() }` on success, null when another
- * live process holds it. Never throws, never blocks.
+ * Try to take the lock, saying WHY when it fails.
+ *
+ * Returns `{ ok: true, release() }`, `{ ok: false, reason: 'busy' }` when a live
+ * peer holds it, or `{ ok: false, reason: 'unavailable', error }` when the lock
+ * could not be created at all (unwritable parent, EPERM, EROFS).
+ *
+ * The distinction is not cosmetic, and `acquireLock`'s single `null` is why this
+ * exists. A caller that is about to destroy something needs opposite behaviour
+ * in the two cases: `busy` means a peer is already doing this work, so standing
+ * down is correct and safe; `unavailable` means NO mutual exclusion is possible
+ * here, so a destructive step must not proceed on the assumption that it has
+ * any. Both used to arrive as `null`. And the reason must come from the syscall
+ * — an `existsSync` after the fact cannot tell "a peer created it between my
+ * call and my check" from "my create failed for its own reasons".
+ *
+ * Never throws, never blocks.
  */
-function acquireLock(lockPath, { staleMs = STALE_MS } = {}) {
-  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { return null; }
+function tryAcquireLock(lockPath, { staleMs = STALE_MS } = {}) {
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  } catch (error) {
+    return { ok: false, reason: 'unavailable', error };
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, 'wx');
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
       fs.closeSync(fd);
-      return { release: () => { try { fs.unlinkSync(lockPath); } catch { /* ok */ } } };
+      return { ok: true, release: () => { try { fs.unlinkSync(lockPath); } catch { /* ok */ } } };
     } catch (e) {
-      if (!e || e.code !== 'EEXIST') return null;
-      if (!lockIsStale(lockPath, staleMs)) return null;
+      if (!e || e.code !== 'EEXIST') return { ok: false, reason: 'unavailable', error: e };
+      if (!lockIsStale(lockPath, staleMs)) return { ok: false, reason: 'busy' };
       try { fs.unlinkSync(lockPath); } catch { /* another reclaimer won — retry loop */ }
     }
   }
-  return null;
+  // Both attempts lost the reclaim race: someone else is live and holding it.
+  return { ok: false, reason: 'busy' };
 }
 
-module.exports = { acquireLock, STALE_MS };
+/**
+ * Try to take the lock. Returns `{ release() }` on success, null when another
+ * live process holds it. Never throws, never blocks.
+ *
+ * Thin wrapper over `tryAcquireLock` — one implementation, so the two entry
+ * points cannot drift on which errno counts as "held".
+ */
+function acquireLock(lockPath, opts = {}) {
+  const r = tryAcquireLock(lockPath, opts);
+  return r.ok ? { release: r.release } : null;
+}
+
+module.exports = { acquireLock, tryAcquireLock, STALE_MS };
