@@ -3865,16 +3865,24 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
         "the matcher no longer recognises the associated-function spelling"
     );
 
-    // The two sites that need IMMEDIATE and cannot use a SAVEPOINT to get it.
-    // Both are reached only from `spawn_startup_repair`'s own thread and
-    // connection, never from inside `rebuild_index`'s transaction, so neither
-    // can abort an enclosing one. Listed rather than pattern-excused: a new
-    // bare BEGIN must argue for itself here, in this file, where the reason is
-    // read alongside the rule.
-    const IMMEDIATE_EXEMPT: [&str; 2] = [
-        "src/storage/queries/vectors.rs",
-        "src/storage/queries/embedding_cache.rs",
-    ];
+    // Exemptions are per-SITE, marked at the call itself, never per-file.
+    //
+    // The first version of this exemption keyed on the file, because the two
+    // legitimate IMMEDIATE sites happened to live in two files. But the
+    // justification is about the CALL — "reached only from
+    // `spawn_startup_repair`'s own thread and connection, never from inside
+    // `rebuild_index`'s transaction" — and a file is not a call. Pre-ship review
+    // 2026-09-08 measured the gap: `Transaction::new_unchecked` planted as the
+    // first statement of `insert_node_vectors_batch`, which IS reached from
+    // `index_files` (via `build_context_strings_and_embed` -> `embed_and_store_batch`)
+    // and therefore CAN sit inside the rebuild's transaction, left this guard
+    // GREEN. A file-wide exemption silently covered a function the reason never
+    // covered.
+    //
+    // The marker has to sit on the offending line or the one above it, so the
+    // argument is read where the call is, and a second bare BEGIN elsewhere in
+    // the same file gets none of its predecessor's licence.
+    const BARE_BEGIN_OK: &str = "bare-begin-ok:";
 
     let mut offenders = Vec::new();
     for path in &files {
@@ -3893,19 +3901,20 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
             Some(i) => &src[..i],
             None => &src[..],
         };
-        let exempt = IMMEDIATE_EXEMPT
-            .iter()
-            .any(|e| path.to_string_lossy().replace('\\', "/").ends_with(e));
-        for (n, line) in body.lines().enumerate() {
+        let raw: Vec<&str> = body.lines().collect();
+        for (n, line) in raw.iter().enumerate() {
             let code = code_only(line);
             if !BARE_BEGIN.iter().any(|pat| code.contains(pat)) {
                 continue;
             }
-            // An exempt FILE is not an exempt method: the exemption exists for
-            // the IMMEDIATE-behaviour sites, and `.unchecked_transaction()` in
-            // one of those files would still be an ordinary bare BEGIN with a
-            // savepoint available.
-            if exempt && code.contains(BARE_BEGIN[1]) {
+            // Read the marker from the RAW line, not from `code_only` output —
+            // it is a comment, and `code_only` exists to throw comments away.
+            let marked =
+                line.contains(BARE_BEGIN_OK) || (n > 0 && raw[n - 1].contains(BARE_BEGIN_OK));
+            // Only the associated-function spelling can be excused at all.
+            // `.unchecked_transaction()` has a savepoint available in every
+            // position, so there is no argument to make for it.
+            if marked && code.contains(BARE_BEGIN[1]) {
                 continue;
             }
             offenders.push(format!("{}:{}", path.display(), n + 1));

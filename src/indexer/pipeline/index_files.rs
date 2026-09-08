@@ -2272,6 +2272,29 @@ pub(super) fn index_files(
         if all_indexed.len() + delete_paths.len() >= STATS_REFRESH_MIN_FILES {
             db.refresh_query_stats();
         }
+        // A run whose deferred pass or pending sweep produced edges goes GLOBAL,
+        // whatever the file count said.
+        //
+        // `restore_inbound_edges` deliberately SKIPS sources that are in this
+        // run and requeues the rest, and `resolve_deferred_relations` re-binds
+        // the target BY NAME against the whole tree. So such a run can create an
+        // `imports` edge whose source and target are both files it never opened
+        // — which moves `cg_imports` / `cg_unique_imports` for a file no arm of
+        // the scope reaches. 2e survives that (the requeue implies a node-count
+        // change inside a scope file, so the name arm carries it), but 2d-bind
+        // and 2d-prune have no name arm and no equivalent, and the completeness
+        // argument's first bullet claimed an invariant that does not hold here
+        // (pre-ship review 2026-09-08, HIGH; no reproducer landed, so this is
+        // the conservative reading rather than a fix to a demonstrated bug).
+        //
+        // Cheap where it matters: the interactive one-file refresh this whole
+        // change exists for resolves nothing deferred and sweeps nothing pending
+        // in the ordinary case, so it keeps the scoped path.
+        let post_pass_scope = if deferred_edges > 0 || pending_resolved > 0 {
+            super::resolve::PostPassScope::Global
+        } else {
+            post_pass_scope
+        };
         // Finish the scope now that the run's writes are done: file ids are
         // current, and the name-count drift is measurable against the snapshot
         // taken before Phase 0.

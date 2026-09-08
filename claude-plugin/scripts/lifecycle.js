@@ -781,7 +781,24 @@ function reportUnadoptSweep(entries) {
       lines.push('             Your own text outside the block was kept; .code-graph/ index dirs are untouched.');
     }
     if (failed.length) {
-      lines.push(`[code-graph] Could NOT clean ${failed.length} project(s) — remove the block by hand or run \`code-graph-mcp unadopt\` there:`);
+      // Issue #41's third printer. The other two now spend `unadoptCommand()`,
+      // and that IS still runnable at the instant this line prints — the reclaim
+      // below never touches the plugin's script dir. But this is advice acted on
+      // minutes or days later, in OTHER repositories, and the plugin directory is
+      // Claude Code's to reap once the uninstall settles. A path into it is
+      // correct-when-printed and possibly-stale-when-pasted, and the bare name it
+      // replaced was never runnable for a plugin-only install at all.
+      //
+      // So lead with the remedy that cannot go stale: the block is
+      // sentinel-delimited, so deleting the lines between the two markers is a
+      // complete instruction that needs no tooling, no network and no surviving
+      // install. The tool route follows it, named as optional.
+      const { SENTINEL_BEGIN, SENTINEL_END } = require('./adopt');
+      lines.push(`[code-graph] Could NOT clean ${failed.length} project(s). In each CLAUDE.md below, delete`);
+      lines.push(`             everything from  ${SENTINEL_BEGIN}`);
+      lines.push(`             through          ${SENTINEL_END}`);
+      lines.push('             (your own text outside those markers is not ours to remove), or run');
+      lines.push('             `npx -y @sdsrs/code-graph unadopt` in the project:');
       for (const p of failed.slice(0, 10)) lines.push(`             ${p}`);
     }
     process.stderr.write(lines.join('\n') + '\n');

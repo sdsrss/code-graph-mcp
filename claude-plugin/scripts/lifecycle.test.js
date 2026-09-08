@@ -2129,3 +2129,45 @@ test('a live peer holding the reclaim lock makes this call stand down', (t) => {
   assert.equal(after, 'true');
   assert.equal(fs.existsSync(cacheDir), false);
 });
+
+test('the unadopt sweep names a remedy that survives the plugin being removed', () => {
+  // Issue #41's third printer, found in pre-ship review 2026-09-08. This line
+  // used to say "run `code-graph-mcp unadopt` there" — the exact command a
+  // plugin-only install cannot run, which is what the issue reported. It is
+  // also the one remedy in the codebase that is READ later and in a DIFFERENT
+  // repository, so even a correct path into the plugin cache would be a path
+  // Claude Code may have reaped by the time it is pasted. The block is
+  // sentinel-delimited, so the markers are a complete instruction that needs no
+  // tooling, no network and no surviving install.
+  const { reportUnadoptSweep, SENTINEL_BEGIN, SENTINEL_END } = (() => {
+    const l = require('./lifecycle');
+    const a = require('./adopt');
+    return { reportUnadoptSweep: l.reportUnadoptSweep, SENTINEL_BEGIN: a.SENTINEL_BEGIN, SENTINEL_END: a.SENTINEL_END };
+  })();
+  const orig = process.stderr.write.bind(process.stderr);
+  let out = '';
+  process.stderr.write = (s) => { out += s; return true; };
+  try {
+    reportUnadoptSweep([{ project: '/repo/a', cleaned: false, failed: true }]);
+  } finally {
+    process.stderr.write = orig;
+  }
+
+  assert.ok(out.includes(SENTINEL_BEGIN), `the begin marker must be named verbatim:\n${out}`);
+  assert.ok(out.includes(SENTINEL_END), `the end marker must be named verbatim:\n${out}`);
+  assert.ok(
+    !/`code-graph-mcp unadopt`/.test(out),
+    `the bare binary name is the unrunnable spelling issue #41 reported:\n${out}`,
+  );
+  assert.ok(out.includes('/repo/a'), 'the project that could not be cleaned must still be listed');
+
+  // Negative control: a clean sweep says none of this.
+  let clean = '';
+  process.stderr.write = (s) => { clean += s; return true; };
+  try {
+    reportUnadoptSweep([{ project: '/repo/b', cleaned: true }]);
+  } finally {
+    process.stderr.write = orig;
+  }
+  assert.ok(!clean.includes(SENTINEL_BEGIN), 'a successful sweep must not print hand-removal instructions');
+});

@@ -180,6 +180,11 @@ pub fn gc_embedding_cache(conn: &Connection) -> Result<usize> {
     // the fix is identical and keeping them symmetric avoids a sibling-hole. blake3 is not a SQL
     // function, so the live set must be built in Rust — hence enumerate-then-delete, not a set
     // DELETE.
+    // `gc_embedding_cache` has exactly one production caller, `spawn_startup_repair`
+    // (mcp/server/mod.rs), which runs on its own thread with its own connection —
+    // never inside `rebuild_index`'s transaction, so there is no enclosing one to
+    // abort. IMMEDIATE is required here and a SAVEPOINT cannot supply it.
+    // bare-begin-ok: startup-repair thread only; needs IMMEDIATE
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     // Empty-nodes valve (see reap_orphan_vectors): never prune against a mid-rebuild / version-
     // bump wipe transient — that would delete the ENTIRE cache and turn the next rebuild back into

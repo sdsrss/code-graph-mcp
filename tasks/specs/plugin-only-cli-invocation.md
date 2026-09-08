@@ -45,8 +45,16 @@ never on PATH.
   every teammate, and `buildBlock()`'s byte-determinism (`:104-105`) is what
   `needsRefresh()` uses to detect drift — machine-varying content would make
   every session rewrite the block and churn the repo.
-- Not touching `formatResult()` (`adopt.js:866`): that text is only reached by
-  someone who just ran `code-graph-mcp adopt`, so the bare name is correct there.
+- ~~Not touching `formatResult()` (`adopt.js:866`): that text is only reached by
+  someone who just ran `code-graph-mcp adopt`, so the bare name is correct
+  there.~~ **Withdrawn 2026-09-08 — the premise was false.** A plugin-only user
+  cannot reach `formatResult` through `code-graph-mcp adopt` at all: the cached
+  binary has no `adopt.js` beside it to re-exec, so that command exits 1. The
+  population that DOES reach this printer is the one running
+  `node <plugin>/claude-plugin/scripts/adopt.js` — exactly the invocation
+  SessionStart now hands them — and for them the bare name in the `Reverse:`
+  line is the unrunnable spelling this whole spec exists to remove. Fixed in
+  `2446874`; the two printers now share one `unadoptCommand()` in adopt.js.
 - Not touching `doctor.js` / `README.md` `npm install -g` guidance: those are
   install instructions, not invocations of an assumed-present binary.
 

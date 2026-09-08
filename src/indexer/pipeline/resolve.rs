@@ -428,11 +428,15 @@ pub(super) enum PostPassScope {
     /// Completeness, per pass — each reads only these inputs:
     ///
     /// * 2d-bind and 2d-prune read the caller file's own nodes and import edges
-    ///   plus the target node's name and id. All of those change only when the
-    ///   caller's file or the target's file was re-indexed this run, so the two
-    ///   file arms cover them. An edge inserted mid-run by the pending sweep or
-    ///   the deferred pass has its target in a file this run indexed (that is why
-    ///   it resolved), or its source there (that is why it was re-extracted).
+    ///   plus the target node's name and id. Those change when the caller's file
+    ///   or the target's file was re-indexed this run, which the two file arms
+    ///   cover — but NOT only then, and an earlier version of this comment
+    ///   claimed otherwise. `restore_inbound_edges` skips sources that are in
+    ///   the run and requeues the rest, and the deferred pass re-binds by NAME
+    ///   against the whole tree, so a run can mint an `imports` edge between two
+    ///   files it never opened. Neither pass has a name arm, so `index_files`
+    ///   sends any run that produced deferred or pending edges down `Global`
+    ///   instead of trying to bound it (pre-ship review 2026-09-08).
     /// * 2e-confidence additionally reads `COUNT(*)` of same-name, same-language
     ///   nodes — a GLOBAL input. A node appearing or vanishing anywhere flips the
     ///   confidence of edges between two files that did not change, so the name
@@ -472,15 +476,22 @@ impl PostPassScope {
 /// the run does — so their counts cannot move, and counting all 48,084 of them
 /// would spend the 29 ms this is meant to save.
 pub(super) fn snapshot_scope_name_counts(conn: &rusqlite::Connection) -> Result<()> {
+    // Keyed (name, LANGUAGE), because that is how `cg_namecount` — the input
+    // Phase 2e classifies from — is keyed. Grouping by name alone made a name
+    // MOVING between languages invisible: python `helper` falling 2 -> 1 while a
+    // javascript `helper` appears leaves the name-only count at 1 both sides, so
+    // `helper` never entered the scope and an edge between two untouched files
+    // kept an `ambiguous` a rebuild calls `inferred` (pre-ship review
+    // 2026-09-08, reproduced).
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_namecount_before;
          CREATE TEMP TABLE cg_namecount_before AS
-           SELECT n.name AS nm, COUNT(*) AS cnt
+           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_scope_paths p ON p.path = f.path
-           GROUP BY n.name;
-         CREATE INDEX cg_namecount_before_k ON cg_namecount_before(nm);",
+           GROUP BY n.name, f.language;
+         CREATE INDEX cg_namecount_before_k ON cg_namecount_before(nm, lang);",
     )?;
     Ok(())
 }
@@ -492,24 +503,31 @@ pub(super) fn snapshot_scope_name_counts(conn: &rusqlite::Connection) -> Result<
 /// was renamed away) drops other files' edges from `ambiguous` back to
 /// `inferred`, which is as much a change as gaining one.
 pub(super) fn scope_names_from_count_drift(conn: &rusqlite::Connection) -> Result<usize> {
+    // The pairs are compared on (nm, lang); the SCOPE is the set of NAMES those
+    // pairs mention, because the classify arm joins `tgt.name` and picks the
+    // language up from `cg_namecount` afterwards. `IS NOT` rather than `<>` so a
+    // pair present on one side and absent on the other (NULL cnt) counts as
+    // drift, and `lang IS b.lang` because `files.language` is nullable.
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_namecount_after;
          CREATE TEMP TABLE cg_namecount_after AS
-           SELECT n.name AS nm, COUNT(*) AS cnt
+           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_scope_paths p ON p.path = f.path
-           GROUP BY n.name;
-         CREATE INDEX cg_namecount_after_k ON cg_namecount_after(nm);
+           GROUP BY n.name, f.language;
+         CREATE INDEX cg_namecount_after_k ON cg_namecount_after(nm, lang);
          DROP TABLE IF EXISTS temp.cg_scope_names;
          CREATE TEMP TABLE cg_scope_names AS
-           SELECT b.nm AS nm FROM cg_namecount_before b
-             LEFT JOIN cg_namecount_after a ON a.nm = b.nm
-             WHERE a.cnt IS NOT b.cnt
-           UNION
-           SELECT a.nm AS nm FROM cg_namecount_after a
-             LEFT JOIN cg_namecount_before b ON b.nm = a.nm
-             WHERE b.cnt IS NOT a.cnt;
+           SELECT DISTINCT nm FROM (
+             SELECT b.nm AS nm FROM cg_namecount_before b
+               LEFT JOIN cg_namecount_after a ON a.nm = b.nm AND a.lang IS b.lang
+               WHERE a.cnt IS NOT b.cnt
+             UNION ALL
+             SELECT a.nm AS nm FROM cg_namecount_after a
+               LEFT JOIN cg_namecount_before b ON b.nm = a.nm AND b.lang IS a.lang
+               WHERE b.cnt IS NOT a.cnt
+           );
          CREATE INDEX cg_scope_names_k ON cg_scope_names(nm);
          DROP TABLE IF EXISTS temp.cg_namecount_before;
          DROP TABLE IF EXISTS temp.cg_namecount_after;",

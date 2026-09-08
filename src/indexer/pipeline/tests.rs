@@ -4847,3 +4847,65 @@ fn deleting_the_duplicate_puts_the_untouched_edge_back() {
         "an incrementally grown index must carry the same confidences as a rebuild of the same tree"
     );
 }
+
+#[test]
+fn a_name_moving_across_languages_hides_the_drift_from_the_name_scope() {
+    // `cg_namecount` — the input Phase 2e classifies from — is keyed
+    // (name, LANGUAGE). `snapshot_scope_name_counts` /
+    // `scope_names_from_count_drift` count `GROUP BY n.name` only. So a run that
+    // moves a name from a Python file to a JavaScript file inside its own scope
+    // leaves the name-only count UNCHANGED (1 before, 1 after) while the
+    // (helper, python) count really did fall from 2 to 1.
+    //
+    // The edge that has to be relabelled runs between two files the run never
+    // opened, so neither file arm reaches it, and the name arm does not carry
+    // `helper` because no drift was observed. Incremental keeps `ambiguous`;
+    // a rebuild of the same tree says `inferred`.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+    fs::write(src.join("x.py"), "def helper():\n    pass\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let edge_of = |rows: &[(String, String, String, String)]| -> Option<String> {
+        rows.iter()
+            .find(|(s, r, t, _)| s == "src/b.py:caller" && r == REL_CALLS && t == "src/a.py:helper")
+            .map(|(_, _, _, c)| c.clone())
+    };
+    let before = graph_projection_with_confidence(&db);
+    assert_eq!(
+        edge_of(&before).as_deref(),
+        Some("ambiguous"),
+        "precondition: two python `helper`s, so the cross-file call is ambiguous: {before:?}"
+    );
+
+    // ONE run, two files: x.py loses `helper`, x.js gains one. Name-only count
+    // over this run's paths: `helper` = 1 before, 1 after — no drift observed.
+    fs::write(src.join("x.py"), "def other():\n    pass\n").unwrap();
+    fs::write(src.join("x.js"), "function helper() {}\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+    assert_eq!(
+        edge_of(&full).as_deref(),
+        Some("inferred"),
+        "control: a rebuild sees one python `helper` and labels the edge inferred: {full:?}"
+    );
+    assert_eq!(
+        edge_of(&inc).as_deref(),
+        Some("inferred"),
+        "the python `helper` count fell 2 -> 1, so the untouched b.py -> a.py edge must be \
+         reclassified — but the drift snapshot groups by name only, so `helper` never \
+         entered cg_scope_names: {inc:?}"
+    );
+}

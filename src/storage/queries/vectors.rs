@@ -242,7 +242,13 @@ pub fn get_node_embedding(conn: &Connection, node_id: i64) -> Result<Vec<u8>> {
 // --- Unembedded nodes ---
 
 /// Get (node_id, context_string) for nodes that have context strings but no vectors.
-/// Returns at most `limit` rows per call to bound memory usage.
+/// Returns at most `limit` rows per call.
+///
+/// The `limit` bounds the ROWS, not the work: the ranking underneath is a GROUP
+/// BY over every node joined onto every edge, and it is computed in full before
+/// the first row exists. [`UnembeddedQueue`] is what the backfill loops use for
+/// that reason; this remains as the single-shot query and as that queue's test
+/// oracle.
 pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
     // Priority: embed hot-path nodes first (most referenced = highest value for search)
     // Uses LEFT JOIN + GROUP BY instead of correlated subquery for better performance
@@ -283,17 +289,21 @@ pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64,
 ///   its context strings are fetched, so a node another process embedded in the
 ///   meantime is dropped rather than re-embedded.
 /// * **Termination.** The loops stop on an empty chunk. Exhausting the snapshot
-///   is not "empty" — the queue rebuilds once and keeps going, so nodes that
-///   became embeddable mid-run are picked up. Only a rebuild that yields nothing
-///   new reports empty.
+///   is not "empty" — the queue rebuilds and keeps going, so nodes that became
+///   embeddable mid-run are picked up. Only a snapshot that offered no
+///   candidate at all reports empty.
+///
+/// The trade it does make is memory: `ranked` holds every unembedded id for the
+/// life of the drain — 379 KB on the django corpus above, ~8 MB at a million
+/// nodes — where the per-batch query held `limit` rows at a time.
 pub struct UnembeddedQueue {
     ranked: Vec<i64>,
     pos: usize,
-    /// True while the current snapshot has not yielded a single row since it was
-    /// built. Walking a whole freshly-built snapshot without producing anything
-    /// is what "there is no work left" looks like; without this the queue would
-    /// rebuild forever against a poison set.
-    barren: bool,
+    /// Whether the CURRENT snapshot offered a single CANDIDATE id — one that
+    /// survived `exclude` and was put to `fetch`. Deliberately not "returned a
+    /// row": those two differ exactly when a peer is draining, and that is the
+    /// case worth telling apart.
+    offered_candidates: bool,
 }
 
 impl UnembeddedQueue {
@@ -301,7 +311,7 @@ impl UnembeddedQueue {
         let mut q = Self {
             ranked: Vec::new(),
             pos: 0,
-            barren: true,
+            offered_candidates: false,
         };
         q.rebuild(conn)?;
         Ok(q)
@@ -320,7 +330,7 @@ impl UnembeddedQueue {
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         self.ranked = rows.collect::<Result<Vec<_>, _>>()?;
         self.pos = 0;
-        self.barren = true;
+        self.offered_candidates = false;
         Ok(())
     }
 
@@ -332,12 +342,46 @@ impl UnembeddedQueue {
         limit: usize,
         exclude: &std::collections::HashSet<i64>,
     ) -> Result<Vec<(i64, String)>> {
+        // A caller asking for nothing gets nothing. Without this the
+        // `while ids.len() < limit` below never runs, `pos` never advances and
+        // the outer loop spins on a CPU forever — and this is a public type, so
+        // that is a hang reachable from outside the crate.
+        // `get_unembedded_nodes(_, 0)` returns empty via SQL `LIMIT 0`, so this
+        // matches what it replaces (pre-ship review 2026-09-08).
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         // Chunked because the id list is bound as parameters; the callers pass
         // 32 and 64, so this never actually splits today.
         let limit = limit.min(super::helpers::MAX_IN_PARAMS);
         loop {
             if self.pos >= self.ranked.len() {
-                if self.barren {
+                // An EMPTY worklist is the database's own answer — nothing is
+                // unembedded — not a snapshot gone stale. Stop.
+                if self.ranked.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // A snapshot is spent for exactly two reasons, and they have
+                // opposite characters (pre-ship review 2026-09-08):
+                //
+                //   (a) it offered no CANDIDATE at all — everything in it was
+                //       excluded. Deterministic: a rebuild returns the same set
+                //       and excludes it again. Stop, or the poison set spins.
+                //   (b) it offered candidates and `fetch` dropped them all.
+                //       Every drop means a peer wrote a vector (or removed the
+                //       node) in the rank->fetch window, so work that appeared
+                //       meanwhile is invisible to THIS snapshot while both
+                //       callers stop on the first empty chunk. Rebuild.
+                //
+                // (b) needs no bound and must not have one. It cannot repeat
+                //     without external progress — with no peer writing, `fetch`
+                //     drops nothing — and a peer that keeps inserting new nodes
+                //     is a world where the work is real, so continuing to find
+                //     it is correct rather than spinning. A counted bound was
+                //     the first fix here and it was wrong: any finite N is
+                //     defeated by a peer that embeds one snapshot and inserts
+                //     one node per round.
+                if !self.offered_candidates {
                     return Ok(Vec::new());
                 }
                 self.rebuild(conn)?;
@@ -356,9 +400,9 @@ impl UnembeddedQueue {
             if ids.is_empty() {
                 continue;
             }
+            self.offered_candidates = true;
             let rows = self.fetch(conn, &ids)?;
             if !rows.is_empty() {
-                self.barren = false;
                 return Ok(rows);
             }
             // Every id in this window has gained a vector since the snapshot.
@@ -519,6 +563,11 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     // lock across enumerate+delete, so a racing writer either committed before our snapshot (its
     // node is seen as live, never enumerated as an orphan) or is serialized after us. vec0 still
     // requires point deletes by primary key, so the enumerate-then-delete shape is unchanged.
+    // `reap_orphan_vectors` has exactly one production caller, `spawn_startup_repair`
+    // (mcp/server/mod.rs), which runs on its own thread with its own connection —
+    // never inside `rebuild_index`'s transaction, so there is no enclosing one to
+    // abort. IMMEDIATE is required here and a SAVEPOINT cannot supply it.
+    // bare-begin-ok: startup-repair thread only; needs IMMEDIATE
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     // Safety: never sweep against an EMPTY `nodes` table. An empty nodes set is far more likely a
     // transient (mid-rebuild / INDEX_VERSION-bump wipe window) than a real zero-symbol project —
@@ -1542,6 +1591,86 @@ mod tests {
             vec![ids[2], ids[3]],
             "and the queue keeps walking rather than returning a short/empty chunk"
         );
+    }
+
+    #[test]
+    fn a_peer_draining_the_snapshot_does_not_make_the_queue_report_done() {
+        // Pre-ship review 2026-09-08, HIGH. Every id in the snapshot gets
+        // embedded by someone else between the ranking and the fetch, so the
+        // first pass yields nothing — but work that appeared meanwhile is real.
+        // Reporting done here is what the per-batch query never did: it
+        // re-queried and saw it. The CLI loop is where that bites, because
+        // `embed_missing_nodes` runs once, prints nothing when `total == 0`, and
+        // exits 0 with the work silently skipped.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = ranked_fixture(conn, 3);
+        let none = std::collections::HashSet::new();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+
+        // A peer embeds the entire snapshot before the queue serves any of it.
+        for id in &ids {
+            insert_node_vector(conn, *id, &vec![0.5f32; crate::domain::EMBEDDING_DIM]).unwrap();
+        }
+        // ... and new embeddable work appears.
+        let latecomer = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: 1,
+                node_type: "function".into(),
+                name: "latecomer".into(),
+                qualified_name: None,
+                start_line: 999,
+                end_line: 999,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("ctx-late".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+
+        // Control: the query this queue replaced sees that work right now.
+        assert_eq!(
+            get_unembedded_nodes_excluding(conn, 2, &[])
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![latecomer],
+            "control: the per-batch query still finds the new node"
+        );
+
+        let chunk = queue.next_chunk(conn, 2, &none).unwrap();
+        assert_eq!(
+            chunk.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![latecomer],
+            "a snapshot drained by a peer must trigger a rebuild, not a DONE"
+        );
+    }
+
+    #[test]
+    fn asking_for_zero_returns_empty_instead_of_hanging() {
+        // Pre-ship review 2026-09-08, LOW. With `limit == 0` the inner take-loop
+        // never runs, `pos` never advances, and the outer loop spins forever.
+        // `UnembeddedQueue` is public, so that hang is reachable from outside
+        // the crate. `get_unembedded_nodes(_, 0)` returns empty via SQL LIMIT 0.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        ranked_fixture(conn, 3);
+        let none = std::collections::HashSet::new();
+        let mut queue = UnembeddedQueue::new(conn).unwrap();
+        assert!(queue.next_chunk(conn, 0, &none).unwrap().is_empty());
+        assert!(
+            get_unembedded_nodes(conn, 0).unwrap().is_empty(),
+            "control: the function it replaces also returns empty for 0"
+        );
+        // And the queue is not left poisoned by the zero-length request.
+        assert_eq!(queue.next_chunk(conn, 2, &none).unwrap().len(), 2);
     }
 
     #[test]
