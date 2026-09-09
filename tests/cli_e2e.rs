@@ -6987,6 +6987,40 @@ fn test_cli_incremental_index() {
     );
 }
 
+// `CODE_GRAPH_NO_GITIGNORE=1` end to end, through the real binary. The unit test
+// beside `ensure_code_graph_dir_ignored` drives the switch by argument (a
+// process-global `set_var` there races the four sibling tests that call the same
+// entry point), so the VARIABLE NAME and its `"1"` value are pinned only here —
+// a subprocess has its own environment, so this cannot race anything.
+// `setup_indexed_project` indexes through the library, which does not touch
+// `.gitignore`, so the file is absent until the CLI writes it.
+#[test]
+fn test_cli_incremental_index_gitignore_opt_out() {
+    let project = setup_indexed_project();
+    let gitignore = project.path().join(".gitignore");
+
+    let (_, stderr, code) = run_cli_env(
+        &project,
+        &["incremental-index"],
+        &[("CODE_GRAPH_NO_GITIGNORE", "1")],
+    );
+    assert_eq!(code, 0, "indexing must still succeed; stderr={stderr}");
+    assert!(
+        !gitignore.exists(),
+        "the switch must suppress the .gitignore write entirely"
+    );
+
+    // Positive control: the same command without the switch still writes, so the
+    // assertion above is not green because indexing silently did nothing.
+    let (_, stderr, code) = run_cli(&project, &["incremental-index"]);
+    assert_eq!(code, 0, "control run must succeed; stderr={stderr}");
+    let content = std::fs::read_to_string(&gitignore).expect("control run must create .gitignore");
+    assert!(
+        content.contains(".code-graph/"),
+        "control run should add the entry; got: {content:?}"
+    );
+}
+
 // Regression guard for feedback_tracing_invisible_in_cli: CLI subcommands now
 // install a stderr tracing subscriber (previously only `serve` did), so indexer
 // warn!/info! is visible. The "[incremental]" line is a tracing::info! (distinct

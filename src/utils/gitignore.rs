@@ -26,7 +26,19 @@ use crate::domain::CODE_GRAPH_DIR;
 /// `.code-graph/`, the unconditional append otherwise touches every repo the
 /// tool runs in, including ones they don't own.
 pub(crate) fn ensure_code_graph_dir_ignored(project_root: &Path) {
-    if std::env::var("CODE_GRAPH_NO_GITIGNORE").ok().as_deref() == Some("1") {
+    let disabled = std::env::var("CODE_GRAPH_NO_GITIGNORE").ok().as_deref() == Some("1");
+    ensure_code_graph_dir_ignored_unless(project_root, disabled);
+}
+
+/// [`ensure_code_graph_dir_ignored`] with the switch already read.
+///
+/// The env read stays in the caller so tests can drive BOTH arms by argument.
+/// Setting `CODE_GRAPH_NO_GITIGNORE` from a test instead would be process-global
+/// while four sibling tests in this module call the public entry point on other
+/// threads — the same `env::set_var` race the embedding tests removed by
+/// injection (`src/embedding/model.rs`, `record_download_state_at`).
+fn ensure_code_graph_dir_ignored_unless(project_root: &Path, disabled: bool) {
+    if disabled {
         return;
     }
     let gitignore_path = project_root.join(".gitignore");
@@ -128,26 +140,19 @@ mod tests {
         }
     }
 
-    /// `CODE_GRAPH_NO_GITIGNORE=1` disables the write entirely — for a user
-    /// whose own ignore rules already cover `.code-graph/`, so the tool never
-    /// touches `.gitignore` at all, not even to create it.
+    /// The switch disables the write entirely — for a user whose own ignore
+    /// rules already cover `.code-graph/`, the tool never touches `.gitignore`
+    /// at all, not even to create it.
     ///
-    /// In-process `set_var`/`remove_var`, following the pattern already used
-    /// at `src/cli/tests.rs:733` and `src/indexer/resync.rs:454`: no other
-    /// test in the crate reads or writes `CODE_GRAPH_NO_GITIGNORE`, so this is
-    /// safe under `cargo test`'s parallel test threads (each thread shares the
-    /// process env, but nothing else touches this uniquely-named variable).
-    /// The prior value is restored before the positive control runs, so a
-    /// panic in either half cannot leak the override into the other tests in
-    /// this module or into `test_from_project_root_creates_db`.
+    /// Driven by argument, not by `env::set_var`: the switch is read at the
+    /// public entry point, and four sibling tests in this module call that
+    /// entry point on other threads under `cargo test`. A process-global write
+    /// here makes THEM take the early return — the failure is theirs, not this
+    /// test's, which is what makes it easy to misread.
     #[test]
-    fn the_env_switch_suppresses_the_write() {
-        const VAR: &str = "CODE_GRAPH_NO_GITIGNORE";
-        let prior = std::env::var(VAR).ok();
-        std::env::set_var(VAR, "1");
-
+    fn the_switch_suppresses_the_write() {
         let root = tempfile::TempDir::new().unwrap();
-        ensure_code_graph_dir_ignored(root.path());
+        ensure_code_graph_dir_ignored_unless(root.path(), true);
         assert!(
             !root.path().join(".gitignore").exists(),
             "no .gitignore should be created while the switch is set"
@@ -156,22 +161,17 @@ mod tests {
         let existing_root = tempfile::TempDir::new().unwrap();
         let p = existing_root.path().join(".gitignore");
         std::fs::write(&p, "node_modules/\n").unwrap();
-        ensure_code_graph_dir_ignored(existing_root.path());
+        ensure_code_graph_dir_ignored_unless(existing_root.path(), true);
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "node_modules/\n",
             "an existing .gitignore must be left untouched"
         );
 
-        match prior {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
-
-        // Positive control: with the switch unset, a sibling repo still gets
-        // the entry, so the assertions above are not green by inaction.
+        // Positive control: the same call with the switch off still writes, so
+        // the assertions above are not green by inaction.
         let control_root = tempfile::TempDir::new().unwrap();
-        ensure_code_graph_dir_ignored(control_root.path());
+        ensure_code_graph_dir_ignored_unless(control_root.path(), false);
         assert_eq!(
             std::fs::read_to_string(control_root.path().join(".gitignore")).unwrap(),
             ".code-graph/\n"
