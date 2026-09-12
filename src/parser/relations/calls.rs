@@ -37,6 +37,7 @@ pub(super) struct CallCtx<'a> {
     /// Dispatch config, whose `name` is the language FAMILY (`.tsx` → its family).
     pub config: &'a LanguageConfig,
     pub active_scope: Option<&'a str>,
+    pub current_class: Option<&'a str>,
     pub current_rust_impl: Option<&'a str>,
 }
 
@@ -533,17 +534,26 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
     // Undefined callees (print, os.path.join, …) drop at Phase-2 same-language
     // resolution, so this only adds edges to defined same-project functions.
     let scope = ctx.scope_or_module();
-    if let Some(callee) = helpers::extract_callee_name(&node, source) {
+    if let Some((callee, qualifier)) =
+        helpers::extract_python_callee(&node, source, ctx.current_class)
+    {
         // Receiver-type propagation (issue #32 cause 2): when the call is
         // `recv.method()` and `recv`'s type is fixed by a single local
         // `recv = ClassName(...)` constructor assignment, stamp
         // `{"q":"rtype","v":"ClassName"}` so Phase-2 resolution binds it to
         // `ClassName.method` (self_filter_candidates) instead of dropping
         // the ambiguous by-name fan-out across every same-named method.
-        // Falls back to the bare, metadata-less form (unchanged behavior)
-        // whenever the type can't be proven — never emits a wrong-type edge.
-        let metadata = super::infer_python_call_receiver_type(&node, source)
-            .map(|ty| serialize_rtype_metadata(&ty));
+        // Falls back to qualifier serialization (e.g. self/cls or path) or bare metadata-less form.
+        let metadata = match qualifier {
+            helpers::CalleeQualifier::SelfRecv(_) => serialize_callee_qualifier(&qualifier),
+            _ => {
+                if let Some(ty) = super::infer_python_call_receiver_type(&node, source) {
+                    Some(serialize_rtype_metadata(&ty))
+                } else {
+                    serialize_callee_qualifier(&qualifier)
+                }
+            }
+        };
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,

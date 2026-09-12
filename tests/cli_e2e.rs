@@ -78,6 +78,43 @@ export class Logger {
     project
 }
 
+fn setup_indexed_python_method_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        r#"
+class Alpha:
+    def caller(self):
+        return self.helper()
+
+    def helper(self):
+        return 1
+
+class Beta:
+    def helper(self):
+        return 2
+
+def static_call():
+    return Alpha.helper(None)
+
+def beta_static_call():
+    return Beta.helper(None)
+
+def unknown_receiver(alpha):
+    return alpha.helper()
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    project
+}
+
 /// Run a CLI command and return (stdout, stderr, exit_code).
 fn run_cli(project: &TempDir, args: &[&str]) -> (String, String, i32) {
     run_cli_env(project, args, &[])
@@ -11417,4 +11454,400 @@ fn refs_by_node_id_keeps_its_id_when_the_target_has_no_file_row_to_re_resolve_by
         Some("orphan_target"),
         "the answer must still be about the symbol the id named: {after}"
     );
+}
+#[test]
+fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
+    let project = setup_indexed_python_method_project();
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["refs", "Alpha.helper", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0);
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "helper");
+    let names: Vec<&str> = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified refs should include self caller, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified refs should include static caller, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified refs must exclude Beta caller, got: {names:?}"
+    );
+    let unknown = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|reference| reference["name"] == "unknown_receiver")
+        .expect("runtime receiver should use normal bare-name resolution");
+    assert_eq!(unknown["confidence"], "ambiguous");
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Alpha.helper",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "helper");
+    let names: Vec<&str> = graph["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified callgraph should include caller, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified callgraph should include static caller, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified callgraph must exclude Beta caller, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified callgraph must exclude unknown receiver, got: {names:?}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "Alpha.helper", "--json"]);
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "helper");
+    assert_eq!(impact["direct_callers"], 2);
+}
+#[test]
+fn test_cli_python_qualified_method_file_disambiguation_and_ambiguity() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("one.py"),
+        r#"
+class Alpha:
+    def helper(self):
+        return 1
+
+def caller_one():
+    return Alpha.helper(None)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("two.py"),
+        r#"
+class Alpha:
+    def helper(self):
+        return 2
+
+class Beta:
+    def helper(self):
+        return 3
+
+def caller_two():
+    return Alpha.helper(None)
+
+def beta_caller():
+    return Beta.helper(None)
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // 1. Without --file, Alpha.helper is ambiguous across one.py and two.py
+    let (_, stderr, code) = run_cli(&project, &["refs", "Alpha.helper"]);
+    assert_ne!(code, 0, "ambiguous qualified refs without --file must fail");
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "Alpha.helper"]);
+    assert_ne!(
+        code, 0,
+        "ambiguous qualified callgraph without --file must fail"
+    );
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    let (_, stderr, code) = run_cli(&project, &["impact", "Alpha.helper"]);
+    assert_ne!(
+        code, 0,
+        "ambiguous qualified impact without --file must fail"
+    );
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    // 2. With --file two.py, Alpha.helper disambiguates to two.py:
+    // It must NOT merge with one.py and must NOT traverse Beta.helper
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Alpha.helper",
+            "--file",
+            "two.py",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "helper");
+    let names: Vec<&str> = graph["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller_two"),
+        "should include caller_two: {names:?}"
+    );
+    assert!(
+        !names.contains(&"caller_one"),
+        "must exclude caller_one from other file: {names:?}"
+    );
+    assert!(
+        !names.contains(&"beta_caller"),
+        "must exclude beta_caller: {names:?}"
+    );
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "Alpha.helper", "--file", "two.py", "--json"],
+    );
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "helper");
+    assert_eq!(impact["direct_callers"], 1); // only caller_two, not caller_one, not beta_caller
+
+    // 3. Without --file, a qualified miss retains the historical bare fallback.
+    // `helper` is ambiguous here, so each command must report that ambiguity.
+    let (stdout, _, code) = run_cli(&project, &["impact", "Gamma.helper", "--json"]);
+    assert_ne!(code, 0, "non-existent qualified target in impact must fail");
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "Gamma.helper", "--json"]);
+    assert_ne!(
+        code, 0,
+        "non-existent qualified target in callgraph must fail"
+    );
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
+
+    let (stdout, _, code) = run_cli(&project, &["refs", "Gamma.helper", "--json"]);
+    assert_ne!(code, 0, "non-existent qualified target in refs must fail");
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
+
+    // With --file, the qualifier is strict even though that file has a bare
+    // helper under other classes.
+    for command in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(
+            &project,
+            &[command, "Gamma.helper", "--file", "two.py", "--json"],
+        );
+        assert_ne!(
+            code, 0,
+            "{command} accepted a missing file-scoped qualifier"
+        );
+        let miss: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(miss["symbol"], "Gamma.helper");
+        if command == "impact" {
+            assert!(
+                miss["candidates"]
+                    .as_array()
+                    .is_some_and(|candidates| !candidates.is_empty()),
+                "impact qualified miss must retain recovery candidates: {miss}"
+            );
+            assert!(
+                stderr.contains("Defined in:"),
+                "impact qualified miss must retain the human recovery hint: {stderr}"
+            );
+        }
+    }
+
+    // 4. Stale file refresh for qualified target in impact re-queries node IDs
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        project.path().join("two.py"),
+        r#"
+class Alpha:
+    @staticmethod
+    def helper(x):
+        return x
+
+def caller_two():
+    return Alpha.helper(1)
+
+def caller_three():
+    return Alpha.helper(2)
+"#,
+    )
+    .unwrap();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "Alpha.helper", "--file", "two.py", "--json"],
+    );
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "helper");
+    assert_eq!(impact["direct_callers"], 2);
+}
+
+#[test]
+fn test_cli_qualified_selection_ignores_test_duplicate_without_file() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self): return 1\n\ndef prod_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self): return 2\n\ndef test_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["refs", "Worker.run", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "run");
+    let ref_names = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(ref_names.contains(&"prod_caller"), "{refs}");
+    assert!(!ref_names.contains(&"test_caller"), "{refs}");
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Worker.run",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "run");
+    assert!(graph["results"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["name"] == "prod_caller")));
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Worker.run", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "run");
+    assert_eq!(impact["direct_callers"], 1);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "refs",
+            "Worker.run",
+            "--file",
+            "tests/test_worker.py",
+            "--relation",
+            "calls",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "explicit test file must remain selectable: {stderr}"
+    );
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(refs["references"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["name"] == "test_caller")));
+}
+
+#[test]
+fn test_cli_missing_qualifier_falls_back_to_unique_bare_symbol() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("health.py"),
+        "def probe(): return True\ndef invoke(): return probe()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["refs", "Missing.probe", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "probe");
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Missing.probe",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        !stderr.contains("re-index"),
+        "bare fallback emitted a stale hint: {stderr}"
+    );
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "probe");
+    assert!(graph["results"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty()));
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Missing.probe", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "probe");
 }

@@ -304,17 +304,15 @@ mod tests {
         assert_eq!(indexed, 0);
     }
 
-    /// Two Python files where `b` imports and calls a symbol defined in `a`, so
-    /// deleting `a` leaves real inbound edges to rescue.
+    /// Two Python files where `b` calls a symbol defined in `a`, so deleting
+    /// `a` leaves a real inbound edge to rescue. The call is deliberately bare:
+    /// a missing explicit-import module is a final external miss and is not
+    /// retained in the pending-call table.
     fn indexed_pair() -> Fixture {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         std::fs::write(root.join("a.py"), "def target():\n    return 1\n").unwrap();
-        std::fs::write(
-            root.join("b.py"),
-            "from a import target\n\n\ndef caller():\n    return target()\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("b.py"), "def caller():\n    return target()\n").unwrap();
         std::fs::create_dir_all(root.join(".code-graph")).unwrap();
         let db = Database::open(&root.join(".code-graph/graph.db")).unwrap();
         run_full_index(&db, &root, None, None).unwrap();

@@ -4395,3 +4395,310 @@ fn the_query_time_refresh_also_treats_deletions_as_dirty() {
         "regenerated, not blanked: {after:?}"
     );
 }
+#[test]
+fn test_python_qualified_method_references_and_call_graph() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("app.py"),
+        r#"
+class Alpha:
+    def caller(self):
+        return self.helper()
+
+    def helper(self):
+        return 1
+
+class Beta:
+    def helper(self):
+        return 2
+
+def static_call():
+    return Alpha.helper(None)
+
+def beta_static_call():
+    return Beta.helper(None)
+
+def unknown_receiver(alpha):
+    return alpha.helper()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["symbol"], "Alpha.helper");
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"caller"),
+        "Alpha.helper should include self caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "Alpha.helper should include static caller, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "Alpha.helper must not include Beta caller beta_static_call, got: {:?}",
+        names
+    );
+    let unknown = refs
+        .iter()
+        .find(|reference| reference["name"] == "unknown_receiver")
+        .expect("runtime receivers use normal bare-name reference resolution");
+    assert_eq!(
+        unknown["confidence"], "ambiguous",
+        "runtime receiver collisions must remain non-structural: {unknown}"
+    );
+
+    let graph = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "direction": "callers",
+            "depth": 1
+        }),
+    );
+    let resp = server.handle_message(&graph).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["function"], "Alpha.helper");
+    let callers = result["callers"].as_array().unwrap();
+    let names: Vec<&str> = callers.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified call graph should include caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified call graph should include static_call, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified call graph must not include Beta caller beta_static_call, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified call graph must not include unknown receiver, got: {:?}",
+        names
+    );
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "include_references": true,
+            "include_impact": true
+        }),
+    );
+    let resp = server.handle_message(&ast).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["qualified_name"], "Alpha.helper");
+    let callers = result["called_by"].as_array().unwrap();
+    let names: Vec<&str> = callers.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified AST lookup should include caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified AST lookup should include static_call, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified AST lookup must not include Beta caller beta_static_call, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"unknown_receiver"),
+        "AST references should retain the ambiguous runtime-receiver edge, got: {:?}",
+        names
+    );
+    assert_eq!(result["impact"]["direct_callers"], 2);
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "file_path": "app.py",
+            "symbol_name": "Alpha.helper",
+            "compact": true
+        }),
+    );
+    let resp = server.handle_message(&ast).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["qualified_name"], "Alpha.helper");
+}
+
+#[test]
+fn test_mcp_qualified_selection_ignores_test_duplicate_without_file() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+    fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self): return 1\n\ndef prod_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self): return 2\n\ndef test_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    let server = common::init_server(&project);
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name": "Worker.run", "relation": "calls"}),
+    );
+    let result = parse_tool_result(&server.handle_message(&refs).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    let names = result["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"prod_caller"), "{result}");
+    assert!(!names.contains(&"test_caller"), "{result}");
+
+    let graph = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "Worker.run",
+            "direction": "callers",
+            "depth": 1
+        }),
+    );
+    let result = parse_tool_result(&server.handle_message(&graph).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(result["function"], "Worker.run");
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({"symbol_name": "Worker.run", "compact": true}),
+    );
+    let result = parse_tool_result(&server.handle_message(&ast).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(result["qualified_name"], "Worker.run");
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "Worker.run",
+            "file_path": "tests/test_worker.py",
+            "relation": "calls"
+        }),
+    );
+    let result = parse_tool_result(&server.handle_message(&refs).unwrap());
+    assert!(
+        result["references"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "test_caller")),
+        "explicit test file must remain selectable: {result}"
+    );
+}
+
+#[test]
+fn test_python_module_alias_call_resolution() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("api.py"),
+        r#"
+def execute():
+    return 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("main.py"),
+        r#"
+import api as a
+
+def invoke():
+    return a.execute()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "execute",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"invoke"),
+        "aliased module import call a.execute() should resolve to execute, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_python_shadowed_local_import_not_resolved() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("api.py"),
+        r#"
+def execute():
+    return 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("consumer.py"),
+        r#"
+from api import execute as run
+
+def wrapper(run):
+    return run()
+
+def normal_caller():
+    return run()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "execute",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"normal_caller"),
+        "unshadowed caller should resolve to execute, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"wrapper"),
+        "shadowed parameter in wrapper(run) must not resolve to execute, got: {:?}",
+        names
+    );
+}

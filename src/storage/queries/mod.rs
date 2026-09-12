@@ -49,12 +49,15 @@ pub use nodes::{
     delete_nodes_by_file, filter_method_ids, get_all_node_names_with_ids, get_dirty_node_ids,
     get_external_sentinel_importers, get_first_node_id_by_name, get_inbound_calls_for_pending,
     get_inbound_cross_file_edges, get_inbound_relations_for_requeue, get_node_by_id,
-    get_node_ids_by_name, get_node_names_with_paths_excluding_files, get_node_paths_by_ids,
+    get_node_ids_by_name, get_node_ids_by_qualified_name,
+    get_node_names_with_paths_excluding_files, get_node_paths_by_ids,
     get_node_qualified_names_by_ids, get_node_types_by_ids, get_node_with_file_by_id,
     get_nodes_by_file_path, get_nodes_by_name, get_nodes_missing_context,
     get_nodes_with_files_by_filters, get_nodes_with_files_by_ids, get_nodes_with_files_by_name,
+    get_nodes_with_files_by_qualified_name, get_nodes_with_files_by_symbol,
     get_structural_dependent_files, insert_node, insert_node_cached, reap_orphan_external_nodes,
-    update_context_strings_batch, NameEntry, NodeRecord, NodeResult, NodeWithFile,
+    update_context_strings_batch, InboundCrossFileEdge, NameEntry, NodeRecord, NodeResult,
+    NodeWithFile,
 };
 pub use project_map::{get_project_map, EntryPoint, HotFunction, ModuleDep, ModuleStats};
 pub use routes::{

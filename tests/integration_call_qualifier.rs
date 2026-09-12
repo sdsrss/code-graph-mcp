@@ -47,6 +47,42 @@ fn callers_of_in_file(db: &Database, target_name: &str, file_rel: &str) -> Vec<S
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Return Python call edges to `target_name` with source, qualified target,
+/// target file, confidence, and metadata for precise resolver assertions.
+fn python_call_edges(
+    db: &Database,
+    target_name: &str,
+) -> Vec<(String, String, String, String, Option<String>)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(src.qualified_name, src.name),
+                    COALESCE(tgt.qualified_name, tgt.name), tf.path,
+                    e.confidence, e.metadata
+             FROM edges e
+             JOIN nodes src ON src.id = e.source_id
+             JOIN nodes tgt ON tgt.id = e.target_id
+             JOIN files sf ON sf.id = src.file_id
+             JOIN files tf ON tf.id = tgt.file_id
+             WHERE e.relation = 'calls' AND tgt.name = ?1
+               AND sf.language = 'python'
+             ORDER BY 1, 2, 3",
+        )
+        .unwrap();
+    stmt.query_map([target_name], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
 #[test]
 fn chain_builder_drops_intermediate_callers() {
     let tmp = TempDir::new().unwrap();
@@ -1139,6 +1175,94 @@ class ProfileWriter:
     );
 }
 
+#[test]
+fn python_import_and_inheritance_parity_full_vs_persistent_pending() {
+    const CALLER: &str = r#"
+import pkg.api as api
+from pkg.models import Child as ImportedChild
+
+def imported_call():
+    return api.execute()
+
+def inherited_call():
+    child = ImportedChild()
+    return child.process()
+
+def runtime_call(receiver):
+    return receiver.runtime_only()
+"#;
+    const MODELS_BEFORE: &str = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n";
+    const MODELS_AFTER: &str =
+        "class Base:\n    def process(self): return 2\n\nclass Child(Base):\n    pass\n";
+    const API_BEFORE: &str = "def placeholder(): return 0\n";
+    const API_AFTER: &str = "def placeholder(): return 0\ndef execute(): return 1\n";
+    const RUNTIME_BEFORE: &str = "def placeholder(): return 0\n";
+    const RUNTIME_AFTER: &str = "def placeholder(): return 0\ndef runtime_only(): return 3\n";
+
+    let build_files = |root: &std::path::Path, api: &str, models: &str, runtime: &str| {
+        write(root, "pkg/__init__.py", "");
+        write(root, "pkg/api.py", api);
+        write(root, "pkg/models.py", models);
+        write(root, "runtime.py", runtime);
+        write(root, "caller.py", CALLER);
+    };
+
+    let full_tmp = TempDir::new().unwrap();
+    build_files(full_tmp.path(), API_AFTER, MODELS_AFTER, RUNTIME_AFTER);
+    let full_db_path = full_tmp.path().join(".code-graph/graph.db");
+    fs::create_dir_all(full_db_path.parent().unwrap()).unwrap();
+    let full_db = Database::open(&full_db_path).unwrap();
+    run_full_index(&full_db, full_tmp.path(), None, None).unwrap();
+
+    let incremental_tmp = TempDir::new().unwrap();
+    build_files(
+        incremental_tmp.path(),
+        API_BEFORE,
+        MODELS_BEFORE,
+        RUNTIME_BEFORE,
+    );
+    let incremental_db_path = incremental_tmp.path().join(".code-graph/graph.db");
+    fs::create_dir_all(incremental_db_path.parent().unwrap()).unwrap();
+    let incremental_db = Database::open(&incremental_db_path).unwrap();
+    run_incremental_index(&incremental_db, incremental_tmp.path(), None, None).unwrap();
+    let pending_before: i64 = incremental_db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        pending_before >= 3,
+        "fixture must persist all unresolved calls; got {pending_before}"
+    );
+
+    write(incremental_tmp.path(), "pkg/api.py", API_AFTER);
+    write(incremental_tmp.path(), "pkg/models.py", MODELS_AFTER);
+    write(incremental_tmp.path(), "runtime.py", RUNTIME_AFTER);
+    run_incremental_index(&incremental_db, incremental_tmp.path(), None, None).unwrap();
+
+    for target in ["execute", "process", "runtime_only"] {
+        let full = python_call_edges(&full_db, target);
+        let incremental = python_call_edges(&incremental_db, target);
+        assert_eq!(
+            incremental, full,
+            "{target} resolution differs after persistent pending replay"
+        );
+        assert_eq!(
+            full.len(),
+            1,
+            "fixture must resolve one {target} edge: {full:?}"
+        );
+    }
+    assert_eq!(python_call_edges(&full_db, "execute")[0].2, "pkg/api.py");
+    assert_eq!(python_call_edges(&full_db, "process")[0].1, "Base.process");
+    assert_eq!(
+        python_call_edges(&full_db, "runtime_only")[0].4,
+        None,
+        "runtime-receiver pending fallback must discard structural metadata"
+    );
+}
+
 /// Regression (audit 2026-08-22 P1-1): a call qualified with the crate's OWN
 /// package name — `my_crate::cli::cmd_grep()`, the standard `bin` → `lib`
 /// shape — kept `my_crate` as the first Path segment. That segment names the
@@ -1318,4 +1442,540 @@ fn crate_root_strip_does_not_fire_when_the_chain_as_written_matches() {
          written already resolves; got: {:?}",
         callers_of_in_file(&db, "go", "src/thirdparty/helper/mod.rs")
     );
+}
+
+#[test]
+fn python_self_and_cls_walk_nearest_inherited_methods() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "models.py",
+        r#"
+class Root:
+    def transitive(self):
+        return 1
+
+    def overridden(self):
+        return 1
+
+class Base(Root):
+    def inherited(self):
+        return 2
+
+    def overridden(self):
+        return 2
+
+class Child(Base):
+    def direct(self):
+        return 3
+
+    def calls(self):
+        self.direct()
+        self.inherited()
+        self.transitive()
+        self.overridden()
+
+    @classmethod
+    def class_call(cls):
+        cls.inherited()
+
+class Left:
+    def shared(self):
+        return 4
+
+class Right:
+    def shared(self):
+        return 5
+
+class Diamond(Left, Right):
+    def calls(self):
+        self.shared()
+
+def unresolved(self):
+    return 6
+
+class ExternalChild(UnknownBase):
+    def calls(self):
+        self.unresolved()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let direct = python_call_edges(&db, "direct");
+    assert!(direct.iter().any(|edge| {
+        edge.0 == "Child.calls" && edge.1 == "Child.direct" && edge.3 == "extracted"
+    }));
+
+    let inherited = python_call_edges(&db, "inherited");
+    assert!(inherited
+        .iter()
+        .any(|edge| edge.0 == "Child.calls" && edge.1 == "Base.inherited"));
+    assert!(inherited
+        .iter()
+        .any(|edge| edge.0 == "Child.class_call" && edge.1 == "Base.inherited"));
+
+    let transitive = python_call_edges(&db, "transitive");
+    assert!(transitive
+        .iter()
+        .any(|edge| edge.0 == "Child.calls" && edge.1 == "Root.transitive"));
+
+    let overridden = python_call_edges(&db, "overridden");
+    assert!(overridden
+        .iter()
+        .any(|edge| edge.0 == "Child.calls" && edge.1 == "Base.overridden"));
+    assert!(!overridden
+        .iter()
+        .any(|edge| edge.0 == "Child.calls" && edge.1 == "Root.overridden"));
+
+    let shared = python_call_edges(&db, "shared");
+    let diamond: Vec<_> = shared
+        .iter()
+        .filter(|edge| edge.0 == "Diamond.calls")
+        .collect();
+    assert_eq!(
+        diamond.len(),
+        2,
+        "nearest multiple bases must both remain: {shared:?}"
+    );
+    assert!(diamond.iter().all(|edge| edge.3 == "ambiguous"));
+
+    let unresolved = python_call_edges(&db, "unresolved");
+    assert!(unresolved.iter().any(|edge| {
+        edge.0 == "ExternalChild.calls" && edge.1 == "unresolved" && edge.4.is_none()
+    }));
+}
+
+#[test]
+fn python_same_named_classes_are_scoped_to_the_callers_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "one/__init__.py", "");
+    write(
+        root,
+        "one/service.py",
+        "class Worker:\n    def run(self): return 1\n    def call(self): return self.run()\n",
+    );
+    write(
+        root,
+        "one/caller.py",
+        "def call_one(): return Worker.run(None)\n",
+    );
+    write(root, "two/__init__.py", "");
+    write(
+        root,
+        "two/service.py",
+        "class Worker:\n    def run(self): return 2\n    def call(self): return self.run()\n",
+    );
+    write(
+        root,
+        "two/caller.py",
+        "def call_two(): return Worker.run(None)\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let edges = python_call_edges(&db, "run");
+    let one = edges
+        .iter()
+        .filter(|edge| edge.2 == "one/service.py")
+        .count();
+    let two = edges
+        .iter()
+        .filter(|edge| edge.2 == "two/service.py")
+        .count();
+    assert_eq!(
+        (one, two),
+        (2, 2),
+        "typed calls crossed package classes: {edges:?}"
+    );
+    assert!(edges.iter().any(|edge| {
+        edge.0 == "call_one" && edge.1 == "Worker.run" && edge.2 == "one/service.py"
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.0 == "call_two" && edge.1 == "Worker.run" && edge.2 == "two/service.py"
+    }));
+}
+
+#[test]
+fn python_import_paths_and_runtime_receivers_use_separate_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "pkg/__init__.py", "");
+    write(
+        root,
+        "pkg/api.py",
+        "def execute(): return 1\nclass Engine:\n    def start(self): return 2\nclass Other:\n    def execute(self): return 4\n",
+    );
+    write(root, "cmd.py", "def execute(): return 3\n");
+    write(
+        root,
+        "other.py",
+        "class OtherEngine:\n    def start(self): return 5\n",
+    );
+    write(
+        root,
+        "caller.py",
+        r#"
+import pkg.api as api
+import pkg.api
+from pkg.api import Engine as ImportedEngine
+from pkg.api import execute as imported_execute
+
+def alias_call():
+    api.execute()
+
+def dotted_call():
+    pkg.api.execute()
+
+def shortened_dotted_call():
+    pkg.execute()
+
+def bare_alias_call():
+    imported_execute()
+
+def class_alias_call():
+    ImportedEngine.start(None)
+
+def inferred_alias_call():
+    engine = ImportedEngine()
+    engine.start()
+
+def runtime_call(cmd):
+    cmd.execute()
+
+def nested_runtime(holder):
+    holder.cmd.execute()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let execute = python_call_edges(&db, "execute");
+    for caller in ["alias_call", "dotted_call", "bare_alias_call"] {
+        let rows: Vec<_> = execute.iter().filter(|edge| edge.0 == caller).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "{caller} must have one module-bound edge: {execute:?}"
+        );
+        assert_eq!(rows[0].2, "pkg/api.py");
+    }
+    assert!(
+        execute.iter().all(|edge| edge.0 != "shortened_dotted_call"),
+        "plain `import pkg.api` must not treat pkg.execute() as pkg.api.execute(): {execute:?}"
+    );
+    for caller in ["runtime_call", "nested_runtime"] {
+        let rows: Vec<_> = execute.iter().filter(|edge| edge.0 == caller).collect();
+        assert!(
+            !rows.is_empty(),
+            "runtime receiver must use bare fallback: {execute:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|edge| { edge.3 == "ambiguous" && edge.4.is_none() }),
+            "runtime fallback must remain non-structural: {rows:?}"
+        );
+    }
+
+    let start = python_call_edges(&db, "start");
+    for caller in ["class_alias_call", "inferred_alias_call"] {
+        let edge = start
+            .iter()
+            .find(|edge| edge.0 == caller && edge.1 == "Engine.start" && edge.2 == "pkg/api.py")
+            .unwrap_or_else(|| panic!("missing imported-class edge for {caller}: {start:?}"));
+        assert_eq!(
+            edge.3, "inferred",
+            "an explicit imported class remains precise when another class has the method"
+        );
+    }
+}
+
+#[test]
+fn python_shared_import_roots_and_package_submodules_all_resolve() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "pkg/__init__.py", "");
+    write(root, "pkg/models.py", "def load(): return 1\n");
+    write(root, "pkg/views.py", "def render(): return 2\n");
+    write(root, "pkg/sub.py", "def func(): return 3\n");
+    write(
+        root,
+        "app.py",
+        r#"
+import pkg.models
+import pkg.views
+import pkg
+
+def run():
+    pkg.models.load()
+    pkg.views.render()
+    pkg.sub.func()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for (name, file) in [
+        ("load", "pkg/models.py"),
+        ("render", "pkg/views.py"),
+        ("func", "pkg/sub.py"),
+    ] {
+        let edges = python_call_edges(&db, name);
+        assert!(
+            edges.iter().any(|edge| edge.0 == "run" && edge.2 == file),
+            "missing package-bound {name} edge: {edges:?}"
+        );
+    }
+    let pending: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 0, "resolved package calls must not stay pending");
+}
+
+#[test]
+fn python_binding_patterns_shadow_imports_without_attribute_false_positives() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "lib.py", "def run(): return 1\n");
+    write(root, "api.py", "def send(): return 1\n");
+    write(
+        root,
+        "caller.py",
+        r#"
+import api
+from lib import run
+
+def imported_module():
+    api.send()
+
+def except_alias():
+    try:
+        raise RuntimeError()
+    except RuntimeError as api:
+        api.send()
+
+def parameter(run):
+    run()
+
+def annotated(run: object):
+    run()
+
+def assigned():
+    run = lambda: 1
+    run()
+
+def attribute(obj):
+    obj.run = 1
+    run()
+
+def subscript(items, key):
+    items[key] = 1
+    run()
+
+def destructured():
+    run, other = (lambda: 1), 2
+    run()
+
+def looped():
+    for run in []:
+        run()
+
+def comprehension():
+    values = [run for run in []]
+    return run()
+
+def global_rebind():
+    global run
+    run = lambda: 1
+    return run()
+
+def outer():
+    run = lambda: 1
+    def nonlocal_call():
+        nonlocal run
+        return run()
+    return nonlocal_call()
+
+def context():
+    return object()
+
+def with_bound():
+    with context() as run:
+        run()
+
+def walrus():
+    if (run := (lambda: 1)):
+        run()
+
+def nested():
+    def run():
+        return 2
+    run()
+
+class Scope:
+    def invoke(self, run):
+        run()
+
+def invoke():
+    run()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let edges = python_call_edges(&db, "run");
+    let imported_callers: std::collections::HashSet<&str> = edges
+        .iter()
+        .filter(|edge| edge.2 == "lib.py")
+        .map(|edge| edge.0.as_str())
+        .collect();
+    assert!(imported_callers.contains("attribute"));
+    assert!(imported_callers.contains("subscript"));
+    assert!(imported_callers.contains("invoke"));
+    assert!(imported_callers.contains("comprehension"));
+    assert!(imported_callers.contains("global_rebind"));
+    for shadowed in [
+        "parameter",
+        "annotated",
+        "assigned",
+        "destructured",
+        "looped",
+        "with_bound",
+        "walrus",
+        "nested",
+        "nonlocal_call",
+        "Scope.invoke",
+    ] {
+        assert!(
+            !imported_callers.contains(shadowed),
+            "{shadowed} incorrectly bound to imported run: {edges:?}"
+        );
+    }
+
+    let send_edges = python_call_edges(&db, "send");
+    assert!(
+        send_edges
+            .iter()
+            .any(|edge| edge.0 == "imported_module" && edge.2 == "api.py"),
+        "the unshadowed module import must resolve: {send_edges:?}"
+    );
+    assert!(
+        send_edges.iter().all(|edge| edge.0 != "except_alias"),
+        "an except-clause alias must shadow the module import: {send_edges:?}"
+    );
+}
+
+#[test]
+fn python_project_builtins_win_only_when_uniquely_defined() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "builtins_override.py",
+        "def len(value): return 7\ndef open(path): return 8\ndef id(value): return value\n",
+    );
+    write(root, "other_builtin.py", "def id(value): return value\n");
+    write(
+        root,
+        "caller.py",
+        "from builtins_override import open\ndef call_len(): return len([])\ndef call_open(): return open('x')\ndef call_id(): return id(1)\ndef genuine(): return print('x')\n",
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert!(python_call_edges(&db, "len")
+        .iter()
+        .any(|edge| edge.0 == "call_len" && edge.2 == "builtins_override.py"));
+    assert!(python_call_edges(&db, "open")
+        .iter()
+        .any(|edge| edge.0 == "call_open" && edge.2 == "builtins_override.py"));
+    assert!(
+        python_call_edges(&db, "id").is_empty(),
+        "an ambiguous project override must not capture a Python builtin"
+    );
+    assert!(python_call_edges(&db, "print").is_empty());
+    let pending_print: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM pending_unresolved_calls WHERE target_name = 'print'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_print, 0,
+        "a genuine builtin call must be removed from the pending queue"
+    );
+}
+
+#[test]
+fn python_equivalent_module_imports_store_one_canonical_edge() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "pkg/__init__.py", "");
+    write(root, "pkg/sub.py", "def ping(): return 1\n");
+    write(
+        root,
+        "caller.py",
+        r#"
+import pkg.sub as first
+import pkg.sub as second
+from pkg import sub as third
+
+def invoke():
+    first.ping()
+    second.ping()
+    third.ping()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let rows: Vec<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT e.metadata FROM edges e
+                 JOIN nodes src ON src.id = e.source_id
+                 JOIN nodes tgt ON tgt.id = e.target_id
+                 JOIN files sf ON sf.id = src.file_id
+                 JOIN files tf ON tf.id = tgt.file_id
+                 WHERE e.relation = 'imports' AND sf.path = 'caller.py'
+                   AND tf.path = 'pkg/sub.py'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "equivalent module imports duplicated: {rows:?}"
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(metadata["python_module"], "pkg.sub");
+    assert_eq!(metadata["is_module_import"], true);
+    assert!(metadata.get("python_local").is_none());
+    assert!(metadata.get("python_scope").is_none());
 }

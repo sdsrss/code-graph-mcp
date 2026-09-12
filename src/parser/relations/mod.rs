@@ -680,6 +680,7 @@ fn walk_for_relations(
             language,
             config,
             active_scope,
+            current_class,
             current_rust_impl,
         },
         results,

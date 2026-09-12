@@ -2789,7 +2789,7 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     // The full index above already ran one sweep (attempts = 1). Sweep until
     // one shy of the threshold: the row must still be buffered.
     for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
-        resolve_pending_calls(&db, &Default::default()).unwrap();
+        resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
     }
     assert_eq!(
         count_pending_unresolved_calls(db.conn()).unwrap(),
@@ -2798,7 +2798,7 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     );
 
     // The threshold-crossing sweep evicts it.
-    resolve_pending_calls(&db, &Default::default()).unwrap();
+    resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
     assert_eq!(
         count_pending_unresolved_calls(db.conn()).unwrap(),
         0,
@@ -2909,7 +2909,7 @@ fn test_pending_at_eviction_boundary_still_resolves() {
 
     // Age to the brink: attempts = MAX - 1 (full index swept once already).
     for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
-        resolve_pending_calls(&db, &Default::default()).unwrap();
+        resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
     }
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 
@@ -3943,8 +3943,9 @@ fn test_cross_batch_relations_match_single_batch_control() {
 fn test_incremental_rename_converges_to_full_rebuild() {
     // Audit 2026-08-02 P1-2 reproduction: renaming a symbol inside a CHANGED
     // file must re-resolve the unchanged caller's edges the way a full rebuild
-    // would — before the fix the calls edge vanished (restore missed by name,
-    // nothing requeued) and the graph diverged from a fresh rebuild forever.
+    // would. An explicit Python import stays constrained to its bound module:
+    // after the imported symbol is renamed, an unrelated same-name definition
+    // must not steal the call.
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let src = project_dir.path().join("src");
@@ -3982,10 +3983,10 @@ fn test_incremental_rename_converges_to_full_rebuild() {
     let (inc_nodes, inc_edges) = graph_projection(&db);
     let (full_nodes, full_edges) = graph_projection(&control_db);
     assert!(
-        inc_edges
+        !inc_edges
             .iter()
             .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/other.py:save"),
-        "incremental rename dropped the caller's edge instead of re-resolving it: {inc_edges:?}"
+        "module-bound call incorrectly resolved to an unrelated definition: {inc_edges:?}"
     );
     assert_eq!(
         inc_nodes, full_nodes,
@@ -3994,6 +3995,46 @@ fn test_incremental_rename_converges_to_full_rebuild() {
     assert_eq!(
         inc_edges, full_edges,
         "incremental edge set diverged from a fresh full rebuild"
+    );
+
+    // Add the imported name back alongside the renamed definition. This
+    // positively exercises re-resolution to a legitimate new target rather
+    // than proving parity only while the call has no valid destination.
+    fs::write(
+        src.join("db.py"),
+        "def store():\n    pass\n\ndef save():\n    pass\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let restored_control_dir = TempDir::new().unwrap();
+    let restored_control = Database::open(&restored_control_dir.path().join("index.db")).unwrap();
+    run_full_index(&restored_control, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&restored_control);
+    assert!(
+        inc_edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/db.py:save"),
+        "restored import target did not regain its call edge: {inc_edges:?}"
+    );
+    assert!(
+        !inc_edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/other.py:save"),
+        "restored import target was stolen by an unrelated definition: {inc_edges:?}"
+    );
+    assert_eq!(inc_nodes, full_nodes);
+    let calls_only = |edges: Vec<(String, String, String, String, Option<String>)>| {
+        edges
+            .into_iter()
+            .filter(|(_, _, relation, _, _)| relation == REL_CALLS)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        calls_only(inc_edges),
+        calls_only(full_edges),
+        "incremental call re-resolution diverged from a fresh full rebuild"
     );
 }
 

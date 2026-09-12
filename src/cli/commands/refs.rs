@@ -78,7 +78,12 @@ enum RefsTarget {
     Orphan(i64),
     /// A name resolution already settled, optionally scoped to one file. Cheap
     /// to redo, and redoing it is what keeps the answer attached to the name.
-    Name { file_path: Option<String> },
+    Name {
+        file_path: Option<String>,
+    },
+    QualifiedName {
+        file_path: Option<String>,
+    },
 }
 
 impl RefsTarget {
@@ -100,11 +105,21 @@ impl RefsTarget {
             .map(|c| vec![c.node.id])
             .unwrap_or_default(),
             RefsTarget::Orphan(id) => vec![*id],
+            RefsTarget::QualifiedName { file_path } => {
+                crate::resolve::selectable_qualified_definitions(
+                    conn,
+                    symbol,
+                    file_path.as_deref(),
+                )?
+                .into_iter()
+                .map(|candidate| candidate.node.id)
+                .collect()
+            }
             RefsTarget::Name {
                 file_path: Some(fp),
             } => queries::get_nodes_by_file_path(conn, fp)?
                 .into_iter()
-                .filter(|n| n.name == symbol)
+                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .map(|n| n.id)
                 .collect(),
             RefsTarget::Name { file_path: None } => queries::get_node_ids_by_name(conn, symbol)?
@@ -135,11 +150,32 @@ impl RefsTarget {
     ) -> Result<()> {
         let cands: Vec<queries::NameCandidate> = match self {
             RefsTarget::Node { .. } | RefsTarget::Orphan(_) => return Ok(()),
+            RefsTarget::QualifiedName { file_path } => {
+                let matches = crate::resolve::selectable_qualified_definitions(
+                    conn,
+                    symbol,
+                    file_path.as_deref(),
+                )?;
+                if matches.len() > 1 {
+                    let cands: Vec<queries::NameCandidate> = matches
+                        .into_iter()
+                        .map(|candidate| queries::NameCandidate {
+                            name: candidate.node.name,
+                            file_path: candidate.file_path,
+                            node_type: candidate.node.node_type,
+                            node_id: candidate.node.id,
+                            start_line: candidate.node.start_line,
+                        })
+                        .collect();
+                    emit_exact_ambiguity(symbol, &cands, json_mode);
+                }
+                return Ok(());
+            }
             RefsTarget::Name {
                 file_path: Some(fp),
             } => queries::get_nodes_by_file_path(conn, fp)?
                 .into_iter()
-                .filter(|n| n.name == symbol)
+                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .map(|n| queries::NameCandidate {
                     name: n.name,
                     file_path: fp.clone(),
@@ -231,111 +267,143 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
-        let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-        let file_path = explicit_file.or(resolved_file.as_deref());
-
-        if let Some(fp) = file_path {
-            let nodes = queries::get_nodes_by_file_path(conn, fp)?;
-            let matched: Vec<&queries::NodeResult> =
-                nodes.iter().filter(|n| n.name == base).collect();
-            if matched.is_empty() {
-                // Empty-JSON contract: emit a parseable envelope, not empty stdout.
+        let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+            Ok(selection) => selection,
+            Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
+                emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
+            }
+            Err(CliSymbolSelectionError::QualifiedNotFound) => {
                 if json_mode {
-                    print_refs_notfound_json(base);
+                    print_refs_notfound_json(raw_symbol);
                 }
-                eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
+                eprintln!(
+                    "[code-graph] Symbol '{}' not found in file '{}'.",
+                    raw_symbol,
+                    explicit_file.unwrap_or_default()
+                );
                 std::process::exit(1);
             }
-            // SURF-17 (audit 2026-09-07): a file selector cannot split same-file
-            // overloads, so merging them produced ONE reference total for TWO
-            // symbols — silently, while MCP `find_references` refused the very
-            // same input as ambiguous. That is the 2026-06-03 #6 shape (one
-            // input, two surfaces, opposite verdicts) `crate::resolve` exists to
-            // prevent, and the bare-name arm below has carried this gate since
-            // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; note the
-            // shared same-file message points at `show --node-id <N>` rather
-            // than at this command's own `--node-id`, because it is written for
-            // callgraph/impact, which have no such flag. The node_ids it lists
-            // are the ones to pass here (pre-ship review 2026-09-07 — an earlier
-            // version of this comment claimed the message names `refs --node-id`,
-            // which it does not).
-            if matched.len() > 1 {
-                let cands: Vec<queries::NameCandidate> = matched
-                    .iter()
-                    .map(|n| queries::NameCandidate {
-                        name: n.name.clone(),
-                        file_path: fp.to_string(),
-                        node_type: n.node_type.clone(),
-                        node_id: n.id,
-                        start_line: n.start_line,
-                    })
-                    .collect();
-                emit_exact_ambiguity(base, &cands, json_mode);
+        };
+        if selection.lookup == CliSymbolLookup::ExactQualified {
+            let qualified_ids =
+                crate::resolve::selectable_qualified_definitions(conn, raw_symbol, explicit_file)?
+                    .into_iter()
+                    .map(|candidate| candidate.node.id)
+                    .collect::<Vec<_>>();
+            {
+                let target = RefsTarget::QualifiedName {
+                    file_path: explicit_file.map(|s| s.to_string()),
+                };
+                target.reject_if_ambiguous(conn, raw_symbol, json_mode)?;
+                (qualified_ids, raw_symbol.to_string(), target)
             }
-            (
-                matched.iter().map(|n| n.id).collect(),
-                base.to_string(),
-                RefsTarget::Name {
-                    file_path: Some(fp.to_string()),
-                },
-            )
         } else {
-            // Exact-name ambiguity guard — shared with callgraph/impact and the
-            // MCP twin via crate::resolve so every surface gives ONE answer for
-            // one input (audit 2026-08-02 P1-6: refs was the third consumer and
-            // skipped this gate, silently MERGING all same-name definitions'
-            // references into a single total while callgraph/MCP errored
-            // Ambiguous on the same symbol — the 2026-06-03 #6 shape).
-            if let Some(cands) = crate::resolve::detect_ambiguity(conn, base)? {
-                emit_exact_ambiguity(base, &cands, json_mode);
-            }
-            let ids = queries::get_node_ids_by_name(conn, base)?;
-            if ids.is_empty() {
-                // Fuzzy auto-resolve: unique match → promote; multi → suggest; none → bail
-                match resolve_fuzzy_name_cli(conn, base)? {
-                    CliFuzzyResolution::Unique(resolved) => {
-                        let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
-                        (
-                            resolved_ids.into_iter().map(|(id, _)| id).collect(),
-                            resolved,
-                            RefsTarget::Name { file_path: None },
-                        )
+            let base = selection.lookup_name.as_str();
+            let file_path = selection.file_filter.as_deref();
+
+            if let Some(fp) = file_path {
+                let nodes = queries::get_nodes_by_file_path(conn, fp)?;
+                let matched: Vec<&queries::NodeResult> =
+                    nodes.iter().filter(|n| n.name == base).collect();
+                if matched.is_empty() {
+                    // Empty-JSON contract: emit a parseable envelope, not empty stdout.
+                    if json_mode {
+                        print_refs_notfound_json(base);
                     }
-                    CliFuzzyResolution::Ambiguous(cands) => {
-                        // ARC-01: shared renderer, refs's published envelope
-                        // (`suggestions`, no `results` key). Both suffixes name the
-                        // disambiguation flags, but the JSON one spells out
-                        // "to disambiguate" and the stderr one does not — kept
-                        // verbatim, since both strings are already shipped.
-                        crate::cli::symbols::emit_fuzzy_ambiguity(
-                            base,
-                            &cands,
-                            json_mode,
-                            crate::cli::symbols::FuzzyEnvelope::Suggestions,
-                            ". Specify --file or --node-id to disambiguate.",
-                            ". Specify --file or --node-id.",
-                        );
-                    }
-                    CliFuzzyResolution::NotFound => {
-                        // Match the success-case envelope shape (object with
-                        // references/by_relation), not a bare `[]`. Object-success
-                        // commands (callgraph/trace/deps) all emit an object on the
-                        // empty/error path so one parser handles both — refs was the
-                        // outlier returning `[]`, which broke `.references` access.
-                        if json_mode {
-                            print_refs_notfound_json(base);
-                        }
-                        eprintln!("[code-graph] Symbol not found: {}", base);
-                        hint_symbol_maybe_unindexed(base);
-                        std::process::exit(1);
-                    }
+                    eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
+                    std::process::exit(1);
                 }
-            } else {
+                // SURF-17 (audit 2026-09-07): a file selector cannot split same-file
+                // overloads, so merging them produced ONE reference total for TWO
+                // symbols — silently, while MCP `find_references` refused the very
+                // same input as ambiguous. That is the 2026-06-03 #6 shape (one
+                // input, two surfaces, opposite verdicts) `crate::resolve` exists to
+                // prevent, and the bare-name arm below has carried this gate since
+                // audit 2026-08-02 P1-6. `--node-id` is the escape hatch; note the
+                // shared same-file message points at `show --node-id <N>` rather
+                // than at this command's own `--node-id`, because it is written for
+                // callgraph/impact, which have no such flag. The node_ids it lists
+                // are the ones to pass here (pre-ship review 2026-09-07 — an earlier
+                // version of this comment claimed the message names `refs --node-id`,
+                // which it does not).
+                if matched.len() > 1 {
+                    let cands: Vec<queries::NameCandidate> = matched
+                        .iter()
+                        .map(|n| queries::NameCandidate {
+                            name: n.name.clone(),
+                            file_path: fp.to_string(),
+                            node_type: n.node_type.clone(),
+                            node_id: n.id,
+                            start_line: n.start_line,
+                        })
+                        .collect();
+                    emit_exact_ambiguity(base, &cands, json_mode);
+                }
                 (
-                    ids.into_iter().map(|(id, _)| id).collect(),
+                    matched.iter().map(|n| n.id).collect(),
                     base.to_string(),
-                    RefsTarget::Name { file_path: None },
+                    RefsTarget::Name {
+                        file_path: Some(fp.to_string()),
+                    },
                 )
+            } else {
+                // Exact-name ambiguity guard — shared with callgraph/impact and the
+                // MCP twin via crate::resolve so every surface gives ONE answer for
+                // one input (audit 2026-08-02 P1-6: refs was the third consumer and
+                // skipped this gate, silently MERGING all same-name definitions'
+                // references into a single total while callgraph/MCP errored
+                // Ambiguous on the same symbol — the 2026-06-03 #6 shape).
+                if let Some(cands) = crate::resolve::detect_ambiguity(conn, base)? {
+                    emit_exact_ambiguity(base, &cands, json_mode);
+                }
+                let ids = queries::get_node_ids_by_name(conn, base)?;
+                if ids.is_empty() {
+                    // Fuzzy auto-resolve: unique match → promote; multi → suggest; none → bail
+                    match resolve_fuzzy_name_cli(conn, base)? {
+                        CliFuzzyResolution::Unique(resolved) => {
+                            let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
+                            (
+                                resolved_ids.into_iter().map(|(id, _)| id).collect(),
+                                resolved,
+                                RefsTarget::Name { file_path: None },
+                            )
+                        }
+                        CliFuzzyResolution::Ambiguous(cands) => {
+                            // ARC-01: shared renderer, refs's published envelope
+                            // (`suggestions`, no `results` key). Both suffixes name the
+                            // disambiguation flags, but the JSON one spells out
+                            // "to disambiguate" and the stderr one does not — kept
+                            // verbatim, since both strings are already shipped.
+                            crate::cli::symbols::emit_fuzzy_ambiguity(
+                                base,
+                                &cands,
+                                json_mode,
+                                crate::cli::symbols::FuzzyEnvelope::Suggestions,
+                                ". Specify --file or --node-id to disambiguate.",
+                                ". Specify --file or --node-id.",
+                            );
+                        }
+                        CliFuzzyResolution::NotFound => {
+                            // Match the success-case envelope shape (object with
+                            // references/by_relation), not a bare `[]`. Object-success
+                            // commands (callgraph/trace/deps) all emit an object on the
+                            // empty/error path so one parser handles both — refs was the
+                            // outlier returning `[]`, which broke `.references` access.
+                            if json_mode {
+                                print_refs_notfound_json(base);
+                            }
+                            eprintln!("[code-graph] Symbol not found: {}", base);
+                            hint_symbol_maybe_unindexed(base);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    (
+                        ids.into_iter().map(|(id, _)| id).collect(),
+                        base.to_string(),
+                        RefsTarget::Name { file_path: None },
+                    )
+                }
             }
         }
     };
@@ -343,6 +411,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // single binding — the tuple above must own the String so `get_node_by_id`'s
     // return doesn't get dropped across the .as_str() borrow.
     let symbol = symbol.as_str();
+    let output_symbol = if matches!(&target, RefsTarget::QualifiedName { .. }) {
+        strip_qualified_prefix(symbol)
+    } else {
+        symbol
+    };
 
     // `relation` is already canonicalized by `normalize_relation` above, which
     // only ever yields a `RELATION_FILTER_VOCAB` member or "all" — so this maps
@@ -452,7 +525,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             *by_relation.entry(r.relation.clone()).or_insert(0) += 1;
         }
         let mut envelope = serde_json::json!({
-            "symbol": symbol,
+            "symbol": output_symbol,
             "total_references": items.len(),
             "by_relation": by_relation,
             "references": items,

@@ -50,7 +50,9 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_module_map, project_module_files, resolve_python_module_targets,
+    build_python_import_bindings, build_python_module_map, collect_python_local_bindings,
+    find_python_import_bindings, project_module_files, python_bound_call_target,
+    python_import_is_shadowed, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -558,7 +560,15 @@ struct BatchInserted {
     /// every same-name node in the batch (which fanned out cross-file /
     /// cross-language).
     #[allow(clippy::type_complexity)]
-    saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)>,
+    saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )>,
     /// File ids in this batch, so Phase 2c can skip intra-batch edges.
     file_ids: HashSet<i64>,
     nodes_created: usize,
@@ -579,7 +589,15 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
     // re-binds ONLY to the new same-name node in THAT file, not every same-name
     // node in the batch (which fanned out cross-file / cross-language).
     #[allow(clippy::type_complexity)]
-    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+    let mut saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = Vec::new();
     // Track file_ids in this batch to filter intra-batch edges in Phase 2c
     let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
@@ -600,8 +618,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         saved_inbound_edges.extend(
             get_inbound_cross_file_edges(db.conn(), file_id)?
                 .into_iter()
-                .map(|(src, src_file, tname, rel, meta)| {
-                    (src, src_file, file_id, tname, rel, meta)
+                .map(|(src, src_file, tname, tqn, rel, meta)| {
+                    (src, src_file, file_id, tname, tqn, rel, meta)
                 }),
         );
         batch_file_ids.insert(file_id);
@@ -710,6 +728,28 @@ fn module_node_of(
         .unwrap_or_default()
 }
 
+/// Remove Python's lexical binding details from persisted import edges.
+///
+/// `python_scope`, `python_local`, and `python_explicit_alias` are extractor-time
+/// facts used to resolve calls in the importing file. They do not change the
+/// dependency represented by the graph edge. Storing them made equivalent
+/// imports with different aliases produce duplicate edges because edge
+/// uniqueness includes metadata.
+fn canonical_import_edge_metadata(metadata: Option<&str>) -> Option<String> {
+    let raw = metadata?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let module = value.get("python_module")?.as_str()?;
+    let mut canonical = serde_json::json!({"python_module": module});
+    if value
+        .get("is_module_import")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        canonical["is_module_import"] = serde_json::json!(true);
+    }
+    Some(canonical.to_string())
+}
+
 /// Insert the `sources` × `targets` cross-product for one relation.
 ///
 /// Every Phase-2 resolution branch ends this way, and each used to carry its
@@ -733,11 +773,17 @@ fn insert_relation_edges(
     metadata: Option<&str>,
     allow_self: bool,
 ) -> Result<usize> {
+    let canonical_metadata = if relation == REL_IMPORTS {
+        canonical_import_edge_metadata(metadata)
+    } else {
+        None
+    };
+    let stored_metadata = canonical_metadata.as_deref().or(metadata);
     let mut created = 0usize;
     for &src_id in sources {
         for &tgt_id in targets {
             if (src_id != tgt_id || allow_self)
-                && insert_edge_cached(db.conn(), src_id, tgt_id, relation, metadata)?
+                && insert_edge_cached(db.conn(), src_id, tgt_id, relation, stored_metadata)?
             {
                 created += 1;
             }
@@ -1163,7 +1209,7 @@ fn resolve_batch_relations(
     let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
 
     for pf in batch_parsed {
-        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let mut relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
 
         // Pre-scan this file's require-namespace bindings
@@ -1196,7 +1242,18 @@ fn resolve_batch_relations(
             }
         }
 
-        for rel in &relations {
+        let python_import_bindings = if pf.language == "python" {
+            build_python_import_bindings(&relations)
+        } else {
+            HashMap::new()
+        };
+        let python_local_bindings = if pf.language == "python" {
+            collect_python_local_bindings(&pf.tree, &pf.source)
+        } else {
+            HashMap::new()
+        };
+
+        for rel in &mut relations {
             // Contract: extract_relations_from_tree stamps every relation with
             // source_language equal to the language argument. The
             // same-language resolution at line 811+ depends on it. Hard
@@ -1227,15 +1284,42 @@ fn resolve_batch_relations(
             // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
             // than whitelist type kinds) so no language's type node is missed.
             let type_source_only = rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
-            let mut source_ids = (0..pf.node_ids.len())
+            let source_is_allowed = |i: usize| {
+                !type_source_only || !matches!(pf.node_types[i].as_str(), "function" | "method")
+            };
+            let qualified_source_ids = (0..pf.node_ids.len())
                 .filter(|&i| {
-                    (pf.node_names[i] == rel.source_name
-                        || pf.node_qualified_names[i].as_deref() == Some(rel.source_name.as_str()))
-                        && (!type_source_only
-                            || !matches!(pf.node_types[i].as_str(), "function" | "method"))
+                    pf.node_qualified_names[i].as_deref() == Some(rel.source_name.as_str())
+                        && source_is_allowed(i)
                 })
                 .map(|i| pf.node_ids[i])
                 .collect::<Vec<_>>();
+            // Python relation scopes are qualified whenever they refer to a
+            // method, so exact qualified identity must win there. This matters
+            // when a module function and a class method share a bare name: the
+            // module function's relation source must not also attach to the
+            // method. Keep the established union for other languages, whose
+            // parsers can report a bare method scope (notably split Rust impls).
+            let mut source_ids = if pf.language == "python" {
+                if qualified_source_ids.is_empty() {
+                    (0..pf.node_ids.len())
+                        .filter(|&i| pf.node_names[i] == rel.source_name && source_is_allowed(i))
+                        .map(|i| pf.node_ids[i])
+                        .collect::<Vec<_>>()
+                } else {
+                    qualified_source_ids
+                }
+            } else {
+                (0..pf.node_ids.len())
+                    .filter(|&i| {
+                        (pf.node_names[i] == rel.source_name
+                            || pf.node_qualified_names[i].as_deref()
+                                == Some(rel.source_name.as_str()))
+                            && source_is_allowed(i)
+                    })
+                    .map(|i| pf.node_ids[i])
+                    .collect::<Vec<_>>()
+            };
 
             // Route handlers are commonly imported from a controller file —
             // the canonical Express layout `import { getUser } from './ctrl';
@@ -1343,15 +1427,159 @@ fn resolve_batch_relations(
                 }
             }
 
+            // A bare Python call to an imported binding can be resolved more
+            // precisely than global name matching. Internal imports bind to
+            // the imported module only; aliased imports bind to the original
+            // exported name.
+            if rel.relation == REL_CALLS && pf.language == "python" {
+                use super::resolve::{parse_callee_metadata, CalleeMeta};
+                if rel.metadata.is_none() {
+                    // If the function scope shadows target_name (via parameter, assignment,
+                    // or nested definition), it is a dynamic invocation of a local, not a call
+                    // to any imported or global symbol.
+                    if python_import_is_shadowed(
+                        &python_import_bindings,
+                        &python_local_bindings,
+                        &rel.source_name,
+                        &rel.target_name,
+                    ) {
+                        continue;
+                    }
+                    if let Some(bindings) = find_python_import_bindings(
+                        &python_import_bindings,
+                        &python_local_bindings,
+                        &rel.source_name,
+                        &rel.target_name,
+                    ) {
+                        // Relative imports need package context that the current
+                        // module map does not model. Keep their existing pending
+                        // behavior until that resolution is implemented.
+                        if let Some(binding) = bindings.last().filter(|binding| {
+                            !binding.module.is_empty()
+                                && !binding.module.starts_with('.')
+                                && !binding.is_module_import
+                        }) {
+                            if python_module_map.contains_key(&binding.module) {
+                                // Resolve against the complete pool. Besides
+                                // removing batch-order dependence, this keeps a
+                                // top-level imported symbol from fanning out to
+                                // same-named class methods in the module file.
+                                let mut deferred_call = DeferredRelation::of(
+                                    &source_ids,
+                                    rel,
+                                    &pf.rel_path,
+                                    &pf.language,
+                                );
+                                deferred_call.target_name = binding.imported_name.clone();
+                                deferred_call.metadata = Some(
+                                    serde_json::json!({
+                                        "q": "python_import",
+                                        "module": binding.module,
+                                    })
+                                    .to_string(),
+                                );
+                                deferred.push(deferred_call);
+                                continue;
+                            }
+                            // An explicit external import cannot name an
+                            // internal project definition by coincidence.
+                            continue;
+                        }
+                    }
+                } else if let Some(callee_meta) = parse_callee_metadata(rel.metadata.as_deref()) {
+                    let import_path = match callee_meta {
+                        CalleeMeta::Path(segments) => Some(segments),
+                        // An inferred or annotated receiver type can itself be
+                        // an imported alias (`item = ImportedEngine()`). Resolve
+                        // that alias to the original class in the bound module.
+                        CalleeMeta::RecvType(receiver_type) => Some(
+                            receiver_type
+                                .split('.')
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    };
+                    // A dotted call is module-bound only when its leading name
+                    // has a live import binding in this lexical scope. Runtime
+                    // receivers and unimported class names keep their original
+                    // qualifier for the Python-specific resolver; they never
+                    // use filename suffixes.
+                    if let Some(segments) = import_path {
+                        if let Some(first) = segments.first() {
+                            // A local receiver (including an `except ... as name`
+                            // alias) invalidates the same-spelled module import.
+                            // Drop it here rather than letting the runtime path
+                            // fallback reconnect it to the imported function by
+                            // bare-name coincidence.
+                            if python_import_is_shadowed(
+                                &python_import_bindings,
+                                &python_local_bindings,
+                                &rel.source_name,
+                                first,
+                            ) {
+                                continue;
+                            }
+                            if let Some(bindings) = find_python_import_bindings(
+                                &python_import_bindings,
+                                &python_local_bindings,
+                                &rel.source_name,
+                                first,
+                            ) {
+                                if let Some((module, owner)) =
+                                    python_bound_call_target(bindings, &segments, python_module_map)
+                                {
+                                    let mut metadata = serde_json::json!({
+                                        "q": "python_import",
+                                        "module": module,
+                                    });
+                                    if let Some(owner) = owner {
+                                        metadata["owner"] = serde_json::json!(owner);
+                                    }
+                                    rel.metadata = Some(metadata.to_string());
+                                } else {
+                                    // The binding names an external/unindexed module.
+                                    // Do not reinterpret its spelling as a project
+                                    // filename or an unrelated bare method.
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Try Python module-constrained resolution for import edges
             if let Some(meta) = import_meta.as_ref() {
                 if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
-                    let is_module_import = meta
+                    let mut is_module_import = meta
                         .get("is_module_import")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let mut effective_module = python_module.to_string();
+                    if !is_module_import {
+                        let submodule = if python_module.is_empty() {
+                            rel.target_name.clone()
+                        } else {
+                            format!("{}.{}", python_module, rel.target_name)
+                        };
+                        if python_module_map.contains_key(&submodule) {
+                            // `from pkg import sub` imports the same module as
+                            // `import pkg.sub`. Canonicalize both the target
+                            // lookup and stored metadata to that identity.
+                            effective_module = submodule;
+                            is_module_import = true;
+                            rel.metadata = Some(
+                                serde_json::json!({
+                                    "python_module": effective_module,
+                                    "is_module_import": true,
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
                     if let Some(module_files) =
-                        project_module_files(python_module, python_module_map)
+                        project_module_files(&effective_module, python_module_map)
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
@@ -1387,7 +1615,7 @@ fn resolve_batch_relations(
                         // For `from X import Y`, we track the module-level dependency (X),
                         // not the individual symbol (Y), since we can't index external code.
                         for &src_id in &source_ids {
-                            external_python_imports.push((src_id, python_module.to_string()));
+                            external_python_imports.push((src_id, effective_module.clone()));
                         }
                         continue; // No point in default resolution for external imports
                     }
@@ -1554,6 +1782,19 @@ fn resolve_batch_relations(
             if rel.relation == REL_CALLS {
                 use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
                 match parse_callee_metadata(rel.metadata.as_deref()) {
+                    Some(_) if pf.language == "python" => {
+                        // Python qualifiers need the complete class, inheritance,
+                        // import-module, and same-package pools. Resolve them in
+                        // the shared deferred path so batch order cannot change
+                        // the answer.
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
+                        continue;
+                    }
                     Some(CalleeMeta::Receiver(recv))
                         if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
                     {
@@ -1763,6 +2004,25 @@ fn resolve_batch_relations(
                 .collect();
 
             let source_lang = pf.language.as_str();
+
+            // Whether a Python builtin spelling names a project definition can
+            // be decided only from the complete same-language pool. Same-file
+            // definitions already won above; defer every remaining builtin so
+            // the final pass can accept one unique project definition or drop
+            // a genuine builtin call.
+            if same_file_targets.is_empty()
+                && rel.relation == REL_CALLS
+                && source_lang == "python"
+                && crate::domain::is_python_builtin_call_target(&rel.target_name)
+            {
+                deferred.push(DeferredRelation::of(
+                    &source_ids,
+                    rel,
+                    &pf.rel_path,
+                    &pf.language,
+                ));
+                continue;
+            }
 
             // Same-file binds are decided HERE (a file's nodes are atomic
             // within its batch, so that pool is complete); the cross-file
@@ -2066,13 +2326,13 @@ pub(super) fn index_files(
     // Pre-build Python module map once (used in all batches for import resolution)
     let mut all_python_paths: HashSet<String> = files
         .iter()
-        .filter(|f| f.ends_with(".py"))
+        .filter(|f| f.ends_with(".py") || f.ends_with(".pyi"))
         .cloned()
         .collect();
     {
         let mut stmt = db
             .conn()
-            .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?;
+            .prepare("SELECT path FROM files WHERE language = 'python'")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             all_python_paths.insert(row?);
@@ -2335,7 +2595,7 @@ pub(super) fn index_files(
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        resolve_pending_calls(db, &crate_roots)?
+        resolve_pending_calls(db, &crate_roots, &python_module_map)?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
@@ -2712,7 +2972,15 @@ fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
-    saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    saved_inbound_edges: &[(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )],
     run_file_paths: &HashSet<&str>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
@@ -2728,12 +2996,24 @@ fn restore_inbound_edges(
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
         let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
+        let mut batch_qualified_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
         for pf in batch_parsed {
-            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+            for ((id, name), qualified_name) in pf
+                .node_ids
+                .iter()
+                .zip(pf.node_names.iter())
+                .zip(pf.node_qualified_names.iter())
+            {
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
                     .push(*id);
+                if let Some(qualified_name) = qualified_name.as_deref() {
+                    batch_qualified_name_to_ids
+                        .entry((pf.file_id, qualified_name))
+                        .or_default()
+                        .push(*id);
+                }
             }
         }
 
@@ -2743,8 +3023,15 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
-        for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
-            saved_inbound_edges
+        for (
+            source_id,
+            source_file_id,
+            target_file_id,
+            target_name,
+            target_qualified_name,
+            relation,
+            metadata,
+        ) in saved_inbound_edges
         {
             // Source file is also in this batch — source_id is stale (deleted + re-created).
             // Phase 2 already resolves cross-file edges for intra-batch files.
@@ -2752,9 +3039,13 @@ fn restore_inbound_edges(
                 skipped_intra_batch += 1;
                 continue;
             }
-            if let Some(new_target_ids) =
-                batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
-            {
+            let new_target_ids = match target_qualified_name.as_deref() {
+                Some(qualified_name) => {
+                    batch_qualified_name_to_ids.get(&(*target_file_id, qualified_name))
+                }
+                None => batch_name_to_ids.get(&(*target_file_id, target_name.as_str())),
+            };
+            if let Some(new_target_ids) = new_target_ids {
                 for &new_tgt_id in new_target_ids {
                     if *source_id != new_tgt_id
                         && insert_edge_cached(
@@ -2866,8 +3157,9 @@ fn resolve_deferred_relations(
     crate_roots: &HashSet<String>,
 ) -> Result<(usize, usize)> {
     use super::resolve::{
-        method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates,
-        CalleeMeta,
+        mark_call_edges_ambiguous, method_candidates, parse_callee_metadata,
+        path_filter_candidates, python_imported_call_candidates, python_typed_method_candidates,
+        self_filter_candidates, should_suppress_call_target, CalleeMeta,
     };
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
@@ -3142,7 +3434,123 @@ fn resolve_deferred_relations(
             }
 
             let mut handled = true;
+            let mut fallback_metadata = d.metadata.as_deref();
+            let mut pending_metadata = d.metadata.as_deref();
             match parse_callee_metadata(d.metadata.as_deref()) {
+                Some(CalleeMeta::PythonImport { module, owner }) if d.language == "python" => {
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let targets = python_imported_call_candidates(
+                        &module,
+                        owner.as_deref(),
+                        &d.target_name,
+                        &same_lang,
+                        db,
+                        python_module_map,
+                    )?;
+                    if !targets.is_empty() {
+                        let metadata = (targets.len() == 1)
+                            .then_some(d.metadata.as_deref())
+                            .flatten();
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &targets,
+                            &d.relation,
+                            metadata,
+                            false,
+                        )?;
+                        if targets.len() > 1 {
+                            mark_call_edges_ambiguous(db, &source_ids, &targets)?;
+                        }
+                    } else if python_module_map.contains_key(&module) {
+                        // The binding is internal but its target has not been
+                        // indexed yet. Preserve the constraint across runs.
+                        for source_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                *source_id,
+                                &d.target_name,
+                                &d.language,
+                                d.metadata.as_deref(),
+                            )?;
+                        }
+                    }
+                }
+                Some(CalleeMeta::SelfRecv(class_name))
+                | Some(CalleeMeta::SelfType(class_name))
+                | Some(CalleeMeta::RecvType(class_name))
+                    if d.language == "python" =>
+                {
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let targets = python_typed_method_candidates(
+                        &class_name,
+                        &d.target_name,
+                        &same_lang,
+                        &d.rel_path,
+                        db,
+                        python_module_map,
+                    )?;
+                    if targets.is_empty() {
+                        handled = false;
+                        fallback_metadata = None;
+                    } else {
+                        let metadata = (targets.len() == 1)
+                            .then_some(d.metadata.as_deref())
+                            .flatten();
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &targets,
+                            &d.relation,
+                            metadata,
+                            false,
+                        )?;
+                        if targets.len() > 1 {
+                            mark_call_edges_ambiguous(db, &source_ids, &targets)?;
+                        }
+                    }
+                }
+                Some(CalleeMeta::Path(segments)) if d.language == "python" => {
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let class_name = segments.join(".");
+                    let targets = python_typed_method_candidates(
+                        &class_name,
+                        &d.target_name,
+                        &same_lang,
+                        &d.rel_path,
+                        db,
+                        python_module_map,
+                    )?;
+                    if targets.is_empty() {
+                        // This is a runtime receiver, not proof of a module.
+                        // Re-enter normal bare resolution without structural
+                        // metadata so collisions retain ambiguous confidence.
+                        handled = false;
+                        fallback_metadata = None;
+                    } else {
+                        let metadata = (targets.len() == 1)
+                            .then_some(d.metadata.as_deref())
+                            .flatten();
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &targets,
+                            &d.relation,
+                            metadata,
+                            false,
+                        )?;
+                        if targets.len() > 1 {
+                            mark_call_edges_ambiguous(db, &source_ids, &targets)?;
+                        }
+                    }
+                }
+                Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_))
+                    if d.language == "python" =>
+                {
+                    handled = false;
+                    fallback_metadata = None;
+                    pending_metadata = None;
+                }
                 Some(CalleeMeta::Receiver(_))
                     if matches!(d.language.as_str(), "javascript" | "typescript" | "tsx") =>
                 {
@@ -3250,6 +3658,13 @@ fn resolve_deferred_relations(
             if handled {
                 continue;
             }
+            let python_runtime_fallback =
+                d.language == "python" && d.metadata.is_some() && fallback_metadata.is_none();
+            let python_candidate_count = if python_runtime_fallback {
+                same_lang_of(&all, &d.language, &[]).len()
+            } else {
+                0
+            };
 
             // 6b. Default chain for bare calls (and JS receiver ns-misses):
             //     same-file → noise → same-language(refined) → pending buffer.
@@ -3266,12 +3681,12 @@ fn resolve_deferred_relations(
                     &source_ids,
                     &same_file_targets,
                     &d.relation,
-                    d.metadata.as_deref(),
+                    fallback_metadata,
                     false,
                 )?;
-                continue;
-            }
-            if is_cross_file_call_noise(&d.target_name, &d.language) {
+                if python_runtime_fallback && python_candidate_count > 1 {
+                    mark_call_edges_ambiguous(db, &source_ids, &same_file_targets)?;
+                }
                 continue;
             }
             // Cross-file pool: batch-time exclusion is BY SOURCE FILE (local_ids),
@@ -3286,6 +3701,10 @@ fn resolve_deferred_relations(
                 })
                 .collect();
             let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            if should_suppress_call_target(&d.target_name, &d.language, same_language_targets.len())
+            {
+                continue;
+            }
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
@@ -3294,7 +3713,7 @@ fn resolve_deferred_relations(
                     &source_ids,
                     &final_targets,
                     &d.relation,
-                    d.metadata.as_deref(),
+                    fallback_metadata,
                     false,
                 )?;
                 continue;
@@ -3308,7 +3727,7 @@ fn resolve_deferred_relations(
                     src_id,
                     &d.target_name,
                     &d.language,
-                    d.metadata.as_deref(),
+                    pending_metadata,
                 )?;
             }
             continue;

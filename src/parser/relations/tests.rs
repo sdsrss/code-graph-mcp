@@ -1020,6 +1020,48 @@ fn test_extract_python_from_import() {
     assert!(imports.contains(&"defaultdict"), "got: {:?}", imports);
 }
 
+#[test]
+fn test_extract_python_aliased_import_binding_metadata() {
+    let code =
+        "def caller():\n    from pkg.cache import Cache as NewCache\n    return NewCache()\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let import = relations
+        .iter()
+        .find(|r| r.relation == REL_IMPORTS && r.target_name == "Cache")
+        .expect("aliased Python import should be extracted");
+    let metadata: serde_json::Value =
+        serde_json::from_str(import.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["python_module"], "pkg.cache");
+    assert_eq!(metadata["python_local"], "NewCache");
+    assert_eq!(metadata["python_scope"], "caller");
+    assert_eq!(metadata["python_explicit_alias"], true);
+    assert!(metadata.get("is_module_import").is_none());
+}
+
+#[test]
+fn test_extract_python_plain_dotted_import_binds_first_component() {
+    let relations =
+        extract_relations("import pkg.sub\nimport pkg.other as explicit\n", "python").unwrap();
+    let plain = relations
+        .iter()
+        .find(|relation| relation.relation == REL_IMPORTS && relation.target_name == "pkg.sub")
+        .expect("plain dotted import should be extracted");
+    let plain_metadata: serde_json::Value =
+        serde_json::from_str(plain.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(plain_metadata["python_local"], "pkg");
+    assert_eq!(plain_metadata["is_module_import"], true);
+    assert!(plain_metadata.get("python_explicit_alias").is_none());
+
+    let aliased = relations
+        .iter()
+        .find(|relation| relation.relation == REL_IMPORTS && relation.target_name == "pkg.other")
+        .expect("aliased dotted import should be extracted");
+    let aliased_metadata: serde_json::Value =
+        serde_json::from_str(aliased.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(aliased_metadata["python_local"], "explicit");
+    assert_eq!(aliased_metadata["python_explicit_alias"], true);
+}
+
 // --- Task 4: Python class inheritance ---
 
 #[test]
@@ -1330,6 +1372,38 @@ fn test_extract_python_method_call() {
         .collect();
     assert!(calls.iter().any(|(s, t)| *s == "caller" && *t == "method"),
         "Python method call `obj.method()` inside `caller` should emit REL_CALLS edge with target=method; got: {:?}", calls);
+}
+
+#[test]
+fn test_extract_python_self_method_call_qualifier() {
+    let code = "class Service:\n    def caller(self):\n        return self.helper()\n\n    def helper(self):\n        return 1\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let call = relations
+        .iter()
+        .find(|r| {
+            r.relation == REL_CALLS
+                && r.source_name == "Service.caller"
+                && r.target_name == "helper"
+        })
+        .expect("Service.caller -> self.helper call should be extracted");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"self","v":"Service"}"#)
+    );
+}
+
+#[test]
+fn test_extract_python_dotted_call_qualifier() {
+    let code = "def caller():\n    return services.users.load()\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let call = relations
+        .iter()
+        .find(|r| r.relation == REL_CALLS && r.source_name == "caller" && r.target_name == "load")
+        .expect("services.users.load call should be extracted");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"services::users"}"#)
+    );
 }
 
 #[test]
@@ -3574,11 +3648,21 @@ class Holder:
         "expected some run() calls to be extracted"
     );
     for r in &runs {
-        assert_eq!(
-            r.metadata, None,
-            "ambiguous/unknown receiver must stay bare (source={}); got {:?}",
-            r.source_name, r.metadata
-        );
+        if r.source_name == "Holder.caller" {
+            assert_eq!(
+                r.metadata.as_deref(),
+                Some(r#"{"q":"self","v":"Holder"}"#),
+                "self.run() inside Holder carries Self qualifier"
+            );
+        } else {
+            assert_eq!(
+                r.metadata.as_deref(),
+                Some(r#"{"q":"path","v":"w"}"#),
+                "ambiguous/unknown receiver carries path qualifier (source={}); got {:?}",
+                r.source_name,
+                r.metadata
+            );
+        }
     }
 }
 
@@ -3661,8 +3745,9 @@ def reassigned(w: A):
             );
         } else {
             assert_eq!(
-                r.metadata, None,
-                "un-annotated / builtin-annotated receiver must stay bare (source={}); got {:?}",
+                r.metadata.as_deref(),
+                Some(r#"{"q":"path","v":"w"}"#),
+                "un-annotated / builtin-annotated receiver carries path qualifier (source={}); got {:?}",
                 r.source_name, r.metadata
             );
         }

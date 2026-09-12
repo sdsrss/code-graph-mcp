@@ -307,7 +307,7 @@ fn extract_dart_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
 /// list.
 fn extract_import_statement(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
     if ctx.config.name == "python" {
-        extract_python_import_names(&ctx.node, ctx.source, results);
+        extract_python_import_names(&ctx.node, ctx.source, ctx.active_scope, results);
     } else {
         extract_import_names(&ctx.node, ctx.source, results);
     }
@@ -339,7 +339,7 @@ fn extract_kotlin_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
 
 /// Python `from X import Y`.
 fn extract_python_from_import(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
-    extract_python_from_import_names(&ctx.node, ctx.source, results);
+    extract_python_from_import_names(&ctx.node, ctx.source, ctx.active_scope, results);
 }
 
 /// Rust `use std::collections::HashMap;`, including the grouped form
@@ -672,6 +672,7 @@ fn extract_import_names_recursive_inner(
 pub(super) fn extract_python_import_names(
     node: &tree_sitter::Node,
     source: &str,
+    scope: Option<&str>,
     results: &mut Vec<ParsedRelation>,
 ) {
     for i in 0..node.named_child_count() {
@@ -679,11 +680,12 @@ pub(super) fn extract_python_import_names(
             if child.kind() == "dotted_name" || child.kind() == "identifier" {
                 let name = node_text(&child, source).to_string();
                 if !name.is_empty() {
-                    let metadata = serde_json::json!({
-                        "python_module": &name,
-                        "is_module_import": true
-                    })
-                    .to_string();
+                    // `import pkg.sub` binds only `pkg` in the local namespace.
+                    // An explicit alias (`import pkg.sub as ps`) is handled by
+                    // the branch below and remains the local binding verbatim.
+                    let local_name = name.split('.').next().unwrap_or(&name);
+                    let metadata =
+                        python_import_metadata(&name, true, Some(local_name), scope, false);
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: name,
@@ -697,11 +699,13 @@ pub(super) fn extract_python_import_names(
                 if let Some(module) = child.named_child(0) {
                     let name = node_text(&module, source).to_string();
                     if !name.is_empty() {
-                        let metadata = serde_json::json!({
-                            "python_module": &name,
-                            "is_module_import": true
-                        })
-                        .to_string();
+                        let local_name = child
+                            .child_by_field_name("alias")
+                            .or_else(|| child.named_child(1))
+                            .map(|alias| node_text(&alias, source))
+                            .unwrap_or(&name);
+                        let metadata =
+                            python_import_metadata(&name, true, Some(local_name), scope, true);
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
@@ -741,6 +745,7 @@ pub(super) fn extract_python_import_names(
 pub(super) fn extract_python_from_import_names(
     node: &tree_sitter::Node,
     source: &str,
+    scope: Option<&str>,
     results: &mut Vec<ParsedRelation>,
 ) {
     // Prefer tree-sitter field name for module (more robust than positional heuristic)
@@ -789,9 +794,9 @@ pub(super) fn extract_python_from_import_names(
                         // Subsequent dotted_names are imported symbols
                         let name = node_text(&child, source).to_string();
                         if !name.is_empty() {
-                            let metadata = module_path
-                                .as_ref()
-                                .map(|m| serde_json::json!({"python_module": m}).to_string());
+                            let metadata = module_path.as_ref().map(|m| {
+                                python_import_metadata(m, false, Some(&name), scope, false)
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
@@ -809,7 +814,7 @@ pub(super) fn extract_python_from_import_names(
                     if !name.is_empty() {
                         let metadata = module_path
                             .as_ref()
-                            .map(|m| serde_json::json!({"python_module": m}).to_string());
+                            .map(|m| python_import_metadata(m, false, Some(&name), scope, false));
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
@@ -824,9 +829,14 @@ pub(super) fn extract_python_from_import_names(
                     if let Some(original) = child.named_child(0) {
                         let name = node_text(&original, source).to_string();
                         if !name.is_empty() {
-                            let metadata = module_path
-                                .as_ref()
-                                .map(|m| serde_json::json!({"python_module": m}).to_string());
+                            let local_name = child
+                                .child_by_field_name("alias")
+                                .or_else(|| child.named_child(1))
+                                .map(|alias| node_text(&alias, source))
+                                .unwrap_or(&name);
+                            let metadata = module_path.as_ref().map(|m| {
+                                python_import_metadata(m, false, Some(local_name), scope, true)
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
@@ -841,7 +851,7 @@ pub(super) fn extract_python_from_import_names(
                     // from X import * — record as wildcard
                     let metadata = module_path
                         .as_ref()
-                        .map(|m| serde_json::json!({"python_module": m}).to_string());
+                        .map(|m| python_import_metadata(m, false, None, scope, false));
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: "*".into(),
@@ -854,6 +864,37 @@ pub(super) fn extract_python_from_import_names(
             }
         }
     }
+}
+
+/// Build parser-time Python import metadata used for lexical call binding.
+///
+/// `python_explicit_alias` is intentionally emitted only for an `as` binding.
+/// The indexer removes it with the other lexical fields before persisting the
+/// import edge, but retaining it here distinguishes `import pkg.sub` from
+/// `import pkg.sub as pkg`, which bind the same local spelling differently.
+fn python_import_metadata(
+    module: &str,
+    is_module_import: bool,
+    local_name: Option<&str>,
+    scope: Option<&str>,
+    is_explicit_alias: bool,
+) -> String {
+    let mut metadata = serde_json::json!({
+        "python_module": module,
+        "python_scope": scope.unwrap_or("<module>"),
+    });
+    // Absence means "imported symbol". Emitting false made the parser's two
+    // row kinds look equivalent to consumers that distinguish by key presence.
+    if is_module_import {
+        metadata["is_module_import"] = serde_json::json!(true);
+    }
+    if let Some(local_name) = local_name {
+        metadata["python_local"] = serde_json::json!(local_name);
+    }
+    if is_explicit_alias {
+        metadata["python_explicit_alias"] = serde_json::json!(true);
+    }
+    metadata.to_string()
 }
 
 #[cfg(test)]

@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Upgrading
+
+Every existing index rebuilds once. `INDEX_VERSION` goes from 71 to 72. The
+schema version does not change. Re-extraction is required because Python import
+metadata, call targets, and confidence tiers changed.
+
+Qualified symbol selection now follows these rules:
+
+- A dotted CLI input is first matched exactly against the indexed one-level
+  `Class.method` qualified name. Deeper spellings are not indexed. Without
+  `--file`, a missing exact qualifier retains the historical final-component
+  bare-name fallback. With `--file`, it is a strict not-found result.
+- Multiple exact qualified definitions return an ambiguous exit. One exact
+  definition takes precedence over bare-name ambiguity. Test definitions do not
+  make a production definition ambiguous unless a test file is selected
+  explicitly.
+- `refs`, `callgraph`, and `impact` use the same qualified selection. Their
+  successful JSON `symbol` field reports the final bare component; the
+  qualifier is used only to select the traversal target. `impact` keeps its
+  existing bare human label and its qualified-miss `candidates` and `Defined
+  in:` recovery hints.
+- `refs|callgraph|impact <Class>.<method> --file <path>` now exits 1 when that
+  exact qualified definition is absent from the selected file. The previous
+  `impact` note about merging same-named symbols in one file is removed because
+  the traversal now retains the exact qualifier.
+- MCP `get_call_graph`, `get_ast_node`, and `find_references` resolve exact
+  `Class.method` names. `get_ast_node(include_impact=true)` calculates impact
+  for that qualified method instead of merging every method with the same bare
+  name. MCP request schemas are unchanged.
+
+Python call resolution now retains multiple plain dotted imports that bind the
+same root, promotes indexed receiver prefixes such as `pkg.sub` to submodules,
+and follows Python 3 scope rules for comprehension targets, `global`, and
+`nonlocal`. Typed `self` and `cls` calls resolve through indexed inheritance,
+while unresolved runtime receivers retain non-structural ambiguity confidence.
+Equivalent import forms store one canonical edge.
+
+The internal Rust return type of `get_inbound_cross_file_edges` now includes a
+sixth field for the target qualified name. Public CLI arguments, MCP schemas,
+and the database schema remain unchanged.
+
 ## 0.147.0
 
 **Upgrading: every index rebuilds itself once, on first use after the upgrade.**

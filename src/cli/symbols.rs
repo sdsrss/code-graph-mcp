@@ -128,38 +128,85 @@ pub(crate) fn emit_fuzzy_ambiguity(
     std::process::exit(1);
 }
 
-/// Resolve a possibly-qualified symbol name (e.g. "Database.open") to a base name
-/// and optional file path for disambiguation. When the user passes a qualified name,
-/// we find the matching node and use its file_path as a filter so that downstream
-/// queries (callgraph, impact, refs) pick the right symbol.
-/// Returns (base_name, resolved_file_filter) where resolved_file_filter is Some only
-/// if the qualified name resolved uniquely and no explicit --file was given.
-pub(crate) fn resolve_qualified_symbol<'a>(
+/// The lookup chosen for a CLI symbol after qualified-name selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliSymbolLookup {
+    /// An exact `qualified_name` match. Traversals must retain the qualifier.
+    ExactQualified,
+    /// A bare-name lookup, including the historical dotted-to-bare fallback.
+    Bare,
+}
+
+/// Shared symbol selection consumed by `refs`, `callgraph`, and `impact`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CliSymbolSelection {
+    pub(crate) lookup_name: String,
+    pub(crate) bare_name: String,
+    pub(crate) file_filter: Option<String>,
+    pub(crate) lookup: CliSymbolLookup,
+}
+
+/// A qualified CLI lookup can fail before command-specific querying begins.
+pub(crate) enum CliSymbolSelectionError {
+    /// More than one exact qualified definition survived the optional file filter.
+    Ambiguous(Vec<queries::NameCandidate>),
+    /// `--file` makes a missing qualifier a strict miss.
+    QualifiedNotFound,
+}
+
+/// Select a CLI symbol with exact-qualified precedence and compatible fallback.
+///
+/// Exact qualified matches are filtered by `explicit_file`. One match keeps the
+/// qualified spelling for traversal; multiple matches are ambiguous. With no
+/// exact match, dotted input falls back to its final bare component only when
+/// no file filter was supplied. Bare input keeps the normal name lookup.
+pub(crate) fn select_cli_symbol(
     conn: &rusqlite::Connection,
-    raw_symbol: &'a str,
-    explicit_file: Option<&'a str>,
-) -> (&'a str, Option<String>) {
-    // If user already provided --file, just strip the prefix and use their filter
-    if explicit_file.is_some() {
-        return (strip_qualified_prefix(raw_symbol), None);
-    }
-    // If the symbol contains '.', try qualified name resolution
+    raw_symbol: &str,
+    explicit_file: Option<&str>,
+) -> Result<std::result::Result<CliSymbolSelection, CliSymbolSelectionError>> {
+    let bare_name = strip_qualified_prefix(raw_symbol).to_string();
     if raw_symbol.contains('.') {
-        let base = strip_qualified_prefix(raw_symbol);
-        if let Ok(nodes) = queries::get_nodes_by_name(conn, base) {
-            let matched: Vec<_> = nodes
-                .iter()
-                .filter(|n| n.qualified_name.as_deref() == Some(raw_symbol))
+        let matches =
+            crate::resolve::selectable_qualified_definitions(conn, raw_symbol, explicit_file)?;
+        if matches.len() > 1 {
+            let candidates = matches
+                .into_iter()
+                .map(|candidate| queries::NameCandidate {
+                    name: candidate.node.name,
+                    file_path: candidate.file_path,
+                    node_type: candidate.node.node_type,
+                    node_id: candidate.node.id,
+                    start_line: candidate.node.start_line,
+                })
                 .collect();
-            if matched.len() == 1 {
-                if let Ok(Some(fp)) = queries::get_file_path(conn, matched[0].file_id) {
-                    return (base, Some(fp));
-                }
-            }
+            return Ok(Err(CliSymbolSelectionError::Ambiguous(candidates)));
         }
-        return (base, None);
+        if matches.into_iter().next().is_some() {
+            return Ok(Ok(CliSymbolSelection {
+                lookup_name: raw_symbol.to_string(),
+                bare_name,
+                // The exact qualifier is already the selector. Retain only a
+                // file filter the user supplied; caching the matched path here
+                // would make a freshness refresh follow a pre-refresh path.
+                file_filter: explicit_file.map(str::to_string),
+                lookup: CliSymbolLookup::ExactQualified,
+            }));
+        }
+        if explicit_file.is_some() {
+            return Ok(Err(CliSymbolSelectionError::QualifiedNotFound));
+        }
     }
-    (raw_symbol, None)
+    Ok(Ok(CliSymbolSelection {
+        lookup_name: if raw_symbol.contains('.') {
+            bare_name.clone()
+        } else {
+            raw_symbol.to_string()
+        },
+        bare_name,
+        file_filter: explicit_file.map(str::to_string),
+        lookup: CliSymbolLookup::Bare,
+    }))
 }
 
 // --- Output formatting ---
