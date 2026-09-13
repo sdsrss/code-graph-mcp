@@ -44,6 +44,26 @@ function makeRig(upgrade) {
   return { input, out, handle, send, getExit: () => exitCode };
 }
 
+// `makeRig` stubs setInterval to a no-op, which is right for the handover tests
+// (they drive attemptUpgrade directly) and wrong for anything about CADENCE: no
+// poll tick ever runs, so the backoff counter those ticks consume is invisible.
+// This rig captures the real callback instead and lets a test step time.
+function makeTickingRig(upgrade) {
+  const input = new PassThrough();
+  const out = [];
+  let cb = null;
+  const handle = serveEmptyMcpStub({
+    input,
+    output: { write: (s) => { out.push(s); return true; } },
+    setInterval: (fn) => { cb = fn; return 1; },
+    clearInterval: () => { cb = null; },
+    exit: () => {},
+    upgrade,
+  });
+  // Named `step`, not `tick`: the module-level `tick` is the setImmediate flush.
+  return { out, handle, step: () => { if (cb) cb(); }, stopped: () => cb === null };
+}
+
 const INIT = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'cc', version: '1' } } };
 
 test('permanent stub: 0 tools, listChanged:false, unknown method → -32601', async () => {
@@ -139,7 +159,8 @@ test('upgrade with unresolvable binary stays a stub and keeps answering', async 
 });
 
 // `spawnReal` returning null was covered; `spawnReal` THROWING was not, and
-// node reserves the async 'error' event for ENOENT/EAGAIN/EMFILE/ENFILE only —
+// node reserves the async 'error' event for five errnos only (EACCES, EAGAIN,
+// EMFILE, ENFILE, ENOENT) —
 // every other errno is thrown synchronously out of child_process.spawn. ETXTBSY
 // is the one that matters: the missing-binary gate nudges attemptUpgrade() from
 // the install chain's onInstalled, i.e. it execs a 40MB binary at the instant
@@ -202,18 +223,74 @@ test('upgrade: default reason is still the non-project wording', async () => {
   assert.match(out.map((s) => JSON.parse(s)).find((m) => m.id === 5).error.message, /cwd becomes a project/);
 });
 
-test('upgrade: repeated spawn throws hit the retry cap instead of looping forever', async () => {
-  const boom = Object.assign(new Error('spawn EACCES'), { code: 'EACCES' });
-  const { send, handle } = makeRig({
-    shouldUpgrade: () => true,
-    spawnReal: () => { throw boom; },
+// Pre-ship review of 7dc7eb4, MEDIUM: containing the throw is not enough on its
+// own. `backoffTicks` is reset only inside the `!shouldUpgrade()` arm, so after a
+// whole offline session has ratcheted it up to the 14-tick cap, an ETXTBSY throw
+// returns straight into that stale counter — and `pollTick` burns it down one per
+// 4 s tick before it will even probe again. The measured delay after a SUCCESSFUL
+// install was 4 s / 16 s / 36 s / 52 s for a 10 s / 30 s / 45 s / 90 s install,
+// against a comment that promised milliseconds. The backoff models "the binary is
+// not there yet"; a throw means it IS there, so that model no longer applies.
+test('upgrade: a spawn throw does not inherit the offline backoff — the next tick retries', async () => {
+  const boom = Object.assign(new Error('spawn ETXTBSY'), { code: 'ETXTBSY' });
+  const child = makeFakeChild();
+  let ready = false;
+  let throwOnce = true;
+  let spawnAttempts = 0;
+  const { handle, step } = makeTickingRig({
+    backoff: true,
+    shouldUpgrade: () => ready,
+    spawnReal: () => {
+      spawnAttempts++;
+      if (throwOnce) { throwOnce = false; throw boom; }
+      return child;
+    },
   });
-  send(INIT);
+
+  // A long offline stretch, exactly what the missing-binary gate does while npm
+  // downloads: ratchet the backoff to its cap.
+  for (let i = 0; i < 40; i++) step();
+  assert.equal(spawnAttempts, 0, 'nothing should have been spawned while offline');
+
+  // The install lands; the chain nudges attemptUpgrade() directly (onInstalled).
+  ready = true;
+  handle.attemptUpgrade();
+  assert.equal(spawnAttempts, 1, 'the nudge must attempt a spawn');
+  assert.equal(handle._state().hasChild, false, 'that attempt threw');
+
+  // The retry must be the very next tick, not a backoff countdown away.
+  step();
   await tick();
-  for (let i = 0; i < MAX_UPGRADE_FAILURES + 3; i++) {
-    assert.doesNotThrow(() => handle.attemptUpgrade(), `attempt ${i} escaped`);
+  assert.equal(spawnAttempts, 2,
+    `after a throw the stub waited for the stale offline backoff to drain instead of ` +
+    `retrying on the next tick — that is a multi-second 0-tool window on a machine ` +
+    `whose install just SUCCEEDED (spawnAttempts=${spawnAttempts})`);
+  assert.equal(handle._state().hasChild, true, 'the retry should have adopted the child');
+});
+
+// Pre-ship review of 7dc7eb4, LOW: the first version of this test asserted only
+// `doesNotThrow` ×18 and `hasChild === false`, which the containment test above
+// already proves — deleting `noteUpgradeFailure()` from the throw path left the
+// whole suite green. Count the spawns instead, through the real poll callback:
+// that is the thing the cap actually bounds, and it is what tells a permanently
+// broken binary apart from an endlessly re-spawned one.
+test('upgrade: a permanently throwing spawn stops at MAX_UPGRADE_FAILURES and parks the poller', async () => {
+  const boom = Object.assign(new Error('spawn EPERM'), { code: 'EPERM' });
+  let spawnAttempts = 0;
+  const { handle, step, stopped } = makeTickingRig({
+    shouldUpgrade: () => true,
+    spawnReal: () => { spawnAttempts++; throw boom; },
+  });
+
+  for (let i = 0; i < MAX_UPGRADE_FAILURES + 10; i++) {
+    assert.doesNotThrow(() => step(), `tick ${i} let the throw escape`);
   }
   await tick();
+
+  assert.equal(spawnAttempts, MAX_UPGRADE_FAILURES,
+    `the cap must bound re-spawns of a doomed binary: expected exactly ` +
+    `${MAX_UPGRADE_FAILURES} attempts, got ${spawnAttempts}`);
+  assert.equal(stopped(), true, 'the poller must be parked once the cap is reached');
   assert.equal(handle._state().hasChild, false);
 });
 

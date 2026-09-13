@@ -154,27 +154,35 @@ function serveEmptyMcpStub(opts = {}) {
       }
       return;
     }
-    // `spawnReal` may THROW rather than return null. node hands only
-    // ENOENT/EAGAIN/EMFILE/ENFILE to the async 'error' event that `beginProxy`
-    // listens on; every other spawn errno comes back as a synchronous throw out
-    // of child_process.spawn. ETXTBSY is the one this path invites: the
-    // missing-binary gate nudges attemptUpgrade() from the install chain's
-    // onInstalled, so it execs a ~40MB binary at the instant the installer
-    // finished writing it, and Linux answers ETXTBSY for as long as any writer
-    // fd is still open. Uncaught, the throw escaped this function, escaped the
-    // poll-timer callback that called it, and killed the whole MCP server — at
-    // the moment the install had SUCCEEDED (QA 2026-09-13: 3/3 against a cold
-    // npm cache, 0/3 warm, i.e. reliably on a genuinely new machine).
-    //
-    // Containment, not repair: the poller is still armed (it is cleared below,
-    // after a spawn we actually adopted), so the existing retry machinery gets
-    // its turn and ETXTBSY clears within milliseconds.
+    // `spawnReal` may THROW rather than return null. node hands exactly FIVE
+    // errnos to the async 'error' event that `beginProxy` listens on — EACCES,
+    // EAGAIN, EMFILE, ENFILE, ENOENT ("Run-time errors should emit an error, not
+    // throw an exception", internal/child_process.js) — and throws every other
+    // one synchronously out of child_process.spawn. ETXTBSY is outside that set,
+    // and it is the one this path invites: the missing-binary gate nudges
+    // attemptUpgrade() from the install chain's onInstalled, so it execs a ~40MB
+    // binary at the instant the installer finished writing it, and Linux answers
+    // ETXTBSY for as long as any writer fd is still open. Uncaught, the throw
+    // escaped this function, escaped the poll-timer callback that called it, and
+    // killed the whole MCP server — at the moment the install had SUCCEEDED
+    // (QA 2026-09-13: 3/3 against a cold npm cache, 0/3 warm).
     let spawned;
     try {
       spawned = upgrade.spawnReal();
     } catch (err) {
       const code = (err && err.code) || 'unknown';
       process.stderr.write(`[code-graph] plugin MCP upgrade spawn failed (${code}); staying in 0-tool stub, will retry\n`);
+      // Clear the offline backoff. It models "the binary is not there yet", and
+      // `shouldUpgrade()` just returned TRUE — the binary IS there, this is a
+      // transient exec failure. Without this the throw returns into whatever
+      // `backoffTicks` a whole offline stretch ratcheted up (capped at 14 ticks
+      // = 56 s), and `pollTick` burns that down one tick at a time before it
+      // will even probe again: measured 4 s / 16 s / 36 s / 52 s of 0-tool stub
+      // after a 10 s / 30 s / 45 s / 90 s install (pre-ship review of 7dc7eb4).
+      // The retry is what makes containment a fix rather than a downgrade, so it
+      // has to be the next tick.
+      backoffTicks = 0;
+      backoffNext = 1;
       noteUpgradeFailure(`spawn-threw-${code}`);
       return;
     }

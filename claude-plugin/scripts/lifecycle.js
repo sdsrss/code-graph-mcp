@@ -2003,7 +2003,10 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
  * Deliberately NOT the same text as the two notes in `uninstall` itself
  * (`cannot write installed_plugins.json` / `cannot read …`): those fire exactly
  * when the registration could NOT be removed, so there `/plugin uninstall` is
- * both necessary and successful. One string in one place because these two
+ * both necessary and successful. That distinction is ENFORCED, not just
+ * described — both printers gate on `installedPluginsUnusable`. It was only
+ * described for one commit, and in that commit a corrupt installed_plugins.json
+ * got both messages at once (pre-ship review of 7dc7eb4). One string because these two
  * printers are the pair that drifted before (v0.142.0 shipped a fix for two
  * printers of the same `unadopt` string, and the release before it fixed the
  * first of them).
@@ -2127,7 +2130,12 @@ if (require.main === module) {
       for (const p of r.adoptedProjects) console.log(`    ${p}`);
       console.log('    Clean all at once: re-run with --unadopt-all, or per project `code-graph-mcp unadopt` + `rm -rf .code-graph`.');
     }
-    for (const line of POST_TEARDOWN_UI_NOTE) console.log(`  ${line}`);
+    // Suppressed in the arm where the registration could NOT be removed — the
+    // stderr note printed there says the opposite, and both at once is a
+    // contradiction. See the constant's own docstring.
+    if (!r.installedPluginsUnusable) {
+      for (const line of POST_TEARDOWN_UI_NOTE) console.log(`  ${line}`);
+    }
   } else if (cmd === 'update') {
     const r = update();
     if (r.settingsUnreadable || r.settingsUnwritable) {

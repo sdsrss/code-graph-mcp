@@ -210,11 +210,17 @@ try {
   process.exit(1);
 }
 
-// Both ways a spawn failure can reach us. node emits the async 'error' event for
-// ENOENT/EAGAIN/EMFILE/ENFILE and THROWS synchronously for every other errno —
-// so the EACCES/EPERM branch below, written for exactly the macOS-quarantine
-// case, was only ever reachable through the `catch`. Reported through one
-// function so neither path can drift into being the one with the good message.
+// Both ways a spawn failure can reach us, reported through one function so
+// neither path can drift into being the one with the good message.
+//
+// node hands exactly FIVE errnos to the async 'error' event — EACCES, EAGAIN,
+// EMFILE, ENFILE, ENOENT ("Run-time errors should emit an error, not throw an
+// exception", internal/child_process.js) — and throws every other one
+// synchronously out of `spawn`. So the EACCES branch below always did reach its
+// handler; what had no path at all was the synchronous side, where an ETXTBSY
+// from a binary an auto-update replaced moments ago printed a raw stack instead
+// of any of this. Unlike the stub's, this process exits 1 either way: here the
+// catch buys the message, not the process.
 function reportSpawnFailure(err) {
   process.stderr.write(`[code-graph] Failed to start: ${err.message}\n`);
   if (process.platform === 'darwin' && (err.code === 'EACCES' || err.code === 'EPERM')) {

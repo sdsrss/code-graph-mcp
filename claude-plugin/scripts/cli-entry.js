@@ -157,7 +157,14 @@ function main({ argv = process.argv, findBinaryRoot = null } = {}) {
         " `code-graph-mcp unadopt` + `rm -rf .code-graph`\n" +
         otherAdopted.map((p) => `    ${p}\n`).join("");
     }
-    for (const line of lifecycle.POST_TEARDOWN_UI_NOTE) out += `  ${line}\n`;
+    // Only when the registration actually went. `uninstall` reports the arm
+    // where it could not (unreadable / unwritable installed_plugins.json) via
+    // `installedPluginsUnusable`, and in that arm it has ALREADY printed the
+    // opposite instruction to stderr — so printing this too told the user both
+    // to run `/plugin uninstall` and that its failure was expected, in one run.
+    if (!r.installedPluginsUnusable) {
+      for (const line of lifecycle.POST_TEARDOWN_UI_NOTE) out += `  ${line}\n`;
+    }
     process.stdout.write(out);
     process.exit(0);
   }

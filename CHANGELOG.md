@@ -1,12 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.148.0
 
-Three fixes from a full install→use→update→self-heal→uninstall pass run as a new
+**Upgrading: two skills appear that were never there before, and a first
+install on a fresh machine stops crashing its own MCP server.** Nothing
+migrates. `INDEX_VERSION` is unchanged, so no re-index — the index, the schema,
+every flag and every exit code stay as they are. What you will notice is
+`explore` and `index` showing up in Claude Code's skill list: they have shipped
+since v0.7.17 (`64ac15e`, "convert commands to skills") and have never once
+loaded, because that commit moved them to a shape Claude Code ignores without a
+word. `claude plugin details code-graph-mcp` is where to confirm it —
+`Skills (2)`, previously `Skills (0)`.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.147.0`, or `cargo install
+code-graph-mcp --version 0.147.0`; plugin users can set the version in the
+marketplace entry. Pinning back re-hides the two skills and restores the
+first-install crash below.
+
+Four fixes from a full install→use→update→self-heal→uninstall pass run as a new
 user would experience it: a clean clone of the repo added as a local marketplace,
 installed into a throwaway `HOME`, against a node prefix with no prior
-`@sdsrs/code-graph` anywhere. Nothing here changes a documented behaviour; two of
-the three restore one.
+`@sdsrs/code-graph` anywhere. Nothing here changes a documented behaviour; three
+of the four restore one.
 
 ### The MCP server crashed at the moment a first install succeeded
 
@@ -17,25 +32,31 @@ hand-off ran `spawn()` on a ~40 MB file npm had just finished writing, and Linux
 answers `ETXTBSY` while any writer fd is still open on an executable.
 
 `ETXTBSY` is not delivered to the `'error'` handler that `beginProxy` installs:
-node reserves the async `'error'` event for `ENOENT`/`EAGAIN`/`EMFILE`/`ENFILE`
-and throws every other spawn errno synchronously out of `child_process.spawn`.
-The throw left `attemptUpgrade`, left the poll-timer callback that called it, and
-killed the whole server process — so a new user's first session ended with no
-code-graph MCP server at all, moments after the install worked.
+node reserves the async `'error'` event for exactly five errnos — `EACCES`,
+`EAGAIN`, `EMFILE`, `ENFILE`, `ENOENT` — and throws every other one
+synchronously out of `child_process.spawn`. The throw left `attemptUpgrade`,
+left the poll-timer callback that called it, and killed the whole server
+process — so a new user's first session ended with no code-graph MCP server at
+all, moments after the install worked.
 
 Measured on a cold npm cache (the genuine new-machine case, where npm must
 download and extract the platform package): **3 of 3 runs crashed**. With a warm
 npm cache, 0 of 3 — which is why it survived every repeat install.
 
 The fix contains the throw and lets the retry machinery that was already there
-do its job; `ETXTBSY` clears in milliseconds, so the next poll wins. Same three
-runs after the fix: **0 of 3 crashed**, `ETXTBSY` still occurred in 2 of them,
-was logged as `upgrade spawn failed (ETXTBSY); staying in 0-tool stub, will
-retry`, and all three upgraded to the real tool list.
+do its job. It also clears the offline backoff on the way out: that counter
+models "the binary has not landed yet", and a throw means it has, so inheriting
+it turned the instant handover into a wait of up to 56 s on exactly the
+cold-cache machine where `ETXTBSY` fires. Same three runs after the fix: **0 of
+3 crashed**, `ETXTBSY` still occurred in 2 of them, was logged as `upgrade spawn
+failed (ETXTBSY); staying in 0-tool stub, will retry`, and all three upgraded to
+the real tool list.
 
-`mcp-launcher.js`'s own top-level spawn had the same blind spot, and its
-macOS-quarantine branch (`EACCES`/`EPERM`) sat in the `'error'` handler where
-those errnos never arrive — reachable now, through one shared reporter.
+`mcp-launcher.js`'s own top-level spawn had the same blind spot, and now reports
+through the same function as its `'error'` handler. That process exits 1 either
+way, so there the catch buys the message — an actionable line instead of a raw
+stack — not the process. Its macOS-quarantine branch was always reachable:
+`EACCES` is one of the five the event does deliver.
 
 ### The two plugin skills were never loaded
 
@@ -105,6 +126,8 @@ those two are the pair that drifted before.
 The two notes inside `uninstall` that also name `/plugin uninstall` are
 unchanged and correct: they fire only when the registration could *not* be
 removed, which is precisely when that command is both necessary and successful.
+Both printers of the new note gate on that same condition, so a corrupt
+`installed_plugins.json` no longer gets told both things at once.
 
 ## 0.147.0
 

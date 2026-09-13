@@ -57,10 +57,17 @@ test('plugin-side config is relocatable: ${CLAUDE_PLUGIN_ROOT}, no absolute path
   ).version;
   assert.match(version, /^\d+\.\d+\.\d+/, 'plugin.json must carry a version to check against');
 
-  let checkedPaths = 0;
   for (const rel of RELOCATABLE_CONFIG) {
     const raw = fs.readFileSync(path.join(PLUGIN_ROOT_DIR, rel), 'utf8');
     assert.doesNotThrow(() => JSON.parse(raw), `${rel} must parse`);
+
+    // Counted PER FILE. An aggregate floor happens to behave per-file only
+    // while each side contributes exactly one path, which is true today and is
+    // not a property either file promises: hooks.json registering a second
+    // command would let .mcp.json stop naming a script with the total still at
+    // 2, silently skipping the rooting check for it (pre-ship review of
+    // 7dc7eb4).
+    let checkedPaths = 0;
 
     // Every path-shaped token that names a file inside the plugin.
     for (const m of raw.matchAll(/[^"\s]*\/scripts\/[A-Za-z0-9_.-]+\.js/g)) {
@@ -79,11 +86,14 @@ test('plugin-side config is relocatable: ${CLAUDE_PLUGIN_ROOT}, no absolute path
     assert.ok(!raw.includes(version),
       `${rel} hardcodes the version ${version}; the plugin-cache path carries it, ` +
       'so this breaks on the next release');
+
+    // Anti-vacuity, per file: each DOES name at least one script, so a regex
+    // that stopped matching would otherwise leave this green while checking
+    // nothing.
+    assert.ok(checkedPaths >= 1,
+      `expected at least 1 script path in ${rel}, found ${checkedPaths} — ` +
+      'the rooting check silently covered nothing for this file');
   }
-  // Anti-vacuity: both files DO name scripts, so a regex that stopped matching
-  // would otherwise leave this test green while checking nothing.
-  assert.ok(checkedPaths >= 2,
-    `expected at least 2 script paths across ${RELOCATABLE_CONFIG.join(' + ')}, found ${checkedPaths}`);
 });
 
 test('hooks.json: every entry has a string matcher', () => {

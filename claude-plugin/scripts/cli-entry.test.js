@@ -289,4 +289,25 @@ test('plugin-only: a full teardown leaves no cache directory behind', posixOnly,
   assert.equal(fs.existsSync(cacheDir), false,
     `teardown left ${cacheDir} standing, holding ` +
     `${fs.existsSync(cacheDir) ? JSON.stringify(fs.readdirSync(cacheDir)) : ''}`);
+  assert.match(r.stdout, /answers "not found"/,
+    'a teardown that DID remove the registration must say so');
+});
+
+// The other arm of the same note. When `installed_plugins.json` cannot be read,
+// `uninstall` leaves the registration alone and says so on stderr — "Claude Code
+// may still list this plugin; remove it with `/plugin uninstall`". Printing the
+// post-teardown note as well told the user both to run that command and that its
+// failure was expected, in one run (pre-ship review of 7dc7eb4).
+test('plugin-only: the post-teardown note is suppressed when the registration could not be removed', posixOnly, (t) => {
+  const box = mkPluginOnly(t);
+  const installed = path.join(box.home, '.claude', 'plugins', 'installed_plugins.json');
+  fs.mkdirSync(path.dirname(installed), { recursive: true });
+  fs.writeFileSync(installed, '{ this is not json');
+
+  const r = runPluginOnly(box, ['uninstall']);
+  assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+  assert.match(r.stdout, /^Uninstalled code-graph-mcp/,
+    'control: the teardown must still have run and reported');
+  assert.doesNotMatch(r.stdout, /answers "not found"/,
+    'the registration was NOT removed, so the note claiming it is gone must not print');
 });
