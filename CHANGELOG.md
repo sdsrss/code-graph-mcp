@@ -1,5 +1,111 @@
 # Changelog
 
+## Unreleased
+
+Three fixes from a full install→use→update→self-heal→uninstall pass run as a new
+user would experience it: a clean clone of the repo added as a local marketplace,
+installed into a throwaway `HOME`, against a node prefix with no prior
+`@sdsrs/code-graph` anywhere. Nothing here changes a documented behaviour; two of
+the three restore one.
+
+### The MCP server crashed at the moment a first install succeeded
+
+On a machine with no binary yet, the launcher answers the MCP handshake with a
+0-tool stub and installs `@sdsrs/code-graph` in the background, then hands the
+live connection to the real binary the instant the install reports done. That
+hand-off ran `spawn()` on a ~40 MB file npm had just finished writing, and Linux
+answers `ETXTBSY` while any writer fd is still open on an executable.
+
+`ETXTBSY` is not delivered to the `'error'` handler that `beginProxy` installs:
+node reserves the async `'error'` event for `ENOENT`/`EAGAIN`/`EMFILE`/`ENFILE`
+and throws every other spawn errno synchronously out of `child_process.spawn`.
+The throw left `attemptUpgrade`, left the poll-timer callback that called it, and
+killed the whole server process — so a new user's first session ended with no
+code-graph MCP server at all, moments after the install worked.
+
+Measured on a cold npm cache (the genuine new-machine case, where npm must
+download and extract the platform package): **3 of 3 runs crashed**. With a warm
+npm cache, 0 of 3 — which is why it survived every repeat install.
+
+The fix contains the throw and lets the retry machinery that was already there
+do its job; `ETXTBSY` clears in milliseconds, so the next poll wins. Same three
+runs after the fix: **0 of 3 crashed**, `ETXTBSY` still occurred in 2 of them,
+was logged as `upgrade spawn failed (ETXTBSY); staying in 0-tool stub, will
+retry`, and all three upgraded to the real tool list.
+
+`mcp-launcher.js`'s own top-level spawn had the same blind spot, and its
+macOS-quarantine branch (`EACCES`/`EPERM`) sat in the `'error'` handler where
+those errnos never arrive — reachable now, through one shared reporter.
+
+### The two plugin skills were never loaded
+
+`explore` and `index` shipped as `skills/explore.md` and `skills/index.md`.
+Claude Code loads a plugin skill from `skills/<name>/SKILL.md` — a directory per
+skill — and ignores a flat `skills/<name>.md` without a warning: `claude plugin
+details code-graph-mcp` reported `Skills (0)` while the README advertised two.
+They have been flat since they were converted from `commands/`, where flat `.md`
+*is* the correct shape.
+
+Now `skills/explore/SKILL.md` and `skills/index/SKILL.md`; the same command
+reports `Skills (2) explore, index`. The tests that covered this directory
+asserted the flat spelling, so they were green for the whole window — they now
+assert the loader's contract instead of the listing that happened to exist.
+
+### `uninstall` left the cache directory standing
+
+`lifecycle.removeCacheResidue` holds two rules: preserve a non-empty
+adopted-projects registry, because those projects still carry a managed CLAUDE.md
+block someone has to be able to find (JS-17), and never re-create the cache
+directory merely to hold `[]` — which its own comment calls "just new residue".
+
+`cli-entry.js` defeated the second rule with call order. It ran the teardown
+first and `unadopt()` second, so the sweep correctly preserved a registry naming
+this project, and unadopt then rewrote that file to `[]` with nothing left to
+clean up after it. The file the sweep had preserved became the residue the sweep
+exists to prevent. Measured A/B from an identical state: teardown-then-unadopt
+leaves `adopted-projects.json`; unadopt-then-teardown leaves no cache directory
+at all. The step-6 comment already described the right order — "the normal
+SessionStart teardown order, which unadopts first" — and this was the one caller
+that did not.
+
+One deliberate knock-on: with `--unadopt-all`, the current project is now
+reported once, on the `this project unadopted=` line, instead of also being
+counted in the swept total.
+
+Still open, and now filed as
+`tasks/specs/uninstall-race-with-in-flight-auto-update.md`: a teardown that runs
+while a SessionStart-spawned `auto-update` is in flight still gets the cache
+directory re-created under it — up to a fresh 42 MB binary when the teardown
+lands before the download starts. The obvious fix (have `uninstall` take the
+install lock the updater already respects) was prototyped and **refuted**: that
+lock lives inside the directory being deleted, so it vanishes with it and the
+updater acquires freely seconds later. The spec records both measured arms and
+the refutation.
+
+### A stub told callers to fix the wrong thing
+
+Both gates that serve a 0-tool stub shared one `-32601` message naming the
+non-project cause, so the missing-binary gate answered a caller standing in a
+perfectly good git repo with "upgrades when cwd becomes a project". That string
+is the only diagnosis a model ever sees — the launcher's stderr goes to the
+Claude Code log, not into the tool result. Each gate now supplies its own, and
+the missing-binary one names `code-graph-mcp doctor`.
+
+### Uninstall no longer signs off with an error message
+
+A successful teardown removes the plugin from `enabledPlugins` and from
+`installed_plugins.json`, so `claude plugin uninstall code-graph-mcp` afterwards
+exits non-zero with `Plugin "code-graph-mcp" not found in installed plugins` —
+and both the summary and `uninstall --help` closed by telling the user to run
+exactly that. The wording now says the registration is already gone, that "not
+found" is the expected answer, and that only a Claude Code session still listing
+the plugin needs `/plugin uninstall`. One string, shared by both printers, since
+those two are the pair that drifted before.
+
+The two notes inside `uninstall` that also name `/plugin uninstall` are
+unchanged and correct: they fire only when the registration could *not* be
+removed, which is precisely when that command is both necessary and successful.
+
 ## 0.147.0
 
 **Upgrading: every index rebuilds itself once, on first use after the upgrade.**

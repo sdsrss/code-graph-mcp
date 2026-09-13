@@ -84,10 +84,15 @@ function serveEmptyMcpStub(opts = {}) {
     else if (m === 'tools/list') result = { tools: [] };
     else if (m === 'resources/list') result = { resources: [] };
     else if (m === 'prompts/list') result = { prompts: [] };
+    // The reason a caller is talking to a 0-tool stub differs per gate, and this
+    // string is the ONLY place it reaches the model — the launcher's stderr goes
+    // to the Claude Code log, not into the tool result. One shared wording named
+    // the non-project cause for both gates, so the missing-binary gate told a
+    // caller sitting in a perfectly good git repo to make it a project.
     else error = {
       code: -32601,
       message: canUpgrade
-        ? 'method not found (plugin MCP stub; upgrades when cwd becomes a project)'
+        ? `method not found (plugin MCP stub; ${upgrade.hint || 'upgrades when cwd becomes a project'})`
         : 'method not found (plugin MCP is in dedup stub mode)',
     };
     writeCc(error ? { jsonrpc: '2.0', id: req.id, error } : { jsonrpc: '2.0', id: req.id, result });
@@ -149,7 +154,30 @@ function serveEmptyMcpStub(opts = {}) {
       }
       return;
     }
-    const spawned = upgrade.spawnReal();
+    // `spawnReal` may THROW rather than return null. node hands only
+    // ENOENT/EAGAIN/EMFILE/ENFILE to the async 'error' event that `beginProxy`
+    // listens on; every other spawn errno comes back as a synchronous throw out
+    // of child_process.spawn. ETXTBSY is the one this path invites: the
+    // missing-binary gate nudges attemptUpgrade() from the install chain's
+    // onInstalled, so it execs a ~40MB binary at the instant the installer
+    // finished writing it, and Linux answers ETXTBSY for as long as any writer
+    // fd is still open. Uncaught, the throw escaped this function, escaped the
+    // poll-timer callback that called it, and killed the whole MCP server — at
+    // the moment the install had SUCCEEDED (QA 2026-09-13: 3/3 against a cold
+    // npm cache, 0/3 warm, i.e. reliably on a genuinely new machine).
+    //
+    // Containment, not repair: the poller is still armed (it is cleared below,
+    // after a spawn we actually adopted), so the existing retry machinery gets
+    // its turn and ETXTBSY clears within milliseconds.
+    let spawned;
+    try {
+      spawned = upgrade.spawnReal();
+    } catch (err) {
+      const code = (err && err.code) || 'unknown';
+      process.stderr.write(`[code-graph] plugin MCP upgrade spawn failed (${code}); staying in 0-tool stub, will retry\n`);
+      noteUpgradeFailure(`spawn-threw-${code}`);
+      return;
+    }
     if (!spawned) { noteUpgradeFailure('binary-unresolved'); return; }
     if (poller) { clearIv(poller); poller = null; }
     child = spawned;

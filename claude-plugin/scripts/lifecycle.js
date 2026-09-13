@@ -1989,6 +1989,32 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // here now. So the preservation belongs here, at the wipe, rather than at each
 // caller — the same "fix it at the shared layer, not per surface" the
 // <external> query filter needed.
+/**
+ * What to say about Claude Code's own plugin registry after a teardown that
+ * SUCCEEDED.
+ *
+ * `uninstall` step 3 drops the plugin from `enabledPlugins` and step 5 from
+ * `installed_plugins.json`, so by the time this prints there is nothing left for
+ * `claude plugin uninstall` to find: in a fresh terminal it exits non-zero with
+ * `Plugin "code-graph-mcp" not found in installed plugins`. Both printers used to
+ * say "also run `/plugin uninstall …`" with no such warning, which hands the user
+ * an error message as the last word on an uninstall that worked.
+ *
+ * Deliberately NOT the same text as the two notes in `uninstall` itself
+ * (`cannot write installed_plugins.json` / `cannot read …`): those fire exactly
+ * when the registration could NOT be removed, so there `/plugin uninstall` is
+ * both necessary and successful. One string in one place because these two
+ * printers are the pair that drifted before (v0.142.0 shipped a fix for two
+ * printers of the same `unadopt` string, and the release before it fixed the
+ * first of them).
+ */
+const POST_TEARDOWN_UI_NOTE = [
+  'Claude Code UI: the registration is already gone, so `claude plugin uninstall',
+  'code-graph-mcp` in a new terminal answers "not found" — that is the expected',
+  'result here, not a failure. In a session that still lists the plugin, run',
+  '`/plugin uninstall code-graph-mcp` there to sync its UI.',
+];
+
 function removeCacheResidue() {
   // Path comes from adopt.js rather than a second spelling of the basename —
   // a literal here would silently stop matching the day adopt.js renames it,
@@ -2051,6 +2077,7 @@ module.exports = {
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
   registerStatuslineProvider, unregisterStatuslineProvider, detachStatuslineIntegration,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, INSTALL_LOCK_FILE, SHELL_PKG,   // uninstall residue
+  POST_TEARDOWN_UI_NOTE,                                                       // one wording, two printers
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
   settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,
 };
@@ -2100,7 +2127,7 @@ if (require.main === module) {
       for (const p of r.adoptedProjects) console.log(`    ${p}`);
       console.log('    Clean all at once: re-run with --unadopt-all, or per project `code-graph-mcp unadopt` + `rm -rf .code-graph`.');
     }
-    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
+    for (const line of POST_TEARDOWN_UI_NOTE) console.log(`  ${line}`);
   } else if (cmd === 'update') {
     const r = update();
     if (r.settingsUnreadable || r.settingsUnwritable) {

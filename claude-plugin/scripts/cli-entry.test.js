@@ -156,9 +156,25 @@ function mkPluginOnly(t) {
   // USERPROFILE alongside HOME: `os.homedir()` reads USERPROFILE on Windows and
   // ignores HOME, so a one-name redirect points the sandbox at the developer's
   // real home there (the two-name rule, pinned by tmpdir-drift-guard.test.js).
-  const env = { ...process.env, HOME: home, USERPROFILE: home, PATH: '/usr/bin:/bin' };
+  //
+  // TMPDIR/TMP/TEMP for the same reason one level over: `lifecycle.uninstall`
+  // step 6.5 wholesale-deletes `tmp-dir.js`'s CG_TMP_DIR, which is resolved from
+  // `os.tmpdir()` — NOT from HOME. A child with HOME redirected and TMPDIR
+  // inherited therefore deletes the machine-global dir every developer's live
+  // hooks share. `hardening.rs::js_test_suite_leaves_the_shared_tmp_dir_intact`
+  // catches exactly that, and caught this helper the first time a test here ran
+  // `uninstall`. All three names because node's `os.tmpdir()` reads TMPDIR on
+  // POSIX and TEMP then TMP on Windows, ignoring TMPDIR entirely.
+  const tmp = path.join(root, 'tmp');
+  fs.mkdirSync(tmp, { recursive: true });
+  const env = {
+    ...process.env,
+    HOME: home, USERPROFILE: home,
+    TMPDIR: tmp, TMP: tmp, TEMP: tmp,
+    PATH: '/usr/bin:/bin',
+  };
   delete env._FIND_BINARY_ROOT;
-  return { launcher: path.join(root, 'claude-plugin', 'bin', 'code-graph-mcp'), env, cwd: root };
+  return { launcher: path.join(root, 'claude-plugin', 'bin', 'code-graph-mcp'), env, cwd: root, home };
 }
 
 function runPluginOnly(box, args) {
@@ -234,4 +250,43 @@ test('plugin-only: adopt is answered without consulting the binary', posixOnly, 
   assert.doesNotMatch(r.stdout + r.stderr, /REACHED_THE_BINARY/);
   assert.equal(r.status, 0);
   assert.match(r.stdout, /install the code-graph steering block/);
+});
+
+// `uninstall` is the one teardown a user gets, and it must not leave the cache
+// directory standing. `lifecycle.removeCacheResidue` already encodes both halves
+// of that: PRESERVE a non-empty adopted-projects registry (JS-17 — those
+// projects still carry a managed block someone has to be able to find), and
+// never re-create CACHE_DIR merely to hold `[]`, which its own comment calls
+// "just new residue".
+//
+// The second half was defeated by call order. `cli-entry.js` ran
+// `lifecycle.uninstall()` first and `unadopt()` second, so the sweep correctly
+// preserved a registry naming this project, and unadopt then rewrote that file
+// to `[]` with nothing left to clean up after it. Measured A/B from an identical
+// state: teardown-then-unadopt leaves `adopted-projects.json`; unadopt-then-
+// teardown leaves no cache directory at all.
+//
+// The adopt step is not setup — it is the control. With an already-empty
+// registry `removeCacheResidue` deletes everything under either order, so
+// without asserting the registry is non-empty first, this test passes for the
+// wrong reason at every value of the bug.
+test('plugin-only: a full teardown leaves no cache directory behind', posixOnly, (t) => {
+  const box = mkPluginOnly(t);
+  const cacheDir = path.join(box.home, '.cache', 'code-graph');
+  const registry = path.join(cacheDir, 'adopted-projects.json');
+
+  // adopt refuses a directory with no project marker, by design.
+  fs.writeFileSync(path.join(box.cwd, 'package.json'), '{"name":"fixture"}\n');
+
+  const adopted = runPluginOnly(box, ['adopt']);
+  assert.equal(adopted.status, 0, `adopt failed: ${adopted.stdout}${adopted.stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(registry, 'utf8')), [box.cwd],
+    'control: the registry must NAME this project, or removeCacheResidue would ' +
+    'have had nothing to preserve and the assertion below would prove nothing');
+
+  const r = runPluginOnly(box, ['uninstall']);
+  assert.equal(r.status, 0, `uninstall failed: ${r.stderr}`);
+  assert.equal(fs.existsSync(cacheDir), false,
+    `teardown left ${cacheDir} standing, holding ` +
+    `${fs.existsSync(cacheDir) ? JSON.stringify(fs.readdirSync(cacheDir)) : ''}`);
 });

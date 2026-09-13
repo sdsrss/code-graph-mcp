@@ -497,16 +497,53 @@ test('integration: simple confirmation → skipped', () => {
 
 // ── Skill files validation ──────────────────────────────
 
-test('skills: explore.md has correct frontmatter', () => {
-  const content = fs.readFileSync(path.join(__dirname, '../skills/explore.md'), 'utf8');
-  assert.match(content, /^---\nname: explore/);
-  assert.match(content, /description:/);
+// Claude Code loads a plugin skill from `skills/<name>/SKILL.md` — a DIRECTORY
+// per skill. A flat `skills/<name>.md` is not a skill and not an error either:
+// it is silently ignored, `claude plugin details` reports "Skills (0)", and
+// nothing in the install path says a word. That is what shipped between
+// 64ac15e ("convert commands to skills", which moved commands/*.md straight to
+// skills/*.md — the correct shape for the surface it left, not for the one it
+// joined) and this fix, while the README advertised two skills.
+//
+// The three tests here before this one asserted the flat spelling — they read
+// `../skills/explore.md` and deep-equalled readdir against
+// `['explore.md','index.md']`, so they were green for the whole of that window
+// and the layout was the one axis they pinned. Assert the loader's contract
+// instead of the directory listing that happens to exist.
+const SKILLS_DIR = path.join(__dirname, '../skills');
+const EXPECTED_SKILLS = ['explore', 'index'];
+
+test('skills: each is a directory holding SKILL.md (Claude Code ignores flat skills/<name>.md)', () => {
+  for (const name of EXPECTED_SKILLS) {
+    const dir = path.join(SKILLS_DIR, name);
+    assert.ok(fs.existsSync(dir) && fs.statSync(dir).isDirectory(),
+      `skills/${name} must be a directory`);
+    assert.ok(fs.existsSync(path.join(dir, 'SKILL.md')),
+      `skills/${name}/SKILL.md must exist — a flat skills/${name}.md loads as nothing`);
+  }
 });
 
-test('skills: index.md has correct frontmatter', () => {
-  const content = fs.readFileSync(path.join(__dirname, '../skills/index.md'), 'utf8');
-  assert.match(content, /^---\nname: index/);
-  assert.match(content, /description:/);
+test('skills: no stray flat .md at the skills/ root (it would load as nothing)', () => {
+  const stray = fs.readdirSync(SKILLS_DIR)
+    .filter((f) => f.endsWith('.md'))
+    .sort();
+  assert.deepEqual(stray, [],
+    `flat markdown at skills/ root is silently ignored by the loader: ${stray.join(', ')}`);
+});
+
+test('skills: SKILL.md frontmatter name matches its directory', () => {
+  for (const name of EXPECTED_SKILLS) {
+    const content = fs.readFileSync(path.join(SKILLS_DIR, name, 'SKILL.md'), 'utf8');
+    assert.match(content, new RegExp(`^---\\nname: ${name}\\n`),
+      `skills/${name}/SKILL.md frontmatter name must be "${name}"`);
+    assert.match(content, /description:/);
+  }
+});
+
+test('skills: only expected skills exist', () => {
+  const dirs = fs.readdirSync(SKILLS_DIR, { withFileTypes: true })
+    .filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  assert.deepEqual(dirs, EXPECTED_SKILLS);
 });
 
 test('skills: commands directory is empty (all converted to skills)', () => {
@@ -517,12 +554,6 @@ test('skills: commands directory is empty (all converted to skills)', () => {
     assert.equal(files.length, 0, 'commands/ should have no .md files');
   }
   // Directory not existing is also valid
-});
-
-test('skills: only expected skills exist', () => {
-  const skillsDir = path.join(__dirname, '../skills');
-  const files = fs.readdirSync(skillsDir).filter(f => f.endsWith('.md')).sort();
-  assert.deepEqual(files, ['explore.md', 'index.md']);
 });
 
 // ── computeQuietHooks priority chain (default-noisy flip) ────────

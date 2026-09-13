@@ -503,14 +503,35 @@ fn shipped_steering_docs() -> Vec<(String, String)> {
         let mut found = 0usize;
         for entry in entries {
             let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
+            // Agents are flat `<name>.md`; skills are `<name>/SKILL.md` — a
+            // DIRECTORY per skill, which is the only shape Claude Code loads.
+            // This walk used to be flat-only, so it read the skills as top-level
+            // `.md` files and would have gone to zero the moment they were moved
+            // into the layout the loader actually wants. The `found > 0` floor
+            // below is what made that loud rather than vacuous; keep both.
+            let md: Vec<std::path::PathBuf> = if path.is_dir() {
+                let nested = path.join("SKILL.md");
+                if nested.is_file() {
+                    vec![nested]
+                } else {
+                    vec![]
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                vec![path]
+            } else {
+                vec![]
+            };
+            for p in md {
+                let name = p
+                    .strip_prefix(&full)
+                    .expect("child of dir")
+                    .to_string_lossy()
+                    .into_owned();
+                let text = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+                out.push((format!("{dir}/{name}"), text));
+                found += 1;
             }
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-            out.push((format!("{dir}/{name}"), text));
-            found += 1;
         }
         assert!(
             found > 0,

@@ -151,6 +151,11 @@ if (!binary) {
 
   const stub = serveEmptyMcpStub({
     upgrade: {
+      // What a tool call gets told while this gate holds. Without it the stub
+      // answered with the OTHER gate's reason ("upgrades when cwd becomes a
+      // project"), which is both wrong here and unactionable — the cwd is fine,
+      // the binary is what is missing.
+      hint: `binary not installed yet — installing @sdsrs/code-graph@${version} in the background; if tools never appear, run \`code-graph-mcp doctor\``,
       // Each probe is a full discovery walk (incl. `npm root -g`, up to 2s);
       // offline the binary never appears, so back the poll off toward 60s.
       // The install chain's onInstalled nudge below still upgrades instantly.
@@ -205,13 +210,12 @@ try {
   process.exit(1);
 }
 
-// Spawn binary with stdio inheritance for MCP JSON-RPC
-const child = spawn(binary, ['serve'], hidden({
-  stdio: 'inherit',
-  env: process.env,
-}));
-
-child.on('error', (err) => {
+// Both ways a spawn failure can reach us. node emits the async 'error' event for
+// ENOENT/EAGAIN/EMFILE/ENFILE and THROWS synchronously for every other errno —
+// so the EACCES/EPERM branch below, written for exactly the macOS-quarantine
+// case, was only ever reachable through the `catch`. Reported through one
+// function so neither path can drift into being the one with the good message.
+function reportSpawnFailure(err) {
   process.stderr.write(`[code-graph] Failed to start: ${err.message}\n`);
   if (process.platform === 'darwin' && (err.code === 'EACCES' || err.code === 'EPERM')) {
     process.stderr.write(
@@ -219,12 +223,34 @@ child.on('error', (err) => {
       `  xattr -d com.apple.quarantine "${binary}"\n`
     );
   }
+  // ETXTBSY: something still holds a writer fd on the binary — an auto-update
+  // that replaced it moments ago. Retryable, unlike the rest of this function.
+  if (err.code === 'ETXTBSY') {
+    process.stderr.write(
+      'The binary was still being written when we tried to run it.\n' +
+      '  Retry: restart Claude Code, or run `code-graph-mcp doctor`\n'
+    );
+  }
   // A glibc binary installed on musl (older npm ignores the `libc` field) is present
   // but execs into a loader error — surface the actionable platform hint.
   const platformHint = unsupportedPlatformHint();
   if (platformHint) process.stderr.write(platformHint + '\n');
   process.exit(1);
-});
+}
+
+// Spawn binary with stdio inheritance for MCP JSON-RPC
+let child;
+try {
+  child = spawn(binary, ['serve'], hidden({
+    stdio: 'inherit',
+    env: process.env,
+  }));
+} catch (err) {
+  reportSpawnFailure(err);   // exits; the return keeps `child` from being read as undefined
+  return;
+}
+
+child.on('error', reportSpawnFailure);
 
 child.on('exit', (code, signal) => {
   if (signal) {

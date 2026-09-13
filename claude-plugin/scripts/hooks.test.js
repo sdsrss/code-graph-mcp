@@ -34,6 +34,58 @@ test('hooks.json: file parses as JSON', () => {
   assert.doesNotThrow(loadHooks);
 });
 
+// Relocatability of the PLUGIN-SIDE config — the two files Claude Code reads out
+// of the plugin root and expands `${CLAUDE_PLUGIN_ROOT}` in. Note the opposite
+// rule below at "hook commands use absolute paths (no env vars)": that one is
+// about the entries `lifecycle.js` writes into `~/.claude/settings.json`, where
+// nothing expands the variable. Same-looking strings, opposite requirements,
+// which is why each needs its own guard.
+//
+// This is the property `claude --plugin-dir <path>` exercises: the same tree
+// loaded from a source checkout instead of `~/.claude/plugins/cache/<m>/<p>/<v>/`.
+// It is asserted here rather than end-to-end because `--plugin-dir` needs
+// credentials, and running it against a real home would have this plugin's own
+// SessionStart hook rewrite that machine's live settings.json (QA 2026-09-13).
+// A version literal is the specific way this breaks: the cache path carries the
+// version, so a hardcoded one survives exactly until the next release.
+const PLUGIN_ROOT_DIR = path.resolve(__dirname, '..');
+const RELOCATABLE_CONFIG = ['hooks/hooks.json', '.mcp.json'];
+
+test('plugin-side config is relocatable: ${CLAUDE_PLUGIN_ROOT}, no absolute paths, no ../, no version literal', () => {
+  const version = JSON.parse(
+    fs.readFileSync(path.join(PLUGIN_ROOT_DIR, '.claude-plugin', 'plugin.json'), 'utf8')
+  ).version;
+  assert.match(version, /^\d+\.\d+\.\d+/, 'plugin.json must carry a version to check against');
+
+  let checkedPaths = 0;
+  for (const rel of RELOCATABLE_CONFIG) {
+    const raw = fs.readFileSync(path.join(PLUGIN_ROOT_DIR, rel), 'utf8');
+    assert.doesNotThrow(() => JSON.parse(raw), `${rel} must parse`);
+
+    // Every path-shaped token that names a file inside the plugin.
+    for (const m of raw.matchAll(/[^"\s]*\/scripts\/[A-Za-z0-9_.-]+\.js/g)) {
+      const p = m[0];
+      checkedPaths++;
+      assert.ok(p.startsWith('${CLAUDE_PLUGIN_ROOT}/'),
+        `${rel}: ${p} must be rooted at \${CLAUDE_PLUGIN_ROOT}`);
+      assert.ok(!p.includes('..'),
+        `${rel}: ${p} escapes the plugin root with ".."`);
+      assert.ok(fs.existsSync(p.replace('${CLAUDE_PLUGIN_ROOT}', PLUGIN_ROOT_DIR)),
+        `${rel}: ${p} does not exist on disk`);
+    }
+
+    assert.ok(!/"\/(?:home|Users|var|opt|usr)\//.test(raw),
+      `${rel} contains an absolute path — it would not survive being installed anywhere else`);
+    assert.ok(!raw.includes(version),
+      `${rel} hardcodes the version ${version}; the plugin-cache path carries it, ` +
+      'so this breaks on the next release');
+  }
+  // Anti-vacuity: both files DO name scripts, so a regex that stopped matching
+  // would otherwise leave this test green while checking nothing.
+  assert.ok(checkedPaths >= 2,
+    `expected at least 2 script paths across ${RELOCATABLE_CONFIG.join(' + ')}, found ${checkedPaths}`);
+});
+
 test('hooks.json: every entry has a string matcher', () => {
   const cfg = loadHooks();
   let count = 0;

@@ -102,20 +102,40 @@ function main({ argv = process.argv, findBinaryRoot = null } = {}) {
         "deletes ~/.cache/code-graph, and removes this project's CLAUDE.md adoption\n" +
         "block. --unadopt-all also removes the managed block + detail file from every\n" +
         "registered adopted project; --purge-global removes the globally-installed\n" +
-        "@sdsrs npm packages even without the plugin-install marker. Also run\n" +
-        "`/plugin uninstall code-graph-mcp` in Claude Code to sync its UI.\n");
+        "@sdsrs npm packages even without the plugin-install marker.\n\n" +
+        "This also removes Claude Code's own registration, so `claude plugin uninstall\n" +
+        "code-graph-mcp` afterwards answers \"not found\" — expected. Only a Claude Code\n" +
+        "session still listing the plugin needs `/plugin uninstall code-graph-mcp`.\n");
       process.exit(0);
     }
     rejectUnknownFlags(argv, "uninstall", new Set(["--help", "-h", "--unadopt-all", "--purge-global"]));
     const lifecycle = require("./lifecycle");
     const { unadopt } = require("./adopt");
+    // Unadopt THIS project BEFORE the teardown, not after.
+    //
+    // `lifecycle.removeCacheResidue` (step 6) holds two rules: PRESERVE a
+    // non-empty adopted-projects registry — those projects still carry a managed
+    // block someone has to be able to find (JS-17) — and never re-create
+    // CACHE_DIR merely to hold `[]`, which its own comment calls "just new
+    // residue". Unadopting afterwards produced exactly that `[]`, one step too
+    // late for anything to sweep it, so the file step 6 had carefully preserved
+    // for us became the residue step 6 exists to prevent. Unadopt first and the
+    // registry is already empty when step 6 reads it, so the whole cache
+    // directory goes. It is also why that comment describes "the normal
+    // SessionStart teardown order, which unadopts first" — this was the one
+    // caller that did not.
+    //
+    // Deliberate knock-on: `r.adoptedProjects` (captured at step 5.5) and the
+    // `--unadopt-all` sweep no longer see this project, so it is reported once,
+    // on the `this project unadopted=` line, instead of being counted twice.
+    // `otherAdopted` below already filtered `process.cwd()` out either way.
+    let ua = { ok: false };
+    try { ua = unadopt(); } catch { /* best-effort — the teardown below still runs */ }
+    const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
     const r = lifecycle.uninstall({
       purgeGlobal: argv.slice(3).includes("--purge-global"),
       unadoptAll: argv.slice(3).includes("--unadopt-all"),
     });
-    let ua = { ok: false };
-    try { ua = unadopt(); } catch { /* best-effort — settings/cache already cleaned */ }
-    const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
     let out =
       `Uninstalled code-graph-mcp | settings cleaned=${r.settingsChanged}` +
       ` | this project unadopted=${projectUnadopted}\n`;
@@ -137,7 +157,7 @@ function main({ argv = process.argv, findBinaryRoot = null } = {}) {
         " `code-graph-mcp unadopt` + `rm -rf .code-graph`\n" +
         otherAdopted.map((p) => `    ${p}\n`).join("");
     }
-    out += "  Also run `/plugin uninstall code-graph-mcp` in Claude Code to sync its UI state.\n";
+    for (const line of lifecycle.POST_TEARDOWN_UI_NOTE) out += `  ${line}\n`;
     process.stdout.write(out);
     process.exit(0);
   }

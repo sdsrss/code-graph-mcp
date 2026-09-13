@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { PassThrough } = require('stream');
 const { EventEmitter } = require('events');
-const { serveEmptyMcpStub, SENTINEL_ID } = require('./mcp-stub');
+const { serveEmptyMcpStub, SENTINEL_ID, MAX_UPGRADE_FAILURES } = require('./mcp-stub');
 
 const tick = () => new Promise((r) => setImmediate(r));
 
@@ -136,6 +136,85 @@ test('upgrade with unresolvable binary stays a stub and keeps answering', async 
   await tick();
   const resp = out.map((s) => JSON.parse(s)).find((m) => m.id === 9);
   assert.deepEqual(resp.result.tools, []);   // still served by the stub
+});
+
+// `spawnReal` returning null was covered; `spawnReal` THROWING was not, and
+// node reserves the async 'error' event for ENOENT/EAGAIN/EMFILE/ENFILE only —
+// every other errno is thrown synchronously out of child_process.spawn. ETXTBSY
+// is the one that matters: the missing-binary gate nudges attemptUpgrade() from
+// the install chain's onInstalled, i.e. it execs a 40MB binary at the instant
+// the installer finished writing it, and Linux answers ETXTBSY while any writer
+// fd is still open. Uncaught, that throw left the poll-timer callback and killed
+// the whole MCP server — at the moment the install SUCCEEDED. Reproduced 3/3
+// against a cold npm cache (QA 2026-09-13).
+test('upgrade: a spawnReal that THROWS (ETXTBSY) is contained — stub survives and retries', async () => {
+  const boom = Object.assign(new Error('spawn ETXTBSY'), { code: 'ETXTBSY', errno: -26, syscall: 'spawn' });
+  let throwNext = true;
+  const child = makeFakeChild();
+  const { out, send, handle } = makeRig({
+    shouldUpgrade: () => true,
+    spawnReal: () => { if (throwNext) throw boom; return child; },
+  });
+  send(INIT);
+  await tick();
+
+  // The defect: this call propagated the throw to the caller (the poll timer).
+  assert.doesNotThrow(() => handle.attemptUpgrade(), 'spawnReal throwing must not escape attemptUpgrade');
+  await tick();
+  assert.equal(handle._state().hasChild, false, 'no child adopted after a failed spawn');
+
+  // The connection must still be alive and answering as a stub.
+  send({ jsonrpc: '2.0', id: 9, method: 'tools/list', params: {} });
+  await tick();
+  assert.deepEqual(out.map((s) => JSON.parse(s)).find((m) => m.id === 9).result.tools, []);
+
+  // ETXTBSY clears in milliseconds, so the retry must still be able to win.
+  throwNext = false;
+  handle.attemptUpgrade();
+  await tick();
+  assert.equal(handle._state().hasChild, true, 'a later attempt still upgrades');
+});
+
+// The -32601 text is the only diagnosis a MODEL ever sees — stderr goes to the
+// Claude Code log, not into the tool result. Both upgradeable gates shared one
+// string that named the non-project cause, so the missing-binary gate (the gate
+// every new install passes through) answered a caller standing in a perfectly
+// good git repo with "upgrades when cwd becomes a project".
+test('upgrade: the -32601 reason reflects the gate that armed the stub', async () => {
+  const { out, send } = makeRig({
+    shouldUpgrade: () => false, spawnReal: () => null,
+    hint: 'binary still installing',
+  });
+  send(INIT);
+  send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'project_map', arguments: {} } });
+  await tick();
+  const err = out.map((s) => JSON.parse(s)).find((m) => m.id === 4).error;
+  assert.equal(err.code, -32601);
+  assert.match(err.message, /binary still installing/);
+  assert.doesNotMatch(err.message, /cwd becomes a project/);
+});
+
+test('upgrade: default reason is still the non-project wording', async () => {
+  const { out, send } = makeRig({ shouldUpgrade: () => false, spawnReal: () => null });
+  send(INIT);
+  send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'project_map', arguments: {} } });
+  await tick();
+  assert.match(out.map((s) => JSON.parse(s)).find((m) => m.id === 5).error.message, /cwd becomes a project/);
+});
+
+test('upgrade: repeated spawn throws hit the retry cap instead of looping forever', async () => {
+  const boom = Object.assign(new Error('spawn EACCES'), { code: 'EACCES' });
+  const { send, handle } = makeRig({
+    shouldUpgrade: () => true,
+    spawnReal: () => { throw boom; },
+  });
+  send(INIT);
+  await tick();
+  for (let i = 0; i < MAX_UPGRADE_FAILURES + 3; i++) {
+    assert.doesNotThrow(() => handle.attemptUpgrade(), `attempt ${i} escaped`);
+  }
+  await tick();
+  assert.equal(handle._state().hasChild, false);
 });
 
 test('upgrade: a request in the handoff window is queued then flushed to the child in order', async () => {
