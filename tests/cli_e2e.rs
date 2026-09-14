@@ -11627,6 +11627,12 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
 
     // Two definitions of `Worker.run` exist, but only one is selectable without
     // --file, so this must resolve rather than report ambiguity.
+    //
+    // Exit 0 alone does not say WHICH definition was selected: if the default
+    // picked the test definition and `--file` were ignored outright, both calls
+    // below would still exit 0 and this test would pass while asserting the
+    // opposite of its name. So each arm asserts the caller it must have found —
+    // `prod_caller` lives only in src/, `test_caller` only in tests/.
     let (stdout, stderr, code) = run_cli(&project, &["refs", "Worker.run", "--json"]);
     let combined = format!("{stdout}{stderr}");
     assert_eq!(
@@ -11637,8 +11643,23 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
         !combined.to_lowercase().contains("ambiguous"),
         "a test namesake must not make the production symbol ambiguous: {combined}"
     );
-    // And the explicit bypass still reaches the test definition.
-    let (_, _, code) = run_cli(
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let names: Vec<&str> = refs["references"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"prod_caller"),
+        "the default selection must be the production definition: {refs}"
+    );
+    assert!(
+        !names.contains(&"test_caller"),
+        "the production selection must not carry the test definition's caller: {refs}"
+    );
+
+    // And the explicit bypass still reaches the test definition — asserted by
+    // the caller it returns, not merely by exiting 0.
+    let (stdout, stderr, code) = run_cli(
         &project,
         &[
             "refs",
@@ -11648,7 +11669,20 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
             "--json",
         ],
     );
-    assert_eq!(code, 0, "--file must still select the test definition");
+    assert_eq!(
+        code, 0,
+        "--file must still select the test definition: {stdout}{stderr}"
+    );
+    let bypass: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let bypass_names: Vec<&str> = bypass["references"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        bypass_names.contains(&"test_caller"),
+        "--file tests/... must reach the TEST definition, not fall back to the \
+         production one: {bypass}"
+    );
 
     // The same rule, for a production method whose NAME looks like a test.
     for cmd in ["refs", "callgraph", "impact"] {
@@ -11658,6 +11692,16 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
             code, 0,
             "{cmd} must select the production Worker.test_step, not refuse: {combined}"
         );
+        // `callgraph --json` grew a top-level `symbol` on the success envelope,
+        // documented as the BARE name. Nothing else pins its VALUE, so a change
+        // that echoed the qualified input instead would ship unnoticed.
+        if cmd == "callgraph" {
+            let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+            assert_eq!(
+                out["symbol"], "test_step",
+                "callgraph --json must echo the bare name in `symbol`: {out}"
+            );
+        }
         assert!(
             !combined.to_lowercase().contains("ambiguous"),
             "{cmd}: a test-shaped production NAME must not empty the production \

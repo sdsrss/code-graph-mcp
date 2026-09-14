@@ -70,7 +70,9 @@ path. A path contains dots, so exact-qualified lookup matched one — and `impac
 lib.py` would have answered exit 0 with a `risk` verdict for an input it never
 resolved to a symbol, on the command this project's own routing table puts before
 an edit. Module rows are excluded; a path is back on the not-found path,
-byte-identical to 0.151.0's answer, on all five surfaces that take a symbol name.
+byte-identical to 0.151.0's answer, on all six surfaces that take a symbol name
+(`refs`, `callgraph`, `impact`, and MCP `find_references`, `get_ast_node`,
+`get_call_graph`).
 
 **The exclusion is needed in two places, and that is the part worth stating.**
 Dropping module rows from the qualified *selection* query covers `refs`,
@@ -80,7 +82,8 @@ symbol string, through three predicates in `graph::query` that never reach the
 selection layer. With only the first layer in place, one input got a refusal from
 two MCP tools and an empty-but-successful call graph from the third, which is the
 one-input-two-verdicts shape this repo has shipped three times. Both layers are
-in; a test asserts the five surfaces agree.
+in; a test asserts that the three MCP tools agree, and a CLI test covers the
+other three.
 
 ### The guard that makes resolution changes visible
 
@@ -145,14 +148,15 @@ which shape moved.
   scripted surface and it is consistent with its siblings, so this is left
   alone rather than churned before a release — but it is a difference, and it is
   named here rather than discovered.
-- Two behaviours on the qualified path have no test behind them: the VALUE of
-  `callgraph --json`'s new `symbol` key, and the re-validation that re-runs
-  symbol selection after an on-the-fly staleness refresh. Both were found by
-  mutation during pre-ship review — each can be neutered with the whole suite
-  green. They are recorded rather than fixed because neither is a regression
-  against 0.151.0; the disclosure that WAS unpinned and is a safety surface
-  (`impact`'s excluded-caller count and its "blast radius may be larger" note on
-  a qualified input) has a guard as of this release.
+- One behaviour on the qualified path has no test behind it: the re-validation
+  that re-runs symbol selection after an on-the-fly staleness refresh. Deleting
+  those fourteen lines leaves the whole suite green. It is recorded rather than
+  fixed because it is not a regression against 0.151.0. Two siblings found by
+  the same mutation pass DID get guards in this release — `impact`'s
+  excluded-caller count with its "blast radius may be larger" note on a
+  qualified input, which is a safety surface, and the VALUE of `callgraph
+  --json`'s new `symbol` key, which reviewers pointed out could have started
+  echoing the qualified spelling unnoticed.
 
 ## 0.151.0
 
