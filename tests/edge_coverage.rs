@@ -1019,3 +1019,248 @@ fn cjs_exports_do_not_bind_the_wrong_node() {
         "control: a genuine shorthand export must still emit — without this the test passes by breaking the feature"
     );
 }
+
+// --- Resolution tier inventory -------------------------------------------
+
+/// Index a Python fixture built from the call shapes whose resolution is most
+/// often changed, and return the exact `(relation, confidence)` histogram.
+fn python_resolution_fixture() -> (TempDir, Database) {
+    let project = TempDir::new().unwrap();
+    let w = |rel: &str, body: &str| {
+        let p = project.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+
+    // 1. Inherited self-call: Child.run -> Base.helper across files.
+    w(
+        "base.py",
+        "class Base:\n    def helper(self):\n        return 1\n",
+    );
+    w(
+        "child.py",
+        "from base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return self.helper()\n",
+    );
+    // 2. Same method name on an unrelated class — the fan-out surface.
+    w(
+        "other.py",
+        "class Other:\n    def helper(self):\n        return 2\n",
+    );
+    // 3. A receiver whose name matches a module file name.
+    w(
+        "cmd.py",
+        "class Command:\n    def execute(self):\n        return 3\n",
+    );
+    w(
+        "builder.py",
+        "class Builder:\n    def execute(self):\n        return 4\n\n\ndef make_builder():\n    return Builder()\n",
+    );
+    w(
+        "app.py",
+        "from builder import make_builder\n\n\ndef go():\n    cmd = make_builder()\n    return cmd.execute()\n",
+    );
+    // 4. Aliased class import.
+    w(
+        "cache.py",
+        "class Cache:\n    def get(self):\n        return 5\n",
+    );
+    w(
+        "use_alias.py",
+        "from cache import Cache as NewCache\n\n\ndef build():\n    return NewCache()\n",
+    );
+    // 5. Two dotted imports sharing a root component.
+    w("pkg/__init__.py", "");
+    w("pkg/models.py", "def load():\n    return 6\n");
+    w("pkg/views.py", "def render():\n    return 7\n");
+    w(
+        "dotted.py",
+        "import pkg.models\nimport pkg.views\n\n\ndef run():\n    pkg.models.load()\n    return pkg.views.render()\n",
+    );
+    // 6. A project function whose name shadows a Python builtin.
+    w("shadow.py", "def open(path):\n    return 8\n");
+    w("caller.py", "def call_it():\n    return open('x')\n");
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    (project, db)
+}
+
+fn tier_histogram(db: &Database) -> BTreeMap<(String, String), i64> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT e.relation, COALESCE(e.confidence, '<null>'), COUNT(*)
+             FROM edges e
+             JOIN nodes n ON n.id = e.source_id
+             JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'python'
+             GROUP BY 1, 2",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Pin the exact `(relation, confidence)` histogram Python resolution produces.
+///
+/// `edge_coverage_per_language_baseline` above asserts `calls(lang) >= 1`, which
+/// is a floor no realistic regression can breach: a change that dropped 62% of a
+/// 500k-edge corpus would still satisfy it, and a change that only RELABELS
+/// edges between tiers moves no count it looks at at all. That second shape is
+/// the expensive one here, because `impact` and `callgraph` default to a
+/// `--min-confidence inferred` floor — an edge relabelled `ambiguous` ->
+/// `inferred` goes from hidden to counted, and an edge relabelled the other way
+/// silently leaves every default-flag answer.
+///
+/// So this pins counts exactly, per tier, over one fixture holding the call
+/// shapes whose resolution actually gets edited: an inherited `self` call, a
+/// same-named method on an unrelated class, a receiver named like a module file,
+/// an aliased class import, two dotted imports sharing a root, and a project
+/// function shadowing a builtin.
+///
+/// **A failure here is not by itself a regression.** It means Python resolution
+/// moved and the diff below names which tier moved, which is the question a
+/// reviewer would otherwise answer by building two binaries and differencing
+/// edge sets by hand. Update the map deliberately, in the same commit as the
+/// change, and say in the message which shape moved and why.
+#[test]
+fn python_resolution_tier_inventory_is_pinned() {
+    let (_p, db) = python_resolution_fixture();
+    let got = tier_histogram(&db);
+
+    let expected: BTreeMap<(String, String), i64> = [
+        // Two fan-outs, two edges each, and both are the conservative answer:
+        //   `go -> execute`     x2  — receiver `cmd` is untyped, so the call
+        //                             binds to BOTH `Command.execute` and
+        //                             `Builder.execute`.
+        //   `Child.run -> helper` x2 — `self.helper()` is resolved by bare name,
+        //                             so it reaches `Other.helper` as well as
+        //                             the inherited `Base.helper`.
+        // Precision work targets exactly these four. Narrowing either pair to
+        // its one true target is an improvement; dropping the pair to zero edges
+        // is not, and only a per-tier count tells those two apart.
+        (("calls", "ambiguous"), 4),
+        // `make_builder -> Builder`, a constructor call inside one file.
+        (("calls", "extracted"), 1),
+        // `call_it -> open` (the project `def open` shadowing the builtin),
+        // `go -> make_builder`, `run -> load`, `run -> render`.
+        (("calls", "inferred"), 4),
+        (("imports", "extracted"), 8),
+        (("inherits", "extracted"), 1),
+    ]
+    .into_iter()
+    .map(|((rel, conf), n)| ((rel.to_string(), conf.to_string()), n))
+    .collect();
+
+    assert_eq!(
+        got, expected,
+        "Python resolution moved. Left is this build, right is the pinned map."
+    );
+
+    // The backlog is the other half of the picture: an edge missing from the
+    // histogram was either dropped or is still buffered, and those two call for
+    // opposite responses. The one row here is `build -> NewCache`, the aliased
+    // class import (`from cache import Cache as NewCache`), which this extractor
+    // never binds back to `Cache`. Teaching it to resolve aliases takes this to 0
+    // and adds one `calls` edge above — both numbers move together, which is the
+    // point of pinning them in one test.
+    assert_eq!(
+        queries::resolution_stats(db.conn())
+            .unwrap()
+            .pending_unresolved_calls,
+        1,
+        "the pending-call backlog moved"
+    );
+}
+
+/// An incrementally grown index must hold the same edges as a rebuild of the
+/// same final tree.
+///
+/// This repo has bumped `INDEX_VERSION` twice for the same shape: an index grown
+/// file-by-file carrying FEWER edges than a full index of the identical tree,
+/// with nothing saying so. It is invisible by construction — `health-check`
+/// reports OK, the missing edge only reappears if the caller's own file happens
+/// to be touched later, and no single-path test can see it, because every arm
+/// agrees with itself.
+///
+/// So compare the two paths directly, on the shape that provokes it: a name
+/// whose set of definitions GROWS after the callers were already indexed.
+#[test]
+fn python_resolution_converges_incrementally_to_a_rebuild() {
+    // The call sites come first, so pass 2 is the run that changes what they
+    // should resolve to without touching the files that contain them.
+    let seed: &[(&str, &str)] = &[
+        ("caller.py", "def call_it():\n    return open('x')\n"),
+        ("uses_helper.py", "def go():\n    return helper()\n"),
+        ("helper_a.py", "def helper():\n    return 1\n"),
+    ];
+    // Pass 2 adds a project definition shadowing a builtin, and a SECOND
+    // definition of a name whose caller is already indexed.
+    let added: &[(&str, &str)] = &[
+        ("shadow.py", "def open(path):\n    return 8\n"),
+        ("helper_b.py", "def helper():\n    return 2\n"),
+    ];
+
+    let write = |root: &std::path::Path, files: &[(&str, &str)]| {
+        for (rel, body) in files {
+            std::fs::write(root.join(rel), body).unwrap();
+        }
+    };
+    let open_db = |root: &std::path::Path| {
+        let dir = root.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        Database::open(&dir.join("index.db")).unwrap()
+    };
+
+    // Incremental: seed, index, add, index again.
+    let inc_project = TempDir::new().unwrap();
+    write(inc_project.path(), seed);
+    let inc_db = open_db(inc_project.path());
+    code_graph_mcp::indexer::pipeline::run_full_index(&inc_db, inc_project.path(), None, None)
+        .unwrap();
+    write(inc_project.path(), added);
+    code_graph_mcp::indexer::pipeline::run_incremental_index(
+        &inc_db,
+        inc_project.path(),
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Rebuild: the identical final tree, indexed once into a fresh database.
+    let full_project = TempDir::new().unwrap();
+    write(full_project.path(), seed);
+    write(full_project.path(), added);
+    let full_db = open_db(full_project.path());
+    code_graph_mcp::indexer::pipeline::run_full_index(&full_db, full_project.path(), None, None)
+        .unwrap();
+
+    let inc = tier_histogram(&inc_db);
+    let full = tier_histogram(&full_db);
+    assert_eq!(
+        inc, full,
+        "incremental and rebuild disagree on the same tree. Left is the index \
+         grown in two passes, right is the one-shot rebuild. A LOWER count on \
+         the left is the silent-under-reporting shape; a higher one means the \
+         incremental path kept an edge the rebuild drops."
+    );
+
+    // Naming the shared value as well: an identical pair of empty histograms
+    // would satisfy the assertion above without either path resolving anything.
+    assert!(
+        full.get(&("calls".to_string(), "inferred".to_string()))
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "fixture stopped exercising resolution at all: {full:?}"
+    );
+}
