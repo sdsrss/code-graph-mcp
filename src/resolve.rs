@@ -47,21 +47,40 @@ pub fn selectable_qualified_definitions(
         return Ok(in_scope);
     }
 
-    // Partition on where a definition LIVES, not on what it is called.
-    // `is_test_symbol` is name-OR-path, and its name legs are wrong here twice
-    // over. Substantively: production-wins is a statement about location, and a
-    // production helper called `test_connection` or `test_mode` is production.
-    // Structurally: every candidate in this vector shares one `qualified_name`,
-    // and a node's name is that qualified name's last component — so the name
-    // legs evaluate identically for all of them and can only classify ALL or
-    // NONE. Classifying none is a no-op; classifying all empties `production`
-    // and hands the fallback the entire set, which then reports as ambiguous.
-    // That is a strictly-harmful predicate: it cannot help and it did regress
-    // `refs Job.test_step` from an answer to `Ambiguous symbol` once a test-file
-    // twin existed (pre-ship review round 2, D1).
-    let (production, test_only): (Vec<_>, Vec<_>) = in_scope
-        .into_iter()
-        .partition(|candidate| !crate::domain::is_test_path(&candidate.file_path));
+    // Partition on the AST's own verdict plus where the definition LIVES —
+    // never on what it is called.
+    //
+    // `is_test_symbol` is name-OR-path, and its name legs classified a
+    // PRODUCTION method called `test_step` as a test. Once a test-file twin
+    // existed, `production` emptied, the fallback returned both, and
+    // `refs Job.test_step` went from an answer to `Ambiguous symbol`
+    // (pre-ship review round 2, D1). Substantively the name is the wrong thing
+    // to ask: production-wins is a claim about location, and `test_connection` /
+    // `test_mode` / `test_step` are ordinary production helper names.
+    //
+    // An earlier version of this comment also argued the name legs were
+    // STRUCTURALLY inert here — that every candidate shares one
+    // `qualified_name`, so a node's name is that name's last component and the
+    // legs must classify all-or-none. That is true for every language in this
+    // project's own index (5,083 distinct qualified names, zero mapping to more
+    // than one distinct `name`) and it is FALSE for C/C++ gtest: the `is_gtest`
+    // branch in `parser::treesitter` gives `TEST(Suite, Name)` the node name
+    // "Suite.Name" AND the qualified name "Suite.Name", so it collides with the
+    // method `Suite::Name` while carrying a different `name`. The legs then
+    // classify non-uniformly, which is the case the all-or-none argument said
+    // could not exist. Recorded because the reasoning was wrong, not just the
+    // predicate.
+    //
+    // `node.is_test` is what closes it, and it is the right kind of fact: the
+    // parser sets it from the AST (a gtest macro case, a `#[test]` fn), so it
+    // is authoritative where a filename is a heuristic. Without it,
+    // `refs Widget.run` against `TEST(Widget, run)` — Google's own
+    // `TEST(ClassUnderTest, method)` convention — refuses as ambiguous where
+    // main answered, and neither file is on a test PATH: `INFIX_TEST_EXTS`
+    // covers go/rs/py/dart, not cc/cpp.
+    let (production, test_only): (Vec<_>, Vec<_>) = in_scope.into_iter().partition(|candidate| {
+        !(candidate.node.is_test || crate::domain::is_test_path(&candidate.file_path))
+    });
 
     Ok(if production.is_empty() {
         test_only

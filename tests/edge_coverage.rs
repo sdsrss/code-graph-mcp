@@ -1201,6 +1201,33 @@ fn python_resolution_tier_inventory_is_pinned() {
         "Python resolution moved. Left is this build, right is the pinned set."
     );
 
+    // `edge_identities` renders `file:qualified_name`, which is unique only
+    // while no file defines one qualified name twice. Python's
+    // platform-conditional idiom (`if sys.platform: def f() else: def f()`)
+    // produces exactly that, and two edges re-pointed between such twins would
+    // render identically — a resolution change invisible to the set above. No
+    // such pair exists in this fixture; assert it, so the day one appears is a
+    // loud failure rather than a silent loss of discrimination.
+    let duplicate_pairs: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT n.file_id, n.qualified_name
+                 FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE f.language = 'python' AND n.qualified_name IS NOT NULL
+                   AND n.type <> 'module'
+                 GROUP BY n.file_id, n.qualified_name HAVING COUNT(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        duplicate_pairs, 0,
+        "the fixture grew a file defining one qualified name twice, so \
+         `edge_identities` can no longer tell those definitions apart — either \
+         drop the duplicate or add the node's start_line to the identity format"
+    );
+
     // The backlog is the other half of the picture: an edge missing from the
     // histogram was either dropped or is still buffered, and those two call for
     // opposite responses. The one row here is `build -> NewCache`, the aliased

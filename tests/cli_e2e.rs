@@ -11734,3 +11734,47 @@ fn the_qualified_path_still_discloses_the_callers_it_excluded() {
          producing ambiguous callers: {bare}"
     );
 }
+
+#[test]
+fn a_gtest_case_does_not_shadow_the_method_it_tests() {
+    // The one extractor path where a node's name is NOT its qualified name's
+    // last component: `parser::treesitter`'s `is_gtest` branch gives
+    // `TEST(Suite, Name)` the node name "Suite.Name" AND the qualified name
+    // "Suite.Name". So a gtest case collides with the method it exercises, and
+    // `TEST(ClassUnderTest, method)` is Google's own convention.
+    //
+    // Neither file here is on a test PATH — `INFIX_TEST_EXTS` covers
+    // go/rs/py/dart, not cc/cpp — so path heuristics cannot separate them. The
+    // parser's per-node `is_test` flag is what does, and this is the only
+    // qualified-lookup coverage in any language but Python.
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/widget.cc"),
+        "class Widget {\npublic:\n  int run() { return 1; }\n};\n\nint drive() { Widget w; return w.run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/widget_test.cc"),
+        "#include \"widget.h\"\n\nTEST(Widget, run) {\n  Widget w;\n  w.run();\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "Widget.run", "--json"]);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "{cmd} Widget.run must resolve to the method, not refuse against its \
+             own gtest case: {combined}"
+        );
+        assert!(
+            !combined.to_lowercase().contains("ambiguous"),
+            "{cmd}: a gtest case must not make the method it tests ambiguous: {combined}"
+        );
+    }
+}
