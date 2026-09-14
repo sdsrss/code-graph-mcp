@@ -69,7 +69,9 @@ Every file carries a `<module>` node whose `qualified_name` is the file's own
 path. A path contains dots, so exact-qualified lookup matched one — and `impact
 lib.py` would have answered exit 0 with a `risk` verdict for an input it never
 resolved to a symbol, on the command this project's own routing table puts before
-an edit. Module rows are excluded; a path is back on the not-found path,
+an edit. Module rows are excluded — and markdown heading rows with them, since
+a `## Widget.run` in an API doc otherwise occupies the same spelling as the
+method it documents. A path is back on the not-found path,
 byte-identical to 0.151.0's answer, on all six surfaces that take a symbol name
 (`refs`, `callgraph`, `impact`, and MCP `find_references`, `get_ast_node`,
 `get_call_graph`).
@@ -108,31 +110,33 @@ which shape moved.
 
 ### Not covered
 
-- **A dotted name that is a whole name, not a `Class.method`, collides.**
+- **A bash function named `Widget.run` still collides with the method.**
   `qualified_name` doubles as "Container.member" and as "this node's own name",
   so any node whose NAME contains a dot occupies a `Class.method` spelling.
-  Three extractors produce one, and all three were checked across the twenty
-  supported languages: a markdown heading (`## Widget.run`), a gtest case
-  (`TEST(Widget, run)`), and a bash function (`Widget.run() { … }`). Against a
-  Python `class Widget: def run`, each makes `refs Widget.run` refuse as
-  ambiguous where 0.151.0 answered.
+  Exactly three extractors produce one, checked across all twenty supported
+  languages: markdown headings, C/C++ gtest cases, and bash functions. Two are
+  closed in this release — gtest by the parser's own `is_test` flag, headings by
+  the `h1`..`h6` exclusion above. Bash is not, and cannot be by any type
+  predicate: its node type is `function`, so a denylist omits it and an allowlist
+  must include it.
 
-  The refusal names both files and tells you to pass `--file`, which is why this
-  ships documented rather than patched: both candidate fixes are worse. A
-  node-type list cannot express it — bash's type is `function`, so a denylist
-  omits it and an allowlist must include it. The predicate that does express it,
-  `name <> qualified_name`, was built and measured: it fixes `refs` and turns
-  `impact` into a silent over-count, because `query_direction` seeds on
-  `n.name = ?1` and a bash function's name IS the dotted string, so the seed
-  re-admits what selection just excluded — `impact Widget.run` then reports two
-  callers where 0.151.0 reported one, still verdicting `risk: LOW`. Trading a
-  refusal for a wrong blast-radius number is the wrong direction.
+  `Widget.run() { … }` in a shell script alongside a Python `class Widget: def
+  run` makes `refs Widget.run` refuse as ambiguous where 0.151.0 answered. The
+  refusal names both files and tells you to pass `--file`.
+
+  The predicate that would express the class, `name <> qualified_name`, was built
+  and measured, and it is worse: it fixes `refs` and turns `impact` into a silent
+  over-count, because `query_direction` seeds on `n.name = ?1` and a bash
+  function's name IS the dotted string, so the seed re-admits what selection just
+  excluded — `impact Widget.run` reports two callers where 0.151.0 reported one,
+  still verdicting `risk: LOW`. Trading a refusal for a wrong blast-radius number
+  is the wrong direction. Headings were safe to exclude precisely because a
+  heading carries no edges, so the seed re-admitting it changes nothing.
 
   The fix is one level below the predicate and is the same root cause as the
   entry below: seed traversals from the node ids selection already chose,
   instead of re-deriving them from the symbol string. That is a deliberate
-  change, not a release-eve patch. No collision exists in this repository today
-  — 309 heading nodes carry a dot, none matching a code symbol.
+  change, not a release-eve patch.
 - The traversal seed in `graph::query::query_direction` still matches on the
   symbol string (`n.name = ?1 OR n.qualified_name = ?1`) with no test-symbol
   filter, while `selectable_qualified_definitions` applies one. So `refs` and

@@ -11822,3 +11822,53 @@ fn a_gtest_case_does_not_shadow_the_method_it_tests() {
         );
     }
 }
+
+#[test]
+fn a_markdown_heading_does_not_shadow_the_method_it_documents() {
+    // A heading's `qualified_name` is its own text, so `## Widget.run` in an API
+    // doc occupies the same spelling as the method it documents. `## Class.method`
+    // is ordinary API-doc style, and this made the lookup ambiguous where
+    // 0.151.0 answered.
+    //
+    // Headings are the one producer of a dotted name that carries no edges, so
+    // excluding them from selection restores the base answer exactly rather than
+    // merely changing which way it is wrong.
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("docs")).unwrap();
+    std::fs::write(
+        project.path().join("src/widget.py"),
+        "class Widget:\n    def run(self):\n        return 1\n\ndef drive():\n    return Widget.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("docs/api.md"),
+        "# API\n\n## Widget.run\n\nRuns the widget.\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "Widget.run", "--json"]);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "{cmd} must resolve to the method, not refuse against its own doc \
+             heading: {combined}"
+        );
+        assert!(
+            !combined.to_lowercase().contains("ambiguous"),
+            "{cmd}: a doc heading must not make the method it documents ambiguous: {combined}"
+        );
+    }
+
+    // And the answer is the base answer, not merely a non-refusal: the one
+    // caller is `drive`, in the source file.
+    let (stdout, _, _) = run_cli(&project, &["impact", "Widget.run", "--json"]);
+    let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(out["direct_callers"], 1, "{out}");
+    assert_eq!(out["callers"][0]["name"], "drive", "{out}");
+}

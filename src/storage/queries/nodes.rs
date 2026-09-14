@@ -206,13 +206,29 @@ pub fn get_nodes_with_files_by_symbol(
 /// `impact lib.py` matches a module row exactly and the command answers with a
 /// success envelope — `risk` verdict included — for an input it never resolved
 /// to a symbol. A path is not a symbol; it belongs on the not-found path.
+///
+/// Markdown heading rows (`h1`..`h6`) are excluded for a parallel reason. A
+/// heading's `qualified_name` is its own text, so `## Widget.run` in an API doc
+/// occupies the same spelling as the method `Widget.run` and made the lookup
+/// ambiguous where 0.151.0 answered. A heading is not a definition of anything.
+///
+/// A denylist rather than an allowlist of definition types, deliberately: an
+/// allowlist that omitted `constant`, `struct`, `interface`, `enum`, `trait` or
+/// `type_alias` for any of the twenty grammars would silently stop resolving a
+/// real symbol, which is a worse failure than the one being fixed.
+///
+/// This does NOT close the class — a bash function may be named `Widget.run`,
+/// and its type is `function`, so no type predicate of either polarity can
+/// separate it from a real symbol. See the CHANGELOG's "Not covered" for the
+/// measurement and for why the fix belongs in the traversal seed instead.
 pub fn get_nodes_with_files_by_qualified_name(
     conn: &Connection,
     symbol: &str,
 ) -> Result<Vec<NodeWithFile>> {
     let sql = format!(
         "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id \
-         WHERE n.qualified_name = ?1 AND f.path <> '<external>' AND n.type <> 'module'",
+         WHERE n.qualified_name = ?1 AND f.path <> '<external>' \
+           AND n.type NOT IN ('module', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6')",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
