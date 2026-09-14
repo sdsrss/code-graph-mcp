@@ -180,8 +180,56 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     Ok(results)
 }
 
+/// Match a symbol, applying exact-qualified precedence only to qualified input.
+///
+/// For a dotted symbol, an exact `qualified_name` match wins; otherwise the
+/// literal bare name is queried. A bare symbol always returns every `name`
+/// match, even when a top-level node also has `qualified_name = symbol`, so that
+/// same-named methods remain visible to ambiguity detection.
+pub fn get_nodes_with_files_by_symbol(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<Vec<NodeWithFile>> {
+    if symbol.contains('.') {
+        let qualified = get_nodes_with_files_by_qualified_name(conn, symbol)?;
+        if !qualified.is_empty() {
+            return Ok(qualified);
+        }
+    }
+    get_nodes_with_files_by_name(conn, symbol)
+}
+
+/// Return internal nodes whose qualified name exactly matches `symbol`.
+///
+/// `<module>` rows are excluded: every file gets one, and its `qualified_name`
+/// is the file's own path. A path contains dots, so without this predicate any
+/// `impact lib.py` matches a module row exactly and the command answers with a
+/// success envelope — `risk` verdict included — for an input it never resolved
+/// to a symbol. A path is not a symbol; it belongs on the not-found path.
+pub fn get_nodes_with_files_by_qualified_name(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<Vec<NodeWithFile>> {
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.qualified_name = ?1 AND f.path <> '<external>' AND n.type <> 'module'",
+        NODE_SELECT_ALIASED
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([symbol], |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(15)?,
+            language: row.get(16)?,
+        })
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Collect cross-file inbound edges before deleting a file's nodes.
-/// Returns (source_id, target_name, relation, metadata) for edges where:
+/// Returns (source_id, source_file_id, target_name, target_qualified_name,
+/// relation, metadata) for edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
@@ -979,6 +1027,77 @@ mod tests {
         let found = get_nodes_by_name(db.conn(), "handleLogin").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "handleLogin");
+    }
+
+    #[test]
+    fn qualified_lookup_has_exact_precedence_and_excludes_external_rows() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let internal_file = upsert_file(
+            conn,
+            &FileRecord {
+                path: "pkg/service.py".into(),
+                blake3_hash: "internal".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        let external_file = upsert_file(
+            conn,
+            &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: None,
+            },
+        )
+        .unwrap();
+        let node = |file_id, name: &str, qualified_name: Option<&str>, line| NodeRecord {
+            file_id,
+            node_type: "function".into(),
+            name: name.into(),
+            qualified_name: qualified_name.map(str::to_string),
+            start_line: line,
+            end_line: line,
+            code_content: String::new(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
+        };
+
+        let exact = insert_node(conn, &node(internal_file, "run", Some("Service.run"), 1)).unwrap();
+        insert_node(conn, &node(internal_file, "Service.run", None, 2)).unwrap();
+        let top_level = insert_node(conn, &node(internal_file, "run", Some("run"), 3)).unwrap();
+        insert_node(conn, &node(external_file, "run", Some("Service.run"), 0)).unwrap();
+
+        let rows = get_nodes_with_files_by_symbol(conn, "Service.run").unwrap();
+        assert_eq!(rows.len(), 1, "qualified lookup must not union bare rows");
+        assert_eq!(rows[0].node.id, exact);
+        let mut bare_ids: Vec<i64> = get_nodes_with_files_by_symbol(conn, "run")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.node.id)
+            .collect();
+        bare_ids.sort_unstable();
+        let mut expected_bare = vec![exact, top_level];
+        expected_bare.sort_unstable();
+        assert_eq!(
+            bare_ids, expected_bare,
+            "a top-level qualified_name equal to the bare name must not hide methods"
+        );
+        // `<external>` sentinels never reach a qualified answer.
+        assert!(
+            get_nodes_with_files_by_qualified_name(conn, "Service.run")
+                .unwrap()
+                .iter()
+                .all(|row| row.file_path != "<external>"),
+            "qualified lookup must exclude <external> sentinels"
+        );
     }
 
     #[test]

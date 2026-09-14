@@ -63,6 +63,20 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
+        let qualified_matches =
+            if let Some(symbol_name) = symbol_name_arg.filter(|s| s.contains('.')) {
+                crate::resolve::selectable_qualified_definitions(
+                    self.db.conn(),
+                    symbol_name,
+                    file_path,
+                )?
+                .into_iter()
+                .map(|candidate| (candidate.node.id, candidate.file_path))
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
         // Resolve symbol to node_id(s)
         let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
             // SURF-16 (audit 2026-09-07) is NOT fixed here, deliberately.
@@ -97,13 +111,42 @@ impl McpServer {
             let node = queries::get_node_by_id(self.db.conn(), nid)?
                 .ok_or_else(|| anyhow!("node_id {} not found in index", nid))?;
             (vec![nid], node.name)
+        } else if !qualified_matches.is_empty() {
+            let symbol_name = symbol_name_arg.unwrap();
+            if qualified_matches.len() > 1 {
+                let suggestions: Vec<_> = qualified_matches
+                    .iter()
+                    .filter_map(|(id, fp)| {
+                        queries::get_node_by_id(self.db.conn(), *id)
+                            .ok()
+                            .flatten()
+                            .map(|n| queries::NameCandidate {
+                                name: n.name,
+                                file_path: fp.clone(),
+                                node_type: n.node_type,
+                                node_id: n.id,
+                                start_line: n.start_line,
+                            })
+                    })
+                    .collect();
+                return Ok(crate::resolve::ambiguity_response(
+                    symbol_name,
+                    &suggestions,
+                ));
+            }
+            (
+                qualified_matches.iter().map(|(id, _)| *id).collect(),
+                symbol_name.to_string(),
+            )
         } else if let Some(fp) = file_path {
             let symbol_name = symbol_name_arg.unwrap();
             // Specific file: find the symbol in that file
             let nodes = queries::get_nodes_by_file_path(self.db.conn(), fp)?;
             let matching: Vec<i64> = nodes
                 .iter()
-                .filter(|n| n.name == symbol_name)
+                .filter(|n| {
+                    n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name)
+                })
                 .map(|n| n.id)
                 .collect();
             if matching.is_empty() {
@@ -125,7 +168,9 @@ impl McpServer {
             if matching.len() > 1 {
                 let cands: Vec<queries::NameCandidate> = nodes
                     .iter()
-                    .filter(|n| n.name == symbol_name)
+                    .filter(|n| {
+                        n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name)
+                    })
                     .map(|n| queries::NameCandidate {
                         name: n.name.clone(),
                         file_path: fp.to_string(),

@@ -14,6 +14,29 @@ use rusqlite::Connection;
 
 use crate::storage::queries::{self, NameCandidate};
 
+/// Return exact qualified definitions using the shared surface selection rule.
+///
+/// Without an explicit file selector, test symbols are excluded just as they
+/// are from [`detect_ambiguity`]. Supplying a file is an intentional bypass so
+/// callers can select a definition in a test file. The storage query already
+/// excludes the `<external>` sentinel.
+pub fn selectable_qualified_definitions(
+    conn: &Connection,
+    qualified_name: &str,
+    explicit_file: Option<&str>,
+) -> Result<Vec<queries::NodeWithFile>> {
+    Ok(
+        queries::get_nodes_with_files_by_qualified_name(conn, qualified_name)?
+            .into_iter()
+            .filter(|candidate| explicit_file.is_none_or(|wanted| wanted == candidate.file_path))
+            .filter(|candidate| {
+                explicit_file.is_some()
+                    || !crate::domain::is_test_symbol(&candidate.node.name, &candidate.file_path)
+            })
+            .collect(),
+    )
+}
+
 /// Which surface is rendering the message — only affects flag/tool wording
 /// (`--file` vs `file_path`, `show --node-id` vs `get_ast_node`), never the
 /// ambiguity decision itself.
@@ -64,12 +87,15 @@ pub fn reresolve_node_by_identity(
 /// need a `node_id` (see `find_references` / `get_ast_node`). This is the gate
 /// MCP already used; the CLI now shares it.
 ///
+/// Bare input checks every definition with that name. Dotted input gives an
+/// exact qualified-name match precedence, matching MCP's qualified lookup.
+///
 /// `<external>` sentinels never count. They are not definitions the caller can
 /// open or select, so counting one turns a symbol that RESOLVED into one that
 /// refuses to and then offers `<external>` as the disambiguator — see
 /// [`is_selectable_definition`].
 pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<NameCandidate>>> {
-    let with_files = queries::get_nodes_with_files_by_name(conn, name)?;
+    let with_files = queries::get_nodes_with_files_by_symbol(conn, name)?;
     let non_test: Vec<NameCandidate> = with_files
         .iter()
         .filter(|nf| is_selectable_definition(&nf.file_path))
@@ -861,5 +887,30 @@ mod external_sentinel_tests {
             "the sentinel must not appear among the suggestions: {:?}",
             cands.iter().map(|c| &c.file_path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn top_level_qualified_name_does_not_hide_same_named_method() {
+        let project = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("app.py"),
+            "def run(): return 1\nclass Worker:\n    def run(self): return 2\n",
+        )
+        .unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        crate::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+        assert_eq!(
+            queries::get_nodes_with_files_by_qualified_name(db.conn(), "run")
+                .unwrap()
+                .len(),
+            1,
+            "the fixture needs a top-level node whose qualified name is bare"
+        );
+        let candidates = detect_ambiguity(db.conn(), "run")
+            .unwrap()
+            .expect("the top-level function and Worker.run are ambiguous by bare name");
+        assert_eq!(candidates.len(), 2, "got {candidates:?}");
     }
 }

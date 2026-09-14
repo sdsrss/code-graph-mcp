@@ -215,7 +215,7 @@ impl McpServer {
             if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), sym)? {
                 return Ok(crate::resolve::ambiguity_response(sym, &cands));
             }
-            let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), sym)?;
+            let candidates = queries::get_nodes_with_files_by_symbol(self.db.conn(), sym)?;
             let non_test: Vec<_> = candidates
                 .iter()
                 .filter(|nf| crate::resolve::is_selectable_definition(&nf.file_path))
@@ -267,7 +267,10 @@ impl McpServer {
         // exact silent behaviour SURF-02 removed. Exempting doc files would buy a
         // shorter answer on a Markdown heading by reintroducing, for one
         // node_type, the bug this branch exists to prevent.
-        let matching: Vec<_> = nodes.iter().filter(|n| n.name == symbol_name).collect();
+        let matching: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name))
+            .collect();
         if matching.len() > 1 {
             let cands: Vec<crate::storage::queries::NameCandidate> = matching
                 .iter()
@@ -352,10 +355,11 @@ impl McpServer {
                 }
 
                 if include_impact {
+                    let impact_symbol = n.qualified_name.as_deref().unwrap_or(&n.name);
                     self.append_impact_summary(
                         &mut result,
                         n.id,
-                        &n.name,
+                        impact_symbol,
                         file_path,
                         &n.node_type,
                         impact_conf_rank,
@@ -517,10 +521,11 @@ impl McpServer {
         }
 
         if include_impact {
+            let impact_symbol = node.qualified_name.as_deref().unwrap_or(&node.name);
             self.append_impact_summary(
                 &mut result,
                 node.id,
-                &node.name,
+                impact_symbol,
                 &file_path,
                 &node.node_type,
                 min_confidence_rank,

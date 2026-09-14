@@ -4395,3 +4395,109 @@ fn the_query_time_refresh_also_treats_deletions_as_dirty() {
         "regenerated, not blanked: {after:?}"
     );
 }
+
+/// The CLI and the MCP server must give one answer to one qualified input.
+///
+/// This repo has shipped the opposite three times (SURF-02, SURF-17, SURF-26):
+/// one input, two surfaces, opposite verdicts. The two qualified paths share a
+/// selection helper today, but nothing held them together — both surfaces were
+/// only ever exercised separately, so a refactor could re-open the split with
+/// every existing test still green. Compare them directly instead.
+#[test]
+fn cli_and_mcp_agree_on_one_qualified_symbol() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+    fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self):\n        return 1\n\ndef prod_caller():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+    // A same-named definition under tests/ — the input on which the two
+    // surfaces are most likely to drift, since only one of them historically
+    // applied the test-symbol filter.
+    fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self):\n        return 2\n\ndef test_caller():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    /// `refs --json` reference rows reduced to the identity both surfaces must
+    /// agree on: which node, in which file, over which relation.
+    fn identity(rows: Option<&Vec<serde_json::Value>>) -> Vec<(i64, String, String)> {
+        let mut out: Vec<(i64, String, String)> = rows
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r["node_id"].as_i64().unwrap_or(-1),
+                            r["file_path"].as_str().unwrap_or("").to_string(),
+                            r["relation"].as_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    let server = common::init_server(&project);
+
+    for file_arg in [None, Some("tests/test_worker.py")] {
+        let mut cli_args = vec![
+            "refs".to_string(),
+            "Worker.run".to_string(),
+            "--relation".to_string(),
+            "calls".to_string(),
+            "--json".to_string(),
+        ];
+        let mut mcp_args = serde_json::json!({
+            "symbol_name": "Worker.run",
+            "relation": "calls"
+        });
+        if let Some(path) = file_arg {
+            cli_args.push("--file".to_string());
+            cli_args.push(path.to_string());
+            mcp_args["file_path"] = serde_json::json!(path);
+        }
+
+        let cli_out = std::process::Command::new(env!("CARGO_BIN_EXE_code-graph-mcp"))
+            .args(&cli_args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        let cli_json: serde_json::Value =
+            serde_json::from_slice(&cli_out.stdout).unwrap_or_default();
+
+        let mcp_json = common::parse_tool_result(
+            &server
+                .handle_message(&common::tool_call_json("find_references", mcp_args))
+                .unwrap(),
+        );
+
+        let label = file_arg.unwrap_or("<no --file>");
+
+        // Same verdict: either both refuse, or neither does.
+        assert_eq!(
+            cli_json.get("error").is_some(),
+            mcp_json.get("error").is_some(),
+            "surfaces disagree on whether '{label}' is answerable\n cli: {cli_json}\n mcp: {mcp_json}"
+        );
+
+        // And when they answer, the same references.
+        if cli_json.get("error").is_none() {
+            assert_eq!(
+                identity(cli_json["references"].as_array()),
+                identity(mcp_json["references"].as_array()),
+                "surfaces disagree on the reference set for '{label}'\n cli: {cli_json}\n mcp: {mcp_json}"
+            );
+        }
+    }
+}

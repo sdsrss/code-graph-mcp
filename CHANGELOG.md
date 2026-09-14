@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.152.0
+
+**Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71) and
+the schema (v10) are unchanged, and no extraction source is touched — the
+extraction fingerprint is byte-identical. The change is additive: `refs`,
+`callgraph` and `impact`, and the MCP tools `find_references`, `get_ast_node` and
+`get_call_graph`, now accept a qualified name (`Alpha.helper`) where before only a
+bare one resolved. To pin back: `npm i -g @sdsrs/code-graph@0.151.0`, or
+`cargo install code-graph-mcp --version 0.151.0`; plugin users can set the version
+in the marketplace entry.
+
+**Two envelopes move, and a script keying on either will see it.** `callgraph
+--json` gains a top-level `symbol` key on the **success** envelope — it carried
+one only on errors before. And `refs <Class>.<method> --file <path>` now exits 0
+with a result where it exited 1 with an `Ambiguous symbol` error and a
+`suggestions` array, when the named file holds two definitions sharing the bare
+name; the qualifier is exactly what resolves it, so the refusal was the thing
+worth removing, but a client branching on `suggestions` sees a different object.
+
+### A method's name was not enough to ask about it
+
+`Alpha.helper` and `Beta.helper` in one file are one symbol as far as the CLI was
+concerned: every command stripped the qualifier and looked up `helper`, so the
+answer merged both classes' callers, or refused as ambiguous and offered
+`show --node-id <N>` — an escape hatch that answers a different question, since
+`show` prints a definition and the question was about callers.
+
+The three commands and the three MCP tools now try an exact `qualified_name`
+match first and fall back to the bare name when nothing matches it, which is what
+`resolve_qualified_symbol` documented all along. `--file` narrows the qualified
+match; two files defining the same qualified name refuse with both paths named,
+rather than merging them.
+
+**The fallback is the part worth stating explicitly**, because losing it would be
+a language-agnostic regression and nothing pinned it: a dotted input that matches
+no qualified name still drops to its final component, so `refs health.probe`
+keeps working on a Rust or TypeScript index where `health` is a module rather
+than a type, and the stale-index hint stays gated on the **bare** name being
+absent.
+
+### A file path is not a symbol
+
+Every file carries a `<module>` node whose `qualified_name` is the file's own
+path. A path contains dots, so exact-qualified lookup matched one — and `impact
+lib.py` would have answered exit 0 with a `risk` verdict for an input it never
+resolved to a symbol, on the command this project's own routing table puts before
+an edit. Module rows are excluded from qualified lookup; a path is back on the
+not-found path, byte-identical to 0.151.0's answer.
+
+### The guard that makes resolution changes visible
+
+`tests/edge_coverage.rs` asserted `calls(lang) >= 1` per language — a floor no
+realistic regression breaches, and blind to **relabelling**. `impact` and
+`callgraph` default to a `--min-confidence inferred` floor, so an edge moved
+`ambiguous` → `inferred` goes from folded-out to counted and the reverse
+silently leaves every default answer, with the total unchanged either way.
+
+Two tests now pin what the total hides: an exact `(relation, confidence)`
+histogram over a fixture holding the Python call shapes that get edited
+(inherited `self` call, same-named method on an unrelated class, receiver named
+like a module file, aliased class import, two dotted imports sharing a root,
+project function shadowing a builtin), and an incremental-vs-rebuild comparison
+of the same final tree. The second is the one this repo has bumped
+`INDEX_VERSION` twice for: an index grown file-by-file carrying fewer edges than
+a rebuild, with nothing saying so.
+
+A failure in either is not by itself a regression — it means resolution moved and
+the diff names which tier. Update the pinned map in the same commit, and say
+which shape moved.
+
+### Not covered
+
+- The traversal seed in `graph::query::query_direction` still matches on the
+  symbol string (`n.name = ?1 OR n.qualified_name = ?1`) with no test-symbol
+  filter, while `selectable_qualified_definitions` applies one. So `refs` and
+  `callgraph`/`impact` can still disagree about whether a test file's same-named
+  definition is in scope. The selection helper is shared; the seed is not, and
+  this entry does not claim otherwise.
+- The CLI echoes the bare name in `symbol` where MCP echoes the qualified one.
+  Reported during review of the upstream branch; not independently reproduced
+  here, and not changed by this release.
+
 ## 0.151.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (71), the

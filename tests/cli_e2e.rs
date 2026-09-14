@@ -11418,3 +11418,139 @@ fn refs_by_node_id_keeps_its_id_when_the_target_has_no_file_row_to_re_resolve_by
         "the answer must still be about the symbol the id named: {after}"
     );
 }
+
+// --- Qualified-symbol selection ------------------------------------------
+//
+// These cover the SELECTION contract only — which definition a command binds
+// its answer to — and deliberately assert nothing about which `calls` edges the
+// extractor produced. A bare `Worker.run(None)` fans out to every same-named
+// definition on this extractor, so any caller-set assertion here would be
+// testing extraction precision instead, and would move the moment that changes.
+
+/// Two files, each defining `class Worker` with `def run` and its own caller.
+fn setup_two_file_qualified_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("one.py"),
+        "class Worker:\n    def run(self):\n        return 1\n\ndef caller_one():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("two.py"),
+        "class Worker:\n    def run(self):\n        return 2\n\ndef caller_two():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+#[test]
+fn a_qualified_name_defined_twice_refuses_rather_than_picking_one() {
+    let project = setup_two_file_qualified_project();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "Worker.run", "--json"]);
+        assert_ne!(
+            code, 0,
+            "{cmd} must refuse a qualified name with two definitions, got exit 0: {stdout}"
+        );
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("Ambiguous") || combined.contains("ambiguous"),
+            "{cmd} must name the ambiguity rather than answering: {combined}"
+        );
+        // The refusal is only useful if it names where to look.
+        assert!(
+            combined.contains("one.py") && combined.contains("two.py"),
+            "{cmd} refusal must list both definition sites: {combined}"
+        );
+    }
+}
+
+#[test]
+fn an_explicit_file_resolves_the_qualified_name_the_bare_input_could_not() {
+    let project = setup_two_file_qualified_project();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        // Control: the same input without --file is the refusal above. Asserting
+        // it here too is what makes the exit 0 below attributable to the filter
+        // rather than to the qualifier having been unambiguous all along.
+        let (_, _, ambiguous_code) = run_cli(&project, &[cmd, "Worker.run", "--json"]);
+        assert_ne!(ambiguous_code, 0, "{cmd} control arm should have refused");
+
+        let (stdout, stderr, code) =
+            run_cli(&project, &[cmd, "Worker.run", "--file", "one.py", "--json"]);
+        assert_eq!(
+            code, 0,
+            "{cmd} --file one.py must resolve: stdout={stdout} stderr={stderr}"
+        );
+        let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert!(
+            out.get("error").is_none(),
+            "{cmd} --file one.py must not carry an error envelope: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_file_path_is_not_a_symbol() {
+    // Every file carries a `<module>` node whose qualified_name is the file's
+    // own path. A path contains a dot, so an exact-qualified lookup matches one
+    // unless module rows are excluded — and `impact` would then answer with a
+    // `risk` verdict for an input it never resolved to a symbol.
+    let project = setup_two_file_qualified_project();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, _, code) = run_cli(&project, &[cmd, "one.py", "--json"]);
+        assert_ne!(
+            code, 0,
+            "{cmd} must not answer for a file path passed as a symbol: {stdout}"
+        );
+        let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+        assert!(
+            out.get("error").is_some(),
+            "{cmd} must return an error envelope for a file path: {out}"
+        );
+        assert!(
+            out.get("risk").is_none(),
+            "{cmd} must not emit a risk verdict for an input it did not resolve: {out}"
+        );
+    }
+
+    // Control: a real qualified name in the same index still resolves, so the
+    // assertions above cannot pass by breaking qualified lookup altogether.
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["refs", "Worker.run", "--file", "one.py", "--json"],
+    );
+    assert_eq!(
+        code, 0,
+        "qualified lookup must survive the module exclusion: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn a_qualifier_matching_no_definition_still_falls_back_to_the_bare_name() {
+    // The fallback `resolve_qualified_symbol` documented, and which the CLI must
+    // keep: `Nonexistent.run` has no exact qualified match, so the lookup drops
+    // to `run` — which is itself ambiguous here, so the answer is that
+    // ambiguity, not a "symbol not found" that would send the user to reindex.
+    let project = setup_two_file_qualified_project();
+
+    let (stdout, stderr, code) = run_cli(&project, &["refs", "Nonexistent.run", "--json"]);
+    let combined = format!("{stdout}{stderr}");
+    assert_ne!(code, 0, "ambiguous bare fallback should refuse: {combined}");
+    assert!(
+        combined.contains("Ambiguous") || combined.contains("ambiguous"),
+        "a missing qualifier must fall back to the bare name, not report the \
+         qualified spelling as absent: {combined}"
+    );
+    assert!(
+        !combined.contains("may be stale"),
+        "the reindex hint must not fire for a name the index does have: {combined}"
+    );
+}

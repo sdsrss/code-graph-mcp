@@ -53,6 +53,7 @@ pub use nodes::{
     get_node_qualified_names_by_ids, get_node_types_by_ids, get_node_with_file_by_id,
     get_nodes_by_file_path, get_nodes_by_name, get_nodes_missing_context,
     get_nodes_with_files_by_filters, get_nodes_with_files_by_ids, get_nodes_with_files_by_name,
+    get_nodes_with_files_by_qualified_name, get_nodes_with_files_by_symbol,
     get_structural_dependent_files, insert_node, insert_node_cached, reap_orphan_external_nodes,
     update_context_strings_batch, NameEntry, NodeRecord, NodeResult, NodeWithFile,
 };
