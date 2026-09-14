@@ -270,8 +270,8 @@ fn query_direction(
         let mut stmt = conn.prepare(
             "SELECT n.id FROM nodes n
              JOIN files f ON f.id = n.file_id
-             WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
-               AND n.type <> 'module'
+             WHERE (n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
+               AND f.path <> '<external>'
                AND (?2 IS NULL OR f.path = ?2)
              ORDER BY n.id",
         )?;
@@ -498,8 +498,8 @@ pub fn count_suppressed_seed_edges(
         "SELECT COUNT(*) FROM edges e
          JOIN nodes n ON n.id = e.{seed_col}
          JOIN files f ON f.id = n.file_id
-         WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
-               AND n.type <> 'module'
+         WHERE (n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
+               AND f.path <> '<external>'
            AND (?2 IS NULL OR f.path = ?2) AND e.relation = ?3
            AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) < ?4"
     );
@@ -661,8 +661,8 @@ mod tests {
                 -- `HashMap (<external>)` — a call graph for a symbol that is not in
                 -- the project. The by-name lookups in `queries/nodes.rs` carry the
                 -- same exclusion; this CTE seeds itself and needed its own.
-                WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
-               AND n.type <> 'module'
+                WHERE (n.name = ?1 OR (n.qualified_name = ?1 AND n.type <> 'module'))
+               AND f.path <> '<external>'
                 {file_filter}
 
                 UNION ALL

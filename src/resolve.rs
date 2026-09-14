@@ -16,25 +16,46 @@ use crate::storage::queries::{self, NameCandidate};
 
 /// Return exact qualified definitions using the shared surface selection rule.
 ///
-/// Without an explicit file selector, test symbols are excluded just as they
-/// are from [`detect_ambiguity`]. Supplying a file is an intentional bypass so
-/// callers can select a definition in a test file. The storage query already
-/// excludes the `<external>` sentinel.
+/// Without an explicit file selector, test definitions are DEPRIORITISED rather
+/// than removed: they drop out whenever a production definition of the same
+/// qualified name survives, and are kept when they are all there is. Supplying a
+/// file is an intentional bypass so callers can select a definition in a test
+/// file. The storage query already excludes the `<external>` sentinel.
+///
+/// The two-step shape is load-bearing, and a plain `.filter()` here was wrong in
+/// a way worth naming. [`detect_ambiguity`] applies the same `is_test_symbol`
+/// predicate, but there it WIDENS what resolves — a test namesake must not make
+/// your production symbol ambiguous. Applied to an exact qualified lookup it
+/// NARROWS instead, and for a name that exists ONLY in a test file it narrows to
+/// nothing: the caller then fell through to a bare-name lookup, silently
+/// discarding the qualifier. `refs TestHarness.run` answered with an ambiguity
+/// error naming `Alpha.run` and `Beta.run` in a file the user never mentioned,
+/// and offered `show --node-id <N>` pointing at the wrong symbol. Same
+/// predicate, inverted consequence.
 pub fn selectable_qualified_definitions(
     conn: &Connection,
     qualified_name: &str,
     explicit_file: Option<&str>,
 ) -> Result<Vec<queries::NodeWithFile>> {
-    Ok(
+    let in_scope: Vec<queries::NodeWithFile> =
         queries::get_nodes_with_files_by_qualified_name(conn, qualified_name)?
             .into_iter()
             .filter(|candidate| explicit_file.is_none_or(|wanted| wanted == candidate.file_path))
-            .filter(|candidate| {
-                explicit_file.is_some()
-                    || !crate::domain::is_test_symbol(&candidate.node.name, &candidate.file_path)
-            })
-            .collect(),
-    )
+            .collect();
+
+    if explicit_file.is_some() {
+        return Ok(in_scope);
+    }
+
+    let (production, test_only): (Vec<_>, Vec<_>) = in_scope.into_iter().partition(|candidate| {
+        !crate::domain::is_test_symbol(&candidate.node.name, &candidate.file_path)
+    });
+
+    Ok(if production.is_empty() {
+        test_only
+    } else {
+        production
+    })
 }
 
 /// Which surface is rendering the message — only affects flag/tool wording

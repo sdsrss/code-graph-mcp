@@ -11,13 +11,25 @@ bare one resolved. To pin back: `npm i -g @sdsrs/code-graph@0.151.0`, or
 `cargo install code-graph-mcp --version 0.151.0`; plugin users can set the version
 in the marketplace entry.
 
-**Two envelopes move, and a script keying on either will see it.** `callgraph
---json` gains a top-level `symbol` key on the **success** envelope — it carried
-one only on errors before. And `refs <Class>.<method> --file <path>` now exits 0
-with a result where it exited 1 with an `Ambiguous symbol` error and a
-`suggestions` array, when the named file holds two definitions sharing the bare
-name; the qualifier is exactly what resolves it, so the refusal was the thing
-worth removing, but a client branching on `suggestions` sees a different object.
+**Three envelopes move, and a script keying on any of them will see it.**
+
+1. `callgraph --json` gains a top-level `symbol` key on the **success**
+   envelope — it carried one only on errors before.
+2. `refs <Class>.<method>` now exits 0 with a result where it exited 1 with an
+   `Ambiguous symbol` error and a `suggestions` array, when the two definitions
+   sharing the bare name are distinguished by their qualifiers. The qualifier is
+   exactly what resolves it, so the refusal was the thing worth removing, but a
+   client branching on `suggestions` sees a different object. This happens with
+   and without `--file`.
+3. The reverse, and the one that is a genuine narrowing: a dotted input that
+   matches no qualified name is a strict miss **when `--file` is given**, where
+   before it fell back to the bare component. `callgraph a.run --file two.py`
+   answered about `two.py`'s `run` on 0.151.0 and now exits 1; `refs` on the
+   same input exits 1 either way but swaps an `Ambiguous symbol` envelope
+   carrying `suggestions` for a plain `Symbol not found`. Refusing is the right
+   answer for `Zeta.run` where no `Zeta` exists — it is the receiver-variable
+   spelling (`a.run`) that loses an answer it used to get. Without `--file` the
+   fallback is unchanged.
 
 ### A method's name was not enough to ask about it
 
@@ -91,6 +103,20 @@ which shape moved.
 - The CLI echoes the bare name in `symbol` where MCP echoes the qualified one.
   Reported during review of the upstream branch; not independently reproduced
   here, and not changed by this release.
+- `refs` disagrees with itself across output modes: its text line says
+  `1 references to 'Alpha.run'` while `--json` reports `"symbol":"run"`.
+  `impact` and `callgraph` print the bare name in both. The JSON envelope is the
+  scripted surface and it is consistent with its siblings, so this is left
+  alone rather than churned before a release — but it is a difference, and it is
+  named here rather than discovered.
+- Two behaviours on the qualified path have no test behind them: the VALUE of
+  `callgraph --json`'s new `symbol` key, and the re-validation that re-runs
+  symbol selection after an on-the-fly staleness refresh. Both were found by
+  mutation during pre-ship review — each can be neutered with the whole suite
+  green. They are recorded rather than fixed because neither is a regression
+  against 0.151.0; the disclosure that WAS unpinned and is a safety surface
+  (`impact`'s excluded-caller count and its "blast radius may be larger" note on
+  a qualified input) has a guard as of this release.
 
 ## 0.151.0
 

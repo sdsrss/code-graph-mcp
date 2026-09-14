@@ -11554,3 +11554,161 @@ fn a_qualifier_matching_no_definition_still_falls_back_to_the_bare_name() {
         "the reindex hint must not fire for a name the index does have: {combined}"
     );
 }
+
+#[test]
+fn a_qualified_name_that_exists_only_in_a_test_file_still_answers_about_itself() {
+    // `selectable_qualified_definitions` drops test definitions when no --file is
+    // given. For a name defined ONLY in a test file that leaves nothing, and the
+    // caller then fell through to a bare-name lookup — silently discarding the
+    // qualifier and answering about whatever else shares the bare name.
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("two.py"),
+        "class Alpha:\n    def run(self):\n        return 1\n\nclass Beta:\n    def run(self):\n        return 2\n\ndef drive():\n    return Alpha.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_only.py"),
+        "class TestHarness:\n    def run(self):\n        return 3\n\ndef test_entry():\n    return TestHarness.run(None)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "TestHarness.run", "--json"]);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "{cmd} TestHarness.run must answer about TestHarness, not refuse: {combined}"
+        );
+        // The specific failure this pins: answering about `two.py`'s Alpha/Beta,
+        // a file the user never named, with node_ids pointing at the wrong
+        // symbols. Naming the file makes the assertion diagnostic.
+        assert!(
+            !combined.contains("two.py"),
+            "{cmd} answered about an unrelated file the input never named: {combined}"
+        );
+    }
+}
+
+#[test]
+fn a_production_definition_still_wins_over_a_test_namesake() {
+    // The control for the test above: when BOTH exist, the test definition must
+    // still drop out, or the deprioritise-instead-of-remove change would have
+    // reintroduced the ambiguity the filter was added to prevent.
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self):\n        return 1\n\ndef prod_caller():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self):\n        return 2\n\ndef test_caller():\n    return Worker.run(None)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // Two definitions of `Worker.run` exist, but only one is selectable without
+    // --file, so this must resolve rather than report ambiguity.
+    let (stdout, stderr, code) = run_cli(&project, &["refs", "Worker.run", "--json"]);
+    let combined = format!("{stdout}{stderr}");
+    assert_eq!(
+        code, 0,
+        "production definition must be selected: {combined}"
+    );
+    assert!(
+        !combined.to_lowercase().contains("ambiguous"),
+        "a test namesake must not make the production symbol ambiguous: {combined}"
+    );
+    // And the explicit bypass still reaches the test definition.
+    let (_, _, code) = run_cli(
+        &project,
+        &[
+            "refs",
+            "Worker.run",
+            "--file",
+            "tests/test_worker.py",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "--file must still select the test definition");
+}
+
+#[test]
+fn the_qualified_path_still_discloses_the_callers_it_excluded() {
+    // `impact` folds `ambiguous` callers out of its risk number by default and
+    // says so — the count plus "actual blast radius may be larger". That
+    // disclosure is the reason a LOW verdict is safe to act on.
+    //
+    // The seed for the suppressed-edge count lives in `count_suppressed_seed_edges`,
+    // a SEPARATE query from the traversal seed, and it needed its own
+    // `OR n.qualified_name = ?1` to see a qualified input at all. Without it the
+    // qualified path answers `risk: LOW` with the warning silently absent, which
+    // is worse than refusing: the number looks like a cleared safety check.
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("base.py"),
+        "class Base:\n    def helper(self):\n        return 1\n",
+    )
+    .unwrap();
+    // A same-named method on an unrelated class, so `self.helper()` below is
+    // resolved by bare name and lands in the `ambiguous` tier.
+    std::fs::write(
+        project.path().join("other.py"),
+        "class Other:\n    def helper(self):\n        return 2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("child.py"),
+        "from base import Base\n\n\nclass Child(Base):\n    def run(self):\n        return self.helper()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Base.helper", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert_eq!(
+        out["ambiguous_callers_excluded"], 1,
+        "the qualified path must count the ambiguous caller it folded out: {out}"
+    );
+    assert!(
+        out["ambiguous_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("blast radius")),
+        "a risk verdict that hides callers must say so: {out}"
+    );
+    // Control: the SAME definition reached by its bare name discloses
+    // identically, so the assertions above cannot pass by breaking suppression
+    // everywhere. `--file` is needed because the bare name is itself ambiguous
+    // across base.py and other.py — which is what makes the caller ambiguous in
+    // the first place.
+    let (bare_stdout, _, bare_code) = run_cli(
+        &project,
+        &["impact", "helper", "--file", "base.py", "--json"],
+    );
+    assert_eq!(
+        bare_code, 0,
+        "bare-name control did not resolve: {bare_stdout}"
+    );
+    let bare: serde_json::Value = serde_json::from_str(bare_stdout.trim()).unwrap();
+    assert!(
+        bare["ambiguous_callers_excluded"].as_i64().unwrap_or(0) >= 1,
+        "bare-name control lost its disclosure too — the fixture stopped \
+         producing ambiguous callers: {bare}"
+    );
+}

@@ -1087,27 +1087,42 @@ fn python_resolution_fixture() -> (TempDir, Database) {
     (project, db)
 }
 
-fn tier_histogram(db: &Database) -> BTreeMap<(String, String), i64> {
+/// Every Python edge as `relation confidence src_file:src_name -> tgt_file:tgt_name`.
+///
+/// Identities, not counts: a migration that moves one edge each way between two
+/// tiers leaves every count untouched, and that is exactly the shape the
+/// `--min-confidence inferred` default makes consequential — one edge silently
+/// enters every default answer while another silently leaves it.
+fn edge_identities(db: &Database) -> Vec<String> {
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT e.relation, COALESCE(e.confidence, '<null>'), COUNT(*)
+            "SELECT e.relation, e.confidence, fs.path, ns.name, ft.path, nt.name
              FROM edges e
-             JOIN nodes n ON n.id = e.source_id
-             JOIN files f ON f.id = n.file_id
-             WHERE f.language = 'python'
-             GROUP BY 1, 2",
+             JOIN nodes ns ON ns.id = e.source_id
+             JOIN files fs ON fs.id = ns.file_id
+             JOIN nodes nt ON nt.id = e.target_id
+             JOIN files ft ON ft.id = nt.file_id
+             WHERE fs.language = 'python'",
         )
         .unwrap();
-    let rows = stmt
+    let mut rows: Vec<String> = stmt
         .query_map([], |r| {
-            Ok((
-                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
-                r.get::<_, i64>(2)?,
+            Ok(format!(
+                "{} {} {}:{} -> {}:{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })
-        .unwrap();
-    rows.map(|r| r.unwrap()).collect()
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows.sort();
+    rows
 }
 
 /// Pin the exact `(relation, confidence)` histogram Python resolution produces.
@@ -1135,35 +1150,44 @@ fn tier_histogram(db: &Database) -> BTreeMap<(String, String), i64> {
 #[test]
 fn python_resolution_tier_inventory_is_pinned() {
     let (_p, db) = python_resolution_fixture();
-    let got = tier_histogram(&db);
-
-    let expected: BTreeMap<(String, String), i64> = [
+    let expected = [
         // Two fan-outs, two edges each, and both are the conservative answer:
-        //   `go -> execute`     x2  — receiver `cmd` is untyped, so the call
-        //                             binds to BOTH `Command.execute` and
-        //                             `Builder.execute`.
-        //   `Child.run -> helper` x2 — `self.helper()` is resolved by bare name,
-        //                             so it reaches `Other.helper` as well as
-        //                             the inherited `Base.helper`.
-        // Precision work targets exactly these four. Narrowing either pair to
-        // its one true target is an improvement; dropping the pair to zero edges
-        // is not, and only a per-tier count tells those two apart.
-        (("calls", "ambiguous"), 4),
-        // `make_builder -> Builder`, a constructor call inside one file.
-        (("calls", "extracted"), 1),
-        // `call_it -> open` (the project `def open` shadowing the builtin),
-        // `go -> make_builder`, `run -> load`, `run -> render`.
-        (("calls", "inferred"), 4),
-        (("imports", "extracted"), 8),
-        (("inherits", "extracted"), 1),
+        // `go -> execute` binds to BOTH `Command.execute` and `Builder.execute`
+        // because receiver `cmd` is untyped; `child.run -> helper` is resolved by
+        // bare name, so it reaches the unrelated `other.py:helper` as well as the
+        // inherited `base.py:helper`. Precision work targets exactly these four.
+        // Narrowing either pair to its one true target is an improvement;
+        // dropping a pair to zero edges is not — and only the identities tell
+        // those two apart.
+        "calls ambiguous app.py:go -> builder.py:execute",
+        "calls ambiguous app.py:go -> cmd.py:execute",
+        "calls ambiguous child.py:run -> base.py:helper",
+        "calls ambiguous child.py:run -> other.py:helper",
+        // A constructor call inside one file.
+        "calls extracted builder.py:make_builder -> builder.py:Builder",
+        // The import-mediated calls, plus the project `def open` that shadows
+        // the builtin.
+        "calls inferred app.py:go -> builder.py:make_builder",
+        "calls inferred caller.py:call_it -> shadow.py:open",
+        "calls inferred dotted.py:run -> pkg/models.py:load",
+        "calls inferred dotted.py:run -> pkg/views.py:render",
+        "imports extracted app.py:<module> -> builder.py:<module>",
+        "imports extracted app.py:<module> -> builder.py:make_builder",
+        "imports extracted child.py:<module> -> base.py:<module>",
+        "imports extracted child.py:<module> -> base.py:Base",
+        "imports extracted dotted.py:<module> -> pkg/models.py:<module>",
+        "imports extracted dotted.py:<module> -> pkg/views.py:<module>",
+        "imports extracted use_alias.py:<module> -> cache.py:<module>",
+        "imports extracted use_alias.py:<module> -> cache.py:Cache",
+        "inherits extracted child.py:Child -> base.py:Base",
     ]
-    .into_iter()
-    .map(|((rel, conf), n)| ((rel.to_string(), conf.to_string()), n))
-    .collect();
+    .map(str::to_string)
+    .to_vec();
 
     assert_eq!(
-        got, expected,
-        "Python resolution moved. Left is this build, right is the pinned map."
+        edge_identities(&db),
+        expected,
+        "Python resolution moved. Left is this build, right is the pinned set."
     );
 
     // The backlog is the other half of the picture: an edge missing from the
@@ -1244,23 +1268,22 @@ fn python_resolution_converges_incrementally_to_a_rebuild() {
     code_graph_mcp::indexer::pipeline::run_full_index(&full_db, full_project.path(), None, None)
         .unwrap();
 
-    let inc = tier_histogram(&inc_db);
-    let full = tier_histogram(&full_db);
+    let inc = edge_identities(&inc_db);
+    let full = edge_identities(&full_db);
     assert_eq!(
         inc, full,
         "incremental and rebuild disagree on the same tree. Left is the index \
-         grown in two passes, right is the one-shot rebuild. A LOWER count on \
-         the left is the silent-under-reporting shape; a higher one means the \
-         incremental path kept an edge the rebuild drops."
+         grown in two passes, right is the one-shot rebuild. An edge MISSING on \
+         the left is the silent-under-reporting shape; one present only on the \
+         left means the incremental path kept an edge the rebuild drops; and a \
+         row differing only in its confidence column is a tier that did not \
+         converge, which counts alone would hide."
     );
 
-    // Naming the shared value as well: an identical pair of empty histograms
-    // would satisfy the assertion above without either path resolving anything.
+    // Naming the shared value as well: two identical empty sets would satisfy
+    // the assertion above without either path resolving anything.
     assert!(
-        full.get(&("calls".to_string(), "inferred".to_string()))
-            .copied()
-            .unwrap_or(0)
-            >= 1,
+        full.iter().any(|row| row.starts_with("calls inferred")),
         "fixture stopped exercising resolution at all: {full:?}"
     );
 }
