@@ -11605,12 +11605,19 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
     std::fs::create_dir_all(project.path().join("tests")).unwrap();
     std::fs::write(
         project.path().join("src/worker.py"),
-        "class Worker:\n    def run(self):\n        return 1\n\ndef prod_caller():\n    return Worker.run(None)\n",
+        // `test_step` is a PRODUCTION method whose name is test-shaped. Keeping
+        // it beside `run` is the whole point: partitioning on a name-OR-path
+        // predicate classifies it as a test symbol, empties the production side,
+        // and turns this input into `Ambiguous symbol` — a regression against
+        // both main and the first cut of this branch (review round 2, D1).
+        // `test_connection` / `test_mode` / `test_step` are ordinary production
+        // helper names.
+        "class Worker:\n    def run(self):\n        return 1\n\n    def test_step(self):\n        return 1\n\ndef prod_caller():\n    return Worker.run(None)\n\ndef prod_stepper():\n    return Worker.test_step(None)\n",
     )
     .unwrap();
     std::fs::write(
         project.path().join("tests/test_worker.py"),
-        "class Worker:\n    def run(self):\n        return 2\n\ndef test_caller():\n    return Worker.run(None)\n",
+        "class Worker:\n    def run(self):\n        return 2\n\n    def test_step(self):\n        return 2\n\ndef test_caller():\n    return Worker.run(None)\n\ndef test_stepper():\n    return Worker.test_step(None)\n",
     )
     .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -11642,6 +11649,21 @@ fn a_production_definition_still_wins_over_a_test_namesake() {
         ],
     );
     assert_eq!(code, 0, "--file must still select the test definition");
+
+    // The same rule, for a production method whose NAME looks like a test.
+    for cmd in ["refs", "callgraph", "impact"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "Worker.test_step", "--json"]);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "{cmd} must select the production Worker.test_step, not refuse: {combined}"
+        );
+        assert!(
+            !combined.to_lowercase().contains("ambiguous"),
+            "{cmd}: a test-shaped production NAME must not empty the production \
+             side of the partition: {combined}"
+        );
+    }
 }
 
 #[test]

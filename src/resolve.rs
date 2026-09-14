@@ -47,9 +47,21 @@ pub fn selectable_qualified_definitions(
         return Ok(in_scope);
     }
 
-    let (production, test_only): (Vec<_>, Vec<_>) = in_scope.into_iter().partition(|candidate| {
-        !crate::domain::is_test_symbol(&candidate.node.name, &candidate.file_path)
-    });
+    // Partition on where a definition LIVES, not on what it is called.
+    // `is_test_symbol` is name-OR-path, and its name legs are wrong here twice
+    // over. Substantively: production-wins is a statement about location, and a
+    // production helper called `test_connection` or `test_mode` is production.
+    // Structurally: every candidate in this vector shares one `qualified_name`,
+    // and a node's name is that qualified name's last component — so the name
+    // legs evaluate identically for all of them and can only classify ALL or
+    // NONE. Classifying none is a no-op; classifying all empties `production`
+    // and hands the fallback the entire set, which then reports as ambiguous.
+    // That is a strictly-harmful predicate: it cannot help and it did regress
+    // `refs Job.test_step` from an answer to `Ambiguous symbol` once a test-file
+    // twin existed (pre-ship review round 2, D1).
+    let (production, test_only): (Vec<_>, Vec<_>) = in_scope
+        .into_iter()
+        .partition(|candidate| !crate::domain::is_test_path(&candidate.file_path));
 
     Ok(if production.is_empty() {
         test_only

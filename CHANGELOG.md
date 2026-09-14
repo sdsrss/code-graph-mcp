@@ -52,6 +52,17 @@ keeps working on a Rust or TypeScript index where `health` is a module rather
 than a type, and the stale-index hint stays gated on the **bare** name being
 absent.
 
+**A qualified name reaches a test-only definition where the bare name refuses,
+and that is deliberate.** MCP `find_references` answers `Fixture.probe` when
+`Fixture` is defined only under `tests/`, while the bare `probe` still returns
+`all 1 match(es) are in test/bench paths … pass node_id or file_path explicitly
+to bypass the test filter`. The answer is the right one — it is about the symbol
+the caller named, and the CLI has always answered it — but note that the refusal
+message enumerates two bypasses and there are now three. The qualified spelling
+is the third. `impact` and `callgraph` are unaffected: a test definition reached
+this way still lands in `test_callers` / `test_callers_hidden` and still
+contributes 0 to `direct_callers` and to the risk verdict.
+
 ### A file path is not a symbol
 
 Every file carries a `<module>` node whose `qualified_name` is the file's own

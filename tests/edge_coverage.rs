@@ -1087,17 +1087,28 @@ fn python_resolution_fixture() -> (TempDir, Database) {
     (project, db)
 }
 
-/// Every Python edge as `relation confidence src_file:src_name -> tgt_file:tgt_name`.
+/// Every Python edge as `relation confidence src_file:src_qual -> tgt_file:tgt_qual`.
 ///
 /// Identities, not counts: a migration that moves one edge each way between two
 /// tiers leaves every count untouched, and that is exactly the shape the
 /// `--min-confidence inferred` default makes consequential — one edge silently
 /// enters every default answer while another silently leaves it.
+///
+/// QUALIFIED names, not bare ones, for the same reason one level down. Bare
+/// names render `Alpha.run` and `Beta.run` in one file as the same string, so
+/// re-pointing a call from one to the other — a real resolution change, and the
+/// precise class this feature exists to fix — left the sorted output
+/// byte-identical. `COALESCE` because top-level functions carry no qualifier.
 fn edge_identities(db: &Database) -> Vec<String> {
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT e.relation, e.confidence, fs.path, ns.name, ft.path, nt.name
+            "SELECT e.relation, e.confidence, fs.path,
+                    CASE ns.type WHEN 'module' THEN ns.name
+                         ELSE COALESCE(ns.qualified_name, ns.name) END,
+                    ft.path,
+                    CASE nt.type WHEN 'module' THEN nt.name
+                         ELSE COALESCE(nt.qualified_name, nt.name) END
              FROM edges e
              JOIN nodes ns ON ns.id = e.source_id
              JOIN files fs ON fs.id = ns.file_id
@@ -1159,10 +1170,10 @@ fn python_resolution_tier_inventory_is_pinned() {
         // Narrowing either pair to its one true target is an improvement;
         // dropping a pair to zero edges is not — and only the identities tell
         // those two apart.
-        "calls ambiguous app.py:go -> builder.py:execute",
-        "calls ambiguous app.py:go -> cmd.py:execute",
-        "calls ambiguous child.py:run -> base.py:helper",
-        "calls ambiguous child.py:run -> other.py:helper",
+        "calls ambiguous app.py:go -> builder.py:Builder.execute",
+        "calls ambiguous app.py:go -> cmd.py:Command.execute",
+        "calls ambiguous child.py:Child.run -> base.py:Base.helper",
+        "calls ambiguous child.py:Child.run -> other.py:Other.helper",
         // A constructor call inside one file.
         "calls extracted builder.py:make_builder -> builder.py:Builder",
         // The import-mediated calls, plus the project `def open` that shadows
