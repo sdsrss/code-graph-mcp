@@ -4501,3 +4501,73 @@ fn cli_and_mcp_agree_on_one_qualified_symbol() {
         }
     }
 }
+
+/// A file path is not a symbol — on every MCP tool that takes one.
+///
+/// Every file carries a `<module>` node whose `qualified_name` is the file's own
+/// path, so a path matches an exact-qualified lookup. Excluding module rows from
+/// the SELECTION query is not enough: `get_call_graph` seeds its traversal from
+/// the symbol string directly, in three separate predicates that never see the
+/// selection layer. That is how the same input got a refusal from
+/// `find_references` and a success envelope from `get_call_graph` — the
+/// one-input-two-verdicts shape this repo has shipped three times.
+#[test]
+fn mcp_tools_agree_that_a_file_path_is_not_a_symbol() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("uniq.py"),
+        "class Health:\n    def probe(self):\n        return 1\n\ndef ping():\n    return Health.probe(None)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let server = common::init_server(&project);
+
+    let cases = [
+        (
+            "get_call_graph",
+            serde_json::json!({"symbol_name": "uniq.py", "direction": "callers", "depth": 1}),
+        ),
+        (
+            "find_references",
+            serde_json::json!({"symbol_name": "uniq.py"}),
+        ),
+        (
+            "get_ast_node",
+            serde_json::json!({"symbol_name": "uniq.py", "compact": true}),
+        ),
+    ];
+
+    for (tool, args) in cases {
+        let raw = server
+            .handle_message(&common::tool_call_json(tool, args))
+            .unwrap();
+        // A refusal may arrive as an error envelope or as an `isError` result;
+        // what must never happen is an answer ABOUT the path.
+        let text = raw.as_deref().unwrap_or_default().to_string();
+        assert!(
+            text.contains("not found"),
+            "{tool} answered for a file path instead of refusing it: {text}"
+        );
+    }
+
+    // Control: a real qualified symbol in the same index still resolves on the
+    // tool whose seed this guards, so the assertions above cannot pass by
+    // breaking call-graph lookup outright.
+    let ok = common::parse_tool_result(
+        &server
+            .handle_message(&common::tool_call_json(
+                "get_call_graph",
+                serde_json::json!({"symbol_name": "Health.probe", "direction": "callers", "depth": 1}),
+            ))
+            .unwrap(),
+    );
+    assert!(
+        ok.get("error").is_none(),
+        "qualified call-graph lookup must survive the module exclusion: {ok}"
+    );
+}

@@ -256,11 +256,22 @@ fn query_direction(
     // project. The by-name lookups in `queries/nodes.rs` carry the same
     // exclusion. `ORDER BY n.id` fixes multi-seed order (same-named defs in
     // several files) so depth-0 output does not depend on the query plan.
+    //
+    // `<module>` rows are excluded for a parallel reason, and the exclusion has
+    // to be HERE as well as in the selection layer. Every file gets a module
+    // node whose `qualified_name` is the file's own path, and a path contains
+    // dots, so `qualified_name = ?1` matches one exactly. The CLI reaches this
+    // function through `select_cli_symbol`, which already drops module rows —
+    // but MCP `get_call_graph` seeds straight off the symbol string, so a file
+    // path came back as an empty-but-successful call graph there while
+    // `find_references` and `get_ast_node` refused the same input. Three seed
+    // predicates in this file need it; all three have it.
     let mut frontier: Vec<i64> = {
         let mut stmt = conn.prepare(
             "SELECT n.id FROM nodes n
              JOIN files f ON f.id = n.file_id
              WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
+               AND n.type <> 'module'
                AND (?2 IS NULL OR f.path = ?2)
              ORDER BY n.id",
         )?;
@@ -488,6 +499,7 @@ pub fn count_suppressed_seed_edges(
          JOIN nodes n ON n.id = e.{seed_col}
          JOIN files f ON f.id = n.file_id
          WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
+               AND n.type <> 'module'
            AND (?2 IS NULL OR f.path = ?2) AND e.relation = ?3
            AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) < ?4"
     );
@@ -650,6 +662,7 @@ mod tests {
                 -- the project. The by-name lookups in `queries/nodes.rs` carry the
                 -- same exclusion; this CTE seeds itself and needed its own.
                 WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'
+               AND n.type <> 'module'
                 {file_filter}
 
                 UNION ALL

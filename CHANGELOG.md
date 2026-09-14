@@ -46,8 +46,18 @@ Every file carries a `<module>` node whose `qualified_name` is the file's own
 path. A path contains dots, so exact-qualified lookup matched one — and `impact
 lib.py` would have answered exit 0 with a `risk` verdict for an input it never
 resolved to a symbol, on the command this project's own routing table puts before
-an edit. Module rows are excluded from qualified lookup; a path is back on the
-not-found path, byte-identical to 0.151.0's answer.
+an edit. Module rows are excluded; a path is back on the not-found path,
+byte-identical to 0.151.0's answer, on all five surfaces that take a symbol name.
+
+**The exclusion is needed in two places, and that is the part worth stating.**
+Dropping module rows from the qualified *selection* query covers `refs`,
+`callgraph` and `impact` on the CLI, and MCP `find_references` and
+`get_ast_node` — but MCP `get_call_graph` seeds its traversal straight off the
+symbol string, through three predicates in `graph::query` that never reach the
+selection layer. With only the first layer in place, one input got a refusal from
+two MCP tools and an empty-but-successful call graph from the third, which is the
+one-input-two-verdicts shape this repo has shipped three times. Both layers are
+in; a test asserts the five surfaces agree.
 
 ### The guard that makes resolution changes visible
 

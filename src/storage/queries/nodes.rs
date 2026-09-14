@@ -228,8 +228,8 @@ pub fn get_nodes_with_files_by_qualified_name(
 }
 
 /// Collect cross-file inbound edges before deleting a file's nodes.
-/// Returns (source_id, source_file_id, target_name, target_qualified_name,
-/// relation, metadata) for edges where:
+/// Returns (source_id, source_file_id, target_name, relation, metadata) for
+/// edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
