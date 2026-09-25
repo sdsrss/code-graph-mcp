@@ -5670,6 +5670,14 @@ fn a_verified_set_from_another_version_is_not_trusted() {
             }
         })
         .to_string(),
+        serde_json::json!({
+            "v": crate::domain::INDEX_VERSION - 1,
+            "files": {
+                "broken.rs": "x",
+                "hurt.rs": crate::indexer::merkle::hash_bytes(b"fn hurt_a() {}\nfn hurt_b() {}\n"),
+            }
+        })
+        .to_string(),
     ] {
         let project_dir = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();

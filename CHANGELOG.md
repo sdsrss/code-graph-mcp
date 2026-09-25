@@ -9,7 +9,7 @@ newer code-graph, it stops writing to it: tools keep answering from the index
 as it stands, and CLI `incremental-index` exits 1 with a message telling you to
 restart. The first incremental run after upgrading re-parses any file that
 `health-check` lists as a damaged parse and that this version has not parsed
-itself, which is usually none and at most a handful. If `health-check` still
+itself, once each. If `health-check` still
 shows files you believe are fine, `code-graph-mcp rebuild-index --confirm`
 rebuilds from scratch. To pin back: `npm i -g @sdsrs/code-graph@0.156.0`, or
 `cargo install code-graph-mcp --version 0.156.0`; plugin users can set the
@@ -30,12 +30,13 @@ did not bring it back. On this repository, 9 Rust files sat in `health-check`'s
 
 From this release, a code-graph that finds the index was built by a newer
 `INDEX_VERSION` stops writing parse results into it. It checks the index as it
-is at the moment of each write, not as it was when the server started, because
-the usual order is the reverse: the server is already running when the newer
-binary rebuilds under it. The server keeps answering from the index as it
+is when each indexing run starts, not as it was when the server started,
+because the usual order is the reverse: the server is already running when the
+newer binary rebuilds under it. The server keeps answering from the index as it
 stands, including tools given a `file_path` whose file has changed (they skip
-the refresh rather than fail). Tools whose results name files say, in a
-`freshness` note, that the index belongs to a newer code-graph and that
+the refresh rather than fail). On the primary instance, the tools that refresh
+the files their results name (call graph, references, searches and the like)
+add a `freshness` note saying the index belongs to a newer code-graph and that
 restarting the session is the remedy. A secondary instance does not promote itself to
 primary over such an index; and the startup context-string repair does not
 run. CLI `incremental-index` exits 1 and says why. This protects future
@@ -45,8 +46,8 @@ changed, which is what the second part is for.
 A file listed as a damaged parse is now re-parsed by the next incremental run
 unless this version recorded that verdict itself, for the content the index
 now holds. The record is kept per `INDEX_VERSION` and per file content, so a
-verdict another version wrote, or one about content another binary has since
-re-indexed, does not count. A file that really does fail to parse is re-parsed
+verdict another version wrote, or one about content that has since changed,
+does not count. A file that really does fail to parse is re-parsed
 once and then left alone. Indexes already damaged by an older server therefore
 repair themselves on first use, as far as the damage is on record: the damaged
 list exists since 0.151.0, so a server older than that leaves nothing to find,
@@ -64,9 +65,15 @@ and `rebuild-index --confirm` is the remedy there.
 - Opening an index whose vector table has a different embedding dimension
   still drops that table, before any version check. No release has changed the
   dimension; this matters only if one does.
+- An indexing run already under way when the newer binary stamps the index
+  finishes writing; the check is made when a run starts.
 - CLI read commands over a newer index still suggest
-  `code-graph-mcp incremental-index` when files changed, and that command now
-  exits 1 there. Restarting the session is the remedy.
+  `code-graph-mcp incremental-index` when files changed, and `health-check`
+  suggests `reindex`; both now exit 1 there. Restarting the session is the
+  remedy.
+- The verified record takes each file's hash from the index when the run
+  finishes. If another binary re-indexes that file in the same moment, the
+  record can vouch for content this run did not parse.
 
 ## 0.156.0
 
