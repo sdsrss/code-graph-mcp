@@ -501,6 +501,18 @@ If you see this repeatedly, another code-graph server of a different version is 
         self.index_version_stale
     }
 
+    /// `Some(stored)` when the index was built by a NEWER `INDEX_VERSION` than
+    /// this binary.
+    ///
+    /// Such an index belongs to the newer binary. The open path already refuses
+    /// to wipe it; this is what the write path checks, so an older binary still
+    /// running after an upgrade does not store its older parse under the newer
+    /// version stamp, where no later run would ever replace it.
+    pub fn newer_index_version(&self) -> Option<i32> {
+        self.index_version_stale
+            .filter(|&v| v > crate::domain::INDEX_VERSION)
+    }
+
     /// Files currently believed to have parsed with tree-sitter ERROR nodes, so
     /// a reader can report a degraded index long after the run that built it.
     ///
@@ -587,19 +599,48 @@ If you see this repeatedly, another code-graph server of a different version is 
         kept.extend(errored.iter().cloned());
         kept.sort();
         kept.dedup();
-        if kept.is_empty() {
-            crate::storage::queries::delete_meta(
-                self.conn(),
-                crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
-            )?;
-        } else {
-            crate::storage::queries::set_meta(
-                self.conn(),
-                crate::storage::schema::META_KEY_PARSE_ERROR_FILES,
-                &serde_json::to_string(&kept)?,
-            )?;
-        }
+        // Same fold over the verdicts this binary produced, bounded by `kept`:
+        // a path the main set no longer names has no verdict left to vouch for,
+        // and must not count as verified if another binary lists it again.
+        let kept_set: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
+        let mut verified: Vec<String> = self
+            .parse_error_files_verified()?
+            .into_iter()
+            .filter(|p| !reexamined.contains(p.as_str()))
+            .chain(errored.iter().cloned())
+            .filter(|p| kept_set.contains(p.as_str()))
+            .collect();
+        verified.sort();
+        verified.dedup();
+        self.write_path_set(crate::storage::schema::META_KEY_PARSE_ERROR_FILES, &kept)?;
+        self.write_path_set(
+            crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
+            &verified,
+        )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The paths whose damaged-parse verdict this binary produced itself. Unlike
+    /// [`Database::parse_error_files`] this is not intersected with `files`: its
+    /// only use is subtraction from that already-intersected set. Malformed reads
+    /// as empty, which only makes the listed files eligible for one re-parse.
+    pub fn parse_error_files_verified(&self) -> Result<Vec<String>> {
+        Ok(crate::storage::queries::get_meta(
+            self.conn(),
+            crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
+        )?
+        .map(|raw| serde_json::from_str(&raw).unwrap_or_default())
+        .unwrap_or_default())
+    }
+
+    /// Store a path set as a JSON array under `key`, deleting the key when empty.
+    fn write_path_set(&self, key: &str, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            crate::storage::queries::delete_meta(self.conn(), key)?;
+        } else {
+            crate::storage::queries::set_meta(self.conn(), key, &serde_json::to_string(paths)?)?;
+        }
         Ok(())
     }
 

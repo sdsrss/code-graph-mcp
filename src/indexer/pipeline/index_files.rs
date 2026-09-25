@@ -1877,6 +1877,20 @@ pub(super) fn index_files(
     delete_paths: &[String],
     progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
+    // An index built by a newer INDEX_VERSION belongs to the newer binary. Every
+    // parse this one stored would sit under the newer stamp, looking current, and
+    // an unchanged file is never re-parsed — so refuse before the first write.
+    // An error, not an empty result: `wipe_and_rebuild` deletes every row in the
+    // same transaction first, and only an error rolls that back.
+    if let Some(stored) = db.newer_index_version() {
+        anyhow::bail!(
+            "index was built by a newer code-graph (index v{} > this binary v{}); not writing to it. \
+Restart every code-graph server on this project so they run one version.",
+            stored,
+            crate::domain::INDEX_VERSION
+        );
+    }
+
     // Phase transactions use `db.savepoint(...)`, NOT `conn().unchecked_transaction()`,
     // so this pipeline is atomic whether run standalone (CLI / incremental — a
     // top-level SAVEPOINT auto-starts a transaction, RELEASE commits it) OR nested

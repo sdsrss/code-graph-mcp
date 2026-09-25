@@ -36,6 +36,22 @@ pub const META_KEY_INDEX_RUN_IN_FLIGHT: &str = "index_run_in_flight";
 /// [`META_KEY_INDEX_RUN_IN_FLIGHT`] above).
 pub const META_KEY_PARSE_ERROR_FILES: &str = "parse_error_files";
 
+/// The subset of [`META_KEY_PARSE_ERROR_FILES`] whose "damaged parse" verdict
+/// this binary produced itself — JSON array of relative paths, folded by the
+/// same `(stored - examined) + errored` rule.
+///
+/// The main set is also written by OTHER binaries sharing the index: a server
+/// started before an upgrade keeps running, and until it stopped writing to a
+/// newer index it stored its older grammar's parse of any file it touched.
+/// Those files look damaged, hash as unchanged, and were never re-parsed. A
+/// listed path missing from this key is re-parsed by the next incremental run
+/// (see `pipeline::unverified_parse_error_files`).
+///
+/// No SCHEMA_VERSION bump: absent reads as empty, so on an index from before
+/// this key every listed file is re-examined once, which is what repairs the
+/// indexes already written that way.
+pub const META_KEY_PARSE_ERROR_FILES_VERIFIED: &str = "parse_error_files_verified";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "

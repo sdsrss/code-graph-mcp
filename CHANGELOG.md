@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### A server left running from before an upgrade no longer rewrites the index
+
+A Claude Code session opened before an upgrade keeps its code-graph server
+running on the old binary. Once the upgraded binary rebuilt the index, that old
+server refused to wipe it, as it should, but it went on indexing into it: every
+file it re-indexed was stored as the OLD grammar's parse under the NEW version
+stamp. The newer binary never re-parses a file whose content did not change, so
+the damage stayed until you edited the file or rebuilt by hand. Reproduced with
+a 0.153.0 server against a 0.156.0 index: the function after a
+`for r in &raw {}` loop disappeared from the index, and running 0.156.0 again
+did not bring it back. On this repository, 9 Rust files sat in `health-check`'s
+`Parse:` line after the 0.155.0 upgrade, and `cmd_affected` was missing.
+
+Two changes. A binary that finds an index built by a newer `INDEX_VERSION` no
+longer writes to it: the MCP server answers from it read-only, the way a
+secondary instance does, until its session restarts, and `incremental-index`
+exits with an error that says so. This covers servers from this release on;
+older ones already running cannot be changed, which is what the second part
+is for. Every file listed as a damaged parse is now re-parsed once by the next
+incremental run unless this binary produced that verdict itself, so indexes
+already written that way repair themselves on first use. A file that really
+does fail to parse is re-parsed that one time and then left alone.
+
 ## 0.156.0
 
 **Upgrading: nothing migrates and nothing re-indexes.** `INDEX_VERSION` (72) and

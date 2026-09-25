@@ -5410,3 +5410,172 @@ fn a_name_moving_across_languages_still_enters_the_drift_scope() {
          (name, language) and `helper` is no longer entering cg_scope_names: {inc:?}"
     );
 }
+
+/// Stamp the index as built by a NEWER `INDEX_VERSION` than this binary — the
+/// state a long-lived server from before an upgrade finds after the upgraded
+/// binary rebuilt the index under it.
+fn stamp_index_as_newer(db_path: &std::path::Path) {
+    let db = Database::open(db_path).unwrap();
+    db.conn()
+        .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+        .unwrap();
+}
+
+/// An older binary must not write into an index a newer one owns. The open path
+/// already refused to WIPE it ("an older binary must not clobber a newer
+/// index"), but then went on indexing: every file it touched was re-parsed with
+/// the older grammar and stored under the newer version stamp, and the newer
+/// binary never re-parses an unchanged file. Reproduced 2026-09-25 with a
+/// 0.153.0 binary (v71) against a 0.156.0 index (v72): a function after a
+/// `for r in &raw {}` loop vanished from the index and stayed gone after the
+/// newer binary ran again.
+#[test]
+fn an_older_binary_does_not_write_into_a_newer_index() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    fs::write(project_dir.path().join("a.rs"), "fn first_fn() {}\n").unwrap();
+    {
+        let db = Database::open(&db_path).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+    }
+    stamp_index_as_newer(&db_path);
+
+    let db = Database::open(&db_path).unwrap();
+    assert!(
+        db.newer_index_version().is_some(),
+        "precondition: this handle sees a newer index"
+    );
+
+    fs::write(
+        project_dir.path().join("a.rs"),
+        "fn first_fn() {}\nfn second_fn() {}\n",
+    )
+    .unwrap();
+    let incremental = run_incremental_index(&db, project_dir.path(), None, None);
+    assert!(
+        incremental.is_err(),
+        "an incremental run must refuse, not write an older parse under the newer stamp"
+    );
+    let full = run_full_index(&db, project_dir.path(), None, None);
+    assert!(full.is_err(), "a full run must refuse too");
+    assert!(
+        get_nodes_by_name(db.conn(), "second_fn")
+            .unwrap()
+            .is_empty(),
+        "nothing this binary parsed may reach the newer index"
+    );
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "first_fn").unwrap().len(),
+        1,
+        "the newer binary's data must be left as it was"
+    );
+}
+
+/// A file listed as parse-damaged by a verdict THIS binary did not produce is
+/// re-parsed on the next incremental run, even though its content is unchanged.
+///
+/// The damage is simulated the way an older binary leaves it: the file's hash
+/// matches the tree, a symbol is missing, and the file is named in
+/// `parse_error_files`. `control.rs` is damaged identically but NOT listed, so
+/// a pass here cannot come from a run that happens to re-parse everything.
+/// `broken.rs` really does fail to parse: once this binary has confirmed that
+/// verdict, it must not be re-parsed on every run.
+#[test]
+fn a_parse_damage_verdict_from_another_binary_is_re_examined() {
+    use crate::storage::queries::set_meta;
+    use crate::storage::schema::META_KEY_PARSE_ERROR_FILES;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    fs::write(
+        project_dir.path().join("hurt.rs"),
+        "fn hurt_a() {}\nfn hurt_b() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("control.rs"),
+        "fn ctl_a() {}\nfn ctl_b() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("broken.rs"),
+        "fn broken( {\nfn after_broken() {}\n",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        db.parse_error_files().unwrap(),
+        vec!["broken.rs".to_string()],
+        "precondition: only broken.rs really fails to parse"
+    );
+
+    // The older binary's leftovers.
+    db.conn()
+        .execute("DELETE FROM nodes WHERE name IN ('hurt_b', 'ctl_b')", [])
+        .unwrap();
+    set_meta(
+        db.conn(),
+        META_KEY_PARSE_ERROR_FILES,
+        r#"["broken.rs","hurt.rs"]"#,
+    )
+    .unwrap();
+
+    let healed = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "hurt_b").unwrap().len(),
+        1,
+        "hurt.rs is named by a verdict this binary never produced, so it must be re-parsed"
+    );
+    assert!(
+        get_nodes_by_name(db.conn(), "ctl_b").unwrap().is_empty(),
+        "control: an unlisted, unchanged file must not be re-parsed"
+    );
+    assert_eq!(healed.files_indexed, 1, "only hurt.rs is re-examined");
+    assert_eq!(
+        db.parse_error_files().unwrap(),
+        vec!["broken.rs".to_string()],
+        "hurt.rs parses clean now; broken.rs keeps its verdict"
+    );
+
+    let settled = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        settled.files_indexed, 0,
+        "a verdict this binary produced itself is not re-examined on every run"
+    );
+}
+
+/// An index built before the verified-verdict key existed names its damaged
+/// files with no record of which binary parsed them; every one is re-examined
+/// once. This is the path that repairs indexes already written by an older
+/// binary before this fix shipped.
+#[test]
+fn an_index_without_verified_verdicts_re_examines_every_listed_file_once() {
+    use crate::storage::queries::delete_meta;
+    use crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    fs::write(
+        project_dir.path().join("broken.rs"),
+        "fn broken( {\nfn after_broken() {}\n",
+    )
+    .unwrap();
+    fs::write(project_dir.path().join("fine.rs"), "fn fine() {}\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    delete_meta(db.conn(), META_KEY_PARSE_ERROR_FILES_VERIFIED).unwrap();
+
+    let first = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        first.files_indexed, 1,
+        "broken.rs's unverified verdict is re-examined"
+    );
+    let second = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(second.files_indexed, 0, "and then it is verified");
+    assert_eq!(
+        db.parse_error_files().unwrap(),
+        vec!["broken.rs".to_string()]
+    );
+}

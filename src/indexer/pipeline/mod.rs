@@ -667,15 +667,43 @@ fn index_run_was_interrupted(db: &Database) -> Result<bool> {
     .is_some())
 }
 
+/// Files named as parse-damaged by a verdict this binary did not produce: in
+/// `parse_error_files` but not in `parse_error_files_verified`. See
+/// [`crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED`].
+fn unverified_parse_error_files(db: &Database) -> Result<Vec<String>> {
+    let verified: HashSet<String> = db.parse_error_files_verified()?.into_iter().collect();
+    Ok(db
+        .parse_error_files()?
+        .into_iter()
+        .filter(|p| !verified.contains(p))
+        .collect())
+}
+
 /// The file set an incremental run should process: its diff normally, or the
 /// whole tree when the previous run was interrupted. `index_files` re-sets and
 /// clears the marker itself, so the escalated run needs no extra bookkeeping.
+///
+/// A normal run also re-parses every still-present file whose damaged-parse
+/// verdict another binary wrote. Such a file hashes as unchanged, so the diff
+/// alone would keep that binary's parse forever. `index_files` dedups, and its
+/// verdict fold marks each one verified, so this costs one parse per file once.
 fn to_index_after_interrupt_check(
     db: &Database,
-    diff_files: Vec<String>,
+    mut diff_files: Vec<String>,
     current_hashes: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     if !index_run_was_interrupted(db)? {
+        let unverified: Vec<String> = unverified_parse_error_files(db)?
+            .into_iter()
+            .filter(|p| current_hashes.contains_key(p))
+            .collect();
+        if !unverified.is_empty() {
+            tracing::info!(
+                "[incremental] re-parsing {} file(s) whose damaged-parse verdict this binary did not produce",
+                unverified.len()
+            );
+            diff_files.extend(unverified);
+        }
         return Ok(diff_files);
     }
     tracing::warn!(

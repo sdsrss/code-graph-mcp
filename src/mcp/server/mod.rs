@@ -1534,6 +1534,20 @@ impl McpServer {
         // Consume result whether we waited or it completed before this call
         self.consume_startup_index_result();
 
+        // A newer binary rebuilt the index under this session. `index_files`
+        // refuses to write to it, so indexing here would fail every tool call;
+        // answer from it read-only instead, the way a secondary does, until the
+        // session restarts on the newer version.
+        if self.write_db().newer_index_version().is_some() {
+            let has_data = queries::get_index_status(self.db.conn(), false)
+                .map(|s| s.files_count > 0)
+                .unwrap_or(false);
+            if has_data {
+                *lock_or_recover(&self.indexed, "indexed") = true;
+            }
+            return Ok(());
+        }
+
         // Read the indexed flag (short lock scope to avoid holding across I/O)
         let is_indexed = *lock_or_recover(&self.indexed, "indexed");
 
@@ -6949,6 +6963,43 @@ app.post('/api/login', handleLogin);
             vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/mod_dir"],
             "all three key spellings, nested arbitrarily deep; `<external>` and \
              empty placeholders excluded"
+        );
+    }
+
+    /// A server started before an upgrade keeps running after the upgraded binary
+    /// has rebuilt the index under it. It must keep answering from that index
+    /// and stop writing to it: every file it re-indexed used to be stored as its
+    /// older parse under the newer version stamp, which no later run repairs.
+    #[test]
+    fn test_older_server_answers_but_does_not_index_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+
+        let server = McpServer::new_test_with_project(project.path());
+        std::fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+        server
+            .ensure_indexed()
+            .expect("tool calls must keep working over a newer index");
+        assert_eq!(
+            queries::get_nodes_by_name(server.db.conn(), "alpha_fn")
+                .unwrap()
+                .len(),
+            1,
+            "the newer index still answers"
+        );
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "an older server must not write its parse into a newer index"
         );
     }
 }
