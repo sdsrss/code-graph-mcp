@@ -5579,3 +5579,190 @@ fn an_index_without_verified_verdicts_re_examines_every_listed_file_once() {
         vec!["broken.rs".to_string()]
     );
 }
+
+/// The check has to read the index as it is NOW. A handle opened while the
+/// index was current keeps a version read at open; the newer binary stamping
+/// the index afterwards is exactly the case this guard exists for.
+#[test]
+fn a_handle_opened_before_the_index_became_newer_stops_writing() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    fs::write(project_dir.path().join("a.rs"), "fn first_fn() {}\n").unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    stamp_index_as_newer(&db_path);
+    fs::write(
+        project_dir.path().join("a.rs"),
+        "fn first_fn() {}\nfn second_fn() {}\n",
+    )
+    .unwrap();
+    assert!(
+        run_incremental_index(&db, project_dir.path(), None, None).is_err(),
+        "the same handle must refuse once the index on disk is newer"
+    );
+    assert!(get_nodes_by_name(db.conn(), "second_fn")
+        .unwrap()
+        .is_empty());
+}
+
+/// Direction matters: an index built by an OLDER version is owed a rebuild, and
+/// until then a refresh through a reader handle still writes the current parse.
+#[test]
+fn a_refresh_over_an_older_index_still_writes() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    fs::write(project_dir.path().join("a.rs"), "fn first_fn() {}\n").unwrap();
+    {
+        let db = Database::open(&db_path).unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        db.conn()
+            .pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+            .unwrap();
+    }
+    let reader = Database::open_nondestructive(&db_path).unwrap();
+    assert!(reader.newer_index_version().is_none());
+    fs::write(
+        project_dir.path().join("a.rs"),
+        "fn first_fn() {}\nfn second_fn() {}\n",
+    )
+    .unwrap();
+    assert!(ensure_file_indexed(&reader, project_dir.path(), "a.rs", None).unwrap());
+    assert_eq!(
+        get_nodes_by_name(reader.conn(), "second_fn").unwrap().len(),
+        1
+    );
+}
+
+/// Write the verdict set a different binary would leave: `hurt.rs` listed as
+/// damaged with a symbol missing, its hash matching the tree.
+fn simulate_foreign_damage(db: &Database, listed: &[&str], missing_symbol: &str) {
+    use crate::storage::queries::set_meta;
+    use crate::storage::schema::META_KEY_PARSE_ERROR_FILES;
+    db.conn()
+        .execute("DELETE FROM nodes WHERE name = ?1", [missing_symbol])
+        .unwrap();
+    set_meta(
+        db.conn(),
+        META_KEY_PARSE_ERROR_FILES,
+        &serde_json::to_string(listed).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A verified set another binary wrote is not this binary's word. The format
+/// 0.157's first cut used (a bare array) carries no version, and a set stamped
+/// with a different INDEX_VERSION came from a different parser.
+#[test]
+fn a_verified_set_from_another_version_is_not_trusted() {
+    use crate::storage::queries::set_meta;
+    use crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED;
+
+    for foreign in [
+        r#"["broken.rs","hurt.rs"]"#.to_string(),
+        serde_json::json!({
+            "v": crate::domain::INDEX_VERSION + 1,
+            "files": {
+                "broken.rs": "x",
+                "hurt.rs": crate::indexer::merkle::hash_bytes(b"fn hurt_a() {}\nfn hurt_b() {}\n"),
+            }
+        })
+        .to_string(),
+    ] {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        fs::write(
+            project_dir.path().join("hurt.rs"),
+            "fn hurt_a() {}\nfn hurt_b() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.path().join("broken.rs"),
+            "fn broken( {\nfn after_broken() {}\n",
+        )
+        .unwrap();
+        run_full_index(&db, project_dir.path(), None, None).unwrap();
+        simulate_foreign_damage(&db, &["broken.rs", "hurt.rs"], "hurt_b");
+        set_meta(db.conn(), META_KEY_PARSE_ERROR_FILES_VERIFIED, &foreign).unwrap();
+
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+        assert_eq!(
+            get_nodes_by_name(db.conn(), "hurt_b").unwrap().len(),
+            1,
+            "a verified set from another version must not vouch for hurt.rs: {foreign}"
+        );
+    }
+}
+
+/// A verdict is about one content. A binary that does not maintain the verified
+/// set can re-index an edited file and store its own parse; the stored hash
+/// then moves, and this binary's old verdict must stop vouching for the file.
+#[test]
+fn a_verified_verdict_does_not_survive_a_content_change() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    fs::write(
+        project_dir.path().join("broken.rs"),
+        "fn broken( {\nfn after_broken() {}\n",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(db.unverified_parse_error_files().unwrap().is_empty());
+
+    // Another binary re-indexes an edited, still-broken file: new hash stored,
+    // and its parse lacks `later_fn`.
+    let edited = "fn broken( {\nfn after_broken() {}\nfn later_fn() {}\n";
+    fs::write(project_dir.path().join("broken.rs"), edited).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE files SET blake3_hash = ?1 WHERE path = 'broken.rs'",
+            [crate::indexer::merkle::hash_bytes(edited.as_bytes())],
+        )
+        .unwrap();
+    assert!(get_nodes_by_name(db.conn(), "later_fn").unwrap().is_empty());
+
+    let run = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(run.files_indexed, 1, "the verdict was for the old content");
+    assert_eq!(get_nodes_by_name(db.conn(), "later_fn").unwrap().len(), 1);
+}
+
+/// When the main set stops naming a file, its verified entry goes with it, so a
+/// later re-listing by another binary is not vouched for by a stale entry.
+#[test]
+fn a_verified_entry_leaves_with_its_verdict() {
+    use crate::storage::queries::delete_meta;
+    use crate::storage::schema::META_KEY_PARSE_ERROR_FILES;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    fs::write(
+        project_dir.path().join("broken.rs"),
+        "fn broken( {\nfn after_broken() {}\n",
+    )
+    .unwrap();
+    fs::write(project_dir.path().join("other.rs"), "fn other() {}\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Another binary's fold dropped broken.rs from the main set.
+    delete_meta(db.conn(), META_KEY_PARSE_ERROR_FILES).unwrap();
+    // A run of ours that parses something else folds both sets.
+    fs::write(
+        project_dir.path().join("other.rs"),
+        "fn other() {}\nfn other2() {}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Another binary lists broken.rs again, now with a symbol missing.
+    simulate_foreign_damage(&db, &["broken.rs"], "after_broken");
+    let run = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        run.files_indexed, 1,
+        "the old verified entry must not vouch for the new listing"
+    );
+}

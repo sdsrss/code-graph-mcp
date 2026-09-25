@@ -154,7 +154,7 @@ impl McpServer {
     /// re-resolve by identity, and it can only know to do that if the refresh
     /// says whether it fired.
     pub(super) fn ensure_file_fresh_reported(&self, path: Option<&str>) -> Result<bool> {
-        if !self.is_primary() {
+        if !self.may_write_index() {
             return Ok(false);
         }
         let Some(rel_path) = path else {
@@ -247,6 +247,31 @@ impl McpServer {
         }
         // Secondaries hold a read-only DB; nothing to refresh with.
         if !self.is_primary() {
+            return value;
+        }
+        // An index a newer binary built is not ours to write either. Say so rather
+        // than attempt the refresh: `index_files` would refuse it, and the failure
+        // would be disclosed below as a budget or busy-database problem, which
+        // points the caller at the wrong remedy.
+        let newer = self.write_db().newer_index_version();
+        if let Some(newer) = newer {
+            let mut value = value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "freshness".to_string(),
+                    json!({
+                        "refreshed": 0,
+                        "note": format!(
+                            "This index was built by a newer code-graph (index v{} > this \
+                             server v{}), so this server no longer updates it: results may \
+                             predate recent edits. Restart the Claude Code session to run one \
+                             version.",
+                            newer,
+                            crate::domain::INDEX_VERSION
+                        ),
+                    }),
+                );
+            }
             return value;
         }
         let Some(root) = self.project_root.clone() else {

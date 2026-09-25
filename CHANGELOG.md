@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.157.0
+
+**Upgrading: nothing to do; an index damaged by an older server repairs itself.**
+`INDEX_VERSION` (72) and the schema (v10) are unchanged, so nothing re-indexes.
+Two behaviors change. When a code-graph server finds the index was built by a
+newer code-graph, it stops writing to it: tools keep answering from the index
+as it stands, and CLI `incremental-index` exits 1 with a message telling you to
+restart. The first incremental run after upgrading re-parses any file that
+`health-check` lists as a damaged parse and that this version has not parsed
+itself, which is usually none and at most a handful. If `health-check` still
+shows files you believe are fine, `code-graph-mcp rebuild-index --confirm`
+rebuilds from scratch. To pin back: `npm i -g @sdsrs/code-graph@0.156.0`, or
+`cargo install code-graph-mcp --version 0.156.0`; plugin users can set the
+version in the marketplace entry.
 
 ### A server left running from before an upgrade no longer rewrites the index
 
@@ -15,15 +28,45 @@ a 0.153.0 server against a 0.156.0 index: the function after a
 did not bring it back. On this repository, 9 Rust files sat in `health-check`'s
 `Parse:` line after the 0.155.0 upgrade, and `cmd_affected` was missing.
 
-Two changes. A binary that finds an index built by a newer `INDEX_VERSION` no
-longer writes to it: the MCP server answers from it read-only, the way a
-secondary instance does, until its session restarts, and `incremental-index`
-exits with an error that says so. This covers servers from this release on;
-older ones already running cannot be changed, which is what the second part
-is for. Every file listed as a damaged parse is now re-parsed once by the next
-incremental run unless this binary produced that verdict itself, so indexes
-already written that way repair themselves on first use. A file that really
-does fail to parse is re-parsed that one time and then left alone.
+From this release, a code-graph that finds the index was built by a newer
+`INDEX_VERSION` stops writing parse results into it. It checks the index as it
+is at the moment of each write, not as it was when the server started, because
+the usual order is the reverse: the server is already running when the newer
+binary rebuilds under it. The server keeps answering from the index as it
+stands, including tools given a `file_path` whose file has changed (they skip
+the refresh rather than fail). Tools whose results name files say, in a
+`freshness` note, that the index belongs to a newer code-graph and that
+restarting the session is the remedy. A secondary instance does not promote itself to
+primary over such an index; and the startup context-string repair does not
+run. CLI `incremental-index` exits 1 and says why. This protects future
+upgrades; servers from 0.156.0 and earlier that are already running cannot be
+changed, which is what the second part is for.
+
+A file listed as a damaged parse is now re-parsed by the next incremental run
+unless this version recorded that verdict itself, for the content the index
+now holds. The record is kept per `INDEX_VERSION` and per file content, so a
+verdict another version wrote, or one about content another binary has since
+re-indexed, does not count. A file that really does fail to parse is re-parsed
+once and then left alone. Indexes already damaged by an older server therefore
+repair themselves on first use, as far as the damage is on record: the damaged
+list exists since 0.151.0, so a server older than that leaves nothing to find,
+and `rebuild-index --confirm` is the remedy there.
+
+### Not covered
+
+- Background embedding still writes vectors into a newer index. Vectors are
+  computed from the newer binary's own context strings and never change what
+  was extracted.
+- A file listed as damaged that cannot be READ is re-queued on every
+  incremental run until it is readable again, because a failed read does not
+  count as having examined it. Each otherwise empty incremental then runs a
+  small index pass, including the post-index phases.
+- Opening an index whose vector table has a different embedding dimension
+  still drops that table, before any version check. No release has changed the
+  dimension; this matters only if one does.
+- CLI read commands over a newer index still suggest
+  `code-graph-mcp incremental-index` when files changed, and that command now
+  exits 1 there. Restarting the session is the remedy.
 
 ## 0.156.0
 

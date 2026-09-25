@@ -1,6 +1,6 @@
 use super::schema;
 use anyhow::Result;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Once;
 
@@ -508,9 +508,18 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// to wipe it; this is what the write path checks, so an older binary still
     /// running after an upgrade does not store its older parse under the newer
     /// version stamp, where no later run would ever replace it.
+    ///
+    /// Read from the database on every call, not from the value seen at open: the
+    /// case that matters is a server opened while the index was current, which a
+    /// newer binary then rebuilds and stamps under it. One pragma read, and a read
+    /// failure counts as "not newer" — the write it would guard then fails on its
+    /// own.
     pub fn newer_index_version(&self) -> Option<i32> {
-        self.index_version_stale
-            .filter(|&v| v > crate::domain::INDEX_VERSION)
+        let stored: i32 = self
+            .conn
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .ok()?;
+        (stored > crate::domain::INDEX_VERSION).then_some(stored)
     }
 
     /// Files currently believed to have parsed with tree-sitter ERROR nodes, so
@@ -599,42 +608,93 @@ If you see this repeatedly, another code-graph server of a different version is 
         kept.extend(errored.iter().cloned());
         kept.sort();
         kept.dedup();
-        // Same fold over the verdicts this binary produced, bounded by `kept`:
-        // a path the main set no longer names has no verdict left to vouch for,
-        // and must not count as verified if another binary lists it again.
+        // Same fold over the verdicts this binary produced, each keyed to the
+        // content hash it was about. Bounded by `kept`: a path the main set no
+        // longer names has no verdict left to vouch for, and must not count as
+        // verified if another binary lists it again. A path this run re-examined
+        // is either in `errored` (re-stamped below) or out of `kept`.
         let kept_set: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
-        let mut verified: Vec<String> = self
-            .parse_error_files_verified()?
-            .into_iter()
-            .filter(|p| !reexamined.contains(p.as_str()))
-            .chain(errored.iter().cloned())
-            .filter(|p| kept_set.contains(p.as_str()))
-            .collect();
-        verified.sort();
-        verified.dedup();
+        let mut verified = self.parse_error_files_verified()?;
+        verified.retain(|p, _| kept_set.contains(p.as_str()));
+        let mut hash_of = self
+            .conn()
+            .prepare_cached("SELECT blake3_hash FROM files WHERE path = ?1")?;
+        for path in errored {
+            let hash: Option<String> = hash_of.query_row([path], |row| row.get(0)).optional()?;
+            match hash {
+                Some(h) => {
+                    verified.insert(path.clone(), h);
+                }
+                None => {
+                    verified.remove(path);
+                }
+            }
+        }
+        drop(hash_of);
         self.write_path_set(crate::storage::schema::META_KEY_PARSE_ERROR_FILES, &kept)?;
-        self.write_path_set(
-            crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
-            &verified,
-        )?;
+        if verified.is_empty() {
+            crate::storage::queries::delete_meta(
+                self.conn(),
+                crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
+            )?;
+        } else {
+            crate::storage::queries::set_meta(
+                self.conn(),
+                crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
+                &serde_json::json!({ "v": crate::domain::INDEX_VERSION, "files": verified })
+                    .to_string(),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// The paths whose damaged-parse verdict this binary produced itself. Unlike
-    /// [`Database::parse_error_files`] this is not intersected with `files`: its
-    /// only use is subtraction from that already-intersected set. Malformed reads
-    /// as empty, which only makes the listed files eligible for one re-parse.
-    pub fn parse_error_files_verified(&self) -> Result<Vec<String>> {
+    /// The damaged-parse verdicts this binary's version produced, as path →
+    /// content hash the verdict was about. Not intersected with `files`: its only
+    /// use is subtraction from that already-intersected set.
+    ///
+    /// Stored as `{"v": INDEX_VERSION, "files": {path: hash}}`. Anything else
+    /// reads as empty — a set stamped by another version came from another
+    /// parser, and the bare array of the first cut carries no stamp at all — and
+    /// empty costs only one re-parse of each listed file.
+    pub fn parse_error_files_verified(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        #[derive(serde::Deserialize)]
+        struct Verified {
+            v: i32,
+            files: std::collections::BTreeMap<String, String>,
+        }
         Ok(crate::storage::queries::get_meta(
             self.conn(),
             crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED,
         )?
-        .map(|raw| serde_json::from_str(&raw).unwrap_or_default())
+        .and_then(|raw| serde_json::from_str::<Verified>(&raw).ok())
+        .filter(|set| set.v == crate::domain::INDEX_VERSION)
+        .map(|set| set.files)
         .unwrap_or_default())
     }
 
-    /// Store a path set as a JSON array under `key`, deleting the key when empty.
+    /// Files named as parse-damaged whose verdict this binary did not produce for
+    /// the content now on record: absent from `parse_error_files_verified`, or
+    /// verified for a hash the `files` row no longer carries (another binary
+    /// re-indexed an edited file). See
+    /// [`crate::storage::schema::META_KEY_PARSE_ERROR_FILES_VERIFIED`].
+    pub fn unverified_parse_error_files(&self) -> Result<Vec<String>> {
+        let verified = self.parse_error_files_verified()?;
+        let mut hash_of = self
+            .conn()
+            .prepare_cached("SELECT blake3_hash FROM files WHERE path = ?1")?;
+        let mut unverified = Vec::new();
+        for path in self.parse_error_files()? {
+            let current: Option<String> =
+                hash_of.query_row([&path], |row| row.get(0)).optional()?;
+            if current.is_none() || verified.get(&path) != current.as_ref() {
+                unverified.push(path);
+            }
+        }
+        Ok(unverified)
+    }
+
+    /// Store a path list as a JSON array under `key`, deleting the key when empty.
     fn write_path_set(&self, key: &str, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
             crate::storage::queries::delete_meta(self.conn(), key)?;

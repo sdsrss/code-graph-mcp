@@ -618,6 +618,14 @@ impl McpServer {
         }
     }
 
+    /// Whether this instance may write to the index: it holds the write role, and
+    /// the index is not one a newer binary built. The second half is read live
+    /// (see [`Database::newer_index_version`]), because the newer binary can
+    /// rebuild the index while this server runs.
+    pub(super) fn may_write_index(&self) -> bool {
+        self.is_primary() && self.write_db().newer_index_version().is_none()
+    }
+
     /// Re-attempt the index lock from a secondary instance, throttled.
     ///
     /// `try_acquire_index_lock` used to run exactly once, in the constructor, so
@@ -659,6 +667,17 @@ impl McpServer {
                 return false;
             }
         };
+        // The lock is free because the old primary exited — possibly a newer
+        // binary's server that rebuilt the index. Promoting would start the
+        // startup repair and embedding, which write; stay a reader instead.
+        if let Some(newer) = write_db.newer_index_version() {
+            tracing::warn!(
+                "Won the index lock, but the index was built by a newer code-graph (v{} > v{}) — staying secondary",
+                newer,
+                crate::domain::INDEX_VERSION
+            );
+            return false;
+        }
         *lock_or_recover(&self.promoted_db, "promoted_db") = Some(write_db);
         *lock_or_recover(&self._index_lock, "index_lock") = Some(lock);
         self.is_primary.store(true, Ordering::Release);
@@ -1177,7 +1196,9 @@ impl McpServer {
     /// (post-node-insert, before context_string/embedding commit). Primary-only:
     /// secondary instances can't write.
     fn spawn_startup_repair(&self, project_root: &Path) {
-        if !self.is_primary() {
+        // The repair rewrites context strings in this binary's format; not over an
+        // index a newer binary owns.
+        if !self.may_write_index() {
             return;
         }
         if self
@@ -1538,7 +1559,7 @@ impl McpServer {
         // refuses to write to it, so indexing here would fail every tool call;
         // answer from it read-only instead, the way a secondary does, until the
         // session restarts on the newer version.
-        if self.write_db().newer_index_version().is_some() {
+        if !self.may_write_index() {
             let has_data = queries::get_index_status(self.db.conn(), false)
                 .map(|s| s.files_count > 0)
                 .unwrap_or(false);
@@ -7000,6 +7021,199 @@ app.post('/api/login', handleLogin);
                 .unwrap()
                 .is_empty(),
             "an older server must not write its parse into a newer index"
+        );
+        assert!(
+            *lock_or_recover(&server.indexed, "indexed"),
+            "the data it answers from counts as indexed, so later calls skip the indexing path"
+        );
+    }
+
+    /// The case the fix exists for: the server was ALREADY running when the newer
+    /// binary rebuilt and stamped the index. A version read once at open still
+    /// says "current", so the check has to look at the index as it is now.
+    #[test]
+    fn test_running_server_stops_writing_once_the_index_becomes_newer() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let other = Database::open(&project.path().join(CODE_GRAPH_DIR).join("index.db")).unwrap();
+        other
+            .conn()
+            .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+            .unwrap();
+        drop(other);
+
+        std::fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+        server
+            .indexing
+            .pending_incremental
+            .store(true, Ordering::Release);
+        server
+            .ensure_indexed()
+            .expect("tool calls must keep working after the index becomes newer");
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "a server opened before the newer stamp must not write into the newer index"
+        );
+    }
+
+    /// A tool given a `file_path` refreshes that file before answering. Over a
+    /// newer index the refresh is refused, and the tool must answer from the
+    /// index as it stands rather than turn the refusal into an error.
+    #[test]
+    fn test_file_path_tool_answers_over_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\n",
+        )
+        .unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\nfn gamma_fn() {}\n",
+        )
+        .unwrap();
+
+        for req in [
+            tool_call_json(
+                "get_call_graph",
+                json!({"symbol_name": "alpha_fn", "file_path": "alpha.rs", "direction": "callees"}),
+            ),
+            tool_call_json(
+                "find_references",
+                json!({"symbol_name": "beta_fn", "file_path": "alpha.rs"}),
+            ),
+        ] {
+            let resp = server.handle_message(&req).unwrap().unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            assert_ne!(
+                parsed["result"]["isError"],
+                serde_json::json!(true),
+                "a refused refresh must not fail the tool: {resp}"
+            );
+        }
+        assert!(
+            queries::get_nodes_by_name(server.db.conn(), "gamma_fn")
+                .unwrap()
+                .is_empty(),
+            "and the refresh must not have written"
+        );
+    }
+
+    /// A tool whose result names files cannot refresh them over a newer index,
+    /// and the response has to say why — not blame a budget or a busy database.
+    #[test]
+    fn test_result_set_tool_discloses_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\n",
+        )
+        .unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        std::fs::write(
+            project.path().join("alpha.rs"),
+            "fn alpha_fn() { beta_fn(); }\nfn beta_fn() {}\nfn gamma_fn() {}\n",
+        )
+        .unwrap();
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({"symbol_name": "alpha_fn", "direction": "callees"}),
+        );
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("built by a newer code-graph"),
+            "the response must name the newer index as the reason: {text}"
+        );
+        assert!(
+            !text.contains("busy database"),
+            "and not blame a busy database: {text}"
+        );
+    }
+
+    /// The startup repair rewrites context strings in this binary's format, so it
+    /// is not armed over an index a newer binary owns.
+    #[test]
+    fn test_startup_repair_does_not_run_over_a_newer_index() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.spawn_startup_repair(project.path());
+        assert!(
+            !server.indexing.startup_repair_done.load(Ordering::Acquire),
+            "the repair must not be started over a newer index"
+        );
+    }
+
+    /// A secondary whose primary exits must not promote itself over an index a
+    /// newer binary owns: promotion starts the startup repair and embedding,
+    /// which write.
+    #[cfg(unix)]
+    #[test]
+    fn test_secondary_does_not_promote_over_a_newer_index() {
+        use std::os::unix::io::AsRawFd;
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+            boot.db
+                .conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION + 1)
+                .unwrap();
+        }
+        let cg_dir = project.path().join(CODE_GRAPH_DIR);
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg_dir.join("index.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(!server.is_primary(), "precondition: secondary");
+        drop(holder);
+
+        server.timing.promotion_retry = std::time::Duration::ZERO;
+        server.ensure_indexed().unwrap();
+        assert!(
+            !server.is_primary(),
+            "the lock is free, but the index belongs to a newer binary"
         );
     }
 }
