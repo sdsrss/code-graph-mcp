@@ -155,6 +155,7 @@ pub fn extract_relations_from_tree(
     // never carry a previous Rust file's entries into the next Rust one.
     rust::reset_fn_local_names_cache();
     member::reset_import_bound(tree.root_node(), source, config.name);
+    receiver::reset();
     walk_for_relations(
         tree.root_node(),
         source,

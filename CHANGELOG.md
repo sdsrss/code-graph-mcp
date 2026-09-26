@@ -90,6 +90,20 @@ leveldb's test cases and exported classes.
   Only a definition makes one now.
 - **TypeScript `abstract class` was not a class.** It had no node, its methods
   were unqualified, and its `extends`/`implements` made no edge.
+- **Editing a file re-bound calls into it by name.** When a file is
+  re-indexed, calls from unchanged files into it are restored. A call the
+  resolver had bound through its receiver's class, a `super()` or a member
+  call's candidates was restored to every same-named method in the file,
+  and it stayed that way until the caller's file changed. On 0.157.0,
+  editing one django file left 66 or 179 such extra edges that a rebuild
+  does not have. Each is now restored to the method with the same qualified
+  name, and the incremental graph equals a rebuild's on every file tried
+  (django, leveldb, hono, flask).
+
+Indexing does more work per call. A full index took 7% longer on django
+(11.9 s → 12.8 s, 3,290 files), 11% on hono and 21% on leveldb (537 → 648 ms,
+most of it from the earlier INDEX_VERSION 73 fixes). A one-file edit on django
+takes as long as on 0.157.0: 0.8–1.7 s for both in interleaved runs.
 
 The JS/TS oracle's tsconfig now uses `"module": "preserve"`, which resolves
 extensionless ESM imports as well as `require()`. The oracle also gained C++
@@ -107,6 +121,11 @@ constructor calls and a `--repo DIR` option.
 - **Overrides are found through `inherits` edges, which are bound by name.**
   When two classes share a name, a subclass may be bound to the wrong one, so
   such a class contributes no overrides.
+- **A Python local constructed from an imported library class** that shares a
+  project class's name (`from requests import Session; s = Session()`) is
+  typed as the project's class, as it was before this release. A TypeScript
+  class imported from a package stays untyped, and a C++ `std::` type binds
+  nothing.
 - **A later file does not re-bind an earlier typed call.** A class added after
   its caller was indexed gets the call only while the call is still buffered
   (a bounded number of runs). A subclass override added later gets no

@@ -54,7 +54,7 @@ use super::python_modules::{
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
-    refine_ambiguous_targets, resolve_pending_calls,
+    refine_ambiguous_targets,
 };
 use super::{IndexPhase, IndexResult, IndexStats, ProgressFn};
 
@@ -570,7 +570,15 @@ struct BatchInserted {
     /// every same-name node in the batch (which fanned out cross-file /
     /// cross-language).
     #[allow(clippy::type_complexity)]
-    saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)>,
+    saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )>,
     /// File ids in this batch, so Phase 2c can skip intra-batch edges.
     file_ids: HashSet<i64>,
     nodes_created: usize,
@@ -586,12 +594,21 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
     let mut parsed: Vec<FileParsed> = Vec::new();
     let mut nodes_created = 0usize;
     // Saved inbound edges from other files → batch files (to restore after cascade delete)
-    // Tuple: (source_id, source_file_id, target_file_id, target_name, relation, metadata).
+    // Tuple: (source_id, source_file_id, target_file_id, target_name, relation,
+    // metadata, target qualified_name).
     // target_file_id is the re-indexed file the edge pointed INTO; the restore
     // re-binds ONLY to the new same-name node in THAT file, not every same-name
     // node in the batch (which fanned out cross-file / cross-language).
     #[allow(clippy::type_complexity)]
-    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+    let mut saved_inbound_edges: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
     // Track file_ids in this batch to filter intra-batch edges in Phase 2c
     let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
@@ -612,8 +629,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         saved_inbound_edges.extend(
             get_inbound_cross_file_edges(db.conn(), file_id)?
                 .into_iter()
-                .map(|(src, src_file, tname, rel, meta)| {
-                    (src, src_file, file_id, tname, rel, meta)
+                .map(|(src, src_file, tname, rel, meta, tqual)| {
+                    (src, src_file, file_id, tname, rel, meta, tqual)
                 }),
         );
         batch_file_ids.insert(file_id);
@@ -2508,10 +2525,11 @@ Restart every code-graph server on this project so they run one version.",
     // Attempts now count resolution OPPORTUNITIES.
     //
     // Deletions do not qualify: removing nodes can only shrink the candidate set.
+    let mut pending_sources = std::collections::BTreeSet::new();
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        resolve_pending_calls(db, &crate_roots)?
+        super::resolve::resolve_pending_calls_touching(db, &crate_roots, &mut pending_sources)?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
@@ -2608,8 +2626,13 @@ Restart every code-graph server on this project so they run one version.",
             // the global path and the whole change was inert — 1.08 s, the
             // number it was written to remove. Widening by the touched sources
             // costs a handful of file ids instead.
-            let deferred_sources: std::collections::BTreeSet<&str> =
-                deferred.iter().map(|d| d.rel_path.as_str()).collect();
+            // The pending sweep's binds have the same shape, from callers this
+            // run may not have opened either.
+            let deferred_sources: std::collections::BTreeSet<&str> = deferred
+                .iter()
+                .map(|d| d.rel_path.as_str())
+                .chain(pending_sources.iter().map(String::as_str))
+                .collect();
             if !deferred_sources.is_empty() {
                 let conn = db.conn();
                 let mut stmt =
@@ -2888,7 +2911,15 @@ fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
-    saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    saved_inbound_edges: &[(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )],
     run_file_paths: &HashSet<&str>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
@@ -2903,13 +2934,19 @@ fn restore_inbound_edges(
         // file sharing the symbol name (or a cross-language same-name node in the
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
-        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<(i64, Option<&str>)>> = HashMap::new();
         for pf in batch_parsed {
-            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+            for ((id, name), q) in pf
+                .node_ids
+                .iter()
+                .zip(pf.node_names.iter())
+                .zip(pf.node_qualified_names.iter())
+            {
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
-                    .push(*id);
+                    .push((*id, q.as_deref()));
             }
         }
 
@@ -2919,8 +2956,15 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
-        for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
-            saved_inbound_edges
+        for (
+            source_id,
+            source_file_id,
+            target_file_id,
+            target_name,
+            relation,
+            metadata,
+            target_qualified,
+        ) in saved_inbound_edges
         {
             // Source file is also in this batch — source_id is stale (deleted + re-created).
             // Phase 2 already resolves cross-file edges for intra-batch files.
@@ -2928,10 +2972,26 @@ fn restore_inbound_edges(
                 skipped_intra_batch += 1;
                 continue;
             }
-            if let Some(new_target_ids) =
-                batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
-            {
-                for &new_tgt_id in new_target_ids {
+            // A call the resolver bound through its metadata (a receiver's class,
+            // `super()`, a member call's candidates nearest the caller) went to
+            // particular methods: restore each edge to the method of the same
+            // qualified name. Restoring it to every same-named node in the file
+            // bound sibling classes' methods — labelled `inferred` when typed —
+            // until the caller's own file changed; a rebuild binds them to none.
+            let typed = relation.as_str() == REL_CALLS
+                && super::resolve::parse_callee_metadata(metadata.as_deref()).is_some();
+            let new_target_ids: Option<Vec<i64>> = batch_name_to_ids
+                .get(&(*target_file_id, target_name.as_str()))
+                .map(|found| {
+                    found
+                        .iter()
+                        .filter(|(_, q)| !typed || *q == target_qualified.as_deref())
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<i64>>()
+                })
+                .filter(|ids| !ids.is_empty());
+            if let Some(new_target_ids) = new_target_ids {
+                for &new_tgt_id in &new_target_ids {
                     if *source_id != new_tgt_id
                         && insert_edge_cached(
                             db.conn(),
@@ -3296,7 +3356,7 @@ fn resolve_deferred_relations(
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
-            let all = super::resolve::member_call_candidates(d.metadata.as_deref(), all, db)?;
+            let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
 
             // 6a. JS namespace-receiver constraint captured at batch time
             //     (`m.foo()` where `m` is a require/import-namespace binding).
@@ -3400,8 +3460,18 @@ fn resolve_deferred_relations(
                     // a class the project does not define binds nothing.
                     let same_lang = same_lang_of(&all, &d.language, &[]);
                     if same_lang.is_empty() {
-                        // Nothing by that name yet: the default chain buffers it.
-                        handled = false;
+                        // Nothing by that name yet: buffer it for a later run. Not
+                        // through the default chain, whose noise-name drop is for
+                        // untyped guesses (`q.build()` on a `Q` is no guess).
+                        for &src_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                src_id,
+                                &d.target_name,
+                                &d.language,
+                                call_meta,
+                            )?;
+                        }
                     } else {
                         match recv_type_targets(
                             &recv_type,

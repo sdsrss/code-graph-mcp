@@ -356,6 +356,17 @@ pub(super) fn infer_python_super_type(
         return None;
     }
     let (_, class) = py_method_class(call_node, None, source)?;
+    // `super(B, self)` starts after `B`, which need not be this class: only the
+    // two-argument form naming the enclosing class is the plain `super()`.
+    let class_name = class
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, source));
+    let args = object.child_by_field_name("arguments")?;
+    if let Some(named) = args.named_child(0) {
+        if Some(node_text(&named, source)) != class_name {
+            return None;
+        }
+    }
     let bases = class.child_by_field_name("superclasses")?;
     let first = bases.named_child(0)?;
     (first.kind() == "identifier").then(|| node_text(&first, source).to_string())
@@ -378,6 +389,16 @@ fn py_method_class<'a>(
         }
         if n.kind() == "class_definition" {
             return None; // class body code, not inside a method
+        }
+        // `lambda self: self.f()` binds its own `self`.
+        if n.kind() == "lambda" {
+            if let (Some(r), Some(params)) = (receiver, n.child_by_field_name("parameters")) {
+                let mut ids = std::collections::HashSet::new();
+                collect_py_idents(&params, source, &mut ids, 0);
+                if ids.contains(r) {
+                    return None;
+                }
+            }
         }
         if n.kind() == "function_definition" {
             let first_param = n

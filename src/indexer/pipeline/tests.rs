@@ -1962,6 +1962,172 @@ fn test_typed_receiver_tells_same_named_cpp_classes_apart() {
     );
 }
 
+/// Every `calls` edge as `caller-path.caller -> callee-path.callee [metadata]
+/// confidence`, sorted: what an incremental run must agree on with a rebuild.
+fn call_edges_with_confidence(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT fs.path || '.' || ns.name || ' -> ' || ft.path || '.' \
+                 || COALESCE(nt.qualified_name, nt.name) || ' ' \
+                 || COALESCE(e.metadata, '-') || ' ' || COALESCE(e.confidence, '-') \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             WHERE e.relation = 'calls' ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// Index `before`, write `after` over it (a file mapped to None is deleted),
+/// index incrementally, and require the calls a fresh index of the result has.
+fn assert_incremental_matches_rebuild(before: &[(&str, &str)], after: &[(&str, Option<&str>)]) {
+    let (project, _d, db) = fresh_index_of(before);
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    for (path, body) in after {
+        tree.retain(|(p, _)| p != path);
+        match body {
+            Some(b) => {
+                fs::write(project.path().join(path), b).unwrap();
+                tree.push((path.to_string(), b.to_string()));
+            }
+            None => fs::remove_file(project.path().join(path)).unwrap(),
+        }
+    }
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "incremental after {after:?} must equal a rebuild"
+    );
+}
+
+/// Pre-ship review of D#89: every way an incremental run bound a typed call
+/// differently from a rebuild.
+#[test]
+fn test_typed_receiver_incremental_matches_rebuild() {
+    // Editing the callee file restored `f->Run()` to every `Run` in it.
+    let a_h = "struct Foo { void Run() {} };\nstruct Bar { void Run() {} };\n";
+    assert_incremental_matches_rebuild(
+        &[("a.h", a_h), ("b.cc", "void g(Foo* f) { f->Run(); }\n")],
+        &[("a.h", Some(&format!("{a_h}// touched\n")))],
+    );
+    // ... and to an unrelated class's `step` beside the override it had.
+    let sub = "from base import Base\n\nclass Sub(Base):\n    def step(self):\n        pass\n\n\
+               class Unrelated:\n    def step(self):\n        pass\n";
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "base.py",
+                "class Base:\n    def run(self):\n        self.step()\n\n    def step(self):\n        pass\n",
+            ),
+            ("sub.py", sub),
+        ],
+        &[("sub.py", Some(&format!("{sub}# touched\n")))],
+    );
+    // An untyped member call (here `super()` onto two same-named bases) bound
+    // the candidates nearest its caller; editing one base's file must not
+    // re-bind it to every `__init__` there.
+    let forms = "class Field:\n    def __init__(self):\n        pass\n\n\
+                 class CharField(Field):\n    def __init__(self):\n        pass\n";
+    assert_incremental_matches_rebuild(
+        &[
+            ("db_field.py", "class Field:\n    def __init__(self):\n        pass\n"),
+            ("forms_field.py", forms),
+            (
+                "gis.py",
+                "from db_field import Field\n\nclass Geo(Field):\n    def __init__(self):\n        super().__init__()\n",
+            ),
+        ],
+        &[("forms_field.py", Some(&format!("{forms}# touched\n")))],
+    );
+    // A buffered call whose class appears later: no noise-name bind, and the
+    // edge is classified like a rebuild's.
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "other.py",
+                "class Other:\n    def build(self):\n        pass\n\n    def launch(self):\n        pass\n",
+            ),
+            ("b.py", "def g():\n    x = Foo()\n    x.build()\n    x.launch()\n"),
+        ],
+        &[("c.py", Some("class Foo:\n    pass\n"))],
+    );
+    // A noise-named method the class gains later is bound, as a rebuild binds it.
+    assert_incremental_matches_rebuild(
+        &[
+            ("c.py", "class Foo:\n    pass\n"),
+            (
+                "b.py",
+                "from c import Foo\n\ndef g():\n    x = Foo()\n    x.build()\n",
+            ),
+        ],
+        &[(
+            "c.py",
+            Some("class Foo:\n    def build(self):\n        pass\n"),
+        )],
+    );
+}
+
+/// Pre-ship review of D#89: receivers the typing claimed for the wrong class.
+#[test]
+fn test_typed_receiver_does_not_claim_a_look_alike_class() {
+    let files: &[(&str, &str)] = &[
+        // An unrelated class named like a subclass is no override.
+        (
+            "base.py",
+            "class Base:\n    def run(self):\n        self.step()\n\n    def step(self):\n        pass\n",
+        ),
+        ("impl1.py", "from base import Base\n\nclass Impl(Base):\n    def step(self):\n        pass\n"),
+        ("impl2.py", "class Impl:\n    def step(self):\n        pass\n"),
+        // A library class named like a project class is not it.
+        ("req.ts", "export class Request { json() {} }\nexport class Other { json() {} }\n"),
+        ("h.ts", "import { Request } from 'express';\nfunction handler(req: Request) { req.json(); }\n"),
+        ("mu.h", "class mutex { public: void lock() {} };\n"),
+        ("u.cc", "void f() { std::mutex m; m.lock(); }\n"),
+        // A nested class's method defined in another file is not the top-level
+        // class's.
+        ("iter.h", "class Iterator {\n public:\n  virtual void Next() = 0;\n};\n"),
+        ("skiplist.h", "class SkipList {\n public:\n  class Iterator {\n   public:\n    void Next();\n  };\n};\n"),
+        ("skiplist.cc", "void SkipList::Iterator::Next() {}\n"),
+        ("user.cc", "void drain(Iterator* it) { it->Next(); }\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = call_edges_with_confidence(&db);
+    let from =
+        |caller: &str| -> Vec<&String> { edges.iter().filter(|e| e.starts_with(caller)).collect() };
+    let run: Vec<_> = from("base.py.run ->");
+    assert!(
+        run.iter().any(|e| e.contains("impl1.py.Impl.step")),
+        "the override is bound: {run:?}"
+    );
+    assert!(
+        !run.iter().any(|e| e.contains("impl2.py")),
+        "an unrelated Impl is no override: {run:?}"
+    );
+    for caller in ["h.ts.handler ->", "u.cc.f ->", "user.cc.drain ->"] {
+        let typed: Vec<_> = from(caller)
+            .into_iter()
+            .filter(|e| e.contains(r#""q":"rtype""#))
+            .collect();
+        assert!(
+            typed.is_empty(),
+            "{caller} claimed a look-alike class: {typed:?}"
+        );
+    }
+    assert!(
+        from("u.cc.f ->").is_empty(),
+        "std::mutex binds nothing: {edges:#?}"
+    );
+}
+
 /// D#90: a nested function its factory returns in an object literal
 /// (`return { attemptUpgrade }`) is a member of what the factory returns, so a
 /// member call on that object reaches it; a nested helper nobody exposes stays

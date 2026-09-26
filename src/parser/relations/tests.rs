@@ -638,6 +638,67 @@ fn meta_of<'a>(calls: &'a [(String, Option<String>)], target: &str) -> Option<&'
 const MEMBER: &str = r#"{"q":"member"}"#;
 
 #[test]
+fn test_receiver_type_is_not_claimed_where_the_source_rebinds_it() {
+    const RTYPE: &str = r#""q":"rtype""#;
+    let untyped = |code: &str, lang: &str, callee: &str| {
+        let calls = call_meta(code, lang);
+        let m = meta_of(&calls, callee).map(str::to_string);
+        assert!(
+            !m.as_deref()
+                .is_some_and(|m| m.contains(RTYPE) || m.contains(r#""q":"super""#)),
+            "{lang}: {callee} must stay untyped in {code:?}; got {m:?}"
+        );
+    };
+    // A template parameter named like a class.
+    untyped(
+        "template <typename Iterator> void Advance(Iterator it) { it.Next(); }",
+        "cpp",
+        "Next",
+    );
+    // A closure reassigns the captured variable; a destructuring assignment.
+    untyped(
+        "function f() { let q = new Q(); const swap = () => { q = new R(); }; swap(); q.run(); }",
+        "javascript",
+        "run",
+    );
+    untyped(
+        "function f(other) { let q = new Q(); [q] = [other]; q.run(); }",
+        "javascript",
+        "run",
+    );
+    // `super(B, self)` from another class starts past B; a lambda's own `self`.
+    untyped(
+        "class C(A):\n    def f(self):\n        super(B, self).go()\n",
+        "python",
+        "go",
+    );
+    untyped(
+        "class C:\n    def f(self):\n        g = lambda self: self.go()\n",
+        "python",
+        "go",
+    );
+    // A nested function re-creating the same class keeps it.
+    let calls = call_meta(
+        "function f() { let ws: W; const setup = () => { ws = new W(); }; setup(); ws.close(); }",
+        "typescript",
+    );
+    assert_eq!(meta_of(&calls, "close"), Some(r#"{"q":"rtype","v":"W"}"#));
+    // A property assignment does not rebind; a wrapper type is its argument.
+    let calls = call_meta(
+        "function f() { const q = new Q(); q.x = 1; q.run(); }\nfunction g(r: Readonly<Impl>) { r.go(); }",
+        "typescript",
+    );
+    assert_eq!(meta_of(&calls, "run"), Some(r#"{"q":"rtype","v":"Q"}"#));
+    assert_eq!(meta_of(&calls, "go"), Some(r#"{"q":"rtype","v":"Impl"}"#));
+    // `super(C, self)` naming the enclosing class is plain `super()`.
+    let calls = call_meta(
+        "class C(A):\n    def f(self):\n        super(C, self).go()\n",
+        "python",
+    );
+    assert_eq!(meta_of(&calls, "go"), Some(r#"{"q":"super","v":"A"}"#));
+}
+
+#[test]
 fn test_member_call_on_an_object_is_marked_member() {
     // D#86: `x.f()` on an object can only run a method, never a free function —
     // the resolver needs to know the call was a member call. A receiver that is

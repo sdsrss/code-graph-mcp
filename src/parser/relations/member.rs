@@ -26,8 +26,9 @@ thread_local! {
     /// a module-function call (`helpers.run()`, `m.f()`), which may well target a
     /// free function, so it is not marked. Per file: reset by `reset_import_bound`.
     /// The value is the absolute module a Python import binds the name from
-    /// (`import click` → `click`, `from a.b import c` → `a.b`); None for a
-    /// relative import and for JS.
+    /// (`import click` → `click`, `from a.b import c` → `a.b`), or the specifier
+    /// a JS import / `require` names (`'express'`, `'./x'`); None for a Python
+    /// relative import.
     static IMPORT_BOUND: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
 }
 
@@ -88,7 +89,7 @@ fn collect(
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {
                     if c.kind() == "identifier" {
-                        out.insert(text(c), None);
+                        out.insert(text(c), js_import_specifier(node, source));
                     }
                 }
             }
@@ -98,7 +99,7 @@ fn collect(
                 .child_by_field_name("alias")
                 .or_else(|| node.child_by_field_name("name"))
             {
-                out.insert(text(n), None);
+                out.insert(text(n), js_import_specifier(node, source));
             }
             return;
         }
@@ -108,9 +109,17 @@ fn collect(
                 Some(v) if v.kind() == "await_expression" => v.named_child(0),
                 v => v,
             };
-            if value.is_some_and(|v| is_module_load(v, source)) {
+            if let Some(load) = value.filter(|v| is_module_load(*v, source)) {
                 if let Some(name) = node.child_by_field_name("name") {
-                    bind_pattern(name, source, out);
+                    let spec = load
+                        .child_by_field_name("arguments")
+                        .and_then(|a| a.named_child(0))
+                        .map(|a| {
+                            node_text(&a, source)
+                                .trim_matches(['"', '\'', '`'])
+                                .to_string()
+                        });
+                    bind_pattern(name, source, &spec, out);
                 }
             }
         }
@@ -132,24 +141,57 @@ fn is_module_load(node: tree_sitter::Node, source: &str) -> bool {
 }
 
 /// Every identifier a declarator's name binds: `m`, `{ a, b: c }`.
-fn bind_pattern(node: tree_sitter::Node, source: &str, out: &mut HashMap<String, Option<String>>) {
+fn bind_pattern(
+    node: tree_sitter::Node,
+    source: &str,
+    spec: &Option<String>,
+    out: &mut HashMap<String, Option<String>>,
+) {
     match node.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => {
-            out.insert(node_text(&node, source).to_string(), None);
+            out.insert(node_text(&node, source).to_string(), spec.clone());
         }
         "pair_pattern" => {
             if let Some(v) = node.child_by_field_name("value") {
-                bind_pattern(v, source, out);
+                bind_pattern(v, source, spec, out);
             }
         }
         _ => {
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {
-                    bind_pattern(c, source, out);
+                    bind_pattern(c, source, spec, out);
                 }
             }
         }
     }
+}
+
+/// The module specifier of the `import` statement holding `node`, unquoted.
+fn js_import_specifier(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "import_statement" {
+            let spec = n.child_by_field_name("source")?;
+            return Some(
+                node_text(&spec, source)
+                    .trim_matches(['"', '\'', '`'])
+                    .to_string(),
+            );
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Whether the current JS/TS file imports `name` from a package — a specifier
+/// that is not a relative or absolute path (`'express'`, `'node:fs'`).
+pub(super) fn js_imported_from_package(name: &str) -> bool {
+    IMPORT_BOUND.with(|b| {
+        b.borrow()
+            .get(name)
+            .and_then(|spec| spec.as_deref())
+            .is_some_and(|spec| !spec.starts_with('.') && !spec.starts_with('/'))
+    })
 }
 
 /// Whether the call node is a member call on an object (see module docs).

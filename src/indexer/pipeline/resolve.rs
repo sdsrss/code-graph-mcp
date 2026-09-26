@@ -204,7 +204,19 @@ pub(super) fn refine_ambiguous_targets(
 /// `refine_ambiguous_targets` applied when multiple candidates share the name.
 ///
 /// Returns the number of edges inserted by this sweep.
+#[cfg(test)]
 pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>) -> Result<usize> {
+    resolve_pending_calls_touching(db, crate_roots, &mut std::collections::BTreeSet::new())
+}
+
+/// [`resolve_pending_calls`], adding to `touched` the file of every caller it
+/// bound an edge from: those edges are cross-file by-name binds the post-pass
+/// scope must classify, and their caller may be a file this run never opened.
+pub(super) fn resolve_pending_calls_touching(
+    db: &Database,
+    crate_roots: &HashSet<String>,
+    touched: &mut std::collections::BTreeSet<String>,
+) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
     if pending.is_empty() {
         return Ok(0);
@@ -300,6 +312,13 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         // buffer today; self/stype/path handling is latent parity should a future
         // Phase-2 change route them here.
         let mut metadata = row.metadata.as_deref();
+        // A typed receiver's own-class binding is final, as in the deferred pass:
+        // no proximity refinement may drop its overrides.
+        let mut refine = true;
+        let caller_path = source_id_to_path
+            .get(&row.source_id)
+            .map(String::as_str)
+            .unwrap_or_default();
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
             Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
                 let (t, dispatch) = match meta {
@@ -307,10 +326,6 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     CalleeMeta::SuperType(t) => (t, false),
                     _ => unreachable!("matched above"),
                 };
-                let caller_path = source_id_to_path
-                    .get(&row.source_id)
-                    .map(String::as_str)
-                    .unwrap_or_default();
                 match recv_type_targets(
                     &t,
                     dispatch,
@@ -320,15 +335,39 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     caller_path,
                     &node_id_to_path,
                 )? {
-                    RecvTypeTargets::Bind(own) => own,
+                    RecvTypeTargets::Bind(own) => {
+                        refine = false;
+                        own
+                    }
                     // Stored as the untyped member call it resolves as.
                     RecvTypeTargets::Ambiguous(own) => {
                         metadata = Some(crate::domain::CALL_META_MEMBER);
+                        refine = false;
                         own
                     }
+                    // The deferred pass's default chain over member candidates:
+                    // same-file ones, else none for a noise name, else refined.
                     RecvTypeTargets::Fallback => {
                         metadata = Some(crate::domain::CALL_META_MEMBER);
-                        member_call_candidates(metadata, candidates, db)?
+                        let pool = classes.member_call_candidates(db, metadata, candidates)?;
+                        let local: Vec<i64> = pool
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                node_id_to_path.get(id).map(String::as_str) == Some(caller_path)
+                            })
+                            .collect();
+                        if !local.is_empty() {
+                            refine = false;
+                            local
+                        } else if crate::domain::is_cross_file_call_noise(
+                            &row.target_name,
+                            &row.source_language,
+                        ) {
+                            Vec::new()
+                        } else {
+                            pool
+                        }
                     }
                     // Not a project class yet: stay buffered (and age out), in
                     // case a later run adds it.
@@ -345,19 +384,15 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
             }
             // Member call: the same free-function exclusion as Phase 2.
             Some(CalleeMeta::Member) => {
-                member_call_candidates(row.metadata.as_deref(), candidates, db)?
+                classes.member_call_candidates(db, row.metadata.as_deref(), candidates)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
             _ => candidates,
         };
 
-        let refined = if resolved.len() > 1 {
-            let source_path = source_id_to_path
-                .get(&row.source_id)
-                .cloned()
-                .unwrap_or_default();
-            refine_ambiguous_targets(&resolved, &source_path, &node_id_to_path)
+        let refined = if refine && resolved.len() > 1 {
+            refine_ambiguous_targets(&resolved, caller_path, &node_id_to_path)
         } else {
             resolved
         };
@@ -365,6 +400,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         for tgt_id in &refined {
             if insert_edge_cached(db.conn(), row.source_id, *tgt_id, REL_CALLS, metadata)? {
                 edges_added += 1;
+                touched.insert(caller_path.to_string());
             }
         }
         to_delete.push(row.id);
@@ -1422,58 +1458,126 @@ pub(super) enum RecvTypeTargets {
     Drop,
 }
 
-/// A class-like node: its id and whether it is nested in another class-like
-/// node of its file (or spelled `Outer::T`).
+/// A class-like node: its id, file and whether it is nested in another
+/// class-like node of its file (or spelled `Outer::T`).
 struct ClassNode {
     id: i64,
+    file_id: i64,
     nested: bool,
 }
 
-/// The project's class-like nodes by last name segment, read once on first
-/// use, plus a cache of subclass closures.
+/// What receiver-type resolution reads from the index, loaded once per pass and
+/// then answered from memory — per call it runs no SQL beyond fetching the file
+/// and qualified name of candidates it has not seen yet (django: one `__init__`
+/// call has 912 candidates, and there are thousands of such calls).
 #[derive(Default)]
 pub(super) struct ProjectClassNames {
+    /// Class-like nodes by last name segment; None until loaded.
     by_last: Option<HashMap<String, Vec<ClassNode>>>,
-    last_of: HashMap<i64, String>,
-    subclasses: HashMap<Vec<i64>, HashSet<String>>,
+    /// Candidate id → (file id, qualified name).
+    node_info: HashMap<i64, (i64, String)>,
+    /// Superclass id → direct subclass ids, from `inherits` edges; None until
+    /// loaded. The deferred pass resolves calls after every other relation, so
+    /// these are complete when the first call reads them.
+    children: Option<HashMap<i64, Vec<i64>>>,
+    /// Free functions no member call reaches (`filter_out_function_ids`'s
+    /// complement); None until loaded.
+    free_functions: Option<HashSet<i64>>,
 }
 
 impl ProjectClassNames {
-    fn load(&mut self, db: &crate::storage::db::Database) -> anyhow::Result<()> {
+    /// [`member_call_candidates`] from memory: the deferred pass and the pending
+    /// sweep run after every node of the run exists, so the set of free
+    /// functions is read once instead of once per call (a query of up to
+    /// hundreds of ids for each `self.x()` in a large Python tree).
+    pub(super) fn member_call_candidates(
+        &mut self,
+        db: &crate::storage::db::Database,
+        metadata: Option<&str>,
+        candidates: Vec<i64>,
+    ) -> anyhow::Result<Vec<i64>> {
+        if !matches!(
+            parse_callee_metadata(metadata),
+            Some(CalleeMeta::Member | CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))
+        ) {
+            return Ok(candidates);
+        }
+        if self.free_functions.is_none() {
+            let mut stmt = db.conn().prepare(
+                "SELECT id FROM nodes WHERE type = 'function'
+                 AND (qualified_name IS NULL OR qualified_name NOT LIKE '%.%')",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<HashSet<i64>>>()?;
+            self.free_functions = Some(ids);
+        }
+        let free = self.free_functions.as_ref().expect("loaded above");
+        Ok(candidates
+            .into_iter()
+            .filter(|id| !free.contains(id))
+            .collect())
+    }
+
+    fn load(
+        &mut self,
+        db: &crate::storage::db::Database,
+        candidates: &[i64],
+    ) -> anyhow::Result<()> {
         if self.by_last.is_none() {
             let mut map: HashMap<String, Vec<ClassNode>> = HashMap::new();
-            for (id, name, nested) in crate::storage::queries::class_like_names(db.conn())? {
+            for (id, file_id, name, nested) in crate::storage::queries::class_like_names(db.conn())?
+            {
                 let segs = class_path(&name);
                 if let Some(last) = segs.last() {
-                    self.last_of.insert(id, last.to_string());
                     map.entry(last.to_string()).or_default().push(ClassNode {
                         id,
+                        file_id,
                         nested: nested || segs.len() > 1,
                     });
                 }
             }
             self.by_last = Some(map);
         }
+        let missing: Vec<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !self.node_info.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            self.node_info
+                .extend(crate::storage::queries::get_node_files_and_qualified_names(
+                    db.conn(),
+                    &missing,
+                )?);
+        }
         Ok(())
     }
 
-    /// Last segments of the names of every class inheriting from `seeds`.
+    /// Every class inheriting, directly or not, from `seeds` (seeds excluded).
     fn subclasses(
         &mut self,
         db: &crate::storage::db::Database,
-        mut seeds: Vec<i64>,
-    ) -> anyhow::Result<&HashSet<String>> {
-        seeds.sort_unstable();
-        seeds.dedup();
-        if !self.subclasses.contains_key(&seeds) {
-            let names = crate::storage::queries::subclass_names(db.conn(), &seeds)?;
-            let set = names
-                .iter()
-                .filter_map(|n| class_path(n).last().map(|s| s.to_string()))
-                .collect();
-            self.subclasses.insert(seeds.clone(), set);
+        seeds: &[i64],
+    ) -> anyhow::Result<HashSet<i64>> {
+        if self.children.is_none() {
+            let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+            for (sub, sup) in crate::storage::queries::inherits_edges(db.conn())? {
+                children.entry(sup).or_default().push(sub);
+            }
+            self.children = Some(children);
         }
-        Ok(&self.subclasses[&seeds])
+        let children = self.children.as_ref().expect("loaded above");
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut stack: Vec<i64> = seeds.to_vec();
+        while let Some(c) = stack.pop() {
+            for &sub in children.get(&c).into_iter().flatten() {
+                if !seeds.contains(&sub) && seen.insert(sub) {
+                    stack.push(sub);
+                }
+            }
+        }
+        Ok(seen)
     }
 }
 
@@ -1522,10 +1626,15 @@ fn owner_path(qualified: &str) -> Vec<&str> {
 
 /// Bind a call on a receiver of class `ty` (a `::`-joined class path, e.g.
 /// `Slice` or `SkipList::Iterator`) to that class's own method and, when
-/// `dispatch` (not a `super()` call), to its overrides in subclasses. A method
-/// of a nested class `Outer::T` answers to a bare `T` only when no top-level
-/// class is named `T` — leveldb's `SkipList::Iterator` is not
-/// `leveldb::Iterator`.
+/// `dispatch` (not a `super()` call), to its overrides in subclasses.
+///
+/// A candidate's class is known by its method's qualified name, which names
+/// only the last scope (`Iterator.Next` for `SkipList<K>::Iterator::Next`), so
+/// the class NODE it belongs to is taken from the method's own file, else from
+/// every class of that name. A nested class (`SkipList::Iterator`) answers to a
+/// bare `T` only when no top-level class is named `T`; a class whose name is
+/// both nested and top-level somewhere, with the method outside either's file,
+/// counts as nested. A `std::` type is never the project's.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn recv_type_targets(
     ty: &str,
@@ -1540,41 +1649,44 @@ pub(super) fn recv_type_targets(
     let Some(&last) = want.last() else {
         return Ok(RecvTypeTargets::Fallback);
     };
-    let qualified =
-        crate::storage::queries::get_node_qualified_names_by_ids(db.conn(), candidates)?;
-    // The same-file class nodes each candidate's owner may be: a method defined
-    // outside its class is qualified by the last scope only (`Iterator.Valid`
-    // for `SkipList<K, C>::Iterator::Valid`), and only that class node says
-    // whether it is a nested one.
-    let mut owner_nodes: HashMap<i64, Vec<(i64, bool)>> = HashMap::new();
-    for (id, class_id, class, nested) in
-        crate::storage::queries::same_file_classes(db.conn(), candidates)?
-    {
-        let owner = qualified.get(&id).map(|q| owner_path(q));
-        if owner.as_ref().and_then(|o| o.last()) == class_path(&class).last() {
-            owner_nodes.entry(id).or_default().push((class_id, nested));
-        }
+    if want.first() == Some(&"std") {
+        return Ok(RecvTypeTargets::Drop);
     }
+    classes.load(db, candidates)?;
+    let by_last = classes.by_last.as_ref().expect("loaded above");
+    let no_classes = Vec::new();
+    // The class nodes a candidate's method may belong to.
+    let owners = |id: i64| -> (Vec<&str>, Vec<&ClassNode>) {
+        let Some((file_id, q)) = classes.node_info.get(&id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let have = owner_path(q);
+        let named = have
+            .last()
+            .and_then(|o| by_last.get(*o))
+            .unwrap_or(&no_classes);
+        let local: Vec<&ClassNode> = named.iter().filter(|c| c.file_id == *file_id).collect();
+        let nodes = if local.is_empty() {
+            named.iter().collect()
+        } else {
+            local
+        };
+        (have, nodes)
+    };
     let (mut exact, mut nested) = (Vec::new(), Vec::new());
     for &id in candidates {
-        let Some(have) = qualified.get(&id).map(|q| owner_path(q)) else {
-            continue;
-        };
+        let (have, nodes) = owners(id);
         let k = have.len().min(want.len());
         if k == 0 || have[have.len() - k..] != want[want.len() - k..] {
             continue;
         }
-        let in_nested_class = owner_nodes
-            .get(&id)
-            .is_some_and(|nodes| nodes.iter().all(|&(_, n)| n));
+        let in_nested_class = nodes.iter().any(|c| c.nested);
         if have.len() > want.len() || (have.len() == want.len() && in_nested_class) {
             nested.push(id);
         } else {
             exact.push(id);
         }
     }
-    classes.load(db)?;
-    let by_last = classes.by_last.as_ref().expect("loaded above");
     let known = by_last.contains_key(last);
     let top_level = by_last
         .get(last)
@@ -1608,40 +1720,27 @@ pub(super) fn recv_type_targets(
     if dispatch {
         // A subclass's override runs too when the object is one (virtual
         // dispatch): binding only `T.f` left every override without a caller.
-        // Subclasses of the class nodes that own the bound methods — the
-        // same-file class of that name, else every top-level one. `inherits`
-        // edges are bound by name too, so a class whose name another class
-        // shares has subclasses that may be the other's (leveldb's `DBIter`
-        // inherits `leveldb::Iterator`, and was bound to `SkipList::Iterator`):
-        // such a class seeds nothing.
+        // `inherits` edges are bound by name too, so a class whose name another
+        // class shares may have another's subclasses (leveldb's `DBIter`
+        // inherits `leveldb::Iterator` and was bound to `SkipList::Iterator`):
+        // only a uniquely named class seeds overrides, and a candidate counts
+        // only when every class node it may belong to is a subclass.
         let mut seeds = Vec::new();
-        for id in &targets {
-            match owner_nodes.get(id) {
-                Some(nodes) => seeds.extend(nodes.iter().map(|&(c, _)| c)),
-                None => {
-                    let owner = qualified.get(id).map(|q| owner_path(q)).unwrap_or_default();
-                    if let Some(nodes) = owner.last().and_then(|o| by_last.get(*o)) {
-                        seeds.extend(nodes.iter().filter(|c| !c.nested).map(|c| c.id));
-                    }
-                }
+        for &id in &targets {
+            let (have, _) = owners(id);
+            if let Some([only]) = have.last().and_then(|o| by_last.get(*o)).map(Vec::as_slice) {
+                seeds.push(only.id);
             }
         }
-        let unique = |id: &i64| {
-            classes
-                .last_of
-                .get(id)
-                .and_then(|l| by_last.get(l))
-                .is_some_and(|nodes| nodes.len() == 1)
-        };
-        seeds.retain(unique);
+        let overrides: Vec<(i64, Vec<i64>)> = candidates
+            .iter()
+            .filter(|id| !targets.contains(id))
+            .map(|&id| (id, owners(id).1.iter().map(|c| c.id).collect()))
+            .collect();
         if !seeds.is_empty() {
-            let subclasses = classes.subclasses(db, seeds)?;
-            for &id in candidates {
-                let overrides = qualified
-                    .get(&id)
-                    .and_then(|q| owner_path(q).last().copied())
-                    .is_some_and(|owner| subclasses.contains(owner));
-                if overrides && !targets.contains(&id) {
+            let subclasses = classes.subclasses(db, &seeds)?;
+            for (id, nodes) in overrides {
+                if !nodes.is_empty() && nodes.iter().all(|c| subclasses.contains(c)) {
                     targets.push(id);
                 }
             }

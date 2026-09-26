@@ -244,17 +244,17 @@ pub fn get_nodes_with_files_by_qualified_name(
 }
 
 /// Collect cross-file inbound edges before deleting a file's nodes.
-/// Returns (source_id, source_file_id, target_name, relation, metadata) for
-/// edges where:
+/// Returns (source_id, source_file_id, target_name, relation, metadata,
+/// target qualified_name) for edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
 pub fn get_inbound_cross_file_edges(
     conn: &Connection,
     file_id: i64,
-) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
+) -> Result<Vec<(i64, i64, String, String, Option<String>, Option<String>)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata
+        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata, nt.qualified_name
          FROM edges e
          JOIN nodes nt ON nt.id = e.target_id
          JOIN nodes ns ON ns.id = e.source_id
@@ -267,6 +267,7 @@ pub fn get_inbound_cross_file_edges(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1010,95 +1011,79 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
 /// Node types that define a class-like type, for receiver-type resolution.
 const CLASS_LIKE_TYPES: &str = "('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')";
 
-/// The spellings (`qualified_name`, else `name`) of every class-like node, each
-/// with whether it is nested in another class-like node of its file by line
-/// span — a C++ class defined in another's body keeps a bare name (`Iterator`
-/// inside `SkipList`), and only its span tells it apart from a top-level one.
-pub fn class_like_names(conn: &Connection) -> Result<Vec<(i64, String, bool)>> {
+/// Every class-like node: `(id, file id, spelling, nested)`, the spelling being
+/// `qualified_name` else `name`, and `nested` whether another class-like node of
+/// its file encloses it by line span — a C++ class defined in another's body
+/// keeps a bare name (`Iterator` inside `SkipList`), and only its span tells it
+/// apart from a top-level one. One scan, read once per resolution pass.
+pub fn class_like_names(conn: &Connection) -> Result<Vec<(i64, i64, String, bool)>> {
+    // Nesting is decided here rather than by a correlated subquery per class,
+    // which cost 141 ms on django's 10,342 class nodes — on every incremental run.
     let sql = format!(
-        "SELECT c.id, COALESCE(c.qualified_name, c.name),
-                EXISTS (SELECT 1 FROM nodes o
-                        WHERE o.file_id = c.file_id AND o.id <> c.id
-                          AND o.type IN {CLASS_LIKE_TYPES}
-                          AND o.start_line <= c.start_line AND o.end_line >= c.end_line)
-         FROM nodes c WHERE c.type IN {CLASS_LIKE_TYPES}"
+        "SELECT id, file_id, COALESCE(qualified_name, name), start_line, end_line
+         FROM nodes WHERE type IN {CLASS_LIKE_TYPES}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, bool>(2)?,
-        ))
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut by_file: HashMap<i64, Vec<(i64, i64, i64)>> = HashMap::new();
+    for (id, file_id, _, start, end) in &rows {
+        by_file
+            .entry(*file_id)
+            .or_default()
+            .push((*id, *start, *end));
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(id, file_id, name, start, end)| {
+            let nested = by_file[&file_id]
+                .iter()
+                .any(|&(o, s, e)| o != id && s <= start && e >= end);
+            (id, file_id, name, nested)
+        })
+        .collect())
+}
+
+/// Every `inherits` edge as `(subclass id, superclass id)`.
+pub fn inherits_edges(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT source_id, target_id FROM edges WHERE relation = ?1")?;
+    let rows = stmt.query_map([crate::domain::REL_INHERITS], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Names of the classes that inherit, directly or not, from the class nodes
-/// `class_ids`, through `inherits` edges. Chunked under MAX_IN_PARAMS.
-pub fn subclass_names(conn: &Connection, class_ids: &[i64]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for chunk in class_ids.chunks(MAX_IN_PARAMS) {
-        let sql = format!(
-            "WITH RECURSIVE sub(id) AS (
-                 SELECT id FROM nodes WHERE id IN ({})
-                 UNION
-                 SELECT e.source_id FROM edges e JOIN sub s ON e.target_id = s.id
-                 WHERE e.relation = ?{}
-             )
-             SELECT DISTINCT n.name FROM sub JOIN nodes n ON n.id = sub.id
-             WHERE n.id NOT IN ({})",
-            make_placeholders(1, chunk.len()),
-            chunk.len() + 1,
-            make_placeholders(1, chunk.len()),
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
-            .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-        params.push(&crate::domain::REL_INHERITS);
-        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
-        for row in rows {
-            out.push(row?);
-        }
-    }
-    Ok(out)
-}
-
-/// For each of `node_ids`, the class-like nodes of its file: `(id, class id,
-/// class name, nested in another class-like node by line span)`. A method defined outside
-/// its class (`SkipList<K, C>::Iterator::Valid`) is qualified by the last scope
-/// only (`Iterator.Valid`); the same-file class of that name says whether it is
-/// a nested one. Chunked under MAX_IN_PARAMS.
-pub fn same_file_classes(
+/// `id → (file id, qualified_name or '')` for `node_ids`. Chunked under
+/// MAX_IN_PARAMS.
+pub fn get_node_files_and_qualified_names(
     conn: &Connection,
     node_ids: &[i64],
-) -> Result<Vec<(i64, i64, String, bool)>> {
-    let mut out = Vec::new();
+) -> Result<HashMap<i64, (i64, String)>> {
+    let mut out = HashMap::new();
     for chunk in node_ids.chunks(MAX_IN_PARAMS) {
         let sql = format!(
-            "SELECT m.id, c.id, c.name,
-                    EXISTS (SELECT 1 FROM nodes o
-                            WHERE o.file_id = c.file_id AND o.id <> c.id
-                              AND o.type IN {CLASS_LIKE_TYPES}
-                              AND o.start_line <= c.start_line AND o.end_line >= c.end_line)
-             FROM nodes m
-             JOIN nodes c ON c.file_id = m.file_id AND c.type IN {CLASS_LIKE_TYPES}
-             WHERE m.id IN ({})",
+            "SELECT id, file_id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
             make_placeholders(1, chunk.len())
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
+                (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
             ))
         })?;
         for row in rows {
-            out.push(row?);
+            let (id, v) = row?;
+            out.insert(id, v);
         }
     }
     Ok(out)
