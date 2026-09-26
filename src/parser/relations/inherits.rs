@@ -54,6 +54,8 @@ use crate::domain::{REL_IMPLEMENTS, REL_INHERITS};
 pub(super) const HERITAGE_DECL_KINDS: &[&str] = &[
     // TS/JS/Java/PHP/C#/Kotlin/Swift/Dart all spell their class this way.
     "class_declaration",
+    // TS `abstract class`.
+    "abstract_class_declaration",
     "class_definition",
     "class",
     // Java (extends interfaces), TypeScript (extends interfaces), PHP, C#.

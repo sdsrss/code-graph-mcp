@@ -984,12 +984,16 @@ pub fn filter_method_ids(
 }
 
 /// `node_ids` minus the free functions (`type = 'function'`): what a member call
-/// on an object can reach. Order is not preserved. Chunked under MAX_IN_PARAMS.
+/// on an object can reach. A function with a dotted qualified name is kept: in
+/// JS that is a nested function its factory returns in an object literal
+/// (`makeStub.attemptUpgrade`), a member of the returned object. Order is not
+/// preserved. Chunked under MAX_IN_PARAMS.
 pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<i64>> {
     let mut kept = Vec::new();
     for chunk in node_ids.chunks(MAX_IN_PARAMS) {
         let sql = format!(
-            "SELECT id FROM nodes WHERE id IN ({}) AND type <> 'function'",
+            "SELECT id FROM nodes WHERE id IN ({})
+             AND (type <> 'function' OR qualified_name LIKE '%.%')",
             make_placeholders(1, chunk.len())
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1001,6 +1005,103 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
         }
     }
     Ok(kept)
+}
+
+/// Node types that define a class-like type, for receiver-type resolution.
+const CLASS_LIKE_TYPES: &str = "('class', 'struct', 'interface', 'type', 'enum', 'trait', 'union')";
+
+/// The spellings (`qualified_name`, else `name`) of every class-like node, each
+/// with whether it is nested in another class-like node of its file by line
+/// span — a C++ class defined in another's body keeps a bare name (`Iterator`
+/// inside `SkipList`), and only its span tells it apart from a top-level one.
+pub fn class_like_names(conn: &Connection) -> Result<Vec<(i64, String, bool)>> {
+    let sql = format!(
+        "SELECT c.id, COALESCE(c.qualified_name, c.name),
+                EXISTS (SELECT 1 FROM nodes o
+                        WHERE o.file_id = c.file_id AND o.id <> c.id
+                          AND o.type IN {CLASS_LIKE_TYPES}
+                          AND o.start_line <= c.start_line AND o.end_line >= c.end_line)
+         FROM nodes c WHERE c.type IN {CLASS_LIKE_TYPES}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Names of the classes that inherit, directly or not, from the class nodes
+/// `class_ids`, through `inherits` edges. Chunked under MAX_IN_PARAMS.
+pub fn subclass_names(conn: &Connection, class_ids: &[i64]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for chunk in class_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM nodes WHERE id IN ({})
+                 UNION
+                 SELECT e.source_id FROM edges e JOIN sub s ON e.target_id = s.id
+                 WHERE e.relation = ?{}
+             )
+             SELECT DISTINCT n.name FROM sub JOIN nodes n ON n.id = sub.id
+             WHERE n.id NOT IN ({})",
+            make_placeholders(1, chunk.len()),
+            chunk.len() + 1,
+            make_placeholders(1, chunk.len()),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        params.push(&crate::domain::REL_INHERITS);
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// For each of `node_ids`, the class-like nodes of its file: `(id, class id,
+/// class name, nested in another class-like node by line span)`. A method defined outside
+/// its class (`SkipList<K, C>::Iterator::Valid`) is qualified by the last scope
+/// only (`Iterator.Valid`); the same-file class of that name says whether it is
+/// a nested one. Chunked under MAX_IN_PARAMS.
+pub fn same_file_classes(
+    conn: &Connection,
+    node_ids: &[i64],
+) -> Result<Vec<(i64, i64, String, bool)>> {
+    let mut out = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "SELECT m.id, c.id, c.name,
+                    EXISTS (SELECT 1 FROM nodes o
+                            WHERE o.file_id = c.file_id AND o.id <> c.id
+                              AND o.type IN {CLASS_LIKE_TYPES}
+                              AND o.start_line <= c.start_line AND o.end_line >= c.end_line)
+             FROM nodes m
+             JOIN nodes c ON c.file_id = m.file_id AND c.type IN {CLASS_LIKE_TYPES}
+             WHERE m.id IN ({})",
+            make_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
 }
 
 /// Find nodes that are missing context strings (likely from a failed Phase 3).

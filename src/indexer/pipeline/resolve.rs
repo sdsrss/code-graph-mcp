@@ -27,17 +27,24 @@ pub(super) enum CalleeMeta {
     Path(Vec<String>),
     SelfType(String),
     SelfRecv(String),
-    /// `recv.method()` where `recv`'s type is fixed by a single local constructor
-    /// assignment (`recv = ClassName(...)`). Payload is the inferred type name.
-    /// Resolves identically to `SelfType` — restrict candidates to that type's
-    /// methods (issue #32 cause 2, Python).
+    /// `recv.method()` where the source fixes `recv`'s class: a Python local
+    /// constructor assignment or annotation, `self` / `this`, a C++ declared
+    /// type, JS `new T()` / TS `: T` (parser `relations/receiver.rs`). Payload is
+    /// the class, as a `::` path when written so. See [`recv_type_targets`].
     RecvType(String),
+    /// `super().f()` (Python): the first base class, bound like `RecvType` but
+    /// without its subclasses' overrides — `super()` names one implementation.
+    SuperType(String),
     Receiver(String),
     Chain,
     /// `x.f()` on an object that is not `this`/`self` or a module binding
     /// (parser `relations/member.rs`): resolves like a bare call, minus the free
     /// functions, which no member call can reach.
     Member,
+    /// Python `m.f()` where `m` is bound by an absolute import of module `v`
+    /// (`relations/member.rs`): no project code runs unless `v` is a project
+    /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
+    Module(String),
 }
 
 /// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
@@ -50,6 +57,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
     match q {
         "chain" => Some(CalleeMeta::Chain),
         "member" => Some(CalleeMeta::Member),
+        "module" => v
+            .get("v")?
+            .as_str()
+            .map(|m| CalleeMeta::Module(m.to_string())),
         "path" => {
             let payload = v.get("v")?.as_str()?;
             let segments: Vec<String> = payload.split("::").map(String::from).collect();
@@ -71,6 +82,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .get("v")?
             .as_str()
             .map(|t| CalleeMeta::RecvType(t.to_string())),
+        "super" => v
+            .get("v")?
+            .as_str()
+            .map(|t| CalleeMeta::SuperType(t.to_string())),
         "recv" => v
             .get("v")?
             .as_str()
@@ -243,6 +258,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
 
     let mut edges_added = 0usize;
     let mut to_delete: Vec<i64> = Vec::new();
+    let mut classes = ProjectClassNames::default();
 
     for row in &pending {
         let candidates: Vec<i64> = name_to_lang_targets
@@ -270,25 +286,53 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         //
         // Empty-filter behavior must match Phase 2 per qualifier shape, NOT a
         // blanket bare-fallback:
-        //   - RecvType (Python locally-inferred receiver): ADDITIVE — an empty
-        //     filter is an inherited / mis-inferred method, so fall back to the
-        //     bare set (index_files.rs RecvType arm falls through to bare).
+        //   - RecvType (receiver of known class): `recv_type_targets` — the
+        //     class's own method, else the member-call set when the class is the
+        //     project's (inherited method), else nothing (a library class), as
+        //     the index_files.rs RecvType arm does.
         //   - SelfType / SelfRecv (Rust `Self::` / `self.`) and Path: STRUCTURAL —
         //     an empty filter means no target matches the fixed qualifier and a
         //     re-scan yields the same answer, so bind NOTHING and drain the row
         //     (index_files.rs SelfRecv/SelfType/Path arms all drop on empty). A
         //     bare fallback here would wire the very false same-name-sibling edges
         //     the qualifier exists to exclude.
-        // Only bare (None), rtype (Python), and JS receiver can actually reach the
+        // Only bare (None), rtype, member and JS receiver can actually reach the
         // buffer today; self/stype/path handling is latent parity should a future
         // Phase-2 change route them here.
+        let mut metadata = row.metadata.as_deref();
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
-            Some(CalleeMeta::RecvType(t)) => {
-                let filtered = self_filter_candidates(&t, &candidates, db)?;
-                if filtered.is_empty() {
-                    candidates
-                } else {
-                    filtered
+            Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
+                let (t, dispatch) = match meta {
+                    CalleeMeta::RecvType(t) => (t, true),
+                    CalleeMeta::SuperType(t) => (t, false),
+                    _ => unreachable!("matched above"),
+                };
+                let caller_path = source_id_to_path
+                    .get(&row.source_id)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                match recv_type_targets(
+                    &t,
+                    dispatch,
+                    &candidates,
+                    db,
+                    &mut classes,
+                    caller_path,
+                    &node_id_to_path,
+                )? {
+                    RecvTypeTargets::Bind(own) => own,
+                    // Stored as the untyped member call it resolves as.
+                    RecvTypeTargets::Ambiguous(own) => {
+                        metadata = Some(crate::domain::CALL_META_MEMBER);
+                        own
+                    }
+                    RecvTypeTargets::Fallback => {
+                        metadata = Some(crate::domain::CALL_META_MEMBER);
+                        member_call_candidates(metadata, candidates, db)?
+                    }
+                    // Not a project class yet: stay buffered (and age out), in
+                    // case a later run adds it.
+                    RecvTypeTargets::Drop => continue,
                 }
             }
             Some(CalleeMeta::SelfType(t)) | Some(CalleeMeta::SelfRecv(t)) => {
@@ -319,13 +363,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         };
 
         for tgt_id in &refined {
-            if insert_edge_cached(
-                db.conn(),
-                row.source_id,
-                *tgt_id,
-                REL_CALLS,
-                row.metadata.as_deref(),
-            )? {
+            if insert_edge_cached(db.conn(), row.source_id, *tgt_id, REL_CALLS, metadata)? {
                 edges_added += 1;
             }
         }
@@ -1017,7 +1055,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                             AND i.tid = tgt.id
                       )
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
-                      -- qualifier (self / stype / rtype / path). Those bind the call
+                      -- qualifier (self / stype / rtype / super / path). Those bind the call
                       -- by a structural signal (the receiver's impl type, or the
                       -- module path), not by a bare-name guess among same-name
                       -- siblings — so a duplicate bare name must not relabel them
@@ -1026,7 +1064,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- uniqueness or fall back to bare, so a duplicate name there is
                       -- genuinely ambiguous. NULL metadata (bare) also stays eligible.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path'))
                  THEN ?3 ELSE ?4 END";
     const CONF_WHERE: &str = "
              WHERE e.relation IN (?1, ?2)
@@ -1316,6 +1354,306 @@ pub(super) fn self_filter_candidates(
     filter_method_ids(db.conn(), candidates, Some(impl_type))
 }
 
+/// Candidates a call can reach given its metadata: a member call on an object
+/// (`CalleeMeta::Member`, or `RecvType` — a receiver of known class) cannot reach
+/// a free function; every other call keeps them all. One helper so the batch,
+/// deferred and pending paths cannot disagree.
+pub(super) fn member_call_candidates(
+    metadata: Option<&str>,
+    candidates: Vec<i64>,
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if matches!(
+        parse_callee_metadata(metadata),
+        Some(CalleeMeta::Member | CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))
+    ) {
+        crate::storage::queries::filter_out_function_ids(db.conn(), &candidates)
+    } else {
+        Ok(candidates)
+    }
+}
+
+/// Whether a dotted Python module is a project module or package: a key of the
+/// module map, or a prefix of one (a namespace package without `__init__.py` is
+/// no key of its own). Memoized per module name — the prefix test scans every
+/// key, and a file calls into the same few modules over and over.
+pub(super) struct ProjectPythonModules<'a> {
+    map: &'a HashMap<String, Vec<String>>,
+    seen: HashMap<String, bool>,
+}
+
+impl<'a> ProjectPythonModules<'a> {
+    pub(super) fn new(map: &'a HashMap<String, Vec<String>>) -> Self {
+        Self {
+            map,
+            seen: HashMap::new(),
+        }
+    }
+
+    pub(super) fn contains(&mut self, module: &str) -> bool {
+        if let Some(&known) = self.seen.get(module) {
+            return known;
+        }
+        let known = self.map.contains_key(module)
+            || self.map.keys().any(|k| {
+                k.len() > module.len()
+                    && k.starts_with(module)
+                    && k.as_bytes()[module.len()] == b'.'
+            });
+        self.seen.insert(module.to_string(), known);
+        known
+    }
+}
+
+/// What a call on a receiver of class `ty` (`CalleeMeta::RecvType`) binds.
+#[derive(Debug, PartialEq)]
+pub(super) enum RecvTypeTargets {
+    /// The class's own method of that name — one, or those in the caller's
+    /// file when several same-named classes define it — plus its overrides.
+    Bind(Vec<i64>),
+    /// Several same-named classes define the method and none is in the caller's
+    /// file: bind them all, but as the untyped member call this is.
+    Ambiguous(Vec<i64>),
+    /// A project class without that method (inherited, or the type was
+    /// mis-read): resolve like an untyped member call.
+    Fallback,
+    /// No class the project defines (`std::string`, `AbortController`, an
+    /// imported library class): no project method can run.
+    Drop,
+}
+
+/// A class-like node: its id and whether it is nested in another class-like
+/// node of its file (or spelled `Outer::T`).
+struct ClassNode {
+    id: i64,
+    nested: bool,
+}
+
+/// The project's class-like nodes by last name segment, read once on first
+/// use, plus a cache of subclass closures.
+#[derive(Default)]
+pub(super) struct ProjectClassNames {
+    by_last: Option<HashMap<String, Vec<ClassNode>>>,
+    last_of: HashMap<i64, String>,
+    subclasses: HashMap<Vec<i64>, HashSet<String>>,
+}
+
+impl ProjectClassNames {
+    fn load(&mut self, db: &crate::storage::db::Database) -> anyhow::Result<()> {
+        if self.by_last.is_none() {
+            let mut map: HashMap<String, Vec<ClassNode>> = HashMap::new();
+            for (id, name, nested) in crate::storage::queries::class_like_names(db.conn())? {
+                let segs = class_path(&name);
+                if let Some(last) = segs.last() {
+                    self.last_of.insert(id, last.to_string());
+                    map.entry(last.to_string()).or_default().push(ClassNode {
+                        id,
+                        nested: nested || segs.len() > 1,
+                    });
+                }
+            }
+            self.by_last = Some(map);
+        }
+        Ok(())
+    }
+
+    /// Last segments of the names of every class inheriting from `seeds`.
+    fn subclasses(
+        &mut self,
+        db: &crate::storage::db::Database,
+        mut seeds: Vec<i64>,
+    ) -> anyhow::Result<&HashSet<String>> {
+        seeds.sort_unstable();
+        seeds.dedup();
+        if !self.subclasses.contains_key(&seeds) {
+            let names = crate::storage::queries::subclass_names(db.conn(), &seeds)?;
+            let set = names
+                .iter()
+                .filter_map(|n| class_path(n).last().map(|s| s.to_string()))
+                .collect();
+            self.subclasses.insert(seeds.clone(), set);
+        }
+        Ok(&self.subclasses[&seeds])
+    }
+}
+
+/// The class path a type spelling names, template arguments dropped:
+/// `SkipList<Key, Comparator>::Node` → `[SkipList, Node]`, Python's
+/// `Outer.Inner` → `[Outer, Inner]`.
+fn class_path(spelling: &str) -> Vec<&str> {
+    let b = spelling.as_bytes();
+    let (mut depth, mut start, mut i) = (0i32, 0usize, 0usize);
+    let mut segs = Vec::new();
+    let mut push = |from: usize, to: usize| {
+        let seg = &spelling[from..to];
+        let seg = seg.split('<').next().unwrap_or(seg).trim();
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && b.get(i + 1) == Some(&b':') => {
+                push(start, i);
+                start = i + 2;
+                i += 1;
+            }
+            b'.' if depth == 0 => {
+                push(start, i);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    push(start, b.len());
+    segs
+}
+
+/// The owning class path of a method's qualified name (`A::B.f` → `[A, B]`).
+fn owner_path(qualified: &str) -> Vec<&str> {
+    qualified
+        .rsplit_once('.')
+        .map(|(owner, _)| class_path(owner))
+        .unwrap_or_default()
+}
+
+/// Bind a call on a receiver of class `ty` (a `::`-joined class path, e.g.
+/// `Slice` or `SkipList::Iterator`) to that class's own method and, when
+/// `dispatch` (not a `super()` call), to its overrides in subclasses. A method
+/// of a nested class `Outer::T` answers to a bare `T` only when no top-level
+/// class is named `T` — leveldb's `SkipList::Iterator` is not
+/// `leveldb::Iterator`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recv_type_targets(
+    ty: &str,
+    dispatch: bool,
+    candidates: &[i64],
+    db: &crate::storage::db::Database,
+    classes: &mut ProjectClassNames,
+    caller_path: &str,
+    node_id_to_path: &HashMap<i64, String>,
+) -> anyhow::Result<RecvTypeTargets> {
+    let want = class_path(ty);
+    let Some(&last) = want.last() else {
+        return Ok(RecvTypeTargets::Fallback);
+    };
+    let qualified =
+        crate::storage::queries::get_node_qualified_names_by_ids(db.conn(), candidates)?;
+    // The same-file class nodes each candidate's owner may be: a method defined
+    // outside its class is qualified by the last scope only (`Iterator.Valid`
+    // for `SkipList<K, C>::Iterator::Valid`), and only that class node says
+    // whether it is a nested one.
+    let mut owner_nodes: HashMap<i64, Vec<(i64, bool)>> = HashMap::new();
+    for (id, class_id, class, nested) in
+        crate::storage::queries::same_file_classes(db.conn(), candidates)?
+    {
+        let owner = qualified.get(&id).map(|q| owner_path(q));
+        if owner.as_ref().and_then(|o| o.last()) == class_path(&class).last() {
+            owner_nodes.entry(id).or_default().push((class_id, nested));
+        }
+    }
+    let (mut exact, mut nested) = (Vec::new(), Vec::new());
+    for &id in candidates {
+        let Some(have) = qualified.get(&id).map(|q| owner_path(q)) else {
+            continue;
+        };
+        let k = have.len().min(want.len());
+        if k == 0 || have[have.len() - k..] != want[want.len() - k..] {
+            continue;
+        }
+        let in_nested_class = owner_nodes
+            .get(&id)
+            .is_some_and(|nodes| nodes.iter().all(|&(_, n)| n));
+        if have.len() > want.len() || (have.len() == want.len() && in_nested_class) {
+            nested.push(id);
+        } else {
+            exact.push(id);
+        }
+    }
+    classes.load(db)?;
+    let by_last = classes.by_last.as_ref().expect("loaded above");
+    let known = by_last.contains_key(last);
+    let top_level = by_last
+        .get(last)
+        .is_some_and(|nodes| nodes.iter().any(|c| !c.nested));
+    let own = if !exact.is_empty() {
+        exact
+    } else if !top_level {
+        nested
+    } else {
+        Vec::new()
+    };
+    if own.is_empty() {
+        return Ok(if known {
+            RecvTypeTargets::Fallback
+        } else {
+            RecvTypeTargets::Drop
+        });
+    }
+    // Several same-named classes define it: the caller's file's, else all of
+    // them as an untyped member call.
+    let local: Vec<i64> = own
+        .iter()
+        .copied()
+        .filter(|id| node_id_to_path.get(id).map(String::as_str) == Some(caller_path))
+        .collect();
+    let (mut targets, ambiguous) = match (own.len(), local.is_empty()) {
+        (1, _) => (own, false),
+        (_, false) => (local, false),
+        (_, true) => (own, true),
+    };
+    if dispatch {
+        // A subclass's override runs too when the object is one (virtual
+        // dispatch): binding only `T.f` left every override without a caller.
+        // Subclasses of the class nodes that own the bound methods — the
+        // same-file class of that name, else every top-level one. `inherits`
+        // edges are bound by name too, so a class whose name another class
+        // shares has subclasses that may be the other's (leveldb's `DBIter`
+        // inherits `leveldb::Iterator`, and was bound to `SkipList::Iterator`):
+        // such a class seeds nothing.
+        let mut seeds = Vec::new();
+        for id in &targets {
+            match owner_nodes.get(id) {
+                Some(nodes) => seeds.extend(nodes.iter().map(|&(c, _)| c)),
+                None => {
+                    let owner = qualified.get(id).map(|q| owner_path(q)).unwrap_or_default();
+                    if let Some(nodes) = owner.last().and_then(|o| by_last.get(*o)) {
+                        seeds.extend(nodes.iter().filter(|c| !c.nested).map(|c| c.id));
+                    }
+                }
+            }
+        }
+        let unique = |id: &i64| {
+            classes
+                .last_of
+                .get(id)
+                .and_then(|l| by_last.get(l))
+                .is_some_and(|nodes| nodes.len() == 1)
+        };
+        seeds.retain(unique);
+        if !seeds.is_empty() {
+            let subclasses = classes.subclasses(db, seeds)?;
+            for &id in candidates {
+                let overrides = qualified
+                    .get(&id)
+                    .and_then(|q| owner_path(q).last().copied())
+                    .is_some_and(|owner| subclasses.contains(owner));
+                if overrides && !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+        }
+    }
+    Ok(if ambiguous {
+        RecvTypeTargets::Ambiguous(targets)
+    } else {
+        RecvTypeTargets::Bind(targets)
+    })
+}
+
 /// Filter candidates to those whose `qualified_name` denotes a METHOD — i.e.
 /// contains a `.` separator (`Type.method`), as opposed to a free function
 /// whose `qualified_name` equals its bare name. A receiver call `obj.method()`
@@ -1325,21 +1663,6 @@ pub(super) fn self_filter_candidates(
 ///
 /// Storage encodes methods as `Type.method` (treesitter.rs qualified_name
 /// assignment) and free functions as just `name`.
-/// Candidates a call can reach given its metadata: a member call (`CalleeMeta::
-/// Member`) cannot reach a free function; every other call keeps them all. One
-/// helper so the batch, deferred and pending paths cannot disagree.
-pub(super) fn member_call_candidates(
-    metadata: Option<&str>,
-    candidates: Vec<i64>,
-    db: &crate::storage::db::Database,
-) -> anyhow::Result<Vec<i64>> {
-    if matches!(parse_callee_metadata(metadata), Some(CalleeMeta::Member)) {
-        crate::storage::queries::filter_out_function_ids(db.conn(), &candidates)
-    } else {
-        Ok(candidates)
-    }
-}
-
 pub(super) fn method_candidates(
     candidates: &[i64],
     db: &crate::storage::db::Database,

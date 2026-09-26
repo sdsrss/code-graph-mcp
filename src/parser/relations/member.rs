@@ -15,22 +15,25 @@
 //! its own receiver qualifiers.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use super::node_text;
 
-pub(super) const MEMBER_META: &str = r#"{"q":"member"}"#;
+pub(super) const MEMBER_META: &str = crate::domain::CALL_META_MEMBER;
 
 thread_local! {
     /// Names the current file binds by import / require. A member call on one is
     /// a module-function call (`helpers.run()`, `m.f()`), which may well target a
     /// free function, so it is not marked. Per file: reset by `reset_import_bound`.
-    static IMPORT_BOUND: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// The value is the absolute module a Python import binds the name from
+    /// (`import click` → `click`, `from a.b import c` → `a.b`); None for a
+    /// relative import and for JS.
+    static IMPORT_BOUND: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
 pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: &str) {
-    let mut names = HashSet::new();
+    let mut names = HashMap::new();
     if matches!(family, "python" | "javascript" | "typescript" | "tsx") {
         collect(root, source, family, &mut names, 0);
     }
@@ -41,7 +44,7 @@ fn collect(
     node: tree_sitter::Node,
     source: &str,
     family: &str,
-    out: &mut HashSet<String>,
+    out: &mut HashMap<String, Option<String>>,
     depth: usize,
 ) {
     if depth > 256 {
@@ -50,24 +53,30 @@ fn collect(
     let text = |n: tree_sitter::Node| node_text(&n, source).to_string();
     match (family, node.kind()) {
         ("python", "import_statement") | ("python", "import_from_statement") => {
-            let module = node.child_by_field_name("module_name").map(|m| m.id());
+            let module = node.child_by_field_name("module_name");
+            // `from x import y`: y comes from x; relative (`from . import y`): None.
+            let from = module.filter(|m| m.kind() == "dotted_name").map(text);
+            let is_from = node.kind() == "import_from_statement";
             for i in 0..node.named_child_count() {
                 let Some(c) = node.named_child(i) else {
                     continue;
                 };
-                if Some(c.id()) == module {
+                if Some(c.id()) == module.map(|m| m.id()) {
                     continue; // `from x import y` binds y, not x
                 }
+                let origin = |path: String| if is_from { from.clone() } else { Some(path) };
                 match c.kind() {
                     // `import a.b` binds `a`; `from x import a` binds `a`.
                     "dotted_name" => {
                         if let Some(first) = c.named_child(0) {
-                            out.insert(text(first));
+                            out.insert(text(first), origin(text(first)));
                         }
                     }
+                    // `import a.b as m` binds `m` to `a.b`.
                     "aliased_import" => {
                         if let Some(alias) = c.child_by_field_name("alias") {
-                            out.insert(text(alias));
+                            let path = c.child_by_field_name("name").map(text).unwrap_or_default();
+                            out.insert(text(alias), origin(path));
                         }
                     }
                     _ => {}
@@ -79,7 +88,7 @@ fn collect(
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {
                     if c.kind() == "identifier" {
-                        out.insert(text(c));
+                        out.insert(text(c), None);
                     }
                 }
             }
@@ -89,7 +98,7 @@ fn collect(
                 .child_by_field_name("alias")
                 .or_else(|| node.child_by_field_name("name"))
             {
-                out.insert(text(n));
+                out.insert(text(n), None);
             }
             return;
         }
@@ -123,10 +132,10 @@ fn is_module_load(node: tree_sitter::Node, source: &str) -> bool {
 }
 
 /// Every identifier a declarator's name binds: `m`, `{ a, b: c }`.
-fn bind_pattern(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
+fn bind_pattern(node: tree_sitter::Node, source: &str, out: &mut HashMap<String, Option<String>>) {
     match node.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => {
-            out.insert(node_text(&node, source).to_string());
+            out.insert(node_text(&node, source).to_string(), None);
         }
         "pair_pattern" => {
             if let Some(v) = node.child_by_field_name("value") {
@@ -189,10 +198,29 @@ pub(super) fn is_member_call(call: tree_sitter::Node, source: &str, family: &str
         if matches!(
             name,
             "this" | "self" | "cls" | "globalThis" | "window" | "module" | "exports"
-        ) || IMPORT_BOUND.with(|b| b.borrow().contains(name))
+        ) || IMPORT_BOUND.with(|b| b.borrow().contains_key(name))
         {
             return false;
         }
     }
     true
+}
+
+/// Metadata of a Python call through a name an absolute import binds
+/// (`click.echo()` → `{"q":"module","v":"click"}`): the resolver drops it when
+/// that module is not the project's, since no project code can run then.
+pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let mut root = function.child_by_field_name("object")?;
+    while root.kind() == "attribute" {
+        root = root.child_by_field_name("object")?;
+    }
+    if root.kind() != "identifier" {
+        return None;
+    }
+    let module = IMPORT_BOUND.with(|b| b.borrow().get(node_text(&root, source)).cloned())??;
+    Some(serde_json::json!({ "q": "module", "v": module }).to_string())
 }

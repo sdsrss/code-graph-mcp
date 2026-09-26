@@ -369,11 +369,20 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 // only run a method: tell the resolver (see `member.rs`). A JS
                 // identifier receiver arrives as `Receiver`, kept only when it is
                 // an import binding, whose namespace resolution needs it.
-                let member = matches!(
+                let unqualified = matches!(
                     qualifier,
                     helpers::CalleeQualifier::Bare | helpers::CalleeQualifier::Receiver(_)
-                ) && super::member::is_member_call(node, source, ctx.config.name);
-                let metadata = if member {
+                );
+                let member =
+                    unqualified && super::member::is_member_call(node, source, ctx.config.name);
+                // A receiver whose class the source writes down binds that class's
+                // method (see `receiver.rs`).
+                let receiver_type = unqualified
+                    .then(|| super::receiver::receiver_type(node, source, ctx.config.name))
+                    .flatten();
+                let metadata = if let Some(ty) = receiver_type {
+                    Some(serialize_rtype_metadata(&ty))
+                } else if member {
                     Some(super::member::MEMBER_META.to_string())
                 } else if ctx.config.name == "cpp" && is_cpp_scoped_call(node) {
                     // `DB::Put()` names its class: tell the resolver it is not a
@@ -583,12 +592,17 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         // the ambiguous by-name fan-out across every same-named method.
         // Falls back to the bare, metadata-less form (unchanged behavior)
         // whenever the type can't be proven — never emits a wrong-type edge.
-        let metadata = super::infer_python_call_receiver_type(&node, source)
-            .map(|ty| serialize_rtype_metadata(&ty))
+        let metadata = super::python::infer_python_super_type(&node, source)
+            .map(|ty| serde_json::json!({ "q": "super", "v": ty }).to_string())
+            .or_else(|| {
+                super::infer_python_call_receiver_type(&node, source)
+                    .map(|ty| serialize_rtype_metadata(&ty))
+            })
             .or_else(|| {
                 super::member::is_member_call(node, source, "python")
                     .then(|| super::member::MEMBER_META.to_string())
-            });
+            })
+            .or_else(|| super::member::python_module_call_meta(node, source));
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,

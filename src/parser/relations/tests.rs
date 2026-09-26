@@ -649,7 +649,8 @@ fn test_member_call_on_an_object_is_marked_member() {
     );
     assert_eq!(meta_of(&cpp, "Delete"), Some(MEMBER));
     assert_eq!(meta_of(&cpp, "clear"), Some(MEMBER));
-    assert_eq!(meta_of(&cpp, "Put"), None);
+    // `this` names its class (D#89).
+    assert_eq!(meta_of(&cpp, "Put"), Some(r#"{"q":"rtype","v":"A"}"#));
     assert_eq!(meta_of(&cpp, "Helper"), None);
 
     let py = call_meta(
@@ -659,8 +660,15 @@ fn test_member_call_on_an_object_is_marked_member() {
         "python",
     );
     assert_eq!(meta_of(&py, "get"), Some(MEMBER));
-    for t in ["push", "run", "go", "parse", "close", "make", "local"] {
+    // `self` / `super()` / `cls` outside a class body name no class.
+    for t in ["push", "close", "make", "local"] {
         assert_eq!(meta_of(&py, t), None, "{t} must resolve as before: {py:?}");
+    }
+    // A call through an absolute import names its module (dropped when that
+    // module is not the project's).
+    for (t, module) in [("run", "helpers"), ("go", "pkg.mod"), ("parse", "x")] {
+        let want = format!(r#"{{"q":"module","v":"{module}"}}"#);
+        assert_eq!(meta_of(&py, t), Some(want.as_str()), "{t}: {py:?}");
     }
 
     let js = call_meta(
@@ -3695,11 +3703,11 @@ class Holder:
         "expected some run() calls to be extracted"
     );
     // No receiver TYPE may be claimed (no rtype). `w.run()` is a member call on
-    // an object (D#86: `{"q":"member"}`, which names no type); `self.run()` is
-    // not marked at all.
+    // an object (D#86: `{"q":"member"}`, which names no type); `self.run()`
+    // names its own class (D#89), which is no guess.
     for r in &runs {
         let want = if r.source_name.starts_with("Holder.") {
-            None
+            Some(r#"{"q":"rtype","v":"Holder"}"#)
         } else {
             Some(r#"{"q":"member"}"#)
         };
@@ -3977,6 +3985,33 @@ fn test_ts_extends_clause_does_not_emit_references_edge() {
         rels.iter()
             .map(|r| (r.relation.as_str(), r.target_name.as_str()))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_ts_abstract_class_is_a_class() {
+    // `abstract class` is its own node kind in tree-sitter-typescript, and it was
+    // missing from every class list: its methods' calls came from an unqualified
+    // `run`, and its `extends` made no inherits edge.
+    let src = "abstract class Base extends Root {\n  run() { this.go(); }\n  protected abstract go(): void\n}\n";
+    let rels = extract_relations(src, "typescript").unwrap();
+    let got: Vec<_> = rels
+        .iter()
+        .map(|r| {
+            (
+                r.source_name.as_str(),
+                r.relation.as_str(),
+                r.target_name.as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        got.contains(&("Base", REL_INHERITS, "Root")),
+        "abstract class must inherit; got {got:?}"
+    );
+    assert!(
+        got.contains(&("Base.run", REL_CALLS, "go")),
+        "a method call must come from Base.run; got {got:?}"
     );
 }
 
@@ -6570,6 +6605,15 @@ fn heritage_cases() -> Vec<(
             vec![
                 ("Admin", "User", REL_INHERITS),
                 ("Admin", "Auditable", REL_INHERITS),
+            ],
+        ),
+        // TypeScript: `abstract class` is its own declaration kind.
+        (
+            "typescript",
+            "abstract class Base extends Root implements Named { }",
+            vec![
+                ("Base", "Root", REL_INHERITS),
+                ("Base", "Named", REL_IMPLEMENTS),
             ],
         ),
         // C# already had a `base_list` arm keyed on the node kind rather than on

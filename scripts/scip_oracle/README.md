@@ -273,29 +273,32 @@ The measured errors:
 - Everything else found: JS recall at the default floor is 1284/1289; Python
   197/197.
 
-## Baseline: external corpora, v0.157.0 and after the v73 fixes (2026-09-26)
+## Baseline: external corpora, v0.157.0 and INDEX_VERSION 74 (2026-09-26)
 
 `corpora.sh` pins hono v4.6.14 (TypeScript), express 4.21.2 (JavaScript),
 flask 3.1.0 (Python) and leveldb 1.23 (C++; googletest/benchmark are compiled
 against but excluded from the index). Both arms were indexed the same way and
-scored with the same oracle. Precision / recall at the `inferred` floor:
+scored with the same oracle against the same SCIP index files. Save one
+`index.scip` per corpus and score every arm against it: the same leveldb commit,
+cloned twice, gave `f3425ef` 3,394 gold pairs in one clone and 3,431 in the
+other, with one scip-clang worker both times. Precision / recall at the
+`inferred` floor:
 
-| corpus | v0.157.0 | after |
+| corpus | v0.157.0 | INDEX_VERSION 74 |
 |---|---|---|
-| hono | P 471/571, R 780/896 | P 471/503, R 780/896 |
+| hono | P 471/571, R 780/896 | P 490/520, R 799/896 |
 | express | P 5/9, R 63/68 | P 5/5, R 63/68 |
-| flask | P 69/237, R 233/273 | P 69/101, R 233/273 |
-| leveldb | P 641/682, R 1358/3356 | P 792/838, R 2094/3394 |
+| flask | P 69/237, R 233/273 | P 73/89, R 236/273 |
+| leveldb | P 641/682, R 1364/3393 | P 1355/1395, R 2620/3431 |
 
-leveldb extracted: 822/966 → 1469/1617. The five errors behind the change
-are in CHANGELOG.md (INDEX_VERSION 73). What is left, by category:
+leveldb extracted: 828/972 → 1484/1563. The recall denominators differ because
+gold pairs are counted only where code-graph has a caller node. The errors behind
+the change are in CHANGELOG.md (INDEX_VERSION 73 and 74). What is left:
 
-- **Member call on another object bound to a same-name method** (no receiver
-  types): leveldb 107 of 405 same-file member-call edges; hono `c.text()` /
-  `req.arrayBuffer()`, flask `ctx.pop()` / `dict.get()`.
-- **A call through an external module bound to a project function**: flask
-  `click.echo()` (16 edges) reaches flask's own `echo`, because `click` is an
-  import binding and module calls are left unrestricted.
+- **Member call on a receiver the source does not type**: a C++ field used by a
+  member function defined outside its class body, a chain (`c.req.text()`), a
+  call result, a Python name imported from another module (`_cv_app.get()`).
+  48 of leveldb's 79 wrong same-file edges.
 - **Calls a SCIP indexer cannot name**: parameters, factory results, dependency
   objects with no type information (`unjudged_edges_unknown_binding` /
   `unjudged_edges_untyped_call`) — neither right nor wrong here.

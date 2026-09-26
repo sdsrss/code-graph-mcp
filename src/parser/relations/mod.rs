@@ -56,6 +56,7 @@ mod inherits;
 mod java;
 mod member;
 mod python;
+mod receiver;
 mod routes;
 mod rust;
 mod typescript;
@@ -773,7 +774,11 @@ fn walk_for_relations(
     // Determine class context for children: when entering a class body,
     // pass the class name so methods can build qualified scope names.
     let child_class = match kind {
-        "class_declaration" | "class_definition" | "class" | "class_specifier"
+        "class_declaration"
+        | "abstract_class_declaration"
+        | "class_definition"
+        | "class"
+        | "class_specifier"
         | "struct_specifier" => node
             .child_by_field_name("name")
             .map(|n| node_text(&n, source).to_string()),

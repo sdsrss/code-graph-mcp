@@ -304,10 +304,15 @@ pub(super) fn infer_python_call_receiver_type(
         return None;
     }
     let recv = node_text(&object, source);
-    // `self`/`cls` are not local-variable receivers; leave them to bare
-    // resolution (Python does not currently emit a Self qualifier).
-    if recv.is_empty() || recv == "self" || recv == "cls" {
+    if recv.is_empty() {
         return None;
+    }
+    // `self.f()` / `cls.f()`: the class whose method's first parameter it is.
+    if recv == "self" || recv == "cls" {
+        let (_, class) = py_method_class(call_node, Some(recv), source)?;
+        return class
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, source).to_string());
     }
 
     let scope = nearest_py_scope(call_node)?;
@@ -330,6 +335,90 @@ pub(super) fn infer_python_call_receiver_type(
         // >1 assignment → possibly reassigned to different types → unknown.
         _ => None,
     }
+}
+
+/// `super().f()` / `super(C, self).f()`: the first base class of the class
+/// whose method holds the call, when it is a plain name (`class A(Base)`).
+pub(super) fn infer_python_super_type(
+    call_node: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let function = call_node.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    let is_super = object.kind() == "call"
+        && object
+            .child_by_field_name("function")
+            .is_some_and(|f| node_text(&f, source) == "super");
+    if !is_super {
+        return None;
+    }
+    let (_, class) = py_method_class(call_node, None, source)?;
+    let bases = class.child_by_field_name("superclasses")?;
+    let first = bases.named_child(0)?;
+    (first.kind() == "identifier").then(|| node_text(&first, source).to_string())
+}
+
+/// The method enclosing `node` and its class: the nearest `def` directly in a
+/// class body, reached through nested `def`s only when none of them rebinds
+/// `receiver` as a parameter. With `Some(receiver)`, the method's first parameter
+/// must be that name (`self` / `cls`), so a `@staticmethod` does not qualify.
+fn py_method_class<'a>(
+    node: &tree_sitter::Node<'a>,
+    receiver: Option<&str>,
+    source: &str,
+) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>)> {
+    let mut cur = node.parent();
+    let mut depth = 0;
+    while let Some(n) = cur {
+        if depth > MAX_SUBTREE_DEPTH {
+            return None;
+        }
+        if n.kind() == "class_definition" {
+            return None; // class body code, not inside a method
+        }
+        if n.kind() == "function_definition" {
+            let first_param = n
+                .child_by_field_name("parameters")
+                .and_then(|p| p.named_child(0))
+                .map(|p| match p.kind() {
+                    "identifier" => node_text(&p, source),
+                    _ => p
+                        .child_by_field_name("name")
+                        .or_else(|| p.named_child(0))
+                        .map(|c| node_text(&c, source))
+                        .unwrap_or(""),
+                });
+            let mut holder = n.parent();
+            if holder.is_some_and(|h| h.kind() == "decorated_definition") {
+                holder = holder.and_then(|h| h.parent());
+            }
+            let class = holder
+                .filter(|b| b.kind() == "block")
+                .and_then(|b| b.parent())
+                .filter(|c| c.kind() == "class_definition");
+            if let Some(class) = class {
+                return match receiver {
+                    Some(r) if first_param != Some(r) => None,
+                    _ => Some((n, class)),
+                };
+            }
+            if let Some(r) = receiver {
+                let mut ids = std::collections::HashSet::new();
+                if let Some(params) = n.child_by_field_name("parameters") {
+                    collect_py_idents(&params, source, &mut ids, 0);
+                }
+                if ids.contains(r) {
+                    return None; // a nested function's own `self` parameter
+                }
+            }
+        }
+        cur = n.parent();
+        depth += 1;
+    }
+    None
 }
 
 /// Nearest enclosing scope node — a `function_definition` or the `module` root.

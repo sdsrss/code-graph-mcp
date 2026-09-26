@@ -47,6 +47,7 @@ pub(super) fn extract_ts_type_reference(
             parent.kind(),
             "interface_declaration"
                 | "class_declaration"
+                | "abstract_class_declaration"
                 | "type_alias_declaration"
                 | "enum_declaration"
         ) && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())

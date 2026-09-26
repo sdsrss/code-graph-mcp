@@ -1122,6 +1122,7 @@ fn resolve_batch_relations(
     all_file_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<BatchRelations> {
+    let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut edges_created = 0usize;
     // --- Phase 2: Extract relations + insert edges ---
     // These three pools are rebuilt from `global_name_map` on EVERY batch —
@@ -1596,6 +1597,11 @@ fn resolve_batch_relations(
             if rel.relation == REL_CALLS {
                 use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
                 match parse_callee_metadata(rel.metadata.as_deref()) {
+                    // `click.echo()` through an import of a library module: no
+                    // project code can run. A project module resolves as bare.
+                    Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
+                        continue;
+                    }
                     Some(CalleeMeta::Receiver(recv))
                         if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
                     {
@@ -1735,7 +1741,7 @@ fn resolve_batch_relations(
                         ));
                         continue;
                     }
-                    Some(CalleeMeta::RecvType(_)) => {
+                    Some(CalleeMeta::RecvType(_)) | Some(CalleeMeta::SuperType(_)) => {
                         // Same partial-view argument as SelfRecv/SelfType
                         // above; additionally this arm's EMPTY case falls
                         // through to bare default resolution rather than
@@ -3036,9 +3042,11 @@ fn resolve_deferred_relations(
     crate_roots: &HashSet<String>,
 ) -> Result<(usize, usize)> {
     use super::resolve::{
-        method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates,
-        CalleeMeta,
+        method_candidates, parse_callee_metadata, path_filter_candidates, recv_type_targets,
+        self_filter_candidates, CalleeMeta, ProjectClassNames, RecvTypeTargets,
     };
+    let mut classes = ProjectClassNames::default();
+    let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -3104,7 +3112,13 @@ fn resolve_deferred_relations(
     let mut edges_created = 0usize;
     let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
 
-    for d in deferred {
+    // Calls last: a typed receiver's call also binds overrides, found through
+    // `inherits` edges that may themselves be among the deferred.
+    let ordered = deferred
+        .iter()
+        .filter(|d| d.relation != REL_CALLS)
+        .chain(deferred.iter().filter(|d| d.relation == REL_CALLS));
+    for d in ordered {
         // routes_to whose imported-handler source never resolved at batch time.
         let source_ids: Vec<i64> = if d.relation == REL_ROUTES_TO && d.source_ids.is_empty() {
             let all = name_to_ids.get(&d.source_name).cloned().unwrap_or_default();
@@ -3313,7 +3327,14 @@ fn resolve_deferred_relations(
             }
 
             let mut handled = true;
+            let mut call_meta = d.metadata.as_deref();
             match parse_callee_metadata(d.metadata.as_deref()) {
+                Some(CalleeMeta::Module(module)) => {
+                    if !py_modules.contains(&module) {
+                        continue; // a library module's function, as at batch time
+                    }
+                    handled = false;
+                }
                 Some(CalleeMeta::Receiver(_))
                     if matches!(d.language.as_str(), "javascript" | "typescript" | "tsx") =>
                 {
@@ -3346,7 +3367,7 @@ fn resolve_deferred_relations(
                                 &source_ids,
                                 &[tgt_id],
                                 &d.relation,
-                                d.metadata.as_deref(),
+                                call_meta,
                                 false,
                             )?;
                         }
@@ -3361,31 +3382,76 @@ fn resolve_deferred_relations(
                             &source_ids,
                             &filtered,
                             &d.relation,
-                            d.metadata.as_deref(),
+                            call_meta,
                             false,
                         )?;
                     }
                     // empty → drop: qualifier is fixed and the pool is now complete.
                 }
-                Some(CalleeMeta::RecvType(recv_type)) => {
-                    // Bind precisely to the inferred type's own methods; an EMPTY
-                    // filter (inherited method / mis-inferred type) falls through
-                    // to the bare default chain below — rtype is strictly additive
-                    // precision and must never drop an edge the bare path would
-                    // have resolved (mirrors the batch-time arm).
+                Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
+                    let (recv_type, dispatch) = match meta {
+                        CalleeMeta::RecvType(t) => (t, true),
+                        CalleeMeta::SuperType(t) => (t, false),
+                        _ => unreachable!("matched above"),
+                    };
+                    // The receiver's class's own method; a project class without
+                    // it (inherited method) falls through to the default chain
+                    // below, over `all`, which already excludes free functions;
+                    // a class the project does not define binds nothing.
                     let same_lang = same_lang_of(&all, &d.language, &[]);
-                    let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
-                    if !filtered.is_empty() {
-                        edges_created += insert_relation_edges(
-                            db,
-                            &source_ids,
-                            &filtered,
-                            &d.relation,
-                            d.metadata.as_deref(),
-                            false,
-                        )?;
-                    } else {
+                    if same_lang.is_empty() {
+                        // Nothing by that name yet: the default chain buffers it.
                         handled = false;
+                    } else {
+                        match recv_type_targets(
+                            &recv_type,
+                            dispatch,
+                            &same_lang,
+                            db,
+                            &mut classes,
+                            &d.rel_path,
+                            &node_id_to_path,
+                        )? {
+                            RecvTypeTargets::Bind(own) => {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &own,
+                                    &d.relation,
+                                    call_meta,
+                                    false,
+                                )?;
+                            }
+                            RecvTypeTargets::Ambiguous(own) => {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &own,
+                                    &d.relation,
+                                    Some(crate::domain::CALL_META_MEMBER),
+                                    false,
+                                )?;
+                            }
+                            RecvTypeTargets::Fallback => {
+                                // Stored as the untyped member call it now resolves as,
+                                // so its edges are classified like one.
+                                call_meta = Some(crate::domain::CALL_META_MEMBER);
+                                handled = false;
+                            }
+                            // No project class of that name (yet): buffer it, so a
+                            // later run that adds the class can still bind it.
+                            RecvTypeTargets::Drop => {
+                                for &src_id in &source_ids {
+                                    crate::storage::queries::insert_pending_unresolved_call(
+                                        db.conn(),
+                                        src_id,
+                                        &d.target_name,
+                                        &d.language,
+                                        call_meta,
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
                 Some(CalleeMeta::Path(segments)) => {
@@ -3408,7 +3474,7 @@ fn resolve_deferred_relations(
                             &source_ids,
                             &final_targets,
                             &d.relation,
-                            d.metadata.as_deref(),
+                            call_meta,
                             false,
                         )?;
                     }
@@ -3437,7 +3503,7 @@ fn resolve_deferred_relations(
                     &source_ids,
                     &same_file_targets,
                     &d.relation,
-                    d.metadata.as_deref(),
+                    call_meta,
                     false,
                 )?;
                 continue;
@@ -3465,7 +3531,7 @@ fn resolve_deferred_relations(
                     &source_ids,
                     &final_targets,
                     &d.relation,
-                    d.metadata.as_deref(),
+                    call_meta,
                     false,
                 )?;
                 continue;
@@ -3479,7 +3545,7 @@ fn resolve_deferred_relations(
                     src_id,
                     &d.target_name,
                     &d.language,
-                    d.metadata.as_deref(),
+                    call_meta,
                 )?;
             }
             continue;

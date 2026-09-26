@@ -3,9 +3,13 @@
 ## Unreleased
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 72 → 73 because five call-graph errors below change which
-`calls` edges a file produces, and an existing index keeps the wrong ones until
-each file's content changes. Nothing to run.
+`INDEX_VERSION` goes 72 → 74 because the call-graph errors below change which
+nodes and `calls` edges a file produces, and an existing index keeps the wrong
+ones until each file's content changes. Nothing to run. To pin back:
+`npm i -g @sdsrs/code-graph@0.157.0`, or `cargo install code-graph-mcp --version
+0.157.0`; plugin users can set the version in the marketplace entry. An older
+binary leaves a v74 index intact and warns instead of rebuilding it; delete
+`.code-graph/index.db*` after pinning to get its graph back.
 
 ### Call edges measured against the compiler on four outside projects
 
@@ -13,21 +17,56 @@ The call graph was scored against SCIP indexes (the compilers' own name
 resolution) on pinned open-source corpora, one per language this repository
 has little or none of: hono (TypeScript), express (JavaScript), flask (Python)
 and leveldb (C++). `scripts/scip_oracle/corpora.sh DIR` clones, indexes and
-scores them. Four errors turned up and are fixed, plus a fifth that fixing one of them exposed. Before and after, precision
-and recall at the `inferred` confidence floor that `callgraph` and `impact` use (leveldb's
-extracted tier, the same-file edges: 822/966 = 85.1% → 1469/1617 = 90.8%):
+scores them. Every error below was found that way and is fixed. Before and
+after, precision and recall at the `inferred` confidence floor that
+`callgraph` and `impact` use, 0.157.0 against this release on the same SCIP
+indexes:
 
 | corpus | precision | recall |
 |---|---|---|
-| flask | 69/237 = 29.1% → 69/101 = 68.3% | 233/273, unchanged |
-| hono | 471/571 = 82.5% → 471/503 = 93.6% | 780/896, unchanged |
+| flask | 69/237 = 29.1% → 73/89 = 82.0% | 233/273 → 236/273 |
+| hono | 471/571 = 82.5% → 490/520 = 94.2% | 780/896 → 799/896 |
 | express | 5/9 → 5/5 | 63/68, unchanged |
-| leveldb | 641/682 = 94.0% → 792/838 = 94.5% | 1358/3356 = 40.5% → 2094/3394 = 61.7% |
-| this repo, JS | 495/516 → 493/493 | 1284/1289 → 1282/1289 |
-| this repo, Rust | 3105/3142 → 3105/3141 | 6509/6792, unchanged |
+| leveldb | 641/682 = 94.0% → 1355/1395 = 97.1% | 1364/3393 = 40.2% → 2620/3431 = 76.4% |
+| this repo, JS | 495/516 → 495/495 | 1284/1289, unchanged |
+| this repo, Rust | 3125/3162 → 3125/3161 | 6549/6832, unchanged |
 
+leveldb's extracted tier (same-file edges) went from 828/972 = 85.2% to
+1484/1563 = 94.9%. The recall denominators move because SCIP's gold pairs are
+counted only where code-graph has a caller node, and 0.157.0 was missing
+leveldb's test cases and exported classes.
+
+- **A member call bound every same-named method.** `x.f()` names only `f`, so
+  `snapshots_.Delete()` inside `DBImpl` bound `DBImpl::Delete`, and
+  `this.getCookies()` bound three sibling classes' `getCookies`. When the
+  source writes the receiver's class down, the call now binds that class's
+  method. That covers `this`/`self`, Python `super()` (its first base), a
+  Python local assigned from a constructor, a C++ local, parameter or in-class
+  field's declared type (`Slice s`, `DB* db`, `std::unique_ptr<T> p` for `->`),
+  JS `const q = new Q()`, and a TypeScript `: T`. Overrides in subclasses
+  are bound too, since the object may be one; `super()` is exempt, since it
+  names one implementation. A class the project does not define
+  (`std::string`, `AbortController`, an imported library class) binds nothing.
+  A project class without the method (inherited) resolves as an untyped member
+  call. Same-named classes are told apart: a caller's own file's class wins,
+  and a class nested in another (leveldb's `SkipList::Iterator`) is not the
+  top-level one of that name (`leveldb::Iterator`).
+- **A call through a library module bound a project function.** flask's
+  `click.echo()` bound flask's own `echo` (16 edges). A Python call through
+  an import of a module the project does not have now binds nothing;
+  `helpers.run()` on a project module is unchanged.
+- **A member call on an object bound free functions.** `words.push(x)`,
+  `JSON.stringify(v)`, `s.clear()` or `ctx.get(None)` could bind a project
+  function of that name, such as a nested `const push = () => …`, a
+  module-private `function stringify` or a free `void clear()`. An object's
+  member is never a free function, so in C++, Python, JavaScript and TypeScript
+  such a call no longer reaches one. The exception is a nested function that its
+  factory returns in an object literal (`return { attemptUpgrade }`). It is a
+  member of the returned object and is now qualified `makeStub.attemptUpgrade`.
+  A call through a module (`helpers.run()`, `require('./x').f()`, `m.f()` for
+  an imported `m`) is unchanged.
 - **Same-named functions in one file shared their calls.** A call's caller was
-  found by name, so every same-named definition in the file got it: flask's
+  found by name, so every same-named definition in the file got it. flask's
   test file has 37 nested `def index()` route handlers, and each carried the
   `url_for` / `flash` / `abort` calls of all the others (125 of flask's 168
   wrong inferred edges). The same happened to Rust `#[cfg]` twins and Python
@@ -36,50 +75,43 @@ extracted tier, the same-file edges: 822/966 = 85.1% → 1469/1617 = 90.8%):
   `DBTest.Get`, but its calls were recorded as coming from `TEST_F`, so 228 of
   leveldb's 229 test cases showed no callees and their helpers no test callers.
   Now 226 of 229 have their calls. A bare `Put()` in a test body, like one in
-  any member function, now binds the class's own `DBTest::Put` when the file
-  defines it, instead of every `Put` in the file (`ModelDB::Put`,
-  `Handler::Put`): 175 of the 180 wrong same-file edges that test bodies
-  brought in were that. `ModelDB::Put()` and a `Status(...)` constructor call
-  inside a `Status` member are not affected.
+  any member function, binds the class's own `DBTest::Put` when the file
+  defines it, instead of every `Put` in the file. `ModelDB::Put()` and a
+  `Status(...)` constructor call inside a `Status` member are not affected.
 - **`class LEVELDB_EXPORT Slice {` was not a class.** An export or annotation
   macro between `class`/`struct` and the name made the parser read the line as
-  a function `Slice` returning `class LEVELDB_EXPORT`; each such class became a
-  one-line node named after the macro, and its members free functions. 27 of
-  leveldb's class nodes were named after a macro; 26 are now `DB`, `Slice`,
-  `Status` and the rest, with their methods. The macro is blanked before
-  parsing.
-- **A member call on an object bound free functions.** `words.push(x)`,
-  `JSON.stringify(v)`, `s.clear()` or `ctx.get(None)` could bind a project
-  function of that name — a nested `const push = () => …`, a module-private
-  `function stringify`, a free `void clear()`. An object's member is never a
-  free function, so in C++, Python, JavaScript and TypeScript such a call no
-  longer reaches one. A call through a module (`helpers.run()`,
-  `require('./x').f()`, `m.f()` for an imported `m`) or through
-  `this`/`self` is unchanged.
+  a function `Slice` returning `class LEVELDB_EXPORT`. Each such class became a
+  one-line node named after the macro, and its members became free functions.
+  The macro is now blanked before parsing.
+- **A `class` or `struct` without a body made a node.** A forward declaration
+  (`class Cache;`, `class LEVELDB_EXPORT Cache;`) and every C type use
+  (`struct stat *st`, `static struct node *g(...)`) produced a class/struct
+  node of that name beside the real definition, or in place of a system type.
+  Only a definition makes one now.
+- **TypeScript `abstract class` was not a class.** It had no node, its methods
+  were unqualified, and its `extends`/`implements` made no edge.
 
 The JS/TS oracle's tsconfig now uses `"module": "preserve"`, which resolves
-extensionless ESM imports as well as `require()`; the oracle gained C++
+extensionless ESM imports as well as `require()`. The oracle also gained C++
 (scip-clang), virtual dispatch through SCIP's override relationships,
-constructor calls, and a `--repo DIR` option.
+constructor calls and a `--repo DIR` option.
 
 ### Not covered
 
-- **A closure returned in an object literal loses its member callers.**
-  `function makeStub() { function attemptUpgrade() {…} return { attemptUpgrade } }`
-  then `stub.attemptUpgrade()`: the target is a nested function, so the member
-  call no longer binds it. This repository has 2 such edges (the `recall` drop
-  above); every other member-call-to-function edge measured was wrong.
-- **A member call to the wrong class's method is still bound.** Without
-  receiver types, `snapshots_.Delete()` inside `DBImpl` binds `DBImpl::Delete`
-  in the same file. In leveldb 107 of 405 same-file member-call edges are wrong
-  this way.
-- **A call through an imported module still reaches a project function of
-  that name.** flask's `click.echo()` binds flask's own `echo` (16 edges):
-  a module binding is left unrestricted, since `helpers.run()` legitimately
-  reaches a free function.
-- A forward declaration with a macro (`class LEVELDB_EXPORT Cache;`) still
-  yields a one-line node named after the macro: in C, `struct FOO bar;` is a
-  variable, so `;` cannot mark a class name.
+- **A receiver the source does not type stays an untyped member call.** That
+  covers a C++ field used by a member function defined outside its class body
+  (`snapshots_.Delete()` in `db_impl.cc`, the field declared in `db_impl.h`),
+  a chain (`c.req.text()`), a call's result, and a Python name imported from
+  another module (`_cv_app.get()`). Such a call still binds every same-named
+  method: 48 of leveldb's 79 remaining wrong same-file edges are these.
+- **Overrides are found through `inherits` edges, which are bound by name.**
+  When two classes share a name, a subclass may be bound to the wrong one, so
+  such a class contributes no overrides.
+- **A later file does not re-bind an earlier typed call.** A class added after
+  its caller was indexed gets the call only while the call is still buffered
+  (a bounded number of runs). A subclass override added later gets no
+  existing callers until those callers' files change. `rebuild-index` binds
+  both.
 - C member calls are not restricted: a struct field commonly holds a free
   function of the same name (`ops->read` → `read`).
 

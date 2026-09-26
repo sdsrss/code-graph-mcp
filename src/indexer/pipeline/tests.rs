@@ -1773,10 +1773,10 @@ fn test_member_call_on_an_object_never_binds_a_free_function() {
             .filter_map(Result::ok)
             .collect()
     };
-    assert_eq!(
-        target_types("run"),
-        vec!["method".to_string()],
-        "s.clear() reached the free clear()"
+    // `s` is a `std::string`: no project `clear` of any kind runs.
+    assert!(
+        target_types("run").is_empty(),
+        "s.clear() on a std::string bound a project clear"
     );
     assert_eq!(
         target_types("both"),
@@ -1799,6 +1799,201 @@ fn test_member_call_on_an_object_never_binds_a_free_function() {
     ] {
         assert!(has(right), "lost: {right}\n{edges:#?}");
     }
+}
+
+/// D#89: a member call whose receiver's class the source writes down binds
+/// that class's method, not every same-named one — `this`/`self`, a C++ local,
+/// parameter or field's declared type, JS `new T()`, a TS `: T`, Python
+/// `super()`. A class the project does not define binds nothing; a subclass's
+/// override is bound too, except through `super()`.
+#[test]
+fn test_typed_receiver_binds_its_own_class_method() {
+    let files: &[(&str, &str)] = &[
+        (
+            "x.cc",
+            "struct A { void run() {} void go() { this->run(); } };\n\
+             struct B { void run() {} };\n\
+             struct H { B field; void use() { field.run(); } };\n\
+             void f(A& a, B* b, std::string s) { a.run(); b->run(); s.run(); }\n",
+        ),
+        (
+            "a.ts",
+            "class P { run() {} go() { this.run(); } }\n\
+             class Q { run() {} }\n\
+             function h() { const q = new Q(); q.run(); }\n\
+             function k(p: P) { p.run(); }\n\
+             function m() { const c = new AbortController(); c.run(); }\n",
+        ),
+        (
+            "m.py",
+            "import click\n\n\
+             def echo():\n    pass\n\n\
+             def cmd():\n    click.echo('x')\n\n\
+             class Base:\n    def run(self):\n        pass\n\n    def go(self):\n        self.run()\n\n\
+             class Sub(Base):\n    def run(self):\n        super().run()\n\n\
+             class Leaf(Sub):\n    def run(self):\n        pass\n\n\
+             class Other:\n    def run(self):\n        pass\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let calls = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT DISTINCT COALESCE(nt.qualified_name, nt.name) FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 WHERE e.relation = 'calls' AND (ns.qualified_name = ?1 OR ns.name = ?1) \
+                 AND nt.name IN ('run', 'echo') ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    for (caller, want) in [
+        ("A.go", vec!["A.run"]),
+        ("H.use", vec!["B.run"]),
+        ("f", vec!["A.run", "B.run"]),
+        ("P.go", vec!["P.run"]),
+        ("h", vec!["Q.run"]),
+        ("k", vec!["P.run"]),
+        ("m", vec![]),
+        ("cmd", vec![]),
+        ("Base.go", vec!["Base.run", "Leaf.run", "Sub.run"]),
+        ("Sub.run", vec!["Base.run"]),
+    ] {
+        assert_eq!(calls(caller), want, "calls of {caller}");
+    }
+}
+
+/// The same receiver typing on the pending-call sweep: a typed call buffered
+/// because no candidate existed yet binds its class's method when a later run
+/// adds it, not every same-named one.
+#[test]
+fn test_pending_typed_receiver_binds_its_own_class_method() {
+    // `r.ts` gives `run` a candidate from the start, so `q.run()` is not merely
+    // unresolved: its class is unknown, and it must stay buffered for `Q`.
+    let (project, _d, db) = fresh_index_of(&[
+        (
+            "a.ts",
+            "import { Q } from './q';\nfunction h() { const q = new Q(); q.run(); }\n\
+             function m() { const c = new AbortController(); c.run(); }\n",
+        ),
+        ("r.ts", "export class R { run() {} }\n"),
+    ]);
+    assert!(
+        !edge_set(&db)
+            .iter()
+            .any(|e| e.starts_with("a.ts.") && e.ends_with(".run")),
+        "a class the project does not define binds nothing"
+    );
+    fs::write(
+        project.path().join("q.ts"),
+        "export class Q { run() {} }\nexport class S { run() {} }\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = edge_set(&db);
+    let runs: Vec<_> = edges
+        .iter()
+        .filter(|e| e.starts_with("a.ts.") && e.ends_with(".run"))
+        .collect();
+    assert_eq!(runs, ["a.ts.h --calls--> q.ts.run"], "{edges:#?}");
+}
+
+/// D#89, the C++ spellings a class name alone gets wrong: a nested class
+/// (`SkipList::Iterator`, defined in its outer class's body, its methods
+/// qualified `Iterator.Next`) is not the top-level `Iterator`, and of two
+/// same-named classes the caller's own file's wins.
+#[test]
+fn test_typed_receiver_tells_same_named_cpp_classes_apart() {
+    let files: &[(&str, &str)] = &[
+        ("iter.h", "class Iterator {\n public:\n  virtual void Next() = 0;\n};\n"),
+        (
+            "skiplist.h",
+            "template <class K> class SkipList {\n public:\n  class Iterator {\n   public:\n    void Next();\n  };\n};\n\
+             template <class K> void SkipList<K>::Iterator::Next() {}\n\
+             void walk(SkipList<int>::Iterator it) { it.Next(); }\n",
+        ),
+        ("user.cc", "void drain(Iterator* it) { it->Next(); }\n"),
+        ("b1.cc", "class Bench { public: void Run() {} };\nint main() { Bench b; b.Run(); }\n"),
+        ("b2.cc", "class Bench { public: void Run() {} };\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let meta_of = |caller: &str, callee: &str| -> Vec<(String, Option<String>)> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT ft.path, e.metadata FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND ns.name = ?1 AND nt.name = ?2 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller, callee], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    // Spelled with its outer class: the nested class's method, typed.
+    assert_eq!(
+        meta_of("walk", "Next"),
+        vec![(
+            "skiplist.h".to_string(),
+            Some(r#"{"q":"rtype","v":"SkipList<int>::Iterator"}"#.to_string())
+        )]
+    );
+    // A bare `Iterator` is the top-level one, which defines no `Next`: not
+    // claimed as the nested class's, only an untyped member call.
+    let drain = meta_of("drain", "Next");
+    assert!(
+        drain
+            .iter()
+            .all(|(_, m)| m.as_deref() == Some(r#"{"q":"member"}"#)),
+        "{drain:?}"
+    );
+    assert_eq!(
+        meta_of("main", "Run"),
+        vec![(
+            "b1.cc".to_string(),
+            Some(r#"{"q":"rtype","v":"Bench"}"#.to_string())
+        )]
+    );
+}
+
+/// D#90: a nested function its factory returns in an object literal
+/// (`return { attemptUpgrade }`) is a member of what the factory returns, so a
+/// member call on that object reaches it; a nested helper nobody exposes stays
+/// out of reach, as does a top-level function.
+#[test]
+fn test_member_call_reaches_a_function_its_factory_returns() {
+    let files: &[(&str, &str)] = &[
+        (
+            "stub.js",
+            "function makeStub() {\n  function attemptUpgrade() {}\n  const reset = () => 1;\n  \
+             function hidden() {}\n  function renamed() {}\n  \
+             return { attemptUpgrade, reset: reset, again: renamed };\n}\n\
+             module.exports = { makeStub };\n",
+        ),
+        (
+            "use.js",
+            "const { makeStub } = require('./stub');\n\
+             function go() { const stub = makeStub(); stub.attemptUpgrade(); stub.reset(); \
+             stub.hidden(); stub.renamed(); }\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    assert!(
+        has("use.js.go --calls--> stub.js.attemptUpgrade"),
+        "{edges:#?}"
+    );
+    assert!(has("use.js.go --calls--> stub.js.reset"), "{edges:#?}");
+    // Not returned, or returned under another member name.
+    assert!(!has("use.js.go --calls--> stub.js.hidden"), "{edges:#?}");
+    assert!(!has("use.js.go --calls--> stub.js.renamed"), "{edges:#?}");
 }
 
 /// The same exclusion on the pending-call sweep: a member call buffered because

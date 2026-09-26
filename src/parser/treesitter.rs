@@ -348,6 +348,11 @@ fn extract_nodes(
             if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
             {
                 parsed.is_test = node_is_test;
+                if matches!(config.name, "javascript" | "typescript" | "tsx") {
+                    if let Some(q) = js_returned_member(&node, &parsed.name, source) {
+                        parsed.qualified_name = Some(q);
+                    }
+                }
                 results.push(parsed);
             } else if let Some(name) = super::route_handler_name(&node, source) {
                 // Anonymous `function (req, res) { ... }` used as an inline route
@@ -445,13 +450,19 @@ fn extract_nodes(
         "lexical_declaration" | "variable_declaration" => {
             for mut parsed in extract_named_arrows(&node, source) {
                 parsed.is_test = node_is_test;
+                if parsed.node_type == "function" {
+                    if let Some(q) = js_returned_member(&node, &parsed.name, source) {
+                        parsed.qualified_name = Some(q);
+                    }
+                }
                 results.push(parsed);
             }
         }
 
-        // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition)
+        // Classes: shared across TS/JS/Java (class_declaration), Python (class_definition),
+        // TS `abstract class` (abstract_class_declaration).
         // Kotlin: both classes and interfaces use class_declaration — distinguish by first child kind
-        "class_declaration" | "class" | "class_definition" => {
+        "class_declaration" | "abstract_class_declaration" | "class" | "class_definition" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 // Kotlin interfaces are class_declaration with first child kind "interface"
                 // Swift reuses class_declaration for class/struct/enum — first child is the keyword
@@ -785,7 +796,10 @@ fn extract_nodes(
             }
         }
 
-        // C++ class/struct
+        // C++ class/struct. Only a definition: without a body the specifier is a
+        // forward declaration (`class Cache;`) or a C type use (`struct stat *st`),
+        // naming a type defined elsewhere, and a node here would be a phantom twin.
+        "class_specifier" | "struct_specifier" if node.child_by_field_name("body").is_none() => {}
         "class_specifier" | "struct_specifier" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
                 let nt = if kind == "class_specifier" {
@@ -1255,6 +1269,76 @@ fn collect_binding_names(pattern: &tree_sitter::Node, source: &str, out: &mut Ve
         }
         _ => {}
     }
+}
+
+/// JS/TS function kinds that open a scope.
+const JS_FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "function",
+    "generator_function_declaration",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+];
+
+/// `outer.name` when the function `name`, declared at `decl` inside the
+/// function `outer`, is returned by `outer` in an object literal
+/// (`return { attemptUpgrade, reset: reset }`): a member of the object a
+/// factory returns, which a member call (`stub.attemptUpgrade()`) reaches. The
+/// dotted qualified name is what lets the resolver keep it for such a call
+/// (`filter_out_function_ids`).
+fn js_returned_member(decl: &tree_sitter::Node, name: &str, source: &str) -> Option<String> {
+    let mut cur = decl.parent();
+    let outer = loop {
+        let n = cur?;
+        if JS_FUNCTION_KINDS.contains(&n.kind()) {
+            break n;
+        }
+        cur = n.parent();
+    };
+    fn returns(node: tree_sitter::Node, name: &str, source: &str, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        if node.kind() == "return_statement" {
+            let mut value = node.named_child(0);
+            while let Some(v) = value.filter(|v| v.kind() == "parenthesized_expression") {
+                value = v.named_child(0);
+            }
+            if let Some(obj) = value.filter(|v| v.kind() == "object") {
+                return (0..obj.named_child_count())
+                    .filter_map(|i| obj.named_child(i))
+                    .any(|p| match p.kind() {
+                        "shorthand_property_identifier" => node_text(&p, source) == name,
+                        // `{ run: run }`; under another key (`{ again: run }`) a
+                        // member call names the key, which is no node's name.
+                        "pair" => {
+                            p.child_by_field_name("key")
+                                .is_some_and(|k| node_text(&k, source) == name)
+                                && p.child_by_field_name("value").is_some_and(|v| {
+                                    v.kind() == "identifier" && node_text(&v, source) == name
+                                })
+                        }
+                        _ => false,
+                    });
+            }
+        }
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .filter(|c| !JS_FUNCTION_KINDS.contains(&c.kind()))
+            .any(|c| returns(c, name, source, depth + 1))
+    }
+    if !returns(outer.child_by_field_name("body")?, name, source, 0) {
+        return None;
+    }
+    let outer_name = outer.child_by_field_name("name").or_else(|| {
+        outer
+            .parent()
+            .filter(|p| p.kind() == "variable_declarator")
+            .and_then(|p| p.child_by_field_name("name"))
+    })?;
+    Some(format!("{}.{name}", node_text(&outer_name, source)))
 }
 
 fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNode> {
@@ -2345,6 +2429,43 @@ describe('Widget', () => {
     }
 
     #[test]
+    fn test_parse_c_cpp_type_without_a_body_is_not_a_node() {
+        // Only a definition (`{ ... }`) defines a class or struct. A forward
+        // declaration (`class Plain;`, `class LEVELDB_EXPORT Cache;`) and every
+        // elaborated type use in C (`struct stat *st`) name one defined elsewhere
+        // (or nowhere, in a system header); each made a phantom same-named node.
+        for (lang, code, real) in [
+            (
+                "cpp",
+                "class LEVELDB_EXPORT Cache;\nclass Plain;\nstruct Pt;\nclass Real { public: int f(); };\n",
+                ("class", "Real"),
+            ),
+            (
+                "c",
+                "struct stat;\nvoid f(struct stat *st) { struct stat x; }\nstruct node { int v; };\nstatic struct node *g(struct node *n) { return n; }\n",
+                ("struct", "node"),
+            ),
+        ] {
+            let nodes = parse_code(code, lang).unwrap();
+            let types: Vec<_> = nodes
+                .iter()
+                .filter(|n| matches!(n.node_type.as_str(), "class" | "struct"))
+                .map(|n| (n.node_type.as_str(), n.name.as_str(), n.start_line))
+                .collect();
+            assert_eq!(types.len(), 1, "{lang}: only the definition; got {types:?}");
+            assert_eq!((types[0].0, types[0].1), real, "{lang}: got {types:?}");
+            let fns: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.node_type == "function")
+                .map(|n| n.name.as_str())
+                .collect();
+            if lang == "c" {
+                assert_eq!(fns, ["f", "g"], "functions must stay; got {fns:?}");
+            }
+        }
+    }
+
+    #[test]
     fn blank_class_decl_macros_only_blanks_a_macro_before_a_type_name() {
         let blanked: [(&str, &[&str]); 8] = [
             ("class LEVELDB_EXPORT Slice {", &["LEVELDB_EXPORT"]),
@@ -2671,6 +2792,19 @@ function Container() {
             "TSX function with complex JSX should be parsed, got: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn test_parse_ts_abstract_class_is_a_class() {
+        let code =
+            "export abstract class Base {\n  run(): void {}\n  protected abstract go(): void\n}\n";
+        let nodes = parse_code(code, "typescript").unwrap();
+        let got: Vec<_> = nodes
+            .iter()
+            .map(|n| (n.node_type.as_str(), n.qualified_name.as_deref()))
+            .collect();
+        assert!(got.contains(&("class", Some("Base"))), "got {got:?}");
+        assert!(got.contains(&("method", Some("Base.run"))), "got {got:?}");
     }
 
     #[test]
