@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.158.0
 
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 72 → 74 because the call-graph errors below change which
@@ -105,7 +105,7 @@ leveldb's test cases and exported classes.
 Indexing does more work per call. A full index took 7% longer on django
 (11.9 s → 12.8 s, 3,290 files), 11% on hono and 21% on leveldb (537 → 648 ms,
 most of it from the earlier INDEX_VERSION 73 fixes). A one-file edit on django
-takes as long as on 0.157.0: 0.8–1.7 s for both in interleaved runs.
+takes 1–5% longer than on 0.157.0 (0.8–1.4 s per file here).
 
 The JS/TS oracle's tsconfig now uses `"module": "preserve"`, which resolves
 extensionless ESM imports as well as `require()`. The oracle also gained C++
