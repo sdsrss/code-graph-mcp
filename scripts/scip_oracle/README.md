@@ -2,7 +2,7 @@
 
 Measures how right code-graph's `calls` edges are, per confidence tier, against
 the compiler-grade name resolution in a SCIP index: rust-analyzer for Rust,
-scip-typescript for JavaScript/TypeScript, scip-python for Python.
+scip-typescript for JavaScript/TypeScript, scip-python for Python, scip-clang for C++.
 
 The differential guards in `tests/` prove a change *agrees with the previous
 version*. This proves it *agrees with the compiler*. Use it for any change to call
@@ -15,6 +15,7 @@ resolution: report precision and recall before and after, not an edge total
 rustup component add rust-analyzer    # once
 scripts/scip_oracle/run.sh            # Rust, ~35 s on this repo
 scripts/scip_oracle/run.sh --json-out /tmp/after.json --samples 50
+scripts/scip_oracle/run.sh --dump-judged /tmp/judged.json   # every judged edge + verdict
 
 # JS/TS and Python: pinned indexers in a private prefix (not project deps)
 npm install --prefix /var/tmp/scip-tools --save-exact \
@@ -22,13 +23,29 @@ npm install --prefix /var/tmp/scip-tools --save-exact \
 export SCIP_TOOLS_BIN=/var/tmp/scip-tools/node_modules/.bin
 scripts/scip_oracle/run.sh --language javascript   # ~4 s
 scripts/scip_oracle/run.sh --language python       # ~4 s
+
+# C++: scip-clang is a standalone binary (on PATH or in SCIP_TOOLS_BIN)
+curl -sLo /var/tmp/scip-tools/scip-clang \
+  https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-x86_64-linux
+chmod +x /var/tmp/scip-tools/scip-clang
+COMPDB=build/compile_commands.json scripts/scip_oracle/run.sh --repo DIR --language cpp
+
+# Another repo, indexed by code-graph first (writes DIR/.code-graph, DIR/.gitignore)
+scripts/scip_oracle/run.sh --repo DIR --language python
+
+# The pinned external corpora below: clone, index, score (~10 min, mostly embedding)
+scripts/scip_oracle/corpora.sh /var/tmp/scip-corpora && rm -rf /var/tmp/scip-corpora
 ```
 
 For JS and Python, `run.sh` copies the working tree's files of that language
 (tracked + untracked, minus `.gitignore`d) into a temp dir, writes a tsconfig
 there for JS (the repo has none; `--infer-tsconfig` writes a `{}` tsconfig.json into
 the project root and then indexes 0 files), and
-scores against that copy. Nothing is written into the repo.
+scores against that copy. Nothing is written into the repo. The tsconfig uses
+`"module": "preserve"`, which resolves both `require()` and extensionless ESM
+imports (`from './hono-base'`); `nodenext` refuses the latter and every such call
+became external. On this repo the two give identical results.
+For C++, scip-clang reads a compilation database and indexes the repo in place.
 
 `run.sh` reads the index and never writes it: a running MCP server keeps it
 fresh, and indexing from here would race that server. With no server running,
@@ -116,7 +133,50 @@ has a synthetic test in `test_oracle.py`, and a mutation of each turns it red):
 | `call_sites_to_non_function_symbol` / `call_sites_to_unresolved_import` | JS/Python: a call whose callee SCIP does not know (see above) |
 | `call_sites_via_export_alias` | JS: a call through `module.exports = { f }`, resolved to `f` |
 | `enclosing_from_index_span` | JS: a nested function's span taken from its node |
-| `unjudged_edges_unknown_binding` / `unjudged_edges_untyped_call` | JS/Python: our edge to a name the caller calls through an unknown binding or an untyped receiver |
+| `unjudged_edges_unknown_binding` / `unjudged_edges_untyped_call` | JS/Python/C++: our edge to a name the caller calls through an unknown binding or an untyped receiver |
+| `call_sites_in_ambiguous_definition` | a call inside one of several same-file definitions of one symbol (overloads): no caller |
+| `call_sites_to_declaration_only_method` | a call to a pure virtual / abstract method: no callee, but its overrides are credited |
+| `edges_credited_via_override` | our edge to an override of the method the call names (virtual dispatch): correct |
+| `edges_credited_to_constructor_class` | our edge to the class of the constructor the call runs: correct |
+
+### Rules for every language: dispatch, constructors, overloads
+
+Found on the external corpora below, each with a synthetic test and a mutation
+that turns it red:
+
+- **Virtual dispatch.** `processor.getPath()` names the base method; the index
+  may bind the call to the overrides instead. SCIP records an override as an
+  `is_implementation` relationship; an edge to any (transitive) override of the
+  called method counts as correct, and as found for recall. A pure virtual or
+  abstract method has no definition, so a call to it is not gold, but edges to
+  its overrides are still credited (`call_sites_to_declaration_only_method`).
+- **Constructors.** `new Box()` references the constructor (TS `<constructor>`,
+  C++ `Box#Box(…)`); the index resolves it to the class node. An edge to the
+  constructor's class counts as the constructor. Recall splits these out as
+  the `constructor` call shape.
+- **Overloads.** `@overload` stubs and TS overload signatures share one symbol
+  with the implementation. A call in any of their bodies has no known caller and
+  is dropped (`call_sites_in_ambiguous_definition`), not credited to the
+  enclosing scope.
+- **Duplicate occurrences** (same range, symbol and role) are counted once.
+
+### C++ (scip-clang)
+
+- **Columns are UTF-8 bytes** although `position_encoding` is unset (measured:
+  `callee` after `"é😀"` is at column 48, the byte offset, not 45).
+- **Declarations are references.** A header's `Status Get(...);` is a role-0
+  occurrence shaped like a call. Outside every function body a call-shaped
+  reference is a declaration or an initializer: `call_sites_without_enclosing_fn`.
+- **No enclosing ranges.** Every caller's span is its node's
+  (`enclosing_from_index_span`), and no call is credited to `<module>`.
+- **Names.** scip-clang's name range stops at `~` and at `operator`, and a gtest
+  body's range is the `TEST_F` macro; they align to the index's `~Impl`,
+  `operator==` and `Suite.Case`.
+- **Type arguments.** `helper<int>(1)` is a call (so is TS `f<T>()`).
+- **One worker.** `run.sh` passes `--jobs=1`: with parallel workers a header is
+  indexed by whichever translation unit reaches it first, and leveldb's gold
+  moved between 3345 and 3394 pairs over identical input.
+- A `.h` file is indexed as `c`; `--language cpp` scores both.
 
 ### Blind spots of the oracle
 
@@ -137,8 +197,10 @@ has a synthetic test in `test_oracle.py`, and a mutation of each turns it red):
   `makeCooldown()` result bound to the closure the edge points at), some wrong
   (a parameter `install = npmInstallGlobal` bound to `lifecycle.install`); the
   oracle cannot tell which.
-- **JS: no TypeScript in this repo.** The JS numbers come from `.js` files; the
-  `.ts` path of `run.sh` has not been run against a real TS corpus.
+- **C++: one configuration per run**, like Rust's cfg: code behind an `#if` the
+  compilation database turns off has no occurrences. A template's dependent call
+  has none either: `t.f()` on a `T` is `unjudged_edges_untyped_call`, but the
+  untyped-receiver check reads only `.`, so `p->f()` on a dependent `p` is judged.
 - **Python: the import heuristic is one line.** A local counts as an unresolved
   import when one of its occurrences is on a line starting with `import`/`from`;
   a name inside a parenthesised multi-line import is not recognised.
@@ -210,3 +272,33 @@ The measured errors:
   `auto-update.js` ×1).
 - Everything else found: JS recall at the default floor is 1284/1289; Python
   197/197.
+
+## Baseline: external corpora, v0.157.0 and after the v73 fixes (2026-09-26)
+
+`corpora.sh` pins hono v4.6.14 (TypeScript), express 4.21.2 (JavaScript),
+flask 3.1.0 (Python) and leveldb 1.23 (C++; googletest/benchmark are compiled
+against but excluded from the index). Both arms were indexed the same way and
+scored with the same oracle. Precision / recall at the `inferred` floor:
+
+| corpus | v0.157.0 | after |
+|---|---|---|
+| hono | P 471/571, R 780/896 | P 471/503, R 780/896 |
+| express | P 5/9, R 63/68 | P 5/5, R 63/68 |
+| flask | P 69/237, R 233/273 | P 69/101, R 233/273 |
+| leveldb | P 641/682, R 1358/3356 | P 792/838, R 2094/3394 |
+
+leveldb extracted: 822/966 → 1469/1617. The five errors behind the change
+are in CHANGELOG.md (INDEX_VERSION 73). What is left, by category:
+
+- **Member call on another object bound to a same-name method** (no receiver
+  types): leveldb 107 of 405 same-file member-call edges; hono `c.text()` /
+  `req.arrayBuffer()`, flask `ctx.pop()` / `dict.get()`.
+- **A call through an external module bound to a project function**: flask
+  `click.echo()` (16 edges) reaches flask's own `echo`, because `click` is an
+  import binding and module calls are left unrestricted.
+- **Calls a SCIP indexer cannot name**: parameters, factory results, dependency
+  objects with no type information (`unjudged_edges_unknown_binding` /
+  `unjudged_edges_untyped_call`) — neither right nor wrong here.
+- **express gold is small (68 pairs)**: its methods are assigned
+  (`res.send = function send()`), which scip-typescript records as properties,
+  not callables.

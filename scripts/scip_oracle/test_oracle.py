@@ -52,10 +52,20 @@ def occ(rng, symbol, definition=False, enclosing=None):
     return b
 
 
-def document(path, occurrences, language="rust", encoding=1):
+def symbol_info(symbol, implements=()):
+    """SymbolInformation with an is_implementation relationship to each of `implements`."""
+    b = _len_field(1, symbol.encode())
+    for parent in implements:
+        b += _len_field(4, _len_field(1, parent.encode()) + _int_field(3, 1))
+    return b
+
+
+def document(path, occurrences, language="rust", encoding=1, symbols=()):
     b = _len_field(1, path.encode()) + _len_field(4, language.encode())
     for o in occurrences:
         b += _len_field(2, o)
+    for s in symbols:
+        b += _len_field(3, s)
     if encoding:  # 1 = UTF8CodeUnitOffsetFromLineStart; 0 (unset) is what scip-typescript/-python emit
         b += _int_field(6, encoding)
     return b
@@ -218,6 +228,27 @@ class Decode(unittest.TestCase):
         self.assertEqual(caller.range, (2, 3, 2, 9))
         self.assertEqual(caller.enclosing_range, (2, 0, 7, 13))
         self.assertFalse(doc.occurrences[3].is_definition)
+
+    def test_only_is_implementation_relationships_are_overrides(self):
+        ref_only = _len_field(4, _len_field(1, b"p B#") + _int_field(2, 1))  # is_reference
+        doc = document("a.ts", [], symbols=[
+            symbol_info("p A#f().", ["p B#f()."]),
+            _len_field(1, b"p C#") + ref_only,
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "index.scip")
+            with open(path, "wb") as f:
+                f.write(index_bytes([doc]))
+            (d,) = scip_decode.read_index(path)
+        self.assertEqual(d.implements, {"p A#f().": ["p B#f()."]})
+
+    def test_constructor_owner(self):
+        self.assertEqual(oracle.constructor_owner("cxx . . $ leveldb/DBImpl#DBImpl(6e)."), "cxx . . $ leveldb/DBImpl#")
+        self.assertEqual(oracle.constructor_owner("cxx . . $ Widget#Widget(aa)."), "cxx . . $ Widget#")
+        self.assertEqual(oracle.constructor_owner("npm . . src/`e.ts`/Box#`<constructor>`()."), "npm . . src/`e.ts`/Box#")
+        self.assertEqual(oracle.constructor_owner("cxx . . $ a/Outer#Inner#Inner(1)."), "cxx . . $ a/Outer#Inner#")
+        self.assertIsNone(oracle.constructor_owner("cxx . . $ a/DBImpl#Get(1)."))
+        self.assertIsNone(oracle.constructor_owner("cxx . . $ a/DBImpl#"))
 
 
 class Evaluate(unittest.TestCase):
@@ -516,6 +547,233 @@ class Python(unittest.TestCase):
         self.assertEqual(r["tiers"]["ambiguous"], {"judged": 1, "correct": 0})
         self.assertEqual(r["recall_by_call_shape"],
                          {"bare": {"found": 1, "gold": 2}, "member": {"found": 1, "gold": 1}})
+
+
+    def test_calls_inside_overload_stubs_are_not_the_modules(self):
+        # scip-python gives every `@overload` stub and the implementation one symbol:
+        # the definitions are ambiguous, and a call in their bodies has no caller.
+        src = ("@overload\n"                   # 0
+               "def f(x: int) -> int: ...\n"  # 1
+               "@overload\n"                   # 2
+               "def f(x: str) -> str: ...\n"  # 3
+               "def f(x):\n"                   # 4
+               "    return g()\n"              # 5
+               "def g():\n"                    # 6
+               "    pass\n")                   # 7
+        p = "scip-python python demo 0 `lib.o`/"
+        # scip-typescript gives a local no enclosing_range: the node spans stand in.
+        for enclosing in (True, False):
+            e = (lambda rng: rng) if enclosing else (lambda rng: None)
+            d = document("lib/o.py", [
+                occ([1, 4, 5], p + "f().", True, e([0, 0, 1, 25])),
+                occ([3, 4, 5], p + "f().", True, e([2, 0, 3, 25])),
+                occ([4, 4, 5], p + "f().", True, e([4, 0, 5, 14])),
+                occ([5, 11, 12], p + "g()."),
+                occ([6, 4, 5], p + "g().", True, e([6, 0, 7, 8])),
+            ], language="python", encoding=0)
+            with self.subTest(enclosing=enclosing), tempfile.TemporaryDirectory() as tmp:
+                scip, db = _write_case(tmp, "lib/o.py", src, [d], """
+                    INSERT INTO files VALUES (1, 'lib/o.py', 'python');
+                    INSERT INTO nodes VALUES (1, 1, 'function', 'f', 1, 2), (2, 1, 'function', 'f', 3, 4),
+                                             (3, 1, 'function', 'f', 5, 6), (4, 1, 'function', 'g', 7, 8),
+                                             (5, 1, 'module', '<module>', 1, 8);
+                """, [(3, 4, "extracted"), (1, 4, "extracted")])
+                r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="python")
+                self.assertEqual(r["gold_pairs"], 0)
+                self.assertEqual(r["funnel"]["call_sites_in_ambiguous_definition"], 1)
+                self.assertNotIn("call_sites_attributed_to_module", r["funnel"])
+                self.assertEqual(r["funnel"]["unjudged_edges_unmapped_function"], 2)
+
+
+# scip-clang: columns are UTF-8 bytes although position_encoding is unset, header
+# declarations are role-0 references shaped like calls, every occurrence in a header
+# repeats once per translation unit, and there is no enclosing_range at all.
+CXX = "cxx . . $ "
+SRC_CPP = (
+    "struct Base { virtual void Next(); };\n"          # 0 declaration: call-shaped, role 0
+    "struct Derived : Base { void Next() override; };\n"  # 1 declaration
+    "struct Widget { Widget(int x) {} };\n"            # 2 constructor defined in the class
+    "void Base::Next() {}\n"                           # 3
+    "void Derived::Next() {}\n"                        # 4 implements Base::Next
+    "template <typename T> void helper(T x) {}\n"      # 5
+    "void use(Base* b) {\n"                            # 6
+    "  const char* s = \"é\"; b->Next();\n"        # 7 gold use->Base::Next; `é` is 2 bytes
+    "  helper<int>(1);\n"                              # 8 gold use->helper through template args
+    "  Widget* w = new Widget(1);\n"                   # 9 gold use->Widget::Widget
+    "}\n"                                              # 10
+)
+
+
+def _at(line, token, nth=0):
+    """[line, start, end] in UTF-8 bytes of the nth `token` on SRC_CPP's line."""
+    text = SRC_CPP.split("\n")[line].encode()
+    i = -1
+    for _ in range(nth + 1):
+        i = text.index(token.encode(), i + 1)
+    return [line, i, i + len(token.encode())]
+
+
+def cpp_case(tmp, edges):
+    use_def = occ(_at(6, "use"), CXX + "use(cc).", True)
+    d = document("src/a.cc", [
+        occ(_at(0, "Base"), CXX + "Base#", True),
+        occ(_at(0, "Next"), CXX + "Base#Next(49)."),
+        occ(_at(1, "Derived"), CXX + "Derived#", True),
+        occ(_at(1, "Next"), CXX + "Derived#Next(49)."),
+        occ(_at(2, "Widget"), CXX + "Widget#", True),
+        occ(_at(2, "Widget", 1), CXX + "Widget#Widget(aa).", True),
+        occ(_at(3, "Base"), CXX + "Base#"),
+        occ(_at(3, "Next"), CXX + "Base#Next(49).", True),
+        occ(_at(4, "Next"), CXX + "Derived#Next(49).", True),
+        occ(_at(5, "helper"), CXX + "helper(bb).", True),
+        use_def, use_def,  # one per translation unit that saw it
+        occ(_at(7, "Next"), CXX + "Base#Next(49)."),
+        occ(_at(8, "helper"), CXX + "helper(bb)."),
+        occ(_at(9, "Widget"), CXX + "Widget#"),
+        occ(_at(9, "Widget", 1), CXX + "Widget#Widget(aa)."),
+    ], language="CPP", encoding=0,
+        symbols=[symbol_info(CXX + "Derived#Next(49).", [CXX + "Base#Next(49)."])])
+    return _write_case(tmp, "src/a.cc", SRC_CPP, [d], """
+        INSERT INTO files VALUES (1, 'src/a.cc', 'cpp');
+        INSERT INTO nodes VALUES (1, 1, 'struct', 'Base', 1, 1), (2, 1, 'struct', 'Derived', 2, 2),
+                                 (3, 1, 'struct', 'Widget', 3, 3), (4, 1, 'method', 'Widget', 3, 3),
+                                 (5, 1, 'method', 'Next', 4, 4), (6, 1, 'method', 'Next', 5, 5),
+                                 (7, 1, 'function', 'helper', 6, 6), (8, 1, 'function', 'use', 7, 11),
+                                 (9, 1, 'module', '<module>', 1, 11);
+    """, edges)
+
+
+class Cpp(unittest.TestCase):
+    def run_cpp(self, edges):
+        with tempfile.TemporaryDirectory() as tmp:
+            scip, db = cpp_case(tmp, edges)
+            return oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="cpp")
+
+    def test_declarations_dispatch_constructors_and_byte_columns(self):
+        r = self.run_cpp([
+            (8, 5, "extracted"),   # use->Base::Next: TP
+            (8, 6, "extracted"),   # use->Derived::Next: TP, virtual dispatch to an override
+            (8, 7, "inferred"),    # use->helper: TP
+            (8, 3, "inferred"),    # use->Widget (the class): TP, `new Widget(1)` runs its constructor
+            (7, 8, "ambiguous"),   # helper->use: FP
+        ])
+        self.assertEqual(r["gold_pairs"], 3)
+        self.assertEqual(r["tiers"]["extracted"], {"judged": 2, "correct": 2})
+        self.assertEqual(r["tiers"]["inferred"], {"judged": 2, "correct": 2})
+        self.assertEqual(r["tiers"]["ambiguous"], {"judged": 1, "correct": 0})
+        self.assertEqual(r["recall_at_floor"]["inferred"], {"found": 3, "gold": 3})
+        self.assertEqual(r["recall_by_call_shape"], {"bare": {"found": 1, "gold": 1},
+                                                     "constructor": {"found": 1, "gold": 1},
+                                                     "method": {"found": 1, "gold": 1}})
+        f = r["funnel"]
+        self.assertEqual(f["call_sites_without_enclosing_fn"], 2)  # the two declarations
+        self.assertEqual(f["edges_credited_via_override"], 1)
+        self.assertEqual(f["edges_credited_to_constructor_class"], 1)
+        self.assertNotIn("colliding_definitions", f)
+        self.assertNotIn("call_sites_attributed_to_module", f)
+
+    def test_dump_judged_lists_every_judged_edge_with_its_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scip, db = cpp_case(tmp, [(8, 5, "extracted"), (8, 3, "inferred"), (7, 8, "ambiguous")])
+            r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="cpp", dump_judged=True)
+        got = {(j["tier"], j["caller"], j["callee"], j["verdict"]) for j in r["judged_edges"]}
+        self.assertEqual(got, {("extracted", "use", "Next", "correct"), ("inferred", "use", "Widget", "correct"),
+                               ("ambiguous", "helper", "use", "no_call_by_that_name")})
+        self.assertEqual(len(r["judged_edges"]), sum(t["judged"] for t in r["tiers"].values()))
+
+    def test_override_edge_alone_is_recall(self):
+        r = self.run_cpp([(8, 6, "extracted")])
+        self.assertEqual(r["recall_at_floor"]["extracted"], {"found": 1, "gold": 3})
+
+    def test_class_edge_with_no_constructor_call_stays_unjudged(self):
+        r = self.run_cpp([(7, 3, "inferred")])  # helper->Widget: nothing to credit
+        self.assertEqual(r["tiers"]["inferred"], {"judged": 0, "correct": 0})
+        self.assertEqual(r["funnel"]["unjudged_edges_non_function_endpoint"], 1)
+
+
+SRC_CPP2 = (
+    "struct Iface { virtual int Get() = 0; };\n"                   # 0 pure virtual: never defined
+    "struct Impl : Iface { int Get() override; };\n"               # 1
+    "int Impl::Get() { return 1; }\n"                              # 2 implements Iface::Get
+    "Impl::~Impl() { Get(); }\n"                                   # 3 scip-clang's name range is `~`
+    "bool Impl::operator==(const Impl&) const { return Get(); }\n"  # 4 ... and `operator`
+    "TEST_F(Suite, Case) { Impl x; x.Get(); }\n"                   # 5 gtest: the index names it Suite.Case
+    "int call(Iface* i) { return i->Get(); }\n"                    # 6 dispatch through a declaration
+)
+
+
+def _at2(line, token):
+    text = SRC_CPP2.split("\n")[line].encode()
+    i = text.index(token.encode())
+    return [line, i, i + len(token.encode())]
+
+
+class CppNamesAndDeclarationOnlyMethods(unittest.TestCase):
+    def test_destructor_operator_gtest_and_pure_virtual(self):
+        d = document("src/b.cc", [
+            occ(_at2(0, "Iface"), CXX + "Iface#", True),
+            occ(_at2(0, "Get"), CXX + "Iface#Get(1)."),
+            occ(_at2(1, "Impl"), CXX + "Impl#", True),
+            occ(_at2(1, "Get"), CXX + "Impl#Get(1)."),
+            occ(_at2(2, "Get"), CXX + "Impl#Get(1).", True),
+            occ(_at2(3, "~"), CXX + "Impl#`~Impl`(2).", True),
+            occ(_at2(3, "Get"), CXX + "Impl#Get(1)."),
+            occ(_at2(4, "operator"), CXX + "Impl#`operator==`(3).", True),
+            occ(_at2(4, "Get"), CXX + "Impl#Get(1)."),
+            occ(_at2(5, "TEST_F"), CXX + "Suite_Case_Test#", True),
+            occ(_at2(5, "TEST_F"), CXX + "Suite_Case_Test#TestBody(4).", True),
+            occ(_at2(5, "Get"), CXX + "Impl#Get(1)."),
+            occ(_at2(6, "call"), CXX + "call(5).", True),
+            occ(_at2(6, "Get"), CXX + "Iface#Get(1)."),
+        ], language="CPP", encoding=0,
+            symbols=[symbol_info(CXX + "Impl#Get(1).", [CXX + "Iface#Get(1)."])])
+        with tempfile.TemporaryDirectory() as tmp:
+            scip, db = _write_case(tmp, "src/b.cc", SRC_CPP2, [d], """
+                INSERT INTO files VALUES (1, 'src/b.cc', 'cpp');
+                INSERT INTO nodes VALUES (1, 1, 'struct', 'Iface', 1, 1), (2, 1, 'struct', 'Impl', 2, 2),
+                                         (3, 1, 'method', 'Get', 3, 3), (4, 1, 'method', '~Impl', 4, 4),
+                                         (5, 1, 'method', 'operator==', 5, 5),
+                                         (6, 1, 'function', 'Suite.Case', 6, 6),
+                                         (7, 1, 'function', 'call', 7, 7);
+            """, [(4, 3, "extracted"), (5, 3, "extracted"), (6, 3, "extracted"),
+                  (7, 3, "inferred")])  # call->Impl::Get: `i->Get()` dispatches to it
+            r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="cpp")
+        self.assertEqual(r["gold_pairs"], 3)
+        self.assertEqual(r["tiers"]["extracted"], {"judged": 3, "correct": 3})
+        self.assertEqual(r["tiers"]["inferred"], {"judged": 1, "correct": 1})
+        f = r["funnel"]
+        self.assertNotIn("unmapped_definitions", f)
+        self.assertEqual(f["call_sites_to_declaration_only_method"], 1)
+        self.assertEqual(f["call_sites_without_enclosing_fn"], 2)  # the two declarations
+        self.assertEqual(f["edges_credited_via_override"], 1)
+        self.assertNotIn("call_sites_to_external", f)
+
+
+class TypeScriptConstructor(unittest.TestCase):
+    def test_new_credits_the_class_node(self):
+        src = ("class Box {\n"                 # 0
+               "  constructor() {}\n"          # 1
+               "}\n"                           # 2
+               "function make() {\n"           # 3
+               "  return new Box();\n"         # 4
+               "}\n")                          # 5
+        p = "scip-typescript npm . . src/`e.ts`/"
+        d = document("src/e.ts", [
+            occ([0, 6, 9], p + "Box#", True, [0, 0, 2, 1]),
+            occ([1, 2, 13], p + "Box#`<constructor>`().", True, [1, 2, 18]),
+            occ([3, 9, 13], p + "make().", True, [3, 0, 5, 1]),
+            occ([4, 13, 16], p + "Box#`<constructor>`()."),
+        ], language="typescript", encoding=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            scip, db = _write_case(tmp, "src/e.ts", src, [d], """
+                INSERT INTO files VALUES (1, 'src/e.ts', 'typescript');
+                INSERT INTO nodes VALUES (1, 1, 'class', 'Box', 1, 3), (2, 1, 'method', 'constructor', 2, 2),
+                                         (3, 1, 'function', 'make', 4, 6);
+            """, [(3, 1, "extracted")])
+            r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="javascript")
+        self.assertEqual(r["gold_pairs"], 1)
+        self.assertEqual(r["tiers"]["extracted"], {"judged": 1, "correct": 1})
+        self.assertEqual(r["recall_at_floor"]["extracted"], {"found": 1, "gold": 1})
 
 
 class Utf16Columns(unittest.TestCase):

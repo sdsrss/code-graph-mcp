@@ -4,7 +4,8 @@ Field numbers are from sourcegraph/scip `scip.proto`:
   Index            documents=2
   Document         relative_path=1 occurrences=2 symbols=3 language=4 position_encoding=6
   Occurrence       range=1 (packed int32) symbol=2 symbol_roles=3 enclosing_range=7
-  SymbolInformation symbol=1 kind=5 display_name=6
+  SymbolInformation symbol=1 relationships=4 kind=5 display_name=6
+  Relationship     symbol=1 is_implementation=3
 Everything else is skipped by wire type, so newer SCIP producers still decode.
 """
 
@@ -83,6 +84,7 @@ class Document:
     position_encoding: int = 0
     occurrences: list = field(default_factory=list)
     symbol_kinds: dict = field(default_factory=dict)
+    implements: dict = field(default_factory=dict)  # symbol -> symbols it overrides / implements
 
 
 def _occurrence(buf):
@@ -99,14 +101,29 @@ def _occurrence(buf):
     return Occurrence(rng, sym, roles, enc)
 
 
-def _symbol_info(buf):
-    sym, kind = "", 0
+def _implemented(buf):
+    """The relationship's symbol when it is an is_implementation one, else None."""
+    sym, impl = None, False
     for fno, _wt, v in _fields(buf):
         if fno == 1:
             sym = v.decode("utf-8")
+        elif fno == 3:
+            impl = bool(v)
+    return sym if impl else None
+
+
+def _symbol_info(buf):
+    sym, kind, parents = "", 0, []
+    for fno, _wt, v in _fields(buf):
+        if fno == 1:
+            sym = v.decode("utf-8")
+        elif fno == 4:
+            parent = _implemented(v)
+            if parent:
+                parents.append(parent)
         elif fno == 5:
             kind = v
-    return sym, kind
+    return sym, kind, parents
 
 
 def _document(buf):
@@ -117,8 +134,10 @@ def _document(buf):
         elif fno == 2:
             doc.occurrences.append(_occurrence(v))
         elif fno == 3:
-            sym, kind = _symbol_info(v)
+            sym, kind, parents = _symbol_info(v)
             doc.symbol_kinds[sym] = kind
+            if parents:
+                doc.implements.setdefault(sym, []).extend(parents)
         elif fno == 4:
             doc.language = v.decode("utf-8")
         elif fno == 6:
