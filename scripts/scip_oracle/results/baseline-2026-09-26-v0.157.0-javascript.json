@@ -1,0 +1,216 @@
+{
+  "funnel": {
+    "call_sites": 6405,
+    "call_sites_attributed_to_module": 4196,
+    "call_sites_to_external": 2309,
+    "call_sites_to_non_function_symbol": 3129,
+    "call_sites_to_unmapped_callee": 2,
+    "call_sites_to_unresolved_import": 288,
+    "call_sites_via_export_alias": 60,
+    "duplicate_pair_edges": 21,
+    "enclosing_from_index_span": 107,
+    "javascript_files_in_index_not_in_scip": 0,
+    "non_call_references": 943,
+    "self_calls_excluded": 6,
+    "unjudged_edges_unknown_binding": 58,
+    "unjudged_edges_untyped_call": 22,
+    "unmapped_definitions": 1,
+    "wrong_ambiguous_no_call_by_that_name": 2,
+    "wrong_ambiguous_wrong_target": 131,
+    "wrong_extracted_wrong_target": 7,
+    "wrong_inferred_wrong_target": 21
+  },
+  "gold_pairs": 1289,
+  "recall_at_floor": {
+    "ambiguous": {
+      "found": 1285,
+      "gold": 1289
+    },
+    "extracted": {
+      "found": 789,
+      "gold": 1289
+    },
+    "inferred": {
+      "found": 1284,
+      "gold": 1289
+    }
+  },
+  "recall_by_call_shape": {
+    "bare": {
+      "found": 1246,
+      "gold": 1250
+    },
+    "member": {
+      "found": 39,
+      "gold": 39
+    }
+  },
+  "samples": {
+    "missed": [
+      {
+        "callee": "clearCache",
+        "caller": "promoteVerifiedBinary",
+        "shape": "bare",
+        "site": "claude-plugin/scripts/auto-update.js:763"
+      },
+      {
+        "callee": "clearCache",
+        "caller": "binaryVersionResolved",
+        "shape": "bare",
+        "site": "claude-plugin/scripts/doctor.js:807"
+      },
+      {
+        "callee": "clearCache",
+        "caller": "binaryBrokenResolved",
+        "shape": "bare",
+        "site": "claude-plugin/scripts/doctor.js:825"
+      },
+      {
+        "callee": "clearCache",
+        "caller": "buildBinaryFromSource",
+        "shape": "bare",
+        "site": "claude-plugin/scripts/doctor.js:846"
+      }
+    ],
+    "unjudged_function_edges": [],
+    "unmapped_definitions": [
+      "claude-plugin/scripts/hooks.test.js:23 iterMatchers"
+    ],
+    "wrong": [
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "rewritePlan",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:1003",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "quotedSpans",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:279",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "extractDeclSymbols",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:306",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "extractCgFlags",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:481",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "addFilter",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:489",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "extractSedReadTargets",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:651",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "push",
+        "callee_at": "claude-plugin/scripts/pre-grep-guide.js:943",
+        "caller": "splitTopLevelSegments",
+        "caller_at": "claude-plugin/scripts/pre-grep-guide.js:766",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "parseDoctorArgs",
+        "caller_at": "claude-plugin/scripts/doctor.js:1401",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "<module>",
+        "caller_at": "claude-plugin/scripts/doctor.test.js:1",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "<module>",
+        "caller_at": "claude-plugin/scripts/find-binary.test.js:1",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "copyWithLocalDeps",
+        "caller_at": "claude-plugin/scripts/find-binary.test.js:218",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "<module>",
+        "caller_at": "claude-plugin/scripts/hook-emit.test.js:1",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "<module>",
+        "caller_at": "claude-plugin/scripts/hooks.test.js:1",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "surveyHookCoverage",
+        "caller_at": "claude-plugin/scripts/lifecycle.js:1140",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "has",
+        "callee_at": "claude-plugin/scripts/adopt.js:267",
+        "caller": "extractCallgraphSymbols",
+        "caller_at": "claude-plugin/scripts/post-grep-inject.js:102",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      }
+    ]
+  },
+  "tiers": {
+    "ambiguous": {
+      "correct": 1,
+      "judged": 134
+    },
+    "extracted": {
+      "correct": 789,
+      "judged": 796
+    },
+    "inferred": {
+      "correct": 495,
+      "judged": 516
+    }
+  }
+}

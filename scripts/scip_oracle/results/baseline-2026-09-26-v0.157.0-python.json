@@ -1,0 +1,102 @@
+{
+  "funnel": {
+    "call_sites": 1101,
+    "call_sites_attributed_to_module": 66,
+    "call_sites_to_external": 813,
+    "call_sites_to_non_function_symbol": 429,
+    "call_sites_to_unresolved_import": 47,
+    "non_call_references": 38,
+    "python_files_in_index_not_in_scip": 0,
+    "self_calls_excluded": 1,
+    "unjudged_edges_non_function_endpoint": 8,
+    "unjudged_edges_unknown_binding": 29,
+    "unjudged_edges_untyped_call": 5,
+    "wrong_inferred_wrong_target": 5
+  },
+  "gold_pairs": 197,
+  "recall_at_floor": {
+    "ambiguous": {
+      "found": 197,
+      "gold": 197
+    },
+    "extracted": {
+      "found": 159,
+      "gold": 197
+    },
+    "inferred": {
+      "found": 197,
+      "gold": 197
+    }
+  },
+  "recall_by_call_shape": {
+    "bare": {
+      "found": 165,
+      "gold": 165
+    },
+    "member": {
+      "found": 32,
+      "gold": 32
+    }
+  },
+  "samples": {
+    "missed": [],
+    "unjudged_function_edges": [],
+    "unmapped_definitions": [],
+    "wrong": [
+      {
+        "callee": "encode",
+        "callee_at": "scripts/embedding_benchmark/eval_retrieval.py:71",
+        "caller": "duplication_rate",
+        "caller_at": "scripts/audit-metrics.py:200",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "search",
+        "callee_at": "scripts/embedding_benchmark/eval_confidence.py:91",
+        "caller": "js_import_lines",
+        "caller_at": "scripts/audit-metrics.py:351",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "search",
+        "callee_at": "scripts/embedding_benchmark/eval_confidence.py:91",
+        "caller": "keyword_words",
+        "caller_at": "scripts/embedding_benchmark/build_short_slices.py:66",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "search",
+        "callee_at": "scripts/embedding_benchmark/eval_confidence.py:91",
+        "caller": "main",
+        "caller_at": "scripts/embedding_benchmark/diag_retrieval_drop.py:191",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      },
+      {
+        "callee": "search",
+        "callee_at": "scripts/embedding_benchmark/eval_confidence.py:91",
+        "caller": "is_callable_symbol",
+        "caller_at": "scripts/scip_oracle/oracle.py:35",
+        "kind": "wrong_target",
+        "tier": "inferred"
+      }
+    ]
+  },
+  "tiers": {
+    "ambiguous": {
+      "correct": 0,
+      "judged": 0
+    },
+    "extracted": {
+      "correct": 159,
+      "judged": 159
+    },
+    "inferred": {
+      "correct": 38,
+      "judged": 43
+    }
+  }
+}
