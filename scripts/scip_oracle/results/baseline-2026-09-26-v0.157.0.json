@@ -1,0 +1,392 @@
+{
+  "funnel": {
+    "ambiguous_definitions_in_one_file": 9,
+    "call_sites": 47707,
+    "call_sites_to_external": 37777,
+    "call_sites_to_unmapped_callee": 10,
+    "call_sites_without_enclosing_fn": 15,
+    "colliding_definitions": 11,
+    "duplicate_pair_edges": 18,
+    "non_call_references": 17448,
+    "rust_files_in_index_not_in_scip": 1,
+    "self_calls_excluded": 56,
+    "unjudged_edges_non_function_endpoint": 380,
+    "unjudged_edges_unmapped_function": 146,
+    "unmapped_definitions": 2,
+    "wrong_ambiguous_wrong_target": 8,
+    "wrong_extracted_no_call_by_that_name": 4,
+    "wrong_extracted_wrong_target": 46,
+    "wrong_inferred_no_call_by_that_name": 2,
+    "wrong_inferred_wrong_target": 35
+  },
+  "gold_pairs": 6792,
+  "recall_at_floor": {
+    "ambiguous": {
+      "found": 6514,
+      "gold": 6792
+    },
+    "extracted": {
+      "found": 3404,
+      "gold": 6792
+    },
+    "inferred": {
+      "found": 6509,
+      "gold": 6792
+    }
+  },
+  "recall_by_call_shape": {
+    "bare": {
+      "found": 4325,
+      "gold": 4331
+    },
+    "method": {
+      "found": 967,
+      "gold": 1082
+    },
+    "path": {
+      "found": 1222,
+      "gold": 1379
+    }
+  },
+  "samples": {
+    "missed": [
+      {
+        "callee": "type_filter_note",
+        "caller": "normalize_type_filter",
+        "shape": "path",
+        "site": "src/cli/commands/ast_search.rs:239"
+      },
+      {
+        "callee": "type_filter_note",
+        "caller": "cmd_ast_search",
+        "shape": "path",
+        "site": "src/cli/commands/ast_search.rs:66"
+      },
+      {
+        "callee": "as_str",
+        "caller": "cmd_callgraph",
+        "shape": "method",
+        "site": "src/cli/commands/callgraph.rs:289"
+      },
+      {
+        "callee": "headline",
+        "caller": "cmd_cycles",
+        "shape": "method",
+        "site": "src/cli/commands/cycles.rs:99"
+      },
+      {
+        "callee": "is_empty",
+        "caller": "cmd_dead_code",
+        "shape": "method",
+        "site": "src/cli/commands/dead_code.rs:152"
+      },
+      {
+        "callee": "relation_filter_vocab_list",
+        "caller": "cmd_refs",
+        "shape": "path",
+        "site": "src/cli/commands/refs.rs:216"
+      },
+      {
+        "callee": "display_node_name",
+        "caller": "cmd_refs",
+        "shape": "path",
+        "site": "src/cli/commands/refs.rs:564"
+      },
+      {
+        "callee": "headline",
+        "caller": "cmd_report",
+        "shape": "method",
+        "site": "src/cli/commands/report.rs:196"
+      },
+      {
+        "callee": "type_filter_note",
+        "caller": "cmd_search",
+        "shape": "path",
+        "site": "src/cli/commands/search.rs:140"
+      },
+      {
+        "callee": "total_tool_calls",
+        "caller": "build_stats_json",
+        "shape": "method",
+        "site": "src/cli/commands/stats.rs:129"
+      },
+      {
+        "callee": "as_str",
+        "caller": "cmd_tour",
+        "shape": "method",
+        "site": "src/cli/commands/tour.rs:77"
+      },
+      {
+        "callee": "to_json",
+        "caller": "cmd_health_check_opts",
+        "shape": "method",
+        "site": "src/cli/health.rs:471"
+      },
+      {
+        "callee": "to_line",
+        "caller": "cmd_health_check_opts",
+        "shape": "method",
+        "site": "src/cli/health.rs:637"
+      },
+      {
+        "callee": "new",
+        "caller": "embed_missing_nodes",
+        "shape": "path",
+        "site": "src/cli/index_ops.rs:107"
+      },
+      {
+        "callee": "normalize_rel_path",
+        "caller": "normalize_user_path_returns_index_key_spelling",
+        "shape": "path",
+        "site": "src/cli/tests.rs:1147"
+      }
+    ],
+    "unjudged_function_edges": [
+      {
+        "callee": "resolve_model_dir",
+        "callee_at": "scripts/nomic-bert-poc/src/main.rs:42",
+        "caller": "main",
+        "caller_at": "scripts/nomic-bert-poc/src/main.rs:85",
+        "tier": "extracted"
+      },
+      {
+        "callee": "layer_norm",
+        "callee_at": "scripts/nomic-bert-poc/src/main.rs:60",
+        "caller": "main",
+        "caller_at": "scripts/nomic-bert-poc/src/main.rs:85",
+        "tier": "extracted"
+      },
+      {
+        "callee": "linear",
+        "callee_at": "scripts/nomic-bert-poc/src/main.rs:69",
+        "caller": "main",
+        "caller_at": "scripts/nomic-bert-poc/src/main.rs:85",
+        "tier": "extracted"
+      },
+      {
+        "callee": "other_process_holds_index_lock",
+        "callee_at": "src/indexer/lock.rs:326",
+        "caller": "warn_if_index_locked",
+        "caller_at": "src/cli/index_ops.rs:274",
+        "tier": "inferred"
+      },
+      {
+        "callee": "other_process_holds_index_lock",
+        "callee_at": "src/indexer/lock.rs:326",
+        "caller": "lock_index_for_replace",
+        "caller_at": "src/cli/index_ops.rs:329",
+        "tier": "inferred"
+      },
+      {
+        "callee": "load",
+        "callee_at": "src/embedding/model.rs:64",
+        "caller": "embed_missing_nodes",
+        "caller_at": "src/cli/index_ops.rs:77",
+        "tier": "inferred"
+      },
+      {
+        "callee": "make_targz",
+        "callee_at": "src/embedding/model.rs:1062",
+        "caller": "test_extract_and_promote_is_atomic_and_rejects_incomplete",
+        "caller_at": "src/embedding/model.rs:1051",
+        "tier": "extracted"
+      },
+      {
+        "callee": "put",
+        "callee_at": "src/embedding/model.rs:1055",
+        "caller": "make_targz",
+        "caller_at": "src/embedding/model.rs:1062",
+        "tier": "extracted"
+      },
+      {
+        "callee": "find_models_dir",
+        "callee_at": "src/embedding/model.rs:691",
+        "caller": "load_model_data",
+        "caller_at": "src/embedding/model.rs:107",
+        "tier": "extracted"
+      },
+      {
+        "callee": "load",
+        "callee_at": "src/embedding/model.rs:64",
+        "caller": "test_embed_produces_correct_dims",
+        "caller_at": "src/embedding/model.rs:1229",
+        "tier": "extracted"
+      },
+      {
+        "callee": "load",
+        "callee_at": "src/embedding/model.rs:891",
+        "caller": "test_embed_produces_correct_dims",
+        "caller_at": "src/embedding/model.rs:1229",
+        "tier": "extracted"
+      },
+      {
+        "callee": "cache_models_dir",
+        "callee_at": "src/embedding/model.rs:117",
+        "caller": "download_state_file",
+        "caller_at": "src/embedding/model.rs:126",
+        "tier": "extracted"
+      },
+      {
+        "callee": "load",
+        "callee_at": "src/embedding/model.rs:64",
+        "caller": "test_embed_batch",
+        "caller_at": "src/embedding/model.rs:1270",
+        "tier": "extracted"
+      },
+      {
+        "callee": "load",
+        "callee_at": "src/embedding/model.rs:891",
+        "caller": "test_embed_batch",
+        "caller_at": "src/embedding/model.rs:1270",
+        "tier": "extracted"
+      },
+      {
+        "callee": "cosine_sim",
+        "callee_at": "src/embedding/model.rs:1338",
+        "caller": "test_embed_batch_matches_sequential",
+        "caller_at": "src/embedding/model.rs:1284",
+        "tier": "extracted"
+      }
+    ],
+    "unmapped_definitions": [
+      "benches/indexing.rs:79 benches",
+      "src/storage/db.rs:9 sqlite3_vec_init"
+    ],
+    "wrong": [
+      {
+        "callee": "l2_normalize",
+        "callee_at": "src/embedding/model.rs:907",
+        "caller": "embed",
+        "caller_at": "src/embedding/model.rs:896",
+        "kind": "no_call_by_that_name",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_get_callees",
+        "caller_at": "src/graph/query.rs:1143",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_get_callers",
+        "caller_at": "src/graph/query.rs:1190",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_cycle_detection",
+        "caller_at": "src/graph/query.rs:1236",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_both_direction",
+        "caller_at": "src/graph/query.rs:1273",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_callees_ordered_by_caller_count",
+        "caller_at": "src/graph/query.rs:1370",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_min_confidence_filters_ambiguous_edges",
+        "caller_at": "src/graph/query.rs:1470",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "test_min_confidence_extracted_tier_parity",
+        "caller_at": "src/graph/query.rs:1560",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/query.rs:25",
+        "caller": "wide_frontier_spanning_chunks_matches_oracle",
+        "caller_at": "src/graph/query.rs:980",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/reading_order.rs:29",
+        "caller": "paths",
+        "caller_at": "src/graph/reading_order.rs:220",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "as_str",
+        "callee_at": "src/graph/reading_order.rs:29",
+        "caller": "compute_reading_order",
+        "caller_at": "src/graph/reading_order.rs:73",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "is_lock_conflict",
+        "callee_at": "src/indexer/lock.rs:31",
+        "caller": "try_acquire_index_lock",
+        "caller_at": "src/indexer/lock.rs:106",
+        "kind": "no_call_by_that_name",
+        "tier": "extracted"
+      },
+      {
+        "callee": "is_lock_conflict",
+        "callee_at": "src/indexer/lock.rs:31",
+        "caller": "other_process_holds_index_lock",
+        "caller_at": "src/indexer/lock.rs:259",
+        "kind": "no_call_by_that_name",
+        "tier": "extracted"
+      },
+      {
+        "callee": "is_empty",
+        "callee_at": "src/mcp/metrics.rs:239",
+        "caller": "build_record",
+        "caller_at": "src/mcp/metrics.rs:260",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      },
+      {
+        "callee": "drop",
+        "callee_at": "src/mcp/server/mod.rs:2569",
+        "caller": "start_post_index_services",
+        "caller_at": "src/mcp/server/mod.rs:1157",
+        "kind": "wrong_target",
+        "tier": "extracted"
+      }
+    ]
+  },
+  "tiers": {
+    "ambiguous": {
+      "correct": 5,
+      "judged": 13
+    },
+    "extracted": {
+      "correct": 3404,
+      "judged": 3454
+    },
+    "inferred": {
+      "correct": 3105,
+      "judged": 3142
+    }
+  }
+}
