@@ -34,6 +34,10 @@ pub(super) enum CalleeMeta {
     RecvType(String),
     Receiver(String),
     Chain,
+    /// `x.f()` on an object that is not `this`/`self` or a module binding
+    /// (parser `relations/member.rs`): resolves like a bare call, minus the free
+    /// functions, which no member call can reach.
+    Member,
 }
 
 /// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
@@ -45,6 +49,7 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
     let q = v.get("q")?.as_str()?;
     match q {
         "chain" => Some(CalleeMeta::Chain),
+        "member" => Some(CalleeMeta::Member),
         "path" => {
             let payload = v.get("v")?.as_str()?;
             let segments: Vec<String> = payload.split("::").map(String::from).collect();
@@ -293,6 +298,10 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
             Some(CalleeMeta::Path(segments)) => {
                 // Drop on empty (drain the row without binding), never bare-fall-back.
                 path_filter_candidates(&segments, &candidates, &node_id_to_path, db, crate_roots)?
+            }
+            // Member call: the same free-function exclusion as Phase 2.
+            Some(CalleeMeta::Member) => {
+                member_call_candidates(row.metadata.as_deref(), candidates, db)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
@@ -1316,6 +1325,21 @@ pub(super) fn self_filter_candidates(
 ///
 /// Storage encodes methods as `Type.method` (treesitter.rs qualified_name
 /// assignment) and free functions as just `name`.
+/// Candidates a call can reach given its metadata: a member call (`CalleeMeta::
+/// Member`) cannot reach a free function; every other call keeps them all. One
+/// helper so the batch, deferred and pending paths cannot disagree.
+pub(super) fn member_call_candidates(
+    metadata: Option<&str>,
+    candidates: Vec<i64>,
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if matches!(parse_callee_metadata(metadata), Some(CalleeMeta::Member)) {
+        crate::storage::queries::filter_out_function_ids(db.conn(), &candidates)
+    } else {
+        Ok(candidates)
+    }
+}
+
 pub(super) fn method_candidates(
     candidates: &[i64],
     db: &crate::storage::db::Database,

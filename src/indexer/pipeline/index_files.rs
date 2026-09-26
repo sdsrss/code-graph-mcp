@@ -266,6 +266,9 @@ struct FileParsed {
     // source resolution can reject a same-named function/method (a C++ inline
     // constructor shares its class's name) — only a type node can be a supertype.
     node_types: Vec<String>,
+    // 1-based (start, end) lines parallel to node_ids: a relation's source_line
+    // picks among same-named source nodes by containment.
+    node_lines: Vec<(u32, u32)>,
 }
 
 /// The counters Phase 1a bumps from rayon worker threads, so they are atomics
@@ -621,6 +624,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_names = Vec::new();
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
+        let mut node_lines: Vec<(u32, u32)> = Vec::new();
 
         let module_node_id = insert_node_cached(
             db.conn(),
@@ -646,6 +650,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         // <module> resolves by its bare name; no qualified form.
         node_qualified_names.push(None);
         node_types.push("module".into());
+        node_lines.push((1, u32::MAX));
         nodes_created += 1;
 
         for pn in &pp.parsed_nodes {
@@ -673,6 +678,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_names.push(pn.name.clone());
             node_qualified_names.push(pn.qualified_name.clone());
             node_types.push(pn.node_type.clone());
+            node_lines.push((pn.start_line, pn.end_line));
             nodes_created += 1;
         }
 
@@ -686,6 +692,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_names,
             node_qualified_names,
             node_types,
+            node_lines,
         });
     }
 
@@ -1174,6 +1181,13 @@ fn resolve_batch_relations(
     for pf in batch_parsed {
         let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+        // Same-file qualified names, for C++ implicit-`this` member lookup below.
+        let local_qualified: HashMap<i64, &str> = pf
+            .node_ids
+            .iter()
+            .zip(pf.node_qualified_names.iter())
+            .filter_map(|(id, q)| q.as_deref().map(|q| (*id, q)))
+            .collect();
 
         // Pre-scan this file's require-namespace bindings
         // (`const m = require('./x')`, stamped `{"q":"ns_require",...}`) →
@@ -1243,6 +1257,25 @@ fn resolve_batch_relations(
                         && (!type_source_only
                             || !matches!(pf.node_types[i].as_str(), "function" | "method"))
                 })
+                .collect::<Vec<_>>();
+            // Same-named definitions in one file (cfg twins, `@overload` stubs,
+            // nested `def index()` handlers) all match by name. The relation's
+            // scope start line picks the innermost one containing it; with no
+            // line, or no node containing it, every name match stays (as before).
+            if source_ids.len() > 1 {
+                if let Some(line) = rel.source_line {
+                    let innermost = source_ids
+                        .iter()
+                        .copied()
+                        .filter(|&i| pf.node_lines[i].0 <= line && line <= pf.node_lines[i].1)
+                        .min_by_key(|&i| pf.node_lines[i].1 - pf.node_lines[i].0);
+                    if let Some(i) = innermost {
+                        source_ids = vec![i];
+                    }
+                }
+            }
+            let mut source_ids = source_ids
+                .into_iter()
                 .map(|i| pf.node_ids[i])
                 .collect::<Vec<_>>();
 
@@ -1760,10 +1793,17 @@ fn resolve_batch_relations(
             // Tier order: same-file → same-language → (calls: drop) / (other: global).
             // Dropping calls without a same-language match prevents Rust `hasher.update()`
             // binding to an unrelated JS `function update()` via bare-name collision.
-            let all_target_ids = name_to_ids
+            let mut all_target_ids = name_to_ids
                 .get(&rel.target_name)
                 .cloned()
                 .unwrap_or_default();
+            if rel.relation == REL_CALLS {
+                all_target_ids = super::resolve::member_call_candidates(
+                    rel.metadata.as_deref(),
+                    all_target_ids,
+                    db,
+                )?;
+            }
 
             let same_file_targets: Vec<i64> = all_target_ids
                 .iter()
@@ -1784,7 +1824,7 @@ fn resolve_batch_relations(
             // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
             // twins instead of the path-closest helpers.rs one).
             let target_ids = if !same_file_targets.is_empty() {
-                same_file_targets
+                cpp_implicit_this_members(&pf.language, rel, same_file_targets, &local_qualified)
             } else if rel.relation == REL_CALLS
                 && is_cross_file_call_noise(&rel.target_name, source_lang)
             {
@@ -1868,6 +1908,42 @@ fn resolve_batch_relations(
         unresolved_externals,
     })
 }
+/// C++ name lookup: a bare `f()` inside a member function (`Cls::m`, scope
+/// `Cls.m`, or a gtest `TEST_F(Suite, Case)` body, scope `Suite.Case`, which is a
+/// member of a class derived from `Suite`) finds the class's own `f` before any
+/// other. When the file defines `Cls.f`, only it is the target; otherwise every
+/// same-file candidate stays (a free function, or a member inherited from a base
+/// this file does not define). Only for a truly bare call: `DB::Put()` carries
+/// `{"q":"scoped"}` metadata and names its class itself, and `Cls(...)` inside a
+/// `Cls` member is a constructor call.
+fn cpp_implicit_this_members(
+    language: &str,
+    rel: &crate::parser::relations::ParsedRelation,
+    same_file_targets: Vec<i64>,
+    local_qualified: &HashMap<i64, &str>,
+) -> Vec<i64> {
+    if language != "cpp" || rel.relation != REL_CALLS || rel.metadata.is_some() {
+        return same_file_targets;
+    }
+    let Some((class, _)) = rel.source_name.rsplit_once('.') else {
+        return same_file_targets;
+    };
+    if rel.target_name == class.rsplit('.').next().unwrap_or(class) {
+        return same_file_targets; // `Status(...)` in a Status member: a constructor call
+    }
+    let own = format!("{class}.{}", rel.target_name);
+    let members: Vec<i64> = same_file_targets
+        .iter()
+        .copied()
+        .filter(|id| local_qualified.get(id) == Some(&own.as_str()))
+        .collect();
+    if members.is_empty() {
+        same_file_targets
+    } else {
+        members
+    }
+}
+
 pub(super) fn index_files(
     db: &Database,
     root: &Path,
@@ -3206,6 +3282,7 @@ fn resolve_deferred_relations(
         // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
         if d.relation == REL_CALLS {
             let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+            let all = super::resolve::member_call_candidates(d.metadata.as_deref(), all, db)?;
 
             // 6a. JS namespace-receiver constraint captured at batch time
             //     (`m.foo()` where `m` is a require/import-namespace binding).

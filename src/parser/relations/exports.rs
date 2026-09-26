@@ -150,6 +150,7 @@ pub(super) fn extract_export_names(
                             .to_string(),
                     ),
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -179,6 +180,7 @@ pub(super) fn extract_export_names(
                             relation: REL_EXPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -197,6 +199,7 @@ pub(super) fn extract_export_names(
                                         relation: REL_EXPORTS.into(),
                                         metadata: None,
                                         source_language: String::new(),
+                                        source_line: None,
                                     });
                                 }
                             }
@@ -230,6 +233,7 @@ fn collect_reexport_specifiers(
                     relation: REL_IMPORTS.into(),
                     metadata: metadata.map(str::to_string),
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -339,6 +343,7 @@ pub(super) fn extract_cjs_exports(
             relation: REL_EXPORTS.into(),
             metadata: None,
             source_language: String::new(),
+            source_line: None,
         });
     };
 

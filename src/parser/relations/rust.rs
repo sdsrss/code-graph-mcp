@@ -159,6 +159,7 @@ pub(super) fn extract_rust_use_imports(
                 relation: REL_IMPORTS.into(),
                 metadata: external.then(|| crate::domain::IMPORT_EXTERNAL_META.to_string()),
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -194,6 +195,7 @@ pub(super) fn extract_rust_impl_trait(
         relation: REL_IMPLEMENTS.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -287,6 +289,7 @@ pub(super) fn extract_rust_path_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -373,6 +376,7 @@ pub(super) fn extract_rust_type_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -515,6 +519,7 @@ pub(super) fn extract_rust_macro_token_call(
         relation: REL_CALLS.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -721,6 +726,7 @@ pub(super) fn extract_rust_value_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 

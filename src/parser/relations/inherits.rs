@@ -206,6 +206,7 @@ fn extract_declaration_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelat
             relation: REL_INHERITS.into(),
             metadata: None,
             source_language: String::new(),
+            source_line: None,
         });
     }
     extract_implements(&ctx.node, ctx.source, &cls, results);
@@ -260,6 +261,7 @@ fn extract_rust_impl_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelatio
             relation: REL_IMPLEMENTS.into(),
             metadata: Some(super::serialize_impl_method_metadata(&type_name)),
             source_language: String::new(),
+            source_line: None,
         });
     }
 }
@@ -302,6 +304,7 @@ fn extract_csharp_base_list(ctx: &HeritageCtx, results: &mut Vec<ParsedRelation>
             relation: rel.into(),
             metadata: None,
             source_language: String::new(),
+            source_line: None,
         });
     }
 }
@@ -513,6 +516,7 @@ pub(super) fn extract_implements(
                                             relation: REL_IMPLEMENTS.into(),
                                             metadata: None,
                                             source_language: String::new(),
+                                            source_line: None,
                                         });
                                     }
                                     // Handle generic_type: IService<T> -> extract IService
@@ -528,6 +532,7 @@ pub(super) fn extract_implements(
                                                     relation: REL_IMPLEMENTS.into(),
                                                     metadata: None,
                                                     source_language: String::new(),
+                                                    source_line: None,
                                                 });
                                             }
                                         }
@@ -552,6 +557,7 @@ pub(super) fn extract_implements(
                                     relation: REL_IMPLEMENTS.into(),
                                     metadata: None,
                                     source_language: String::new(),
+                                    source_line: None,
                                 });
                             }
                         }
@@ -573,6 +579,7 @@ pub(super) fn extract_implements(
                                 relation: REL_IMPLEMENTS.into(),
                                 metadata: None,
                                 source_language: String::new(),
+                                source_line: None,
                             });
                         }
                     }
@@ -594,6 +601,7 @@ pub(super) fn extract_implements(
                                             relation: REL_IMPLEMENTS.into(),
                                             metadata: None,
                                             source_language: String::new(),
+                                            source_line: None,
                                         });
                                     }
                                 }
@@ -607,6 +615,7 @@ pub(super) fn extract_implements(
                                 relation: REL_IMPLEMENTS.into(),
                                 metadata: None,
                                 source_language: String::new(),
+                                source_line: None,
                             });
                         }
                     }

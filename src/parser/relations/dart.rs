@@ -73,6 +73,7 @@ pub(super) fn extract_dart_imports(
                 relation: REL_IMPORTS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -127,6 +128,7 @@ pub(super) fn extract_dart_call_from_selector(
                 relation: REL_CALLS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }

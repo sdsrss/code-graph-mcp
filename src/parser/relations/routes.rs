@@ -93,6 +93,7 @@ fn extract_axum_routes(node: &tree_sitter::Node, source: &str) -> Vec<ParsedRela
                 relation: REL_ROUTES_TO.into(),
                 metadata: Some(metadata),
                 source_language: String::new(),
+                source_line: None,
             }
         })
         .collect()
@@ -229,6 +230,7 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             relation: REL_ROUTES_TO.into(),
             metadata: Some(metadata),
             source_language: String::new(),
+            source_line: None,
         })
     } else if matches!(
         handler_arg.kind(),
@@ -263,6 +265,7 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             relation: REL_ROUTES_TO.into(),
             metadata: Some(metadata),
             source_language: String::new(),
+            source_line: None,
         })
     } else {
         None
@@ -305,6 +308,7 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
         relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -387,6 +391,7 @@ pub(super) fn extract_python_route(
         relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
         source_language: String::new(),
+        source_line: None,
     })
 }
 

@@ -1691,6 +1691,186 @@ fn fresh_index_of(files: &[(&str, &str)]) -> (TempDir, TempDir, Database) {
     (project_dir, db_dir, db)
 }
 
+/// (caller start line, callee name) of every `calls` edge whose caller is named `name`.
+fn calls_from_named(db: &Database, name: &str) -> Vec<(i64, String)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ns.start_line, nt.name FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             WHERE e.relation = 'calls' AND ns.name = ?1 ORDER BY 1, 2",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// D#70: a call's source was bound by NAME to every same-named node in the file,
+/// so same-named twins shared each other's callees — nested route handlers in a
+/// Python test file (flask: 37 `def index()` in one file, 125 of 168 wrong
+/// inferred edges), cfg twins in Rust. Each twin must keep only its own calls.
+#[test]
+fn test_same_named_functions_in_one_file_keep_their_own_calls() {
+    let py = "def helper_a():\n    return 1\n\ndef helper_b():\n    return 2\n\n\
+              def test_one():\n    def index():\n        return helper_a()\n    return index\n\n\
+              def test_two():\n    def index():\n        return helper_b()\n    return index\n";
+    let rs = "#[cfg(unix)]\nfn lock() {\n    unix_impl();\n}\n#[cfg(not(unix))]\nfn lock() {\n    other_impl();\n}\n\
+              fn unix_impl() {}\nfn other_impl() {}\n";
+    let (_p, _d, db) = fresh_index_of(&[("app.py", py), ("lib.rs", rs)]);
+    let index = calls_from_named(&db, "index");
+    assert_eq!(
+        index,
+        vec![(8, "helper_a".to_string()), (13, "helper_b".to_string())]
+    );
+    let lock = calls_from_named(&db, "lock");
+    assert_eq!(lock.len(), 2, "one call per twin, got {lock:?}");
+    assert!(
+        lock[0].0 < lock[1].0 && lock[0].1 == "unix_impl" && lock[1].1 == "other_impl",
+        "got {lock:?}"
+    );
+}
+
+/// D#86: a member call on an object can only run a method. Bound by bare name it
+/// reached free functions: `words.push(x)` a nested `const push`, `JSON.stringify`
+/// a project `function stringify`, `s.clear()` a free `clear()`, `ctx.get()` a
+/// module-level `def get`. Module-binding calls and bare calls keep their targets.
+#[test]
+fn test_member_call_on_an_object_never_binds_a_free_function() {
+    let files: &[(&str, &str)] = &[
+        (
+            "a.js",
+            "function outer() { const push = () => 1; return push(); }\n\
+             function other(words) { words.push(1); }\n\
+             function f(v) { return JSON.stringify(v); }\n\
+             const u = require('./util');\nfunction g(v) { return u.stringify(v); }\n",
+        ),
+        ("util.js", "function stringify(v) { return v; }\nmodule.exports = { stringify };\n"),
+        (
+            "x.cc",
+            "void clear() {}\nstruct Cache { void clear() {} };\n\
+             void run(std::string& s) { s.clear(); }\nvoid both(Cache& c) { c.clear(); clear(); }\n",
+        ),
+        ("m.py", "import helpers\n\ndef get():\n    pass\n\ndef h(ctx):\n    ctx.get(1)\n\ndef k():\n    helpers.util()\n"),
+        ("helpers.py", "def util():\n    pass\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    // x.cc's free `clear` and `Cache::clear` share a name: judge by the target's type.
+    let target_types = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT DISTINCT nt.type FROM edges e JOIN nodes ns ON ns.id = e.source_id \
+                 JOIN nodes nt ON nt.id = e.target_id \
+                 WHERE e.relation = 'calls' AND ns.name = ?1 AND nt.name = 'clear' ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    assert_eq!(
+        target_types("run"),
+        vec!["method".to_string()],
+        "s.clear() reached the free clear()"
+    );
+    assert_eq!(
+        target_types("both"),
+        vec!["function".to_string(), "method".to_string()]
+    );
+    for wrong in [
+        "a.js.other --calls--> a.js.push",
+        "a.js.f --calls--> util.js.stringify",
+        "m.py.h --calls--> m.py.get",
+    ] {
+        assert!(
+            !has(wrong),
+            "member call bound a free function: {wrong}\n{edges:#?}"
+        );
+    }
+    for right in [
+        "a.js.outer --calls--> a.js.push",
+        "a.js.g --calls--> util.js.stringify",
+        "m.py.k --calls--> helpers.py.util",
+    ] {
+        assert!(has(right), "lost: {right}\n{edges:#?}");
+    }
+}
+
+/// The same exclusion on the pending-call sweep: a member call buffered because
+/// no candidate existed yet must not bind a free function that a LATER run adds.
+#[test]
+fn test_pending_member_call_never_binds_a_later_free_function() {
+    let (project, _d, db) = fresh_index_of(&[(
+        "a.js",
+        "function f(v) { return JSON.stringify(v); }\nfunction g() { return helper(); }\n",
+    )]);
+    fs::write(
+        project.path().join("util.js"),
+        "function stringify(v) { return v; }\nfunction helper() {}\nmodule.exports = { stringify, helper };\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let edges = edge_set(&db);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e == "a.js.g --calls--> util.js.helper"),
+        "bare call control: {edges:#?}"
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e == "a.js.f --calls--> util.js.stringify"),
+        "{edges:#?}"
+    );
+}
+
+/// A bare call inside a C++ member function finds its own class's member first
+/// (implicit `this`), and a gtest `TEST_F(DBTest, X)` body is a member of a class
+/// derived from `DBTest`. It used to bind every same-file method of that name:
+/// leveldb's db_test.cc also defines `ModelDB::Put` and `Handler::Put`, and 175 of
+/// 180 wrong same-file bare-call edges there were test bodies reaching them.
+#[test]
+fn test_cpp_bare_call_in_a_member_prefers_its_own_class() {
+    let cc = "struct ModelDB { void Put() {} };\nstruct DBTest { void Put() {} void Run(); };\n\
+              void Free() {}\nTEST_F(DBTest, Recovery) { Put(); }\nTEST_F(DBTest, UsesFree) { Free(); }\n\
+              void DBTest::Run() { Put(); }\nvoid Loose() { Put(); }\n\
+              void DBTest::Forward() { ModelDB::Put(); }\n\
+              struct Status { Status() {} static Status NotFound() { return Status(); } };\n";
+    let (_p, _d, db) = fresh_index_of(&[("db_test.cc", cc)]);
+    let qualified_targets = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT DISTINCT nt.qualified_name FROM edges e JOIN nodes ns ON ns.id = e.source_id \
+                 JOIN nodes nt ON nt.id = e.target_id \
+                 WHERE e.relation = 'calls' AND ns.name = ?1 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    assert_eq!(qualified_targets("DBTest.Recovery"), vec!["DBTest.Put"]);
+    assert_eq!(qualified_targets("Run"), vec!["DBTest.Put"]);
+    assert_eq!(qualified_targets("DBTest.UsesFree"), vec!["Free"]);
+    // A free function has no class: its bare call still reaches every candidate.
+    assert_eq!(
+        qualified_targets("Loose"),
+        vec!["DBTest.Put", "ModelDB.Put"]
+    );
+    // A qualified call names its class: `ModelDB::Put()` is not an implicit `this`.
+    assert!(qualified_targets("Forward").contains(&"ModelDB.Put".to_string()));
+    // `Status()` inside a Status member is a constructor call: the class stays.
+    assert!(qualified_targets("NotFound").contains(&"Status".to_string()));
+}
+
 const PIPE02_A_PY: &str = "def target():\n    return 1\n";
 const PIPE02_B_PY: &str = "from a import target\n\n\ndef caller():\n    return target()\n";
 

@@ -72,6 +72,7 @@ pub(super) fn extract_go_type_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 
@@ -162,6 +163,7 @@ pub(super) fn extract_go_inheritance(
             relation: REL_INHERITS.into(),
             metadata: None,
             source_language: String::new(),
+            source_line: None,
         })
         .collect()
 }
@@ -257,6 +259,7 @@ pub(super) fn extract_go_value_reference(
         relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     })
 }
 

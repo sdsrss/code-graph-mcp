@@ -50,6 +50,7 @@ impl ImportCtx<'_> {
             relation: REL_IMPORTS.into(),
             metadata,
             source_language: String::new(),
+            source_line: None,
         }
     }
 }
@@ -369,6 +370,7 @@ fn extract_go_import_spec(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
         relation: REL_IMPORTS.into(),
         metadata: None,
         source_language: String::new(),
+        source_line: None,
     });
 }
 
@@ -514,6 +516,7 @@ pub(super) fn extract_import_names(
                                         .to_string(),
                                     ),
                                     source_language: String::new(),
+                                    source_line: None,
                                 });
                             }
                         }
@@ -533,6 +536,7 @@ pub(super) fn extract_import_names(
                             relation: REL_IMPORTS.into(),
                             metadata: metadata.clone(),
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -579,6 +583,7 @@ fn emit_namespace_import(
                 .to_string(),
         ),
         source_language: String::new(),
+        source_line: None,
     });
 }
 
@@ -610,6 +615,7 @@ fn extract_import_specifiers_inner(
                 relation: REL_IMPORTS.into(),
                 metadata: metadata.map(str::to_string),
                 source_language: String::new(),
+                source_line: None,
             });
         }
         return;
@@ -655,6 +661,7 @@ fn extract_import_names_recursive_inner(
                 relation: REL_IMPORTS.into(),
                 metadata: metadata.map(str::to_string),
                 source_language: String::new(),
+                source_line: None,
             });
         }
         return;
@@ -690,6 +697,7 @@ pub(super) fn extract_python_import_names(
                         relation: REL_IMPORTS.into(),
                         metadata: Some(metadata),
                         source_language: String::new(),
+                        source_line: None,
                     });
                 }
             } else if child.kind() == "aliased_import" {
@@ -708,6 +716,7 @@ pub(super) fn extract_python_import_names(
                             relation: REL_IMPORTS.into(),
                             metadata: Some(metadata),
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -767,6 +776,7 @@ pub(super) fn extract_python_from_import_names(
                 serde_json::json!({ "python_module": name, "is_module_import": true }).to_string(),
             ),
             source_language: String::new(),
+            source_line: None,
         });
     };
     for i in 0..node.named_child_count() {
@@ -798,6 +808,7 @@ pub(super) fn extract_python_from_import_names(
                                 relation: REL_IMPORTS.into(),
                                 metadata,
                                 source_language: String::new(),
+                                source_line: None,
                             });
                         }
                     }
@@ -816,6 +827,7 @@ pub(super) fn extract_python_from_import_names(
                             relation: REL_IMPORTS.into(),
                             metadata,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -833,6 +845,7 @@ pub(super) fn extract_python_from_import_names(
                                 relation: REL_IMPORTS.into(),
                                 metadata,
                                 source_language: String::new(),
+                                source_line: None,
                             });
                         }
                     }
@@ -848,6 +861,7 @@ pub(super) fn extract_python_from_import_names(
                         relation: REL_IMPORTS.into(),
                         metadata,
                         source_language: String::new(),
+                        source_line: None,
                     });
                 }
                 _ => {}

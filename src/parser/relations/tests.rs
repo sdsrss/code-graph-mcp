@@ -582,6 +582,120 @@ void run() { Engine::ignite(); }
 }
 
 #[test]
+fn test_cpp_gtest_body_calls_are_sourced_from_the_gtest_node() {
+    // The node extractor names `TEST_F(Suite, Case) {...}` "Suite.Case"; a call's
+    // source must carry the same name, or the pipeline's by-name source lookup
+    // finds no node and every call in a gtest body is dropped (leveldb: 1 of 229
+    // TEST nodes had any call edge).
+    let code = r#"
+TEST_F(DBTest, GetFromImmutableLayer) {
+  Reopen();
+}
+TEST(Coding, Fixed32) { EncodeFixed32(); }
+"#;
+    let nodes = crate::parser::treesitter::parse_code(code, "cpp").unwrap();
+    let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let relations = extract_relations(code, "cpp").unwrap();
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for (case, callee) in [
+        ("DBTest.GetFromImmutableLayer", "Reopen"),
+        ("Coding.Fixed32", "EncodeFixed32"),
+    ] {
+        assert!(
+            names.contains(&case),
+            "node extractor should name the case {case}; got {names:?}"
+        );
+        assert!(
+            calls.contains(&(case, callee)),
+            "a call in {case} must be sourced from {case}; got {calls:?}"
+        );
+    }
+}
+
+/// (target, metadata) of every call in `code`.
+fn call_meta(code: &str, lang: &str) -> Vec<(String, Option<String>)> {
+    extract_relations(code, lang)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.target_name, r.metadata))
+        .collect()
+}
+
+fn meta_of<'a>(calls: &'a [(String, Option<String>)], target: &str) -> Option<&'a str> {
+    calls
+        .iter()
+        .find(|(t, _)| t == target)
+        .unwrap_or_else(|| panic!("no call to {target}: {calls:?}"))
+        .1
+        .as_deref()
+}
+
+const MEMBER: &str = r#"{"q":"member"}"#;
+
+#[test]
+fn test_member_call_on_an_object_is_marked_member() {
+    // D#86: `x.f()` on an object can only run a method, never a free function —
+    // the resolver needs to know the call was a member call. A receiver that is
+    // `this`/`self`/`super`, or a module/import binding, is not marked: those
+    // calls resolve as before.
+    let cpp = call_meta(
+        "void A::run() { snapshots_.Delete(s); p->clear(); this->Put(); Helper(); }",
+        "cpp",
+    );
+    assert_eq!(meta_of(&cpp, "Delete"), Some(MEMBER));
+    assert_eq!(meta_of(&cpp, "clear"), Some(MEMBER));
+    assert_eq!(meta_of(&cpp, "Put"), None);
+    assert_eq!(meta_of(&cpp, "Helper"), None);
+
+    let py = call_meta(
+        "import helpers\nimport pkg.mod as m\nfrom x import util\n\
+         def f(self, ctx):\n    ctx.get(1)\n    self.push()\n    helpers.run()\n    m.go()\n    \
+         util.parse()\n    super().close()\n    cls.make()\n    local()\n",
+        "python",
+    );
+    assert_eq!(meta_of(&py, "get"), Some(MEMBER));
+    for t in ["push", "run", "go", "parse", "close", "make", "local"] {
+        assert_eq!(meta_of(&py, t), None, "{t} must resolve as before: {py:?}");
+    }
+
+    let js = call_meta(
+        "import * as ns from './ns';\nimport def, { named as alias } from './d';\n\
+         const m = require('./m');\nconst { a } = require('./a');\n\
+         function f(words, res) {\n  words.push(1);\n  res.send();\n  obj.a.b.run();\n  getApp().start();\n\
+           this.own();\n  super.base();\n  m.fromM();\n  ns.fromNs();\n  def.fromDef();\n  alias.fromAlias();\n\
+           require('./x').fromX();\n  a.fromA();\n  bare();\n}\n",
+        "javascript",
+    );
+    for t in ["push", "send", "run", "start"] {
+        assert_eq!(meta_of(&js, t), Some(MEMBER), "{t}: {js:?}");
+    }
+    for t in ["own", "base", "fromX", "bare"] {
+        assert_eq!(meta_of(&js, t), None, "{t} must resolve as before: {js:?}");
+    }
+    // An import-bound receiver keeps the qualifier its module binding needs.
+    for (t, recv) in [
+        ("fromM", "m"),
+        ("fromNs", "ns"),
+        ("fromDef", "def"),
+        ("fromAlias", "alias"),
+        ("fromA", "a"),
+    ] {
+        let want = format!(r#"{{"q":"recv","v":"{recv}"}}"#);
+        assert_eq!(meta_of(&js, t), Some(want.as_str()), "{t}: {js:?}");
+    }
+
+    // C and Rust are untouched: a C struct's function-pointer field is commonly
+    // named like the free function it holds, and Rust has its own qualifiers.
+    let c = call_meta("void f(struct ops *o) { o->read(); }", "c");
+    assert_eq!(meta_of(&c, "read"), None);
+}
+
+#[test]
 fn test_extract_bash_source_imports() {
     let code = r#"#!/usr/bin/env bash
 source ./lib/utils.sh
@@ -3476,8 +3590,10 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     // so the indexer can bind them to a require-namespace module
     // (`const foo = require('./x')`); see Cycle 4. Bare calls (`baz()`) keep
     // metadata=None — the guard the previous test_non_rust_callee_metadata_
-    // unchanged enforced, preserved here for the non-receiver shapes.
-    let code = "function caller() { foo.bar(); baz(); }";
+    // unchanged enforced, preserved here for the non-receiver shapes. The
+    // receiver is an import binding here; one that is not (`obj.qux()`) is a
+    // member call on an object (`relations/member.rs`, D#86).
+    let code = "const foo = require('./x');\nfunction caller() { foo.bar(); baz(); obj.qux(); }";
     let relations = extract_relations(code, "javascript").unwrap();
     let bar = relations
         .iter()
@@ -3493,6 +3609,11 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
         .find(|r| r.relation == REL_CALLS && r.target_name == "baz")
         .expect("missing call baz");
     assert_eq!(baz.metadata, None, "bare baz() must keep metadata=None");
+    let qux = relations
+        .iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "qux")
+        .expect("missing call qux");
+    assert_eq!(qux.metadata.as_deref(), Some(r#"{"q":"member"}"#));
 }
 
 #[test]
@@ -3573,11 +3694,21 @@ class Holder:
         !runs.is_empty(),
         "expected some run() calls to be extracted"
     );
+    // No receiver TYPE may be claimed (no rtype). `w.run()` is a member call on
+    // an object (D#86: `{"q":"member"}`, which names no type); `self.run()` is
+    // not marked at all.
     for r in &runs {
+        let want = if r.source_name.starts_with("Holder.") {
+            None
+        } else {
+            Some(r#"{"q":"member"}"#)
+        };
         assert_eq!(
-            r.metadata, None,
-            "ambiguous/unknown receiver must stay bare (source={}); got {:?}",
-            r.source_name, r.metadata
+            r.metadata.as_deref(),
+            want,
+            "ambiguous/unknown receiver must not get a type (source={}); got {:?}",
+            r.source_name,
+            r.metadata
         );
     }
 }
@@ -3660,10 +3791,13 @@ def reassigned(w: A):
                 "local reassignment `w = B()` overrides the param annotation"
             );
         } else {
+            // No type claimed: only the D#86 member-call marker.
             assert_eq!(
-                r.metadata, None,
-                "un-annotated / builtin-annotated receiver must stay bare (source={}); got {:?}",
-                r.source_name, r.metadata
+                r.metadata.as_deref(),
+                Some(r#"{"q":"member"}"#),
+                "un-annotated / builtin-annotated receiver must not get a type (source={}); got {:?}",
+                r.source_name,
+                r.metadata
             );
         }
     }

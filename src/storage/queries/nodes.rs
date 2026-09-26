@@ -983,6 +983,26 @@ pub fn filter_method_ids(
     Ok(kept)
 }
 
+/// `node_ids` minus the free functions (`type = 'function'`): what a member call
+/// on an object can reach. Order is not preserved. Chunked under MAX_IN_PARAMS.
+pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut kept = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "SELECT id FROM nodes WHERE id IN ({}) AND type <> 'function'",
+            make_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            kept.push(row?);
+        }
+    }
+    Ok(kept)
+}
+
 /// Find nodes that are missing context strings (likely from a failed Phase 3).
 /// Excludes external pseudo-nodes which never have context strings.
 pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {

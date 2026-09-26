@@ -221,6 +221,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             relation: REL_IMPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
 
@@ -263,6 +264,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                                     relation: REL_IMPORTS.into(),
                                                     metadata: Some(metadata.clone()),
                                                     source_language: String::new(),
+                                                    source_line: None,
                                                 });
                                             }
                                         }
@@ -282,6 +284,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                         relation: REL_IMPORTS.into(),
                                         metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
                                         source_language: String::new(),
+                                        source_line: None,
                                     });
                                 }
                             }
@@ -362,16 +365,50 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         _ => unreachable!(),
                     }
                 }
-                let metadata = serialize_callee_qualifier(&qualifier);
+                // A member call on an object (not this / a module binding) can
+                // only run a method: tell the resolver (see `member.rs`). A JS
+                // identifier receiver arrives as `Receiver`, kept only when it is
+                // an import binding, whose namespace resolution needs it.
+                let member = matches!(
+                    qualifier,
+                    helpers::CalleeQualifier::Bare | helpers::CalleeQualifier::Receiver(_)
+                ) && super::member::is_member_call(node, source, ctx.config.name);
+                let metadata = if member {
+                    Some(super::member::MEMBER_META.to_string())
+                } else if ctx.config.name == "cpp" && is_cpp_scoped_call(node) {
+                    // `DB::Put()` names its class: tell the resolver it is not a
+                    // bare `Put()` (whose implicit `this` prefers the caller's
+                    // own class). Resolves as a bare name otherwise.
+                    Some(CPP_SCOPED_META.to_string())
+                } else {
+                    serialize_callee_qualifier(&qualifier)
+                };
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,
                     relation: REL_CALLS.into(),
                     metadata,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
+    }
+}
+
+/// Metadata of a C++ call through a scope (`DB::Put()`, `ns::f<T>()`).
+pub(crate) const CPP_SCOPED_META: &str = r#"{"q":"scoped"}"#;
+
+fn is_cpp_scoped_call(call: tree_sitter::Node) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    match function.kind() {
+        "qualified_identifier" => true,
+        "template_function" => function
+            .child_by_field_name("name")
+            .is_some_and(|n| n.kind() == "qualified_identifier"),
+        _ => false,
     }
 }
 
@@ -391,6 +428,7 @@ fn extract_struct_literal(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -444,6 +482,7 @@ fn extract_js_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: serialize_callee_qualifier(&qualifier),
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -477,6 +516,7 @@ fn extract_csharp_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -514,6 +554,7 @@ fn extract_php_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -543,13 +584,18 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         // Falls back to the bare, metadata-less form (unchanged behavior)
         // whenever the type can't be proven — never emits a wrong-type edge.
         let metadata = super::infer_python_call_receiver_type(&node, source)
-            .map(|ty| serialize_rtype_metadata(&ty));
+            .map(|ty| serialize_rtype_metadata(&ty))
+            .or_else(|| {
+                super::member::is_member_call(node, source, "python")
+                    .then(|| super::member::MEMBER_META.to_string())
+            });
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,
             relation: REL_CALLS.into(),
             metadata,
             source_language: String::new(),
+            source_line: None,
         });
     }
 }
@@ -571,6 +617,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             relation: REL_IMPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -586,6 +633,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -612,6 +660,7 @@ fn extract_java_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -663,6 +712,7 @@ fn extract_php_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 relation: REL_CALLS.into(),
                 metadata: None,
                 source_language: String::new(),
+                source_line: None,
             });
         }
     }
@@ -696,6 +746,7 @@ fn extract_csharp_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }
@@ -747,6 +798,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             relation: REL_IMPORTS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -782,6 +834,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     relation: REL_CALLS.into(),
                     metadata: None,
                     source_language: String::new(),
+                    source_line: None,
                 });
             }
         }

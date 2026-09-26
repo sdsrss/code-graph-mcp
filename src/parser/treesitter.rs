@@ -44,7 +44,14 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             .get_mut(language)
             .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
         let timeout = std::time::Duration::from_millis(parse_timeout_ms());
-        match parse_with_deadline(parser, source, timeout) {
+        // The tree's byte ranges index the ORIGINAL source: blanking keeps every
+        // offset, so callers slice node text from `source`, macro included.
+        let parsed = if matches!(language, "c" | "cpp") {
+            blank_class_decl_macros(source)
+        } else {
+            Cow::Borrowed(source)
+        };
+        match parse_with_deadline(parser, &parsed, timeout) {
             Some(tree) => Ok(tree),
             None => {
                 parser.reset();
@@ -52,6 +59,125 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             }
         }
     })
+}
+
+/// Blank (with spaces, same byte length) the attribute macros between `class` /
+/// `struct` and the type name: `class LEVELDB_EXPORT Slice {`, `struct
+/// SCOPED_LOCKABLE MutexLock : Base {`, `class __declspec(dllexport) W {`.
+/// tree-sitter cannot expand a macro, so it reads that line as a function
+/// `Slice` returning `class LEVELDB_EXPORT`, the class body as the function's
+/// body, and every member as a statement or an ERROR. A macro here is an
+/// all-caps identifier (or `__declspec(...)` / `__attribute__((...))`) followed
+/// by another identifier and then `{`, `:` or `final` — no other C/C++ construct
+/// has two identifiers after `class`/`struct` before a body.
+fn blank_class_decl_macros(source: &str) -> Cow<'_, str> {
+    let b = source.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word_end = |mut i: usize| {
+        while i < b.len() && ident(b[i]) {
+            i += 1;
+        }
+        i
+    };
+    // The byte just past a balanced `( ... )` starting at `i`, or None.
+    let parens_end = |mut i: usize| {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b';' | b'{' | b'}' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let is_kw = |kw: &[u8]| {
+            b[i..].starts_with(kw)
+                && (i == 0 || !ident(b[i - 1]))
+                && b.get(i + kw.len()).is_some_and(|c| c.is_ascii_whitespace())
+        };
+        let kw_len = if is_kw(b"class") {
+            5
+        } else if is_kw(b"struct") {
+            6
+        } else {
+            i += 1;
+            continue;
+        };
+        let mut j = skip_ws(i + kw_len);
+        let mut macros = Vec::new();
+        let matched = loop {
+            let start = j;
+            let end = word_end(j);
+            if end == start {
+                break false;
+            }
+            let word = &source[start..end];
+            let after = skip_ws(end);
+            let is_macro_word = word.len() >= 2
+                && word.bytes().any(|c| c.is_ascii_uppercase())
+                && word
+                    .bytes()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+            let (macro_end, next) = if word.starts_with("__") && b.get(after) == Some(&b'(') {
+                match parens_end(after) {
+                    Some(e) => (e, skip_ws(e)),
+                    None => break false,
+                }
+            } else {
+                (end, after)
+            };
+            // `word` is the type name once a macro was seen and a body or base
+            // clause follows (`::` would be a qualified name, not a base). Checked
+            // before the macro test: an all-caps name (`class LEVELDB_EXPORT DB {`)
+            // is shaped like a macro too.
+            let tail = &b[after..];
+            let body = tail.first() == Some(&b'{')
+                || (tail.first() == Some(&b':') && tail.get(1) != Some(&b':'))
+                || (tail.starts_with(b"final") && !tail.get(5).is_some_and(|&c| ident(c)));
+            if macro_end == end && !macros.is_empty() && body {
+                break true;
+            }
+            if !(is_macro_word || macro_end != end) || next >= b.len() || !ident(b[next]) {
+                break false;
+            }
+            macros.push((start, macro_end));
+            j = next;
+        };
+        if matched {
+            spans.extend(macros);
+        }
+        i += kw_len;
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut out = b.to_vec();
+    for (s, e) in spans {
+        for c in &mut out[s..e] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    }
+    // Only ASCII bytes were replaced by ASCII spaces, so this stays valid UTF-8.
+    Cow::Owned(String::from_utf8(out).expect("blanking ASCII keeps UTF-8 valid"))
 }
 
 /// Parse `source`, giving up once `timeout` has elapsed — `None` then, as for any
@@ -1318,7 +1444,10 @@ fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<Str
 /// `TEST(Suite, Name) { ... }` has a function_declarator whose inner
 /// declarator is `TEST` and parameters are two type_identifiers.
 /// Returns `Some("Suite.Name")` when the macro matches; None otherwise.
-fn extract_gtest_test_name(declarator: &tree_sitter::Node, source: &str) -> Option<String> {
+pub(crate) fn extract_gtest_test_name(
+    declarator: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
     if declarator.kind() != "function_declarator" {
         return None;
     }
@@ -2170,6 +2299,102 @@ describe('Widget', () => {
             Some(false),
             "non-gtest function should not be is_test"
         );
+    }
+
+    #[test]
+    fn test_parse_cpp_class_with_export_macro_keeps_its_name() {
+        // `class LEVELDB_EXPORT Slice {` — an export/annotation macro between the
+        // keyword and the name is how most C++ libraries declare public classes.
+        // The class must be `Slice`, and its members its methods.
+        let code = "class LEVELDB_EXPORT Slice {\n public:\n  Slice() {}\n  size_t size() const { return n_; }\n};\nstruct SCOPED_LOCKABLE MutexLock : public Base {\n  void Unlock() {}\n};\n";
+        let nodes = parse_code(code, "cpp").unwrap();
+        let dump: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.node_type.as_str(),
+                    n.name.as_str(),
+                    n.qualified_name.as_deref(),
+                    n.start_line,
+                    n.end_line,
+                )
+            })
+            .collect();
+        let tree = parse_tree(code, "cpp").unwrap();
+        let sexp = tree.root_node().to_sexp();
+        for (ty, name, lines) in [("class", "Slice", (1, 5)), ("struct", "MutexLock", (6, 8))] {
+            assert!(
+                dump.iter()
+                    .any(|d| d.0 == ty && d.1 == name && (d.3, d.4) == lines),
+                "expected {ty} {name} spanning {lines:?}; got {dump:?}\n{sexp}"
+            );
+        }
+        for (method, qual) in [("size", "Slice.size"), ("Unlock", "MutexLock.Unlock")] {
+            assert!(
+                dump.iter()
+                    .any(|d| d.0 == "method" && d.1 == method && d.2 == Some(qual)),
+                "expected method {qual}; got {dump:?}"
+            );
+        }
+        assert!(
+            !dump
+                .iter()
+                .any(|d| matches!(d.1, "LEVELDB_EXPORT" | "SCOPED_LOCKABLE")),
+            "a macro must not become a node; got {dump:?}"
+        );
+    }
+
+    #[test]
+    fn blank_class_decl_macros_only_blanks_a_macro_before_a_type_name() {
+        let blanked: [(&str, &[&str]); 8] = [
+            ("class LEVELDB_EXPORT Slice {", &["LEVELDB_EXPORT"]),
+            ("class LEVELDB_EXPORT DB {", &["LEVELDB_EXPORT"]),
+            ("class EXPORT IO : public Base {", &["EXPORT"]),
+            (
+                "struct SCOPED_LOCKABLE M : public B {",
+                &["SCOPED_LOCKABLE"],
+            ),
+            (
+                "class A_API B_DEPRECATED W final {",
+                &["A_API", "B_DEPRECATED"],
+            ),
+            (
+                "class __declspec(dllexport) W {",
+                &["__declspec(dllexport)"],
+            ),
+            (
+                "struct __attribute__((packed)) P {",
+                &["__attribute__((packed))"],
+            ),
+            ("x; class\tFOO_EXPORT\nW\n{", &["FOO_EXPORT"]),
+        ];
+        for (src, macros) in blanked {
+            let want = macros.iter().fold(src.to_string(), |s, m| {
+                s.replacen(m, &" ".repeat(m.len()), 1)
+            });
+            let got = blank_class_decl_macros(src);
+            assert_eq!(got, want, "for {src:?}");
+            assert_eq!(got.len(), src.len());
+        }
+        for src in [
+            "class Slice {",
+            "struct FOO;",
+            "class ABC {",
+            "template <class T, class U> struct Pair {",
+            "struct POINT make_point(int x) {",
+            "struct foo bar;",
+            "class EXPORT ns::Widget {",
+            "class EXPORT Foo<T> {",
+            "subclass FOO_API W {",
+            "struct S x : 3;",
+            "class LEVELDB_EXPORT Cache;",
+            "class DB {",
+        ] {
+            assert!(
+                matches!(blank_class_decl_macros(src), Cow::Borrowed(_)),
+                "must not touch {src:?}"
+            );
+        }
     }
 
     #[test]

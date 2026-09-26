@@ -54,6 +54,7 @@ mod helpers;
 mod imports;
 mod inherits;
 mod java;
+mod member;
 mod python;
 mod routes;
 mod rust;
@@ -124,6 +125,12 @@ pub struct ParsedRelation {
     /// to enforce same-language hard equality on cross-file `calls` edges
     /// (prevents false positives like Python `foo()` matching a C `foo()`).
     pub source_language: String,
+    /// 1-based start line of the definition whose scope `source_name` names, when
+    /// the relation comes from inside one. Stamped by `walk_for_relations`, so the
+    /// edge resolver can tell same-named definitions in one file apart (cfg twins,
+    /// `@overload` stubs, nested `def index()` handlers) instead of giving every
+    /// one of them this relation.
+    pub source_line: Option<u32>,
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
@@ -146,11 +153,13 @@ pub fn extract_relations_from_tree(
     // Unconditional (not gated on `language == "rust"`) so a non-Rust file can
     // never carry a previous Rust file's entries into the next Rust one.
     rust::reset_fn_local_names_cache();
+    member::reset_import_bound(tree.root_node(), source, config.name);
     walk_for_relations(
         tree.root_node(),
         source,
         language,
         &config,
+        None,
         None,
         None,
         None,
@@ -298,6 +307,7 @@ mod ruby_bare_calls {
                             relation: REL_CALLS.into(),
                             metadata: None,
                             source_language: String::new(),
+                            source_line: None,
                         });
                     }
                 }
@@ -524,6 +534,7 @@ fn walk_for_relations(
     language: &str,
     config: &LanguageConfig,
     current_scope: Option<&str>,
+    current_scope_line: Option<u32>,
     current_class: Option<&str>,
     current_rust_impl: Option<&str>,
     results: &mut Vec<ParsedRelation>,
@@ -552,9 +563,13 @@ fn walk_for_relations(
                     // not a `name` field (so this arm used to return None and the
                     // call's source attributed to `<module>` / got dropped). Pull
                     // the declarator name, e.g. `void Foo::bar(){}` → "Foo::bar".
+                    // A gtest case is named "Suite.Case" by the node extractor, so
+                    // its scope must be too, or no node matches the calls' source.
                     if config.name == "c" || config.name == "cpp" {
-                        node.child_by_field_name("declarator")
-                            .and_then(|d| cpp_declarator_name(&d, source, 0))
+                        node.child_by_field_name("declarator").and_then(|d| {
+                            super::treesitter::extract_gtest_test_name(&d, source)
+                                .or_else(|| cpp_declarator_name(&d, source, 0))
+                        })
                     } else {
                         None
                     }
@@ -638,6 +653,12 @@ fn walk_for_relations(
     };
 
     let active_scope = scope_name.as_deref().or(current_scope);
+    let active_scope_line = if scope_name.is_some() {
+        Some(node.start_position().row as u32 + 1)
+    } else {
+        current_scope_line
+    };
+    let first_new = results.len();
 
     // Additive `references` passes, table-driven (see `REFERENCE_PASSES`).
     // They run BEFORE the `match kind` call-dispatch below so they cannot
@@ -780,6 +801,15 @@ fn walk_for_relations(
     };
     let effective_rust_impl = child_rust_impl.as_deref().or(current_rust_impl);
 
+    // Where the scope these relations name begins: the resolver's tie-break
+    // between same-named definitions. Only a relation sourced FROM the active
+    // scope gets it (not `<module>` imports, not a type's heritage).
+    for r in &mut results[first_new..] {
+        if r.source_line.is_none() && Some(r.source_name.as_str()) == active_scope {
+            r.source_line = active_scope_line;
+        }
+    }
+
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
@@ -789,6 +819,7 @@ fn walk_for_relations(
                 language,
                 config,
                 active_scope,
+                active_scope_line,
                 effective_class,
                 effective_rust_impl,
                 results,
