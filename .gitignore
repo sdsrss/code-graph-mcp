@@ -68,3 +68,6 @@ __pycache__/
 # Auto-generated session-exit paused stubs (claudemd session-end-check.sh).
 # Real paused-task files (tasks/<slug>-paused.md) stay tracked.
 tasks/session-end-*-paused.md
+
+# claude plugin eval output (evals/run.sh)
+/evals/results/
