@@ -859,3 +859,102 @@ test('e2e: a spent hook budget records fallthrough_reason:budget, not a bare una
     cleanupFixture(fixture, cmd);
   }
 });
+
+// ── D#73: bare source dir on the inject path ────────────────────────────────
+// Commands newly recognized by D#73 reach this hook too (a bare dir with a
+// `| head` tail is never rewritten, so it lands here). Pre-ship review round 1
+// found the inject answering the wrong question on text-level matches; the
+// recognition is now the rewrite grammar's, and a subdir shell is guarded.
+
+test('e2e D#73: a bare dir with a tail gets the inject, scoped to that dir', (t) => {
+  const uniq = `InjBare${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\nsrc/foo.rs\\n');`);
+  const cmd = `grep -rn "${uniq}" src | head -3`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, undefined, '');
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, new RegExp(`ARGV\\[grep ${uniq} src\\]`), ctx);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e D#73: a bare dir from a subdir shell gets no inject', (t) => {
+  const uniq = `InjBareSub${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+  const cmd = `grep -rn "${uniq}" src | head -3`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, path.join(fixture.dir, 'xtask'), '');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout, '', `inject answered the root's src for a subdir grep: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+for (const cmd of [
+  'grep -n tasks "task_queue.py"',                   // M1: the bare word is the pattern
+  'grep -rn "widget_count" $(ls -d src tests) | wc -l', // M2
+  'ag "widget_count" --ignore tests . | wc -l',       // M3
+]) {
+  test(`e2e D#73: no inject for a non-path bare word: ${cmd}`, (t) => {
+    const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+    try {
+      for (const d of ['src', 'tests', 'tasks']) fs.mkdirSync(path.join(fixture.dir, d), { recursive: true });
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.stdout, '', `unexpected inject: ${res.stdout}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}
+
+// Round 2 B3 / round 3: anything before the grep in the same command can move
+// the shell (`cd`, and 19 other forms round 3 reproduced: `builtin cd`, `if cd`,
+// `{ cd …; }`, `\\cd`, `popd`, `eval`, a function …). A denylist of those never
+// closes, so a bare dir is answered only when the grep is the FIRST segment.
+for (const prefix of [
+  'cd xtask && ', 'builtin cd xtask && ', 'if cd xtask; then ', '{ cd xtask; ',
+  '\\cd xtask && ', 'popd >/dev/null; ', 'eval "cd xtask"; ', 'echo start; ',
+]) {
+  test(`e2e D#73: no bare-dir inject when a segment precedes the grep: ${prefix}`, (t) => {
+    const uniq = `InjBarePre${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+    const fixture = e2eFixture(`process.stdout.write('ARGV[never]\\n');`);
+    const cmd = `${prefix}grep -rn "${uniq}" src`;
+    try {
+      fs.mkdirSync(path.join(fixture.dir, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.stdout, '', `inject answered the root's src: ${res.stdout}`);
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+}
+
+// Round 2 B1, end to end: the inject must search the grammar's operand.
+test('e2e D#73: a path-shaped pattern is not taken for the inject scope', (t) => {
+  const uniq = `InjPatPath${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('ARGV[' + process.argv.slice(2).join(' ') + ']\\n');`);
+  const cmd = `grep -rn "./src/${uniq}" tests | head`;
+  try {
+    fs.mkdirSync(path.join(fixture.dir, 'tests'), { recursive: true });
+    const res = runHook(cmd, fixture, {}, undefined, '');
+    assert.equal(res.status, 0, res.stderr);
+    if (res.stdout) {
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.doesNotMatch(ctx, new RegExp(`ARGV\\[[^\\]]* \\./src/${uniq}\\]`), `pattern used as scope: ${ctx}`);
+      assert.match(ctx, /ARGV\[[^\]]* tests\]/, ctx);
+    }
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+

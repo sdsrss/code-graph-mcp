@@ -89,6 +89,30 @@ const SRC_PREFIXES =
 const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
 // Anchored variant for whole-token matching in extractSearchPath.
 const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
+// A path operand the rewrite grammar proved: a bare prefix word (`src`), or a
+// `./`-rooted one with any subpath (`./src`, `./src/x/`), which SRC_PATH's
+// lookbehind never matched.
+const SRC_BARE_TOKEN = new RegExp(`^(?:(?:${SRC_PREFIXES})|\\./(?:${SRC_PREFIXES})(?:/.*)?)$`);
+
+// D#73 — a source dir written as a bare word (`grep -rn X src`, `rg X tests`,
+// `./src`): the shape models write when a prompt says "under src/", and it
+// matched nothing before. Recognized ONLY where rewritePlan's grammar proves the
+// word is the command's path operand. A regex over the text cannot tell: these
+// prefixes are English words (`server`, `tasks`) and import-path fragments
+// inside patterns, flag values (`rg -t cmd`, `ag --ignore tests`), halves of a
+// two-path or `$(…)` search, or the pattern itself (`grep -n tasks f.py`) —
+// pre-ship review round 1 reproduced each as a wrong hint or inject. Callers
+// in a subdirectory shell must not use it on an un-rebased word: there a bare
+// `src` is `<cwd>/src`, not the root's (see runMain). `.` and no path at all
+// stay out: they reach non-source files, and grep -r ignores .gitignore where
+// cg does not.
+function bareSourceTarget(clause) {
+  const plan = rewritePlan(clause);
+  return plan && plan.target !== undefined && SRC_BARE_TOKEN.test(plan.target) ? plan.target : null;
+}
+function namesSourcePath(clause) {
+  return SRC_PATH.test(clause) || bareSourceTarget(clause) !== null;
+}
 const PIPE_INTO_GREP = new RegExp(`\\|\\s*(?:${GREP_VERB})\\b`);
 const CG_INVOKED = /\bcode-graph-mcp\b/;
 // File argument(s) that end in a config/lockfile/data extension. If, after removing
@@ -184,11 +208,11 @@ function shouldHint(cmd) {
   // v0.96 — the source-path gate must see ONLY the grep's own args, not a path in
   // a non-grep tail (`grep X skills/a.py; wc scripts/b` must not fire on scripts/b).
   const clause = firstShellClause(cmd);
-  if (!SRC_PATH.test(clause)) return false;         // not against indexed source tree
+  if (!namesSourcePath(clause)) return false;       // not against indexed source tree
   // If a config file appears AND no source path remains after stripping it, skip.
   if (CONFIG_TARGET_ONLY.test(clause)) {
     const stripped = clause.replace(CONFIG_TARGET_STRIP, ' ');
-    if (!SRC_PATH.test(stripped)) return false;
+    if (!namesSourcePath(stripped)) return false;
   }
   return true;
 }
@@ -679,6 +703,13 @@ function extractSearchPath(cmd) {
   // v0.96 — scope to the grep's own clause so the answer is never scoped to a
   // path in a non-grep tail (the file the user actually grepped is the only one
   // the "already ran for you" answer may claim to have searched).
+  // D#73 — when the grammar proves a bare/`./` source operand, it is the scope.
+  // It must win over the text scan below, which takes the first path-shaped
+  // token and so can take a PATTERN (`grep -rn "./src/x" tests`) or cut a
+  // quoted operand at its space (pre-ship review round 2 B1, B2). The grammar
+  // rejects `..`, so no traversal reaches this return.
+  const bare = bareSourceTarget(firstShellClause(cmd));
+  if (bare) return bare;
   for (const raw of firstShellClause(cmd).split(/\s+/)) {
     const token = raw.replace(/^["']|["']$/g, '');
     if (!token || token.startsWith('-')) continue;
@@ -711,6 +742,11 @@ function countNamedPaths(cmd, patterns) {
     if (pats.has(tok)) continue;                    // the search pattern, not a path
     if (tok.includes('/') || /\.[A-Za-z0-9]{1,6}$/.test(tok)) n++;  // dir-sep or file extension
   }
+  // D#73 — the grammar's bare-dir operand is a named path too, counted like
+  // its `src/` spelling (whose loop pass counts it). The grammar admits one
+  // path operand, so this adds at most one.
+  const bare = bareSourceTarget(firstShellClause(cmd));
+  if (bare && !bare.includes('/') && !/\.[A-Za-z0-9]{1,6}$/.test(bare)) n++;
   return n;
 }
 
@@ -1183,6 +1219,9 @@ function runMain() {
   let cmd = normalizeCommandPaths(rawCmd, root);
   const relPrefix = path.relative(root, shellCwd);
   if (relPrefix) cmd = rebaseRelativePaths(cmd, relPrefix, root);
+  // D#73 — from a subdirectory, a bare dir the rebase left alone is `<cwd>/src`,
+  // which the root-relative answer would not search (pre-ship review round 1 H1).
+  if (relPrefix && bareSourceTarget(firstShellClause(cmd))) return;
   if (!shouldHint(cmd)) return;
 
   // v0.64 — fingerprint the grep's pattern once, shared by the emit points below.
@@ -1393,6 +1432,7 @@ module.exports = {
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
   countNamedPaths,    // v0.70 — multi-path deny→hint downgrade
+  bareSourceTarget,      // D#73 — a bare source dir the rewrite grammar proves is the path operand
   isRevisionScopedGitGrep, // v0.71 — git grep --cached/treeish exclusion
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix

@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### The grep hook now answers `grep -rn X src` the way it answers `src/`
+
+The grep hook only recognized a source directory written with a trailing slash.
+`grep -rn "Foo" src`, `rg Foo tests` and `git grep Foo src` ran unhooked,
+while the same command with `src/` was rewritten to `code-graph-mcp grep`.
+Models write the bare form often, for example when a prompt says a project
+lives "under src/". A bare source directory, or one written `./src`, now counts
+when the hook's rewrite grammar can prove it is the command's path argument.
+Such a command gets the treatment its `src/` spelling gets. To check that, we
+took 873 grep commands from real sessions and generated two spellings of each,
+with the first source path written `dir/` and written bare `dir`. The `dir/`
+spelling is rewritten in 38 of them, and in all 38 the bare spelling is
+rewritten to the same directory. Over 1,766 distinct grep commands from real
+sessions, 8 change. In 6 of them an extra answer is now injected after a
+compound command ran (`grep -rn X tests | head`); the other 2 change only an
+internal decision that prints nothing. None of the 1,766 loses a rewrite or
+inject it had. The commands that do lose one are generated shapes where the old
+inject searched a fragment of the pattern instead of a path
+(`grep -rn "src/Foo" tests 2>/dev/null` searched `src/Foo`).
+
+A bare word the grammar cannot place is left alone: the pattern itself
+(`grep -n tasks "task_queue.py"`), a flag's value (`ag --ignore tests`), one of
+two paths, anything inside `$(…)`, and an English word inside a quoted pattern.
+A bare `src` means `src` under wherever the shell is, so it is answered only
+from the project root and only when the grep is the first command in the line:
+after `cd x &&`, `if cd x;`, `{ cd x; …` or even `echo; grep …` it runs as
+typed with no extra answer. `grep -rn X .` and a bare `rg X` are unchanged, because they
+search non-source files and `grep -r` ignores `.gitignore` where the rewrite
+does not. To turn the rewrite off: `CODE_GRAPH_NO_BLOCK_GREP=1`; all grep hints:
+`CODE_GRAPH_QUIET_HOOKS=1`.
+
 ## 0.157.0
 
 **Upgrading: nothing to do; an index damaged by an older server repairs itself.**

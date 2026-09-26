@@ -47,6 +47,7 @@ const {
   splitTopLevelSegments,
   firstShellClause,
   countNamedPaths,
+  bareSourceTarget,
   extractDeclSymbols,
   translateBreToRg,
   buildRewriteCommand,
@@ -2789,5 +2790,167 @@ test('a budget-exhausted answer carries reason:budget out of cg-answer', () => {
     );
   } finally {
     resetHookDeadline();
+  }
+});
+
+// ── D#73: a source dir written as a bare word (no trailing slash) ────
+//
+// The shape table lives in tasks/specs/grep-hook-bare-src-dir.md. `hint` is
+// shouldHint; `rewrite` is the target the rewrite would search (the same three
+// gates runMain applies: classifyDeny, rewritePlan, rewriteMatchesBlock), or
+// null when the command runs as typed.
+function rewriteTarget(cmd) {
+  const block = classifyDeny(cmd);
+  const plan = block ? rewritePlan(cmd) : null;
+  if (!plan || !rewriteMatchesBlock(plan, block, cmd, pickBlockPattern(cmd))) return null;
+  return plan.target;
+}
+
+const BARE_DIR_SHAPES = [
+  // accepted now, exactly like the `src/` spelling
+  { cmd: 'grep -rn "Foo_bar" src', hint: true, rewrite: 'src' },
+  { cmd: 'rg "Foo_bar" tests', hint: true, rewrite: 'tests' },
+  { cmd: 'git grep "Foo_bar" src', hint: true, rewrite: 'src' },
+  { cmd: 'grep -rn "Foo_bar" ./src', hint: true, rewrite: './src' },
+  { cmd: 'grep -rn "Foo_bar" ./src/', hint: true, rewrite: './src/' },
+  // hint only, as with `src/` (whose `2>/dev/null` counts as a second path —
+  // an older quirk kept for parity) and as with any unquoted pattern
+  { cmd: 'grep -rn "Foo_bar" src 2>/dev/null', hint: true, rewrite: null },
+  { cmd: 'grep -rn Foo_bar tests', hint: true, rewrite: null },
+  { cmd: 'grep -rn src_dir tests', hint: true, rewrite: null },
+  // two paths: the grammar takes one path operand, so neither is recognized
+  { cmd: 'grep -rn "Foo_bar" src tests', hint: false, rewrite: null },
+  // the bare word is the PATTERN, not a path: never scoped to it
+  { cmd: 'grep -rn src tests', hint: true, rewrite: null },
+  // unchanged: whole repo, quoted bare word, not a prefix word, outside the project
+  { cmd: 'grep -rn "Foo_bar" .', hint: false, rewrite: null },
+  { cmd: 'rg "Foo_bar"', hint: false, rewrite: null },
+  // quoted, but the grammar's PATH operand: the shell searches src, so do we
+  { cmd: 'grep -rn "Foo_bar" "src"', hint: true, rewrite: 'src' },
+  { cmd: 'grep -rn "Foo_bar" ./src/foo.rs', hint: true, rewrite: './src/foo.rs' },
+  { cmd: 'grep -rn "Foo_bar" srcs', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" src.rs', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" /tmp/clone/src', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" x/src', hint: false, rewrite: null },
+  // prefix words and import paths INSIDE a quoted pattern name no path
+  { cmd: 'grep -n "the server is down" docs/x.md', hint: false, rewrite: null },
+  { cmd: 'grep -rn "fix the tests later" notes.mjs', hint: false, rewrite: null },
+  { cmd: "grep -n \"from './lib/search-core.mjs'\" mem-cli.mjs", hint: false, rewrite: null },
+  { cmd: "grep -n \"globalSetup: ['./tests/setup.mjs']\" vitest.config.mjs", hint: false, rewrite: null },
+  // pre-ship review round 1: shapes a text-level match mistook for a path
+  { cmd: 'grep -n tasks "task_queue.py"', hint: false, rewrite: null },          // M1: bare word is the PATTERN
+  { cmd: 'grep -n api "config_loader.py"', hint: false, rewrite: null },
+  { cmd: 'grep -rn "widget_count" $(ls -d src tests)', hint: false, rewrite: null }, // M2: two dirs via $(…)
+  { cmd: 'grep -rn "widget_count" `ls -d src tests`', hint: false, rewrite: null },
+  { cmd: "grep -rn \"widget_count\" 'src' tests", hint: false, rewrite: null },  // M2: quoted + bare
+  { cmd: 'ag "widget_count" --ignore tests .', hint: false, rewrite: null },       // M3: flag value
+  { cmd: 'rg "Foo_bar" --ignore-file tasks .', hint: false, rewrite: null },
+  { cmd: "grep -n $'helper_util_fn isn\\'t in tests' notes.mjs", hint: false, rewrite: null }, // L1
+  { cmd: 'grep -n server nginx.conf', hint: false, rewrite: null },                // L3
+  { cmd: 'grep -c "user_id" app.log web', hint: false, rewrite: null },
+  { cmd: 'grep -rn "Foo_bar" src Cargo.toml', hint: false, rewrite: null },
+  // L2: a bare prefix word as a flag VALUE must not steal the scope from `src/`
+  { cmd: 'rg -t cmd "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  { cmd: 'rg -g tests "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  { cmd: 'grep --include lib "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  // round 2: a config-file filter peels off, and the bare dir must still count
+  { cmd: 'grep -rn --include=*.json "Foo_bar" src', hint: true, rewrite: 'src' },
+  // round 2 C: main answered this with the PATTERN as the scope; now two paths → hint only
+  { cmd: 'grep -rn "src/Foo_bar4" tests 2>/dev/null', hint: true, rewrite: null },
+  // the `src/` spelling keeps its behavior
+  { cmd: 'grep -rn "Foo_bar" src/', hint: true, rewrite: 'src/' },
+  { cmd: 'grep -rn "src" tests/', hint: true, rewrite: null },
+];
+
+for (const { cmd, hint, rewrite } of BARE_DIR_SHAPES) {
+  test(`D#73 shape: ${cmd}`, () => {
+    assert.equal(shouldHint(cmd), hint, 'shouldHint');
+    assert.equal(rewriteTarget(cmd), rewrite, 'rewrite target');
+  });
+}
+
+// Parity: every bare-dir shape above decides exactly as its `dir/` spelling
+// does (the rewrite target differs only by that slash).
+test('D#73: a bare source dir decides like its slash spelling', () => {
+  // Append the slash to the path operand only (not to a flag value that
+  // happens to be the same word, as in `rg -g tests … src/`).
+  const slash = (cmd) => {
+    const t = bareSourceTarget(firstShellClause(cmd));
+    if (!t || t.includes('/')) return cmd;
+    const words = cmd.split(' ');
+    for (let i = words.length - 1; i >= 0; i--) {
+      if (words[i].replace(/^["']|["']$/g, '') === t) { words[i] = words[i].replace(t, t + '/'); break; }
+    }
+    return words.join(' ');
+  };
+  const norm = (t) => (t == null ? t : t.replace(/\/$/, ''));
+  let compared = 0;
+  for (const { cmd, hint } of BARE_DIR_SHAPES) {
+    if (!hint) continue;
+    const s = slash(cmd);
+    if (s === cmd) continue;
+    compared++;
+    assert.equal(shouldHint(s), shouldHint(cmd), `shouldHint: ${cmd} vs ${s}`);
+    assert.equal(norm(rewriteTarget(s)), norm(rewriteTarget(cmd)), `rewrite: ${cmd} vs ${s}`);
+  }
+  assert.ok(compared >= 8, `parity compared only ${compared} shapes`);
+});
+
+test('D#73: the grammar-proven bare dir counts as one named path, like `src/`', () => {
+  assert.equal(countNamedPaths('grep -rn "Foo_bar" src', ['Foo_bar']),
+    countNamedPaths('grep -rn "Foo_bar" src/', ['Foo_bar']));
+  assert.equal(countNamedPaths('grep -rn "Foo_bar" src', ['Foo_bar']), 1);
+  // not the path operand → not counted (the pattern, a flag value, a non-prefix word)
+  assert.equal(countNamedPaths('grep -n tasks "task_queue.py"', []), 1); // the .py file only
+  assert.equal(countNamedPaths('grep -rn "Foo_bar" srcs', ['Foo_bar']), 0);
+});
+
+test('D#73: extractSearchPath takes the grammar-proven operand over a path-shaped pattern', () => {
+  // round 2 B1: the slash scan picked the PATTERN `./src/Foo_bar` as the scope
+  assert.equal(extractSearchPath('grep -rn "./src/Foo_bar" tests'), 'tests');
+  // round 2 B2: a quoted operand with a space stays whole
+  assert.equal(extractSearchPath('grep -rn "Foo_bar2" "./src/my dir"'), './src/my dir');
+});
+
+test('D#73: bareSourceTarget returns only the path operand the grammar proves', () => {
+  assert.equal(bareSourceTarget('grep -rn "Foo_bar" src'), 'src');
+  assert.equal(bareSourceTarget('grep -rn "Foo_bar" ./tests 2>/dev/null'), './tests');
+  assert.equal(bareSourceTarget('grep -rn "Foo_bar" src/'), null);   // slash form: not this path
+  assert.equal(bareSourceTarget('grep -n tasks "task_queue.py"'), null);
+  assert.equal(bareSourceTarget('grep -rn "Foo_bar" src tests'), null);
+  assert.equal(bareSourceTarget('grep -rn "Foo_bar" src | head'), null); // callers pass one clause
+});
+
+// A bare dir from a subdirectory shell is `<cwd>/src`; the root-relative
+// answer would search the ROOT's src (pre-ship review round 1 H1). Silent.
+test('e2e D#73: a bare dir the rebase left alone in a subdir shell runs as typed', () => {
+  const uniq = `bare_sub_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `grep -rn "${uniq}" src`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'xtask', 'src'), { recursive: true });
+    const res = runHook(cmd, fixture, pathE2e.join(fixture.dir, 'xtask'));
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout, '', `a subdir bare dir must not be rewritten to the root's: ${res.stdout}`);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+// Control for the test above: the same bare dir from the ROOT is rewritten,
+// and the real call searches exactly that dir.
+test('e2e D#73: a bare dir from the project root is rewritten to the same dir', () => {
+  const uniq = `bare_root_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + process.argv.slice(2).join(' ') + '\\n');`);
+  const cmd = `grep -rn "${uniq}" src`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    const rw = rewriteOf(runHook(cmd, fixture));
+    const ran = runRewrite(rw, fixture.dir);
+    if (ran !== null) assert.equal(ran.trim(), `args=grep -m 0 ${uniq} src`);
+  } finally {
+    cleanupFixture(fixture, cmd);
   }
 });

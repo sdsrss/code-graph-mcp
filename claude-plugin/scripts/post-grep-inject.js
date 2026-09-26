@@ -46,6 +46,8 @@ const {
   extractCgFlags,
   cgFlagSet,
   extractSearchPath,
+  bareSourceTarget,
+  firstShellClause,
   normalizeCommandPaths,
   rebaseRelativePaths,
   resolveProjectRoot,
@@ -263,6 +265,14 @@ function runMain() {
   markCooldown(rawCmd, root);
 
   const { segment, block } = found;
+  // D#73 — a bare dir names `<shell cwd>/src`. From a subdirectory shell (same
+  // guard as pre-grep-guide's runMain), or after anything earlier in the same
+  // command, that is not provably the root's src: round 2 found `cd x && grep`,
+  // round 3 reproduced 19 more forms that move the shell (`builtin cd`, `if cd`,
+  // `{ cd …; }`, `\cd`, `popd`, `eval`, a function). A denylist of those never
+  // closes, so a bare dir is answered only when the grep is the FIRST segment.
+  if (bareSourceTarget(firstShellClause(segment))
+      && (relPrefix || splitTopLevelSegments(cmd)[0] !== segment)) return;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
   // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they
