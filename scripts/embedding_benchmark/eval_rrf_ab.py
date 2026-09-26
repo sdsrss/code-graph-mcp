@@ -115,8 +115,9 @@ def main():
     ap.add_argument("--queries", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-leak", type=float, default=0.05,
-                    help="fail when more than this fraction of bootstrap queries appear verbatim "
-                         "in their gold's context_string (default 0.05; 1 accepts any)")
+                    help="fail when more than this fraction of doc-derived (bootstrap, keyword) "
+                         "queries have their doc in the gold's context_string "
+                         "(default 0.05; 1 accepts any)")
     args = ap.parse_args()
 
     queries = []
@@ -136,11 +137,15 @@ def main():
     # the real nodes_fts, which indexes doc_comment and context_string. Unlike
     # eval_retrieval.py there is no doc-free variant of the FTS side short of a
     # rebuilt index, so a leaked query set is refused rather than half-cleaned.
-    boot = [q for q in queries if q.get("source") == "bootstrap"]
+    # A keyword query is words picked out of that doc: always leaked here.
+    boot = [q for q in queries if q.get("source") in ("bootstrap", "keyword")]
     leaked = 0
     for db_idx, qs in by_db.items():
         conn = sqlite3.connect(args.db[db_idx])
         for q in qs:
+            if q.get("source") == "keyword":
+                leaked += 1
+                continue
             if q.get("source") != "bootstrap":
                 continue
             for g in q["gold_node_ids"]:
@@ -151,7 +156,7 @@ def main():
                     break
         conn.close()
     leak_rate = leaked / len(boot) if boot else 0.0
-    print(f"[rrf_ab] leakage: {leaked}/{len(boot)} bootstrap queries appear verbatim in their "
+    print(f"[rrf_ab] leakage: {leaked}/{len(boot)} doc-derived queries have their doc in their "
           f"gold's context_string ({leak_rate:.1%})", file=sys.stderr)
     if leak_rate > args.max_leak:
         raise SystemExit(

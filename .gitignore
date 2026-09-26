@@ -58,6 +58,8 @@ scripts/embedding_benchmark/.venv/
 
 # Embedding benchmark generated artifacts (inputs/outputs, not source)
 scripts/embedding_benchmark/query_set.jsonl
+scripts/embedding_benchmark/short_slices.jsonl
+scripts/embedding_benchmark/all_queries.jsonl
 scripts/embedding_benchmark/results/*.json
 # Python bytecode, anywhere. The two paths this used to list left
 # scripts/__pycache__/ tracked, and importing audit-metrics.py from its JS

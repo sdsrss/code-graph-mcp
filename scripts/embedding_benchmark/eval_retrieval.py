@@ -19,6 +19,7 @@ import sqlite3
 import numpy as np
 
 from leakage import is_leaked, strip_doc
+from lexical import bm25_scores
 from metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
 MINILM_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -97,15 +98,17 @@ def load_candidates(dbs: list[str], field: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["minilm", "potion", "coderank", "jina"], required=True)
+    ap.add_argument("--backend", choices=["minilm", "potion", "coderank", "jina", "bm25"],
+                    required=True, help="bm25 = lexical reference arm (lexical.py), no model")
     ap.add_argument("--field", choices=["context_string", "context_string_nodoc", "code_content"],
                     required=True)
     ap.add_argument("--db", action="append", required=True)
     ap.add_argument("--queries", default="query_set.jsonl")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-leak", type=float, default=0.05,
-                    help="fail when more than this fraction of bootstrap queries appear "
-                         "verbatim in their gold's text (default 0.05; 1 accepts any)")
+                    help="fail when more than this fraction of doc-derived (bootstrap, "
+                         "keyword) queries have their doc in the gold's text "
+                         "(default 0.05; 1 accepts any)")
     args = ap.parse_args()
 
     ids, texts = load_candidates(args.db, args.field)
@@ -118,33 +121,42 @@ def main():
                 queries.append(json.loads(line))
 
     # Leakage before any encoding cost: a leaked run is not worth the minutes.
+    # Both doc-derived sources are checked. A bootstrap query is measured (its
+    # first words, verbatim, in the gold's text). A keyword query is a few words
+    # picked out of the doc, so no verbatim check sees it; it is leaked exactly
+    # when the field still carries the doc, i.e. on plain context_string.
     text_by_id = dict(zip(ids, texts))
-    boot = [q for q in queries if q.get("source") == "bootstrap"]
+    doc_derived = [q for q in queries if q.get("source") in ("bootstrap", "keyword")]
     leaked = sum(
-        1 for q in boot
-        if any(is_leaked(q["query"], text_by_id.get(g, "")) for g in q["gold_node_ids"])
+        1 for q in doc_derived
+        if (args.field == "context_string" if q["source"] == "keyword" else
+            any(is_leaked(q["query"], text_by_id.get(g, "")) for g in q["gold_node_ids"]))
     )
-    leak_rate = leaked / len(boot) if boot else 0.0
-    print(f"[eval] leakage: {leaked}/{len(boot)} bootstrap queries appear verbatim in their "
-          f"gold's {args.field} ({leak_rate:.1%})")
+    leak_rate = leaked / len(doc_derived) if doc_derived else 0.0
+    print(f"[eval] leakage: {leaked}/{len(doc_derived)} doc-derived queries have their doc in "
+          f"the gold's {args.field} ({leak_rate:.1%})")
     if leak_rate > args.max_leak:
         raise SystemExit(
             f"[eval] leakage {leak_rate:.1%} > --max-leak {args.max_leak:.0%}: on this field the "
-            f"bootstrap queries score string overlap, not retrieval. Use --field "
+            f"doc-derived queries score string overlap, not retrieval. Use --field "
             f"context_string_nodoc, or pass --max-leak 1 to measure the leaked number on purpose.")
 
-    backend = Backend(args.backend)
-    print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
-    cand = backend.encode(texts, is_query=False)  # (N, dim), L2-normalized
-
     q_texts = [q["query"] for q in queries]
-    q_emb = backend.encode(q_texts, is_query=True)  # (Q, dim), L2-normalized
+    if args.backend == "bm25":
+        print(f"[eval] scoring {len(texts)} candidates with bm25/{args.field}...")
+        lex = np.asarray(bm25_scores(texts, q_texts), dtype=np.float32)  # (Q, N)
+    else:
+        backend = Backend(args.backend)
+        print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
+        cand = backend.encode(texts, is_query=False)  # (N, dim), L2-normalized
+        q_emb = backend.encode(q_texts, is_query=True)  # (Q, dim), L2-normalized
 
     # Per-query: cosine == dot product on normalized vectors. Rank candidates, score.
     per_lang: dict[str, list[dict]] = {}
+    per_source: dict[str, list[dict]] = {}
     overall: list[dict] = []
     for qi, q in enumerate(queries):
-        sims = cand @ q_emb[qi]               # (N,)
+        sims = lex[qi] if args.backend == "bm25" else cand @ q_emb[qi]  # (N,)
         # stable sort by (-score, id): argsort on score desc, ties broken by id asc
         order = np.lexsort((np.array(ids), -sims))
         ranked = [ids[p] for p in order]
@@ -158,6 +170,7 @@ def main():
         }
         overall.append(rec)
         per_lang.setdefault(q["language"], []).append(rec)
+        per_source.setdefault(q["source"], []).append(rec)
 
     def agg(rows: list[dict]) -> dict:
         if not rows:
@@ -171,9 +184,11 @@ def main():
         "backend": args.backend,
         "field": args.field,
         "candidates": len(ids),
-        "bootstrap_leak": {"leaked": leaked, "bootstrap": len(boot), "rate": round(leak_rate, 4)},
+        "doc_derived_leak": {"leaked": leaked, "doc_derived": len(doc_derived),
+                             "rate": round(leak_rate, 4)},
         "overall": agg(overall),
         "by_language": {lg: agg(rows) for lg, rows in sorted(per_lang.items())},
+        "by_source": {src: agg(rows) for src, rows in sorted(per_source.items())},
     }
     out_dir = os.path.dirname(args.out)
     if out_dir:

@@ -16,6 +16,13 @@ import sys
 
 from leakage import is_leaked
 
+def clean_doc(doc: str | None) -> str:
+    """Strip comment markers so the doc reads as prose, not syntax."""
+    doc = (doc or "").strip()
+    doc = doc.replace("///", " ").replace("//!", " ").replace("//", " ")
+    return doc.replace("/*", " ").replace("*/", " ").replace("*", " ").strip()
+
+
 # node id namespacing: ids are per-DB, so prefix with a DB index to keep them globally unique.
 def _rows(db_path: str, db_idx: int):
     conn = sqlite3.connect(db_path)
@@ -45,10 +52,7 @@ def build(dbs: list[str], min_doc_len: int):
                 name_index.setdefault((db_idx, row["name"]), gid)
             if row["qualified_name"]:
                 name_index.setdefault((db_idx, row["qualified_name"]), gid)
-            doc = (row["doc_comment"] or "").strip()
-            # Strip comment markers so the query is prose, not syntax.
-            doc = doc.replace("///", " ").replace("//!", " ").replace("//", " ")
-            doc = doc.replace("/*", " ").replace("*/", " ").replace("*", " ").strip()
+            doc = clean_doc(row["doc_comment"])
             if len(doc) >= min_doc_len and row["name"] and row["name"] not in doc:
                 # Exclude docs that just restate the symbol name (trivial match).
                 # Exclude docs that sit INSIDE the body (a Python docstring):

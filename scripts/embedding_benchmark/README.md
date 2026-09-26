@@ -31,8 +31,23 @@ python3 build_query_set.py \
   --out results/<backend>_<field>.json
 ```
 
-Every run first prints how many bootstrap queries appear verbatim in their
-gold's text on the chosen field, and fails above `--max-leak` (default 5%) —
+Short-query slices (keyword + partial identifier, see
+[Short-query slices](#short-query-slices-2026-09-26)) come from their own
+stdlib builder; concatenate them with the query set to score all shapes on one
+candidate pool. `--backend bm25` is a lexical reference arm (`lexical.py`), no
+model:
+
+```bash
+python3 build_short_slices.py --db .code-graph/index.db --out short_slices.jsonl
+cat query_set.jsonl short_slices.jsonl > all_queries.jsonl
+.venv/bin/python eval_retrieval.py --backend bm25 --field context_string_nodoc \
+  --db .code-graph/index.db --queries all_queries.jsonl --out results/bm25_nodoc.json
+```
+
+The result's `by_source` splits every metric per slice.
+
+Every run first prints how many doc-derived queries (bootstrap, keyword) have
+their doc in the gold's text on the chosen field, and fails above `--max-leak` (default 5%) —
 see [Leakage](#leakage-2026-09-25). `context_string_nodoc` is the production
 `context_string` with its `doc:` part removed from every candidate; plain
 `context_string` leaks 100% and needs `--max-leak 1` to run at all.
@@ -96,6 +111,76 @@ What survives, what does not:
   leaked query set the same way; `eval_ranking.py`'s NL numbers below remain
   leaked (see "Separate future threads" 2) — use the tier3 slice or real
   queries for anything decided on it.
+
+## Short-query slices (2026-09-26)
+
+Two query shapes the doc-comment set does not cover, built by
+`build_short_slices.py` (accepted shapes and their tests:
+`tasks/specs/retrieval-short-query-slices.md`,
+`tests/embedding_benchmark/test_short_slices.py`):
+
+- **partial_identifier** — two contiguous subtokens of a symbol name
+  (`parse_config_file` -> `parse config`); gold = every symbol whose name holds
+  that run (at most 3). Examples: `extract function`, `adopted projects`.
+- **keyword** — the 3 highest-IDF plain words of the doc's first sentence
+  (`scoped tmp dir`, `prerequisites kahn topological`); gold = the symbol.
+  Synthetic, and a share read as word salad (`channel branch owes`).
+
+One DB: `code-graph-mcp` at `2043f3b`, `sqlite3 .backup` snapshot, 4145
+candidates; all slices scored in one run per cell, so rows are comparable with
+each other. The bootstrap row is the same set as the [Leakage](#leakage-2026-09-25)
+table re-run on today's index (n=1520 vs 1513, 4145 vs 3974 candidates: minilm
+0.4075 vs 0.4082). `bm25` is BM25 over identifier subtokens (`lexical.py`) — a
+reference for term overlap, **not** the production FTS (`porter unicode61`,
+which stems and does not split camelCase).
+
+NDCG@10 / recall@1 / recall@10 / MRR:
+
+| slice | backend | field | NDCG@10 | recall@1 | recall@10 | MRR |
+|---|---|---|---|---|---|---|
+| partial_identifier (n=867) | bm25 | context_string_nodoc | **0.6724** | 0.4225 | 0.8929 | 0.6123 |
+| | bm25 | code_content | 0.6055 | 0.3799 | 0.8110 | 0.5553 |
+| | minilm | context_string_nodoc | 0.4015 | 0.2197 | 0.5844 | 0.3623 |
+| | minilm | code_content | 0.3732 | 0.2095 | 0.5488 | 0.3378 |
+| | potion | context_string_nodoc | 0.2140 | 0.1176 | 0.3101 | 0.1964 |
+| | potion | code_content | 0.1696 | 0.0807 | 0.2668 | 0.1535 |
+| keyword (n=999) | bm25 | context_string_nodoc | 0.0909 | 0.0330 | 0.1722 | 0.0758 |
+| | bm25 | code_content | 0.0895 | 0.0290 | 0.1682 | 0.0738 |
+| | minilm | context_string_nodoc | 0.0668 | 0.0210 | 0.1301 | 0.0568 |
+| | minilm | code_content | 0.0715 | 0.0260 | 0.1281 | 0.0636 |
+| | potion | context_string_nodoc | 0.0717 | 0.0270 | 0.1381 | 0.0624 |
+| | potion | code_content | 0.0734 | 0.0260 | 0.1331 | 0.0652 |
+| bootstrap (n=1520) | bm25 | context_string_nodoc | 0.4108 | 0.2559 | 0.5855 | 0.3649 |
+| | bm25 | code_content | 0.3679 | 0.2178 | 0.5303 | 0.3259 |
+| | minilm | context_string_nodoc | 0.4075 | 0.2309 | 0.6013 | 0.3566 |
+| | minilm | code_content | 0.3726 | 0.2053 | 0.5625 | 0.3247 |
+| | potion | context_string_nodoc | 0.3695 | 0.2171 | 0.5447 | 0.3254 |
+| | potion | code_content | 0.3229 | 0.1822 | 0.4849 | 0.2832 |
+
+What the numbers say:
+
+- **Partial identifiers are a lexical job.** Term overlap beats minilm by
+  27.09pp (0.6724 vs 0.4015) and potion by 45.84pp on `context_string_nodoc`.
+  Every partial_identifier query's words are in its gold's text (867/867), so
+  this is ranking, not vocabulary: the dense arm does not reward an exact
+  subtoken match the way BM25 does. potion loses more here than anywhere
+  (-18.75pp to minilm), which adds to the NO-GO.
+- **The keyword slice does not test "dense collapses on keywords".** BM25 is at
+  the floor too (0.0909). Measured: all query words appear in the gold's
+  `context_string_nodoc` for 26/999 queries (2.6%), none of them for 509/999
+  (51.0%) — the words come from the doc, and the doc is exactly what the field
+  removes. The slice measures doc-vocabulary vs code-vocabulary mismatch; a real
+  keyword slice needs queries written by a person or an LLM (the other half of
+  the #1(a) proposal), not picked out of the doc.
+- **On doc -> code queries, BM25 ties minilm** (0.4108 vs 0.4075 NDCG@10;
+  minilm leads recall@10 0.6013 vs 0.5855). The vector arm alone adds nothing
+  over term overlap on this set; whether their fusion adds is an
+  `eval_rrf_ab.py`-type question that needs a doc-free FTS to answer.
+- Not measured: the production pipeline on these slices. `eval_ranking.py`
+  reads the real index, whose FTS and vectors carry the doc, so the keyword
+  slice is leaked there (`eval_rrf_ab.py` refuses it); partial_identifier is not
+  doc-derived and can be run end-to-end. No significance test was run (the
+  #1(a) proposal names ranx); the gaps called out above are 27-46pp on n=867.
 
 ## Results (2026-06-21, query_set n=648, candidates=5879)
 
