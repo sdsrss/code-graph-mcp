@@ -1950,7 +1950,7 @@ fn test_typed_receiver_tells_same_named_cpp_classes_apart() {
     assert!(
         drain
             .iter()
-            .all(|(_, m)| m.as_deref() == Some(r#"{"q":"member"}"#)),
+            .all(|(_, m)| m.as_deref().is_some_and(|m| m.contains(r#""amb":1"#))),
         "{drain:?}"
     );
     assert_eq!(
@@ -2013,11 +2013,47 @@ fn assert_incremental_matches_rebuild(before: &[(&str, &str)], after: &[(&str, O
 /// differently from a rebuild.
 #[test]
 fn test_typed_receiver_incremental_matches_rebuild() {
-    // Editing the callee file restored `f->Run()` to every `Run` in it.
-    let a_h = "struct Foo { void Run() {} };\nstruct Bar { void Run() {} };\n";
+    // Editing the callee file restored `f->Run()` to every `Run` in it. (`.hpp`:
+    // a `.h` of plain structs is read as C, which has no member calls.)
+    let a_hpp = "struct Foo { void Run() {} };\nstruct Bar { void Run() {} };\n";
     assert_incremental_matches_rebuild(
-        &[("a.h", a_h), ("b.cc", "void g(Foo* f) { f->Run(); }\n")],
-        &[("a.h", Some(&format!("{a_h}// touched\n")))],
+        &[("a.hpp", a_hpp), ("b.cc", "void g(Foo* f) { f->Run(); }\n")],
+        &[("a.hpp", Some(&format!("{a_hpp}// touched\n")))],
+    );
+    // Renaming one of two same-named bases requeues the `super()` call, which
+    // must re-resolve as the typed call a rebuild sees — not as an untyped
+    // member call binding the caller's file's unrelated `__init__`.
+    let sub = "from a import Base\n\nclass Helper:\n    def __init__(self):\n        pass\n\n\
+               class Sub(Base):\n    def __init__(self):\n        super().__init__()\n";
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "a.py",
+                "class Base:\n    def __init__(self):\n        pass\n",
+            ),
+            (
+                "b.py",
+                "class Base:\n    def __init__(self):\n        pass\n",
+            ),
+            ("c.py", sub),
+        ],
+        &[(
+            "b.py",
+            Some("class Base2:\n    def __init__(self):\n        pass\n"),
+        )],
+    );
+    // Removing the base's method: the override calling `super()` is the only
+    // same-named method in its file and binds nothing, as in a rebuild.
+    assert_incremental_matches_rebuild(
+        &[
+            ("a.py", "class Field:\n    def deconstruct(self):\n        pass\n"),
+            (
+                "g.py",
+                "from a import Field\n\nclass Gen(Field):\n    def deconstruct(self):\n        super().deconstruct()\n",
+            ),
+            ("x.py", "class Other:\n    def deconstruct(self):\n        pass\n"),
+        ],
+        &[("a.py", Some("class Field:\n    pass\n"))],
     );
     // ... and to an unrelated class's `step` beside the override it had.
     let sub = "from base import Base\n\nclass Sub(Base):\n    def step(self):\n        pass\n\n\
@@ -2076,6 +2112,37 @@ fn test_typed_receiver_incremental_matches_rebuild() {
     );
 }
 
+/// A typed call its class did not decide (two same-named bases) is as much a
+/// guess as an untyped one: `ambiguous`, not the `inferred` a typed bind earns.
+#[test]
+fn test_undecided_typed_call_is_classified_ambiguous() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "a.py",
+            "class Base:\n    def __init__(self):\n        pass\n",
+        ),
+        (
+            "b.py",
+            "class Base:\n    def __init__(self):\n        pass\n",
+        ),
+        (
+            "c.py",
+            "class Sub(Base):\n    def __init__(self):\n        super().__init__()\n",
+        ),
+    ]);
+    let edges = call_edges_with_confidence(&db);
+    let sub: Vec<_> = edges
+        .iter()
+        .filter(|e| e.starts_with("c.py.__init__"))
+        .collect();
+    assert_eq!(sub.len(), 2, "{edges:#?}");
+    assert!(
+        sub.iter()
+            .all(|e| e.ends_with(" ambiguous") && e.contains(r#""amb":1"#)),
+        "{sub:#?}"
+    );
+}
+
 /// Pre-ship review of D#89: receivers the typing claimed for the wrong class.
 #[test]
 fn test_typed_receiver_does_not_claim_a_look_alike_class() {
@@ -2115,7 +2182,7 @@ fn test_typed_receiver_does_not_claim_a_look_alike_class() {
     for caller in ["h.ts.handler ->", "u.cc.f ->", "user.cc.drain ->"] {
         let typed: Vec<_> = from(caller)
             .into_iter()
-            .filter(|e| e.contains(r#""q":"rtype""#))
+            .filter(|e| e.contains(r#""q":"rtype""#) && !e.contains(r#""amb":1"#))
             .collect();
         assert!(
             typed.is_empty(),

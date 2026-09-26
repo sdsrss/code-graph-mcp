@@ -97,8 +97,10 @@ leveldb's test cases and exported classes.
   and it stayed that way until the caller's file changed. On 0.157.0,
   editing one django file left 66 or 179 such extra edges that a rebuild
   does not have. Each is now restored to the method with the same qualified
-  name, and the incremental graph equals a rebuild's on every file tried
-  (django, leveldb, hono, flask).
+  name. After appending a line to any of 11 files across django, leveldb,
+  hono and flask, the incremental graph equals a rebuild's. When the edit
+  renames or deletes the class a typed call was bound to, the call is
+  re-resolved as the typed call it is.
 
 Indexing does more work per call. A full index took 7% longer on django
 (11.9 s → 12.8 s, 3,290 files), 11% on hono and 21% on leveldb (537 → 648 ms,
@@ -123,9 +125,20 @@ constructor calls and a `--repo DIR` option.
   such a class contributes no overrides.
 - **A Python local constructed from an imported library class** that shares a
   project class's name (`from requests import Session; s = Session()`) is
-  typed as the project's class, as it was before this release. A TypeScript
-  class imported from a package stays untyped, and a C++ `std::` type binds
-  nothing.
+  typed as the project's class, as it was before this release. The same
+  now happens to a C++ type brought in by `using std::mutex;`, a TypeScript
+  type aliased from a namespace import, and a browser global such as
+  `Response`, when a project class has that name. A TypeScript
+  class imported by name from a package stays untyped, and a `std::` type
+  binds nothing. A path alias or workspace package (`'@/models'`) counts as a
+  package, so its classes stay untyped too.
+- **Renaming or deleting a class does not re-resolve unchanged callers.** A
+  typed call binds by the whole project's set of classes: whether its class
+  is known, and whether its name is unique enough to follow overrides. When
+  an edit changes that set, a rebuild can bind calls in files the edit never
+  touched differently. After deleting django's `forms/fields.py`, a rebuild
+  had 19 edges an incremental run did not, all of them overrides it could
+  now follow. `rebuild-index` catches up.
 - **A later file does not re-bind an earlier typed call.** A class added after
   its caller was indexed gets the call only while the call is still buffered
   (a bounded number of runs). A subclass override added later gets no

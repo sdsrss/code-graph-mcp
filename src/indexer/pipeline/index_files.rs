@@ -3388,6 +3388,11 @@ fn resolve_deferred_relations(
 
             let mut handled = true;
             let mut call_meta = d.metadata.as_deref();
+            let guessed = d
+                .metadata
+                .as_deref()
+                .filter(|m| m.contains(r#""rtype""#) || m.contains(r#""super""#))
+                .map(super::resolve::ambiguous_meta);
             match parse_callee_metadata(d.metadata.as_deref()) {
                 Some(CalleeMeta::Module(module)) => {
                     if !py_modules.contains(&module) {
@@ -3498,14 +3503,14 @@ fn resolve_deferred_relations(
                                     &source_ids,
                                     &own,
                                     &d.relation,
-                                    Some(crate::domain::CALL_META_MEMBER),
+                                    guessed.as_deref(),
                                     false,
                                 )?;
                             }
                             RecvTypeTargets::Fallback => {
-                                // Stored as the untyped member call it now resolves as,
-                                // so its edges are classified like one.
-                                call_meta = Some(crate::domain::CALL_META_MEMBER);
+                                // Resolved as the untyped member call it now is, and
+                                // marked so its edges are classified like one.
+                                call_meta = guessed.as_deref();
                                 handled = false;
                             }
                             // No project class of that name (yet): buffer it, so a

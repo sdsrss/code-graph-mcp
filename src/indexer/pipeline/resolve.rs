@@ -311,7 +311,7 @@ pub(super) fn resolve_pending_calls_touching(
         // Only bare (None), rtype, member and JS receiver can actually reach the
         // buffer today; self/stype/path handling is latent parity should a future
         // Phase-2 change route them here.
-        let mut metadata = row.metadata.as_deref();
+        let mut guessed: Option<String> = None;
         // A typed receiver's own-class binding is final, as in the deferred pass:
         // no proximity refinement may drop its overrides.
         let mut refine = true;
@@ -319,6 +319,12 @@ pub(super) fn resolve_pending_calls_touching(
             .get(&row.source_id)
             .map(String::as_str)
             .unwrap_or_default();
+        // The caller itself is a same-named same-file candidate (`def f(self):
+        // super().f()`), excluded above as a self-call: at resolution it filled
+        // the same-file tier, which then bound nothing.
+        let caller_shares_name = name_to_lang_targets
+            .get(&row.target_name)
+            .is_some_and(|entries| entries.iter().any(|(id, _)| *id == row.source_id));
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
             Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
                 let (t, dispatch) = match meta {
@@ -326,6 +332,15 @@ pub(super) fn resolve_pending_calls_touching(
                     CalleeMeta::SuperType(t) => (t, false),
                     _ => unreachable!("matched above"),
                 };
+                // The row re-resolves the whole call — a requeue after its target
+                // was renamed or deleted — so the call's surviving edges into
+                // other files are replaced, not kept beside the new answer.
+                delete_typed_call_edges(
+                    db,
+                    row.source_id,
+                    &row.target_name,
+                    row.metadata.as_deref(),
+                )?;
                 match recv_type_targets(
                     &t,
                     dispatch,
@@ -336,20 +351,27 @@ pub(super) fn resolve_pending_calls_touching(
                     &node_id_to_path,
                 )? {
                     RecvTypeTargets::Bind(own) => {
+                        // A requeued edge may carry the `amb` mark of an earlier
+                        // answer: the class now decides, so the mark goes.
+                        guessed = row.metadata.as_deref().map(decided_meta);
                         refine = false;
                         own
                     }
-                    // Stored as the untyped member call it resolves as.
                     RecvTypeTargets::Ambiguous(own) => {
-                        metadata = Some(crate::domain::CALL_META_MEMBER);
+                        guessed = row.metadata.as_deref().map(ambiguous_meta);
                         refine = false;
                         own
                     }
                     // The deferred pass's default chain over member candidates:
-                    // same-file ones, else none for a noise name, else refined.
+                    // same-file ones (the caller among them, which binds nothing
+                    // to itself), else none for a noise name, else refined.
                     RecvTypeTargets::Fallback => {
-                        metadata = Some(crate::domain::CALL_META_MEMBER);
-                        let pool = classes.member_call_candidates(db, metadata, candidates)?;
+                        guessed = row.metadata.as_deref().map(ambiguous_meta);
+                        let pool = classes.member_call_candidates(
+                            db,
+                            row.metadata.as_deref(),
+                            candidates,
+                        )?;
                         let local: Vec<i64> = pool
                             .iter()
                             .copied()
@@ -357,7 +379,7 @@ pub(super) fn resolve_pending_calls_touching(
                                 node_id_to_path.get(id).map(String::as_str) == Some(caller_path)
                             })
                             .collect();
-                        if !local.is_empty() {
+                        if !local.is_empty() || caller_shares_name {
                             refine = false;
                             local
                         } else if crate::domain::is_cross_file_call_noise(
@@ -391,6 +413,7 @@ pub(super) fn resolve_pending_calls_touching(
             _ => candidates,
         };
 
+        let metadata = guessed.as_deref().or(row.metadata.as_deref());
         let refined = if refine && resolved.len() > 1 {
             refine_ambiguous_targets(&resolved, caller_path, &node_id_to_path)
         } else {
@@ -1099,8 +1122,11 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- `chain` / `recv` are NOT exempt: they resolve by method
                       -- uniqueness or fall back to bare, so a duplicate name there is
                       -- genuinely ambiguous. NULL metadata (bare) also stays eligible.
+                      -- A typed call its class did not decide carries `amb`
+                      -- (`ambiguous_meta`) and is classified like a bare one.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path'))
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path')
+                           OR json_extract(e.metadata, '$.amb') IS NOT NULL)
                  THEN ?3 ELSE ?4 END";
     const CONF_WHERE: &str = "
              WHERE e.relation IN (?1, ?2)
@@ -1438,6 +1464,60 @@ impl<'a> ProjectPythonModules<'a> {
             });
         self.seen.insert(module.to_string(), known);
         known
+    }
+}
+
+/// `metadata` without the [`ambiguous_meta`] mark.
+fn decided_meta(metadata: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(metadata) {
+        Ok(serde_json::Value::Object(mut map)) if map.contains_key("amb") => {
+            map.remove("amb");
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => metadata.to_string(),
+    }
+}
+
+/// Delete the `calls` edges from `source_id` to nodes named `target_name` that a
+/// typed call with this metadata's `q`/`v` produced (marked `amb` or not).
+fn delete_typed_call_edges(
+    db: &Database,
+    source_id: i64,
+    target_name: &str,
+    metadata: Option<&str>,
+) -> Result<()> {
+    let Some(meta) = metadata.and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+    else {
+        return Ok(());
+    };
+    let (Some(q), Some(v)) = (
+        meta.get("q").and_then(|q| q.as_str()),
+        meta.get("v").and_then(|v| v.as_str()),
+    ) else {
+        return Ok(());
+    };
+    db.conn().execute(
+        "DELETE FROM edges WHERE source_id = ?1 AND relation = ?2
+           AND target_id IN (SELECT id FROM nodes WHERE name = ?3)
+           AND json_extract(metadata, '$.q') = ?4 AND json_extract(metadata, '$.v') = ?5",
+        rusqlite::params![source_id, REL_CALLS, target_name, q, v],
+    )?;
+    Ok(())
+}
+
+/// The metadata a typed call's edges carry when its class did not decide the
+/// target (`RecvTypeTargets::Ambiguous` / `Fallback`): the call's own
+/// `rtype`/`super` metadata marked `"amb":1`. The mark makes the edge classify
+/// like the untyped member call it resolved as; keeping the type lets a
+/// re-resolution (a requeue after its target was renamed or deleted) resolve it
+/// as the typed call a rebuild sees, not as an untyped one.
+pub(super) fn ambiguous_meta(metadata: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(metadata) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("amb".into(), serde_json::Value::from(1));
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => crate::domain::CALL_META_MEMBER.to_string(),
     }
 }
 
