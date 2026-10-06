@@ -46,8 +46,8 @@ cargo binary to 0.164.0 does not bring the every-session notice back.
 
 Found in review:
 
-- Sessions that start at the same moment in one project each show the notice
-  (8 of 8 in a test that started 8 at once).
+- Sessions that start at the same moment in one project can each show the
+  notice (75 of 80 calls in ten rounds of 8 started at once).
 - The record also covers which variant of the block applies (web or not, from
   the project's dependencies or `CODE_GRAPH_PROJECT_TYPE`). A project whose
   variant changes sees the notice again, and sessions that set
