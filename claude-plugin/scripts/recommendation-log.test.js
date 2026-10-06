@@ -103,6 +103,23 @@ test('recordRecommendation refuses to write through a symlinked jsonl', (t) => {
   assert.match(fs.readFileSync(path.join(plain, '.code-graph', REC_FILE), 'utf8'), /"observe"/);
 });
 
+// session-init passes its own label for the stale-block record; this module's
+// own writes keep the default one.
+test('a refused jsonl is reported on stderr as adoption metrics', (t) => {
+  const cwd = tmpProject(t, true);
+  fs.writeFileSync(path.join(cwd, 'victim.conf'), 'user data\n');
+  fs.symlinkSync(path.join(cwd, 'victim.conf'), path.join(cwd, '.code-graph', REC_FILE));
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    assert.equal(recordRecommendation(cwd, { hook: 'read', action: 'observe' }), false);
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.match(written.join(''), /^\[code-graph\] skipping adoption metrics: .*recommendations\.jsonl is a symlink/m);
+});
+
 // Pre-tag review P2-3: `lstat` reports a hardlinked victim as a plain regular
 // file and `O_NOFOLLOW` has nothing to say about one, so the symlink guard alone
 // left the identical damage reachable — 1,200,020 → 67 bytes, measured. `git`

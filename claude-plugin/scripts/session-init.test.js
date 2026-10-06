@@ -479,6 +479,100 @@ test('the stale-block record never writes or reads through a link', (t) => {
   assert.equal(staleNoticeDue(plain, 'aaaa1111'), false, 'control: a plain record silences the second showing');
 });
 
+// The record matches when it holds the fingerprint and nothing else. Pinned
+// with a real shipped fingerprint (16 hex): the tests above use 8 characters,
+// with which a read of 8 or 16 bytes, a missing truncate or a prefix match all
+// stayed green, and an 8-byte read brings back the every-session notice.
+test('the stale-block record matches the whole fingerprint and nothing else', (t) => {
+  const os = require('os');
+  const { staleNoticeDue } = require('./session-init');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-exact-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const fp = require('./adopt').shippedFingerprint({ cwd: sb });
+  assert.match(fp, /^[0-9a-f]{16}$/, 'adopt.js ships a 16-hex fingerprint; update this test if that changes');
+  let n = 0;
+  const projectWith = (record) => {
+    const p = path.join(sb, `p${n++}`);
+    fs.mkdirSync(path.join(p, '.code-graph'), { recursive: true });
+    if (record !== null) fs.writeFileSync(path.join(p, '.code-graph', 'stale-block-notice'), record);
+    return p;
+  };
+  const recordOf = (p) => fs.readFileSync(path.join(p, '.code-graph', 'stale-block-notice'), 'utf8');
+
+  const fresh = projectWith(null);
+  assert.equal(staleNoticeDue(fresh, fp), true);
+  assert.equal(recordOf(fresh), `${fp}\n`);
+  assert.equal(staleNoticeDue(fresh, fp), false, 'a full fingerprint silences the second showing');
+
+  const longer = projectWith(`${'0'.repeat(40)}\n`);
+  assert.equal(staleNoticeDue(longer, fp), true);
+  assert.equal(recordOf(longer), `${fp}\n`, 'a longer old record must be truncated, not overwritten in place');
+  assert.equal(staleNoticeDue(longer, fp), false);
+
+  assert.equal(staleNoticeDue(projectWith(`${fp}\r\n`), fp), false, 'a CRLF line ending still matches');
+  for (const [what, record] of [
+    ['a prefix of the fingerprint', `${fp.slice(0, 8)}\n`],
+    ['the fingerprint and more', `${fp}0\n`],
+    ['the fingerprint padded past 64 bytes', `${fp}${' '.repeat(64)}tail\n`],
+  ]) {
+    assert.equal(staleNoticeDue(projectWith(record), fp), true, `a record holding ${what} is not a match`);
+  }
+});
+
+// A record that cannot be opened is unrecordable, so the notice shows. Turning
+// that branch into "already shown" left the suite green, and would silence the
+// notice in a read-only checkout or behind a mode-000 record.
+test('the stale-block notice shows when the record cannot be opened', {
+  skip: process.platform === 'win32' || (process.getuid && process.getuid() === 0),
+}, (t) => {
+  const os = require('os');
+  const { staleNoticeDue } = require('./session-init');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-eacces-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+
+  const unopenable = path.join(sb, 'mode-000-record');
+  const record = path.join(unopenable, '.code-graph', 'stale-block-notice');
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  fs.writeFileSync(record, 'aaaa1111\n');
+  fs.chmodSync(record, 0o000);
+  assert.equal(staleNoticeDue(unopenable, 'aaaa1111'), true, 'a record that cannot be opened must not read as shown');
+  assert.equal(staleNoticeDue(unopenable, 'aaaa1111', { record: false }), true, 'nor in an unattended session');
+  assert.equal(fs.statSync(record).mode & 0o777, 0, 'and it is left as it was');
+
+  const readOnly = path.join(sb, 'read-only-dir');
+  const dir = path.join(readOnly, '.code-graph');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.chmodSync(dir, 0o555);
+  try {
+    assert.equal(staleNoticeDue(readOnly, 'aaaa1111'), true, 'a record that cannot be created must not read as shown');
+    assert.equal(staleNoticeDue(readOnly, 'aaaa1111'), true, 'so it shows every session');
+  } finally {
+    fs.chmodSync(dir, 0o755);
+  }
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+// The two writers share recommendation-log's guards; the diagnostic must say
+// which record was skipped.
+test('a refused stale-block record names itself on stderr', (t) => {
+  const os = require('os');
+  const { staleNoticeDue } = require('./session-init');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-label-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(sb, '.code-graph'));
+  fs.writeFileSync(path.join(sb, 'victim.txt'), 'user data\n');
+  fs.symlinkSync(path.join(sb, 'victim.txt'), path.join(sb, '.code-graph', 'stale-block-notice'));
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    assert.equal(staleNoticeDue(sb, 'aaaa1111'), true);
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.match(written.join(''), /^\[code-graph\] skipping the stale-block notice record: .*stale-block-notice is a symlink/m);
+});
+
 // Windows has no O_NOFOLLOW, so there the lstat of the record is the only check
 // before the open follows a symlink. Pinned by loading session-init with
 // recommendation-log's O_NOFOLLOW forced to 0, as recommendation-log.test.js does.

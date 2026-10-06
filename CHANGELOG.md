@@ -13,6 +13,10 @@
   writes it. Where that variable is unset, as in an older Claude Code, the
   record is written as before. A record an unattended session already wrote
   stays: delete `.code-graph/stale-block-notice` to see the notice again.
+- A `.code-graph/stale-block-notice` longer than 64 bytes no longer counts as
+  a match because its first 64 bytes hold the fingerprint; the record must
+  hold the fingerprint and nothing else. The plugin writes 17 bytes, so only a
+  hand-made file was affected.
 
 ## 0.165.0
 

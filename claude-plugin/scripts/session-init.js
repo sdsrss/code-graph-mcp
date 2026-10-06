@@ -597,9 +597,10 @@ function staleNoticeDue(cwd, fingerprint, { record = true } = {}) {
   } catch { return true; }
   if (fd === null) return true;
   try {
+    // A read that fills the buffer is a longer file, whatever its first bytes.
     const buf = Buffer.alloc(64);
     const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    if (buf.toString('utf8', 0, n).trim() === fingerprint) return false;
+    if (n < buf.length && buf.toString('utf8', 0, n).trim() === fingerprint) return false;
     if (!record) return true;
     fs.ftruncateSync(fd, 0);
     fs.writeSync(fd, fingerprint + '\n', 0);
