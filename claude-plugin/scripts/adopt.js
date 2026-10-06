@@ -667,6 +667,19 @@ function needsRefresh({ cwd, templatePath } = {}) {
   } catch { return false; }
 }
 
+// What a stale notice is about: the shipped template plus the block this
+// project would get now. SessionStart shows the notice once per value, so the
+// user's own copy is deliberately not an input — a hand edit is not news, a
+// newer shipped template is. null when the template cannot be read.
+function shippedFingerprint({ cwd, templatePath } = {}) {
+  const effectiveCwd = cwd || process.cwd();
+  let tpl;
+  try { tpl = fs.readFileSync(templatePath || TEMPLATE_PATH); } catch { return null; }
+  return require('crypto').createHash('sha256')
+    .update(tpl).update('\0').update(buildBlock(detectProjectType(effectiveCwd)))
+    .digest('hex').slice(0, 16);
+}
+
 // 检测脚本是否从 Claude Code 插件 cache 运行。
 // 走 __dirname 而非 CLAUDE_PLUGIN_ROOT — 后者在多插件共存时会互相污染
 // （见 feedback_plugin_env_isolation.md）。
@@ -752,7 +765,7 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   // name is kept: SessionStart, tests and the uninstall paths all call it.
   if (isAdopted({ cwd })) {
     if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd })) {
-      return { attempted: false, reason: 'stale', migrated };
+      return { attempted: false, reason: 'stale', fingerprint: shippedFingerprint({ cwd }), migrated };
     }
     return { attempted: false, reason: 'already-adopted', migrated };
   }
@@ -990,7 +1003,7 @@ if (require.main === module) {
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, unadoptCommand, shellQuote, stripSentinelBlock,
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot, adoptCommand,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, shippedFingerprint, isProjectRoot, adoptCommand,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
   claudeMdPath, detailDir, detailPath,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,

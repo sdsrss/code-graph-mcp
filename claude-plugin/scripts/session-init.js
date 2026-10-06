@@ -565,6 +565,27 @@ function samePath(a, b) {
   return real(a) === real(b);
 }
 
+/**
+ * Whether to show the out-of-date-block notice in this project, recording it
+ * as shown. Once per shipped-template fingerprint: 0.164.0 showed it at every
+ * session start. Recorded in `.code-graph/` only when that directory already
+ * exists — creating it would put an unexcluded directory in `git status`, the
+ * side effect D3/D4 removed. Anything unrecordable (no fingerprint, no
+ * directory, a failed write) shows the notice: a failure must never silence it.
+ */
+function staleNoticeDue(cwd, fingerprint) {
+  if (!fingerprint) return true;
+  const dir = path.join(cwd, '.code-graph');
+  const marker = path.join(dir, 'stale-block-notice');
+  try {
+    if (fs.readFileSync(marker, 'utf8').trim() === fingerprint) return false;
+  } catch { /* not recorded yet, or unreadable */ }
+  try {
+    if (fs.statSync(dir).isDirectory()) fs.writeFileSync(marker, fingerprint + '\n');
+  } catch { /* unrecorded: shown again next session */ }
+  return true;
+}
+
 function runSessionInit({ source } = {}) {
   // Fresh per run: this is module state, and the test suite calls this function
   // many times in one process. A carried-over array would report last run's
@@ -684,12 +705,13 @@ function runSessionInit({ source } = {}) {
       autoAdopt = { attempted: false, reason: 'threw', error: (e && e.message) || String(e) };
     }
   }
-  if (autoAdopt.reason === 'stale') {
+  if (autoAdopt.reason === 'stale' && staleNoticeDue(process.cwd(), autoAdopt.fingerprint)) {
     notices.push(
       "[code-graph] This project's CLAUDE.md carries an out-of-date code-graph block.\n" +
       `            Refresh it: ${adoptCommand()}\n` +
       `            Remove it:  ${unadoptCommand()}\n` +
-      '            (SessionStart no longer edits CLAUDE.md itself; CODE_GRAPH_NO_TEMPLATE_REFRESH=1 silences this.)'
+      '            (Shown once per shipped template. SessionStart no longer edits CLAUDE.md itself;\n' +
+      '            CODE_GRAPH_NO_TEMPLATE_REFRESH=1 silences this.)'
     );
   }
 
@@ -855,7 +877,7 @@ module.exports = {
   injectProjectMap,
   verifyBinary, missingBinaryMessage, unadoptCommand,
   consistencyCheck,
-  runSessionInit,
+  runSessionInit, staleNoticeDue,
   computeQuietHooks,
   shouldInjectMap,
   hookFireWarning, checkHookFiring, analyzeHookDark, detectHookDark, // v0.67.0

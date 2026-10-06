@@ -244,17 +244,23 @@ function runSessionInitHook(t, {
   // correctly falls back to cwd, so the two options go together.
   cwdSub = null,
   indexDb = false,
+  // A second SessionStart in the same project: the `sb` a previous call returned.
+  reuse = null,
+  // false: the project has no .code-graph/ (and so no recommendations.jsonl).
+  codeGraphDir = true,
 } = {}) {
   const os = require('os');
   const { spawnSync } = require('child_process');
-  const sb = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  SESSION_INIT_SANDBOXES.push(sb);
-  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const sb = reuse || fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  if (!reuse) {
+    SESSION_INIT_SANDBOXES.push(sb);
+    t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  }
   const home = sb;
   const cfg = path.join(sb, '.claude');
   const proj = path.join(sb, 'proj');
   fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
-  fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
+  fs.mkdirSync(codeGraphDir ? path.join(proj, '.code-graph') : proj, { recursive: true });
   // Fresh hook-fire state so checkHookFiring does NOT spawn its detached
   // background probe: that child outlives the test run and re-creates
   // `<sandbox>/.cache/code-graph` after every cleanup hook has run, which is
@@ -266,8 +272,10 @@ function runSessionInitHook(t, {
   fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
   // Seeds detectHookDark (runs LATE, after adoption): 3 edit events, no
   // grep/read events → it must emit its "may be dark" warning as a notice.
-  fs.writeFileSync(path.join(proj, '.code-graph', 'recommendations.jsonl'),
-    ['{"hook":"edit"}', '{"hook":"edit"}', '{"hook":"edit"}', ''].join('\n'));
+  if (codeGraphDir) {
+    fs.writeFileSync(path.join(proj, '.code-graph', 'recommendations.jsonl'),
+      ['{"hook":"edit"}', '{"hook":"edit"}', '{"hook":"edit"}', ''].join('\n'));
+  }
 
   const args = [];
   if (adoptThrows) {
@@ -298,7 +306,7 @@ function runSessionInitHook(t, {
     input: JSON.stringify({ source: 'startup' }),
     env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' },
   });
-  return { res, proj, home };
+  return { res, proj, home, sb };
 }
 
 // SessionStart writes ONE JSON value on stdout (decision D5): the user-facing
@@ -348,6 +356,53 @@ test('a stale adoption block is reported with a refresh and a remove command', (
   assert.match(n, /out-of-date code-graph block/, `stdout was:\n${res.stdout}`);
   assert.match(n, /Refresh it: node '[^']+adopt\.js' adopt/);
   assert.match(n, /Remove it: {2}node '[^']+adopt\.js' unadopt/);
+});
+
+// 0.164.0 known gap: a project adopted by 0.163 showed the notice at every
+// session start. It is shown once per project for one shipped template; a
+// template that changes again is news, so it is shown again.
+const staleStub = (fingerprint) => `
+  const ad = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+  ad.maybeAutoAdopt = () => ({ attempted: false, reason: 'stale', fingerprint: ${JSON.stringify(fingerprint)} });
+`;
+const STALE_RE = /out-of-date code-graph block/;
+
+test('the stale-block notice is shown once per project for one shipped template', (t) => {
+  const first = runSessionInitHook(t, { prefix: 'cg-si-stale-once-', preloadSrc: staleStub('aaaa1111') });
+  assert.equal(first.res.status, 0, `stderr:\n${first.res.stderr}`);
+  assert.match(noticeOf(first.res), STALE_RE, 'the first session must show it');
+
+  const second = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('aaaa1111') });
+  assert.equal(second.res.status, 0, `stderr:\n${second.res.stderr}`);
+  assert.doesNotMatch(noticeOf(second.res), STALE_RE, 'the same template must not be reported twice');
+
+  const third = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('bbbb2222') });
+  assert.match(noticeOf(third.res), STALE_RE, 'a newer shipped template must be reported again');
+});
+
+test('the stale-block notice keeps showing where it cannot be recorded', (t) => {
+  // No .code-graph/ in the project: creating one would put an unexcluded
+  // directory in `git status`, the side effect D3/D4 removed. Not recorded, so
+  // shown every session, as in 0.164.0.
+  // No binary either, so no index build can create the directory mid-test.
+  const noDirStub = staleStub('aaaa1111') + `
+    require(${JSON.stringify(path.join(__dirname, 'find-binary.js'))}).findBinary = () => null;
+  `;
+  const first = runSessionInitHook(t, { prefix: 'cg-si-stale-nodir-', preloadSrc: noDirStub, codeGraphDir: false });
+  const second = runSessionInitHook(t, { reuse: first.sb, preloadSrc: noDirStub, codeGraphDir: false });
+  assert.match(noticeOf(first.res), STALE_RE);
+  assert.match(noticeOf(second.res), STALE_RE, 'without .code-graph/ nothing may silence it');
+  assert.equal(fs.existsSync(path.join(first.proj, '.code-graph')), false,
+    'the notice must not create the directory to record itself');
+
+  // The marker path is taken by a directory: the write fails, and a failed
+  // write must not read as "already shown".
+  const sb2 = runSessionInitHook(t, { prefix: 'cg-si-stale-eisdir-', preloadSrc: staleStub('aaaa1111') });
+  fs.rmSync(path.join(sb2.proj, '.code-graph', 'stale-block-notice'), { force: true });
+  fs.mkdirSync(path.join(sb2.proj, '.code-graph', 'stale-block-notice'));
+  const again = runSessionInitHook(t, { reuse: sb2.sb, preloadSrc: staleStub('aaaa1111') });
+  assert.equal(again.res.status, 0, `stderr:\n${again.res.stderr}`);
+  assert.match(noticeOf(again.res), STALE_RE);
 });
 
 // issue #41: the reporter uses the plugin only and has no `code-graph-mcp` on

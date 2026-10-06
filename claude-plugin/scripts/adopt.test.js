@@ -32,7 +32,7 @@ test.after(() => {
 });
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
-  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
+  isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, shippedFingerprint, isProjectRoot,
   detectProjectType, buildBlock, migrateLegacyMemoryDir,
   formatResult, unadoptCommand, shellQuote,
   SENTINEL_BEGIN, SENTINEL_END, MANAGED_BY, TEMPLATE_PATH, TARGET_NAME,
@@ -462,6 +462,43 @@ test('needsRefresh: true when the CLAUDE.md block drifts (project type change)',
   } finally { sb.cleanup(); }
 });
 
+// ── shippedFingerprint ──────────────────────────────────────────────────────
+// Names what the stale notice was shown for (SessionStart shows it once per
+// fingerprint): the shipped template + the block this project would get. The
+// user's own copy is not part of it, so a second edit does not re-notify.
+
+test('shippedFingerprint: same for any drift of the user copy, new for a new shipped template', () => {
+  const sb = makeSandbox();
+  const tplDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-tpl-'));
+  try {
+    adopt({ cwd: sb.cwd });
+    const fp = shippedFingerprint({ cwd: sb.cwd });
+    assert.match(fp, /^[0-9a-f]{16}$/);
+    fs.writeFileSync(sb.detail, `${MANAGED_BY}\n# one edit\n`);
+    assert.strictEqual(shippedFingerprint({ cwd: sb.cwd }), fp, 'the user copy is not an input');
+    fs.writeFileSync(sb.detail, `${MANAGED_BY}\n# another edit\n`);
+    assert.strictEqual(shippedFingerprint({ cwd: sb.cwd }), fp);
+
+    const tpl = path.join(tplDir, 'tpl.md');
+    fs.writeFileSync(tpl, fs.readFileSync(TEMPLATE_PATH, 'utf8') + 'one more line\n');
+    assert.notStrictEqual(shippedFingerprint({ cwd: sb.cwd, templatePath: tpl }), fp,
+      'a changed shipped template is a new fingerprint');
+  } finally {
+    sb.cleanup();
+    fs.rmSync(tplDir, { recursive: true, force: true });
+  }
+});
+
+test('shippedFingerprint: new when the project type, and so the block, changes', () => {
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd });
+    const fp = shippedFingerprint({ cwd: sb.cwd });
+    fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[dependencies]\naxum = "0.7"\n');
+    assert.notStrictEqual(shippedFingerprint({ cwd: sb.cwd }), fp);
+  } finally { sb.cleanup(); }
+});
+
 test('needsRefresh: false when not adopted (nothing to refresh)', () => {
   const sb = makeSandbox();
   try {
@@ -530,6 +567,8 @@ test('maybeAutoAdopt reports a drifted block as stale and rewrites nothing', () 
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: {} });
     assert.strictEqual(res.attempted, false);
     assert.strictEqual(res.reason, 'stale');
+    assert.strictEqual(res.fingerprint, shippedFingerprint({ cwd: sb.cwd }),
+      'SessionStart records the notice under this fingerprint');
     assert.strictEqual(fs.readFileSync(sb.detail, 'utf8'), `${MANAGED_BY}\n# stale\n`, 'detail left as it was');
     assert.strictEqual(fs.readFileSync(sb.claudeMd, 'utf8'), claudeMdBefore, 'CLAUDE.md left as it was');
   } finally { sb.cleanup(); }

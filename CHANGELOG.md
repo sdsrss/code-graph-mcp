@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The out-of-date `CLAUDE.md` block notice is shown once per project for each
+  shipped template, not at every session start (a gap 0.164.0 listed). The
+  record is `.code-graph/stale-block-notice`. A project without a
+  `.code-graph/` directory, or one where the record cannot be written, still
+  sees the notice every session; a newer shipped template shows it once more.
+
 ## 0.164.0
 
 Most of this release comes from a 2026-09-28 evaluation of the plugin inside
