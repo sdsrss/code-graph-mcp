@@ -21,9 +21,9 @@ this notice; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` still silences it everywhere.
   writes it. Where that variable is unset, as in an older Claude Code, the
   record is written as before. A record an unattended session already wrote
   stays: delete `.code-graph/stale-block-notice` to see the notice again.
-- A `.code-graph/stale-block-notice` longer than 64 bytes no longer counts as
-  a match because its first 64 bytes hold the fingerprint; the record must
-  hold the fingerprint and nothing else. The plugin writes 17 bytes, so only a
+- A `.code-graph/stale-block-notice` of 64 bytes or more no longer counts as
+  a match because its first bytes hold the fingerprint; the record must hold
+  the fingerprint and nothing else. The plugin writes 17 bytes, so only a
   hand-made file was affected.
 
 ### Evals
@@ -31,21 +31,28 @@ this notice; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` still silences it everywhere.
 - Six "who calls this?" cases on tokio 1.41.1 (`evals/steering/tokio/`), with
   answers from rust-analyzer through the SCIP oracle's new `--dump-gold`. With
   the plugin as shipped, Opus found every caller in 12 of 12 sessions without
-  using code-graph; Sonnet averaged 0.951 recall and Haiku 0.733. The misses
-  sit where code-graph has no edge for a call (method calls on common names,
-  a renamed re-export). The steering-file A/B this run was meant to gate was
-  not run; `evals/README.md` says why.
+  using code-graph; Sonnet averaged 0.951 recall and Haiku 0.733. Of the 26
+  callers the two missed, 24 have no code-graph edge (method calls on common
+  names, a renamed re-export); the other 2 have one that `find_references`
+  dropped (below). The steering-file A/B this run was meant to gate was not
+  run; `evals/README.md` says why.
 
 ### Not covered
 
 - `find_references` answers 0 references for a method whose calls code-graph
   could not resolve, without saying that calls may be missing (12 real
   callers of `LinkedList::remove` in tokio).
+- `find_references` and `code-graph-mcp refs` list one caller per name per
+  file: a second caller with the same name in the same file is dropped, with
+  no count. In tokio, `Recv::new` and `Waiter::new` in `broadcast.rs` both
+  call `Pointers::new`; the index holds 10 such edges and `refs` lists 9.
 - `find_references` and `get_ast_node` refuse an absolute `file_path`, even
   one inside the project; they take project-relative paths.
 - `CLAUDE_CODE_SESSION_ATTENDED` is not documented by Claude Code. It was
   measured in the terminal UI and under `claude -p` only; the IDE and desktop
-  apps count as attended in Claude Code's own code, not in a run.
+  apps count as attended in Claude Code's own code, not in a run, and
+  background, daemon and teammate sessions count as unattended, so a notice
+  read only there shows every time.
 
 ## 0.165.0
 

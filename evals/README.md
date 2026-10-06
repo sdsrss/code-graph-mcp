@@ -260,16 +260,20 @@ from rust-analyzer), variant `none` only, two runs per case per model, $4.82.
 | `claude-haiku-4-5` | 8 | 0.733 | 8/8 | 27.4 | $1.40 |
 
 Haiku stopped at 8 sessions: `ab.py` checks its cost cap only before a session
-starts, and three were already running.
+starts, and two were already running when the sixth crossed it ($0.81).
 
 - Opus found every caller with grep, including the 34 of 58 graded callers
   code-graph has no default-floor edge for. These questions leave Opus no room.
-- The misses sit where code-graph has no edge. `spawn-blocking`'s three
+- Of the 26 graded callers Sonnet (4) and Haiku (22) missed, 24 have no
+  code-graph edge at any tier. `spawn-blocking`'s three
   `Blocking::poll_*` callers call it as `sys::run`, a renamed re-export: Sonnet
   missed all three in 1 run of 2, Haiku in its 1 run. In `linked-list-remove`
   (12 method calls, no edge at any tier) Haiku scored 0.583, and 0.0 after
   `find_references` answered 0 references and the session ran out of its 50
-  turns.
+  turns. The other 2 (Haiku: `Recv::new`, `Receiver::into_nonblocking_fd`)
+  have edges, but `find_references` lists one caller per name per file and
+  returned only their same-named neighbour (`Waiter::new`,
+  `Sender::into_nonblocking_fd`).
 - Haiku passed an absolute `file_path` to `find_references` and
   `get_ast_node`; both failed (2 of the pilot's 22 MCP calls, one session).
   They accept project-relative paths only.
