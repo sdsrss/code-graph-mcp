@@ -221,7 +221,7 @@ impl McpServer {
         let file_path_owned = args["file_path"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
-            .map(super::normalize_path_arg)
+            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()))
             .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
         let file_path = file_path_owned.as_str();
         let direction_raw = args
@@ -501,7 +501,9 @@ impl McpServer {
         // Windows client passing `src\parser` matched nothing and the tool
         // answered "No dead code found" — a false clean, the quietest possible
         // failure for a tool whose whole job is reporting absence.
-        let path = args["path"].as_str().map(super::normalize_path_arg);
+        let path = args["path"]
+            .as_str()
+            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()));
         let path = path.as_deref();
         let node_type = args["node_type"].as_str();
         // Validate node_type up-front: an unknown alias normalizes to an empty Vec
@@ -526,7 +528,10 @@ impl McpServer {
         let (ignore_prefixes, ignore_was_defaulted) = match args.get("ignore_paths") {
             Some(serde_json::Value::Array(arr)) => (
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(super::normalize_path_arg))
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()))
+                    })
                     .collect::<Vec<_>>(),
                 false,
             ),

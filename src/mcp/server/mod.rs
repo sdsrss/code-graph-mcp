@@ -7048,6 +7048,108 @@ app.post('/api/login', handleLogin);
         assert_eq!(prod["test_references_filtered"], 1, "{prod}");
     }
 
+    /// D#228: an absolute path under the project root, and a `./` spelling, name
+    /// the same file as the root-relative path the index stores. Every tool that
+    /// takes a path answered "not found" (or a false-clean empty result) for
+    /// them; models pass absolute paths (Haiku did, in the tokio pilot).
+    #[test]
+    fn test_path_args_accept_absolute_and_dot_slash_spellings_under_the_root() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/a.rs"),
+            "pub fn d228_target() {}\npub fn d228_caller() { d228_target(); }\n\
+             fn d228_unused() {\n    let x = 1;\n    let _ = x;\n}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let abs_file = project
+            .path()
+            .join("src/a.rs")
+            .to_string_lossy()
+            .into_owned();
+        let abs_dir = project.path().join("src").to_string_lossy().into_owned();
+        // (tool, args for a path, [relative, absolute, ./], what the relative
+        // answer must show — `!` prefix: must NOT show — so a spelling that
+        // misses the index cannot match an equally empty answer).
+        type Case<'a> = (
+            &'a str,
+            Box<dyn Fn(&str) -> serde_json::Value>,
+            [&'a str; 3],
+            &'a str,
+        );
+        let file = ["src/a.rs", abs_file.as_str(), "./src/a.rs"];
+        let dir = ["src", abs_dir.as_str(), "./src"];
+        let cases: Vec<Case> = vec![
+            (
+                "find_references",
+                Box::new(|p| json!({ "symbol_name": "d228_target", "file_path": p })),
+                file,
+                "d228_caller",
+            ),
+            (
+                "get_ast_node",
+                Box::new(|p| json!({ "symbol_name": "d228_target", "file_path": p })),
+                file,
+                "d228_target",
+            ),
+            (
+                "get_call_graph",
+                Box::new(
+                    |p| json!({ "function_name": "d228_target", "file_path": p, "direction": "callers" }),
+                ),
+                file,
+                "d228_caller",
+            ),
+            (
+                "dependency_graph",
+                Box::new(|p| json!({ "file_path": p })),
+                file,
+                "src/a.rs",
+            ),
+            (
+                "module_overview",
+                Box::new(|p| json!({ "path": p })),
+                dir,
+                "d228_target",
+            ),
+            (
+                "find_dead_code",
+                Box::new(|p| json!({ "path": p })),
+                dir,
+                "d228_unused",
+            ),
+            (
+                "find_dead_code",
+                Box::new(|p| json!({ "path": "src", "ignore_paths": [p] })),
+                dir,
+                "!d228_unused",
+            ),
+        ];
+        for (tool, args, [relative, absolute, dotted], marker) in &cases {
+            let want = server
+                .dispatch_tool(tool, &args(relative))
+                .unwrap_or_else(|e| panic!("{tool} with {relative}: {e}"));
+            let text = want.to_string();
+            let shown = match marker.strip_prefix('!') {
+                Some(m) => !text.contains(m),
+                None => text.contains(marker),
+            };
+            assert!(
+                shown && !text.contains("not found"),
+                "fixture precondition: {tool} with {relative} must answer `{marker}`: {want}"
+            );
+            for spelling in [absolute, dotted] {
+                let got = server
+                    .dispatch_tool(tool, &args(spelling))
+                    .unwrap_or_else(|e| panic!("{tool} with {spelling}: {e}"));
+                assert_eq!(got, want, "{tool}: {spelling} must answer like {relative}");
+            }
+        }
+    }
+
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
     /// `direct_callers` and `affected_files` from the same truncatable caller
     /// traversal `get_call_graph` reports `limit_hit` for — and reported them
