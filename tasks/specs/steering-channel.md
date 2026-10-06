@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 3
+status: implemented
+revision: 5
 ---
 # Steering channel: stale-block notice once, and measure a git-excluded file channel
 
@@ -47,12 +47,72 @@ revision: 3
   turns and cost per run, for the structural suite (10 cases × 3) and the
   coding suite (5 cases × 3); a recorded decision with the numbers.
 
+## design (r4): `.claude/rules/code-graph.md`
+
+One plugin-owned file, git-excluded, refreshed in place, swept at uninstall.
+
+- **Content.** First line `<!-- managed-by: code-graph-mcp -->` (ownership
+  marker, as the detail doc). Then the block's heading, text and table, minus
+  the detail-doc pointer (0 of 45 measured sessions opened that doc, so no
+  detail doc is written), plus one line: these commands come from the
+  code-graph-mcp plugin; if `code-graph-mcp` is not found, ignore this file.
+- **Where.** SessionStart, plugin mode only, when cwd is the git top-level and
+  holds `.code-graph/`. A session in a subdirectory writes nothing.
+- **First session.** The file is written after Claude Code read its rules, so
+  the session that creates it gets the same text once as `additionalContext`.
+- **Exclude.** `/.claude/rules/code-graph.md` is appended to
+  `git rev-parse --git-path info/exclude` (a worktree's resolves to the
+  common dir) unless `git check-ignore` already ignores it. If that write
+  fails, the file is not written.
+- **Uninstall.** The project is recorded in the adopted-projects registry;
+  `unadopt` removes the file (marker-guarded) and an emptied `rules/` and
+  `.claude/`. The post-uninstall statusline sweep runs `unadopt` over the
+  registry: verified 2026-10-06 in a sandbox — after `claude plugin
+  uninstall` the cache dir stays (marked `.orphaned_at`), the statusline still
+  points at it, and one render removed a registered project's CLAUDE.md block,
+  the cache and the statusline entry. Holes: a statusline the user replaced,
+  or no interactive session before Claude Code reaps the cache; then the
+  file's own last line applies.
+- **Opt-out.** `CODE_GRAPH_NO_AUTO_ADOPT=1` (its existing meaning: no automatic
+  adoption surface).
+
+### shapes (each one a test)
+
+| # | Shape | Result |
+|---|---|---|
+| 1 | git top-level with `.code-graph/`, nothing at the path | created, exclude line, registry, injected once |
+| 2 | our file, same content | unchanged, nothing written |
+| 3 | our file, older content | rewritten |
+| 4 | a file at the path without our first line | left alone |
+| 5 | `.claude` is a symlink | refused |
+| 6 | `.claude/rules` is a symlink | refused |
+| 7 | the file is a symlink | refused |
+| 8 | the path is tracked by git | refused |
+| 9 | not a git work tree | nothing |
+| 10 | git top-level is `$HOME` or `/` | nothing |
+| 11 | cwd is a subdirectory of the top-level | nothing |
+| 12 | top-level `package.json` without `"private": true` and without a `files` array | refused (npm would publish it; `info/exclude` is git-only) |
+| 13 | same, `"private": true` | created |
+| 14 | `files` array with an entry starting with `.claude`, `*`, `.` alone or empty | refused; other `files` arrays: created |
+| 15 | CLAUDE.md already holds our block | nothing (no duplicate) |
+| 16 | we created it, the user deleted it | not re-created (marker `.code-graph/rules-file`) |
+| 17 | exclude not writable | not written |
+| 18 | path already ignored | created, exclude untouched |
+| 19 | `CODE_GRAPH_NO_AUTO_ADOPT=1` | nothing |
+| 20 | not plugin mode | nothing |
+| 21 | linked worktree | file in the worktree, exclude line in the common dir |
+| 22 | `unadopt` / uninstall sweep | our file removed, emptied dirs removed, registry entry dropped |
+| 23 | `unadopt` with a user file at the path | left alone |
+| 24 | no `.code-graph/` at the top-level | nothing |
+
 ## open-questions
 - Answered (r3): a launch-loaded rules file raised code-graph use on structural
   questions 19/30 -> 26/30 (Fisher p=0.07), turns 149 -> 131, cost $5.54 ->
   $5.25, scores at ceiling both; coding tasks 0/15 -> 1/15, no change.
   `CLAUDE.local.md` was not measured (disqualified by the AGENTS.md rule).
-- Open, for the user (L3): ship a `.claude/rules/code-graph.md` channel? A
+- Decided (r4): the user approved "design first, implement only if the
+  uninstall residue is solved"; the sweep was verified, so it is implemented on
+  this branch, not released. Was: ship a `.claude/rules/code-graph.md` channel? A
   design has to settle, before code: first-session delivery (the file is read
   before SessionStart writes it); when not to write (non-git, root at $HOME or
   /, file tracked, `.claude`/`rules` a symlink, an npm root without `files`
@@ -72,3 +132,14 @@ revision: 3
 - r3 (2026-10-06): measured in real `claude -p` sessions (evals/steering/ab.py,
   a8698b7): 90 sessions, $23.68; results in evals/README.md. Shipping is an
   L3 decision for the user.
+- r4 (2026-10-06): design + shapes; uninstall sweep verified in a sandbox;
+  implementation approved under the condition above.
+- r5 (2026-10-06): implemented (rules-file.js + adopt.js unadopt/helpers,
+  session-init injection, lifecycle/cli-entry shared predicate). Shapes 1–24
+  covered by rules-file.test.js (20 tests); 11 guard mutations each caught.
+  End-to-end in a sandbox install (plugin-mode path): session 1 created the
+  file and the model quoted the block "from context added by a hook"; session
+  2 quoted it "from .claude/rules/code-graph.md"; git status empty both times;
+  `claude plugin uninstall` + one statusline render removed the file and its
+  `.claude/`. Trap: a local directory marketplace runs the plugin from its
+  source dir, which is not plugin mode unless it sits under .claude/plugins/.

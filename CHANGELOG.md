@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+**Upgrading:** in a git repository the plugin has indexed, SessionStart now
+keeps `.claude/rules/code-graph.md` (git-excluded). Set
+`CODE_GRAPH_NO_AUTO_ADOPT=1` to keep it out, or delete the file once: it is
+not written back.
+
+### Changed
+
+- **A steering file Claude Code loads at launch.** The MCP `instructions`
+  alone reach the model in every session, yet in real `claude -p` sessions
+  (`evals/steering/ab.py`, 90 sessions, `claude-opus-5-5`) the same table in
+  `.claude/rules/code-graph.md` raised code-graph use on structural questions
+  from 19 to 26 of 30 runs, with 131 turns against 149 and $5.25 against
+  $5.54; coding tasks were unchanged (0 and 1 of 15). SessionStart writes it
+  at a repository's top level when `.code-graph/` exists there, adds it to
+  `.git/info/exclude`, and hands the creating session the text once. It skips
+  a symbolic link, a tracked path, a top level at `$HOME`, a `CLAUDE.md` that
+  already holds the block, and an npm root that would publish the file (and
+  takes its own file out if the root becomes one). A rules file rather than
+  `CLAUDE.md` or `CLAUDE.local.md`: either of those makes Claude Code stop
+  reading the repository's `AGENTS.md`.
+- **Uninstall takes it out.** The project is recorded with the adopted
+  projects, `unadopt` removes the file (and a `.claude/` it alone filled), and
+  the post-uninstall status-line sweep reports it with the `CLAUDE.md` blocks.
+  Where that sweep cannot run (a status line you replaced, or no interactive
+  session before Claude Code reaps the plugin), the file's last line tells
+  Claude to ignore it once `code-graph-mcp` is gone.
+- **Evals: instruction files never load in `claude plugin eval`.** No number
+  in `evals/README.md` before this release includes the `CLAUDE.md` block;
+  `evals/steering/ab.py` compares steering files in real sessions.
+
 ### Fixed
 
 - The out-of-date `CLAUDE.md` block notice is shown once per project for each

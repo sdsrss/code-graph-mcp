@@ -726,8 +726,8 @@ function cleanupDisabledStatusline() {
  */
 function unadoptRegisteredProjects() {
   const out = [];
-  let readAdoptedResult, unadopt;
-  try { ({ readAdoptedResult, unadopt } = require('./adopt')); }
+  let readAdoptedResult, unadopt, unadoptCleaned, unadoptFailed;
+  try { ({ readAdoptedResult, unadopt, unadoptCleaned, unadoptFailed } = require('./adopt')); }
   catch { return { unadopted: out, registryUnusable: false }; } // POSIX-only helper unavailable — teardown continues
   // readAdoptedResult, NOT the lenient readAdoptedProjects(): that wrapper
   // collapses "unreadable / truncated / wrong shape" into `[]`, which here is
@@ -749,9 +749,7 @@ function unadoptRegisteredProjects() {
       // failure separately (`claudeMdUnreadable` / `claudeMdUnwritable`, the
       // same pair adopt.js folds into its own `cleanupFailed`), so use it rather
       // than inferring failure from "nothing happened".
-      const cleaned = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
-      const failed = !!(r && (r.claudeMdUnreadable || r.claudeMdUnwritable));
-      out.push({ project, cleaned, failed });
+      out.push({ project, cleaned: unadoptCleaned(r), failed: unadoptFailed(r) });
     } catch (e) {
       out.push({ project, cleaned: false, failed: true, error: (e && e.message) || String(e) });
     }
@@ -777,7 +775,7 @@ function reportUnadoptSweep(entries) {
     if (!cleaned.length && !failed.length) return;
     const lines = [];
     if (cleaned.length) {
-      lines.push(`[code-graph] Plugin uninstalled — removed the managed CLAUDE.md block from ${cleaned.length} project(s):`);
+      lines.push(`[code-graph] Plugin uninstalled — removed its CLAUDE.md block / .claude/rules/code-graph.md from ${cleaned.length} project(s):`);
       for (const p of cleaned.slice(0, 10)) lines.push(`             ${p}`);
       if (cleaned.length > 10) lines.push(`             …and ${cleaned.length - 10} more`);
       lines.push('             Your own text outside the block was kept; .code-graph/ index dirs are untouched.');
@@ -800,7 +798,8 @@ function reportUnadoptSweep(entries) {
       lines.push(`             everything from  ${SENTINEL_BEGIN}`);
       lines.push(`             through          ${SENTINEL_END}`);
       lines.push('             (your own text outside those markers is not ours to remove), or run');
-      lines.push('             `npx -y @sdsrs/code-graph unadopt` in the project:');
+      lines.push('             `npx -y @sdsrs/code-graph unadopt` in the project; delete a leftover');
+      lines.push('             .claude/rules/code-graph.md by hand:');
       for (const p of failed.slice(0, 10)) lines.push(`             ${p}`);
     }
     process.stderr.write(lines.join('\n') + '\n');
@@ -1705,12 +1704,13 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
   const unadopted = [];
   if (unadoptAll && adoptedProjects.length) {
     let unadoptFn = null;
-    try { unadoptFn = require('./adopt').unadopt; } catch { /* POSIX-only — skip */ }
+    let unadoptCleaned = null;
+    try { ({ unadopt: unadoptFn, unadoptCleaned } = require('./adopt')); } catch { /* POSIX-only — skip */ }
     if (unadoptFn) {
       for (const project of adoptedProjects) {
         try {
           const r = unadoptFn({ cwd: project });
-          unadopted.push({ project, ok: !!(r && r.ok), cleaned: !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved)) });
+          unadopted.push({ project, ok: !!(r && r.ok), cleaned: unadoptCleaned(r) });
         } catch (e) {
           unadopted.push({ project, ok: false, error: (e && e.message) || String(e) });
         }

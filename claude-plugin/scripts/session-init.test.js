@@ -380,6 +380,42 @@ test('the stale-block notice is shown once per project for one shipped template'
   assert.match(noticeOf(third.res), STALE_RE, 'a newer shipped template must be reported again');
 });
 
+// The rules file (rules-file.js): Claude Code read its rules before this hook
+// wrote the file, so the session that creates it gets the text once — and only
+// that session; one that finds it in place has already loaded it.
+const contextOf = (res) => {
+  const out = (res.stdout || '').trim();
+  if (!out) return '';
+  const o = JSON.parse(out);
+  return (o.hookSpecificOutput && o.hookSpecificOutput.additionalContext) || '';
+};
+const rulesStub = (result) => `
+  require(${JSON.stringify(path.join(__dirname, 'rules-file.js'))}).maybeWriteRulesFile = () => (${JSON.stringify(result)});
+`;
+
+test('the session that creates the rules file is handed its text once', (t) => {
+  const created = runSessionInitHook(t, {
+    prefix: 'cg-si-rules-',
+    preloadSrc: rulesStub({ action: 'created', text: 'RULES-TEXT-CANARY' }),
+  });
+  assert.equal(created.res.status, 0, `stderr:\n${created.res.stderr}`);
+  assert.match(contextOf(created.res), /RULES-TEXT-CANARY/);
+  for (const action of ['unchanged', 'updated', 'skipped', 'refused']) {
+    const r = runSessionInitHook(t, {
+      reuse: created.sb, preloadSrc: rulesStub({ action, text: 'RULES-TEXT-CANARY' }),
+    });
+    assert.doesNotMatch(contextOf(r.res), /RULES-TEXT-CANARY/, `${action}: the file itself is loaded already`);
+  }
+});
+
+test('a throwing rules-file writer does not take SessionStart down', (t) => {
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-rules-throw-',
+    preloadSrc: `require(${JSON.stringify(path.join(__dirname, 'rules-file.js'))}).maybeWriteRulesFile = () => { throw new Error('boom'); };`,
+  });
+  assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
+});
+
 test('the stale-block notice keeps showing where it cannot be recorded', (t) => {
   // No .code-graph/ in the project: creating one would put an unexcluded
   // directory in `git status`, the side effect D3/D4 removed. Not recorded, so
