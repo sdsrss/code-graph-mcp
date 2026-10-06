@@ -264,8 +264,9 @@ starts, and two were already running when the sixth crossed it ($0.81).
 
 - Opus found every caller with grep, including the 34 of 58 graded callers
   code-graph has no default-floor edge for. These questions leave Opus no room.
-- Of the 26 graded callers Sonnet (4) and Haiku (22) missed, 24 have no
-  code-graph edge at any tier. `spawn-blocking`'s three
+- Sonnet missed 4 graded callers and Haiku 22: 26 misses of 17 distinct
+  callers. 24 of the misses (15 callers) are of callers with no code-graph
+  edge at any tier. `spawn-blocking`'s three
   `Blocking::poll_*` callers call it as `sys::run`, a renamed re-export: Sonnet
   missed all three in 1 run of 2, Haiku in its 1 run. In `linked-list-remove`
   (12 method calls, no edge at any tier) Haiku scored 0.583, and 0.0 after
@@ -284,8 +285,10 @@ starts, and two were already running when the sixth crossed it ($0.81).
 - The steering A/B this pilot was to gate was not run. Opus has no room;
   Haiku already used code-graph in 8 of 8 sessions; Sonnet's per-session SD of
   0.144 needs about 130 sessions per arm to resolve a 5-point difference. And
-  the misses are where code-graph returns nothing for a method call, which a
-  steering file would amplify, not fix: measure after that changes.
+  the misses are where code-graph returns nothing or too little (no edge for
+  method calls on common names or a renamed re-export, same-named callers
+  dropped from `find_references`), which a steering file would amplify, not
+  fix: measure after that changes.
 
 ## What `run.sh` sets up, and why
 

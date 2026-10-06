@@ -510,10 +510,12 @@ test('the stale-block record matches the whole fingerprint and nothing else', (t
   assert.equal(staleNoticeDue(longer, fp), false);
 
   assert.equal(staleNoticeDue(projectWith(`${fp}\r\n`), fp), false, 'a CRLF line ending still matches');
+  assert.equal(staleNoticeDue(projectWith(`${fp}${' '.repeat(46)}\n`), fp), false, '63 bytes of fingerprint and whitespace still match');
   for (const [what, record] of [
     ['a prefix of the fingerprint', `${fp.slice(0, 8)}\n`],
     ['the fingerprint and more', `${fp}0\n`],
     ['the fingerprint padded past 64 bytes', `${fp}${' '.repeat(64)}tail\n`],
+    ['the fingerprint padded to exactly 64 bytes', `${fp}${' '.repeat(47)}\n`],
   ]) {
     assert.equal(staleNoticeDue(projectWith(record), fp), true, `a record holding ${what} is not a match`);
   }

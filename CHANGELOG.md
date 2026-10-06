@@ -23,7 +23,7 @@ this notice; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` still silences it everywhere.
   stays: delete `.code-graph/stale-block-notice` to see the notice again.
 - A `.code-graph/stale-block-notice` of 64 bytes or more no longer counts as
   a match because its first bytes hold the fingerprint; the record must hold
-  the fingerprint and nothing else. The plugin writes 17 bytes, so only a
+  the fingerprint and nothing but whitespace. The plugin writes 17 bytes, so only a
   hand-made file was affected.
 
 ### Evals
@@ -31,10 +31,10 @@ this notice; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` still silences it everywhere.
 - Six "who calls this?" cases on tokio 1.41.1 (`evals/steering/tokio/`), with
   answers from rust-analyzer through the SCIP oracle's new `--dump-gold`. With
   the plugin as shipped, Opus found every caller in 12 of 12 sessions without
-  using code-graph; Sonnet averaged 0.951 recall and Haiku 0.733. Of the 26
-  callers the two missed, 24 have no code-graph edge (method calls on common
-  names, a renamed re-export); the other 2 have one that `find_references`
-  dropped (below). The steering-file A/B this run was meant to gate was not
+  using code-graph; Sonnet averaged 0.951 recall and Haiku 0.733. Of their
+  26 misses (17 distinct callers), 24 are of callers code-graph has no edge
+  for (method calls on common names, calls through a renamed re-export); the
+  other 2 are of callers whose edges `find_references` dropped (below). The steering-file A/B this run was meant to gate was not
   run; `evals/README.md` says why.
 
 ### Not covered

@@ -12,22 +12,25 @@ REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 DIR="${1:-${CG_STEER_WORK_DIR:-/var/tmp/cg-steer}/tokio}"
 COMMIT=bb7ca7507b94d01ffe0e275ddc669734ab3bf783  # tag tokio-1.41.1
 BIN="${CG_EVAL_BINARY:-$REPO/target/release/code-graph-mcp}"
+case "$BIN" in */*) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" ;; esac
 mkdir -p "$DIR"
-SRC="${TOKIO_SRC:-$DIR/clone}"
-if [ ! -d "$SRC" ]; then
-  git -c advice.detachedHead=false clone -q --branch tokio-1.41.1 https://github.com/tokio-rs/tokio.git "$SRC"
-fi
-[ "$(git -C "$SRC" rev-parse "$COMMIT^{commit}")" = "$COMMIT" ] || { echo "template.sh: $SRC lacks $COMMIT" >&2; exit 1; }
-WS="${DIR:?}/tokio"
-# DIR/tokio is replaced only when this script made it (the marker sits beside
-# it, so nothing extra lands in the workspace the sessions see).
+DIR="$(cd "$DIR" && pwd)"  # absolute: the indexer runs from inside the workspace
+WS="$DIR/tokio"
+# DIR/tokio is replaced only when the marker beside it says this script made
+# a DIR/tokio here. It cannot tell whether that directory was swapped since.
 MARK="$DIR/.tokio-template"
 if [ -e "$WS" ] && [ ! -f "$MARK" ]; then
   echo "template.sh: $WS exists and was not made by this script; move it or pick another DIR" >&2
   exit 1
 fi
+SRC="${TOKIO_SRC:-$DIR/clone}"
+if [ ! -d "$SRC" ]; then
+  git -c advice.detachedHead=false clone -q --branch tokio-1.41.1 https://github.com/tokio-rs/tokio.git "$SRC"
+fi
+[ "$(git -C "$SRC" rev-parse "$COMMIT^{commit}")" = "$COMMIT" ] || { echo "template.sh: $SRC lacks $COMMIT" >&2; exit 1; }
 rm -rf "${WS:?}"
 mkdir -p "$WS"
+rm -f "$MARK"
 echo "$COMMIT" >"$MARK"
 git -C "$SRC" archive "$COMMIT" | tar -x -C "$WS"
 git -C "$WS" init -q
@@ -40,4 +43,5 @@ if ! (cd "$WS" && HOME="$SCRATCH" CODE_GRAPH_NO_AUTO_UPDATE=1 "$BIN" incremental
   echo "template.sh: indexing $WS with $BIN failed" >&2
   exit 1
 fi
+[ -f "$WS/.code-graph/index.db" ] || { echo "template.sh: $BIN wrote no index in $WS" >&2; exit 1; }
 echo "template: $WS ($("$BIN" --version))"

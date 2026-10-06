@@ -48,4 +48,5 @@ every case.
 
 First run (2026-10-06, Opus, Sonnet and Haiku, $4.82): `evals/README.md`,
 "Headroom pilot on tokio". Opus scored 1.000 on all 12 sessions; the room is
-in the smaller models, where code-graph has no edge.
+in the smaller models, on callers code-graph has no edge for or
+`find_references` drops.
