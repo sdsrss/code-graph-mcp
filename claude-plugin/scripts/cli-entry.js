@@ -110,7 +110,7 @@ function main({ argv = process.argv, findBinaryRoot = null } = {}) {
     }
     rejectUnknownFlags(argv, "uninstall", new Set(["--help", "-h", "--unadopt-all", "--purge-global"]));
     const lifecycle = require("./lifecycle");
-    const { unadopt, unadoptCleaned } = require("./adopt");
+    const { unadopt } = require("./adopt");
     // Unadopt THIS project BEFORE the teardown, not after.
     //
     // `lifecycle.removeCacheResidue` (step 6) holds two rules: PRESERVE a
@@ -131,7 +131,7 @@ function main({ argv = process.argv, findBinaryRoot = null } = {}) {
     // `otherAdopted` below already filtered `process.cwd()` out either way.
     let ua = { ok: false };
     try { ua = unadopt(); } catch { /* best-effort — the teardown below still runs */ }
-    const projectUnadopted = unadoptCleaned(ua);
+    const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
     const r = lifecycle.uninstall({
       purgeGlobal: argv.slice(3).includes("--purge-global"),
       unadoptAll: argv.slice(3).includes("--unadopt-all"),

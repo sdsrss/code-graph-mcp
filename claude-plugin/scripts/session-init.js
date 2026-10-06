@@ -10,8 +10,7 @@ const {
 } = require('./lifecycle');
 const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand, adoptCommand, unadoptCleaned } = require('./adopt');
-const { maybeWriteRulesFile } = require('./rules-file');
+const { maybeAutoAdopt, isAdopted, unadopt, unadoptCommand, adoptCommand } = require('./adopt');
 const { capContext } = require('./hook-emit');
 const { isNonProjectCwd } = require('./project-detect');
 const { hidden } = require('./proc-opts');
@@ -650,7 +649,7 @@ function runSessionInit({ source } = {}) {
       try {
         if (!unadopted && !isNonProjectCwd(process.cwd())) {
           const r = unadopt({ cwd: process.cwd() });
-          unadopted = unadoptCleaned(r);
+          unadopted = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
         }
       } catch { /* best-effort — never let teardown break SessionStart */ }
       const cacheRemoved = removeCacheResidue();
@@ -714,17 +713,6 @@ function runSessionInit({ source } = {}) {
       '            (Shown once per shipped template. SessionStart no longer edits CLAUDE.md itself;\n' +
       '            CODE_GRAPH_NO_TEMPLATE_REFRESH=1 silences this.)'
     );
-  }
-
-  // The steering file (rules-file.js, tasks/specs/steering-channel.md). Claude
-  // Code read the project's rules before this hook ran, so the session that
-  // creates the file gets its text once here; later sessions load the file.
-  // Not from a stale relic: it would write an older plugin's text.
-  if (!isRelic) {
-    try {
-      const rules = maybeWriteRulesFile({ scriptPath: __dirname });
-      if (rules && rules.action === 'created' && rules.text) contextParts.push(rules.text);
-    } catch { /* never fails SessionStart (P1-16) */ }
   }
 
   // quietHooks: default quiet (project_map injection duplicates MEMORY.md +

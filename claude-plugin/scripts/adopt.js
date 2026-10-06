@@ -111,20 +111,11 @@ function buildTriggerRows(projectType = 'generic') {
 // Build the full sentinel-wrapped managed block for a project type. Deterministic
 // (same type → byte-identical) so needsRefresh can bytewise-detect drift.
 function buildBlock(projectType = 'generic') {
-  const body = blockBodyLines(projectType)
-    .concat('Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`')
-    .join('\n');
-  return `${SENTINEL_BEGIN}\n${body}\n${SENTINEL_END}`;
-}
-
-// The block's text shared by CLAUDE.md (buildBlock) and the rules file
-// (buildRulesFile), up to the detail-doc pointer only CLAUDE.md carries.
-function blockBodyLines(projectType = 'generic') {
   const rows = buildTriggerRows(projectType);
   const table = ['| Intent | Command |', '|--------|---------|']
     .concat(rows.map(([intent, cmd]) => `| ${intent} | ${cmd} |`))
     .join('\n');
-  return [
+  const body = [
     BLOCK_HEADING,
     '',
     'Parsed index of the whole repo. For structural questions — who calls X, what a',
@@ -135,49 +126,9 @@ function blockBodyLines(projectType = 'generic') {
     'Unresolved calls (dynamic dispatch, reflection, unresolved imports) leave no edge, so',
     'an empty answer is not proof: confirm with grep before deleting or renaming.',
     "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
-  ];
-}
-
-// .claude/rules/code-graph.md — the steering file SessionStart keeps in a git
-// top-level (rules-file.js; tasks/specs/steering-channel.md). Claude Code loads
-// it at launch like CLAUDE.md (2026-10-06 A/B: structural questions used
-// code-graph in 26/30 runs with it, 19/30 without), and unlike CLAUDE.md or
-// CLAUDE.local.md it does not stop Claude from reading the repo's AGENTS.md.
-// A whole file we own: the first line marks it, as the detail doc's does. No
-// detail-doc pointer (0 of 45 measured sessions opened that doc), and a last
-// line for the case the uninstall sweep could not reach.
-const RULES_REL = path.join('.claude', 'rules', 'code-graph.md');
-function rulesFilePath(cwd = process.cwd()) { return path.join(cwd, RULES_REL); }
-
-function buildRulesFile(projectType = 'generic') {
-  return [
-    MANAGED_BY,
-    ...blockBodyLines(projectType),
-    'These commands come from the code-graph-mcp plugin. If `code-graph-mcp` is not found,',
-    'the plugin has been removed: ignore this file.',
-    '',
+    'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',
   ].join('\n');
-}
-
-/**
- * Remove our rules file, then `rules/` and `.claude/` if that left them empty.
- * Marker-guarded and never through a link: a same-named file the user wrote,
- * or one reached through a symlink, is theirs.
- * @returns {{removed: boolean, unremovable: boolean}}
- */
-function removeRulesFile(cwd = process.cwd()) {
-  const p = rulesFilePath(cwd);
-  let mine = false;
-  try {
-    mine = !fs.lstatSync(p).isSymbolicLink()
-      && fs.readFileSync(p, 'utf8').split('\n', 1)[0].trim() === MANAGED_BY;
-  } catch { return { removed: false, unremovable: false }; }   // absent or unreadable: not ours to judge
-  if (!mine) return { removed: false, unremovable: false };
-  try { fs.unlinkSync(p); } catch { return { removed: false, unremovable: true }; }
-  for (const dir of [path.dirname(p), path.dirname(path.dirname(p))]) {
-    try { fs.rmdirSync(dir); } catch { break; }                 // not empty, or not ours to remove
-  }
-  return { removed: true, unremovable: false };
+  return `${SENTINEL_BEGIN}\n${body}\n${SENTINEL_END}`;
 }
 
 // Project-type detection tailors the CLAUDE.md block's trigger rows (buildBlock):
@@ -897,10 +848,6 @@ function unadopt({ cwd, home } = {}) {
     }
   }
 
-  // The rules file SessionStart keeps (rules-file.js). After the detail doc, so
-  // a `.claude/` that held only our two files is removed as empty.
-  const rules = removeRulesFile(effectiveCwd);
-
   // Also sweep any legacy memory-dir remnants (uninstall before auto-migration ran).
   const migrated = migrateLegacyMemoryDir({ cwd, home });
 
@@ -913,24 +860,13 @@ function unadopt({ cwd, home } = {}) {
   // since the uninstall sweep walks the whole list, because an unconditional
   // deregister empties the file and removeCacheResidue() only preserves a
   // NON-EMPTY registry — so the failed project's record died with the cache.
-  const cleanupFailed = claudeMdUnwritable || claudeMdUnreadable || rules.unremovable;
+  const cleanupFailed = claudeMdUnwritable || claudeMdUnreadable;
   const registryUpdated = cleanupFailed ? false : removeAdopted(effectiveCwd, home);
   return {
-    ok: true, fileRemoved, blockPruned, claudeMdRemoved, rulesRemoved: rules.removed,
-    claudeMdUnreadable, claudeMdUnwritable, rulesUnremovable: rules.unremovable, registryUpdated,
-    target: dPath, claudeMdPath: cPath, rulesPath: rulesFilePath(effectiveCwd), migrated,
+    ok: true, fileRemoved, blockPruned, claudeMdRemoved,
+    claudeMdUnreadable, claudeMdUnwritable, registryUpdated,
+    target: dPath, claudeMdPath: cPath, migrated,
   };
-}
-
-// What an `unadopt` result means, for every caller that reports one (the
-// uninstall sweep, `uninstall --unadopt-all`, the CLI's own line). Three copies
-// of the "cleaned" predicate each had to learn about a new artifact; one
-// definition cannot drift from the others.
-function unadoptCleaned(r) {
-  return !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved || r.rulesRemoved));
-}
-function unadoptFailed(r) {
-  return !!(r && (r.claudeMdUnreadable || r.claudeMdUnwritable || r.rulesUnremovable));
 }
 
 /**
@@ -1021,10 +957,6 @@ function formatResult(action, result) {
     if (result.claudeMdRemoved) lines.push(`[code-graph] Removed → ${result.claudeMdPath} (was code-graph-only)`);
     else if (result.blockPruned) lines.push(`[code-graph] De-blocked → ${result.claudeMdPath}`);
     if (result.fileRemoved) lines.push(`[code-graph] Removed → ${result.target}`);
-    if (result.rulesRemoved) lines.push(`[code-graph] Removed → ${result.rulesPath}`);
-    if (result.rulesUnremovable) {
-      lines.push(`[code-graph] Could not remove ${result.rulesPath} — delete it by hand.`);
-    }
     if (result.claudeMdUnreadable || result.claudeMdUnwritable) {
       lines.push(`[code-graph] Could not ${result.claudeMdUnreadable ? 'read' : 'write'} ${result.claudeMdPath} — ` +
                  'the managed block (if any) is still there. Fix its permissions and re-run.');
@@ -1033,7 +965,8 @@ function formatResult(action, result) {
     if (m.memoryIndexPruned || m.legacyDetailRemoved) {
       lines.push('[code-graph] Cleaned legacy memory-dir artifacts.');
     }
-    if (!unadoptCleaned(result) && !unadoptFailed(result) &&
+    if (!result.blockPruned && !result.fileRemoved && !result.claudeMdRemoved &&
+        !result.claudeMdUnreadable && !result.claudeMdUnwritable &&
         !(m.memoryIndexPruned || m.legacyDetailRemoved)) {
       lines.push('[code-graph] Nothing to unadopt');
     }
@@ -1072,8 +1005,6 @@ module.exports = {
   readAdoptedProjects, readAdoptedResult, recordAdopted, removeAdopted, adoptedRegistryFile,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, shippedFingerprint, isProjectRoot, adoptCommand,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
-  buildRulesFile, removeRulesFile, rulesFilePath, RULES_REL, unadoptCleaned, unadoptFailed,
-  writeFileAtomic, platformGuard,
   claudeMdPath, detailDir, detailPath,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,
   SENTINEL_BEGIN, SENTINEL_END, SENTINEL_BEGIN_SRC, SENTINEL_VERSION,

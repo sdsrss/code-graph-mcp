@@ -186,29 +186,6 @@ test('cleanupDisabledStatusline unadopts every registered project on a genuine u
   assert.ok(fs.readFileSync(path.join(b, 'CLAUDE.md'), 'utf8').includes('keep me.'));
 });
 
-test('the uninstall sweep removes the rules file and reports the project cleaned', (t) => {
-  // rules-file.js records each project it writes .claude/rules/code-graph.md in;
-  // after `/plugin uninstall` this render is what takes the file out, or it keeps
-  // pointing every session at a CLI that is gone.
-  const homeDir = mkHome(t);
-  seedOrphanedComposite(homeDir);
-  const dir = path.join(homeDir, 'repos', 'gamma');
-  fs.mkdirSync(path.join(dir, '.claude', 'rules'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.claude', 'rules', 'code-graph.md'),
-    '<!-- managed-by: code-graph-mcp -->\n## Code Graph (repo-wide AST index)\n');
-  writeJson(path.join(homeDir, '.cache', 'code-graph', 'adopted-projects.json'), [dir]);
-
-  const res = spawnSync(process.execPath, ['-e', `
-    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
-    process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
-  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
-  const out = JSON.parse(res.stdout);
-
-  assert.equal(fs.existsSync(path.join(dir, '.claude')), false, 'file and the dirs it alone filled are gone');
-  assert.deepEqual(out.unadopted.map((u) => [u.cleaned, u.failed]), [[true, false]]);
-  assert.match(res.stderr, /gamma/, 'the user is told which repo was edited');
-});
-
 test('the uninstall sweep keeps the registry when a project could not be cleaned', (t) => {
   // End-to-end shape of the adopt.js fix: one clean project, one whose CLAUDE.md
   // cannot be rewritten. The failed one must still be named in a registry file
@@ -1823,7 +1800,7 @@ test('unadopt sweep: nothing-to-clean is not reported as a failure', () => {
     process.stderr.write = realWrite;
   }
   const out = captured.join('');
-  assert.match(out, /removed its CLAUDE\.md block \/ \.claude\/rules\/code-graph\.md from 1 project/);
+  assert.match(out, /removed the managed CLAUDE\.md block from 1 project/);
   assert.match(out, /Could NOT clean 1 project/,
     'a project whose CLAUDE.md could not be rewritten must still be reported');
   assert.match(out, /\/repo\/unwritable/);

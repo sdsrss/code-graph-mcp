@@ -229,30 +229,6 @@ immediately when a newer release is published), instead of re-downloading on
 every session. While it is in that state the statusline shows `⚠ update stuck`
 and `code-graph-mcp doctor` prints the manual update command.
 
-#### The steering file `.claude/rules/code-graph.md`
-
-In a git repository the plugin has indexed, SessionStart keeps a short steering
-file at `<repo>/.claude/rules/code-graph.md`: the intent → command table, and a
-line telling Claude to ignore the file if `code-graph-mcp` is not found. Claude
-Code loads it at launch like `CLAUDE.md`. In a 2026-10-06 comparison of real
-sessions, structural questions used code-graph in 26 of 30 runs with the file
-and 19 of 30 without it (`evals/README.md`).
-
-- It is added to the repository's `.git/info/exclude`, so `git status` never
-  lists it, and unlike `CLAUDE.md` or `CLAUDE.local.md` it does not stop
-  Claude from reading the repository's `AGENTS.md`.
-- It is written only when the session starts at the repository's top level
-  and `.code-graph/` exists there. It is not written where the path is a
-  symbolic link or tracked by git, where the top level is your home directory,
-  where `CLAUDE.md` already holds the code-graph block, or where the top level
-  is an npm package that `npm publish` would ship it with (no `"private": true`
-  and no `files` list that leaves `.claude/` out).
-- The session that creates it gets the same text once as context, since
-  Claude Code read its rules before the hook ran.
-- Delete it and it stays deleted. `code-graph-mcp unadopt` removes it, and so
-  does the uninstall clean-up (the first status-line render after
-  `/plugin uninstall`). `CODE_GRAPH_NO_AUTO_ADOPT=1` stops it being written.
-
 #### Invited-memory mode (quieter prompts)
 
 By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on explicit tool calls, opt into invited-memory mode:
@@ -569,7 +545,7 @@ defaults are what you get by doing nothing.
 | Variable | Effect |
 |---|---|
 | `CODE_GRAPH_NO_AUTO_UPDATE=1` | Never check GitHub for a new release. |
-| `CODE_GRAPH_NO_AUTO_ADOPT=1` | Skip SessionStart's adoption work: no `.claude/rules/code-graph.md`, no cleanup of this plugin's legacy memory-dir files and no notice about an out-of-date steering block. SessionStart never writes `CLAUDE.md` itself; `code-graph-mcp adopt` does. |
+| `CODE_GRAPH_NO_AUTO_ADOPT=1` | Skip SessionStart's adoption check: no cleanup of this plugin's legacy memory-dir files and no notice about an out-of-date steering block. SessionStart never writes `CLAUDE.md` itself; `code-graph-mcp adopt` does. |
 | `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Do not report a steering block that has drifted from the current template (SessionStart only reports it; `code-graph-mcp adopt` refreshes it). |
 | `CODE_GRAPH_NO_GITIGNORE=1` | Do not write the `.code-graph/` ignore rule. It goes to the repository's local `.git/info/exclude`, never to the tracked `.gitignore`, and only when neither file names the directory already. |
 | `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
