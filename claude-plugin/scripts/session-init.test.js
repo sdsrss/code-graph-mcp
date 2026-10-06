@@ -856,6 +856,12 @@ test('a plugin SessionStart removes our hooks from settings.json and keeps the u
   assert.ok(before.hooks && before.hooks.PreToolUse, 'precondition: hooks registered in settings.json');
   before.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] });
   fs.writeFileSync(settingsFile, JSON.stringify(before, null, 2));
+  // Fresh hook-fire state, as runSessionInitHook seeds it: without it
+  // checkHookFiring spawns a detached `verify-hooks-fire` that re-creates
+  // `<sb>/.cache/code-graph` after t.after has removed the sandbox (§8.V4).
+  fs.mkdirSync(path.join(sb, '.cache', 'code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(sb, '.cache', 'code-graph', 'hook-fire-state.json'),
+    JSON.stringify({ ts: new Date().toISOString(), failures: [] }));
 
   const si = path.join(__dirname, 'session-init.js');
   const res = JSON.parse(execFileSync(process.execPath, ['-e',
