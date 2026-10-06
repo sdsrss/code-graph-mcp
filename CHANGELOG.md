@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.165.1
+
+A `claude -p` or SDK session no longer uses up the one showing of the
+out-of-date `CLAUDE.md` block notice.
+
+**Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
+unchanged). The shipped template is unchanged too, so a project that has
+already seen the notice does not see it again. Only a plugin install shows
+this notice; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` still silences it everywhere.
 
 ### Fixed
 
@@ -17,6 +25,27 @@
   a match because its first 64 bytes hold the fingerprint; the record must
   hold the fingerprint and nothing else. The plugin writes 17 bytes, so only a
   hand-made file was affected.
+
+### Evals
+
+- Six "who calls this?" cases on tokio 1.41.1 (`evals/steering/tokio/`), with
+  answers from rust-analyzer through the SCIP oracle's new `--dump-gold`. With
+  the plugin as shipped, Opus found every caller in 12 of 12 sessions without
+  using code-graph; Sonnet averaged 0.951 recall and Haiku 0.733. The misses
+  sit where code-graph has no edge for a call (method calls on common names,
+  a renamed re-export). The steering-file A/B this run was meant to gate was
+  not run; `evals/README.md` says why.
+
+### Not covered
+
+- `find_references` answers 0 references for a method whose calls code-graph
+  could not resolve, without saying that calls may be missing (12 real
+  callers of `LinkedList::remove` in tokio).
+- `find_references` and `get_ast_node` refuse an absolute `file_path`, even
+  one inside the project; they take project-relative paths.
+- `CLAUDE_CODE_SESSION_ATTENDED` is not documented by Claude Code. It was
+  measured in the terminal UI and under `claude -p` only; the IDE and desktop
+  apps count as attended in Claude Code's own code, not in a run.
 
 ## 0.165.0
 
