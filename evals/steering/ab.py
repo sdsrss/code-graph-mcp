@@ -45,6 +45,8 @@ import grade  # noqa: E402  (hidden-test runner and transcript reader)
 FIXTURE_COMMIT = "6f0f6a2"  # evals/_fixture/scaffold.sh
 CODING_CACHE = Path("/var/tmp/code-graph-eval/coding/fixtures")
 WORK = Path(os.environ.get("CG_STEER_WORK_DIR", "/var/tmp/cg-steer"))
+# Cases with `workspace: tokio` copy this (evals/steering/tokio/template.sh).
+TOKIO = Path(os.environ.get("CG_STEER_TOKIO", WORK / "tokio" / "tokio"))
 CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 TARGETS = {
     "rules": ".claude/rules/code-graph.md",
@@ -75,9 +77,9 @@ def frontmatter(path):
     return meta, body.strip()
 
 
-def load_cases(tags, names):
+def load_cases(tags, names, suite=EVALS):
     cases = []
-    for prompt in sorted(EVALS.glob("*/prompt.md")):
+    for prompt in sorted(suite.glob("*/prompt.md")):
         meta, body = frontmatter(prompt)
         case_tags = set(meta.get("tags") or [])
         if names and prompt.parent.name not in names:
@@ -103,6 +105,7 @@ def load_cases(tags, names):
             "timeout": int(meta.get("timeout_seconds", 600)),
             "tools": meta.get("allowed_tools") or ["Read", "Glob", "Grep", "Bash"],
             "coding": "coding" in case_tags,
+            "workspace": meta.get("workspace"),
             "graders": graders,
         })
     return cases
@@ -160,15 +163,21 @@ def build_workspace(case, variant, root, plugin, binary):
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
     if case["coding"]:
         run(["tar", "-xf", str(CODING_CACHE / f"{case['name']}.tar"), "-C", str(ws)])
+    elif case.get("workspace") == "tokio":
+        # Already a one-commit repo, indexed as a user's project would be.
+        if not (TOKIO / ".code-graph" / "index.db").exists():
+            raise RuntimeError(f"no tokio template at {TOKIO}: run evals/steering/tokio/template.sh")
+        shutil.copytree(TOKIO, ws, symlinks=True, dirs_exist_ok=True)
     else:
         archive = subprocess.run(["git", "-C", str(REPO), "archive", FIXTURE_COMMIT, "src"],
                                  check=True, capture_output=True).stdout
         run(["tar", "-x", "-C", str(ws)], input=archive)
     git = ["git", "-C", str(ws), "-c", "user.email=eval@example.invalid", "-c", "user.name=eval"]
     home.mkdir()
-    run(git[:3] + ["init", "-q"], env=env)
-    run(git[:3] + ["add", "-A"], env=env)
-    run(git + ["commit", "-qm", "fixture"], env=env)
+    if not (ws / ".git").exists():
+        run(git[:3] + ["init", "-q"], env=env)
+        run(git[:3] + ["add", "-A"], env=env)
+        run(git + ["commit", "-qm", "fixture"], env=env)
     cg_bin = home / ".cache" / "code-graph" / "bin"
     cg_bin.mkdir(parents=True)
     shutil.copy2(binary, cg_bin / "code-graph-mcp")
@@ -295,6 +304,8 @@ def main():
     ap.add_argument("--variants", default="none,rules")
     ap.add_argument("--tags", default="structural")
     ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--suite", type=Path, default=EVALS,
+                    help="directory of case dirs (default evals/; the tokio cases: evals/steering/tokio/cases)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("-j", type=int, default=3)
     ap.add_argument("--model", required=True)
@@ -318,7 +329,7 @@ def main():
     have = subprocess.run([str(binary), "--version"], capture_output=True, text=True).stdout.split()[1]
     if want != have:
         sys.exit(f"binary is {have}, plugin is {want}")
-    cases = [PROBE] if args.probe else load_cases(set(args.tags.split(",")), set(args.case))
+    cases = [PROBE] if args.probe else load_cases(set(args.tags.split(",")), set(args.case), args.suite)
     if not cases:
         sys.exit("no cases")
     plugin, tools = stage(binary)

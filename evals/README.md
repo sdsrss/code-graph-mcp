@@ -246,6 +246,43 @@ needs real `claude -p` sessions: `steering/ab.py` runs these cases that way
   p = 0.25). Per session, rules − none: cost −$0.010 (95% bootstrap interval
   −0.028 to +0.007), turns −0.6 (−1.37 to +0.07); both intervals include zero.
 
+### Headroom pilot on tokio (2026-10-06, 0.165.0 plus `4cd606e`)
+
+Both arms above scored at the ceiling, so no steering change could move an
+answer there. The pilot looked for questions that leave room:
+`evals/steering/tokio/` (six "who calls this?" cases on tokio 1.41.1, answers
+from rust-analyzer), variant `none` only, two runs per case per model, $4.82.
+
+| Model | Sessions | Mean recall | Used code-graph | Mean turns | Cost |
+|---|---|---|---|---|---|
+| `claude-opus-5-5` | 12 | 1.000 | 0/12 | 4.75 | $2.19 |
+| `claude-sonnet-5-5` | 12 | 0.951 | 2/12 | 5.25 | $1.23 |
+| `claude-haiku-4-5` | 8 | 0.733 | 8/8 | 27.4 | $1.40 |
+
+Haiku stopped at 8 sessions: `ab.py` checks its cost cap only before a session
+starts, and three were already running.
+
+- Opus found every caller with grep, including the 34 of 58 graded callers
+  code-graph has no default-floor edge for. These questions leave Opus no room.
+- The misses sit where code-graph has no edge. `spawn-blocking`'s three
+  `Blocking::poll_*` callers call it as `sys::run`, a renamed re-export: Sonnet
+  missed all three in 1 run of 2, Haiku in its 1 run. In `linked-list-remove`
+  (12 method calls, no edge at any tier) Haiku scored 0.583, and 0.0 after
+  `find_references` answered 0 references and the session ran out of its 50
+  turns.
+- Haiku passed an absolute `file_path` to `find_references` and
+  `get_ast_node`; both failed (2 of the pilot's 22 MCP calls, one session).
+  They accept project-relative paths only.
+- Precision is not scored. Replies listed functions the answer set lacks; the
+  two read in the source (`TcpListener::new`, `listener.rs:296`;
+  `DrainFilter::next`, `linked_list.rs:301`) are real callers in cfg-gated
+  code rust-analyzer did not analyze, so the answer sets are lower bounds.
+- The steering A/B this pilot was to gate was not run. Opus has no room;
+  Haiku already used code-graph in 8 of 8 sessions; Sonnet's per-session SD of
+  0.144 needs about 130 sessions per arm to resolve a 5-point difference. And
+  the misses are where code-graph returns nothing for a method call, which a
+  steering file would amplify, not fix: measure after that changes.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code
