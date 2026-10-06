@@ -1,6 +1,6 @@
 ---
 status: approved
-revision: 1
+revision: 2
 ---
 # Steering channel: stale-block notice once, and measure a git-excluded file channel
 
@@ -29,8 +29,9 @@ revision: 1
   eval says.
 - All arms in one window, one Claude Code version, `--model` pinned, same
   fixtures, same binary; `--ablation none` (only the plugin arm is compared).
-- Eval only through `evals/run.sh`; a probe must show the file reaches the model
-  in each arm before the suite numbers count.
+- A probe must show the file reaches the model in each arm before the suite
+  numbers count. `claude plugin eval` (and so `evals/run.sh`) cannot: it loads
+  no project instruction file by design (r2).
 - Budget: about $40 for the whole comparison, enforced with `--max-cost-usd`.
 
 ## success-criteria
@@ -48,9 +49,16 @@ revision: 1
 
 ## open-questions
 - Does a launch-loaded file raise code-graph use over MCP instructions + hooks?
-  (Answered by the eval.)
+  Unanswered: needs a `claude -p` harness (isolated HOME + CLAUDE_CONFIG_DIR,
+  credentials linked in, as claude-mem-lite's eval did). Waiting on the user:
+  it runs on the user's login and costs money.
 - If it does, is `.claude/rules/code-graph.md` as good as `CLAUDE.local.md`?
 
 # Change log
 - r1 (2026-10-06): created; user approved executing the recommendation
   ("按你的建议在我们仓库执行"), claude-mem-lite out of scope.
+- r2 (2026-10-06): the probe showed plugin eval never loads CLAUDE.md,
+  CLAUDE.local.md or .claude/rules (6/6 runs with a file placed did not quote
+  the block; the 2 replies read in full said STEERING=no; 2 runs listed the
+  file with ls; documented in the plugin-eval docs). Harness variants reverted; finding
+  recorded in evals/README.md. Measurement method is an open question.

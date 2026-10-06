@@ -204,6 +204,22 @@ were unrelated. Every hook now fires from `hooks.json` from the first event;
 the first prompt's hook runs before the new repo's index is built, so 12 of
 12 first-prompt impact queries returned nothing.
 
+## What an eval run cannot measure: instruction files
+
+An eval run loads no project instruction file, even one the scaffold wrote:
+the plugin-eval docs say so ("no `.claude/` directory, `CLAUDE.md`, or
+`.mcp.json` loads from above the workspace or inside it, even one a
+`scaffold_script` wrote"). A probe on 2026-10-06 (Claude Code 2.1.291,
+`claude-opus-5-5`) confirmed it. The block `code-graph-mcp adopt` writes was
+placed before the session as `CLAUDE.md`, `CLAUDE.local.md` or
+`.claude/rules/code-graph.md`. In all 6 runs with a file placed (`CLAUDE.local.md` 3,
+`.claude/rules/` 1, `CLAUDE.md` 2) the reply did not quote the block. The 2
+replies kept in full both began `STEERING=no`, and the 2 runs that also listed
+the workspace showed the file there (`CLAUDE.local.md` once, `CLAUDE.md` once). So no number in
+this file includes the `CLAUDE.md` block. The only steering that reaches the
+model here is the MCP `instructions` and the hooks. Comparing steering files
+needs real `claude -p` sessions.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code
