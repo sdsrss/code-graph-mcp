@@ -305,8 +305,17 @@ impl McpServer {
         )?;
         let test_refs_filtered = rollup.test_filtered;
         let confidence_filtered = rollup.confidence_filtered;
-        let mut all_refs: Vec<serde_json::Value> = rollup
-            .refs
+        let mut rows = rollup.refs;
+        // Stable sort prod-first: include_tests defaults to true and
+        // centralized_compress truncates large arrays to first 10 + last 5.
+        // Without prod-first ordering, alphabetic file paths sandwich prod
+        // callers (benches/, src/, tests/) and the kept window can be all-test.
+        // Same predicate as the rollup's `include_tests: false` filter, so a row
+        // that filter would hide never sorts among the production rows.
+        if include_tests {
+            rows.sort_by_key(|r| crate::domain::is_test_node(r.is_test, &r.name, &r.file_path));
+        }
+        let all_refs: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
                 if compact {
@@ -331,18 +340,6 @@ impl McpServer {
                 }
             })
             .collect();
-
-        // Stable sort prod-first: include_tests defaults to true and
-        // centralized_compress truncates large arrays to first 10 + last 5.
-        // Without prod-first ordering, alphabetic file paths sandwich prod
-        // callers (benches/, src/, tests/) and the kept window can be all-test.
-        if include_tests {
-            all_refs.sort_by_key(|r| {
-                let name = r["name"].as_str().unwrap_or("");
-                let file = r["file_path"].as_str().unwrap_or("");
-                is_test_symbol(name, file)
-            });
-        }
 
         // Group by relation for readability
         let mut by_relation: std::collections::HashMap<String, Vec<&serde_json::Value>> =

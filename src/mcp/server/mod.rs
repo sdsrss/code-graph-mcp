@@ -7001,6 +7001,53 @@ app.post('/api/login', handleLogin);
         assert_eq!(out["total_references"], 2, "{out}");
     }
 
+    /// `include_tests: false` hides test callers by the AST flag, not only by
+    /// the name/path heuristic. A helper with a descriptive name inside
+    /// `#[cfg(test)] mod tests` passed the heuristic and was listed as a
+    /// production reference (tokio: `entry` at `linked_list.rs:498`).
+    #[test]
+    fn test_find_references_without_tests_hides_an_inline_cfg_test_helper() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("b.rs"),
+            // The test module comes FIRST, so source order lists the helper
+            // before the production caller.
+            "pub fn leak_target() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    \
+             fn checks_leak_target() { leak_target(); }\n}\n\
+             pub fn leak_prod_caller() { leak_target(); }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        // With tests included they still sort after production callers — the
+        // truncation window keeps the head — by the same predicate as the filter.
+        let all = find_refs_call(&server, json!({ "symbol_name": "leak_target" }));
+        let order: Vec<&str> = all["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no references array: {all}"))
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["leak_prod_caller", "checks_leak_target"],
+            "{all}"
+        );
+        let prod = find_refs_call(
+            &server,
+            json!({ "symbol_name": "leak_target", "include_tests": false }),
+        );
+        let names: Vec<&str> = prod["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no references array: {prod}"))
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["leak_prod_caller"], "{prod}");
+        assert_eq!(prod["test_references_filtered"], 1, "{prod}");
+    }
+
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
     /// `direct_callers` and `affected_files` from the same truncatable caller
     /// traversal `get_call_graph` reports `limit_hit` for — and reported them

@@ -673,10 +673,12 @@ pub struct ReferenceRollup {
 /// the CLI, which shows every usage site by design — so `test_filtered` stays 0
 /// there rather than becoming a number nothing displays.
 ///
-/// The test predicate is the `is_test_symbol` name/path heuristic rather than
-/// the `IncomingReference::is_test` AST flag the row carries. That is the
-/// pre-existing behaviour, preserved deliberately: swapping it here would change
-/// what MCP hides while wearing the clothes of a refactor.
+/// The test predicate is [`crate::domain::is_test_node`]: the row's AST
+/// `is_test` flag first, the name/path heuristic as the fallback — the rule
+/// `impact` and `callgraph` already partition by. The heuristic alone, kept
+/// through the ARC-03 hoist so that refactor changed nothing, let a helper with
+/// a descriptive name inside `#[cfg(test)] mod tests` through
+/// `include_tests: false` as a production reference.
 pub fn rollup_incoming_references(
     conn: &Connection,
     target_ids: &[i64],
@@ -692,10 +694,7 @@ pub fn rollup_incoming_references(
 
     for target_id in target_ids {
         for r in queries::get_incoming_references(conn, *target_id, relation_filter)? {
-            // `mcp::server::is_test_symbol`, which this call site used to reach,
-            // is a one-line forward to exactly this function — same predicate,
-            // not merely an equivalent one.
-            if skip_tests && crate::domain::is_test_symbol(&r.name, &r.file_path) {
+            if skip_tests && crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
                 test_filtered += 1;
                 continue;
             }
