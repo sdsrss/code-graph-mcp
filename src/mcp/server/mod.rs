@@ -6974,6 +6974,33 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// D#231, end to end: two callers named `new` in one file, on two impls.
+    /// tokio's `broadcast.rs` has exactly this (`Waiter::new`, `Recv::new`) and
+    /// `find_references` listed one of them.
+    #[test]
+    fn test_find_references_lists_both_same_named_callers_in_one_file() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("c.rs"),
+            "pub struct P;\nimpl P { pub fn d231_make() -> P { P } }\n\
+             pub struct A;\nimpl A { pub fn new() -> A { P::d231_make(); A } }\n\
+             pub struct B;\nimpl B { pub fn new() -> B { P::d231_make(); B } }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let out = find_refs_call(&server, json!({ "symbol_name": "d231_make" }));
+        let lines: Vec<u64> = out["references"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no references array: {out}"))
+            .iter()
+            .filter_map(|r| r["start_line"].as_u64())
+            .collect();
+        assert_eq!(lines, vec![4, 6], "A::new and B::new both call it: {out}");
+        assert_eq!(out["total_references"], 2, "{out}");
+    }
+
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
     /// `direct_callers` and `affected_files` from the same truncatable caller
     /// traversal `get_call_graph` reports `limit_hit` for — and reported them

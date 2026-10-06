@@ -289,7 +289,7 @@ impl McpServer {
         // `extracted` same-file hit from an `ambiguous` by-name fan-out
         // (audit 2026-08-16 P1-11).
         //
-        // The dedup rule — key `(name, file_path, relation)`, keep the LOWEST
+        // The dedup rule — key `(source node, relation)`, keep the LOWEST
         // confidence among collapsed siblings — lives in
         // `resolve::rollup_incoming_references`, shared with CLI `refs`
         // (audit 2026-08-29 ARC-03). It used to be written twice, and this copy

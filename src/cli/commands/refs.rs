@@ -430,9 +430,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // freshness resync can re-run it against the refreshed index (parity with
     // show/overview/… via refresh_files_if_stale) — after re-indexing an edited
     // source file its referencing symbol's start_line is post-edit.
-    // Dedup key is (name, file_path, relation) — it does NOT include the target,
+    // Dedup key is (source node, relation) — it does NOT include the target,
     // so two edges from the same source to DIFFERENT same-name targets collapse to
-    // one row. When their confidence differs, show the LOWEST (most conservative)
+    // one row, while two different callers sharing a name and a file stay two
+    // (D#231). When their confidence differs, show the LOWEST (most conservative)
     // tier: the displayed confidence must not understate a hidden sibling's
     // ambiguity (L1 — surfacing low confidence is the whole point of the feature).
     // The rule itself lives in `resolve::rollup_incoming_references`, shared with

@@ -646,11 +646,19 @@ pub struct ReferenceRollup {
 
 /// Fold every resolved target's incoming references into ONE deduped list.
 ///
-/// The dedup key is `(name, file_path, relation)` and deliberately excludes the
+/// The dedup key is `(source node id, relation)` and deliberately excludes the
 /// TARGET, so two edges from one source to different same-name targets collapse
 /// into a single row. When the collapsed siblings disagree on confidence, the
 /// LOWEST tier wins: the displayed confidence must never understate a hidden
 /// sibling's ambiguity, which is the entire point of surfacing the tier.
+///
+/// The key is the SOURCE NODE, not its `(name, file_path)`. Keyed by name, two
+/// different callers that share a short name in one file (`Waiter::new` and
+/// `Recv::new` in tokio's `broadcast.rs`) folded into one row and the second
+/// disappeared with no count: 64 of the 5,537 rust-analyzer-confirmed call
+/// pairs code-graph has an edge for on tokio 1.41.1 (D#231). Each row carries
+/// its own `start_line`, so cfg-gated twins of one function now list once per
+/// definition — two sites a rename has to edit.
 ///
 /// Shared because it was written twice (audit 2026-08-29 ARC-03) — once in
 /// `cli::cmd_refs` over `IncomingReference` values, once in
@@ -677,7 +685,7 @@ pub fn rollup_incoming_references(
     skip_tests: bool,
 ) -> Result<ReferenceRollup> {
     let mut refs: Vec<queries::IncomingReference> = Vec::new();
-    let mut seen: std::collections::HashMap<(String, String, String), usize> =
+    let mut seen: std::collections::HashMap<(i64, String), usize> =
         std::collections::HashMap::new();
     let mut confidence_filtered = 0usize;
     let mut test_filtered = 0usize;
@@ -699,7 +707,7 @@ pub fn rollup_incoming_references(
                     continue;
                 }
             }
-            let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
+            let key = (r.node_id, r.relation.clone());
             match seen.get(&key) {
                 Some(&idx) => {
                     if crate::domain::confidence_rank(&r.confidence)
@@ -730,7 +738,7 @@ mod reference_rollup_tests {
     use tempfile::TempDir;
 
     /// Two same-name targets reached from ONE caller, with different edge
-    /// confidences — the shape the dedup key (name, file_path, relation) folds
+    /// confidences — the shape the dedup key (source node, relation) folds
     /// together, and the reason the rule has to pick a tier rather than take
     /// whichever row arrived first.
     fn two_targets_one_caller(caller_is_test: bool) -> (TempDir, Database, Vec<i64>) {
@@ -833,6 +841,59 @@ mod reference_rollup_tests {
         assert_eq!(rollup.refs[0].confidence, "extracted");
         assert_eq!(rollup.confidence_filtered, 1);
         assert_eq!(rollup.test_filtered, 0, "no test caller in this fixture");
+    }
+
+    /// Two DIFFERENT callers that share a short name and a file — `Waiter::new`
+    /// and `Recv::new` in tokio's `broadcast.rs` — are two rows. Keyed on
+    /// `(name, file_path, relation)` the second was folded into the first and
+    /// vanished with no count: tokio's `Pointers::new` has 10 callers and refs
+    /// listed 9 (D#231).
+    #[test]
+    fn distinct_callers_sharing_a_name_and_file_are_two_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/a.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let node = |name: &str, qualified: &str, line: i64| {
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "method".into(),
+                    name: name.into(),
+                    qualified_name: Some(qualified.into()),
+                    start_line: line,
+                    end_line: line,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
+        };
+        let target = node("make", "P.make", 1);
+        let a_new = node("new", "A.new", 10);
+        let b_new = node("new", "B.new", 20);
+        insert_edge(db.conn(), a_new, target, "calls", None).unwrap();
+        insert_edge(db.conn(), b_new, target, "calls", None).unwrap();
+
+        let rollup = rollup_incoming_references(db.conn(), &[target], None, None, false).unwrap();
+        let mut lines: Vec<i64> = rollup.refs.iter().map(|r| r.start_line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![10, 20], "both callers must be listed");
     }
 
     /// Filter ORDER is contract, not incidental: a test caller that is ALSO
