@@ -1,6 +1,6 @@
 ---
 status: approved
-revision: 3
+revision: 6
 ---
 # Steering channel: stale-block notice once, and measure a git-excluded file channel
 
@@ -52,7 +52,22 @@ revision: 3
   questions 19/30 -> 26/30 (Fisher p=0.07), turns 149 -> 131, cost $5.54 ->
   $5.25, scores at ceiling both; coding tasks 0/15 -> 1/15, no change.
   `CLAUDE.local.md` was not measured (disqualified by the AGENTS.md rule).
-- Open, for the user (L3): ship a `.claude/rules/code-graph.md` channel? A
+- Decided (r6): not shipped. Implemented as 5279162 (24 shapes tested, end to
+  end verified in a sandbox install incl. the uninstall sweep), withdrawn in
+  21d7512 after review round 1 (3 high / 8 medium / 9 low). Reproduced: a
+  `.gitignore` re-include (`!.claude/rules/*.md`) outranks `info/exclude`, so
+  `git status` lists the file; a repo that gains `package.json` after the
+  file exists ships it with `npm pack` (Docker and other packagers alike) with
+  no SessionStart in between to take it out. Any file in the user's repository
+  has the second property. Also found: auto-registration let the uninstall
+  sweep strip a teammate's committed CLAUDE.md block (F6).
+- Next candidate, unmeasured: a user-level `$CLAUDE_CONFIG_DIR/rules/code-graph.md`
+  (one file, no repository writes, no git/npm/teammate exposure, one known path
+  for the uninstall sweep). claude-mem-lite measured user-level rules close to
+  CLAUDE.md in the main session (6/9/4/4 vs 7/5/4/5) and weaker with subagents.
+  Needs its own A/B (`evals/steering/ab.py`, a `user` variant) and the user's
+  call, since it writes into ~/.claude.
+- Was (r3): ship a `.claude/rules/code-graph.md` channel? A
   design has to settle, before code: first-session delivery (the file is read
   before SessionStart writes it); when not to write (non-git, root at $HOME or
   /, file tracked, `.claude`/`rules` a symlink, an npm root without `files`
@@ -72,3 +87,5 @@ revision: 3
 - r3 (2026-10-06): measured in real `claude -p` sessions (evals/steering/ab.py,
   a8698b7): 90 sessions, $23.68; results in evals/README.md. Shipping is an
   L3 decision for the user.
+- r4–r5 (2026-10-06): design, 24 shapes, implementation 5279162 (see git).
+- r6 (2026-10-06): withdrawn after review round 1 (21d7512); see open-questions.
