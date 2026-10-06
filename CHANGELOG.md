@@ -8,11 +8,11 @@ at every session start.
 **Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
 unchanged). A project whose `CLAUDE.md` block is out of date shows the notice
 once more after this update, then not again until a later release ships a
-different template; the notice itself now says so. To pin back:
-`npm i -g @sdsrs/code-graph@0.164.0`, or
-`cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.164.0`,
-and set `CODE_GRAPH_NO_AUTO_UPDATE=1` so the plugin's auto-update does not move
-you forward again.
+different template; the notice itself now says so. To see it again in a
+project, delete `.code-graph/stale-block-notice`; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`
+still silences it everywhere. Only a plugin install shows this notice, and it
+runs the plugin's own copy of the script, so pinning the npm package or the
+cargo binary to 0.164.0 does not bring the every-session notice back.
 
 ### Fixed
 
@@ -21,6 +21,10 @@ you forward again.
   record is `.code-graph/stale-block-notice`. A project without a
   `.code-graph/` directory, or one where the record cannot be written, still
   sees the notice every session; a newer shipped template shows it once more.
+  The record is read and written only as a regular, single-link file in a
+  real `.code-graph/` directory. A symlink, hard link or FIFO there, which a
+  cloned or unpacked repository can carry, counts as unrecordable, so nothing
+  outside the project is written.
 
 ### Evals
 
@@ -29,24 +33,34 @@ you forward again.
   saw the adopted block. `evals/README.md` records how that was checked.
 - `evals/steering/ab.py` compares steering files in real `claude -p`
   sessions. Its first run (90 sessions, `claude-opus-5-5`): the adopt block as
-  a `.claude/rules/` file raised code-graph use on structural questions from
-  19 to 26 of 30 runs, in 3 of 10 cases and none the other way; answer scores
-  were at the ceiling in both arms, cost and turns did not differ beyond the
-  run-to-run spread, and coding tasks did not change (0 and 1 of 15). The
-  plugin does not write such a file: one in the user's repository can show in
-  `git status` (a `.gitignore` re-include outranks `.git/info/exclude`) or
-  ship in an `npm pack`, so it was built and withdrawn.
+  a `.claude/rules/` file raised code-graph use on structural and control
+  questions from 19 to 26 of 30 runs, in 3 of 10 cases and none the other
+  way; mean answer scores were 0.997 and 1.000, cost and turns did not
+  differ beyond the run-to-run spread, and coding tasks did not change (0 and
+  1 of 15). The plugin does not write such a file: one in the user's
+  repository can show in `git status` (a `.gitignore` re-include outranks
+  `.git/info/exclude`) or ship in an `npm pack`, so it was built and
+  withdrawn.
 
 ### Not covered
 
-Found in review, not reproduced:
+Found in review:
 
-- A `claude -p` or SDK session started in the project uses up the one
-  showing: the record is written though nobody sees the notice there.
-  Sessions in a directory that is not a project (claude-mem-lite's under
+- Sessions that start at the same moment in one project each show the notice
+  (8 of 8 in a test that started 8 at once).
+- The record also covers which variant of the block applies (web or not, from
+  the project's dependencies or `CODE_GRAPH_PROJECT_TYPE`). A project whose
+  variant changes sees the notice again, and sessions that set
+  `CODE_GRAPH_PROJECT_TYPE` differently see it at every switch.
+- Where the record cannot be written, the notice still says "Shown once per
+  shipped template" though it is shown every session.
+- Not reproduced: a `claude -p` or SDK session started in the project uses up
+  the one showing, since the record is written though nobody sees the notice
+  there. Sessions in a directory that is not a project (claude-mem-lite's under
   `/tmp`) are skipped and do not.
-- The record is written before the notice is printed, so a SessionStart killed
-  at its 5-second limit between the two loses that showing.
+- Not reproduced: the record is written before the notice is printed, so a
+  SessionStart killed at its 5-second limit between the two loses that
+  showing.
 
 ## 0.164.0
 

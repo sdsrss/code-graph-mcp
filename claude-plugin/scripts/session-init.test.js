@@ -405,6 +405,109 @@ test('the stale-block notice keeps showing where it cannot be recorded', (t) => 
   assert.match(noticeOf(again.res), STALE_RE);
 });
 
+// `.code-graph/` is repo content: one clone can carry a symlink or a hard link
+// where the record goes (tar can carry a FIFO). The record is read and written
+// only as a single-link regular file in a real directory. Anything else is
+// unrecordable: the notice shows, and nothing outside the project changes.
+test('the stale-block record never writes or reads through a link', (t) => {
+  const os = require('os');
+  const { staleNoticeDue } = require('./session-init');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-owned-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const victim = path.join(sb, 'victim.txt');
+  const project = (name) => {
+    const p = path.join(sb, name);
+    fs.mkdirSync(path.join(p, '.code-graph'), { recursive: true });
+    return p;
+  };
+
+  const viaSymlink = project('symlinked-record');
+  fs.writeFileSync(victim, 'user data\n');
+  fs.symlinkSync(victim, path.join(viaSymlink, '.code-graph', 'stale-block-notice'));
+  assert.equal(staleNoticeDue(viaSymlink, 'aaaa1111'), true);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'user data\n', 'the link target must be untouched');
+  assert.equal(staleNoticeDue(viaSymlink, 'aaaa1111'), true, 'unrecorded, so shown again');
+  fs.writeFileSync(victim, 'aaaa1111\n');
+  assert.equal(staleNoticeDue(viaSymlink, 'aaaa1111'), true, 'a linked file holding the fingerprint must not silence it');
+
+  const viaHardlink = project('hardlinked-record');
+  fs.writeFileSync(victim, 'user data\n');
+  fs.linkSync(victim, path.join(viaHardlink, '.code-graph', 'stale-block-notice'));
+  assert.equal(staleNoticeDue(viaHardlink, 'aaaa1111'), true);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'user data\n', 'the other link must be untouched');
+
+  const outside = path.join(sb, 'outside');
+  fs.mkdirSync(outside);
+  const viaDirLink = path.join(sb, 'symlinked-dir');
+  fs.mkdirSync(viaDirLink);
+  fs.symlinkSync(outside, path.join(viaDirLink, '.code-graph'));
+  assert.equal(staleNoticeDue(viaDirLink, 'aaaa1111'), true);
+  assert.deepEqual(fs.readdirSync(outside), [], 'nothing may be written through a linked .code-graph/');
+
+  const plain = project('plain');
+  assert.equal(staleNoticeDue(plain, 'aaaa1111'), true);
+  assert.equal(staleNoticeDue(plain, 'aaaa1111'), false, 'control: a plain record silences the second showing');
+});
+
+// Windows has no O_NOFOLLOW, so there the lstat of the record is the only check
+// before the open follows a symlink. Pinned by loading session-init with
+// recommendation-log's O_NOFOLLOW forced to 0, as recommendation-log.test.js does.
+test('the stale-block record refuses a symlink with O_NOFOLLOW unavailable (Windows shape)', (t) => {
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const rl = require.resolve('./recommendation-log');
+  const NEEDLE = 'const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;';
+  assert.ok(fs.readFileSync(rl, 'utf8').includes(NEEDLE),
+    `recommendation-log.js no longer declares \`${NEEDLE}\`: update the needle, or this test pins nothing`);
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-nofollow-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const victim = path.join(sb, 'victim.txt');
+  fs.writeFileSync(victim, 'user data\n');
+  const linked = path.join(sb, 'linked');
+  fs.mkdirSync(path.join(linked, '.code-graph'), { recursive: true });
+  fs.symlinkSync(victim, path.join(linked, '.code-graph', 'stale-block-notice'));
+  const plain = path.join(sb, 'plain');
+  fs.mkdirSync(path.join(plain, '.code-graph'), { recursive: true });
+
+  const probe = `
+    const fs = require('fs'), Module = require('module');
+    const rl = ${JSON.stringify(rl)};
+    const m = new Module(rl, null);
+    m.filename = rl;
+    m.paths = Module._nodeModulePaths(require('path').dirname(rl));
+    m._compile(fs.readFileSync(rl, 'utf8').replace(${JSON.stringify(NEEDLE)}, 'const O_NOFOLLOW = 0;'), rl);
+    m.loaded = true;
+    require.cache[rl] = m;
+    const { staleNoticeDue } = require(${JSON.stringify(path.join(__dirname, 'session-init.js'))});
+    const out = [staleNoticeDue(${JSON.stringify(linked)}, 'aaaa1111'),
+      staleNoticeDue(${JSON.stringify(plain)}, 'aaaa1111'), staleNoticeDue(${JSON.stringify(plain)}, 'aaaa1111')];
+    process.stdout.write(JSON.stringify(out));
+  `;
+  const res = spawnSync(process.execPath, ['-e', probe], {
+    encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, HOME: sb, USERPROFILE: sb, CLAUDE_CONFIG_DIR: path.join(sb, '.claude') },
+  });
+  assert.equal(res.status, 0, `stderr:\n${res.stderr}`);
+  assert.deepEqual(JSON.parse(res.stdout), [true, true, false],
+    'linked: shown; plain: shown, then recorded (control: the module still writes)');
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'user data\n', 'the link target must be untouched');
+});
+
+test('the stale-block record does not wait on a FIFO', { skip: process.platform === 'win32' }, (t) => {
+  const os = require('os');
+  const { spawnSync, execFileSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-stale-fifo-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(sb, '.code-graph'));
+  execFileSync('mkfifo', [path.join(sb, '.code-graph', 'stale-block-notice')]);
+  const si = path.join(__dirname, 'session-init.js');
+  const res = spawnSync(process.execPath, ['-e',
+    `process.stdout.write(String(require(${JSON.stringify(si)}).staleNoticeDue(${JSON.stringify(sb)}, 'aaaa1111')))`],
+  { encoding: 'utf8', timeout: 3000, env: { ...process.env, HOME: sb, USERPROFILE: sb, CLAUDE_CONFIG_DIR: path.join(sb, '.claude') } });
+  assert.equal(res.signal, null, 'a FIFO must not hold SessionStart until it is killed');
+  assert.equal(res.stdout, 'true', `stderr:\n${res.stderr}`);
+});
+
 // issue #41: the reporter uses the plugin only and has no `code-graph-mcp` on
 // PATH, so a remedy that spends the bare name is unrunnable. The notice is
 // per-machine and ephemeral, so unlike the CLAUDE.md block it may (and must)

@@ -39,11 +39,11 @@ const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 // this is ever required from something long-lived.
 const warnedPaths = new Set();
 
-function warnNotOwned(p, why) {
+function warnNotOwned(p, why, what = 'adoption metrics') {
   if (warnedPaths.has(p)) return;
   warnedPaths.add(p);
   try {
-    process.stderr.write(`[code-graph] skipping adoption metrics: ${p} ${why}\n`);
+    process.stderr.write(`[code-graph] skipping ${what}: ${p} ${why}\n`);
   } catch {
     /* stderr closed → nothing to do */
   }
@@ -67,9 +67,10 @@ function warnNotOwned(p, why) {
  * @param {string} p    absolute path
  * @param {'file'|'dir'} kind
  * @param {fs.Stats} [known]  an lstat the caller already took, to avoid a second
+ * @param {string} [what]  what is skipped, for the diagnostic
  * @returns {boolean} true if `p` is safe to write
  */
-function isOwnedPath(p, kind, known) {
+function isOwnedPath(p, kind, known, what) {
   let st = known;
   if (!st) {
     try {
@@ -79,11 +80,11 @@ function isOwnedPath(p, kind, known) {
     }
   }
   if (st.isSymbolicLink()) {
-    warnNotOwned(p, 'is a symlink (following it would write outside the project)');
+    warnNotOwned(p, 'is a symlink (following it would write outside the project)', what);
     return false;
   }
   if (kind === 'dir' ? st.isDirectory() : st.isFile()) return true;
-  warnNotOwned(p, 'is not a regular file');
+  warnNotOwned(p, 'is not a regular file', what);
   return false;
 }
 
@@ -102,9 +103,10 @@ function isOwnedPath(p, kind, known) {
  *
  * Callers must NOT pass `O_TRUNC`: truncation would happen on the open, before
  * any of this could look. Truncate through the returned descriptor instead.
+ * @param {string} [what]  what is skipped, for the diagnostic
  * @returns {number|null} an open fd the caller must close, or null if refused
  */
-function openOwned(file, flags) {
+function openOwned(file, flags, what) {
   const fd = fs.openSync(file, flags | O_NOFOLLOW);
   let st;
   try {
@@ -114,12 +116,12 @@ function openOwned(file, flags) {
     throw e;
   }
   if (!st.isFile()) {
-    warnNotOwned(file, 'is not a regular file');
+    warnNotOwned(file, 'is not a regular file', what);
     fs.closeSync(fd);
     return null;
   }
   if (st.nlink > 1) {
-    warnNotOwned(file, 'has more than one hard link (the write would reach another path)');
+    warnNotOwned(file, 'has more than one hard link (the write would reach another path)', what);
     fs.closeSync(fd);
     return null;
   }
@@ -202,4 +204,4 @@ function recordRecommendation(cwd, event = {}) {
   }
 }
 
-module.exports = { recordRecommendation, REC_FILE };
+module.exports = { recordRecommendation, REC_FILE, isOwnedPath, openOwned };

@@ -19,6 +19,7 @@ const { installHookFailOpen, remainingMs } = require('./hook-fail-open');
 // treats any throw as "nothing to conclude", so a lazy require in there would
 // turn a resolution failure into a silent disable (pre-tag review, JS-08).
 const { resolveProjectRoot } = require('./project-root');
+const { isOwnedPath, openOwned } = require('./recommendation-log');
 
 // ── SessionStart budget (audit 2026-09-05 NEW-05) ─────────────────────────
 //
@@ -577,12 +578,29 @@ function staleNoticeDue(cwd, fingerprint) {
   if (!fingerprint) return true;
   const dir = path.join(cwd, '.code-graph');
   const marker = path.join(dir, 'stale-block-notice');
+  // `.code-graph/` is repo content: a clone can put a symlink or a hard link
+  // where the record goes (tar a FIFO), and a plain read or write follows it
+  // out of the project. Only a single-link regular file in a real directory is
+  // read or written — recommendation-log.js's guards; anything else is
+  // unrecordable.
+  const what = 'the stale-block notice record';
+  let dirStat;
+  try { dirStat = fs.lstatSync(dir); } catch { return true; }
+  if (!isOwnedPath(dir, 'dir', dirStat, what) || !isOwnedPath(marker, 'file', undefined, what)) return true;
+  let fd;
   try {
-    if (fs.readFileSync(marker, 'utf8').trim() === fingerprint) return false;
-  } catch { /* not recorded yet, or unreadable */ }
+    fd = openOwned(marker,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | (fs.constants.O_NONBLOCK || 0), what);
+  } catch { return true; }
+  if (fd === null) return true;
   try {
-    if (fs.statSync(dir).isDirectory()) fs.writeFileSync(marker, fingerprint + '\n');
+    const buf = Buffer.alloc(64);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    if (buf.toString('utf8', 0, n).trim() === fingerprint) return false;
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, fingerprint + '\n', 0);
   } catch { /* unrecorded: shown again next session */ }
+  finally { fs.closeSync(fd); }
   return true;
 }
 
