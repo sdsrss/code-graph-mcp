@@ -1,6 +1,6 @@
 ---
 status: approved
-revision: 2
+revision: 3
 ---
 # Steering channel: stale-block notice once, and measure a git-excluded file channel
 
@@ -48,11 +48,18 @@ revision: 2
   coding suite (5 cases × 3); a recorded decision with the numbers.
 
 ## open-questions
-- Does a launch-loaded file raise code-graph use over MCP instructions + hooks?
-  Unanswered: needs a `claude -p` harness (isolated HOME + CLAUDE_CONFIG_DIR,
-  credentials linked in, as claude-mem-lite's eval did). Waiting on the user:
-  it runs on the user's login and costs money.
-- If it does, is `.claude/rules/code-graph.md` as good as `CLAUDE.local.md`?
+- Answered (r3): a launch-loaded rules file raised code-graph use on structural
+  questions 19/30 -> 26/30 (Fisher p=0.07), turns 149 -> 131, cost $5.54 ->
+  $5.25, scores at ceiling both; coding tasks 0/15 -> 1/15, no change.
+  `CLAUDE.local.md` was not measured (disqualified by the AGENTS.md rule).
+- Open, for the user (L3): ship a `.claude/rules/code-graph.md` channel? A
+  design has to settle, before code: first-session delivery (the file is read
+  before SessionStart writes it); when not to write (non-git, root at $HOME or
+  /, file tracked, `.claude`/`rules` a symlink, an npm root without `files`
+  that would publish it — `.git/info/exclude` is git-only); a file the user
+  removed stays removed; worktrees share one exclude; refresh in place; and
+  the file outliving `/plugin uninstall`, which runs no hook — it would keep
+  steering every session toward a CLI that is gone.
 
 # Change log
 - r1 (2026-10-06): created; user approved executing the recommendation
@@ -62,3 +69,6 @@ revision: 2
   the block; the 2 replies read in full said STEERING=no; 2 runs listed the
   file with ls; documented in the plugin-eval docs). Harness variants reverted; finding
   recorded in evals/README.md. Measurement method is an open question.
+- r3 (2026-10-06): measured in real `claude -p` sessions (evals/steering/ab.py,
+  a8698b7): 90 sessions, $23.68; results in evals/README.md. Shipping is an
+  L3 decision for the user.

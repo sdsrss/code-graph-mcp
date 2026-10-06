@@ -221,6 +221,27 @@ model here is the MCP `instructions` and the hooks. Comparing steering files
 needs real `claude -p` sessions: `steering/ab.py` runs these cases that way
 (its `--probe` checks that each variant's file reaches the model first).
 
+### Steering file A/B (2026-10-06, commit `a8698b7`, `claude-opus-5-5`)
+
+`steering/ab.py --variants none,rules --tags structural,control,coding
+--runs 3 -j 3`: 90 sessions, 0 errors, $23.68. `none` is 0.164.0 (MCP
+`instructions` + hooks); `rules` adds the adopt block as
+`.claude/rules/code-graph.md` before the session.
+
+| Cases | Used code-graph none / rules | Calls | Turns | Cost | Mean score |
+|---|---|---|---|---|---|
+| structural + control (10 × 3) | 19/30 / 26/30 (Fisher p = 0.07) | 26 / 45 | 149 / 131 | $5.54 / $5.25 | 0.997 / 1.000 |
+| coding (5 × 3) | 0/15 / 1/15 | 0 / 2 | 236 / 264 | $6.34 / $6.56 | 1.000 / 1.000 |
+
+- The difference sits in three cases: `concept-locate` 1/3 → 3/3 (semantic
+  search), `never-called` 0/3 → 3/3 (`overview`), `subagent-callers` 1/3 → 3/3
+  (the parent names the CLI in its Agent prompt; Explore itself skips rules
+  files). `prod-or-test` took 34 turns against 20.
+- With the file, calls move from MCP tools to the CLI the block's table names.
+- Coding tasks: no change in use; the turn gap is inside the run-to-run spread
+  of these 12–33-turn sessions.
+- n = 3 per case: suggestive for structural questions, not significant at 0.05.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code
