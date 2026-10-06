@@ -153,7 +153,7 @@ def _to_bytes(lines, rng):
     return (rng[0], utf16_to_byte(lines[rng[0]], rng[1]), rng[2], utf16_to_byte(lines[rng[2]], rng[3]))
 
 
-def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False):
+def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False, dump_gold=False):
     langs = LANGUAGES[language]
     marks = ",".join("?" * len(langs))
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -524,6 +524,12 @@ def evaluate(docs, db_path, root, samples=15, language="rust", dump_judged=False
              "callee": loc(t)[0], "callee_at": loc(t)[1]}
             for conf, s, t, v in sorted(judged, key=lambda j: (loc(j[1])[1], loc(j[2])[1]))
         ] if dump_judged else None,
+        "gold": [
+            {"caller": loc(c)[0], "caller_at": loc(c)[1], "callee": loc(e)[0], "callee_at": loc(e)[1],
+             "site": site, "shape": shape,
+             "best_tier": None if (b := best_tier((c, e))) is None else TIERS[b]}
+            for (c, e), (site, shape) in sorted(gold.items(), key=lambda g: g[1])
+        ] if dump_gold else None,
         "gold_pairs": len(gold),
         "tiers": tiers,
         "recall_at_floor": recall,
@@ -581,14 +587,17 @@ def main(argv=None):
     ap.add_argument("--samples", type=int, default=15)
     ap.add_argument("--json-out", help="also write the full report as JSON here")
     ap.add_argument("--dump-judged", help="write every judged edge with its verdict (JSON) here")
+    ap.add_argument("--dump-gold", help="write every gold pair with our best tier for it (JSON) here")
     a = ap.parse_args(argv)
     db = a.db or os.path.join(a.root, ".code-graph", "index.db")
-    r = evaluate(scip_decode.read_index(a.scip), db, a.root, a.samples, a.language, bool(a.dump_judged))
-    judged = r.pop("judged_edges")
-    if a.dump_judged:
-        with open(a.dump_judged, "w") as f:
-            json.dump(judged, f, indent=1)
-            f.write("\n")
+    r = evaluate(scip_decode.read_index(a.scip), db, a.root, a.samples, a.language,
+                 bool(a.dump_judged), bool(a.dump_gold))
+    for key, path in (("judged_edges", a.dump_judged), ("gold", a.dump_gold)):
+        rows = r.pop(key)
+        if path:
+            with open(path, "w") as f:
+                json.dump(rows, f, indent=1)
+                f.write("\n")
     print(render(r))
     if a.json_out:
         with open(a.json_out, "w") as f:

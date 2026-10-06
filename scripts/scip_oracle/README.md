@@ -16,6 +16,7 @@ rustup component add rust-analyzer    # once
 scripts/scip_oracle/run.sh            # Rust, ~35 s on this repo
 scripts/scip_oracle/run.sh --json-out /tmp/after.json --samples 50
 scripts/scip_oracle/run.sh --dump-judged /tmp/judged.json   # every judged edge + verdict
+scripts/scip_oracle/run.sh --dump-gold /tmp/gold.json       # every gold pair + our best tier for it (null: missed)
 
 # JS/TS and Python: pinned indexers in a private prefix (not project deps)
 npm install --prefix /var/tmp/scip-tools --save-exact \

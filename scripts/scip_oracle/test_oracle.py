@@ -716,6 +716,19 @@ class Cpp(unittest.TestCase):
                                ("ambiguous", "helper", "use", "no_call_by_that_name")})
         self.assertEqual(len(r["judged_edges"]), sum(t["judged"] for t in r["tiers"].values()))
 
+    def test_dump_gold_lists_every_gold_pair_with_our_best_tier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scip, db = js_case(tmp, [(3, 1, "extracted"), (4, 1, "inferred"), (3, 6, "ambiguous")])
+            r = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="javascript", dump_gold=True)
+            off = oracle.evaluate(scip_decode.read_index(scip), db, tmp, language="javascript")
+        got = {(g["caller"], g["callee"], g["best_tier"]) for g in r["gold"]}
+        self.assertEqual(len(r["gold"]), r["gold_pairs"])
+        self.assertIn(("caller", "callee", "extracted"), got)
+        self.assertIn(("inner", "callee", "inferred"), got)
+        self.assertIn(("caller", "inner", None), got)  # gold, and no edge of ours stands for it
+        self.assertTrue(all(g["caller_at"] and g["callee_at"] and g["site"] and g["shape"] for g in r["gold"]))
+        self.assertIsNone(off["gold"])
+
     def test_override_edge_alone_is_recall(self):
         r = self.run_cpp([(8, 6, "extracted")])
         self.assertEqual(r["recall_at_floor"]["extracted"], {"found": 1, "gold": 3})
