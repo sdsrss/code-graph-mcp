@@ -218,7 +218,8 @@ replies kept in full both began `STEERING=no`, and the 2 runs that also listed
 the workspace showed the file there (`CLAUDE.local.md` once, `CLAUDE.md` once). So no number in
 this file includes the `CLAUDE.md` block. The only steering that reaches the
 model here is the MCP `instructions` and the hooks. Comparing steering files
-needs real `claude -p` sessions.
+needs real `claude -p` sessions: `steering/ab.py` runs these cases that way
+(its `--probe` checks that each variant's file reaches the model first).
 
 ## What `run.sh` sets up, and why
 
