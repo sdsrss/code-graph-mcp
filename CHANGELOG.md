@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.165.0
+
+The out-of-date `CLAUDE.md` block notice that 0.164.0 added no longer repeats
+at every session start.
+
+**Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
+unchanged). A project whose `CLAUDE.md` block is out of date shows the notice
+once more after this update, then not again until a later release ships a
+different template; the notice itself now says so. To pin back:
+`npm i -g @sdsrs/code-graph@0.164.0`, or
+`cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.164.0`,
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1` so the plugin's auto-update does not move
+you forward again.
 
 ### Fixed
 
@@ -9,6 +21,32 @@
   record is `.code-graph/stale-block-notice`. A project without a
   `.code-graph/` directory, or one where the record cannot be written, still
   sees the notice every session; a newer shipped template shows it once more.
+
+### Evals
+
+- `claude plugin eval` never loads a project's `CLAUDE.md`, `CLAUDE.local.md`
+  or `.claude/rules/`, not even one the scaffold writes, so no eval run so far
+  saw the adopted block. `evals/README.md` records how that was checked.
+- `evals/steering/ab.py` compares steering files in real `claude -p`
+  sessions. Its first run (90 sessions, `claude-opus-5-5`): the adopt block as
+  a `.claude/rules/` file raised code-graph use on structural questions from
+  19 to 26 of 30 runs, in 3 of 10 cases and none the other way; answer scores
+  were at the ceiling in both arms, cost and turns did not differ beyond the
+  run-to-run spread, and coding tasks did not change (0 and 1 of 15). The
+  plugin does not write such a file: one in the user's repository can show in
+  `git status` (a `.gitignore` re-include outranks `.git/info/exclude`) or
+  ship in an `npm pack`, so it was built and withdrawn.
+
+### Not covered
+
+Found in review, not reproduced:
+
+- A `claude -p` or SDK session started in the project uses up the one
+  showing: the record is written though nobody sees the notice there.
+  Sessions in a directory that is not a project (claude-mem-lite's under
+  `/tmp`) are skipped and do not.
+- The record is written before the notice is printed, so a SessionStart killed
+  at its 5-second limit between the two loses that showing.
 
 ## 0.164.0
 
