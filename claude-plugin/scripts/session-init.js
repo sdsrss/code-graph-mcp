@@ -573,8 +573,10 @@ function samePath(a, b) {
  * exists — creating it would put an unexcluded directory in `git status`, the
  * side effect D3/D4 removed. Anything unrecordable (no fingerprint, no
  * directory, a failed write) shows the notice: a failure must never silence it.
+ * `record: false` reads the record and never creates or writes it, for a
+ * session nobody attends.
  */
-function staleNoticeDue(cwd, fingerprint) {
+function staleNoticeDue(cwd, fingerprint, { record = true } = {}) {
   if (!fingerprint) return true;
   const dir = path.join(cwd, '.code-graph');
   const marker = path.join(dir, 'stale-block-notice');
@@ -590,13 +592,15 @@ function staleNoticeDue(cwd, fingerprint) {
   let fd;
   try {
     fd = openOwned(marker,
-      fs.constants.O_RDWR | fs.constants.O_CREAT | (fs.constants.O_NONBLOCK || 0), what);
+      (record ? fs.constants.O_RDWR | fs.constants.O_CREAT : fs.constants.O_RDONLY)
+        | (fs.constants.O_NONBLOCK || 0), what);
   } catch { return true; }
   if (fd === null) return true;
   try {
     const buf = Buffer.alloc(64);
     const n = fs.readSync(fd, buf, 0, buf.length, 0);
     if (buf.toString('utf8', 0, n).trim() === fingerprint) return false;
+    if (!record) return true;
     fs.ftruncateSync(fd, 0);
     fs.writeSync(fd, fingerprint + '\n', 0);
   } catch { /* unrecorded: shown again next session */ }
@@ -723,7 +727,13 @@ function runSessionInit({ source } = {}) {
       autoAdopt = { attempted: false, reason: 'threw', error: (e && e.message) || String(e) };
     }
   }
-  if (autoAdopt.reason === 'stale' && staleNoticeDue(process.cwd(), autoAdopt.fingerprint)) {
+  // `claude -p` and SDK sessions run this hook too, and nobody reads their
+  // notice. Claude Code sets CLAUDE_CODE_SESSION_ATTENDED to '0' for them ('1'
+  // in the terminal UI, the IDE and desktop apps), so they read the record but
+  // never write it. Unset (an older Claude Code): recorded, as before.
+  const attended = process.env.CLAUDE_CODE_SESSION_ATTENDED !== '0';
+  if (autoAdopt.reason === 'stale'
+    && staleNoticeDue(process.cwd(), autoAdopt.fingerprint, { record: attended })) {
     notices.push(
       "[code-graph] This project's CLAUDE.md carries an out-of-date code-graph block.\n" +
       `            Refresh it: ${adoptCommand()}\n` +

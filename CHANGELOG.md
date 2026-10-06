@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A `claude -p` or SDK session no longer uses up the one showing of the
+  out-of-date `CLAUDE.md` block notice (0.165.0 listed this as not
+  reproduced; one `claude -p` run in an adopted project wrote the record).
+  Claude Code tells hooks whether a person attends the session
+  (`CLAUDE_CODE_SESSION_ATTENDED`: `0` under `claude -p`, `1` in the terminal
+  UI, measured on 2.1.292); an unattended session reads the record but never
+  writes it. Where that variable is unset, as in an older Claude Code, the
+  record is written as before. A record an unattended session already wrote
+  stays: delete `.code-graph/stale-block-notice` to see the notice again.
+
 ## 0.165.0
 
 The out-of-date `CLAUDE.md` block notice that 0.164.0 added no longer repeats

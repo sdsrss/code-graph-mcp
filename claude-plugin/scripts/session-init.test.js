@@ -248,6 +248,8 @@ function runSessionInitHook(t, {
   reuse = null,
   // false: the project has no .code-graph/ (and so no recommendations.jsonl).
   codeGraphDir = true,
+  // Extra environment for the hook, applied last.
+  env = {},
 } = {}) {
   const os = require('os');
   const { spawnSync } = require('child_process');
@@ -300,11 +302,15 @@ function runSessionInitHook(t, {
     fs.mkdirSync(cwd, { recursive: true });
   }
 
+  // Claude Code sets CLAUDE_CODE_SESSION_ATTENDED for every child, so a suite
+  // run from a `claude -p` session would inherit '0' and record nothing.
+  const inherited = { ...process.env };
+  delete inherited.CLAUDE_CODE_SESSION_ATTENDED;
   const res = spawnSync(process.execPath, args, {
     cwd,
     encoding: 'utf8',
     input: JSON.stringify({ source: 'startup' }),
-    env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1' },
+    env: { ...inherited, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg, CODE_GRAPH_NO_AUTO_UPDATE: '1', ...env },
   });
   return { res, proj, home, sb };
 }
@@ -378,6 +384,30 @@ test('the stale-block notice is shown once per project for one shipped template'
 
   const third = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('bbbb2222') });
   assert.match(noticeOf(third.res), STALE_RE, 'a newer shipped template must be reported again');
+});
+
+// A `claude -p` or SDK session runs SessionStart too, and nobody reads its
+// notice. Claude Code tells every hook whether a person attends the session:
+// CLAUDE_CODE_SESSION_ATTENDED was '0' under `claude -p` and '1' in the
+// terminal UI (measured on 2.1.292). An unattended session reads the record
+// but never writes it, so it cannot use up the one showing.
+test('an unattended session does not use up the stale-block notice', (t) => {
+  const unattended = { CLAUDE_CODE_SESSION_ATTENDED: '0' };
+  const attended = { CLAUDE_CODE_SESSION_ATTENDED: '1' };
+  const first = runSessionInitHook(t, { prefix: 'cg-si-stale-unattended-', preloadSrc: staleStub('aaaa1111'), env: unattended });
+  assert.equal(first.res.status, 0, `stderr:\n${first.res.stderr}`);
+  assert.equal(fs.existsSync(path.join(first.proj, '.code-graph', 'stale-block-notice')), false,
+    'an unattended session must not write the record');
+
+  const seen = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('aaaa1111'), env: attended });
+  assert.match(noticeOf(seen.res), STALE_RE, 'the first attended session must still show it');
+
+  const later = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('aaaa1111'), env: unattended });
+  assert.doesNotMatch(noticeOf(later.res), STALE_RE, 'once shown, an unattended session reads the record too');
+  const next = runSessionInitHook(t, { reuse: first.sb, preloadSrc: staleStub('bbbb2222'), env: unattended });
+  assert.match(noticeOf(next.res), STALE_RE, 'a newer template is still news to an unattended session');
+  assert.equal(fs.readFileSync(path.join(first.proj, '.code-graph', 'stale-block-notice'), 'utf8'), 'aaaa1111\n',
+    'and it is still not recorded there');
 });
 
 test('the stale-block notice keeps showing where it cannot be recorded', (t) => {
