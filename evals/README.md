@@ -241,6 +241,10 @@ needs real `claude -p` sessions: `steering/ab.py` runs these cases that way
 - Coding tasks: no change in use; the turn gap is inside the run-to-run spread
   of these 12–33-turn sessions.
 - n = 3 per case: suggestive for structural questions, not significant at 0.05.
+  Paired by case and run, the exact McNemar test gives p = 0.039 (8 pairs
+  moved to code-graph, 1 away); by case it is 3 up, 0 down (sign test
+  p = 0.25). Per session, rules − none: cost −$0.010 (95% bootstrap interval
+  −0.028 to +0.007), turns −0.6 (−1.37 to +0.07); both intervals include zero.
 
 ## What `run.sh` sets up, and why
 
