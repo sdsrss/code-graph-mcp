@@ -32,22 +32,118 @@ mod search;
 /// issue-#34 failure mode, half-fixed. Normalizing at entry also covers the
 /// `should_skip_indexing` branch, where the freshness helper never runs at all.
 ///
-/// MCP paths are root-relative by contract, so this is separator normalization
-/// only — deliberately NOT `cli::normalize_user_path`, which additionally
-/// resolves against the process cwd (see `indexer::pipeline` docs).
-pub(super) fn normalize_path_arg(raw: &str) -> String {
-    normalize_path_arg_on(raw, cfg!(windows))
+/// MCP paths are root-relative, and a relative path is never resolved against
+/// the process cwd — deliberately NOT `cli::normalize_user_path`, which does
+/// (see `indexer::pipeline` docs). Other spellings of a path under the root
+/// ARE mapped to the stored key, because models send them: an absolute path
+/// (Haiku did, in the tokio pilot, and every path-taking tool answered "not
+/// found" or a false-clean empty result — D#228), a leading `./`, and `.` /
+/// `..` segments that stay inside the root. A path outside the root is
+/// returned unchanged, so it misses the index exactly as before.
+///
+/// The mapping is LEXICAL only — the filesystem is never consulted, so a path
+/// that reaches the root through a symlink misses, as it did in 0.165.1. A
+/// canonicalize fallback (the CLI has one) was tried and withdrawn before
+/// release: resolving through the filesystem dropped a directory's trailing
+/// `/`, so `<link>/src/` became the prefix `src` and also matched `src2/`
+/// (`find_dead_code ignore_paths` then hid real dead code), and it mapped a
+/// link living outside the root onto a project file.
+pub(super) fn normalize_path_arg(raw: &str, project_root: Option<&std::path::Path>) -> String {
+    normalize_path_arg_on(raw, project_root, cfg!(windows))
 }
 
-/// Testable core of [`normalize_path_arg`]. `backslash_is_sep` is a parameter for
-/// the same reason it is one in `merkle::normalize_rel_str_on` and
-/// `cli::normalize_user_path_from_on`: without it the Windows branch of the MCP
-/// entry point is reachable only from the `windows-latest` CI leg, and the audit
-/// that found `find_dead_code` missing its normalization also found this — every
-/// defect in this family so far has been pure string logic that a Linux leg could
-/// have caught if anything had been able to call it.
-pub(super) fn normalize_path_arg_on(raw: &str, backslash_is_sep: bool) -> String {
-    crate::indexer::merkle::normalize_rel_str_on(raw, backslash_is_sep)
+/// Testable core of [`normalize_path_arg`].
+/// `backslash_is_sep` is a parameter for the same reason it is one in
+/// `merkle::normalize_rel_str_on` and `cli::normalize_user_path_from_on`:
+/// without it the Windows branch of the MCP entry point is reachable only from
+/// the `windows-latest` CI leg, and the audit that found `find_dead_code`
+/// missing its normalization also found this — every defect in this family so
+/// far has been pure string logic that a Linux leg could have caught if
+/// anything had been able to call it.
+pub(super) fn normalize_path_arg_on(
+    raw: &str,
+    project_root: Option<&std::path::Path>,
+    backslash_is_sep: bool,
+) -> String {
+    let path = crate::indexer::merkle::normalize_rel_str_on(raw, backslash_is_sep);
+    if let Some(root) = project_root {
+        let root =
+            crate::indexer::merkle::normalize_rel_str_on(&root.to_string_lossy(), backslash_is_sep);
+        let root = root.trim_end_matches('/');
+        // Windows volumes are spelled `D:\` and `d:\` alike; compare the root
+        // prefix case-insensitively there, and only the prefix.
+        let under_root = !root.is_empty()
+            && path.get(..root.len()).is_some_and(|head| {
+                if backslash_is_sep {
+                    head.eq_ignore_ascii_case(root)
+                } else {
+                    head == root
+                }
+            });
+        if under_root {
+            // A separator must follow the root: `/repo-old/a.rs` is not under
+            // `/repo`. A rest that climbs out of the root keeps the absolute
+            // spelling as given, and misses.
+            match &path[root.len()..] {
+                "" | "/" => return ".".to_string(),
+                rest if rest.starts_with('/') => {
+                    return resolve_dot_segments(&rest[1..]).unwrap_or(path);
+                }
+                _ => {}
+            }
+        }
+    }
+    if looks_absolute(&path, backslash_is_sep) {
+        return path;
+    }
+    resolve_dot_segments(&path).unwrap_or(path)
+}
+
+/// Resolve `.` and `..` segments in a root-relative path, lexically, so every
+/// spelling of a file reaches the index as its stored key. A different key
+/// is not just a miss: the freshness refresh indexed `src/./a.rs` as a second
+/// file, and every symbol in it then existed twice. `./` alone becomes `.`,
+/// which `module_overview` reads as the whole project. A trailing `/` is kept,
+/// and a path ending in `/.` or `/..` gets one, because directory tools match
+/// `files.path` against the path as a prefix (`src/.` must not match `src2/`).
+/// `None` when a `..` climbs above the root: that path stays as it was and
+/// misses. A path with no `.` or `..` segment is returned unchanged.
+fn resolve_dot_segments(rel: &str) -> Option<String> {
+    if !rel.split('/').any(|seg| seg == "." || seg == "..") {
+        return Some(rel.to_string());
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                kept.pop()?;
+            }
+            name => kept.push(name),
+        }
+    }
+    if kept.is_empty() {
+        return Some(".".to_string());
+    }
+    let mut out = kept.join("/");
+    if rel.ends_with('/') || rel.ends_with("/.") || rel.ends_with("/..") {
+        out.push('/');
+    }
+    Some(out)
+}
+
+/// A path the index can never hold as a key: rooted (`/x`, and `//host` once
+/// separators are unified) or drive-qualified (`C:/x`, `C:`). The drive test
+/// is the CLI's own (`utils::paths`), lexical so the Windows branch runs on
+/// every host. Where `\` is a separator (Windows) a drive-RELATIVE `C:x` is
+/// outside the root as well — `:` cannot appear in a Windows file name — so
+/// its `..` is never resolved onto a project file; on POSIX `a:b` is an
+/// ordinary name and stays relative.
+fn looks_absolute(path: &str, backslash_is_sep: bool) -> bool {
+    let b = path.as_bytes();
+    path.starts_with('/')
+        || crate::utils::paths::needs_lexical_windows_rejection(path, false)
+        || (backslash_is_sep && b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
 #[cfg(test)]
@@ -58,17 +154,167 @@ mod normalize_path_arg_tests {
     #[test]
     fn normalizes_windows_separators_only_where_backslash_is_one() {
         assert_eq!(
-            normalize_path_arg_on(r"src\parser\mod.rs", true),
+            normalize_path_arg_on(r"src\parser\mod.rs", None, true),
             "src/parser/mod.rs"
         );
-        assert_eq!(normalize_path_arg_on("src//a.ts", true), "src/a.ts");
-        assert_eq!(normalize_path_arg_on("src/a.ts", true), "src/a.ts");
+        assert_eq!(normalize_path_arg_on("src//a.ts", None, true), "src/a.ts");
+        assert_eq!(normalize_path_arg_on("src/a.ts", None, true), "src/a.ts");
         // On Unix `\` is a legal filename byte — rewriting it would build a key
         // that misses the indexed file, which is issue #34 in reverse.
         assert_eq!(
-            normalize_path_arg_on(r"src/od\bc.rs", false),
+            normalize_path_arg_on(r"src/od\bc.rs", None, false),
             r"src/od\bc.rs"
         );
-        assert_eq!(normalize_path_arg_on("src//a.ts", false), "src/a.ts");
+        assert_eq!(normalize_path_arg_on("src//a.ts", None, false), "src/a.ts");
+    }
+
+    /// D#228: the spellings of a file under the root that map to its stored
+    /// key, and the look-alikes that must not.
+    #[test]
+    fn maps_absolute_and_dot_slash_spellings_under_the_root() {
+        let unix = Some(std::path::Path::new("/home/u/repo"));
+        let cases: [(&str, &str); 11] = [
+            ("/home/u/repo/src/a.rs", "src/a.rs"),
+            ("/home/u/repo//src/a.rs", "src/a.rs"),
+            ("/home/u/repo/./src/a.rs", "src/a.rs"),
+            ("/home/u/repo", "."),
+            ("/home/u/repo/", "."),
+            ("./src/a.rs", "src/a.rs"),
+            ("././src", "src"),
+            ("./", "."),
+            (".", "."),
+            ("src/a.rs", "src/a.rs"),
+            ("", ""),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), want, "{raw}");
+        }
+        // `.` and `..` segments resolve to the stored key. Left as they were,
+        // `src/./a.rs` missed the index and the freshness refresh then indexed
+        // it as a SECOND file, so every symbol in it existed twice.
+        let dots: [(&str, &str); 14] = [
+            ("/home/u/repo/src/./a.rs", "src/a.rs"),
+            ("/home/u/repo/src/../src/a.rs", "src/a.rs"),
+            ("src/./a.rs", "src/a.rs"),
+            ("src/../src/a.rs", "src/a.rs"),
+            ("src/sub/..", "src/"),
+            ("src/..", "."),
+            ("./src/", "src/"),
+            ("src/./", "src/"),
+            ("src/../lib/", "lib/"),
+            // A name that merely ends in `.` is not a `.` segment.
+            ("src/./a.", "src/a."),
+            // Ending on `.` / `..` names a directory: keep it one, or the
+            // `path%` prefix also matches a sibling `src2/`.
+            ("src/.", "src/"),
+            ("src/x/..", "src/"),
+            ("/home/u/repo/src/.", "src/"),
+            // `:` is an ordinary filename byte on POSIX.
+            ("a:b/../c.rs", "c.rs"),
+        ];
+        for (raw, want) in dots {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), want, "{raw}");
+        }
+        // Look-alikes that are ordinary names, kept as they are.
+        for raw in [
+            ".../a.rs",
+            "..a/b.rs",
+            "a/.b/c.rs",
+            "a../b.rs",
+            "src/",
+            "src",
+        ] {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
+        }
+        // Not under the root, or climbing out of it: unchanged, so the lookup
+        // misses as it always did.
+        for raw in [
+            "/home/u/repo-old/src/a.rs",
+            "/home/u/rep",
+            "/etc/passwd",
+            "../x.rs",
+            "src/../../x.rs",
+            "a/b/../../..",
+            "/home/u/repo/../repo/src/a.rs",
+            "/home/u/repo/..",
+            "/etc/../src/a.rs",
+        ] {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
+        }
+        // Case matters on Unix: `/home/u/Repo` is another directory.
+        assert_eq!(
+            normalize_path_arg_on("/home/u/Repo/a.rs", unix, false),
+            "/home/u/Repo/a.rs"
+        );
+
+        let win = Some(std::path::Path::new(r"C:\Users\u\repo"));
+        assert_eq!(
+            normalize_path_arg_on(r"C:\Users\u\repo\src\a.rs", win, true),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"c:\users\u\repo\src\A.rs", win, true),
+            "src/A.rs",
+            "the drive and root compare case-insensitively, the rest keeps its case"
+        );
+        assert_eq!(
+            normalize_path_arg_on("C:/Users/u/repo/src/a.rs", win, true),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:\Users\u\repo2\a.rs", win, true),
+            "C:/Users/u/repo2/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:\Users\u\repo\src\.\a.rs", win, true),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r".\src\..\lib\a.rs", win, true),
+            "lib/a.rs"
+        );
+        // Outside the root it is left alone, `..` and all — and on Windows a
+        // drive-RELATIVE `C:x` is outside it too: the `..` must not cancel the
+        // drive's current directory and land on a project file.
+        assert_eq!(
+            normalize_path_arg_on(r"D:\x\..\a.rs", win, true),
+            "D:/x/../a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:x\..\src\a.rs", win, true),
+            "C:x/../src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:src\..\a.rs", Some(std::path::Path::new(r"C:\")), true),
+            "C:src/../a.rs"
+        );
+    }
+
+    /// Spellings are mapped LEXICALLY only. A path that reaches the root
+    /// through a symlink is returned as given and misses, as in 0.165.1: the
+    /// canonicalize fallback that mapped it dropped a directory's trailing `/`
+    /// (`<link>/src/` widened to `src`, so `find_dead_code ignore_paths`
+    /// also hid `src2/` and answered "No dead code"), and mapped a link that
+    /// lives outside the root onto a project file.
+    #[cfg(unix)]
+    #[test]
+    fn does_not_resolve_a_path_through_a_symlinked_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for spelling in ["src/a.rs", "src/", "src/."] {
+            let via_link = format!("{}/{spelling}", link.to_string_lossy());
+            assert_eq!(
+                super::normalize_path_arg(&via_link, Some(&real)),
+                via_link,
+                "{spelling}"
+            );
+        }
+        // The same spellings through the root as given still map.
+        let via_real = format!("{}/src/.", real.to_string_lossy());
+        assert_eq!(super::normalize_path_arg(&via_real, Some(&real)), "src/");
     }
 }

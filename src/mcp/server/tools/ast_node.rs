@@ -107,7 +107,7 @@ impl McpServer {
         let file_path_arg = args["file_path"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
-            .map(super::normalize_path_arg);
+            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()));
 
         // Bound BEFORE `ensure_indexed` / `ensure_file_fresh_opt`, which can run a
         // full index pass and re-index a file — i.e. seconds of work and a write.

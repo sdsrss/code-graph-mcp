@@ -23,7 +23,7 @@ impl McpServer {
         let file_path_arg = args["file_path"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .map(super::normalize_path_arg);
+            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()));
         let file_path = file_path_arg.as_deref();
         let relation_raw = args["relation"].as_str().unwrap_or("all");
         let compact = arg_bool(args, "compact", false)?;
