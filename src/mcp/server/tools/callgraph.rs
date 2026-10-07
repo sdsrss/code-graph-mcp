@@ -140,7 +140,7 @@ impl McpServer {
         let file_path_arg = args["file_path"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()));
+            .map(super::normalize_path_arg);
         let file_path = file_path_arg.as_deref();
         let compact = arg_bool(args, "compact", false)?;
         let include_tests = arg_bool(args, "include_tests", false)?;

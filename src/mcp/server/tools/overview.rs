@@ -59,7 +59,7 @@ impl McpServer {
         // also makes `..\foo` reach the `../` guard instead of slipping past it.
         let raw_path = args["path"]
             .as_str()
-            .map(|p| super::normalize_path_arg(p, self.project_root.as_deref()))
+            .map(super::normalize_path_arg)
             .ok_or_else(|| anyhow!("Missing path"))?;
         let raw_path = raw_path.as_str();
         // Reject empty-string path explicitly: it normalizes to the "match all"
