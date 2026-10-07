@@ -522,8 +522,9 @@ fn attribute_of<'t>(item: &tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t
     attr
 }
 
-/// Whether `node` is an item whose own body (`{ … }` of an impl, trait or
-/// function) opens with an inner `#![cfg(…)]` requiring `test`.
+/// Whether `node`'s own body — the `{ … }` of an impl, trait, function, extern
+/// block, loop or const block — opens with an inner `#![cfg(…)]` requiring
+/// `test`, which removes the whole node from a non-test build.
 fn body_inner_cfg_requires_test(node: &tree_sitter::Node, source: &str) -> bool {
     node.child_by_field_name("body").is_some_and(|body| {
         matches!(body.kind(), "declaration_list" | "block")
@@ -4989,6 +4990,13 @@ fn all_of_any_test() {}
 fn comment_inside_cfg() {}
 #[cfg(r#test)]
 fn raw_test_option() {}
+#[cfg(any(test, // only in test builds
+))]
+fn line_comment_inside_cfg() {}
+#[cfg(r#all(test, unix))]
+fn raw_all() {}
+#[cfg(r#any(test))]
+fn raw_any() {}
 
 #[cfg(any(test, fuzzing))]
 fn test_or_fuzzing() {}
@@ -5031,6 +5039,9 @@ fn production() {}
                 ("all_of_any_test", true),
                 ("comment_inside_cfg", true),
                 ("raw_test_option", true),
+                ("line_comment_inside_cfg", true),
+                ("raw_all", true),
+                ("raw_any", true),
                 ("test_or_fuzzing", false),
                 ("not_test", false),
                 ("all_empty", false),
@@ -5142,21 +5153,34 @@ impl Open {
     // margin does not depend on the test harness's default.
     #[test]
     fn rust_cfg_nested_past_the_cap_is_production_and_does_not_overflow() {
-        let nested = |depth: usize, name: &str| {
+        let nested = |op: &str, depth: usize, name: &str| {
             format!(
                 "#[cfg({}test{})]\nfn {name}() {{}}\n",
-                "all(".repeat(depth),
+                format!("{op}(").repeat(depth),
                 ")".repeat(depth)
             )
         };
-        let deep = nested(100_000, "deep_fn");
-        let got = std::thread::Builder::new()
-            .stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)
-            .spawn(move || rust_is_test_by_name(&deep))
-            .unwrap()
-            .join()
-            .unwrap();
-        assert_eq!(got.get("deep_fn"), Some(&false), "{got:?}");
-        assert_rust_is_test(&nested(8, "shallow_fn"), &[("shallow_fn", true)]);
+        // Both recursive arms, `all` and `any`, must stop at the cap.
+        for op in ["all", "any"] {
+            let deep = nested(op, 100_000, "deep_fn");
+            let got = std::thread::Builder::new()
+                .stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)
+                .spawn(move || rust_is_test_by_name(&deep))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(got.get("deep_fn"), Some(&false), "{op}: {got:?}");
+            // The cap is exactly MAX_CFG_PREDICATE_DEPTH levels of nesting.
+            let edge = MAX_CFG_PREDICATE_DEPTH;
+            assert_rust_is_test(
+                &format!(
+                    "{}{}",
+                    nested(op, edge, "at_cap"),
+                    nested(op, edge + 1, "past_cap")
+                ),
+                &[("at_cap", true), ("past_cap", false)],
+            );
+        }
+        assert_eq!(MAX_CFG_PREDICATE_DEPTH, 32, "the CHANGELOG names 32 levels");
     }
 }

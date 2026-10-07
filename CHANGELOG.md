@@ -14,8 +14,8 @@ reports it as stale.
 **`impact` and `callgraph` on Rust code can show fewer production callers:**
 a caller inside such a block now counts as a test caller (`callgraph
 --include-tests` shows it). To pin back: `npm i -g @sdsrs/code-graph@0.167.0`,
-or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag
-v0.167.0`; plugin users can set the version in the marketplace entry. An
+or `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
+--tag v0.167.0`; plugin users can set the version in the marketplace entry. An
 older binary leaves a v114 index intact and warns instead of rebuilding it;
 delete `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -34,9 +34,9 @@ rules: an item is test code when its predicate can only hold with `test` set
 — `test`, `all(…)` with such a member, or `any(…)` whose members all are.
 `any(test, fuzzing)`, `not(test)` and `feature = "test"` stay production;
 comments inside the predicate are skipped and `r#test` is `test`. An inner
-`#![cfg(…)]` gates its whole file, or the whole module, impl, trait or
-function whose body it opens, where it marked at most the item right after
-it. `#[tokio::test(flavor = "multi_thread")]` counts like `#[tokio::test]`,
+`#![cfg(…)]` gates its whole file, or whatever body it opens (a module,
+impl, trait, function, extern block, loop or const block), where it marked
+at most the item right after it. `#[tokio::test(flavor = "multi_thread")]` counts like `#[tokio::test]`,
 which it did not.
 
 Measured against 0.167.0 on the same checkouts: on tokio-1.41.1, 152 of
@@ -44,8 +44,9 @@ Measured against 0.167.0 on the same checkouts: on tokio-1.41.1, 152 of
 directories, most of them `#[tokio::test(flavor = …)]` functions), and no
 node stops being test code; all 32,081 edges, with their confidence labels,
 are identical. On this repository's 0.167.0 tree nothing changes (7,083
-nodes, 16,179 edges). A full index of tokio takes 2.52 s against 2.54 s
-(medians of five interleaved runs). On a fixture with a call in a helper inside
+nodes, 16,179 edges). The time of a full tokio index is unchanged within
+run-to-run spread: −0.8% in one set of five interleaved runs per build,
++1.4% in another of nine. On a fixture with a call in a helper inside
 `#[cfg(all(test, not(loom)))] mod test`, these answers change:
 
 - `impact` counts the helper as a test caller (1 direct caller where 0.167.0
@@ -65,10 +66,11 @@ nodes, 16,179 edges). A full index of tokio takes 2.52 s against 2.54 s
   `loom/mocked.rs`).
 - Test attributes other than `#[test]` and `#[….::test]`, such as
   `#[rstest]` or `#[test_case(…)]`, are not recognised.
-- Predicates that need negation reasoning (`not(not(test))`) and a
+- Predicates that need negation reasoning (`not(not(test))`) stay
+  production, as does an `all` / `any` nested more than 32 levels deep. A
   `cfg(test)` written inside `cfg_attr` (`#[cfg_attr(all(), cfg(test))]`,
-  which gates like `#[cfg(test)]`) stay production, as does an `all` / `any`
-  nested more than 32 levels deep.
+  which gates like `#[cfg(test)]`) was test code in 0.167.0, which matched
+  its text, and is now production.
 - In a file gated by `#![cfg(test)]`, code outside any function (a `static`
   initializer, say) still counts as production: the unresolved-call list of
   an empty `refs` answer can still show its calls.
