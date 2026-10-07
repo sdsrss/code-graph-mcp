@@ -104,7 +104,7 @@ pub(super) fn normalize_path_arg_on(
             }
         }
     }
-    if looks_absolute(&path) {
+    if looks_absolute(&path, backslash_is_sep) {
         return path;
     }
     resolve_dot_segments(&path).unwrap_or(path)
@@ -115,7 +115,8 @@ pub(super) fn normalize_path_arg_on(
 /// is not just a miss: the freshness refresh indexed `src/./a.rs` as a second
 /// file, and every symbol in it then existed twice. `./` alone becomes `.`,
 /// which `module_overview` reads as the whole project. A trailing `/` is kept,
-/// because directory tools match `files.path` against the path as a prefix.
+/// and a path ending in `/.` or `/..` gets one, because directory tools match
+/// `files.path` against the path as a prefix (`src/.` must not match `src2/`).
 /// `None` when a `..` climbs above the root: that path stays as it was and
 /// misses. A path with no `.` or `..` segment is returned unchanged.
 fn resolve_dot_segments(rel: &str) -> Option<String> {
@@ -136,7 +137,7 @@ fn resolve_dot_segments(rel: &str) -> Option<String> {
         return Some(".".to_string());
     }
     let mut out = kept.join("/");
-    if rel.ends_with('/') {
+    if rel.ends_with('/') || rel.ends_with("/.") || rel.ends_with("/..") {
         out.push('/');
     }
     Some(out)
@@ -145,9 +146,15 @@ fn resolve_dot_segments(rel: &str) -> Option<String> {
 /// A path the index can never hold as a key: rooted (`/x`, and `//host` once
 /// separators are unified) or drive-qualified (`C:/x`, `C:`). The drive test
 /// is the CLI's own (`utils::paths`), lexical so the Windows branch runs on
-/// every host.
-fn looks_absolute(path: &str) -> bool {
-    path.starts_with('/') || crate::utils::paths::needs_lexical_windows_rejection(path, false)
+/// every host. Where `\` is a separator (Windows) a drive-RELATIVE `C:x` is
+/// outside the root as well — `:` cannot appear in a Windows file name — so
+/// its `..` is never resolved onto a project file; on POSIX `a:b` is an
+/// ordinary name and stays relative.
+fn looks_absolute(path: &str, backslash_is_sep: bool) -> bool {
+    let b = path.as_bytes();
+    path.starts_with('/')
+        || crate::utils::paths::needs_lexical_windows_rejection(path, false)
+        || (backslash_is_sep && b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
 #[cfg(test)]
@@ -196,16 +203,23 @@ mod normalize_path_arg_tests {
         // `.` and `..` segments resolve to the stored key. Left as they were,
         // `src/./a.rs` missed the index and the freshness refresh then indexed
         // it as a SECOND file, so every symbol in it existed twice.
-        let dots: [(&str, &str); 9] = [
+        let dots: [(&str, &str); 13] = [
             ("/home/u/repo/src/./a.rs", "src/a.rs"),
             ("/home/u/repo/src/../src/a.rs", "src/a.rs"),
             ("src/./a.rs", "src/a.rs"),
             ("src/../src/a.rs", "src/a.rs"),
-            ("src/sub/..", "src"),
+            ("src/sub/..", "src/"),
             ("src/..", "."),
             ("./src/", "src/"),
             ("src/./", "src/"),
             ("src/../lib/", "lib/"),
+            // Ending on `.` / `..` names a directory: keep it one, or the
+            // `path%` prefix also matches a sibling `src2/`.
+            ("src/.", "src/"),
+            ("src/x/..", "src/"),
+            ("/home/u/repo/src/.", "src/"),
+            // `:` is an ordinary filename byte on POSIX.
+            ("a:b/../c.rs", "c.rs"),
         ];
         for (raw, want) in dots {
             assert_eq!(normalize_path_arg_on(raw, unix, false), want, "{raw}");
@@ -233,6 +247,7 @@ mod normalize_path_arg_tests {
             "a/b/../../..",
             "/home/u/repo/../repo/src/a.rs",
             "/home/u/repo/..",
+            "/etc/../src/a.rs",
         ] {
             assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
         }
@@ -268,10 +283,20 @@ mod normalize_path_arg_tests {
             normalize_path_arg_on(r".\src\..\lib\a.rs", win, true),
             "lib/a.rs"
         );
-        // Outside the root it is left alone, `..` and all.
+        // Outside the root it is left alone, `..` and all — and on Windows a
+        // drive-RELATIVE `C:x` is outside it too: the `..` must not cancel the
+        // drive's current directory and land on a project file.
         assert_eq!(
             normalize_path_arg_on(r"D:\x\..\a.rs", win, true),
             "D:/x/../a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:x\..\src\a.rs", win, true),
+            "C:x/../src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:src\..\a.rs", Some(std::path::Path::new(r"C:\")), true),
+            "C:src/../a.rs"
         );
     }
 
