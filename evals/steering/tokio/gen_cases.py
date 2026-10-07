@@ -37,6 +37,26 @@ CASES = [
     ("registration-poll-read-ready", "Registration.poll_read_ready", "tokio/src/runtime/io/registration.rs:109"),
 ]
 
+# Controls (D#229): definitions rust-analyzer finds no caller for anywhere in
+# the workspace, whose names do have calls code-graph cannot resolve. They
+# measure what an "unresolved calls" note costs when the zero is right.
+CONTROLS = [
+    ("control-tcp-stream-set-ttl", "TcpStream.set_ttl", "tokio/src/net/tcp/stream.rs:1246"),
+    ("control-child-try-wait", "Child.try_wait", "tokio/src/process/mod.rs:1249"),
+]
+
+CONTROL_PROMPT = """---
+description: "{desc}"
+max_turns: 50
+timeout_seconds: 900
+allowed_tools: [Read, Glob, Grep, Bash, Agent]
+tags: [tokio, control]
+workspace: tokio
+---
+
+This repository is tokio 1.41.1, a Rust workspace. Which functions in the library code under `tokio/src/` call `{shown}`, the {kind} defined at `{at}`? Count only direct calls to that definition. Leave out test code: `#[cfg(test)]` modules and anything under a `tests/` directory. End your reply with the complete list, one caller per line, formatted as `Type::method @ path/to/file.rs` (for a free function, `name @ path/to/file.rs`). If nothing calls it, end your reply with the single line `NONE` instead.
+"""
+
 PROMPT = """---
 description: "{desc}"
 max_turns: 50
@@ -122,6 +142,19 @@ def main():
             (d / "graders" / f"item-{i:02d}-{slug}.md").write_text(
                 f"---\ntype: regex\npattern: '{pattern}'\n---\n\n{qn} @ {key[0]}:{key[1]} (code-graph: {tier or 'missed'})\n")
         print(f"{case}: {len(callers)} callers, {len(files)} files, default floor finds {found}")
+
+    for case, callee, at in CONTROLS:
+        assert not any(g["callee_at"] == at for g in gold), f"{case}: {callee} has gold callers"
+        assert meta.get(node(at, callee.split(".")[-1])[0]), f"{case}: no node at {at}"
+        d = Path(a.out) / case
+        (d / "graders").mkdir(parents=True, exist_ok=True)
+        desc = (f"Control: rust-analyzer finds no caller of {callee} anywhere in the workspace. "
+                f"The only grader is the closing NONE line.")
+        shown = callee.replace(".", "::")
+        (d / "prompt.md").write_text(CONTROL_PROMPT.format(desc=desc, shown=shown, kind="method", at=at))
+        (d / "graders" / "item-00-none.md").write_text(
+            "---\ntype: regex\npattern: '(?m)^\\s*`?NONE`?\\s*$'\n---\n\nThe reply ends with NONE.\n")
+        print(f"{case}: control, no callers")
 
 
 if __name__ == "__main__":
