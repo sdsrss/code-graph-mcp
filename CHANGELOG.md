@@ -7,17 +7,23 @@
 - MCP `get_call_graph` given a `file_path` that holds no definition of the
   symbol says so, as `find_references` and `get_ast_node` do. It answered an
   empty caller list beside an empty `boundaries` block, which reads as
-  "nothing calls it": for an indexed file that does not define the symbol,
-  for a path the index does not hold (a typo, or a path through a symlink,
-  which 0.166.0 stopped indexing a second time), and for a near-miss name
-  that resolved to a definition in another file. A file without the symbol
-  now gets `Symbol 'X' not found in file 'F'. Defined in: …`, and a file not
-  in the index gets `get_ast_node`'s `File 'F' not found in index`.
-- `callgraph --file` names the same miss, as `impact` and `refs` do, and
-  like `impact` lists the files that define the symbol, instead of `No call
-  graph results for: X`. Its `--json` miss carries `"error": "Symbol not found in file"` (or
-  `"File not found in index"`), `file` and `candidates` beside `results:
-  []`. It still exits 1.
+  "nothing calls it", when the symbol had one definition in another file,
+  when the path is not in the index (a typo, or a path through a symlink,
+  which 0.166.0 stopped indexing a second time), and when a near-miss name
+  resolved to a definition in another file. When the symbol had two or more
+  definitions elsewhere it answered "No exact match … Did you mean" with
+  those definitions, though the name matched exactly. Each of these is now an
+  error: `Symbol 'X' not found in file 'F'`, or for a path not in the index
+  `get_ast_node`'s `File 'F' not found in index`, followed by the files that
+  define the symbol (the first 5, with the total when there are more). A
+  near-miss name says what it resolved to first. A path not in the index is
+  refused before any near-miss lookup, which used to answer with candidates
+  from other files.
+- `callgraph --file` answers the same misses with the same sentences instead
+  of `No call graph results for: X` (or, for a name defined in two or more
+  other files, `Ambiguous symbol`). Its `--json` miss carries `"error":
+  "Symbol not found in file"` or `"File not found in index"`, `file`, and
+  `candidates` with their `node_id`s beside `results: []`. It still exits 1.
 - `deps` given a file that exists but is not in the index (a path through a
   symlink, or a language the indexer does not parse) answers `File not in
   index` and exits 1. It answered `No tracked dependencies`, or printed the
