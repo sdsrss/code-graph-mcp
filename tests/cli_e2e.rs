@@ -5331,7 +5331,38 @@ fn test_cli_callgraph_file_without_the_symbol_names_the_miss() {
     );
     assert_eq!(code, 1, "got: {stderr}");
     assert!(
-        stderr.contains("File 'src/nope.ts' not found in index"),
+        stderr.contains("File 'src/nope.ts' not found in index")
+            && stderr.contains("'validateToken' is defined in: src/auth.ts"),
+        "got: {stderr}"
+    );
+    // Its JSON lists the defining file too, as `impact --json` does for
+    // the same input (review F4a), with the node_id to pick it by.
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "validateToken",
+            "--file",
+            "src/nope.ts",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "File not found in index", "got: {v}");
+    assert_eq!(v["candidates"][0]["file_path"], "src/auth.ts", "got: {v}");
+    assert!(v["candidates"][0]["node_id"].is_i64(), "got: {v}");
+
+    // A near-miss name resolved into another file says what it resolved to
+    // before naming the miss (review F2).
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateTok", "--file", "src/utils.ts"],
+    );
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(
+        stderr.contains("Resolved 'validateTok' → 'validateToken'")
+            && stderr.contains("Symbol 'validateToken' not found in file 'src/utils.ts'"),
         "got: {stderr}"
     );
 

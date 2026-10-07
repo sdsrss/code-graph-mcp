@@ -203,13 +203,14 @@ impl McpServer {
         let has_edges = results.nodes.iter().any(|n| n.depth > 0);
         let has_seed = results.nodes.iter().any(|n| n.depth == 0);
         // A file_path that holds no definition is a miss, not a filter that
-        // legitimately matches nothing (D#253). An unindexed file, or a name
-        // defined only elsewhere, is refused here; a name defined nowhere
-        // still gets the fuzzy step, and its pick is checked below.
+        // legitimately matches nothing (D#253). A path the index does not
+        // hold is refused here whatever the name, since no lookup can find
+        // anything in it, and so is a name defined only in other files. A
+        // name defined nowhere in an indexed file still gets the fuzzy step,
+        // and its pick is checked below.
         if let (Some(fp), false) = (file_path, has_seed) {
             let miss = crate::resolve::file_selector_miss(self.db.conn(), function_name, fp)?;
-            if !matches!(&miss, crate::resolve::FileSelectorMiss::NotDefinedHere(c) if c.is_empty())
-            {
+            if !miss.defined_nowhere() {
                 return Err(anyhow!(miss.message(function_name, fp)));
             }
         }
@@ -228,7 +229,14 @@ impl McpServer {
                         if !results2.nodes.iter().any(|n| n.depth == 0) {
                             let miss =
                                 crate::resolve::file_selector_miss(self.db.conn(), &resolved, fp)?;
-                            return Err(anyhow!(miss.message(&resolved, fp)));
+                            // Say which name was looked for: the caller typed
+                            // another one (the CLI prints "Resolved 'X' → 'Y'").
+                            return Err(anyhow!(
+                                "No exact match for '{}'; it resolves to '{}'. {}",
+                                function_name,
+                                resolved,
+                                miss.message(&resolved, fp)
+                            ));
                         }
                     }
                     return self.format_call_graph_response(

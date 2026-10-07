@@ -249,44 +249,65 @@ pub fn detect_same_file_ambiguity(
     Ok((cands.len() > 1).then_some(cands))
 }
 
-/// Why a file selector found no definition of a name.
-pub enum FileSelectorMiss {
-    /// The index holds no file at that path: a mistyped path, a path through
-    /// a symlink, or a file the indexer does not parse.
-    FileNotIndexed,
-    /// The file is indexed and does not define the name; these are the
-    /// definitions that do (empty when no file defines it under that exact
-    /// name).
-    NotDefinedHere(Vec<NameCandidate>),
+/// Why a file selector found no definition of a name (D#253).
+pub struct FileSelectorMiss {
+    /// False when the index holds no file at that path: a mistyped path, a
+    /// path through a symlink, or a file the indexer does not parse.
+    pub file_indexed: bool,
+    /// The definitions of the name in other files (empty when no file
+    /// defines it under that exact name).
+    pub elsewhere: Vec<NameCandidate>,
 }
 
 impl FileSelectorMiss {
-    /// The MCP sentence: `get_ast_node`'s for an unindexed file,
-    /// `find_references`' for a file without the symbol, plus the files
-    /// that define it.
-    pub fn message(&self, name: &str, file_path: &str) -> String {
-        match self {
-            Self::FileNotIndexed => format!(
-                "File '{file_path}' not found in index. Check that the path is relative to the project root and the file has been indexed."
-            ),
-            Self::NotDefinedHere(cands) => {
-                let mut msg = format!("Symbol '{name}' not found in file '{file_path}'.");
-                let files = Self::defining_files(cands);
-                if !files.is_empty() {
-                    msg.push_str(&format!(" Defined in: {}.", files.join(", ")));
-                }
-                msg
-            }
-        }
+    /// True when nothing is known beyond "not in this indexed file": the
+    /// name is defined nowhere under that exact spelling, so a caller may
+    /// still try a fuzzy match. An unindexed path is a miss either way.
+    pub fn defined_nowhere(&self) -> bool {
+        self.file_indexed && self.elsewhere.is_empty()
     }
 
-    /// The distinct files in `cands`, sorted, at most [`SUGGESTION_CAP`].
-    pub fn defining_files(cands: &[NameCandidate]) -> Vec<&str> {
-        let mut files: Vec<&str> = cands.iter().map(|c| c.file_path.as_str()).collect();
+    /// The MCP sentence: `get_ast_node`'s for an unindexed file,
+    /// `find_references`' for a file without the symbol, then the files that
+    /// define it. Capped like every candidate list here, and the cap is
+    /// disclosed. No sentence ends in a path: a copied `src/a.rs.` is not a
+    /// file.
+    pub fn message(&self, name: &str, file_path: &str) -> String {
+        let mut msg = if self.file_indexed {
+            format!("Symbol '{name}' not found in file '{file_path}'.")
+        } else {
+            format!(
+                "File '{file_path}' not found in index. Check that the path is relative to the project root and the file has been indexed."
+            )
+        };
+        let (files, total) = self.defining_files();
+        if !files.is_empty() {
+            let lead = if self.file_indexed {
+                "Defined in".to_string()
+            } else {
+                format!("'{name}' is defined in")
+            };
+            msg.push_str(&format!(" {lead}: {}", files.join(", ")));
+            if total > files.len() {
+                msg.push_str(&format!(" ({} of {total} files)", files.len()));
+            }
+        }
+        msg
+    }
+
+    /// The distinct defining files, sorted, at most [`SUGGESTION_CAP`], and
+    /// how many there are in all.
+    pub fn defining_files(&self) -> (Vec<&str>, usize) {
+        let mut files: Vec<&str> = self
+            .elsewhere
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect();
         files.sort_unstable();
         files.dedup();
+        let total = files.len();
         files.truncate(SUGGESTION_CAP);
-        files
+        (files, total)
     }
 }
 
@@ -301,9 +322,6 @@ pub fn file_selector_miss(
     name: &str,
     file_path: &str,
 ) -> Result<FileSelectorMiss> {
-    if !queries::file_is_indexed(conn, file_path)? {
-        return Ok(FileSelectorMiss::FileNotIndexed);
-    }
     let elsewhere = queries::get_nodes_with_files_by_symbol(conn, name)?
         .into_iter()
         .filter(|nf| is_selectable_definition(&nf.file_path) && nf.file_path != file_path)
@@ -315,7 +333,10 @@ pub fn file_selector_miss(
             start_line: nf.node.start_line,
         })
         .collect();
-    Ok(FileSelectorMiss::NotDefinedHere(elsewhere))
+    Ok(FileSelectorMiss {
+        file_indexed: queries::file_is_indexed(conn, file_path)?,
+        elsewhere,
+    })
 }
 
 /// True when `file_path` names a definition the caller can actually act on.
@@ -653,6 +674,41 @@ mod fuzzy_tests {
             ),
             FuzzyResolution::NotFound => panic!("handle_tool is indexed"),
         }
+    }
+
+    /// D#253 review: the defining files are capped like every candidate list
+    /// here, so the cap is disclosed; no sentence ends in a path (a copied
+    /// `src/a.rs.` is not a file); and a file not in the index still names
+    /// where the symbol is, as `impact` does.
+    #[test]
+    fn file_selector_miss_discloses_the_cap_and_lists_files_for_an_unindexed_path() {
+        let files: Vec<(String, &str)> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| (format!("src/{n}.rs"), "pub fn many_x() {}\n"))
+            .chain(std::iter::once(("src/z.rs".to_string(), "pub fn z() {}\n")))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let (_p, _d, db) = indexed(&refs);
+
+        let miss = file_selector_miss(db.conn(), "many_x", "src/z.rs").unwrap();
+        let msg = miss.message("many_x", "src/z.rs");
+        assert!(
+            msg.starts_with("Symbol 'many_x' not found in file 'src/z.rs'.")
+                && msg.contains(
+                    "Defined in: src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs (5 of 6 files)"
+                ),
+            "got: {msg}"
+        );
+        assert!(!msg.ends_with(".rs."), "got: {msg}");
+
+        let miss = file_selector_miss(db.conn(), "z", "nope/z.rs").unwrap();
+        let msg = miss.message("z", "nope/z.rs");
+        assert!(
+            msg.starts_with("File 'nope/z.rs' not found in index.")
+                && msg.contains("'z' is defined in: src/z.rs"),
+            "got: {msg}"
+        );
+        assert!(!msg.ends_with(".rs."), "got: {msg}");
     }
 
     #[test]

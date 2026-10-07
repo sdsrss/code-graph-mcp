@@ -176,12 +176,13 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // match. Matches MCP get_call_graph behavior.
     let has_edges = result.nodes.iter().any(|n| n.depth > 0);
     let has_seed = result.nodes.iter().any(|n| n.depth == 0);
-    // A --file that holds no definition is a miss (D#253), as in `impact`:
-    // an unindexed file, or a name defined only elsewhere. A name defined
-    // nowhere still gets the fuzzy step below.
+    // A --file that holds no definition is a miss (D#253), as in `impact`.
+    // A path the index does not hold is refused whatever the name, and so is
+    // a name defined only in other files. A name defined nowhere in an
+    // indexed file still gets the fuzzy step below.
     if let (Some(fp), false, None) = (file_filter, has_seed, &node_target) {
         let miss = crate::resolve::file_selector_miss(conn, symbol, fp)?;
-        if !matches!(&miss, crate::resolve::FileSelectorMiss::NotDefinedHere(c) if c.is_empty()) {
+        if !miss.defined_nowhere() {
             emit_file_selector_miss(&miss, symbol, fp, json_mode);
         }
     }
@@ -195,13 +196,14 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
                     result = run_query(&resolved, &node_target)?;
+                    // Before any miss below, which names `resolved`.
+                    eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                     if let Some(fp) = file_filter {
                         if !result.nodes.iter().any(|n| n.depth == 0) {
                             let miss = crate::resolve::file_selector_miss(conn, &resolved, fp)?;
                             emit_file_selector_miss(&miss, &resolved, fp, json_mode);
                         }
                     }
-                    eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
             }
@@ -526,8 +528,8 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
 }
 
 /// A `--file` that holds no definition of `name`: the sentence MCP
-/// `get_call_graph` gives, and `impact`'s JSON envelope with callgraph's
-/// `results: []`. Exits 1.
+/// `get_call_graph` gives, and `impact`'s JSON envelope (`error`, `symbol`,
+/// `file`, `candidates`) with callgraph's `results: []`. Exits 1.
 fn emit_file_selector_miss(
     miss: &crate::resolve::FileSelectorMiss,
     name: &str,
@@ -535,33 +537,24 @@ fn emit_file_selector_miss(
     json_mode: bool,
 ) -> ! {
     if json_mode {
-        let (error, candidates) = match miss {
-            crate::resolve::FileSelectorMiss::FileNotIndexed => ("File not found in index", vec![]),
-            crate::resolve::FileSelectorMiss::NotDefinedHere(cands) => (
-                "Symbol not found in file",
-                cands
-                    .iter()
-                    .take(crate::resolve::SUGGESTION_CAP)
-                    .map(|c| {
-                        serde_json::json!({
-                            "name": c.name,
-                            "type": c.node_type,
-                            "file_path": c.file_path,
-                        })
-                    })
-                    .collect(),
-            ),
-        };
-        println!(
-            "{}",
-            serde_json::json!({
-                "results": [],
-                "error": error,
-                "symbol": name,
-                "file": file,
-                "candidates": candidates,
-            })
-        );
+        let mut out = serde_json::json!({
+            "results": [],
+            "error": if miss.file_indexed {
+                "Symbol not found in file"
+            } else {
+                "File not found in index"
+            },
+            "symbol": name,
+            "file": file,
+            "candidates": crate::resolve::candidates_to_json(&miss.elsewhere)
+                .into_iter()
+                .take(crate::resolve::SUGGESTION_CAP)
+                .collect::<Vec<_>>(),
+        });
+        if miss.elsewhere.len() > crate::resolve::SUGGESTION_CAP {
+            out["candidates_total"] = serde_json::json!(miss.elsewhere.len());
+        }
+        println!("{out}");
     }
     eprintln!("[code-graph] {}", miss.message(name, file));
     std::process::exit(1);

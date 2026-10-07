@@ -3172,17 +3172,20 @@ function handleLogin(req: Request) {
         }));
         assert!(is_error, "an unindexed file must be refused, got: {text}");
         assert!(
-            text.contains("File 'nope/a.rs' not found in index"),
+            text.contains("File 'nope/a.rs' not found in index")
+                && text.contains("'d_a' is defined in: src/a.rs"),
             "got: {text}"
         );
 
-        // A fuzzy name that resolves to a definition in another file.
+        // A fuzzy name that resolves to a definition in another file: the
+        // answer says which name it looked for (review F2).
         let (is_error, text) = call(json!({
             "symbol_name": "caller_tw", "file_path": "src/c.rs", "direction": "callers"
         }));
         assert!(is_error, "got: {text}");
         assert!(
-            text.contains("Symbol 'caller_two' not found in file 'src/c.rs'")
+            text.contains("No exact match for 'caller_tw'; it resolves to 'caller_two'.")
+                && text.contains("Symbol 'caller_two' not found in file 'src/c.rs'")
                 && text.contains("Defined in: src/b.rs"),
             "got: {text}"
         );
