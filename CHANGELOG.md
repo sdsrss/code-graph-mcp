@@ -2,17 +2,27 @@
 
 ## Unreleased
 
-MCP tools take an absolute path under the project, and no spelling of a
-path adds a second copy of a file to the index.
+MCP tools take an absolute path under the project, no spelling of a path
+adds a second copy of a file to the index, and a directory path no longer
+covers a sibling that shares its name prefix (`src` is not `src2/`).
 
 **Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
-unchanged). An MCP tool given an absolute path under the project root, a
-leading `./`, or `.` / `..` segments that stay inside the root now answers
-for that file or directory instead of "not found". A path that goes through
-a symlink (`link/a.rs` where `link` points at `src`) is answered "not found"
-by MCP tools and by `affected` / `deps`, where 0.165.2 indexed the file a
-second time under that path. To keep 0.165.2's behaviour, pin
-`@sdsrs/code-graph@0.165.2`.
+unchanged). Three answers change:
+
+- An MCP tool given an absolute path under the project root, a leading
+  `./`, or `.` / `..` segments that stay inside the root answers for that
+  file or directory instead of "not found".
+- A path that goes through a symlink (`link/a.rs` where `link` points at
+  `src`, or a package pnpm links into `node_modules`) is answered "not
+  found" by MCP tools and by `affected` / `deps`, where 0.165.2 indexed the
+  file a second time under that path.
+- The path of `overview` / `module_overview` and each `dead-code --ignore` /
+  `ignore_paths` entry covers that directory or file only. `src` no longer
+  also matches `src2/` or `src.rs`, and `overview src/models` no longer
+  matches `src/models.ts`: name the file. An `ignore_paths` entry of `""`
+  ignores nothing; it ignored everything.
+
+To keep 0.165.2's behaviour, pin `@sdsrs/code-graph@0.165.2`.
 
 ### Fixed
 
@@ -27,14 +37,14 @@ second time under that path. To keep 0.165.2's behaviour, pin
   project. Reached by MCP `file_path` / `path` arguments and by the file
   arguments of `affected` and `deps`; with 0.165.2, `affected link/a.rs`
   added `link/a.rs` and `affected <root>/ext/secret.rs` added
-  `ext/secret.rs`.
-  The refresh now indexes a path only under the key the scan stores: names
-  joined by `/`, no `.`, `..` or empty segment, no symlink below the
-  project root, and, for a file not yet indexed, each name spelled as its
-  directory lists it (on macOS and Windows that keeps `SRC/a.rs` out
-  beside `src/a.rs`). A row an older version stored under such a path is
-  dropped the next time the path is refreshed; the next incremental index
-  already dropped it.
+  `ext/secret.rs`. The refresh now indexes a path only under the key the
+  scan stores: names joined by `/`, no `.`, `..` or empty segment, no
+  symlink below the project root, and, for a file not yet indexed, each
+  name spelled as its directory lists it (on macOS and Windows that keeps
+  `SRC/a.rs` out beside `src/a.rs`). A row an older version stored under a
+  dotted or symlinked path is dropped the next time that path is
+  refreshed. A wrong-case row is left to the next incremental index, which
+  drops every row its scan does not see.
 - MCP tools that take a path accept an absolute path under the project
   root, a leading `./`, and `.` / `..` segments that stay inside the root,
   mapping them onto the stored path. Haiku sent absolute paths in 2 of its
@@ -43,12 +53,23 @@ second time under that path. To keep 0.165.2's behaviour, pin
   path outside the root, or one that reaches the root through a symlink, is
   left as given and misses as before. A path ending in `/.` or `/..` stays a
   directory, so `src/.` does not also match `src2/`.
+- A directory path in `overview` / `module_overview` and in `dead-code
+  --ignore` / `find_dead_code ignore_paths` stops at a path boundary. They
+  matched by string prefix, so `src` also covered `src2/` and `src.rs`: the
+  overview listed the sibling's symbols, and `--ignore src` hid the
+  sibling's dead code behind "No dead code found". Absolute and `./`
+  spellings now reach these filters as `src` too, which is how the
+  pre-release review found it. `dead-code`'s own path filter has stopped at
+  the boundary since 0.118.0.
 
 ### Not covered
 
 - A path through a symlink is answered "not found" without saying why;
   symlinked sources are still not indexed at all (the scan does not follow
   links).
+- MCP resolves `..` by string: with `deep` linking to `src/sub`,
+  `deep/../a.rs` answers for the project's `a.rs`, while the filesystem
+  opens `src/a.rs`.
 - On a case-insensitive filesystem, a wrong-case spelling of an indexed file
   (`SRC/a.rs`) misses instead of answering for `src/a.rs`.
 - `callgraph`, `impact` and `get_ast_node include_impact` still fold two
