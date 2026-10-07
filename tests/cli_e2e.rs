@@ -12859,7 +12859,7 @@ fn test_cli_empty_answers_list_unresolved_calls_nearest_the_definition() {
     }
     let (stdout, _, _) = run_cli(&project, &["refs", "lonely"]);
     assert!(
-        stdout.contains("(no dynamic-dispatch site or call names 'lonely')"),
+        stdout.contains("(no dynamic-dispatch site names 'lonely')"),
         "{stdout}"
     );
 }

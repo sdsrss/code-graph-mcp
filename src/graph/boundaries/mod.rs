@@ -1676,13 +1676,15 @@ impl Boundaries {
                 "next": self.next_command(),
             })
         };
-        if let Some(calls) = self.unresolved_calls() {
+        // Only a list is disclosed; with none, the 0.166.0 shape (see
+        // `render_text`).
+        if let Some(calls) = self.unresolved_calls().filter(|c| !c.is_empty()) {
             let mut u = serde_json::json!({ "total": calls.len() });
             let in_resolved = self.calls.as_ref().map_or(0, |c| c.len() - calls.len());
             if in_resolved > 0 {
                 u["in_resolved_functions"] = serde_json::json!(in_resolved);
             }
-            if !calls.is_empty() {
+            {
                 let mut files: Vec<&str> = calls.iter().map(|c| c.file_path.as_str()).collect();
                 files.sort_unstable();
                 files.dedup();
@@ -1735,33 +1737,15 @@ impl Boundaries {
     pub fn render_text<W: std::io::Write>(&self, out: &mut W, indent: &str) -> std::io::Result<()> {
         let calls_text = self.unresolved_calls_text(indent);
         if self.sites.is_empty() {
-            // With calls counted and none unresolved, the one line says what
-            // the count shows: no call at all, or calls only in functions
-            // where the graph resolved a call of the name (the rule is per
-            // function, so not that each call is resolved).
-            let resolved = self
-                .calls
-                .as_ref()
-                .filter(|_| calls_text.is_empty())
-                .map(Vec::len);
-            let what = if resolved == Some(0) {
-                "dynamic-dispatch site or call"
-            } else {
-                "dynamic-dispatch site"
-            };
-            let tail = match resolved {
-                Some(1) => format!(
-                    "; its 1 call is in a function with a resolved call of '{}'",
-                    self.name
-                ),
-                Some(k) if k > 1 => format!(
-                    "; its {k} calls are all in functions with a resolved call of '{}'",
-                    self.name
-                ),
-                _ => String::new(),
-            };
+            // Nothing listed: the 0.166.0 answer. No line claims there is no
+            // call — the scan skips a bare call in a file that binds the
+            // name, and the definition's own line (pre-tag review round 2).
             if self.complete() {
-                writeln!(out, "{indent}(no {what} names '{}'{tail})", self.name)?;
+                writeln!(
+                    out,
+                    "{indent}(no dynamic-dispatch site names '{}')",
+                    self.name
+                )?;
                 if calls_text.is_empty() {
                     return Ok(());
                 }
@@ -1770,7 +1754,7 @@ impl Boundaries {
             }
             writeln!(
                 out,
-                "{indent}(no {what} names '{}' in the files scanned{tail}; not scanned: {})",
+                "{indent}(no dynamic-dispatch site names '{}' in the files scanned; not scanned: {})",
                 self.name,
                 self.unscanned_text()
             )?;
@@ -2022,7 +2006,13 @@ fn classify_calls(
         }
         fns.sort_unstable();
         mods.sort_unstable();
-        for line in lines {
+        let first = out.len();
+        for (j, line) in lines.into_iter().enumerate() {
+            if j % 1024 == 1023 && Instant::now() >= deadline {
+                out.truncate(first);
+                *files_past_limit += total - k;
+                return Ok(out);
+            }
             let l = line as i64;
             let holders = innermost(&fns, l);
             let holders = if holders.is_empty() {
@@ -2048,17 +2038,15 @@ fn classify_calls(
 /// last start at or before `line` to the first that holds it.
 fn innermost(spans: &[(i64, i64, i64, bool)], line: i64) -> Vec<(i64, i64, i64, bool)> {
     let upto = spans.partition_point(|s| s.0 <= line);
-    let Some(best) = spans[..upto]
-        .iter()
-        .rev()
-        .find(|s| s.1 >= line)
-        .map(|s| s.0)
-    else {
+    let Some(i) = spans[..upto].iter().rposition(|s| s.1 >= line) else {
         return Vec::new();
     };
-    spans[..upto]
+    let best = spans[i].0;
+    // The block starting on `best` (spans are sorted by start).
+    let lo = spans[..i].partition_point(|s| s.0 < best);
+    spans[lo..=i]
         .iter()
-        .filter(|s| s.0 == best && s.1 >= line)
+        .filter(|s| s.1 >= line)
         .copied()
         .collect()
 }

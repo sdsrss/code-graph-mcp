@@ -1432,10 +1432,11 @@ fn an_empty_answer_lists_the_calls_with_no_resolved_target() {
     assert!(json["next"].is_string(), "{json}");
 }
 
-/// No call at all, or only resolved ones: the zero is backed by the count,
-/// in the one line the answer already had.
+/// Nothing to list: the 0.166.0 answer, byte for byte. The scan skips some
+/// calls (a bare call in a file that binds the name, a call on a line that
+/// defines it), so no line may claim there is none (pre-tag review round 2).
 #[test]
-fn an_empty_answer_with_no_unresolved_call_says_so_in_one_line() {
+fn an_empty_answer_with_nothing_listed_is_the_old_answer() {
     let (dir, _db_dir, db) = indexed_project(&[
         (
             "src/lib.rs",
@@ -1449,14 +1450,8 @@ fn an_empty_answer_with_no_unresolved_call_says_so_in_one_line() {
     let b = super::for_empty_result(db.conn(), dir.path(), "lonely", &[])
         .unwrap()
         .unwrap();
-    assert_eq!(
-        text_of(&b),
-        "(no dynamic-dispatch site or call names 'lonely')\n"
-    );
-    assert_eq!(
-        b.to_json()["unresolved_calls"],
-        serde_json::json!({"total": 0})
-    );
+    assert_eq!(text_of(&b), "(no dynamic-dispatch site names 'lonely')\n");
+    assert_eq!(b.to_json(), serde_json::json!({"sites": [], "total": 0}));
 }
 
 /// A definition in a language whose calls are not counted keeps the answer
@@ -1563,25 +1558,14 @@ fn boundaries_with(calls: Vec<(&str, usize, bool)>) -> super::Boundaries {
     }
 }
 
-/// Review of b949ba5f: resolution is per function (an edge has no line), so
-/// calls in functions with a resolved call of the name do not show that each
-/// call is resolved. The zero line says what the count shows, no more.
+/// Calls only in functions with a resolved call of the name: nothing is
+/// listed, so the answer is the old one (resolution is per function, so
+/// that would not show each call is resolved anyway).
 #[test]
-fn the_zero_line_claims_only_what_a_per_function_rule_shows() {
+fn resolved_calls_alone_leave_the_old_answer() {
     let b = boundaries_with(vec![("src/a.rs", 4, true), ("src/b.rs", 9, true)]);
-    assert_eq!(
-        text_of(&b),
-        "(no dynamic-dispatch site names 'lock'; its 2 calls are all in functions with a resolved call of 'lock')\n"
-    );
-    assert_eq!(
-        b.to_json()["unresolved_calls"],
-        serde_json::json!({"total": 0, "in_resolved_functions": 2})
-    );
-    let b = boundaries_with(vec![("src/a.rs", 4, true)]);
-    assert_eq!(
-        text_of(&b),
-        "(no dynamic-dispatch site names 'lock'; its 1 call is in a function with a resolved call of 'lock')\n"
-    );
+    assert_eq!(text_of(&b), "(no dynamic-dispatch site names 'lock')\n");
+    assert_eq!(b.to_json(), serde_json::json!({"sites": [], "total": 0}));
     // The verb agrees with the calls, not the files.
     let b = boundaries_with(vec![("src/a.rs", 4, false), ("src/a.rs", 9, false)]);
     assert!(

@@ -2,22 +2,20 @@
 
 ## 0.167.0
 
-An empty caller answer for a Rust function lists the calls of its name that
-the graph did not resolve, or says there are none; a file selector that holds
-no definition of the symbol is answered as a miss instead of an empty graph;
-and a query no longer indexes a file the index scan skips.
+An empty caller answer for a Rust function lists calls of its name that the
+graph did not resolve; a file selector that holds no definition of the
+symbol is answered as a miss instead of an empty graph; and a query no
+longer indexes a file the index scan skips.
 
 **Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
 unchanged). These answers change:
 
 - When `callgraph`, `impact` or `refs` (MCP `get_call_graph`,
   `find_references`, `get_ast_node include_impact`) finds no caller of a
-  Rust function, the answer lists up to 5 calls of its name with no
-  resolved target, nearest the definition first, and a `next:` grep. With
-  no call of the name in production Rust code, the line `(no
-  dynamic-dispatch site names 'x')` reads `(no dynamic-dispatch site or call
-  names 'x')`. JSON: `boundaries.unresolved_calls`. Answers for every other
-  language are unchanged.
+  function whose definitions are all Rust, the answer can list up to 5 calls
+  of its name with no resolved target, nearest the definition first, and a
+  `next:` grep; JSON `boundaries.unresolved_calls`. When there is nothing to
+  list the answer is unchanged, as it is for every other language.
 - MCP `get_call_graph` and `callgraph --file` answer a file that does not
   define the symbol, or is not in the index, with an error naming the files
   that do define it, where they answered an empty caller list or `No call
@@ -31,8 +29,8 @@ unchanged). These answers change:
   the tests that import it.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.166.0`, or `cargo install
-code-graph-mcp --version 0.166.0`; plugin users can set the version in the
-marketplace entry.
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.166.0`; plugin users
+can set the version in the marketplace entry.
 
 ### Added
 
@@ -49,20 +47,18 @@ marketplace entry.
     next: code-graph-mcp grep -w -F remove
   ```
 
-  A call counts when it is `name(`, `.name(` or `::name(` (through a
-  turbofish) in production Rust code, outside test functions and the lines
-  that define the name, inside a function with no call edge to any
-  definition of the name. When every call of the name is in a function the
-  graph did resolve a call of it in, the line says so: `(no
-  dynamic-dispatch site names 'x'; its 2 calls are all in functions with a
-  resolved call of 'x')`.
+  A call is listed when it is `name(`, `.name(` or `::name(` (through a
+  turbofish) in production Rust code, outside test functions, and inside a
+  function with no call edge to any definition of the name. It appears only
+  when every function definition of the name is Rust.
 
   Measured on tokio 1.41.1 against rust-analyzer (recipe:
   `scripts/zero_answer/README.md`): 1,268 methods have no caller edge, and
   rust-analyzer finds a production caller for 146 of them. The list appears
-  for 1,081 of the 1,268, all 146 among them; where it does not appear, the
-  zero was right for all 187. So most lists are calls of other definitions
-  of the same name: read them as where to look. 393 names scan in 1,484 ms
+  for 1,081 of the 1,268, all 146 among them; none of the 187 it does not
+  appear for has a production caller (31 have one only in tests or
+  benches). So most lists are calls of other definitions of the same name:
+  read them as where to look. 393 names scan in 1,484 ms
   (p95 12 ms, max 156 ms). A Haiku A/B over three tokio caller questions and
   two with no caller (20 sessions) measured no gain: the baseline already
   scored 0.71 and 1.0 on the two questions whose answer was empty, and both
@@ -105,8 +101,9 @@ marketplace entry.
   same-named symbol ambiguous: on 0.166.0, `deps` on three such files turned
   `callgraph d_a` from one caller into `Ambiguous symbol 'd_a': 4 matches`.
   Such a file now answers as not in the index: `deps` with `File not in
-  index`, `affected` with `input file(s) not in index`, MCP tools with `File
-  '…' not found in index`.
+  index`, `affected` with `input file(s) not in index`, MCP `get_ast_node`
+  and `get_call_graph` with `File '…' not found in index`, and
+  `find_references` with `Symbol 'X' not found in file '…'`.
 - `impact --file`'s "Defined in" list says when it left files out (`(5 of 7
   files)`), as `callgraph`'s now does; it stopped at 5 silently.
 
@@ -116,10 +113,14 @@ marketplace entry.
   are not measured yet, and the pre-release review found ones they still
   miss (calls inside Python f-strings, TypeScript signatures without a
   return type).
-- Whether a call is resolved is decided per function, since an edge
-  records no line: a function with one resolved call of the name counts its
-  other calls of it as resolved, which is why the zero line says "in
-  functions with a resolved call" rather than "resolved".
+- The list is not every call, so an answer with no list says nothing about
+  whether calls exist. Not listed: a bare call in a file that also binds the
+  name (a parameter or `let` of that name), a call on a line that defines
+  the name (a one-line delegation `fn poke(&self) { self.inner.poke() }`),
+  and the other calls of the name in a function where the graph resolved
+  one (an edge records no line, so resolution is decided per function).
+  On a line holding two functions, a call is placed in the one that starts
+  last.
 - Rust test code under `#[cfg(all(test, …))]`, or in a file declared
   `#[cfg(test)] mod x;`, is not marked as test, so its calls are listed as
   production calls.

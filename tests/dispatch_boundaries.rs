@@ -520,7 +520,7 @@ fn main() {
         );
         assert!(
             out.ends_with(&format!(
-                "  (no dynamic-dispatch site or call names '{name}' in the files scanned; not scanned: 1 Rust path with an unrecognized qualifier)\n    next: code-graph-mcp grep -w -F {name}\n"
+                "  (no dynamic-dispatch site names '{name}' in the files scanned; not scanned: 1 Rust path with an unrecognized qualifier)\n    next: code-graph-mcp grep -w -F {name}\n"
             )),
             "{name}: {out}"
         );
@@ -541,12 +541,12 @@ fn main() {
     // A Rust function nothing names keeps the complete line.
     let (out, _) = cli(&p, &["callgraph", "lonely"]);
     assert!(
-        out.ends_with("  (no dynamic-dispatch site or call names 'lonely')\n"),
+        out.ends_with("  (no dynamic-dispatch site names 'lonely')\n"),
         "{out}"
     );
     let v = cli_json(&p, &["callgraph", "lonely", "--json"]);
     assert_eq!(
         v["boundaries"],
-        serde_json::json!({"sites": [], "total": 0, "unresolved_calls": {"total": 0}})
+        serde_json::json!({"sites": [], "total": 0})
     );
 }

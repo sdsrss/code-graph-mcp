@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 3
+revision: 4
 ---
 
 # D#229 — "0 个调用者"要说明可信度，并给出下一步
@@ -134,8 +134,7 @@ tokio 试点里，`LinkedList::remove` 在库代码里有 12 个调用者，code
 只在答案为空、名字的所有函数定义都是 Rust 时出现；其它语言的输出不变。
 
 - 有未解析调用：`2 calls of 'remove' in 2 files have no resolved target; a caller of this definition may be among them:`，下面按离被问的定义由近到远列前 5 处 `file:line`，再给 `next: code-graph-mcp grep -w -F remove`。JSON 在 `boundaries.unresolved_calls` 里给 `total`、`files`、`sites`（前 5 个）、`note`。
-- 完全没有调用写法：原来那一行变成 `(no dynamic-dispatch site or call names 'x')`，JSON 是 `{"total": 0}`。
-- 有调用写法，但都在已经解析过同名调用的函数里：`(no dynamic-dispatch site names 'x'; its N calls are all in functions with a resolved call of 'x')`，JSON 加 `in_resolved_functions`。
+- 没有可列的调用：输出和 0.166.0 逐字节相同（revision 4）。第 2 轮评审复现了两种扫描会漏掉的调用：同一文件里有同名参数或 `let` 时，裸调用整文件被跳过（tokio `clock.rs:25` 的 `now()`）；一行写完的委托调用落在定义所在行，被跳过。所以任何"没有调用"的说法都可能是错的，原先的 `(no dynamic-dispatch site or call names 'x')` 和 "its N calls are all in functions…" 两种措辞都删掉了。列出的内容和计数规则不变：tokio 上 393 个名字的列表前后逐条相同（5,119 条），上面的数字不变。
 
 ## 不在范围内
 
@@ -146,3 +145,4 @@ tokio 试点里，`LinkedList::remove` 在库代码里有 12 个调用者，code
 
 - revision 2（2026-10-07）：用户批准实现和 $5 对照。补实测结果（R0/R1/R2，两种口径）、选定 R1、写明输出形状。版本号改为 0.167.0。D#232 F8 已修（914e271e）。
 - revision 3（2026-10-07）：付费对照结果（$4.03，20 个会话）；发版前评审后只对 Rust 开启；零答案措辞只说按函数的规则能证明的内容；最终性能数字。
+- revision 4（2026-10-07）：第 2 轮评审后收窄——没有可列的调用时恢复 0.166.0 的输出，不再做"没有调用"的断言；`innermost` 去掉前缀扫描，文件内也检查扫描时限。
