@@ -347,7 +347,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             .iter()
             .any(|n| n.depth > 0 && matches!(n.direction, crate::graph::query::Direction::Callers))
     {
-        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+        let asked: Vec<i64> = display_nodes
+            .iter()
+            .filter(|n| n.depth == 0)
+            .map(|n| n.node_id)
+            .collect();
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol, &asked)?
     } else {
         None
     };

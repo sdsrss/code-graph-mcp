@@ -442,7 +442,23 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // No production caller: disclose where the name is dispatched dynamically
     // (P1 #4). Not folded into any count above — these are not edges.
     let boundaries = if prod_callers.is_empty() {
-        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+        // The definitions analysed: `symbol_nodes` is every one of the name
+        // (it is fetched without the file filter), the seed only those in
+        // `--file`.
+        let asked: Vec<i64> = symbol_nodes
+            .iter()
+            .filter(|n| {
+                file_filter.is_none_or(|fp| {
+                    queries::get_file_path(conn, n.file_id)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(fp)
+                })
+            })
+            .map(|n| n.id)
+            .collect();
+        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol, &asked)?
     } else {
         None
     };

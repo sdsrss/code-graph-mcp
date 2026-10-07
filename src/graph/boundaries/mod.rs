@@ -1186,6 +1186,9 @@ pub fn scan_source_with_defs(
 struct SourceScan {
     hits: Vec<ShapeHit>,
     unresolved_lines: Vec<usize>,
+    /// Lines holding a call of the name ([`is_call_site`]), in a language
+    /// [`call_family`] reads; empty in any other.
+    call_lines: Vec<usize>,
 }
 
 /// [`scan_source_with_defs`] that gives up at `deadline` (`None` when it
@@ -1227,6 +1230,8 @@ fn scan_source_until(
     }
 
     let mut unresolved_lines: Vec<usize> = Vec::new();
+    let counts_calls = call_family(language).is_some();
+    let mut call_lines: Vec<usize> = Vec::new();
     let nb = name.as_bytes();
     let mut occurrences = Vec::new();
     let mut from = 0;
@@ -1282,6 +1287,13 @@ fn scan_source_until(
             }
             continue;
         }
+        if counts_calls && !(shadowed && is_bare(&m, s)) && is_call_site(&src, s, e, &syn, language)
+        {
+            let line = src.line_no(s);
+            if !def_lines.contains(&line) && !call_lines.contains(&line) {
+                call_lines.push(line);
+            }
+        }
         if s > 0 && matches!(m[s - 1], b'@' | b'$') {
             continue;
         }
@@ -1308,7 +1320,166 @@ fn scan_source_until(
             .map(|(line, (shape, via))| ShapeHit { line, shape, via })
             .collect(),
         unresolved_lines,
+        call_lines,
     })
+}
+
+/// The languages whose call syntax the scan reads (D#229), by the family a
+/// call can come from: a definition in one is called from files of the same
+/// family only. `None` for every other language: its calls are not counted,
+/// which is not the same as there being none.
+pub fn call_family(language: &str) -> Option<&'static str> {
+    match language {
+        "rust" => Some("rust"),
+        "python" => Some("python"),
+        "javascript" | "typescript" | "tsx" => Some("js"),
+        _ => None,
+    }
+}
+
+/// The 1-based lines holding a call of `name` in one source text, skipping
+/// `def_lines`; `None` for a language [`call_family`] does not read.
+pub fn scan_calls(
+    language: &str,
+    source: &str,
+    name: &str,
+    def_lines: &[usize],
+) -> Option<Vec<usize>> {
+    call_family(language)?;
+    scan_source_until(language, source, name, def_lines, None, None).map(|s| s.call_lines)
+}
+
+/// Words before a name that make `name(` a definition, not a call.
+const NOT_CALL_KEYWORDS: &[&str] = &[
+    "def",
+    "fn",
+    "function",
+    "func",
+    "fun",
+    "class",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "interface",
+    "type",
+    "impl",
+];
+
+/// Words that can open a TypeScript member declaration (`abstract
+/// remove(x): void;`).
+const MEMBER_MODIFIERS: &[&str] = &[
+    "public",
+    "private",
+    "protected",
+    "static",
+    "async",
+    "abstract",
+    "readonly",
+    "override",
+    "declare",
+    "get",
+    "set",
+];
+
+/// Past a balanced `<…>` opened at `lt` (not counting the `>` of a `->`):
+/// the position after its `>`, or `None` when it does not close nearby.
+fn past_angle(m: &[u8], lt: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, &b) in m.iter().enumerate().skip(lt).take(512) {
+        match b {
+            b'<' => depth += 1,
+            b'>' if !(k > 0 && m[k - 1] == b'-') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+            b';' | b'{' | b'}' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Inside a Rust attribute: `#[name(…)]`, `#[cfg_attr(x, name(…))]`.
+fn in_attribute(src: &Src, pos: usize) -> bool {
+    let m = src.m;
+    let mut at = pos;
+    for _ in 0..8 {
+        let Some(o) = src.enclosing_opener(at) else {
+            return false;
+        };
+        if m[o] == b'['
+            && o > 0
+            && (m[o - 1] == b'#' || (m[o - 1] == b'!' && o > 1 && m[o - 2] == b'#'))
+        {
+            return true;
+        }
+        at = o;
+    }
+    false
+}
+
+/// Is the occurrence at `[s, e)` a call of the name: followed by its
+/// argument list, past a turbofish (`name::<T>(`) or TypeScript type
+/// arguments (`name<T>(`)? Not a definition or declaration (`fn name(`,
+/// `def name(`, `function name(`, a JS method `name(…) {`, a TypeScript
+/// signature `name(…): T;`), and not a Rust attribute argument.
+fn is_call_site(src: &Src, s: usize, e: usize, syn: &Syntax, language: &str) -> bool {
+    let m = src.m;
+    let rust = language == "rust";
+    let ts = matches!(language, "typescript" | "tsx");
+    let js = ts || language == "javascript";
+    let after = |j: usize| next_non_ws(m, j).map(|(k, _, _)| k);
+    let Some(mut j) = after(e) else {
+        return false;
+    };
+    if rust && m[j..].starts_with(b"::<") {
+        let Some(k) = past_angle(m, j + 2).and_then(after) else {
+            return false;
+        };
+        j = k;
+    } else if ts && m[j] == b'<' {
+        let Some(k) = past_angle(m, j).and_then(after) else {
+            return false;
+        };
+        j = k;
+    }
+    if m[j] != b'(' {
+        return false;
+    }
+    if word_before(m, s, syn).is_some_and(|w| NOT_CALL_KEYWORDS.contains(&w.as_str())) {
+        return false;
+    }
+    if js {
+        // `function* name(`
+        if let Some((p, b'*')) = prev_non_ws(m, s) {
+            if word_before(m, p, syn).as_deref() == Some("function") {
+                return false;
+            }
+        }
+        if is_bare(m, s) {
+            match src.matching_close(j).and_then(|c| next_non_ws(m, c + 1)) {
+                // A method body: `name(x) {`, `async name(x) {`, `{ name(x) {} }`.
+                Some((_, b'{', _)) => return false,
+                // A signature: `name(x: T): R;` where a statement starts.
+                Some((_, b':', _)) => {
+                    let starts = match prev_non_ws(m, s) {
+                        None => true,
+                        Some((_, b';' | b'{' | b'}')) => true,
+                        _ => word_before(m, s, syn)
+                            .is_some_and(|w| MEMBER_MODIFIERS.contains(&w.as_str())),
+                    };
+                    if starts {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    !(rust && in_attribute(src, s))
 }
 
 /// One reported site.
@@ -1318,6 +1489,18 @@ pub struct BoundarySite {
     pub line: usize,
     pub shape: Shape,
     pub via: Option<String>,
+}
+
+/// One call of the name in production code (D#229).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSite {
+    pub file_path: String,
+    pub line: usize,
+    /// The function holding the call has a `calls` edge, at any tier, to a
+    /// definition of the name: the graph resolved a call of it there. Such
+    /// a call is not listed; an empty answer then says none reached the
+    /// definition asked about, or the answer's floor hid it.
+    pub resolved: bool,
 }
 
 /// The disclosure attached to an empty caller result.
@@ -1340,9 +1523,47 @@ pub struct Boundaries {
     /// is not known to be its own (`myapp::save`, `inner::save`, `h::save`,
     /// `Store::save`, `<Db as Store>::save`): not sites, and not absences.
     pub unresolved_paths: usize,
+    /// Calls of the name in production files of the definitions' language
+    /// family, outside test functions and definition lines; `None` when a
+    /// function definition of the name is in a language whose calls are not
+    /// counted ([`call_family`]).
+    pub calls: Option<Vec<CallSite>>,
 }
 
 impl Boundaries {
+    /// The calls with no resolved target ([`CallSite::resolved`] false);
+    /// `None` when calls are not counted for the name.
+    pub fn unresolved_calls(&self) -> Option<Vec<&CallSite>> {
+        self.calls
+            .as_ref()
+            .map(|c| c.iter().filter(|s| !s.resolved).collect())
+    }
+
+    /// The text block for unresolved calls (empty when there are none).
+    fn unresolved_calls_text(&self, indent: &str) -> String {
+        let Some(calls) = self.unresolved_calls().filter(|c| !c.is_empty()) else {
+            return String::new();
+        };
+        let mut files: Vec<&str> = calls.iter().map(|c| c.file_path.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        let n = calls.len();
+        let mut out = format!(
+            "{indent}{n} {} of '{}' in {} {} no resolved target; a caller of this definition may be among them:\n",
+            if n == 1 { "call" } else { "calls" },
+            self.name,
+            files.len(),
+            if files.len() == 1 { "file has" } else { "files have" },
+        );
+        for c in calls.iter().take(BOUNDARY_SITE_CAP) {
+            out.push_str(&format!("{indent}  {}:{}\n", c.file_path, c.line));
+        }
+        if n > BOUNDARY_SITE_CAP {
+            out.push_str(&format!("{indent}  … {} more\n", n - BOUNDARY_SITE_CAP));
+        }
+        out
+    }
+
     /// Whether every file that could hold a site was read.
     pub fn complete(&self) -> bool {
         self.unscanned_languages.is_empty()
@@ -1424,6 +1645,25 @@ impl Boundaries {
                 "next": self.next_command(),
             })
         };
+        if let Some(calls) = self.unresolved_calls() {
+            let mut u = serde_json::json!({ "total": calls.len() });
+            if !calls.is_empty() {
+                let mut files: Vec<&str> = calls.iter().map(|c| c.file_path.as_str()).collect();
+                files.sort_unstable();
+                files.dedup();
+                u["files"] = serde_json::json!(files.len());
+                u["sites"] = calls
+                    .iter()
+                    .take(BOUNDARY_SITE_CAP)
+                    .map(|c| serde_json::json!({ "file_path": c.file_path, "line": c.line }))
+                    .collect();
+                u["note"] = serde_json::json!(
+                    "calls of the name with no resolved target; a caller of this definition may be among them"
+                );
+                v["next"] = serde_json::json!(self.next_command());
+            }
+            v["unresolved_calls"] = u;
+        }
         if !self.complete() {
             let mut ns = serde_json::Map::new();
             if !self.unscanned_languages.is_empty() {
@@ -1458,20 +1698,29 @@ impl Boundaries {
 
     /// Text block printed after an empty result, each line prefixed by `indent`.
     pub fn render_text<W: std::io::Write>(&self, out: &mut W, indent: &str) -> std::io::Result<()> {
+        let calls_text = self.unresolved_calls_text(indent);
         if self.sites.is_empty() {
+            // With calls counted and none unresolved, the one line says both.
+            let what = if self.unresolved_calls().is_some_and(|c| c.is_empty()) {
+                "dynamic-dispatch site or unresolved call"
+            } else {
+                "dynamic-dispatch site"
+            };
             if self.complete() {
-                return writeln!(
-                    out,
-                    "{indent}(no dynamic-dispatch site names '{}')",
-                    self.name
-                );
+                writeln!(out, "{indent}(no {what} names '{}')", self.name)?;
+                if calls_text.is_empty() {
+                    return Ok(());
+                }
+                out.write_all(calls_text.as_bytes())?;
+                return writeln!(out, "{indent}  next: {}", self.next_command());
             }
             writeln!(
                 out,
-                "{indent}(no dynamic-dispatch site names '{}' in the files scanned; not scanned: {})",
+                "{indent}(no {what} names '{}' in the files scanned; not scanned: {})",
                 self.name,
                 self.unscanned_text()
             )?;
+            out.write_all(calls_text.as_bytes())?;
             return writeln!(out, "{indent}  next: {}", self.next_command());
         }
         writeln!(
@@ -1505,6 +1754,7 @@ impl Boundaries {
                 self.sites.len() - BOUNDARY_SITE_CAP
             )?;
         }
+        out.write_all(calls_text.as_bytes())?;
         if !self.complete() {
             writeln!(out, "{indent}  not scanned: {}", self.unscanned_text())?;
         }
@@ -1536,6 +1786,7 @@ pub fn scan_project(
         exclude,
         &[],
         None,
+        None,
         SCAN_TIME_LIMIT,
     )
 }
@@ -1543,6 +1794,7 @@ pub fn scan_project(
 /// [`scan_project`], told the files holding the name's function definitions
 /// (a language there without a shape table is reported as not scanned), the
 /// path qualifiers that name one of them, and the scan's time limit.
+#[allow(clippy::too_many_arguments)] // the scan's inputs, each a fact about the definitions
 fn scan_project_with(
     conn: &Connection,
     project_root: &Path,
@@ -1550,6 +1802,7 @@ fn scan_project_with(
     exclude: &[(String, usize)],
     def_files: &[String],
     qualifiers: Option<&[String]>,
+    call_families: Option<&[&'static str]>,
     time_limit: Duration,
 ) -> Result<Boundaries> {
     let deadline = Instant::now() + time_limit;
@@ -1567,7 +1820,10 @@ fn scan_project_with(
         skipped_files: 0,
         files_past_limit: 0,
         unresolved_paths: 0,
+        calls: call_families.map(|_| Vec::new()),
     };
+    // Call lines per file, classified against the graph below.
+    let mut call_lines: Vec<(String, Vec<usize>)> = Vec::new();
     for (path, language) in files {
         if !scannable(&path, language.as_deref()) {
             if def_files.contains(&path) && language.as_deref().and_then(syntax_for).is_none() {
@@ -1631,6 +1887,80 @@ fn scan_project_with(
                 via: hit.via,
             });
         }
+        let in_family = call_family(language)
+            .is_some_and(|f| call_families.is_some_and(|families| families.contains(&f)));
+        if in_family && !scan.call_lines.is_empty() {
+            call_lines.push((path.clone(), scan.call_lines));
+        }
+    }
+    if let Some(calls) = out.calls.as_mut() {
+        *calls = classify_calls(conn, name, call_lines)?;
+    }
+    Ok(out)
+}
+
+/// Each call line placed in the innermost function holding it: a call in a
+/// test function is dropped (tests are not production callers), the rest
+/// flagged [`CallSite::resolved`] when that function has a call edge to a
+/// definition of the name.
+///
+/// The tokio measurement behind this rule is in
+/// `tasks/specs/d229-zero-answer-disclosure.md`: dropping the resolved calls
+/// kept every definition with a production caller flagged and flagged 50
+/// fewer of the others; also dropping calls inside a same-named function
+/// (delegation) lost 5 real ones.
+fn classify_calls(
+    conn: &Connection,
+    name: &str,
+    call_lines: Vec<(String, Vec<usize>)>,
+) -> Result<Vec<CallSite>> {
+    if call_lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolving: std::collections::HashSet<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT e.source_id FROM edges e JOIN nodes t ON t.id = e.target_id \
+             WHERE e.relation = 'calls' AND t.name = ?1",
+        )?;
+        let rows = stmt.query_map([name], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.type, n.start_line, n.end_line, n.is_test FROM nodes n \
+         JOIN files f ON f.id = n.file_id WHERE f.path = ?1",
+    )?;
+    let mut out = Vec::new();
+    for (path, lines) in call_lines {
+        // (id, start, end, is_test) of each function in the file.
+        let fns: Vec<(i64, i64, i64, bool)> = stmt
+            .query_map([&path], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(_, ty, ..)| crate::domain::is_function_node_type(ty))
+            .map(|(id, _, s, e, t)| (id, s, e, t))
+            .collect();
+        for line in lines {
+            let l = line as i64;
+            let holder = fns
+                .iter()
+                .filter(|(_, s, e, _)| *s <= l && l <= *e)
+                .max_by_key(|(_, s, _, _)| *s);
+            if holder.is_some_and(|h| h.3) {
+                continue;
+            }
+            out.push(CallSite {
+                file_path: path.clone(),
+                line,
+                resolved: holder.is_some_and(|h| resolving.contains(&h.0)),
+            });
+        }
     }
     Ok(out)
 }
@@ -1652,10 +1982,14 @@ fn is_identifier(name: &str) -> bool {
 /// Boundaries for an empty caller result on `symbol`, or `None` when the
 /// disclosure does not apply: the name is not an identifier, or no definition
 /// of it is a function or method (a type or constant is not dispatched to).
+/// `near`: the node ids of the definition(s) asked about, which the
+/// unresolved calls are listed nearest to; empty for every function
+/// definition of the name.
 pub fn for_empty_result(
     conn: &Connection,
     project_root: &Path,
     symbol: &str,
+    near: &[i64],
 ) -> Result<Option<Boundaries>> {
     let name = bare_name(symbol);
     if !is_identifier(name) {
@@ -1682,16 +2016,57 @@ pub fn for_empty_result(
             .iter()
             .map(|d| (d.file_path.as_str(), d.node.qualified_name.as_deref())),
     );
-    scan_project_with(
+    // Calls are counted only when every function definition is in a language
+    // whose calls the scan reads; one elsewhere could be called from files
+    // it does not read.
+    let families: Option<Vec<&'static str>> = fn_defs
+        .iter()
+        .map(|d| d.language.as_deref().and_then(call_family))
+        .collect();
+    let mut out = scan_project_with(
         conn,
         project_root,
         name,
         &exclude,
         &def_files,
         Some(&qualifiers),
+        families.as_deref(),
         SCAN_TIME_LIMIT,
-    )
-    .map(Some)
+    )?;
+    if let Some(calls) = out.calls.as_mut() {
+        // Nearest the definition asked about first: the answer lists five,
+        // and in path order tokio's `examples/` and `tokio-util/` calls of
+        // `remove` came before every `tokio/src/` one.
+        let asked: Vec<&str> = fn_defs
+            .iter()
+            .filter(|d| near.contains(&d.node.id))
+            .map(|d| d.file_path.as_str())
+            .collect();
+        let anchors: Vec<&str> = if asked.is_empty() {
+            def_files.iter().map(String::as_str).collect()
+        } else {
+            asked
+        };
+        let shared = |file: &str| {
+            anchors
+                .iter()
+                .map(|d| {
+                    d.split('/')
+                        .zip(file.split('/'))
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        calls.sort_by(|a, b| {
+            shared(&b.file_path)
+                .cmp(&shared(&a.file_path))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then(a.line.cmp(&b.line))
+        });
+    }
+    Ok(Some(out))
 }
 
 /// The path segments that can stand right before a definition's name and

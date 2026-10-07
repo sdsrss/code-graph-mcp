@@ -3103,6 +3103,63 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// D#229: an empty answer lists the calls of the name the graph did not
+    /// resolve, nearest the definition asked about. `L::remove` (pkg/a.rs)
+    /// and `M::remove` (util/d.rs) both have calls on receivers of unknown
+    /// type; asked about `M::remove`, `util/` comes first.
+    #[test]
+    fn test_empty_answers_list_unresolved_calls_nearest_the_definition() {
+        let project_dir = TempDir::new().unwrap();
+        let w = |p: &str, src: &str| {
+            let path = project_dir.path().join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        };
+        w(
+            "pkg/a.rs",
+            "pub struct L;\nimpl L {\n    pub fn remove(&self) -> u8 {\n        1\n    }\n}\n",
+        );
+        w(
+            "util/d.rs",
+            "pub struct M;\nimpl M {\n    pub fn remove(&self) -> u8 {\n        2\n    }\n}\n",
+        );
+        w("pkg/b.rs", "pub fn pb(v: &V) -> u8 {\n    v.remove()\n}\n");
+        w("util/u.rs", "pub fn uu(v: &V) -> u8 {\n    v.remove()\n}\n");
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+        for (tool, args) in [
+            (
+                "find_references",
+                json!({"symbol_name": "remove", "file_path": "util/d.rs"}),
+            ),
+            (
+                "get_call_graph",
+                json!({"symbol_name": "remove", "file_path": "util/d.rs", "direction": "callers"}),
+            ),
+            (
+                "get_ast_node",
+                json!({"symbol_name": "remove", "file_path": "util/d.rs", "include_impact": true}),
+            ),
+        ] {
+            let result =
+                parse_tool_result(&server.handle_message(&tool_call_json(tool, args)).unwrap());
+            let b = if tool == "get_ast_node" {
+                &result["impact"]["boundaries"]
+            } else {
+                &result["boundaries"]
+            };
+            assert_eq!(b["unresolved_calls"]["total"], 2, "{tool}: {result}");
+            assert_eq!(
+                b["unresolved_calls"]["sites"],
+                json!([
+                    {"file_path": "util/u.rs", "line": 2},
+                    {"file_path": "pkg/b.rs", "line": 2},
+                ]),
+                "{tool}: {result}"
+            );
+        }
+    }
+
     /// D#253: a `file_path` that holds no definition of the symbol is a miss,
     /// not a filter that legitimately matches nothing. Each miss below answered
     /// `callers: []` beside an empty `boundaries` block while `d_a` has two

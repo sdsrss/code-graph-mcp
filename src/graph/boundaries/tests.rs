@@ -870,6 +870,7 @@ fn a_definition_in_an_unscanned_language_is_named_not_scanned() {
         &[("run.sh".to_string(), 1)],
         &["run.sh".to_string()],
         None,
+        None,
         super::SCAN_TIME_LIMIT,
     )
     .unwrap();
@@ -909,6 +910,7 @@ fn a_definition_in_an_unscanned_language_is_named_not_scanned() {
         &[("a.py".to_string(), 1), ("tests/test_a.py".to_string(), 1)],
         &["a.py".to_string(), "tests/test_a.py".to_string()],
         None,
+        None,
         super::SCAN_TIME_LIMIT,
     )
     .unwrap();
@@ -939,6 +941,7 @@ fn the_scan_stops_at_its_time_limit_and_says_so() {
         "save",
         &[],
         &[],
+        None,
         None,
         std::time::Duration::ZERO,
     )
@@ -1141,4 +1144,392 @@ fn the_bracket_index_matches_the_scans_it_replaced() {
     let src = super::Src::new(&m);
     assert_eq!(src.enclosing_opener(100), Some(0));
     assert_eq!(src.enclosing_opener(4999), None);
+}
+
+// ---- Call sites (D#229) ------------------------------------------------------
+//
+// Written before the scanner. Each row: a source, the name, and the exact
+// 1-based lines holding a CALL of the name. A call is the name followed by
+// its argument list: `name(`, `.name(`, `::name(`, through a turbofish or
+// type arguments. Look-alikes: a definition or declaration, a comment, a
+// string, a field read or the function as a value, a macro, an attribute, a
+// local binding of the name, an identifier containing it.
+
+type CallRow = (&'static str, &'static str, &'static str, &'static [usize]);
+
+const CALL_CORPUS: &[CallRow] = &[
+    // ---- Rust ----
+    ("rust", "list.remove(node);\n", "remove", &[1]),
+    ("rust", "let x = Self::remove(a);\n", "remove", &[1]),
+    ("rust", "remove(a);\n", "remove", &[1]),
+    ("rust", "x.remove::<u8>(a);\n", "remove", &[1]),
+    ("rust", "Foo::remove::<u8>(a);\n", "remove", &[1]),
+    ("rust", "let n = list\n    .remove(node);\n", "remove", &[2]),
+    ("rust", "if remove(x) {\n}\n", "remove", &[1]),
+    (
+        "rust",
+        "Some(a.remove(1)).map(|v| v.remove(2));\n",
+        "remove",
+        &[1],
+    ),
+    ("rust", "fn remove(&mut self) {}\n", "remove", &[]),
+    ("rust", "pub(crate) fn remove<T>(x: T) {}\n", "remove", &[]),
+    (
+        "rust",
+        "trait T {\n    fn remove(&self);\n}\n",
+        "remove",
+        &[],
+    ),
+    ("rust", "// list.remove(x)\n", "remove", &[]),
+    ("rust", "/* remove(x) */\n", "remove", &[]),
+    ("rust", "let s = \"remove(x)\";\n", "remove", &[]),
+    ("rust", "let r = list.remove;\n", "remove", &[]),
+    ("rust", "remove!(x);\n", "remove", &[]),
+    ("rust", "#[remove(x)]\nfn g() {}\n", "remove", &[]),
+    (
+        "rust",
+        "#[cfg_attr(test, remove(x))]\nfn g() {}\n",
+        "remove",
+        &[],
+    ),
+    ("rust", "struct remove(u8);\n", "remove", &[]),
+    ("rust", "use crate::x::remove;\n", "remove", &[]),
+    ("rust", "x.removed(a);\n", "remove", &[]),
+    ("rust", "let f = Self::remove;\n", "remove", &[]),
+    (
+        "rust",
+        "fn g(remove: impl Fn()) {\n    remove();\n}\n",
+        "remove",
+        &[],
+    ),
+    // ---- Python ----
+    ("python", "obj.remove(x)\n", "remove", &[1]),
+    ("python", "remove(x)\n", "remove", &[1]),
+    ("python", "if remove(x):\n    pass\n", "remove", &[1]),
+    ("python", "@remove(1)\ndef f():\n    pass\n", "remove", &[1]),
+    ("python", "def remove(self, x):\n    pass\n", "remove", &[]),
+    ("python", "async def remove(x):\n    pass\n", "remove", &[]),
+    ("python", "class remove(Base):\n    pass\n", "remove", &[]),
+    ("python", "@remove\ndef f():\n    pass\n", "remove", &[]),
+    ("python", "# remove(x)\n", "remove", &[]),
+    ("python", "s = 'remove(x)'\n", "remove", &[]),
+    ("python", "x = obj.remove\n", "remove", &[]),
+    // ---- JavaScript / TypeScript ----
+    ("javascript", "list.remove(x);\n", "remove", &[1]),
+    ("javascript", "remove(x);\n", "remove", &[1]),
+    ("javascript", "a?.remove(x);\n", "remove", &[1]),
+    ("javascript", "if (remove(x)) {\n}\n", "remove", &[1]),
+    (
+        "javascript",
+        "const y = c ? remove(x) : 0;\n",
+        "remove",
+        &[1],
+    ),
+    ("javascript", "const s = `${remove(x)}`;\n", "remove", &[1]),
+    ("typescript", "remove<T>(x);\n", "remove", &[1]),
+    ("typescript", "obj.remove<string>(x);\n", "remove", &[1]),
+    ("typescript", "@remove(x)\nclass A {}\n", "remove", &[1]),
+    ("javascript", "function remove(x) {}\n", "remove", &[]),
+    ("javascript", "async function remove(x) {}\n", "remove", &[]),
+    (
+        "javascript",
+        "export function remove(x) {}\n",
+        "remove",
+        &[],
+    ),
+    ("javascript", "function* remove() {}\n", "remove", &[]),
+    (
+        "javascript",
+        "class A {\n  remove(x) {\n    return 1;\n  }\n}\n",
+        "remove",
+        &[],
+    ),
+    (
+        "javascript",
+        "class A {\n  async remove(x) {}\n}\n",
+        "remove",
+        &[],
+    ),
+    (
+        "javascript",
+        "const o = { remove(x) { return x; } };\n",
+        "remove",
+        &[],
+    ),
+    (
+        "typescript",
+        "interface I {\n  remove(x: string): void;\n}\n",
+        "remove",
+        &[],
+    ),
+    (
+        "typescript",
+        "class A {\n  remove(x: string): void {\n  }\n}\n",
+        "remove",
+        &[],
+    ),
+    (
+        "typescript",
+        "abstract class A {\n  abstract remove(x: string): void;\n}\n",
+        "remove",
+        &[],
+    ),
+    ("javascript", "// remove(x)\n", "remove", &[]),
+    ("javascript", "const s = 'remove(x)';\n", "remove", &[]),
+    ("javascript", "const f = obj.remove;\n", "remove", &[]),
+    (
+        "javascript",
+        "const remove = (a) => a;\nremove(1);\n",
+        "remove",
+        &[],
+    ),
+];
+
+#[test]
+fn every_call_corpus_row_reports_exactly_its_call_lines() {
+    let mut failures = Vec::new();
+    for (i, (lang, src, name, want)) in CALL_CORPUS.iter().enumerate() {
+        let got = super::scan_calls(lang, src, name, &[]);
+        if got.as_deref() != Some(*want) {
+            failures.push(format!(
+                "row {i} [{lang}] {src:?} name={name}: want {want:?}, got {got:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} call corpus rows wrong:\n{}",
+        failures.len(),
+        CALL_CORPUS.len(),
+        failures.join("\n")
+    );
+}
+
+/// Non-vacuity, and the language boundary: every counted language has both
+/// verdicts, and a language without a call table answers `None`, not "no
+/// calls".
+#[test]
+fn call_corpus_covers_each_counted_language_and_refuses_the_rest() {
+    for lang in ["rust", "python", "javascript", "typescript"] {
+        let rows: Vec<_> = CALL_CORPUS.iter().filter(|r| r.0 == lang).collect();
+        assert!(rows.iter().any(|r| !r.3.is_empty()), "{lang}: no call row");
+        assert!(
+            rows.iter().any(|r| r.3.is_empty()),
+            "{lang}: no look-alike row"
+        );
+    }
+    for lang in ["go", "java", "ruby", "markdown"] {
+        assert_eq!(
+            super::scan_calls(lang, "remove(x)\n", "remove", &[]),
+            None,
+            "{lang}"
+        );
+    }
+}
+
+/// A definition line is not a call of itself, even when it also calls.
+#[test]
+fn a_definition_line_holds_no_call_of_its_own_name() {
+    let src = "fn remove(&self) -> u8 { self.inner.remove(0) }\nfn g() { h.remove(1); }\n";
+    assert_eq!(
+        super::scan_calls("rust", src, "remove", &[1]),
+        Some(vec![2])
+    );
+}
+
+/// A real index of `files` (path, source) under a temp project root.
+fn indexed_project(
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    crate::storage::db::Database,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    for (path, body) in files {
+        let p = dir.path().join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db = crate::storage::db::Database::open(&db_dir.path().join("index.db")).unwrap();
+    crate::indexer::pipeline::run_full_index(&db, dir.path(), None, None).unwrap();
+    (dir, db_dir, db)
+}
+
+fn text_of(b: &super::Boundaries) -> String {
+    let mut out = Vec::new();
+    b.render_text(&mut out, "").unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// D#229: two `remove` methods, called on receivers whose type the graph
+/// does not resolve, so neither has a caller. Those calls are listed with
+/// the empty answer; a call the graph resolved (to the free `remove`) is
+/// not, and neither is one in a test function.
+const D229_FIXTURE: &[(&str, &str)] = &[
+    ("src/lib.rs", "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\npub mod f;\n"),
+    ("src/a.rs", "pub struct L;\nimpl L {\n    pub fn remove(&self, i: u8) -> u8 {\n        i\n    }\n}\n"),
+    ("src/d.rs", "pub struct M;\nimpl M {\n    pub fn remove(&self, i: u8) -> u8 {\n        i + 1\n    }\n}\n"),
+    ("src/b.rs", "pub fn uses(x: u8) -> u8 {\n    let l = crate::c::make();\n    l.remove(x)\n}\n"),
+    ("src/c.rs", "pub fn make() -> crate::a::L {\n    crate::a::L\n}\npub fn typed(m: &crate::d::M) -> u8 {\n    m.remove(2)\n}\n"),
+    ("src/e.rs", "pub fn remove(i: u8) -> u8 {\n    i\n}\n"),
+    ("src/f.rs", "pub fn k() -> u8 {\n    crate::e::remove(1)\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        let l = crate::c::make();\n        l.remove(3);\n    }\n}\n"),
+    ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+];
+
+#[test]
+fn an_empty_answer_lists_the_calls_with_no_resolved_target() {
+    let (dir, _db_dir, db) = indexed_project(D229_FIXTURE);
+    let b = super::for_empty_result(db.conn(), dir.path(), "remove", &[])
+        .unwrap()
+        .unwrap();
+    let calls: Vec<(String, usize, bool)> = b
+        .calls
+        .as_ref()
+        .expect("rust calls are counted")
+        .iter()
+        .map(|c| (c.file_path.clone(), c.line, c.resolved))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("src/b.rs".to_string(), 3, false),
+            ("src/c.rs".to_string(), 5, false),
+            ("src/f.rs".to_string(), 2, true),
+        ],
+        "the test function's call is dropped"
+    );
+    let text = text_of(&b);
+    assert!(
+        text.contains(
+            "2 calls of 'remove' in 2 files have no resolved target; a caller of this definition may be among them:"
+        ) && text.contains("src/b.rs:3")
+            && text.contains("src/c.rs:5")
+            && !text.contains("src/f.rs:2")
+            && text.contains("next: code-graph-mcp grep -w -F remove"),
+        "{text}"
+    );
+    let json = b.to_json();
+    assert_eq!(json["unresolved_calls"]["total"], 2, "{json}");
+    assert_eq!(json["unresolved_calls"]["files"], 2, "{json}");
+    assert_eq!(
+        json["unresolved_calls"]["sites"],
+        serde_json::json!([
+            {"file_path": "src/b.rs", "line": 3},
+            {"file_path": "src/c.rs", "line": 5},
+        ]),
+        "{json}"
+    );
+    assert!(json["next"].is_string(), "{json}");
+}
+
+/// No call at all, or only resolved ones: the zero is backed by the count,
+/// in the one line the answer already had.
+#[test]
+fn an_empty_answer_with_no_unresolved_call_says_so_in_one_line() {
+    let (dir, _db_dir, db) = indexed_project(&[
+        (
+            "src/lib.rs",
+            "pub fn lonely() -> u8 {\n    7\n}\npub fn other() -> u8 {\n    8\n}\n",
+        ),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+    ]);
+    let b = super::for_empty_result(db.conn(), dir.path(), "lonely", &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        text_of(&b),
+        "(no dynamic-dispatch site or unresolved call names 'lonely')\n"
+    );
+    assert_eq!(
+        b.to_json()["unresolved_calls"],
+        serde_json::json!({"total": 0})
+    );
+}
+
+/// A definition in a language whose calls are not counted keeps the answer
+/// it had: no claim about calls either way.
+#[test]
+fn an_uncounted_language_makes_no_claim_about_calls() {
+    let (dir, _db_dir, db) = indexed_project(&[(
+        "main.go",
+        "package main\n\nfunc lonely() int {\n\treturn 7\n}\n",
+    )]);
+    let b = super::for_empty_result(db.conn(), dir.path(), "lonely", &[])
+        .unwrap()
+        .unwrap();
+    assert!(b.calls.is_none());
+    assert_eq!(text_of(&b), "(no dynamic-dispatch site names 'lonely')\n");
+    assert!(b.to_json().get("unresolved_calls").is_none());
+}
+
+/// The listed calls start nearest the definition asked about: more shared
+/// directories first. Path order put tokio's `examples/` and `tokio-util/`
+/// ahead of the `tokio/src/` calls of `LinkedList::remove`, and nearest to
+/// ANY same-named definition still ranked `tokio-util` beside them.
+#[test]
+fn unresolved_calls_are_listed_nearest_the_definition_first() {
+    let (dir, _db_dir, db) = indexed_project(&[
+        (
+            "pkg/core/a.rs",
+            "pub struct L;\nimpl L {\n    pub fn remove(&self) -> u8 {\n        1\n    }\n}\n",
+        ),
+        (
+            "util/n.rs",
+            "pub struct N;\nimpl N {\n    pub fn remove(&self) -> u8 {\n        2\n    }\n}\n",
+        ),
+        (
+            "examples/x.rs",
+            "pub fn ex(v: &V) -> u8 {\n    v.remove()\n}\n",
+        ),
+        (
+            "pkg/other/c.rs",
+            "pub fn oc(v: &V) -> u8 {\n    v.remove()\n}\n",
+        ),
+        (
+            "pkg/core/b.rs",
+            "pub fn cb(v: &V) -> u8 {\n    v.remove()\n}\n",
+        ),
+        ("util/u.rs", "pub fn uu(v: &V) -> u8 {\n    v.remove()\n}\n"),
+    ]);
+    let order = |near: &[i64]| -> Vec<String> {
+        super::for_empty_result(db.conn(), dir.path(), "remove", near)
+            .unwrap()
+            .unwrap()
+            .unresolved_calls()
+            .unwrap()
+            .iter()
+            .map(|c| c.file_path.clone())
+            .collect()
+    };
+    let l = crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "remove")
+        .unwrap()
+        .into_iter()
+        .find(|d| d.file_path == "pkg/core/a.rs")
+        .unwrap()
+        .node
+        .id;
+    assert_eq!(
+        order(&[l]),
+        [
+            "pkg/core/b.rs",
+            "pkg/other/c.rs",
+            "examples/x.rs",
+            "util/u.rs"
+        ]
+    );
+    // Not told which: nearest to any of them.
+    assert_eq!(
+        order(&[]),
+        [
+            "pkg/core/b.rs",
+            "pkg/other/c.rs",
+            "util/u.rs",
+            "examples/x.rs"
+        ]
+    );
 }

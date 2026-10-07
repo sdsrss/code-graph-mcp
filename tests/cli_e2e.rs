@@ -12821,3 +12821,45 @@ fn node_id_refuses_when_its_twin_group_changes_size() {
     assert_eq!(code, 1, "the deleted twin must not be answered for: {out}");
     assert!(!out.contains("unix_helper"), "{out}");
 }
+
+// D#229: an empty answer lists the calls of the name the graph did not
+// resolve, nearest the definition asked about, on each CLI surface that
+// discloses an empty caller list; and with none, says so in its one line.
+#[test]
+fn test_cli_empty_answers_list_unresolved_calls_nearest_the_definition() {
+    let project = index_project(&[
+        ("pkg/a.rs", "pub struct L;\nimpl L {\n    pub fn remove(&self) -> u8 {\n        1\n    }\n}\n"),
+        ("util/d.rs", "pub struct M;\nimpl M {\n    pub fn remove(&self) -> u8 {\n        2\n    }\n    pub fn lonely(&self) -> u8 {\n        3\n    }\n}\n"),
+        ("pkg/b.rs", "pub fn pb(v: &V) -> u8 {\n    v.remove()\n}\n"),
+        ("util/u.rs", "pub fn uu(v: &V) -> u8 {\n    v.remove()\n}\n"),
+    ]);
+    for args in [
+        &["refs", "remove", "--file", "util/d.rs"][..],
+        &[
+            "callgraph",
+            "remove",
+            "--file",
+            "util/d.rs",
+            "--direction",
+            "callers",
+        ][..],
+        &["impact", "remove", "--file", "util/d.rs"][..],
+    ] {
+        let (stdout, stderr, _) = run_cli(&project, args);
+        let header = "2 calls of 'remove' in 2 files have no resolved target; a caller of this definition may be among them:";
+        let at = stdout
+            .find(header)
+            .unwrap_or_else(|| panic!("{args:?}: stdout: {stdout} stderr: {stderr}"));
+        let rest = &stdout[at..];
+        let (u, b) = (rest.find("util/u.rs:2"), rest.find("pkg/b.rs:2"));
+        assert!(
+            u.is_some() && b.is_some() && u < b,
+            "{args:?}: util/ first, nearest util/d.rs: {stdout}"
+        );
+    }
+    let (stdout, _, _) = run_cli(&project, &["refs", "lonely"]);
+    assert!(
+        stdout.contains("(no dynamic-dispatch site or unresolved call names 'lonely')"),
+        "{stdout}"
+    );
+}

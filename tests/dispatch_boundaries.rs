@@ -185,12 +185,12 @@ fn a_symbol_nothing_names_gets_one_short_line() {
     let (out, _) = cli(&p, &["callgraph", "dead_helper"]);
     assert_eq!(
         out,
-        "dead_helper (src/controller.py)\n  (no dynamic-dispatch site names 'dead_helper')\n"
+        "dead_helper (src/controller.py)\n  (no dynamic-dispatch site or unresolved call names 'dead_helper')\n"
     );
     let v = cli_json(&p, &["callgraph", "dead_helper", "--json"]);
     assert_eq!(
         v["boundaries"],
-        serde_json::json!({"sites": [], "total": 0})
+        serde_json::json!({"sites": [], "total": 0, "unresolved_calls": {"total": 0}})
     );
 }
 
@@ -342,7 +342,7 @@ fn mcp_tools_carry_the_same_field() {
     );
     assert_eq!(
         v["boundaries"],
-        serde_json::json!({"sites": [], "total": 0}),
+        serde_json::json!({"sites": [], "total": 0, "unresolved_calls": {"total": 0}}),
         "{v}"
     );
 
@@ -520,7 +520,7 @@ fn main() {
         );
         assert!(
             out.ends_with(&format!(
-                "  (no dynamic-dispatch site names '{name}' in the files scanned; not scanned: 1 Rust path with an unrecognized qualifier)\n    next: code-graph-mcp grep -w -F {name}\n"
+                "  (no dynamic-dispatch site or unresolved call names '{name}' in the files scanned; not scanned: 1 Rust path with an unrecognized qualifier)\n    next: code-graph-mcp grep -w -F {name}\n"
             )),
             "{name}: {out}"
         );
@@ -541,12 +541,12 @@ fn main() {
     // A Rust function nothing names keeps the complete line.
     let (out, _) = cli(&p, &["callgraph", "lonely"]);
     assert!(
-        out.ends_with("  (no dynamic-dispatch site names 'lonely')\n"),
+        out.ends_with("  (no dynamic-dispatch site or unresolved call names 'lonely')\n"),
         "{out}"
     );
     let v = cli_json(&p, &["callgraph", "lonely", "--json"]);
     assert_eq!(
         v["boundaries"],
-        serde_json::json!({"sites": [], "total": 0})
+        serde_json::json!({"sites": [], "total": 0, "unresolved_calls": {"total": 0}})
     );
 }

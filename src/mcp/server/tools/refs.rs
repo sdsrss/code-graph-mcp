@@ -390,7 +390,7 @@ impl McpServer {
                 relation_filter,
                 None | Some(crate::domain::REL_CALLS) | Some(crate::domain::REL_REFERENCES)
             ) {
-            self.empty_result_boundaries(&symbol_name)?
+            self.empty_result_boundaries(&symbol_name, &target_ids)?
         } else {
             None
         };

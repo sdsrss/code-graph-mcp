@@ -60,20 +60,32 @@ pub(super) fn attach_suppressed_ambiguous(
     ));
 }
 
+/// The node ids of the definitions a call graph was asked about (its roots).
+fn seed_ids(results: &crate::graph::query::CallGraphResult) -> Vec<i64> {
+    results
+        .nodes
+        .iter()
+        .filter(|n| n.depth == 0)
+        .map(|n| n.node_id)
+        .collect()
+}
+
 impl McpServer {
     /// `boundaries` for an empty caller result (P1 #4): the dynamic-dispatch
-    /// sites naming `symbol`, shared by `get_call_graph`, `find_references` and
-    /// `get_ast_node include_impact`. `None` when it does not apply (no project
-    /// root, not a function, not an identifier).
+    /// sites naming `symbol`, and its calls with no resolved target (D#229)
+    /// listed nearest the `near` definitions; shared by `get_call_graph`,
+    /// `find_references` and `get_ast_node include_impact`. `None` when it
+    /// does not apply (no project root, not a function, not an identifier).
     pub(in crate::mcp::server) fn empty_result_boundaries(
         &self,
         symbol: &str,
+        near: &[i64],
     ) -> Result<Option<serde_json::Value>> {
         let Some(root) = self.project_root.as_deref() else {
             return Ok(None);
         };
         Ok(
-            crate::graph::boundaries::for_empty_result(self.db.conn(), root, symbol)?
+            crate::graph::boundaries::for_empty_result(self.db.conn(), root, symbol, near)?
                 .map(|b| b.to_json()),
         )
     }
@@ -486,7 +498,7 @@ impl McpServer {
             attach_truncation_flags(&mut rollup, results);
             attach_suppressed_ambiguous(&mut rollup, results);
             if direction != "callees" && caller_total == 0 {
-                if let Some(b) = self.empty_result_boundaries(function_name)? {
+                if let Some(b) = self.empty_result_boundaries(function_name, &seed_ids(results))? {
                     rollup["boundaries"] = b;
                 }
             }
@@ -514,7 +526,7 @@ impl McpServer {
         // Empty caller side: disclose dynamic-dispatch sites, never as edges.
         // Both response shapes owe it (the rollup arm above attaches the same).
         if direction != "callees" && caller_nodes.is_empty() {
-            if let Some(b) = self.empty_result_boundaries(function_name)? {
+            if let Some(b) = self.empty_result_boundaries(function_name, &seed_ids(results))? {
                 result["boundaries"] = b;
             }
         }

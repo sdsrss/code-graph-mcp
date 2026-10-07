@@ -501,7 +501,12 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             relation_filter,
             None | Some(crate::domain::REL_CALLS) | Some(crate::domain::REL_REFERENCES)
         ) {
-        crate::graph::boundaries::for_empty_result(conn, &ctx.project_root, output_symbol)?
+        crate::graph::boundaries::for_empty_result(
+            conn,
+            &ctx.project_root,
+            output_symbol,
+            &target_ids,
+        )?
     } else {
         None
     };
