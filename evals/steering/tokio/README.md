@@ -27,8 +27,10 @@ spots. `gen_cases.py` writes the cases; its docstring has the full recipe.
 
 The reply must end with one `Type::method @ path` line per caller. Each caller
 has its own grader, which needs the name and the file on one line, so the score
-is recall. A name qualified by another type does not count. Listing extra
-functions costs nothing.
+is recall. A name qualified by another type does not count, and a bare name
+counts only when no other caller in that file has the same name (one bare
+`new @ sync/broadcast.rs` line used to satisfy both `Waiter::new` and
+`Recv::new`). Listing extra functions costs nothing.
 
 | case | callers | files | code-graph default floor finds |
 |---|---|---|---|
@@ -42,9 +44,11 @@ functions costs nothing.
 The selection mixes call shapes code-graph resolves at the default floor (path
 calls) with ones it does not (method calls on common names), and names grep
 cannot tell apart (`new` has 284 definitions in the index, `remove` 14).
-Checked before any paid run: a perfect reply in four spellings
-(`Type::method`, backticked, `<Type as Trait>::method`, bare name) scores 1.0 on
-every case.
+Checked before any paid run: a perfect reply in three spellings
+(`Type::method`, backticked, `<Type as Trait>::method`) scores 1.0 on every
+case; in bare names it scores 1.0 except on `pointers-new` and
+`poll-evented-into-inner` (7/9 each), whose two same-named callers in one file
+need their types.
 
 First run (2026-10-06, Opus, Sonnet and Haiku, $4.82): `evals/README.md`,
 "Headroom pilot on tokio". Opus scored 1.000 on all 12 sessions; the room is

@@ -60,14 +60,19 @@ def path_tail(path):
     return re.escape("/".join(parts[-keep:]))
 
 
-def name_part(qualified):
+def name_part(qualified, bare_ok=True):
     *owner, name = qualified.split(".")
     if not owner:
         return rf"\b{re.escape(name)}\b"
     t, n = re.escape(owner[-1]), re.escape(name)
     # `Type::name`, `Type.name`, `<Type as Trait>::name`, or the bare name; a
-    # name qualified by some other type does not count.
-    return rf"(?:\b{t}\b[^\n]*?(?:::|\.){n}\b|(?<![\w:.]){n}\b)"
+    # name qualified by some other type does not count. The bare name only
+    # when no other caller in the same file shares it: otherwise one bare line
+    # would satisfy both graders (D#232 F8).
+    typed = rf"\b{t}\b[^\n]*?(?:::|\.){n}\b"
+    if not bare_ok:
+        return typed
+    return rf"(?:{typed}|(?<![\w:.]){n}\b)"
 
 
 def main():
@@ -108,8 +113,10 @@ def main():
         shown = callee.replace(".", "::")
         kind = "method" if "." in callee else "function"
         (d / "prompt.md").write_text(PROMPT.format(desc=desc, shown=shown, kind=kind, at=at))
+        bare_in_file = Counter((k[0], qn.split(".")[-1]) for k, (qn, _) in callers.items())
         for i, (key, (qn, tier)) in enumerate(sorted(callers.items(), key=lambda c: (c[0][0], c[0][1]))):
-            pattern = rf"(?m)^(?=[^\n]*{name_part(qn)})(?=[^\n]*{path_tail(key[0])})"
+            bare_ok = bare_in_file[(key[0], qn.split(".")[-1])] == 1
+            pattern = rf"(?m)^(?=[^\n]*{name_part(qn, bare_ok)})(?=[^\n]*{path_tail(key[0])})"
             assert "'" not in pattern
             slug = re.sub(r"[^A-Za-z0-9_]+", "-", qn)
             (d / "graders" / f"item-{i:02d}-{slug}.md").write_text(
