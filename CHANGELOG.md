@@ -9,18 +9,26 @@ covers a sibling that shares its name prefix (`src` is not `src2/`).
 **Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
 unchanged). Three answers change:
 
-- An MCP tool given an absolute path under the project root, a leading
-  `./`, or `.` / `..` segments that stay inside the root answers for that
-  file or directory instead of "not found".
+- An MCP tool given an absolute path under the project root answers for
+  that file or directory instead of "not found". Given a leading `./` or
+  `.` / `..` segments, it answers from the file's one index entry, where
+  0.165.2 first indexed a second copy under that spelling.
 - A path that goes through a symlink (`link/a.rs` where `link` points at
-  `src`, or a package pnpm links into `node_modules`) is answered "not
-  found" by MCP tools and by `affected` / `deps`, where 0.165.2 indexed the
-  file a second time under that path.
+  `src`, or a package pnpm links into `node_modules`) is no longer indexed
+  a second time. `get_ast_node`, `find_references` and `affected` answer
+  that the file is not in the index. `get_call_graph` answers an empty
+  caller list and `deps` finds no tracked dependency edges, as both already
+  did for any file not in the index (see Not covered). `affected` given
+  `src/./a.rs` also reports it not in the index; 0.165.2 indexed a second
+  copy and answered from it.
 - The path of `overview` / `module_overview` and each `dead-code --ignore` /
-  `ignore_paths` entry covers that directory or file only. `src` no longer
-  also matches `src2/` or `src.rs`, and `overview src/models` no longer
-  matches `src/models.ts`: name the file. An `ignore_paths` entry of `""`
-  ignores nothing; it ignored everything.
+  `ignore_paths` entry covers that directory or file and nothing beside it.
+  `src` no longer also matches `src2/` or `src.rs`, and `overview
+  src/models` no longer matches `src/models.ts`: name the file. A file
+  named in the wrong letter case (`overview Src/a.rs`) is no longer
+  matched; 0.165.2 matched it on every platform, which on macOS and
+  Windows is the same file. An `ignore_paths` entry of `""` ignores
+  nothing; it ignored everything.
 
 To keep 0.165.2's behaviour, pin `@sdsrs/code-graph@0.165.2`.
 
@@ -47,9 +55,9 @@ To keep 0.165.2's behaviour, pin `@sdsrs/code-graph@0.165.2`.
   drops every row its scan does not see.
 - MCP tools that take a path accept an absolute path under the project
   root, a leading `./`, and `.` / `..` segments that stay inside the root,
-  mapping them onto the stored path. Haiku sent absolute paths in 2 of its
-  22 MCP calls in the 0.165.1 tokio pilot, and every path-taking tool
-  answered "not found" or an empty result. The mapping is by string only: a
+  mapping them onto the stored path. In the 0.165.1 tokio pilot, 2 of the
+  22 MCP calls were Haiku passing an absolute path, and both failed; every
+  path-taking tool answered "not found" or an empty result. The mapping is by string only: a
   path outside the root, or one that reaches the root through a symlink, is
   left as given and misses as before. A path ending in `/.` or `/..` stays a
   directory, so `src/.` does not also match `src2/`.
@@ -64,9 +72,17 @@ To keep 0.165.2's behaviour, pin `@sdsrs/code-graph@0.165.2`.
 
 ### Not covered
 
-- A path through a symlink is answered "not found" without saying why;
-  symlinked sources are still not indexed at all (the scan does not follow
-  links).
+- A path through a symlink is answered as a file not in the index, without
+  saying it goes through a link; symlinked sources are still not indexed at
+  all (the scan does not follow links).
+- Given a file that is not in the index, `get_call_graph` answers an empty
+  caller list and `deps` finds no tracked dependency edges, and neither
+  says the file is unknown. Both did so in 0.165.2 for a mistyped path; a
+  path through a symlink now lands there too.
+- A directory path matches by SQLite `LIKE`, which ignores ASCII case, in
+  `overview` / `module_overview` and `dead-code`'s path filter: on Linux,
+  where `SRC/` and `src/` are two directories, `overview src` lists both.
+  `--ignore` and the file case compare case-sensitively.
 - MCP resolves `..` by string: with `deep` linking to `src/sub`,
   `deep/../a.rs` answers for the project's `a.rs`, while the filesystem
   opens `src/a.rs`.
