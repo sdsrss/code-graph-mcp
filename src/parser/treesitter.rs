@@ -480,7 +480,7 @@ fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
             "attribute_item" => {
                 if let Some(attr) = attribute_of(&s) {
                     let path = attribute_path(&attr, source);
-                    if path.rsplit("::").next().map(str::trim) == Some("test")
+                    if path.rsplit("::").next().map(unraw) == Some("test")
                         || cfg_attribute_requires_test(&attr, source)
                     {
                         return true;
@@ -495,9 +495,9 @@ fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
     false
 }
 
-/// True when a file or an inline module body opens with an inner
-/// `#![cfg(…)]` whose predicate requires `test`: the whole container is then
-/// test code, not just the item after the attribute.
+/// True when a file or an item body (inline module, impl, trait, function)
+/// opens with an inner `#![cfg(…)]` whose predicate requires `test`: the whole
+/// container is then test code, not just the item after the attribute.
 fn inner_cfg_requires_test(container: &tree_sitter::Node, source: &str) -> bool {
     let mut cursor = container.walk();
     let found = container
@@ -505,7 +505,7 @@ fn inner_cfg_requires_test(container: &tree_sitter::Node, source: &str) -> bool 
         .take_while(|c| {
             matches!(
                 c.kind(),
-                "inner_attribute_item" | "line_comment" | "block_comment"
+                "inner_attribute_item" | "line_comment" | "block_comment" | "shebang"
             )
         })
         .filter(|c| c.kind() == "inner_attribute_item")
@@ -520,6 +520,21 @@ fn attribute_of<'t>(item: &tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t
         .named_children(&mut cursor)
         .find(|c| c.kind() == "attribute");
     attr
+}
+
+/// Whether `node` is an item whose own body (`{ … }` of an impl, trait or
+/// function) opens with an inner `#![cfg(…)]` requiring `test`.
+fn body_inner_cfg_requires_test(node: &tree_sitter::Node, source: &str) -> bool {
+    node.child_by_field_name("body").is_some_and(|body| {
+        matches!(body.kind(), "declaration_list" | "block")
+            && inner_cfg_requires_test(&body, source)
+    })
+}
+
+/// An identifier as the compiler compares it: `r#test` is `test`.
+fn unraw(ident: &str) -> &str {
+    let ident = ident.trim();
+    ident.strip_prefix("r#").unwrap_or(ident)
 }
 
 /// An attribute's path (`cfg`, `tokio::test`), whitespace and all.
@@ -537,7 +552,7 @@ fn cfg_attribute_requires_test(attr: &tree_sitter::Node, source: &str) -> bool {
     }
     match attr
         .child_by_field_name("arguments")
-        .map(|args| cfg_predicates(&args, source))
+        .map(|args| cfg_predicates(&args, source, 0))
         .as_deref()
     {
         Some([only]) => only.requires_test(),
@@ -570,11 +585,22 @@ impl CfgPredicate {
     }
 }
 
+/// How deep `all` / `any` nest before [`cfg_predicates`] stops reading. Real
+/// predicates nest two or three levels; the cap is what keeps a generated or
+/// hostile file from recursing until the stack overflows, which aborts the
+/// process. A predicate past it reads as `Other`, i.e. production code.
+const MAX_CFG_PREDICATE_DEPTH: usize = 32;
+
 /// The comma-separated predicates of a `( … )` token tree: `name`,
-/// `name = "value"`, or `name( … )`. Anything else is `Other`.
-fn cfg_predicates(tree: &tree_sitter::Node, source: &str) -> Vec<CfgPredicate> {
+/// `name = "value"`, or `name( … )`. Anything else is `Other`, and so is an
+/// `all` / `any` nested deeper than [`MAX_CFG_PREDICATE_DEPTH`]. Comments are
+/// skipped, as the compiler skips them.
+fn cfg_predicates(tree: &tree_sitter::Node, source: &str, depth: usize) -> Vec<CfgPredicate> {
     let mut cursor = tree.walk();
-    let children: Vec<_> = tree.children(&mut cursor).collect();
+    let children: Vec<_> = tree
+        .children(&mut cursor)
+        .filter(|c| !matches!(c.kind(), "line_comment" | "block_comment"))
+        .collect();
     let inner = match children.as_slice() {
         [open, inner @ .., close] if open.kind() == "(" && close.kind() == ")" => inner,
         _ => return Vec::new(),
@@ -583,13 +609,17 @@ fn cfg_predicates(tree: &tree_sitter::Node, source: &str) -> Vec<CfgPredicate> {
         .split(|c| c.kind() == ",")
         .filter(|segment| !segment.is_empty())
         .map(|segment| match segment {
-            [name] if name.kind() == "identifier" && node_text(name, source) == "test" => {
+            [name] if name.kind() == "identifier" && unraw(node_text(name, source)) == "test" => {
                 CfgPredicate::Test
             }
-            [name, args] if name.kind() == "identifier" && args.kind() == "token_tree" => {
-                match node_text(name, source) {
-                    "all" => CfgPredicate::All(cfg_predicates(args, source)),
-                    "any" => CfgPredicate::Any(cfg_predicates(args, source)),
+            [name, args]
+                if name.kind() == "identifier"
+                    && args.kind() == "token_tree"
+                    && depth < MAX_CFG_PREDICATE_DEPTH =>
+            {
+                match unraw(node_text(name, source)) {
+                    "all" => CfgPredicate::All(cfg_predicates(args, source, depth + 1)),
+                    "any" => CfgPredicate::Any(cfg_predicates(args, source, depth + 1)),
                     _ => CfgPredicate::Other,
                 }
             }
@@ -693,9 +723,11 @@ fn extract_nodes(
         }
     }
 
-    // Check if this specific node has #[test] or #[cfg(test)] attributes
-    let node_is_test =
-        in_test_context || (config.has_test_attributes && has_test_attribute(&node, source));
+    // Check if this specific node has #[test] or #[cfg(test)] attributes, or a
+    // body that opens with an inner `#![cfg(test)]`.
+    let node_is_test = in_test_context
+        || (config.has_test_attributes
+            && (has_test_attribute(&node, source) || body_inner_cfg_requires_test(&node, source)));
 
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
@@ -4916,7 +4948,7 @@ class Context {
 
     // D#272: an item is test code when its `cfg` predicate can only hold with
     // `test` set — the Rust reference's `all` / `any` / `not` semantics, not a
-    // substring search. tokio gates ten inline `mod test` blocks on
+    // substring search. tokio gates inline `mod test` blocks on
     // `cfg(all(test, not(loom)))`, and their helpers counted as production.
     #[test]
     fn rust_cfg_predicate_that_requires_test_marks_is_test() {
@@ -4943,6 +4975,20 @@ async fn tokio_test_with_args() {}
 async fn tokio_test_bare() {}
 #[test]
 fn plain_test() {}
+#[tokio :: test]
+async fn spaced_harness_path() {}
+#[r#test]
+fn raw_harness_name() {}
+#[cfg(test,)]
+fn trailing_comma() {}
+#[cfg(any(test,))]
+fn any_trailing_comma() {}
+#[cfg(all(any(test), unix))]
+fn all_of_any_test() {}
+#[cfg(all(/* gated */ test, unix))]
+fn comment_inside_cfg() {}
+#[cfg(r#test)]
+fn raw_test_option() {}
 
 #[cfg(any(test, fuzzing))]
 fn test_or_fuzzing() {}
@@ -4960,6 +5006,10 @@ struct CfgAttrOnly;
 fn doc_mentions_cfg_test() {}
 #[instrument(test)]
 fn other_attribute_with_test_argument() {}
+#[mycfg(test)]
+fn cfg_suffixed_attribute() {}
+#[tests]
+fn attribute_named_tests() {}
 fn production() {}
 "#;
         assert_rust_is_test(
@@ -4974,6 +5024,13 @@ fn production() {}
                 ("tokio_test_with_args", true),
                 ("tokio_test_bare", true),
                 ("plain_test", true),
+                ("spaced_harness_path", true),
+                ("raw_harness_name", true),
+                ("trailing_comma", true),
+                ("any_trailing_comma", true),
+                ("all_of_any_test", true),
+                ("comment_inside_cfg", true),
+                ("raw_test_option", true),
                 ("test_or_fuzzing", false),
                 ("not_test", false),
                 ("all_empty", false),
@@ -4982,6 +5039,8 @@ fn production() {}
                 ("CfgAttrOnly", false),
                 ("doc_mentions_cfg_test", false),
                 ("other_attribute_with_test_argument", false),
+                ("cfg_suffixed_attribute", false),
+                ("attribute_named_tests", false),
                 ("production", false),
             ],
         );
@@ -5027,5 +5086,77 @@ fn outside() {}
 
         let not_test_file = "#![cfg(not(loom))]\nfn a() {}\nfn b() {}\n";
         assert_rust_is_test(not_test_file, &[("a", false), ("b", false)]);
+
+        let block_doc_then_inner = "/*! Test support. */\n#![cfg(test)]\nfn after_block_doc() {}\n";
+        assert_rust_is_test(block_doc_then_inner, &[("after_block_doc", true)]);
+
+        let shebang_then_inner =
+            "#!/usr/bin/env run-cargo-script\n#![cfg(test)]\nfn after_shebang() {}\n";
+        assert_rust_is_test(shebang_then_inner, &[("after_shebang", true)]);
+
+        // Inner attributes are allowed in impl, trait and function bodies too,
+        // and gate the whole item (rustc drops `Holder::impl_inner_b` from a
+        // non-test build as well as `impl_inner_a`).
+        let item_bodies = r#"
+impl Holder {
+    #![cfg(test)]
+    fn impl_inner_a(&self) {}
+    fn impl_inner_b(&self) {}
+}
+trait Gated {
+    #![cfg(all(test, unix))]
+    fn trait_inner_m(&self) {}
+}
+fn fn_inner_gated() {
+    #![cfg(test)]
+    fn nested_in_gated() {}
+}
+fn fn_plain() {
+    fn nested_in_plain() {}
+}
+impl Open {
+    #![allow(dead_code)]
+    fn open_m(&self) {}
+}
+"#;
+        assert_rust_is_test(
+            item_bodies,
+            &[
+                ("impl_inner_a", true),
+                ("impl_inner_b", true),
+                ("Gated", true),
+                ("trait_inner_m", true),
+                ("fn_inner_gated", true),
+                ("nested_in_gated", true),
+                ("fn_plain", false),
+                ("nested_in_plain", false),
+                ("open_m", false),
+            ],
+        );
+    }
+
+    // A `cfg` nested past any real use must not recurse without bound: a stack
+    // overflow aborts the process instead of unwinding, and the file would abort
+    // every later index run too (review of 2056ace7: 18,000 levels, 90 KB, killed
+    // `incremental-index`). Run on the index threads' explicit stack size so the
+    // margin does not depend on the test harness's default.
+    #[test]
+    fn rust_cfg_nested_past_the_cap_is_production_and_does_not_overflow() {
+        let nested = |depth: usize, name: &str| {
+            format!(
+                "#[cfg({}test{})]\nfn {name}() {{}}\n",
+                "all(".repeat(depth),
+                ")".repeat(depth)
+            )
+        };
+        let deep = nested(100_000, "deep_fn");
+        let got = std::thread::Builder::new()
+            .stack_size(crate::domain::INDEX_THREAD_STACK_SIZE)
+            .spawn(move || rust_is_test_by_name(&deep))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(got.get("deep_fn"), Some(&false), "{got:?}");
+        assert_rust_is_test(&nested(8, "shallow_fn"), &[("shallow_fn", true)]);
     }
 }

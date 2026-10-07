@@ -5,42 +5,47 @@
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is
 test code, so it no longer counts as a production caller.
 
-**Upgrading: every index rebuilds once, automatically, on first use.**
-`INDEX_VERSION` goes 113 → 114 because Rust items change their test flag
-(below); nodes, edges and confidence labels are unchanged. Nothing to run.
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 113 → 114
+because Rust items change their test flag (below); nodes, edges and
+confidence labels are unchanged. The MCP server rebuilds the index when it
+starts; from the command line, `code-graph-mcp reindex` does. Until then CLI
+queries answer from the old index without saying so, and `health-check`
+reports it as stale.
 **`impact` and `callgraph` on Rust code can show fewer production callers:**
 a caller inside such a block now counts as a test caller (`callgraph
 --include-tests` shows it). To pin back: `npm i -g @sdsrs/code-graph@0.167.0`,
-or `cargo install code-graph-mcp --version 0.167.0`; plugin users can set the
-version in the marketplace entry. An older binary leaves a v114 index intact
-and warns instead of rebuilding it; delete `.code-graph/index.db*` after
-pinning back to get its graph back.
+or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.167.0`; plugin users can set the version in the marketplace entry. An
+older binary leaves a v114 index intact and warns instead of rebuilding it;
+delete `.code-graph/index.db*` after pinning back to get its graph back.
 
 ### Rust test code behind `cfg(all(test, …))`
 
 The index decided whether a Rust item is test code by searching its
 attributes' text for `cfg(test)`. `#[cfg(all(test, not(loom)))]`, which tokio
 puts on its inline `mod test` blocks, did not match, so the helpers and mocks
-inside counted as production code. On tokio, `impact unconstrained` reported
-2 direct callers, one of them `get`, a helper in such a block; it now reports
-1, with 2 tests affected. A `#[doc = "…cfg(test)…"]` attribute matched,
-although it gates nothing.
+inside counted as production code. On tokio, `impact unconstrained --file
+tokio/src/runtime/coop.rs` reported 2 direct callers, one of them `get`, a
+helper in such a block; it now reports 1, with 2 tests affected. A
+`#[doc = "…cfg(test)…"]` attribute matched, although it gates nothing.
 
 The attribute is now read as a `cfg` predicate under the Rust reference's
 rules: an item is test code when its predicate can only hold with `test` set
 — `test`, `all(…)` with such a member, or `any(…)` whose members all are.
-`any(test, fuzzing)`, `not(test)` and `feature = "test"` stay production. An
-inner `#![cfg(…)]` gates its whole file or inline module, where it marked
-at most the item right after it. `#[tokio::test(flavor = "multi_thread")]`
-counts like `#[tokio::test]`, which it did not.
+`any(test, fuzzing)`, `not(test)` and `feature = "test"` stay production;
+comments inside the predicate are skipped and `r#test` is `test`. An inner
+`#![cfg(…)]` gates its whole file, or the whole module, impl, trait or
+function whose body it opens, where it marked at most the item right after
+it. `#[tokio::test(flavor = "multi_thread")]` counts like `#[tokio::test]`,
+which it did not.
 
 Measured against 0.167.0 on the same checkouts: on tokio-1.41.1, 152 of
 9,575 nodes become test code (27 under `src/`, 125 under `tests/`
 directories, most of them `#[tokio::test(flavor = …)]` functions), and no
 node stops being test code; all 32,081 edges, with their confidence labels,
-are identical. On this repository nothing changes (7,083 nodes, 16,179
-edges). A full index of tokio takes 2.52 s against 2.54 s (medians of five
-interleaved runs). On a fixture with a call in a helper inside
+are identical. On this repository's 0.167.0 tree nothing changes (7,083
+nodes, 16,179 edges). A full index of tokio takes 2.52 s against 2.54 s
+(medians of five interleaved runs). On a fixture with a call in a helper inside
 `#[cfg(all(test, not(loom)))] mod test`, these answers change:
 
 - `impact` counts the helper as a test caller (1 direct caller where 0.167.0
@@ -60,6 +65,13 @@ interleaved runs). On a fixture with a call in a helper inside
   `loom/mocked.rs`).
 - Test attributes other than `#[test]` and `#[….::test]`, such as
   `#[rstest]` or `#[test_case(…)]`, are not recognised.
+- Predicates that need negation reasoning (`not(not(test))`) and a
+  `cfg(test)` written inside `cfg_attr` (`#[cfg_attr(all(), cfg(test))]`,
+  which gates like `#[cfg(test)]`) stay production, as does an `all` / `any`
+  nested more than 32 levels deep.
+- In a file gated by `#![cfg(test)]`, code outside any function (a `static`
+  initializer, say) still counts as production: the unresolved-call list of
+  an empty `refs` answer can still show its calls.
 
 ## 0.167.0
 
