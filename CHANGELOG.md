@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.165.2
+
+`refs` and `find_references` list every caller they have an edge for, and
+`include_tests: false` hides an inline test helper.
+
+**Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
+unchanged). A `refs` / `find_references` answer can be longer than in 0.165.1:
+callers it used to drop are listed, and cfg-gated twins of one function are
+listed once per definition, each with its own line. A listed row can also
+show a higher confidence tier than before, when the lower-tier caller that
+was folded into it is now its own row. To keep
+0.165.1's answers, pin `@sdsrs/code-graph@0.165.1`.
+
+### Fixed
+
+- `refs` and MCP `find_references` no longer drop a caller that has the same
+  short name, in the same file, as another caller. `Waiter::new` and
+  `Recv::new` in tokio's `broadcast.rs` both call `Pointers::new`; only one
+  was listed, with no count of the other. On tokio 1.41.1, of the 5,537 call
+  pairs rust-analyzer confirms and code-graph has an edge for, `refs` listed
+  5,473 before and lists all 5,537 now. On the six tokio caller cases of the
+  0.165.1 pilot, `find_references` now names 33 of the 58 graded callers
+  (31 before); the other 25 have no edge at any tier (see Not covered).
+- MCP `find_references` with `include_tests: false` hides a test helper with
+  a descriptive name inside `#[cfg(test)] mod tests`. It was listed as a
+  production reference because only the name/path heuristic was checked; the
+  AST test flag is now checked first, as `impact` and `get_call_graph`
+  already did. With tests included, such a helper sorts after the
+  production callers.
+
+### Not covered
+
+- MCP tools still answer "not found" for an absolute `file_path` / `path`
+  (Haiku sent absolute paths in 2 of its 22 MCP calls in the tokio pilot). A fix was
+  written and withdrawn before this release: every new spelling it accepted
+  could reach a refresh step that indexes a path through a symlink as a second
+  copy of the file (below), so that step gets fixed first.
+- `callgraph`, `impact` and `get_ast_node include_impact` still fold two
+  same-named callers in one file into one: on tokio, 29 of the 4,433
+  rust-analyzer-confirmed call pairs they have an edge for at the default
+  confidence floor. Telling the two rows apart in
+  their output needs a format change; it is a separate item.
+- A path that goes through a symlink inside the project (`link/a.rs` where
+  `link` points at `src`, or at a directory outside the project) is still
+  indexed as a second file when an MCP tool is given it, as in 0.165.1 and
+  earlier. It is a separate item.
+- An answer of 0 callers is still given without saying how far to trust it.
+  On tokio, 228 of the 1,291 library methods code-graph finds no caller for
+  have one according to rust-analyzer (17.7%). A proposal with measurements
+  is in `tasks/specs/d229-zero-answer-disclosure.md`.
+
 ## 0.165.1
 
 A `claude -p` or SDK session no longer uses up the one showing of the
