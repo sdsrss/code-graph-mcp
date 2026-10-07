@@ -34,36 +34,25 @@ mod search;
 ///
 /// MCP paths are root-relative, and a relative path is never resolved against
 /// the process cwd — deliberately NOT `cli::normalize_user_path`, which does
-/// (see `indexer::pipeline` docs). Two other spellings of a file under the root
+/// (see `indexer::pipeline` docs). Other spellings of a path under the root
 /// ARE mapped to the stored key, because models send them: an absolute path
 /// (Haiku did, in the tokio pilot, and every path-taking tool answered "not
-/// found" or a false-clean empty result — D#228) and a leading `./`. An
-/// absolute path outside the root is returned unchanged, so it misses the index
-/// exactly as before.
+/// found" or a false-clean empty result — D#228), a leading `./`, and `.` /
+/// `..` segments that stay inside the root. A path outside the root is
+/// returned unchanged, so it misses the index exactly as before.
+///
+/// The mapping is LEXICAL only — the filesystem is never consulted, so a path
+/// that reaches the root through a symlink misses, as it did in 0.165.1. A
+/// canonicalize fallback (the CLI has one) was tried and withdrawn before
+/// release: resolving through the filesystem dropped a directory's trailing
+/// `/`, so `<link>/src/` became the prefix `src` and also matched `src2/`
+/// (`find_dead_code ignore_paths` then hid real dead code), and it mapped a
+/// link living outside the root onto a project file.
 pub(super) fn normalize_path_arg(raw: &str, project_root: Option<&std::path::Path>) -> String {
-    let out = normalize_path_arg_on(raw, project_root, cfg!(windows));
-    // The lexical strip missed but the path is absolute: the caller may spell
-    // the root through a symlink (macOS `/tmp` is `/private/tmp`), or Windows
-    // may hand back the `\\?\` long form. Same fallback as
-    // `cli::normalize_user_path`; canonicalize resolves `..`, so a successful
-    // strip is genuinely under the root.
-    if let Some(root) = project_root {
-        if std::path::Path::new(&out).is_absolute() {
-            if let (Ok(p), Ok(r)) = (
-                std::path::Path::new(raw).canonicalize(),
-                root.canonicalize(),
-            ) {
-                if let Ok(rel) = p.strip_prefix(&r) {
-                    let rel = crate::indexer::merkle::normalize_rel_path(rel);
-                    return if rel.is_empty() { ".".to_string() } else { rel };
-                }
-            }
-        }
-    }
-    out
+    normalize_path_arg_on(raw, project_root, cfg!(windows))
 }
 
-/// Testable core of [`normalize_path_arg`], without the filesystem fallback.
+/// Testable core of [`normalize_path_arg`].
 /// `backslash_is_sep` is a parameter for the same reason it is one in
 /// `merkle::normalize_rel_str_on` and `cli::normalize_user_path_from_on`:
 /// without it the Windows branch of the MCP entry point is reachable only from
@@ -94,7 +83,7 @@ pub(super) fn normalize_path_arg_on(
         if under_root {
             // A separator must follow the root: `/repo-old/a.rs` is not under
             // `/repo`. A rest that climbs out of the root keeps the absolute
-            // spelling, for `normalize_path_arg`'s filesystem fallback.
+            // spelling as given, and misses.
             match &path[root.len()..] {
                 "" | "/" => return ".".to_string(),
                 rest if rest.starts_with('/') => {
@@ -203,7 +192,7 @@ mod normalize_path_arg_tests {
         // `.` and `..` segments resolve to the stored key. Left as they were,
         // `src/./a.rs` missed the index and the freshness refresh then indexed
         // it as a SECOND file, so every symbol in it existed twice.
-        let dots: [(&str, &str); 13] = [
+        let dots: [(&str, &str); 14] = [
             ("/home/u/repo/src/./a.rs", "src/a.rs"),
             ("/home/u/repo/src/../src/a.rs", "src/a.rs"),
             ("src/./a.rs", "src/a.rs"),
@@ -213,6 +202,8 @@ mod normalize_path_arg_tests {
             ("./src/", "src/"),
             ("src/./", "src/"),
             ("src/../lib/", "lib/"),
+            // A name that merely ends in `.` is not a `.` segment.
+            ("src/./a.", "src/a."),
             // Ending on `.` / `..` names a directory: keep it one, or the
             // `path%` prefix also matches a sibling `src2/`.
             ("src/.", "src/"),
@@ -236,8 +227,7 @@ mod normalize_path_arg_tests {
             assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
         }
         // Not under the root, or climbing out of it: unchanged, so the lookup
-        // misses as it always did (an absolute one still gets the filesystem
-        // fallback in `normalize_path_arg`).
+        // misses as it always did.
         for raw in [
             "/home/u/repo-old/src/a.rs",
             "/home/u/rep",
@@ -300,25 +290,31 @@ mod normalize_path_arg_tests {
         );
     }
 
-    /// The filesystem fallback: a root reached through a symlink.
+    /// Spellings are mapped LEXICALLY only. A path that reaches the root
+    /// through a symlink is returned as given and misses, as in 0.165.1: the
+    /// canonicalize fallback that mapped it dropped a directory's trailing `/`
+    /// (`<link>/src/` widened to `src`, so `find_dead_code ignore_paths`
+    /// also hid `src2/` and answered "No dead code"), and mapped a link that
+    /// lives outside the root onto a project file.
     #[cfg(unix)]
     #[test]
-    fn maps_an_absolute_path_through_a_symlinked_root() {
+    fn does_not_resolve_a_path_through_a_symlinked_root() {
         let dir = tempfile::TempDir::new().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir_all(real.join("src")).unwrap();
         std::fs::write(real.join("src/a.rs"), "").unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let via_link = link.join("src/a.rs").to_string_lossy().into_owned();
-        assert_eq!(
-            super::normalize_path_arg(&via_link, Some(&real)),
-            "src/a.rs"
-        );
-        let via_real = real.join("src/a.rs").to_string_lossy().into_owned();
-        assert_eq!(
-            super::normalize_path_arg(&via_real, Some(&link)),
-            "src/a.rs"
-        );
+        for spelling in ["src/a.rs", "src/", "src/."] {
+            let via_link = format!("{}/{spelling}", link.to_string_lossy());
+            assert_eq!(
+                super::normalize_path_arg(&via_link, Some(&real)),
+                via_link,
+                "{spelling}"
+            );
+        }
+        // The same spellings through the root as given still map.
+        let via_real = format!("{}/src/.", real.to_string_lossy());
+        assert_eq!(super::normalize_path_arg(&via_real, Some(&real)), "src/");
     }
 }
