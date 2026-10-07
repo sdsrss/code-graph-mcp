@@ -243,9 +243,7 @@ fn strip_next_lines(out: &str) -> (String, Vec<String>) {
 /// (see `function_with_no_callers_at_all_is_unknown` in src/graph/impact.rs);
 /// and in the two `mcp_project_map*.json` baselines the `freshness` object,
 /// which counted files past the 32-file scan cap as changed on an untouched
-/// fixture (`stale_kept` 25 and 20; af1a9fb); and in
-/// `mcp_callgraph_hub_rollup.json` `boundaries.unresolved_calls` `{"total":
-/// 0}`, the count of `hub`'s calls with no resolved target (D#229).
+/// fixture (`stale_kept` 25 and 20; af1a9fb).
 #[test]
 fn default_text_answers_are_the_old_bytes_plus_next_lines() {
     let p = fixture();

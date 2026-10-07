@@ -1268,6 +1268,21 @@ fn scan_source_until(
         }
     }
 
+    // Lines that define or declare the name (`def name(`, `fn name(`): a call
+    // there is the definition's own one-line body, whichever line its node
+    // starts on (a decorated Python def starts at the decorator).
+    let decl_lines: std::collections::HashSet<usize> = if counts_calls {
+        occurrences
+            .iter()
+            .filter(|&&(s, _)| {
+                word_before(&m, s, &syn).is_some_and(|w| NOT_CALL_KEYWORDS.contains(&w.as_str()))
+            })
+            .map(|&(s, _)| src.line_no(s))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for (i, &(s, e)) in occurrences.iter().enumerate() {
         if i % 256 == 0 && past() {
             return None;
@@ -1290,7 +1305,11 @@ fn scan_source_until(
         if counts_calls && !(shadowed && is_bare(&m, s)) && is_call_site(&src, s, e, &syn, language)
         {
             let line = src.line_no(s);
-            if !def_lines.contains(&line) && !call_lines.contains(&line) {
+            // Occurrences come in order, so a repeat is the last one.
+            if !def_lines.contains(&line)
+                && !decl_lines.contains(&line)
+                && call_lines.last() != Some(&line)
+            {
                 call_lines.push(line);
             }
         }
@@ -1336,6 +1355,14 @@ pub fn call_family(language: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// The families whose unresolved calls an empty answer lists. Rust only: it
+/// is the one language measured (tokio against rust-analyzer). The Python and
+/// JS/TS call tables are read by [`scan_calls`] but not disclosed until they
+/// are measured on their own corpora, where the 2026-10-07 review found
+/// shapes they still miscount (f-strings, top-level calls, TypeScript
+/// signatures without a return type).
+const DISCLOSED_CALL_FAMILIES: &[&str] = &["rust"];
 
 /// The 1-based lines holding a call of `name` in one source text, skipping
 /// `def_lines`; `None` for a language [`call_family`] does not read.
@@ -1553,7 +1580,11 @@ impl Boundaries {
             if n == 1 { "call" } else { "calls" },
             self.name,
             files.len(),
-            if files.len() == 1 { "file has" } else { "files have" },
+            match (files.len() == 1, n == 1) {
+                (true, true) => "file has",
+                (true, false) => "file have",
+                (false, _) => "files have",
+            },
         );
         for c in calls.iter().take(BOUNDARY_SITE_CAP) {
             out.push_str(&format!("{indent}  {}:{}\n", c.file_path, c.line));
@@ -1647,6 +1678,10 @@ impl Boundaries {
         };
         if let Some(calls) = self.unresolved_calls() {
             let mut u = serde_json::json!({ "total": calls.len() });
+            let in_resolved = self.calls.as_ref().map_or(0, |c| c.len() - calls.len());
+            if in_resolved > 0 {
+                u["in_resolved_functions"] = serde_json::json!(in_resolved);
+            }
             if !calls.is_empty() {
                 let mut files: Vec<&str> = calls.iter().map(|c| c.file_path.as_str()).collect();
                 files.sort_unstable();
@@ -1700,14 +1735,33 @@ impl Boundaries {
     pub fn render_text<W: std::io::Write>(&self, out: &mut W, indent: &str) -> std::io::Result<()> {
         let calls_text = self.unresolved_calls_text(indent);
         if self.sites.is_empty() {
-            // With calls counted and none unresolved, the one line says both.
-            let what = if self.unresolved_calls().is_some_and(|c| c.is_empty()) {
-                "dynamic-dispatch site or unresolved call"
+            // With calls counted and none unresolved, the one line says what
+            // the count shows: no call at all, or calls only in functions
+            // where the graph resolved a call of the name (the rule is per
+            // function, so not that each call is resolved).
+            let resolved = self
+                .calls
+                .as_ref()
+                .filter(|_| calls_text.is_empty())
+                .map(Vec::len);
+            let what = if resolved == Some(0) {
+                "dynamic-dispatch site or call"
             } else {
                 "dynamic-dispatch site"
             };
+            let tail = match resolved {
+                Some(1) => format!(
+                    "; its 1 call is in a function with a resolved call of '{}'",
+                    self.name
+                ),
+                Some(k) if k > 1 => format!(
+                    "; its {k} calls are all in functions with a resolved call of '{}'",
+                    self.name
+                ),
+                _ => String::new(),
+            };
             if self.complete() {
-                writeln!(out, "{indent}(no {what} names '{}')", self.name)?;
+                writeln!(out, "{indent}(no {what} names '{}'{tail})", self.name)?;
                 if calls_text.is_empty() {
                     return Ok(());
                 }
@@ -1716,7 +1770,7 @@ impl Boundaries {
             }
             writeln!(
                 out,
-                "{indent}(no {what} names '{}' in the files scanned; not scanned: {})",
+                "{indent}(no {what} names '{}' in the files scanned{tail}; not scanned: {})",
                 self.name,
                 self.unscanned_text()
             )?;
@@ -1893,8 +1947,9 @@ fn scan_project_with(
             call_lines.push((path.clone(), scan.call_lines));
         }
     }
-    if let Some(calls) = out.calls.as_mut() {
-        *calls = classify_calls(conn, name, call_lines)?;
+    if out.calls.is_some() {
+        let calls = classify_calls(conn, name, call_lines, deadline, &mut out.files_past_limit)?;
+        out.calls = Some(calls);
     }
     Ok(out)
 }
@@ -1902,17 +1957,27 @@ fn scan_project_with(
 /// Each call line placed in the innermost function holding it: a call in a
 /// test function is dropped (tests are not production callers), the rest
 /// flagged [`CallSite::resolved`] when that function has a call edge to a
-/// definition of the name.
+/// definition of the name. A line outside every function belongs to the
+/// innermost module node holding it (a top-level call's edge leaves from
+/// there). When several functions hold the line at the same depth (two
+/// one-line functions), the call is resolved only if all of them are, and
+/// test only if all of them are: which one holds it is unknown, and a call
+/// wrongly listed is the cheaper error than a zero wrongly backed.
 ///
 /// The tokio measurement behind this rule is in
-/// `tasks/specs/d229-zero-answer-disclosure.md`: dropping the resolved calls
-/// kept every definition with a production caller flagged and flagged 50
-/// fewer of the others; also dropping calls inside a same-named function
-/// (delegation) lost 5 real ones.
+/// `tasks/specs/d229-zero-answer-disclosure.md`. It is per function, not per
+/// call (an edge carries no line), so a function with one resolved call of
+/// the name counts its other calls of it as resolved too; the zero line says
+/// only that much.
+///
+/// Files left when `deadline` passes are not classified: their calls are
+/// dropped and the files counted in `files_past_limit`.
 fn classify_calls(
     conn: &Connection,
     name: &str,
     call_lines: Vec<(String, Vec<usize>)>,
+    deadline: Instant,
+    files_past_limit: &mut usize,
 ) -> Result<Vec<CallSite>> {
     if call_lines.is_empty() {
         return Ok(Vec::new());
@@ -1930,39 +1995,72 @@ fn classify_calls(
          JOIN files f ON f.id = n.file_id WHERE f.path = ?1",
     )?;
     let mut out = Vec::new();
-    for (path, lines) in call_lines {
-        // (id, start, end, is_test) of each function in the file.
-        let fns: Vec<(i64, i64, i64, bool)> = stmt
-            .query_map([&path], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, bool>(4)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .filter(|(_, ty, ..)| crate::domain::is_function_node_type(ty))
-            .map(|(id, _, s, e, t)| (id, s, e, t))
-            .collect();
+    let total = call_lines.len();
+    for (k, (path, lines)) in call_lines.into_iter().enumerate() {
+        if Instant::now() >= deadline {
+            *files_past_limit += total - k;
+            break;
+        }
+        // (start, end, id, is_test), functions and modules apart, by start.
+        let mut fns: Vec<(i64, i64, i64, bool)> = Vec::new();
+        let mut mods: Vec<(i64, i64, i64, bool)> = Vec::new();
+        for row in stmt.query_map([&path], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })? {
+            let (id, ty, start, end, test) = row?;
+            if crate::domain::is_function_node_type(&ty) {
+                fns.push((start, end, id, test));
+            } else if ty == "module" {
+                mods.push((start, end, id, test));
+            }
+        }
+        fns.sort_unstable();
+        mods.sort_unstable();
         for line in lines {
             let l = line as i64;
-            let holder = fns
-                .iter()
-                .filter(|(_, s, e, _)| *s <= l && l <= *e)
-                .max_by_key(|(_, s, _, _)| *s);
-            if holder.is_some_and(|h| h.3) {
+            let holders = innermost(&fns, l);
+            let holders = if holders.is_empty() {
+                innermost(&mods, l)
+            } else {
+                holders
+            };
+            if !holders.is_empty() && holders.iter().all(|h| h.3) {
                 continue;
             }
             out.push(CallSite {
                 file_path: path.clone(),
                 line,
-                resolved: holder.is_some_and(|h| resolving.contains(&h.0)),
+                resolved: !holders.is_empty() && holders.iter().all(|h| resolving.contains(&h.2)),
             });
         }
     }
     Ok(out)
+}
+
+/// The intervals (sorted by start) holding `line` that start last: the
+/// innermost, several when they start on the same line. Walks back from the
+/// last start at or before `line` to the first that holds it.
+fn innermost(spans: &[(i64, i64, i64, bool)], line: i64) -> Vec<(i64, i64, i64, bool)> {
+    let upto = spans.partition_point(|s| s.0 <= line);
+    let Some(best) = spans[..upto]
+        .iter()
+        .rev()
+        .find(|s| s.1 >= line)
+        .map(|s| s.0)
+    else {
+        return Vec::new();
+    };
+    spans[..upto]
+        .iter()
+        .filter(|s| s.0 == best && s.1 >= line)
+        .copied()
+        .collect()
 }
 
 /// Last segment of a possibly qualified symbol (`Store::save`, `Store.save`).
@@ -2017,11 +2115,16 @@ pub fn for_empty_result(
             .map(|d| (d.file_path.as_str(), d.node.qualified_name.as_deref())),
     );
     // Calls are counted only when every function definition is in a language
-    // whose calls the scan reads; one elsewhere could be called from files
-    // it does not read.
+    // whose calls the answer discloses; one elsewhere could be called from
+    // files it does not read.
     let families: Option<Vec<&'static str>> = fn_defs
         .iter()
-        .map(|d| d.language.as_deref().and_then(call_family))
+        .map(|d| {
+            d.language
+                .as_deref()
+                .and_then(call_family)
+                .filter(|f| DISCLOSED_CALL_FAMILIES.contains(f))
+        })
         .collect();
     let mut out = scan_project_with(
         conn,

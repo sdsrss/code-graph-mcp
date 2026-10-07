@@ -280,35 +280,35 @@ impl FileSelectorMiss {
                 "File '{file_path}' not found in index. Check that the path is relative to the project root and the file has been indexed."
             )
         };
-        let (files, total) = self.defining_files();
-        if !files.is_empty() {
+        if let Some(files) = file_list(self.elsewhere.iter().map(|c| c.file_path.as_str())) {
             let lead = if self.file_indexed {
                 "Defined in".to_string()
             } else {
                 format!("'{name}' is defined in")
             };
-            msg.push_str(&format!(" {lead}: {}", files.join(", ")));
-            if total > files.len() {
-                msg.push_str(&format!(" ({} of {total} files)", files.len()));
-            }
+            msg.push_str(&format!(" {lead}: {files}"));
         }
         msg
     }
+}
 
-    /// The distinct defining files, sorted, at most [`SUGGESTION_CAP`], and
-    /// how many there are in all.
-    pub fn defining_files(&self) -> (Vec<&str>, usize) {
-        let mut files: Vec<&str> = self
-            .elsewhere
-            .iter()
-            .map(|c| c.file_path.as_str())
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-        let total = files.len();
-        files.truncate(SUGGESTION_CAP);
-        (files, total)
+/// The distinct `paths`, sorted, at most [`SUGGESTION_CAP`] and joined, with
+/// `(5 of 7 files)` when more were left out; `None` when there are none.
+/// What every "Defined in" list prints, so none drops files silently.
+pub fn file_list<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut files: Vec<&str> = paths.into_iter().collect();
+    files.sort_unstable();
+    files.dedup();
+    if files.is_empty() {
+        return None;
     }
+    let total = files.len();
+    files.truncate(SUGGESTION_CAP);
+    let mut out = files.join(", ");
+    if total > files.len() {
+        out.push_str(&format!(" ({} of {total} files)", files.len()));
+    }
+    Some(out)
 }
 
 /// Classify a file selector that holds no definition of `name` (D#253).

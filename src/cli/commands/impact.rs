@@ -158,15 +158,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 raw_symbol,
                 explicit_file.unwrap_or_default()
             );
-            let mut defined_in = candidates
-                .iter()
-                .map(|candidate| candidate.file_path.as_str())
-                .collect::<Vec<_>>();
-            defined_in.sort_unstable();
-            defined_in.dedup();
-            defined_in.truncate(crate::resolve::SUGGESTION_CAP);
-            if !defined_in.is_empty() {
-                eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));
+            if let Some(files) =
+                crate::resolve::file_list(candidates.iter().map(|c| c.file_path.as_str()))
+            {
+                eprintln!("[code-graph] Defined in: {files}");
             }
             std::process::exit(1);
         }
@@ -290,10 +285,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             let defined_in: Vec<String> = symbol_nodes
                 .iter()
                 .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
-                .take(crate::resolve::SUGGESTION_CAP)
                 .collect();
-            if !defined_in.is_empty() {
-                eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));
+            if let Some(files) = crate::resolve::file_list(defined_in.iter().map(String::as_str)) {
+                eprintln!("[code-graph] Defined in: {files}");
             }
             std::process::exit(1);
         }

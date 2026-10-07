@@ -80,7 +80,7 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             );
         }
         let msg = format!(
-            "[code-graph] File not in index: {file_path} (the file exists, but the index does not hold it under this path, for example a path through a symlink, a file the index scan skips as ignored, hidden or under node_modules, or a language the indexer does not parse) \u{2014} Read it directly"
+            "[code-graph] File not in index: {file_path} (the file exists, but the index does not hold it under this path, for example a path through a symlink, a file the index scan skips as ignored, hidden or under node_modules, a language the indexer does not parse, or a file added since the last index that is over the size limit, which the next `code-graph-mcp incremental-index` adds) \u{2014} Read it directly"
         );
         if json_mode {
             eprintln!("{msg}");

@@ -1214,6 +1214,14 @@ const CALL_CORPUS: &[CallRow] = &[
     ("python", "# remove(x)\n", "remove", &[]),
     ("python", "s = 'remove(x)'\n", "remove", &[]),
     ("python", "x = obj.remove\n", "remove", &[]),
+    // A decorated one-line def: its node starts at the decorator, and the
+    // body's call on the def line is the definition's own.
+    (
+        "python",
+        "@staticmethod\ndef remove(x): return x.remove(1)\n",
+        "remove",
+        &[],
+    ),
     // ---- JavaScript / TypeScript ----
     ("javascript", "list.remove(x);\n", "remove", &[1]),
     ("javascript", "remove(x);\n", "remove", &[1]),
@@ -1443,7 +1451,7 @@ fn an_empty_answer_with_no_unresolved_call_says_so_in_one_line() {
         .unwrap();
     assert_eq!(
         text_of(&b),
-        "(no dynamic-dispatch site or unresolved call names 'lonely')\n"
+        "(no dynamic-dispatch site or call names 'lonely')\n"
     );
     assert_eq!(
         b.to_json()["unresolved_calls"],
@@ -1532,4 +1540,150 @@ fn unresolved_calls_are_listed_nearest_the_definition_first() {
             "examples/x.rs"
         ]
     );
+}
+
+fn boundaries_with(calls: Vec<(&str, usize, bool)>) -> super::Boundaries {
+    super::Boundaries {
+        name: "lock".to_string(),
+        sites: Vec::new(),
+        unscanned_languages: Vec::new(),
+        skipped_files: 0,
+        files_past_limit: 0,
+        unresolved_paths: 0,
+        calls: Some(
+            calls
+                .into_iter()
+                .map(|(f, line, resolved)| super::CallSite {
+                    file_path: f.to_string(),
+                    line,
+                    resolved,
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Review of b949ba5f: resolution is per function (an edge has no line), so
+/// calls in functions with a resolved call of the name do not show that each
+/// call is resolved. The zero line says what the count shows, no more.
+#[test]
+fn the_zero_line_claims_only_what_a_per_function_rule_shows() {
+    let b = boundaries_with(vec![("src/a.rs", 4, true), ("src/b.rs", 9, true)]);
+    assert_eq!(
+        text_of(&b),
+        "(no dynamic-dispatch site names 'lock'; its 2 calls are all in functions with a resolved call of 'lock')\n"
+    );
+    assert_eq!(
+        b.to_json()["unresolved_calls"],
+        serde_json::json!({"total": 0, "in_resolved_functions": 2})
+    );
+    let b = boundaries_with(vec![("src/a.rs", 4, true)]);
+    assert_eq!(
+        text_of(&b),
+        "(no dynamic-dispatch site names 'lock'; its 1 call is in a function with a resolved call of 'lock')\n"
+    );
+    // The verb agrees with the calls, not the files.
+    let b = boundaries_with(vec![("src/a.rs", 4, false), ("src/a.rs", 9, false)]);
+    assert!(
+        text_of(&b).starts_with("(no dynamic-dispatch site names 'lock')\n2 calls of 'lock' in 1 file have no resolved target;"),
+        "{}",
+        text_of(&b)
+    );
+    let b = boundaries_with(vec![("src/a.rs", 4, false), ("src/a.rs", 9, true)]);
+    assert_eq!(
+        b.to_json()["unresolved_calls"]["in_resolved_functions"],
+        1,
+        "{}",
+        b.to_json()
+    );
+}
+
+/// Two functions on one line: which holds the call is unknown, so it is
+/// resolved only if both are; a call wrongly listed is the cheaper error.
+#[test]
+fn a_call_on_a_line_two_functions_share_is_resolved_only_if_both_are() {
+    let (dir, _db_dir, db) = indexed_project(&[
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        ("src/a.rs", "pub struct A;\nimpl A {\n    pub fn lock(&self) {}\n}\npub struct B;\nimpl B {\n    pub fn lock(&self) {}\n}\n"),
+        ("src/b.rs", "use crate::a::A;\npub fn two() { crate::x::mk().lock() } pub fn one(a: &A) { a.lock() }\npub fn three(a: &A) { a.lock() } pub fn four(a: &A) { a.lock() }\n"),
+        ("Cargo.toml", "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    ]);
+    let edges: Vec<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT s.name FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id WHERE e.relation = 'calls' AND t.name = 'lock' ORDER BY s.name")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(edges, ["four", "one", "three"], "fixture precondition");
+    let b = super::for_empty_result(db.conn(), dir.path(), "lock", &[])
+        .unwrap()
+        .unwrap();
+    let calls: Vec<(usize, bool)> = b
+        .calls
+        .unwrap()
+        .iter()
+        .map(|c| (c.line, c.resolved))
+        .collect();
+    assert_eq!(calls, vec![(2, false), (3, true)]);
+}
+
+/// Only Rust's calls are disclosed (the one language measured); Python and
+/// JS/TS answers stay as 0.166.0 gave them.
+#[test]
+fn python_and_js_definitions_make_no_claim_about_calls() {
+    for (file, src) in [
+        (
+            "a.py",
+            "def lonely():\n    return 7\n\ndef user(o):\n    return o.lonely()\n",
+        ),
+        (
+            "a.js",
+            "function lonely() { return 7; }\nfunction user(o) { return o.lonely(); }\n",
+        ),
+    ] {
+        let (dir, _db_dir, db) = indexed_project(&[(file, src)]);
+        let b = super::for_empty_result(db.conn(), dir.path(), "lonely", &[])
+            .unwrap()
+            .unwrap();
+        assert!(b.calls.is_none(), "{file}");
+        assert_eq!(
+            text_of(&b),
+            "(no dynamic-dispatch site names 'lonely')\n",
+            "{file}"
+        );
+    }
+}
+
+/// A top-level call belongs to its module node, whose edge resolves it
+/// (Python: `main.py`'s `go()` binds `pkg/a.py`'s `go`).
+#[test]
+fn a_top_level_call_is_resolved_by_its_module_edge() {
+    let (dir, _db_dir, db) = indexed_project(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/a.py", "def go():\n    return 1\n"),
+        ("pkg/b.py", "def go():\n    return 2\n"),
+        ("main.py", "from pkg.a import go\n\ngo()\n"),
+    ]);
+    let b = super::scan_project_with(
+        db.conn(),
+        dir.path(),
+        "go",
+        &[("pkg/a.py".to_string(), 1), ("pkg/b.py".to_string(), 1)],
+        &[],
+        None,
+        Some(&["python"]),
+        super::SCAN_TIME_LIMIT,
+    )
+    .unwrap();
+    let calls: Vec<(String, usize, bool)> = b
+        .calls
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.file_path, c.line, c.resolved))
+        .collect();
+    assert_eq!(calls, vec![("main.py".to_string(), 3, true)]);
 }

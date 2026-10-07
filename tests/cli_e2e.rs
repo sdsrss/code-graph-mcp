@@ -12859,7 +12859,40 @@ fn test_cli_empty_answers_list_unresolved_calls_nearest_the_definition() {
     }
     let (stdout, _, _) = run_cli(&project, &["refs", "lonely"]);
     assert!(
-        stdout.contains("(no dynamic-dispatch site or unresolved call names 'lonely')"),
+        stdout.contains("(no dynamic-dispatch site or call names 'lonely')"),
         "{stdout}"
+    );
+}
+
+// Pre-tag review of 0.167.0: `impact --file`'s "Defined in" list said how
+// many files it left out nowhere, while `callgraph`'s ends "(5 of 7 files)";
+// and `deps` on a new file over the size limit gave reasons that did not
+// cover it.
+#[test]
+fn test_cli_defined_in_lists_disclose_the_cap_and_deps_names_the_size_limit() {
+    let mut files: Vec<(String, String)> = (1..=7)
+        .map(|i| (format!("m/m{i}.rs"), "pub fn many_x() {}\n".to_string()))
+        .collect();
+    files.push(("src/z.rs".to_string(), "pub fn z() {}\n".to_string()));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let project = index_project(&refs);
+    for cmd in ["impact", "callgraph"] {
+        let (_, stderr, code) = run_cli(&project, &[cmd, "many_x", "--file", "src/z.rs"]);
+        assert_eq!(code, 1, "{cmd}: {stderr}");
+        assert!(stderr.contains("(5 of 7 files)"), "{cmd}: {stderr}");
+    }
+    let mut big = String::from("use crate::z::z;\n");
+    while big.len() <= 1024 * 1024 {
+        big.push_str("// padding padding padding padding padding padding padding\n");
+    }
+    std::fs::write(project.path().join("src/big.rs"), big).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["deps", "src/big.rs"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("over the size limit") && stderr.contains("incremental-index"),
+        "{stderr}"
     );
 }
