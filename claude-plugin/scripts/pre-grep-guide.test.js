@@ -4435,12 +4435,18 @@ test('index skip rules mirror src/indexer/merkle.rs, src/utils/config.rs and src
   const excluded = /const EXCLUDED: &\[&str\] = &\[([^\]]*)\]/.exec(merkle);
   assert.ok(excluded, 'merkle.rs EXCLUDED');
   assert.deepEqual([...d133r.INDEX_EXCLUDED_DIRS].sort(), [...excluded[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort());
-  // Both index walks skip hidden entries and do not follow links.
+  // Both index walks (and the refresh's scan_would_store) take one walker,
+  // scan_walk_builder: it skips hidden entries and does not follow links.
+  const builder = /fn scan_walk_builder\([\s\S]*?\n\}/.exec(merkle);
+  assert.ok(builder, 'merkle.rs scan_walk_builder');
+  assert.match(builder[0], /WalkBuilder::new\(root\)/, 'scan_walk_builder: WalkBuilder::new(root)');
+  assert.match(builder[0], /\.hidden\(true\)/, 'scan_walk_builder: hidden(true)');
+  assert.doesNotMatch(builder[0], /follow_links|\.ignore\(false\)|\.parents\(false\)/, 'scan_walk_builder: default links and ignore files');
   for (const fn of ['walk_indexable_files', 'scan_directory_cached']) {
     const walk = new RegExp(`pub fn ${fn}\\([\\s\\S]*?\\.build\\(\\)`).exec(merkle);
     assert.ok(walk, fn);
-    assert.match(walk[0], /WalkBuilder::new\(root\)\s*\.hidden\(true\)/, `${fn}: hidden(true)`);
-    assert.doesNotMatch(walk[0], /follow_links|\.ignore\(false\)|\.parents\(false\)/, `${fn}: default links and ignore files`);
+    assert.match(walk[0], /scan_walk_builder\(root\)\s*\.build\(\)/, `${fn}: the shared walker`);
+    assert.doesNotMatch(walk[0], /WalkBuilder::new/, `${fn}: no walker of its own`);
   }
   const config = fsE2e.readFileSync(pathE2e.join(repo, 'src', 'utils', 'config.rs'), 'utf8');
   const body = /pub fn detect_language[\s\S]*?match ext \{([\s\S]*?)_ => None/.exec(config);
