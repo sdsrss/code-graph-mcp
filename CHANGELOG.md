@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.166.0
 
 MCP tools take an absolute path under the project, no spelling of a path
 adds a second copy of a file to the index, and a directory path no longer
@@ -30,7 +30,9 @@ unchanged). Three answers change:
   Windows is the same file. An `ignore_paths` entry of `""` ignores
   nothing; it ignored everything.
 
-To keep 0.165.2's behaviour, pin `@sdsrs/code-graph@0.165.2`.
+To pin back: `npm i -g @sdsrs/code-graph@0.165.2`, or `cargo install
+code-graph-mcp --version 0.165.2`; plugin users can set the version in the
+marketplace entry.
 
 ### Fixed
 
