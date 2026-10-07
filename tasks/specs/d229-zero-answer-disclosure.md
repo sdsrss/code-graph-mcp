@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 2
+status: implemented
+revision: 3
 ---
 
 # D#229 — "0 个调用者"要说明可信度，并给出下一步
@@ -99,18 +99,43 @@ tokio 试点里，`LinkedList::remove` 在库代码里有 12 个调用者，code
 
 按调用写法数量分档，命中率没有单调变化，所以阈值没有用。按同名定义个数分档有规律（1 个定义 4.6%，2–50 个 17–24%，51 个以上 6.9%），但这条规则没有语言层面的依据，只在一个语料上拟合出来，不采用。
 
-性能：393 个名字共 2.07 秒，单个名字 p50 3 ms、p95 16 ms、最大 31 ms（release）。
+性能（评审修复后的最终代码，release）：393 个名字合计 1,484 ms，单个名字 p50 2 ms、p95 12 ms、最大 156 ms（`new`）。R2 那一行是用一个后来删掉的探索性标记测的，`scripts/zero_answer/analyze.py` 只复现 R0 和 R1。
 
 **决定：采用 R1。** 它和 R0 的覆盖率相同（生产口径 100%），少触发 50 次；R2 漏掉 5 个真有调用者的定义。按本文的门槛口径（任何调用者）R1 命中 18.1%、覆盖 86.3%，过线；按更严格的生产口径命中 13.5%，低于 15%。仍然进入付费对照，理由：
 - 不触发时，"0"在 187/187 个方法、24/24 个自由函数上都是对的。"没有未解析的调用"本身就是一个可信的信号。
 - 触发时多花多少轮次、会不会列出错误的调用者，正是对照用例要测的。如果对照显示有害，就不发这部分。
 
-## 输出（实现后）
+## 付费对照（Haiku，2026-10-07，$4.03）
 
-只在答案为空、名字的所有函数定义都属于 Rust、Python、JS/TS 时出现；其它语言的输出不变。
+两组二进制都从源码编译：基线 `914e271e`（md5 9dd14017…），新组 `b949ba5f`（md5 b2228319…），各自建 tokio 工作区。两组按轮交替跑，并发 1，每批开始前按已花的平均成本检查预算。实际单会话平均约 $0.20，高于估算的 $0.175，所以主用例只跑了 2 轮，对照用例 2 轮，共 20 个会话。
 
-- 有未解析调用：`2 calls of 'remove' in 2 files have no resolved target; a caller of this definition may be among them:`，下面列前 5 处 `file:line`，再给 `next: code-graph-mcp grep -w -F remove`。JSON 在 `boundaries.unresolved_calls` 里给 `total`、`files`、`sites`（前 5 个）、`note`。
-- 没有未解析调用：原来那一行变成 `(no dynamic-dispatch site or unresolved call names 'x')`，JSON 是 `"unresolved_calls": {"total": 0}`。
+| 用例 | 基线得分 | 新组得分 | 基线轮次 | 新组轮次 |
+|---|---|---|---|---|
+| linked-list-remove | 0.708（0.833, 0.583） | 0.625（0.5, 0.75） | 56.5 | 50.0 |
+| registration-poll-read-ready | 1.000 | 0.950 | 38.0 | 39.5 |
+| spawn-blocking（不出现披露，两组输入相同） | 0.500 | 0.500 | 7.0 | 37.5 |
+| control-child-try-wait（真没有调用者） | 2/2 NONE | 2/2 NONE | 24.5 | 26.5 |
+| control-tcp-stream-set-ttl（真没有调用者） | 2/2 NONE | 2/2 NONE | 7.5 | 5.5 |
+
+结论：
+- 召回看不出提升。基线 Haiku 在这两个用例上已经靠 grep 接近满分（上一次试点里 linked-list-remove 得 0.0 的情况没有复现），没有可测的空间。
+- 正确性没有受损：两个"真没有调用者"的对照用例，新组看到披露后仍然 4/4 回答 NONE。
+- 轮次和费用无法判断：输入完全相同的 spawn-blocking 两组差了 5 倍，n=2 时这是噪声。
+- 按事先定的规则（"显示有害就不发"）照常发布。理由是它说的是真话，并且"不出现"本身是可信信号（生产口径 0/187）。发版说明写明没有测出收益。
+
+## 评审后的范围（revision 3）
+
+发版前评审（全新子代理）复现了 Python 和 JS/TS 上的问题：f-string 里的调用看不到；顶层调用被当成未解析；没有返回类型的 TypeScript 签名被当成调用。这三种语言也都没有测过命中率。所以这一版**只对 Rust 开启**（`DISCLOSED_CALL_FAMILIES`），Python 和 JS/TS 的输出和 0.166.0 逐字节相同；它们的调用表留在 `scan_calls` 和语料测试里，测过、修好之后再开。
+
+评审还指出，零答案那一行原先说"没有未解析的调用"说过头了：规则是按函数判断的（边上没有行号），一个函数里有一个已解析的同名调用，就会把它的其它同名调用也算成已解析。所以措辞改成只说规则能证明的内容。
+
+## 输出（发布的版本）
+
+只在答案为空、名字的所有函数定义都是 Rust 时出现；其它语言的输出不变。
+
+- 有未解析调用：`2 calls of 'remove' in 2 files have no resolved target; a caller of this definition may be among them:`，下面按离被问的定义由近到远列前 5 处 `file:line`，再给 `next: code-graph-mcp grep -w -F remove`。JSON 在 `boundaries.unresolved_calls` 里给 `total`、`files`、`sites`（前 5 个）、`note`。
+- 完全没有调用写法：原来那一行变成 `(no dynamic-dispatch site or call names 'x')`，JSON 是 `{"total": 0}`。
+- 有调用写法，但都在已经解析过同名调用的函数里：`(no dynamic-dispatch site names 'x'; its N calls are all in functions with a resolved call of 'x')`，JSON 加 `in_resolved_functions`。
 
 ## 不在范围内
 
@@ -120,3 +145,4 @@ tokio 试点里，`LinkedList::remove` 在库代码里有 12 个调用者，code
 # Change log
 
 - revision 2（2026-10-07）：用户批准实现和 $5 对照。补实测结果（R0/R1/R2，两种口径）、选定 R1、写明输出形状。版本号改为 0.167.0。D#232 F8 已修（914e271e）。
+- revision 3（2026-10-07）：付费对照结果（$4.03，20 个会话）；发版前评审后只对 Rust 开启；零答案措辞只说按函数的规则能证明的内容；最终性能数字。
