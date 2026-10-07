@@ -278,10 +278,11 @@ pub fn ensure_file_indexed(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileRefresh {
     /// Nothing to do: unsafe path, pseudo-file, not indexable, never indexed,
-    /// or the bytes still match the index.
+    /// a key the scan would never store, or the bytes still match the index.
     Fresh,
-    /// The file is gone from disk but still has an index row, which would keep
-    /// serving phantom nodes.
+    /// The file is gone from disk — or reachable by this key only through a
+    /// symlink — but still has an index row, which would keep serving phantom
+    /// nodes.
     DropStaleRow,
     /// Dirty. Payload is the on-disk hash, carried through to the indexer so
     /// the file is not hashed a second time.
@@ -332,7 +333,12 @@ pub fn plan_file_refresh(
     let abs_path = project_root.join(rel_path);
 
     // Missing-file path: drop stale row so future queries don't return phantom nodes.
-    if !abs_path.is_file() {
+    // A file reached only through a symlink, or by a spelling other than its
+    // scan key (`src/./a.rs`), counts as missing too (D#240): the scan never
+    // stores that key, and the next incremental pass deletes a row held under
+    // it, so refreshing it would only duplicate the file, or index one from
+    // outside the project, until then.
+    if !crate::indexer::merkle::names_a_scanned_file(project_root, rel_path, false) {
         let exists_in_db: Option<i64> = db
             .conn()
             .query_row("SELECT id FROM files WHERE path = ?1", [rel_path], |row| {
@@ -387,8 +393,16 @@ pub fn plan_file_refresh(
             |row| row.get(0),
         )
         .ok();
-    if stored_hash.is_none() && scope == RefreshScope::IndexedOnly {
-        return Ok(FileRefresh::Fresh);
+    if stored_hash.is_none() {
+        if scope == RefreshScope::IndexedOnly {
+            return Ok(FileRefresh::Fresh);
+        }
+        // About to create a row: the key must also spell every name as the
+        // directory lists it, or a case-insensitive filesystem lets
+        // `SRC/a.rs` in beside `src/a.rs`.
+        if !crate::indexer::merkle::names_a_scanned_file(project_root, rel_path, true) {
+            return Ok(FileRefresh::Fresh);
+        }
     }
 
     // Hashed after the scope check, not before: for `IndexedOnly` an unknown

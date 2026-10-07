@@ -7048,6 +7048,50 @@ app.post('/api/login', handleLogin);
         assert_eq!(prod["test_references_filtered"], 1, "{prod}");
     }
 
+    /// D#240 through the MCP entry: naming a file by a path through an
+    /// in-project symlink, or by a `./` spelling, indexed it a second time
+    /// under that key, and the next by-name lookup answered "Ambiguous
+    /// symbol" between the file and its copy.
+    #[cfg(unix)]
+    #[test]
+    fn test_path_args_through_a_symlink_add_no_second_copy_of_a_file() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/a.rs"),
+            "pub fn d240_target() {}\npub fn d240_caller() { d240_target(); }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(project.path().join("src"), project.path().join("link"))
+            .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let files = |server: &McpServer| {
+            let mut keys: Vec<String> = queries::get_all_file_hashes(server.db().conn())
+                .unwrap()
+                .into_keys()
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(files(&server), ["src/a.rs"]);
+
+        for spelling in ["link/a.rs", "./src/a.rs"] {
+            for tool in ["get_ast_node", "find_references"] {
+                let req = tool_call_json(
+                    tool,
+                    json!({ "symbol_name": "d240_target", "file_path": spelling }),
+                );
+                server.handle_message(&req).unwrap();
+                assert_eq!(files(&server), ["src/a.rs"], "{tool} {spelling}");
+            }
+        }
+        let req = tool_call_json("get_ast_node", json!({ "symbol_name": "d240_target" }));
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(result["name"], "d240_target", "{result}");
+    }
+
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
     /// `direct_callers` and `affected_files` from the same truncatable caller
     /// traversal `get_call_graph` reports `limit_hit` for — and reported them

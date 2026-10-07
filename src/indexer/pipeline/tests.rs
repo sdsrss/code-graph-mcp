@@ -5514,6 +5514,195 @@ fn test_ensure_file_indexed_rejects_out_of_root_path() {
     );
 }
 
+/// D#240: a query-time refresh may index a path only under the key the
+/// indexer's own scan would store for that file. The scan never follows a
+/// symlink (`merkle::symlink_skip_candidate`) and stores each file under one
+/// `/`-joined spelling of its on-disk names, but the refresh indexed ANY
+/// string-safe key whose `is_file()` held. `./src/a.rs`, `src/./a.rs` and
+/// `link/a.rs` (through `link -> src`) each added a second row for one file,
+/// so every symbol in it existed twice and by-name lookups answered
+/// "Ambiguous symbol"; `ext/secret.rs` (through `ext -> <outside dir>`)
+/// indexed a file from outside the project. The next incremental scan
+/// deletes such a row, and the next query naming the spelling adds it back.
+#[test]
+fn test_refresh_adds_no_row_for_a_key_the_scan_never_stores() {
+    let base = TempDir::new().unwrap();
+    let root = base.path().join("proj");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn d240_target() {}\n").unwrap();
+    let outside = base.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.rs"), "pub fn d240_secret() {}\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(root.join("src"), root.join("link")).unwrap();
+        symlink(&outside, root.join("ext")).unwrap();
+        symlink(root.join("src/a.rs"), root.join("alias.rs")).unwrap();
+        symlink(outside.join("secret.rs"), root.join("src/leak.rs")).unwrap();
+    }
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, &root, None, None).unwrap();
+    let keys = |db: &Database| {
+        let mut keys: Vec<String> = get_all_file_hashes(db.conn())
+            .unwrap()
+            .into_keys()
+            .collect();
+        keys.sort();
+        keys
+    };
+    let before = keys(&db);
+    assert_eq!(before, ["src/a.rs"], "the scan stores one key");
+
+    #[allow(unused_mut)]
+    let mut refused = vec![
+        "./src/a.rs",
+        "src/./a.rs",
+        "src/../src/a.rs",
+        "src//a.rs",
+        "src/a.rs/",
+        // Other spellings of `src/a.rs` on a case-insensitive filesystem (the
+        // macOS and Windows CI legs); on a case-sensitive one no such file
+        // exists, so these cannot fail there.
+        "SRC/a.rs",
+        "src/A.rs",
+    ];
+    #[cfg(unix)]
+    refused.extend(["link/a.rs", "ext/secret.rs", "alias.rs", "src/leak.rs"]);
+    #[cfg(windows)]
+    refused.push(r"src\a.rs");
+    // Every spelling is tried before failing, so one run names them all.
+    let mut indexed = Vec::new();
+    for spelling in refused {
+        let did = ensure_file_indexed(&db, &root, spelling, None).unwrap();
+        let after = keys(&db);
+        if did || after != before {
+            indexed.push(format!("{spelling} (re-indexed: {did}, files: {after:?})"));
+            apply_file_refreshes(&db, &root, &[spelling.to_string()], &[], None).unwrap();
+        }
+    }
+    assert!(
+        indexed.is_empty(),
+        "indexed under a non-scan key: {indexed:#?}"
+    );
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "d240_target").unwrap().len(),
+        1,
+        "one node per symbol"
+    );
+    assert!(
+        get_nodes_by_name(db.conn(), "d240_secret")
+            .unwrap()
+            .is_empty(),
+        "a file outside the project must not be indexed"
+    );
+
+    // Not over-blocked: a file the scan would store, new since the index,
+    // is still indexed on demand, under its own key.
+    fs::create_dir_all(root.join("src/deep")).unwrap();
+    fs::write(root.join("src/deep/new.rs"), "pub fn d240_new() {}\n").unwrap();
+    assert!(ensure_file_indexed(&db, &root, "src/deep/new.rs", None).unwrap());
+    assert_eq!(keys(&db), ["src/a.rs", "src/deep/new.rs"]);
+    // And an edit to an indexed file still re-indexes it.
+    fs::write(root.join("src/a.rs"), "pub fn d240_edited() {}\n").unwrap();
+    assert!(ensure_file_indexed(&db, &root, "src/a.rs", None).unwrap());
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "d240_edited").unwrap().len(),
+        1
+    );
+}
+
+/// D#240, the other half: a row an older version created under such a key is
+/// dropped when that key is refreshed again — what the next incremental scan
+/// does to it anyway, since its walk never sees the path.
+#[test]
+fn test_refresh_drops_a_row_stored_under_a_key_the_scan_never_stores() {
+    let project_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn d240_target() {}\n").unwrap();
+    #[allow(unused_mut)]
+    let mut aliases = vec!["./src/a.rs", "src/./a.rs", "src/../src/a.rs", "src//a.rs"];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("src"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("src/a.rs"), root.join("alias.rs")).unwrap();
+        aliases.extend(["link/a.rs", "alias.rs"]);
+    }
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    let hash = crate::indexer::merkle::hash_file(&root.join("src/a.rs")).unwrap();
+
+    let mut kept = Vec::new();
+    for alias in aliases {
+        // The row 0.165.2 wrote for `get_ast_node {file_path: <alias>}`.
+        apply_file_refreshes(&db, root, &[], &[(alias.to_string(), hash.clone())], None).unwrap();
+        assert_eq!(
+            get_nodes_by_name(db.conn(), "d240_target").unwrap().len(),
+            2,
+            "{alias}: fixture: the alias row duplicates the symbol"
+        );
+        let did = ensure_file_indexed(&db, root, alias, None).unwrap();
+        let keys: Vec<String> = get_all_file_hashes(db.conn())
+            .unwrap()
+            .into_keys()
+            .collect();
+        if !did || keys != ["src/a.rs"] {
+            kept.push(format!("{alias} (dropped: {did}, files: {keys:?})"));
+            apply_file_refreshes(&db, root, &[alias.to_string()], &[], None).unwrap();
+        }
+    }
+    assert!(kept.is_empty(), "alias rows kept: {kept:#?}");
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "d240_target").unwrap().len(),
+        1
+    );
+}
+
+/// D#240: a row is created only for a key whose every name the directory
+/// listing holds verbatim — what tells `SRC/a.rs` from `src/a.rs` on a
+/// case-insensitive filesystem. A directory that can be entered but not
+/// listed (mode 0311) is the Linux shape of the same disagreement: `lstat`
+/// reaches the file, the scan cannot list the directory and stores nothing
+/// in it, so neither may the refresh.
+#[cfg(unix)]
+#[test]
+fn test_refresh_creates_no_row_in_a_directory_the_scan_cannot_list() {
+    use std::os::unix::fs::PermissionsExt;
+    let project_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    fs::create_dir_all(root.join("src/hidden")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn d240_target() {}\n").unwrap();
+    fs::write(root.join("src/hidden/x.rs"), "pub fn d240_unlisted() {}\n").unwrap();
+    let hidden = root.join("src/hidden");
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o311)).unwrap();
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(hidden.clone());
+    if fs::read_dir(&hidden).is_ok() {
+        eprintln!("skipped: this user can list a mode-0311 directory (root?)");
+        return;
+    }
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    assert!(
+        root.join("src/hidden/x.rs").is_file(),
+        "fixture: the file is reachable by path"
+    );
+
+    assert!(!ensure_file_indexed(&db, root, "src/hidden/x.rs", None).unwrap());
+    assert!(get_nodes_by_name(db.conn(), "d240_unlisted")
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn test_std_import_prunes_same_named_project_call_phantom() {
     // IDX v53 differential. `use std::mem::swap; swap(&mut a, &mut b)` used to

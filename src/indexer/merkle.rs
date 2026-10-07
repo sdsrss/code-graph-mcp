@@ -312,6 +312,68 @@ fn symlink_skip_candidate(entry: &ignore::DirEntry, root: &Path) -> Option<Strin
     Some(rel_str)
 }
 
+/// True when `rel` names a regular file under `root` by the key the scan above
+/// stores for it: the test a query-time refresh applies before it indexes a
+/// path a caller named (D#240).
+///
+/// The scan walks with `follow_links(false)` and keys each file by
+/// [`normalize_rel_path`] of the names it walked, so a stored key is a
+/// `/`-joined run of on-disk names, with no `.`, `..` or empty segment and no
+/// symlink anywhere below the root. Other spellings still open the same bytes —
+/// `./src/a.rs`, `src/./a.rs`, `link/a.rs` through `link -> src`, `ext/x.rs`
+/// through a link to a directory outside the project — but the scan never
+/// stores them, so indexing one adds a second row for the file, or a row for a
+/// file outside the project.
+///
+/// `exact_names` also requires each segment to appear verbatim in its
+/// directory's listing. On a case-insensitive filesystem (macOS, Windows)
+/// `SRC/a.rs` passes every `lstat`, and only the listing tells it from
+/// `src/a.rs`. That costs a directory read per segment, so callers pay it only
+/// where a row would be created: a key already stored came from the scan, or
+/// from a refresh that paid it.
+pub(crate) fn names_a_scanned_file(root: &Path, rel: &str, exact_names: bool) -> bool {
+    let mut segments = rel.split('/').peekable();
+    let mut dir = root.to_path_buf();
+    while let Some(segment) = segments.next() {
+        // `\` and `:` cannot appear in a Windows file name, and `\` separates
+        // there; on Unix both are ordinary filename bytes the scan does store.
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || (cfg!(windows) && segment.contains(['\\', ':']))
+        {
+            return false;
+        }
+        // Neither lookup follows a symlink: `DirEntry::file_type` and
+        // `symlink_metadata` both describe the link itself.
+        let file_type = if exact_names {
+            std::fs::read_dir(&dir).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .find(|entry| entry.file_name() == std::ffi::OsStr::new(segment))
+                    .and_then(|entry| entry.file_type().ok())
+            })
+        } else {
+            std::fs::symlink_metadata(dir.join(segment))
+                .ok()
+                .map(|meta| meta.file_type())
+        };
+        let Some(file_type) = file_type else {
+            return false;
+        };
+        let walkable = if segments.peek().is_some() {
+            file_type.is_dir()
+        } else {
+            file_type.is_file()
+        };
+        if !walkable {
+            return false;
+        }
+        dir.push(segment);
+    }
+    true
+}
+
 /// One aggregate warn per scan (not per file) so the periodic watcher-driven
 /// rescans don't spam a line per symlink on every pass.
 fn warn_skipped_symlinks(skipped: &[String]) {
