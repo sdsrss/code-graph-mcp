@@ -1,6 +1,72 @@
 # Changelog
 
-## Unreleased
+## 0.167.0
+
+An empty caller answer for a Rust function lists the calls of its name that
+the graph did not resolve, or says there are none; a file selector that holds
+no definition of the symbol is answered as a miss instead of an empty graph;
+and a query no longer indexes a file the index scan skips.
+
+**Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
+unchanged). These answers change:
+
+- When `callgraph`, `impact` or `refs` (MCP `get_call_graph`,
+  `find_references`, `get_ast_node include_impact`) finds no caller of a
+  Rust function, the answer lists up to 5 calls of its name with no
+  resolved target, nearest the definition first, and a `next:` grep. With
+  no call of the name in production Rust code, the line `(no
+  dynamic-dispatch site names 'x')` reads `(no dynamic-dispatch site or call
+  names 'x')`. JSON: `boundaries.unresolved_calls`. Answers for every other
+  language are unchanged.
+- MCP `get_call_graph` and `callgraph --file` answer a file that does not
+  define the symbol, or is not in the index, with an error naming the files
+  that do define it, where they answered an empty caller list or `No call
+  graph results`.
+- A file the index scan skips (ignored by `.gitignore`, `.ignore` or
+  `.git/info/exclude`, hidden, or under `node_modules`, `vendor` or
+  `target`) is answered as not in the index by `deps`, `affected` and MCP
+  tools, where 0.166.0 indexed it until the next incremental index. That
+  includes a file git tracks although `.gitignore` matches it (added with
+  `git add -f`): `affected` lists it under `not_indexed` instead of finding
+  the tests that import it.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.166.0`, or `cargo install
+code-graph-mcp --version 0.166.0`; plugin users can set the version in the
+marketplace entry.
+
+### Added
+
+- An empty caller answer for a Rust function lists the calls of its name the
+  graph did not resolve. A method call on a receiver whose type the resolver
+  cannot infer leaves no edge at all, and the answer said "0" with nothing
+  to show it might be wrong. Now it reads, for example:
+
+  ```
+  (no dynamic-dispatch site names 'remove')
+  32 calls of 'remove' in 24 files have no resolved target; a caller of this definition may be among them:
+    tokio/src/util/linked_list.rs:301
+    …
+    next: code-graph-mcp grep -w -F remove
+  ```
+
+  A call counts when it is `name(`, `.name(` or `::name(` (through a
+  turbofish) in production Rust code, outside test functions and the lines
+  that define the name, inside a function with no call edge to any
+  definition of the name. When every call of the name is in a function the
+  graph did resolve a call of it in, the line says so: `(no
+  dynamic-dispatch site names 'x'; its 2 calls are all in functions with a
+  resolved call of 'x')`.
+
+  Measured on tokio 1.41.1 against rust-analyzer (recipe:
+  `scripts/zero_answer/README.md`): 1,268 methods have no caller edge, and
+  rust-analyzer finds a production caller for 146 of them. The list appears
+  for 1,081 of the 1,268, all 146 among them; where it does not appear, the
+  zero was right for all 187. So most lists are calls of other definitions
+  of the same name: read them as where to look. 393 names scan in 1,484 ms
+  (p95 12 ms, max 156 ms). A Haiku A/B over three tokio caller questions and
+  two with no caller (20 sessions) measured no gain: the baseline already
+  scored 0.71 and 1.0 on the two questions whose answer was empty, and both
+  arms answered the no-caller questions correctly in all 4 sessions each.
 
 ### Fixed
 
@@ -25,11 +91,43 @@
   "Symbol not found in file"` or `"File not found in index"`, `file`, and
   `candidates` with their `node_id`s beside `results: []`. It still exits 1.
 - `deps` given a file that exists but is not in the index (a path through a
-  symlink, or a language the indexer does not parse) answers `File not in
-  index` and exits 1. It answered `No tracked dependencies`, or printed the
+  symlink, a file the index scan skips, or a language the indexer does not
+  parse) answers `File not in index` and exits 1. It answered `No tracked dependencies`, or printed the
   file's import lines as "no tracked dep edges" and exited 0: the answers
   for an indexed file that has none, while `link/a.rs` through `link -> src`
   is `src/a.rs`, which has edges.
+- A query-time refresh no longer indexes a file the index scan skips: one
+  ignored by `.gitignore` (at any level), `.ignore` or `.git/info/exclude`,
+  one inside a hidden directory, or one under `node_modules`, `vendor` or
+  `target`. Naming such a file to `deps`, `affected` or an MCP tool's
+  `file_path` indexed it. The next incremental index deleted the row and the
+  next query added it back, and while it was there its symbols made every
+  same-named symbol ambiguous: on 0.166.0, `deps` on three such files turned
+  `callgraph d_a` from one caller into `Ambiguous symbol 'd_a': 4 matches`.
+  Such a file now answers as not in the index: `deps` with `File not in
+  index`, `affected` with `input file(s) not in index`, MCP tools with `File
+  '…' not found in index`.
+- `impact --file`'s "Defined in" list says when it left files out (`(5 of 7
+  files)`), as `callgraph`'s now does; it stopped at 5 silently.
+
+### Not covered
+
+- Python and JS/TS answers do not list unresolved calls: their call shapes
+  are not measured yet, and the pre-release review found ones they still
+  miss (calls inside Python f-strings, TypeScript signatures without a
+  return type).
+- Whether a call is resolved is decided per function, since an edge
+  records no line: a function with one resolved call of the name counts its
+  other calls of it as resolved, which is why the zero line says "in
+  functions with a resolved call" rather than "resolved".
+- Rust test code under `#[cfg(all(test, …))]`, or in a file declared
+  `#[cfg(test)] mod x;`, is not marked as test, so its calls are listed as
+  production calls.
+- The index scan skips a file git tracks when `.gitignore` matches it.
+- For a file not in the index, `impact`, `refs` and `find_references` still
+  answer `Symbol 'X' not found in file 'F'` and the others `File 'F' not
+  found in index`; `refs` and `find_references` do not list the defining
+  files.
 
 ## 0.166.0
 
