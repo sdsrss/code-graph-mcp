@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- MCP `get_call_graph` given a `file_path` that holds no definition of the
+  symbol says so, as `find_references` and `get_ast_node` do. It answered an
+  empty caller list beside an empty `boundaries` block, which reads as
+  "nothing calls it": for an indexed file that does not define the symbol,
+  for a path the index does not hold (a typo, or a path through a symlink,
+  which 0.166.0 stopped indexing a second time), and for a near-miss name
+  that resolved to a definition in another file. A file without the symbol
+  now gets `Symbol 'X' not found in file 'F'. Defined in: …`, and a file not
+  in the index gets `get_ast_node`'s `File 'F' not found in index`.
+- `callgraph --file` names the same miss, as `impact` and `refs` do, and
+  like `impact` lists the files that define the symbol, instead of `No call
+  graph results for: X`. Its `--json` miss carries `"error": "Symbol not found in file"` (or
+  `"File not found in index"`), `file` and `candidates` beside `results:
+  []`. It still exits 1.
+- `deps` given a file that exists but is not in the index (a path through a
+  symlink, or a language the indexer does not parse) answers `File not in
+  index` and exits 1. It answered `No tracked dependencies`, or printed the
+  file's import lines as "no tracked dep edges" and exited 0: the answers
+  for an indexed file that has none, while `link/a.rs` through `link -> src`
+  is `src/a.rs`, which has edges.
+
 ## 0.166.0
 
 MCP tools take an absolute path under the project, no spelling of a path
