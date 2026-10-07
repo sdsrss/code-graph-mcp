@@ -128,18 +128,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
         }
         Err(CliSymbolSelectionError::QualifiedNotFound) => {
-            if json_mode {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "results": [],
-                        "error": format!("No call graph results for: {}", raw_symbol),
-                        "symbol": raw_symbol,
-                    })
-                );
-            }
-            eprintln!("[code-graph] No call graph results for: {}", raw_symbol);
-            std::process::exit(1);
+            // Only reached with --file (see `select_cli_symbol`).
+            let fp = explicit_file.unwrap_or_default();
+            let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
+            emit_file_selector_miss(&miss, raw_symbol, fp, json_mode)
         }
     };
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
@@ -184,6 +176,15 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // match. Matches MCP get_call_graph behavior.
     let has_edges = result.nodes.iter().any(|n| n.depth > 0);
     let has_seed = result.nodes.iter().any(|n| n.depth == 0);
+    // A --file that holds no definition is a miss (D#253), as in `impact`:
+    // an unindexed file, or a name defined only elsewhere. A name defined
+    // nowhere still gets the fuzzy step below.
+    if let (Some(fp), false, None) = (file_filter, has_seed, &node_target) {
+        let miss = crate::resolve::file_selector_miss(conn, symbol, fp)?;
+        if !matches!(&miss, crate::resolve::FileSelectorMiss::NotDefinedHere(c) if c.is_empty()) {
+            emit_file_selector_miss(&miss, symbol, fp, json_mode);
+        }
+    }
     let mut resolved_symbol: String = symbol.to_string();
     if !(is_exact_qualified
         || node_target.is_some()
@@ -194,6 +195,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
                     result = run_query(&resolved, &node_target)?;
+                    if let Some(fp) = file_filter {
+                        if !result.nodes.iter().any(|n| n.depth == 0) {
+                            let miss = crate::resolve::file_selector_miss(conn, &resolved, fp)?;
+                            emit_file_selector_miss(&miss, &resolved, fp, json_mode);
+                        }
+                    }
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
@@ -516,6 +523,48 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     stdout.write_all(&footer)?;
 
     Ok(())
+}
+
+/// A `--file` that holds no definition of `name`: the sentence MCP
+/// `get_call_graph` gives, and `impact`'s JSON envelope with callgraph's
+/// `results: []`. Exits 1.
+fn emit_file_selector_miss(
+    miss: &crate::resolve::FileSelectorMiss,
+    name: &str,
+    file: &str,
+    json_mode: bool,
+) -> ! {
+    if json_mode {
+        let (error, candidates) = match miss {
+            crate::resolve::FileSelectorMiss::FileNotIndexed => ("File not found in index", vec![]),
+            crate::resolve::FileSelectorMiss::NotDefinedHere(cands) => (
+                "Symbol not found in file",
+                cands
+                    .iter()
+                    .take(crate::resolve::SUGGESTION_CAP)
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name,
+                            "type": c.node_type,
+                            "file_path": c.file_path,
+                        })
+                    })
+                    .collect(),
+            ),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "results": [],
+                "error": error,
+                "symbol": name,
+                "file": file,
+                "candidates": candidates,
+            })
+        );
+    }
+    eprintln!("[code-graph] {}", miss.message(name, file));
+    std::process::exit(1);
 }
 
 /// The lines after the tree: hidden-test counts, traversal limits, hidden

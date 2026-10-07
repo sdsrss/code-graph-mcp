@@ -202,6 +202,17 @@ impl McpServer {
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
         let has_edges = results.nodes.iter().any(|n| n.depth > 0);
         let has_seed = results.nodes.iter().any(|n| n.depth == 0);
+        // A file_path that holds no definition is a miss, not a filter that
+        // legitimately matches nothing (D#253). An unindexed file, or a name
+        // defined only elsewhere, is refused here; a name defined nowhere
+        // still gets the fuzzy step, and its pick is checked below.
+        if let (Some(fp), false) = (file_path, has_seed) {
+            let miss = crate::resolve::file_selector_miss(self.db.conn(), function_name, fp)?;
+            if !matches!(&miss, crate::resolve::FileSelectorMiss::NotDefinedHere(c) if c.is_empty())
+            {
+                return Err(anyhow!(miss.message(function_name, fp)));
+            }
+        }
         if !(has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
@@ -213,6 +224,13 @@ impl McpServer {
                         file_path,
                         min_conf_rank,
                     )?;
+                    if let Some(fp) = file_path {
+                        if !results2.nodes.iter().any(|n| n.depth == 0) {
+                            let miss =
+                                crate::resolve::file_selector_miss(self.db.conn(), &resolved, fp)?;
+                            return Err(anyhow!(miss.message(&resolved, fp)));
+                        }
+                    }
                     return self.format_call_graph_response(
                         &resolved,
                         direction,

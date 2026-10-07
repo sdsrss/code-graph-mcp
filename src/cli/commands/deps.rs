@@ -58,6 +58,35 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     let conn = ctx.db.conn();
 
     let deps = queries::get_import_tree(conn, file_path, direction, depth)?;
+    // A file that exists but is not in the index (D#253): reached through a
+    // symlink, or in a language the indexer does not parse. It answered "No
+    // tracked dependencies" or printed its import lines as "no tracked dep
+    // edges", the answers for an indexed file that has none, while
+    // `link/a.rs` through `link -> src` is `src/a.rs` with its edges.
+    if deps.is_empty()
+        && ctx.project_root.join(file_path).is_file()
+        && !queries::file_is_indexed(conn, file_path)?
+    {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "file": file_path,
+                    "depends_on": [],
+                    "depended_by": [],
+                    "error": "File not in index",
+                })
+            );
+        }
+        let msg = format!(
+            "[code-graph] File not in index: {file_path} (the file exists, but the index does not hold it under this path, for example a path through a symlink or a language the indexer does not parse) \u{2014} Read it directly"
+        );
+        if json_mode {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+        anyhow::bail!(msg);
+    }
     if deps.is_empty() {
         // Barrel / index-file fallback — scan source for re-export / import lines.
         // Rust `mod.rs` with only `pub mod X;` has no tracked edges in the graph.

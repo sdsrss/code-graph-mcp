@@ -249,6 +249,75 @@ pub fn detect_same_file_ambiguity(
     Ok((cands.len() > 1).then_some(cands))
 }
 
+/// Why a file selector found no definition of a name.
+pub enum FileSelectorMiss {
+    /// The index holds no file at that path: a mistyped path, a path through
+    /// a symlink, or a file the indexer does not parse.
+    FileNotIndexed,
+    /// The file is indexed and does not define the name; these are the
+    /// definitions that do (empty when no file defines it under that exact
+    /// name).
+    NotDefinedHere(Vec<NameCandidate>),
+}
+
+impl FileSelectorMiss {
+    /// The MCP sentence: `get_ast_node`'s for an unindexed file,
+    /// `find_references`' for a file without the symbol, plus the files
+    /// that define it.
+    pub fn message(&self, name: &str, file_path: &str) -> String {
+        match self {
+            Self::FileNotIndexed => format!(
+                "File '{file_path}' not found in index. Check that the path is relative to the project root and the file has been indexed."
+            ),
+            Self::NotDefinedHere(cands) => {
+                let mut msg = format!("Symbol '{name}' not found in file '{file_path}'.");
+                let files = Self::defining_files(cands);
+                if !files.is_empty() {
+                    msg.push_str(&format!(" Defined in: {}.", files.join(", ")));
+                }
+                msg
+            }
+        }
+    }
+
+    /// The distinct files in `cands`, sorted, at most [`SUGGESTION_CAP`].
+    pub fn defining_files(cands: &[NameCandidate]) -> Vec<&str> {
+        let mut files: Vec<&str> = cands.iter().map(|c| c.file_path.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        files.truncate(SUGGESTION_CAP);
+        files
+    }
+}
+
+/// Classify a file selector that holds no definition of `name` (D#253).
+///
+/// `get_call_graph` answered such a selector with `callers: []` beside an
+/// empty `boundaries` block, which reads as "nothing calls it", while
+/// `find_references`, `get_ast_node` and CLI `impact` / `refs` refused the
+/// same input. Call only after the filtered lookup came back empty.
+pub fn file_selector_miss(
+    conn: &Connection,
+    name: &str,
+    file_path: &str,
+) -> Result<FileSelectorMiss> {
+    if !queries::file_is_indexed(conn, file_path)? {
+        return Ok(FileSelectorMiss::FileNotIndexed);
+    }
+    let elsewhere = queries::get_nodes_with_files_by_symbol(conn, name)?
+        .into_iter()
+        .filter(|nf| is_selectable_definition(&nf.file_path) && nf.file_path != file_path)
+        .map(|nf| NameCandidate {
+            name: nf.node.name,
+            file_path: nf.file_path,
+            node_type: nf.node.node_type,
+            node_id: nf.node.id,
+            start_line: nf.node.start_line,
+        })
+        .collect();
+    Ok(FileSelectorMiss::NotDefinedHere(elsewhere))
+}
+
 /// True when `file_path` names a definition the caller can actually act on.
 ///
 /// The `<external>` pseudo-file holds sentinel nodes for imports that bind

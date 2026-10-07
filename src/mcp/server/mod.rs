@@ -3103,6 +3103,102 @@ function handleLogin(req: Request) {
         );
     }
 
+    /// D#253: a `file_path` that holds no definition of the symbol is a miss,
+    /// not a filter that legitimately matches nothing. Each miss below answered
+    /// `callers: []` beside an empty `boundaries` block while `d_a` has two
+    /// callers; `find_references` and `get_ast_node` refused the same input.
+    #[test]
+    fn test_get_call_graph_file_path_without_the_symbol_is_a_miss() {
+        let project_dir = TempDir::new().unwrap();
+        let src = project_dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("a.rs"),
+            "pub fn d_a() -> i32 { 1 }\npub fn caller_one() -> i32 { d_a() + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("b.rs"),
+            "use crate::a::d_a;\npub fn caller_two() -> i32 { d_a() * 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("c.rs"), "pub fn lonely() -> i32 { 7 }\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+        let call = |args: serde_json::Value| -> (bool, String) {
+            let resp = server
+                .handle_message(&tool_call_json("get_call_graph", args))
+                .unwrap()
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            (
+                parsed["result"]["isError"].as_bool().unwrap_or(false),
+                parsed["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+
+        // Control: the defining file answers both callers.
+        let (is_error, text) = call(json!({
+            "symbol_name": "d_a", "file_path": "src/a.rs", "direction": "callers"
+        }));
+        assert!(
+            !is_error && text.contains("caller_one") && text.contains("caller_two"),
+            "got: {text}"
+        );
+
+        // An indexed file that does not define it: one exact definition
+        // elsewhere (the fuzzy step resolved it back to the same name and
+        // re-ran the same filter).
+        let (is_error, text) = call(json!({
+            "symbol_name": "d_a", "file_path": "src/b.rs", "direction": "callers"
+        }));
+        assert!(
+            is_error,
+            "a file without the symbol must be refused, got: {text}"
+        );
+        assert!(
+            text.contains("Symbol 'd_a' not found in file 'src/b.rs'")
+                && text.contains("Defined in: src/a.rs"),
+            "got: {text}"
+        );
+
+        // A file the index does not hold at all.
+        let (is_error, text) = call(json!({
+            "symbol_name": "d_a", "file_path": "nope/a.rs", "direction": "callers"
+        }));
+        assert!(is_error, "an unindexed file must be refused, got: {text}");
+        assert!(
+            text.contains("File 'nope/a.rs' not found in index"),
+            "got: {text}"
+        );
+
+        // A fuzzy name that resolves to a definition in another file.
+        let (is_error, text) = call(json!({
+            "symbol_name": "caller_tw", "file_path": "src/c.rs", "direction": "callers"
+        }));
+        assert!(is_error, "got: {text}");
+        assert!(
+            text.contains("Symbol 'caller_two' not found in file 'src/c.rs'")
+                && text.contains("Defined in: src/b.rs"),
+            "got: {text}"
+        );
+
+        // Controls: a fuzzy name resolving inside the named file still
+        // answers, and a definition with no callers is still an answer.
+        let (is_error, text) = call(json!({
+            "symbol_name": "caller_tw", "file_path": "src/b.rs", "direction": "callees"
+        }));
+        assert!(!is_error && text.contains("\"d_a\""), "got: {text}");
+        let (is_error, text) = call(json!({
+            "symbol_name": "lonely", "file_path": "src/c.rs", "direction": "callers"
+        }));
+        assert!(!is_error && text.contains("\"callers\":[]"), "got: {text}");
+    }
+
     /// C5: the dead-code summary says a non-Rust candidate list is experimental.
     #[test]
     fn test_find_dead_code_marks_non_rust_candidates_experimental() {

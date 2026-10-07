@@ -5290,6 +5290,60 @@ fn test_cli_similar_no_embeddings_remedy_matches_binary_features() {
     );
 }
 
+// D#253: a `--file` that holds no definition of the symbol is a miss, named as
+// one with the files that do define it, as `impact` and `refs` name it. It
+// printed "No call graph results", which reads like "nothing calls it".
+#[test]
+fn test_cli_callgraph_file_without_the_symbol_names_the_miss() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--file", "src/utils.ts"],
+    );
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(
+        stderr.contains("Symbol 'validateToken' not found in file 'src/utils.ts'")
+            && stderr.contains("Defined in: src/auth.ts"),
+        "got: {stderr}"
+    );
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "validateToken",
+            "--file",
+            "src/utils.ts",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "Symbol not found in file", "got: {v}");
+    assert_eq!(v["file"], "src/utils.ts", "got: {v}");
+    assert_eq!(v["results"], serde_json::json!([]), "got: {v}");
+    assert_eq!(v["candidates"][0]["file_path"], "src/auth.ts", "got: {v}");
+
+    // A file the index does not hold at all.
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--file", "src/nope.ts"],
+    );
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(
+        stderr.contains("File 'src/nope.ts' not found in index"),
+        "got: {stderr}"
+    );
+
+    // Control: the defining file still answers.
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--file", "src/auth.ts"],
+    );
+    assert_eq!(code, 0, "got: {stdout}");
+    assert!(stdout.contains("handleLogin"), "got: {stdout}");
+}
+
 // callgraph is ISSUE-006's fifth surface (pre-tag review SF-1): a just-added
 // symbol must get the stale-index hint here too — but ONLY when the symbol is
 // genuinely absent. A symbol that exists with zero edges reaches the same
@@ -5319,7 +5373,11 @@ fn test_cli_callgraph_miss_hints_stale_index_only_for_absent_symbol() {
         &["callgraph", "hashPassword", "--file", "src/api.ts"],
     );
     assert_eq!(code2, 1, "empty scoped result exits 1: {stderr2}");
-    assert!(stderr2.contains("No call graph results"), "got: {stderr2}");
+    // Since D#253 this miss names the file instead of "No call graph results".
+    assert!(
+        stderr2.contains("not found in file 'src/api.ts'"),
+        "got: {stderr2}"
+    );
     assert!(
         !stderr2.contains("incremental-index"),
         "symbol present in index must NOT get the reindex hint, got: {stderr2}"
@@ -6258,6 +6316,50 @@ fn test_cli_deps_directory_points_to_overview() {
             .contains("director"),
         "deps --json directory error should mention directory; got {v:?}"
     );
+}
+
+// D#253: a file that exists but is not in the index answered "No tracked
+// dependencies", the answer for an indexed file that has none.
+#[test]
+fn test_cli_deps_file_not_in_index_says_so() {
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src/notes.txt"),
+        "import { validateToken } from './auth';\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["deps", "src/notes.txt"]);
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(
+        stderr.contains("File not in index: src/notes.txt"),
+        "got: {stderr}"
+    );
+    assert!(!stderr.contains("No tracked dependencies"), "got: {stderr}");
+    let (stdout, _, code) = run_cli(&project, &["deps", "src/notes.txt", "--json"]);
+    assert_eq!(code, 1, "got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "File not in index", "got: {v}");
+
+    // Control: an indexed file with no dependency edges keeps its answer.
+    let (_, stderr, code) = run_cli(&project, &["deps", "src/utils.ts"]);
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(stderr.contains("No tracked dependencies"), "got: {stderr}");
+}
+
+// D#253, through a symlink: `link/api.ts` printed its import lines as "no
+// tracked dep edges" (exit 0) while `src/api.ts` depends on `src/auth.ts`.
+#[cfg(unix)]
+#[test]
+fn test_cli_deps_path_through_a_symlink_is_not_in_index() {
+    let project = setup_indexed_project();
+    std::os::unix::fs::symlink("src", project.path().join("link")).unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["deps", "link/api.ts"]);
+    assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stderr.contains("File not in index: link/api.ts"),
+        "got: {stderr}"
+    );
+    assert!(!stdout.contains("no tracked dep edges"), "got: {stdout}");
 }
 
 /// A project with a call chain `top`/`side` → `middle` → `bottom`, so `middle`
