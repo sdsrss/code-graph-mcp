@@ -458,6 +458,44 @@ mod tests {
         assert_eq!(count_export_filtered_out(conn, "").unwrap(), 2);
     }
 
+    /// `_` and `%` in a path are literal on both legs of the boundary match:
+    /// escaped in the `LIKE 'dir/%'` leg, where `_` would match any byte
+    /// (`src_x` covering `srcAx/`), and NOT escaped in the `=` leg, where an
+    /// escape would make a file whose name holds one match nothing.
+    #[test]
+    fn module_exports_take_like_metacharacters_literally() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        for (path, name) in [
+            ("src_x/d.rs", "under_src_x"),
+            ("srcAx/e.rs", "under_srcax"),
+            ("p%q/f.rs", "under_percent"),
+            ("pzzq/g.rs", "under_pzzq"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, 'h', 0, 'rust', 0)",
+                [path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (last_insert_rowid(), 'function', ?1, ?1, 1, 2, '')",
+                [name],
+            )
+            .unwrap();
+        }
+        let names = |prefix: &str| -> Vec<String> {
+            get_module_exports(conn, prefix)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(names("src_x"), ["under_src_x"]);
+        assert_eq!(names("src_x/d.rs"), ["under_src_x"]);
+        assert_eq!(names("p%q"), ["under_percent"]);
+        assert_eq!(names("p%q/f.rs"), ["under_percent"]);
+    }
+
     #[test]
     fn test_get_module_exports() {
         let (db, _tmp) = test_db();

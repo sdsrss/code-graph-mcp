@@ -29,7 +29,7 @@ pub struct DeadCodeArgs {
     /// Show full code snippets (default: compact, names only)
     #[arg(long)]
     pub no_compact: bool,
-    /// Exclude a path prefix (repeatable; default: claude-plugin/, benches/)
+    /// Exclude a directory or file (repeatable; default: claude-plugin/, benches/)
     #[arg(long)]
     pub ignore: Vec<String>,
     /// Disable the default --ignore prefixes
@@ -88,8 +88,10 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     // list, not user input, so `claude-plugin/` must keep meaning the tree at
     // the root even when the caller stands in `src/`.
     //
-    // A trailing separator is preserved across the resolution: `--ignore tmp/`
-    // must not silently widen into a prefix that also matches `tmpfiles/`.
+    // A trailing separator is preserved across the resolution, so the
+    // reported list keeps the spelling given. The match itself stops at a path
+    // boundary either way (`path_is_under`): `--ignore tmp` does not cover
+    // `tmpfiles/`.
     let resolve_ignore = |raw: &str| -> Result<String> {
         let trailing = raw.ends_with('/') || raw.ends_with('\\');
         let resolved = normalize_user_path(project_root, raw)?;
@@ -106,7 +108,7 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // value (`--ignore ""`) reaches this from anywhere.
         if resolved.is_empty() {
             anyhow::bail!(
-                "--ignore '{raw}' resolves to the project root \u{2014} it would exclude every file. Pass a prefix inside the project (e.g. --ignore src/generated)."
+                "--ignore '{raw}' resolves to the project root \u{2014} it would exclude every file. Pass a path inside the project (e.g. --ignore src/generated)."
             );
         }
         Ok(if trailing && !resolved.ends_with('/') {

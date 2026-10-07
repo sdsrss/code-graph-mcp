@@ -7,7 +7,7 @@ use super::*;
     about = "Module overview (symbols grouped by file and type)"
 )]
 pub struct OverviewArgs {
-    /// Path prefix to scan ('.' = whole project; absolute paths under root OK)
+    /// Directory or file to scan ('.' = whole project; absolute paths under root OK)
     pub path: String,
     /// JSON output
     #[arg(long)]
