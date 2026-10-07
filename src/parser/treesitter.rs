@@ -454,36 +454,148 @@ pub fn extract_nodes_from_tree(
 ) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
     let config = LanguageConfig::for_language(language);
+    let root = tree.root_node();
+    let file_is_test = config.has_test_attributes && inner_cfg_requires_test(&root, source);
     extract_nodes(
-        tree.root_node(),
+        root,
         source,
         language,
         &config,
         None,
         &mut nodes,
         0,
-        false,
+        file_is_test,
     );
     nodes
 }
 
-/// Check if a node has a preceding `#[cfg(test)]` or `#[test]` attribute.
+/// Check if a node has a preceding test attribute: a harness attribute
+/// (`#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = …)]`) or a `#[cfg(…)]`
+/// whose predicate requires `test`. Inner attributes are skipped: they gate their
+/// container, which [`inner_cfg_requires_test`] reads.
 fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {
         match s.kind() {
-            "attribute_item" | "inner_attribute_item" => {
-                let text = node_text(&s, source);
-                if text.contains("cfg(test)") || text == "#[test]" || text.contains("::test]") {
-                    return true;
+            "attribute_item" => {
+                if let Some(attr) = attribute_of(&s) {
+                    let path = attribute_path(&attr, source);
+                    if path.rsplit("::").next().map(str::trim) == Some("test")
+                        || cfg_attribute_requires_test(&attr, source)
+                    {
+                        return true;
+                    }
                 }
             }
-            "line_comment" | "block_comment" | "comment" => {}
+            "inner_attribute_item" | "line_comment" | "block_comment" | "comment" => {}
             _ => break,
         }
         sibling = s.prev_sibling();
     }
     false
+}
+
+/// True when a file or an inline module body opens with an inner
+/// `#![cfg(…)]` whose predicate requires `test`: the whole container is then
+/// test code, not just the item after the attribute.
+fn inner_cfg_requires_test(container: &tree_sitter::Node, source: &str) -> bool {
+    let mut cursor = container.walk();
+    let found = container
+        .named_children(&mut cursor)
+        .take_while(|c| {
+            matches!(
+                c.kind(),
+                "inner_attribute_item" | "line_comment" | "block_comment"
+            )
+        })
+        .filter(|c| c.kind() == "inner_attribute_item")
+        .any(|item| attribute_of(&item).is_some_and(|a| cfg_attribute_requires_test(&a, source)));
+    found
+}
+
+/// The `attribute` inside a `#[…]` or `#![…]` item.
+fn attribute_of<'t>(item: &tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    let mut cursor = item.walk();
+    let attr = item
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "attribute");
+    attr
+}
+
+/// An attribute's path (`cfg`, `tokio::test`), whitespace and all.
+fn attribute_path<'s>(attr: &tree_sitter::Node, source: &'s str) -> &'s str {
+    attr.named_child(0)
+        .filter(|p| Some(*p) != attr.child_by_field_name("arguments"))
+        .map_or("", |p| node_text(&p, source))
+}
+
+/// Whether `attr` is `cfg(P)` with a predicate `P` that can only hold in a build
+/// with `test` set. `cfg_attr(test, …)` gates nothing and is not one.
+fn cfg_attribute_requires_test(attr: &tree_sitter::Node, source: &str) -> bool {
+    if attribute_path(attr, source).trim() != "cfg" {
+        return false;
+    }
+    match attr
+        .child_by_field_name("arguments")
+        .map(|args| cfg_predicates(&args, source))
+        .as_deref()
+    {
+        Some([only]) => only.requires_test(),
+        _ => false,
+    }
+}
+
+/// A `cfg` predicate, reduced to what decides whether it requires `test`.
+/// `Other` is every predicate that can hold without `test` (`not(…)`,
+/// `feature = "x"`, `loom`, and any shape this reader does not know), so a
+/// misread predicate errs toward production code, never toward test code.
+enum CfgPredicate {
+    Test,
+    All(Vec<CfgPredicate>),
+    Any(Vec<CfgPredicate>),
+    Other,
+}
+
+impl CfgPredicate {
+    /// The Rust reference's semantics: `all` holds only if every member does, so
+    /// one member requiring `test` is enough; `any` requires `test` only if every
+    /// member does (and an empty `any()` never holds at all).
+    fn requires_test(&self) -> bool {
+        match self {
+            Self::Test => true,
+            Self::All(members) => members.iter().any(Self::requires_test),
+            Self::Any(members) => !members.is_empty() && members.iter().all(Self::requires_test),
+            Self::Other => false,
+        }
+    }
+}
+
+/// The comma-separated predicates of a `( … )` token tree: `name`,
+/// `name = "value"`, or `name( … )`. Anything else is `Other`.
+fn cfg_predicates(tree: &tree_sitter::Node, source: &str) -> Vec<CfgPredicate> {
+    let mut cursor = tree.walk();
+    let children: Vec<_> = tree.children(&mut cursor).collect();
+    let inner = match children.as_slice() {
+        [open, inner @ .., close] if open.kind() == "(" && close.kind() == ")" => inner,
+        _ => return Vec::new(),
+    };
+    inner
+        .split(|c| c.kind() == ",")
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| match segment {
+            [name] if name.kind() == "identifier" && node_text(name, source) == "test" => {
+                CfgPredicate::Test
+            }
+            [name, args] if name.kind() == "identifier" && args.kind() == "token_tree" => {
+                match node_text(name, source) {
+                    "all" => CfgPredicate::All(cfg_predicates(args, source)),
+                    "any" => CfgPredicate::Any(cfg_predicates(args, source)),
+                    _ => CfgPredicate::Other,
+                }
+            }
+            _ => CfgPredicate::Other,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,6 +622,7 @@ fn extract_nodes(
         let is_test_mod = mod_name.as_deref() == Some("tests") || has_test_attribute(&node, source);
         // Recurse into the module body with updated test context
         if let Some(body) = node.child_by_field_name("body") {
+            let is_test_mod = is_test_mod || inner_cfg_requires_test(&body, source);
             for i in 0..body.named_child_count() {
                 if let Some(child) = body.named_child(i) {
                     extract_nodes(
@@ -4781,5 +4894,138 @@ class Context {
                 "missing ({n}, {q}, method) in {got:?}"
             );
         }
+    }
+
+    fn rust_is_test_by_name(code: &str) -> std::collections::HashMap<String, bool> {
+        parse_code(code, "rust")
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.is_test))
+            .collect()
+    }
+
+    fn assert_rust_is_test(code: &str, expected: &[(&str, bool)]) {
+        let got = rust_is_test_by_name(code);
+        let wrong: Vec<_> = expected
+            .iter()
+            .filter(|(name, want)| got.get(*name) != Some(want))
+            .map(|(name, want)| format!("{name}: want {want}, got {:?}", got.get(*name)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}\nall nodes: {got:?}");
+    }
+
+    // D#272: an item is test code when its `cfg` predicate can only hold with
+    // `test` set — the Rust reference's `all` / `any` / `not` semantics, not a
+    // substring search. tokio gates ten inline `mod test` blocks on
+    // `cfg(all(test, not(loom)))`, and their helpers counted as production.
+    #[test]
+    fn rust_cfg_predicate_that_requires_test_marks_is_test() {
+        let code = r#"
+#[cfg(all(test, not(loom)))]
+mod test {
+    fn helper_in_all_mod() {}
+}
+#[cfg(all(loom, test))]
+fn all_test_second() {}
+#[cfg(any(test, all(test, loom)))]
+fn any_every_member_requires_test() {}
+#[cfg( test )]
+fn spaced_cfg_test() {}
+#[cfg(test)]
+fn plain_cfg_test() {}
+#[cfg(all(test, target_has_atomic = "64"))]
+impl Holder {
+    fn method_in_test_impl(&self) {}
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn tokio_test_with_args() {}
+#[tokio::test]
+async fn tokio_test_bare() {}
+#[test]
+fn plain_test() {}
+
+#[cfg(any(test, fuzzing))]
+fn test_or_fuzzing() {}
+#[cfg(not(test))]
+fn not_test() {}
+#[cfg(all())]
+fn all_empty() {}
+#[cfg(any())]
+fn any_empty() {}
+#[cfg(feature = "test")]
+fn feature_named_test() {}
+#[cfg_attr(test, derive(Debug))]
+struct CfgAttrOnly;
+#[doc = "only built under cfg(test)"]
+fn doc_mentions_cfg_test() {}
+#[instrument(test)]
+fn other_attribute_with_test_argument() {}
+fn production() {}
+"#;
+        assert_rust_is_test(
+            code,
+            &[
+                ("helper_in_all_mod", true),
+                ("all_test_second", true),
+                ("any_every_member_requires_test", true),
+                ("spaced_cfg_test", true),
+                ("plain_cfg_test", true),
+                ("method_in_test_impl", true),
+                ("tokio_test_with_args", true),
+                ("tokio_test_bare", true),
+                ("plain_test", true),
+                ("test_or_fuzzing", false),
+                ("not_test", false),
+                ("all_empty", false),
+                ("any_empty", false),
+                ("feature_named_test", false),
+                ("CfgAttrOnly", false),
+                ("doc_mentions_cfg_test", false),
+                ("other_attribute_with_test_argument", false),
+                ("production", false),
+            ],
+        );
+    }
+
+    // An inner `#![cfg(…)]` gates its whole container — the file, or the module
+    // whose body it opens — not just the item that happens to follow it.
+    #[test]
+    fn rust_inner_cfg_attribute_gates_the_whole_container() {
+        let file_gated = r#"//! Test support.
+#![cfg(test)]
+#![allow(dead_code)]
+use std::fmt;
+fn first_after_inner() {}
+fn second_after_inner() {}
+"#;
+        assert_rust_is_test(
+            file_gated,
+            &[("first_after_inner", true), ("second_after_inner", true)],
+        );
+
+        let module_gated = r#"
+mod helpers {
+    #![cfg(all(test, feature = "x"))]
+    fn h1() {}
+    fn h2() {}
+}
+mod loom_only {
+    #![cfg(loom)]
+    fn l1() {}
+}
+fn outside() {}
+"#;
+        assert_rust_is_test(
+            module_gated,
+            &[
+                ("h1", true),
+                ("h2", true),
+                ("l1", false),
+                ("outside", false),
+            ],
+        );
+
+        let not_test_file = "#![cfg(not(loom))]\nfn a() {}\nfn b() {}\n";
+        assert_rust_is_test(not_test_file, &[("a", false), ("b", false)]);
     }
 }

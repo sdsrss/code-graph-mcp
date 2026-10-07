@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is
+test code, so it no longer counts as a production caller.
+
+**Upgrading: every index rebuilds once, automatically, on first use.**
+`INDEX_VERSION` goes 113 → 114 because Rust items change their test flag
+(below); nodes, edges and confidence labels are unchanged. Nothing to run.
+**`impact` and `callgraph` on Rust code can show fewer production callers:**
+a caller inside such a block now counts as a test caller (`callgraph
+--include-tests` shows it). To pin back: `npm i -g @sdsrs/code-graph@0.167.0`,
+or `cargo install code-graph-mcp --version 0.167.0`; plugin users can set the
+version in the marketplace entry. An older binary leaves a v114 index intact
+and warns instead of rebuilding it; delete `.code-graph/index.db*` after
+pinning back to get its graph back.
+
+### Rust test code behind `cfg(all(test, …))`
+
+The index decided whether a Rust item is test code by searching its
+attributes' text for `cfg(test)`. `#[cfg(all(test, not(loom)))]`, which tokio
+puts on its inline `mod test` blocks, did not match, so the helpers and mocks
+inside counted as production code. On tokio, `impact unconstrained` reported
+2 direct callers, one of them `get`, a helper in such a block; it now reports
+1, with 2 tests affected. A `#[doc = "…cfg(test)…"]` attribute matched,
+although it gates nothing.
+
+The attribute is now read as a `cfg` predicate under the Rust reference's
+rules: an item is test code when its predicate can only hold with `test` set
+— `test`, `all(…)` with such a member, or `any(…)` whose members all are.
+`any(test, fuzzing)`, `not(test)` and `feature = "test"` stay production. An
+inner `#![cfg(…)]` gates its whole file or inline module, where it marked
+at most the item right after it. `#[tokio::test(flavor = "multi_thread")]`
+counts like `#[tokio::test]`, which it did not.
+
+Measured against 0.167.0 on the same checkouts: on tokio-1.41.1, 152 of
+9,575 nodes become test code (27 under `src/`, 125 under `tests/`
+directories, most of them `#[tokio::test(flavor = …)]` functions), and no
+node stops being test code; all 32,081 edges, with their confidence labels,
+are identical. On this repository nothing changes (7,083 nodes, 16,179
+edges). A full index of tokio takes 2.52 s against 2.54 s (medians of five
+interleaved runs). On a fixture with a call in a helper inside
+`#[cfg(all(test, not(loom)))] mod test`, these answers change:
+
+- `impact` counts the helper as a test caller (1 direct caller where 0.167.0
+  said 2) and `callgraph` hides it with the test callers.
+- When `refs` finds no caller, the list of calls with no resolved target
+  leaves out the helper's call, as it already did for `#[cfg(test)]` code.
+- CLI `search` no longer returns the helper, as it already did not return
+  `#[cfg(test)]` code; `show` and `grep` still find it.
+
+### Not covered
+
+- An out-of-line module declared `#[cfg(test)] mod mocks;` does not make
+  `mocks.rs` test code: the attribute sits in another file. A file named
+  `tests.rs` or under a `tests/` directory is test code by its path, which
+  covers every such module in this repository; tokio has 3 that are not
+  (`fs/mocks.rs`, `fs/open_options/mock_open_options.rs`,
+  `loom/mocked.rs`).
+- Test attributes other than `#[test]` and `#[….::test]`, such as
+  `#[rstest]` or `#[test_case(…)]`, are not recognised.
+
 ## 0.167.0
 
 An empty caller answer for a Rust function lists calls of its name that the
