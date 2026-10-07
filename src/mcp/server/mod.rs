@@ -7080,6 +7080,11 @@ app.post('/api/login', handleLogin);
             [&'a str; 3],
             &'a str,
         );
+        let abs_dotted = project
+            .path()
+            .join("src/./a.rs")
+            .to_string_lossy()
+            .into_owned();
         let file = ["src/a.rs", abs_file.as_str(), "./src/a.rs"];
         let dir = ["src", abs_dir.as_str(), "./src"];
         let cases: Vec<Case> = vec![
@@ -7148,6 +7153,32 @@ app.post('/api/login', handleLogin);
                 assert_eq!(got, want, "{tool}: {spelling} must answer like {relative}");
             }
         }
+
+        // A `.` / `..` segment names the same file too, and must not reach the
+        // freshness refresh as a new key: it indexed `src/./a.rs` as a second
+        // file, after which every by-name query for its symbols was ambiguous.
+        let want = server
+            .dispatch_tool("get_ast_node", &json!({ "symbol_name": "d228_target" }))
+            .unwrap();
+        for spelling in [abs_dotted.as_str(), "src/./a.rs", "src/../src/a.rs"] {
+            let got = server
+                .dispatch_tool(
+                    "get_ast_node",
+                    &json!({ "symbol_name": "d228_target", "file_path": spelling }),
+                )
+                .unwrap_or_else(|e| panic!("get_ast_node with {spelling}: {e}"));
+            assert_eq!(got, want, "{spelling} must answer like the by-name lookup");
+        }
+        let indexed: Vec<String> = server
+            .db
+            .conn()
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(indexed, vec!["src/a.rs"], "no spelling may add a file row");
     }
 
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,

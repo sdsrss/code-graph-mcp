@@ -93,29 +93,61 @@ pub(super) fn normalize_path_arg_on(
             });
         if under_root {
             // A separator must follow the root: `/repo-old/a.rs` is not under
-            // `/repo`.
+            // `/repo`. A rest that climbs out of the root keeps the absolute
+            // spelling, for `normalize_path_arg`'s filesystem fallback.
             match &path[root.len()..] {
                 "" | "/" => return ".".to_string(),
-                rest if rest.starts_with('/') => return strip_dot_slash(&rest[1..]),
+                rest if rest.starts_with('/') => {
+                    return resolve_dot_segments(&rest[1..]).unwrap_or(path);
+                }
                 _ => {}
             }
         }
     }
-    strip_dot_slash(&path)
+    if looks_absolute(&path) {
+        return path;
+    }
+    resolve_dot_segments(&path).unwrap_or(path)
 }
 
-/// `./src/a.rs` → `src/a.rs`; `./` alone → `.`, which tools that take a
-/// directory read as the whole project (an empty path is rejected there).
-fn strip_dot_slash(path: &str) -> String {
-    let mut s = path;
-    while let Some(rest) = s.strip_prefix("./") {
-        s = rest;
+/// Resolve `.` and `..` segments in a root-relative path, lexically, so every
+/// spelling of a file reaches the index as its stored key. A different key
+/// is not just a miss: the freshness refresh indexed `src/./a.rs` as a second
+/// file, and every symbol in it then existed twice. `./` alone becomes `.`,
+/// which `module_overview` reads as the whole project. A trailing `/` is kept,
+/// because directory tools match `files.path` against the path as a prefix.
+/// `None` when a `..` climbs above the root: that path stays as it was and
+/// misses. A path with no `.` or `..` segment is returned unchanged.
+fn resolve_dot_segments(rel: &str) -> Option<String> {
+    if !rel.split('/').any(|seg| seg == "." || seg == "..") {
+        return Some(rel.to_string());
     }
-    if s.is_empty() && !path.is_empty() {
-        ".".to_string()
-    } else {
-        s.to_string()
+    let mut kept: Vec<&str> = Vec::new();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                kept.pop()?;
+            }
+            name => kept.push(name),
+        }
     }
+    if kept.is_empty() {
+        return Some(".".to_string());
+    }
+    let mut out = kept.join("/");
+    if rel.ends_with('/') {
+        out.push('/');
+    }
+    Some(out)
+}
+
+/// A path the index can never hold as a key: rooted (`/x`, and `//host` once
+/// separators are unified) or drive-qualified (`C:/x`, `C:`). The drive test
+/// is the CLI's own (`utils::paths`), lexical so the Windows branch runs on
+/// every host.
+fn looks_absolute(path: &str) -> bool {
+    path.starts_with('/') || crate::utils::paths::needs_lexical_windows_rejection(path, false)
 }
 
 #[cfg(test)]
@@ -161,12 +193,46 @@ mod normalize_path_arg_tests {
         for (raw, want) in cases {
             assert_eq!(normalize_path_arg_on(raw, unix, false), want, "{raw}");
         }
-        // Not under the root: unchanged, so the lookup misses as it always did.
+        // `.` and `..` segments resolve to the stored key. Left as they were,
+        // `src/./a.rs` missed the index and the freshness refresh then indexed
+        // it as a SECOND file, so every symbol in it existed twice.
+        let dots: [(&str, &str); 9] = [
+            ("/home/u/repo/src/./a.rs", "src/a.rs"),
+            ("/home/u/repo/src/../src/a.rs", "src/a.rs"),
+            ("src/./a.rs", "src/a.rs"),
+            ("src/../src/a.rs", "src/a.rs"),
+            ("src/sub/..", "src"),
+            ("src/..", "."),
+            ("./src/", "src/"),
+            ("src/./", "src/"),
+            ("src/../lib/", "lib/"),
+        ];
+        for (raw, want) in dots {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), want, "{raw}");
+        }
+        // Look-alikes that are ordinary names, kept as they are.
+        for raw in [
+            ".../a.rs",
+            "..a/b.rs",
+            "a/.b/c.rs",
+            "a../b.rs",
+            "src/",
+            "src",
+        ] {
+            assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
+        }
+        // Not under the root, or climbing out of it: unchanged, so the lookup
+        // misses as it always did (an absolute one still gets the filesystem
+        // fallback in `normalize_path_arg`).
         for raw in [
             "/home/u/repo-old/src/a.rs",
             "/home/u/rep",
             "/etc/passwd",
             "../x.rs",
+            "src/../../x.rs",
+            "a/b/../../..",
+            "/home/u/repo/../repo/src/a.rs",
+            "/home/u/repo/..",
         ] {
             assert_eq!(normalize_path_arg_on(raw, unix, false), raw, "{raw}");
         }
@@ -193,6 +259,19 @@ mod normalize_path_arg_tests {
         assert_eq!(
             normalize_path_arg_on(r"C:\Users\u\repo2\a.rs", win, true),
             "C:/Users/u/repo2/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r"C:\Users\u\repo\src\.\a.rs", win, true),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_path_arg_on(r".\src\..\lib\a.rs", win, true),
+            "lib/a.rs"
+        );
+        // Outside the root it is left alone, `..` and all.
+        assert_eq!(
+            normalize_path_arg_on(r"D:\x\..\a.rs", win, true),
+            "D:/x/../a.rs"
         );
     }
 
