@@ -695,7 +695,7 @@ fn print_help() {
     println!("    --impact            Show impact summary (show; alias: --include-impact)");
     println!("    --context-lines N   Surrounding source lines (show; default: 0)");
     println!("    --min-lines N       Min lines to report (dead-code; default: 3)");
-    println!("    --ignore <prefix>   Exclude path prefix (dead-code; repeatable; default: claude-plugin/, benches/)");
+    println!("    --ignore <path>     Exclude a directory or file (dead-code; repeatable; default: claude-plugin/, benches/)");
     println!("    --no-ignore         Disable default --ignore prefixes (dead-code)");
     println!(
         "    --relation <type>   Filter: {} (refs)",

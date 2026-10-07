@@ -231,14 +231,14 @@ const EXPORT_VISIBLE_PREDICATE: &str = "(
 /// test symbols and belong in neither.
 pub fn count_export_filtered_out(conn: &Connection, dir_prefix: &str) -> Result<i64> {
     use crate::domain::REL_EXPORTS;
-    let prefix_pattern = format!("{}%", escape_like(dir_prefix));
+    let (path_exact, path_pattern) = super::helpers::path_under_sql_params(dir_prefix);
     // DISTINCT on the same (qualified_name, file_path) key `get_module_exports`
     // dedups by, so the withheld count and the shown set are in one unit.
     let sql = format!(
         "SELECT COUNT(DISTINCT COALESCE(n.qualified_name, n.name) || char(31) || f.path)
          FROM nodes n
          JOIN files f ON f.id = n.file_id
-         WHERE f.path LIKE ?1 ESCAPE '\\'
+         WHERE (f.path = ?4 OR f.path LIKE ?1 ESCAPE '\\')
            AND n.type != 'module'
            AND n.name != '<module>'
            AND NOT {test_filter}
@@ -250,7 +250,12 @@ pub fn count_export_filtered_out(conn: &Connection, dir_prefix: &str) -> Result<
     // ?2 is unused by this query but the spliced predicate is written against
     // ?3; bind a placeholder so the numbering matches the text.
     let n: i64 = stmt.query_row(
-        rusqlite::params![&prefix_pattern, rusqlite::types::Null, REL_EXPORTS],
+        rusqlite::params![
+            &path_pattern,
+            rusqlite::types::Null,
+            REL_EXPORTS,
+            &path_exact
+        ],
         |row| row.get(0),
     )?;
     Ok(n)
@@ -283,8 +288,7 @@ pub fn export_filter_note(hidden: i64) -> String {
 /// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
     use crate::domain::{REL_CALLS, REL_EXPORTS};
-    let escaped_prefix = escape_like(dir_prefix);
-    let prefix_pattern = format!("{}%", escaped_prefix);
+    let (path_exact, path_pattern) = super::helpers::path_under_sql_params(dir_prefix);
 
     // Per-file export semantics (decided per file, NOT globally over the prefix):
     //   - a file that declares explicit exports (ESM `export` → REL_EXPORTS edges)
@@ -320,7 +324,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
                AND {prod_where}
              GROUP BY e2.target_id
          ) cc ON cc.target_id = n.id
-         WHERE f.path LIKE ?1 ESCAPE '\\'
+         WHERE (f.path = ?4 OR f.path LIKE ?1 ESCAPE '\\')
            AND n.type != 'module'
            AND n.name != '<module>'
            AND n.is_test = 0
@@ -330,7 +334,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        rusqlite::params![&prefix_pattern, REL_CALLS, REL_EXPORTS],
+        rusqlite::params![&path_pattern, REL_CALLS, REL_EXPORTS, &path_exact],
         |row| {
             Ok(ModuleExport {
                 node_id: row.get(0)?,
@@ -391,6 +395,69 @@ mod tests {
     use super::super::helpers::test_db;
     use super::*;
 
+    /// A directory prefix covers that directory, not a sibling sharing its name
+    /// prefix: `src` is not `src2/` and not `src.rs`. `LIKE 'src%'` matched both,
+    /// so `overview src` / `module_overview src` listed their symbols too.
+    #[test]
+    fn module_exports_stop_at_a_path_boundary() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        for path in ["src/a.ts", "src2/b.ts", "src/c.rs", "src.rs"] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, 'h', 0, 'x', 0)",
+                [path],
+            )
+            .unwrap();
+        }
+        // An ESM file shows its exported symbol and withholds the other.
+        for (file_id, stem) in [(1, "a"), (2, "b")] {
+            let node = |ty: &str, name: String| {
+                conn.execute(
+                    "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (?1, ?2, ?3, ?3, 1, 2, '')",
+                    rusqlite::params![file_id, ty, name],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            };
+            let exported = node("function", format!("{stem}_exported"));
+            let module = node("module", stem.to_string());
+            node("function", format!("{stem}_private"));
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'exports')",
+                [module, exported],
+            )
+            .unwrap();
+        }
+        for (file_id, name) in [(3, "c_fn"), (4, "srcrs_fn")] {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (?1, 'function', ?2, ?2, 1, 2, '')",
+                rusqlite::params![file_id, name],
+            )
+            .unwrap();
+        }
+        let names = |prefix: &str| {
+            let mut names: Vec<String> = get_module_exports(conn, prefix)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("src"), ["a_exported", "c_fn"]);
+        assert_eq!(names("src/"), ["a_exported", "c_fn"]);
+        assert_eq!(names("src2"), ["b_exported"]);
+        assert_eq!(names("src/a.ts"), ["a_exported"]);
+        assert_eq!(
+            names(""),
+            ["a_exported", "b_exported", "c_fn", "srcrs_fn"],
+            "an empty prefix is the whole project (module_overview `.`)"
+        );
+        assert_eq!(count_export_filtered_out(conn, "src").unwrap(), 1);
+        assert_eq!(count_export_filtered_out(conn, "src2").unwrap(), 1);
+        assert_eq!(count_export_filtered_out(conn, "").unwrap(), 2);
+    }
+
     #[test]
     fn test_get_module_exports() {
         let (db, _tmp) = test_db();
@@ -434,7 +501,7 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Helper', 'Helper', 6, 8, 'class Helper {}')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'secret', 'Helper.secret', 7, 7, 'secret() {}')", []).unwrap();
 
-        let names: Vec<String> = get_module_exports(conn, "src/models")
+        let names: Vec<String> = get_module_exports(conn, "src/models.ts")
             .unwrap()
             .iter()
             .map(|e| e.name.clone())
@@ -484,7 +551,7 @@ mod tests {
         )
         .unwrap();
 
-        let render_qns: Vec<String> = get_module_exports(conn, "src/widgets")
+        let render_qns: Vec<String> = get_module_exports(conn, "src/widgets.ts")
             .unwrap()
             .iter()
             .filter(|e| e.name == "render")
@@ -527,12 +594,12 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'secret', 'Helper.secret', 7, 7, 'secret() {}')", []).unwrap();
 
         assert_eq!(
-            get_module_exports(conn, "src/models").unwrap().len(),
+            get_module_exports(conn, "src/models.ts").unwrap().len(),
             2,
             "Animal + Animal.speak are the public half"
         );
         assert_eq!(
-            count_export_filtered_out(conn, "src/models").unwrap(),
+            count_export_filtered_out(conn, "src/models.ts").unwrap(),
             2,
             "Helper + Helper.secret are the withheld half — without this count the \
              one-line output read as the whole file"
@@ -557,8 +624,8 @@ mod tests {
                 rusqlite::params![ty, name],
             ).unwrap();
         }
-        assert_eq!(get_module_exports(conn, "src/lib").unwrap().len(), 3);
-        assert_eq!(count_export_filtered_out(conn, "src/lib").unwrap(), 0);
+        assert_eq!(get_module_exports(conn, "src/lib.rs").unwrap().len(), 3);
+        assert_eq!(count_export_filtered_out(conn, "src/lib.rs").unwrap(), 0);
     }
 
     #[test]
@@ -642,12 +709,12 @@ mod tests {
             .unwrap();
         }
 
-        let run1: Vec<String> = get_module_exports(conn, "src/target")
+        let run1: Vec<String> = get_module_exports(conn, "src/target.py")
             .unwrap()
             .iter()
             .map(|e| e.name.clone())
             .collect();
-        let run2: Vec<String> = get_module_exports(conn, "src/target")
+        let run2: Vec<String> = get_module_exports(conn, "src/target.py")
             .unwrap()
             .iter()
             .map(|e| e.name.clone())

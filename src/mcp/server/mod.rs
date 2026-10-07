@@ -7235,6 +7235,60 @@ app.post('/api/login', handleLogin);
         assert_eq!(indexed, vec!["src/a.rs"], "no spelling may add a file row");
     }
 
+    /// A directory path covers that directory, not its siblings that share a
+    /// name prefix: `src` is not `src2/`. `module_overview` listed `src2/`'s
+    /// symbols under `src`, and `find_dead_code ignore_paths: ["src"]` hid
+    /// `src2/`'s dead code too, answering a false "No dead code". The CLI had
+    /// it for relative and absolute spellings alike; D#228's mapping of
+    /// `<root>/src` and `./src` onto `src` carried it into MCP's.
+    #[test]
+    fn test_directory_paths_stop_at_a_path_boundary() {
+        let project = TempDir::new().unwrap();
+        for dir in ["src", "src2"] {
+            std::fs::create_dir_all(project.path().join(dir)).unwrap();
+        }
+        std::fs::write(
+            project.path().join("src/a.rs"),
+            "fn bnd_src_dead() {\n    let x = 1;\n    let _ = x;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("src2/b.rs"),
+            "fn bnd_src2_dead() {\n    let x = 1;\n    let _ = x;\n}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let root = project.path().to_string_lossy();
+        let mut wrong = Vec::new();
+        for spelling in [
+            "src".to_string(),
+            "src/".to_string(),
+            "./src".to_string(),
+            format!("{root}/src"),
+        ] {
+            let overview = server
+                .dispatch_tool("module_overview", &json!({ "path": spelling }))
+                .unwrap()
+                .to_string();
+            if !overview.contains("bnd_src_dead") || overview.contains("bnd_src2_dead") {
+                wrong.push(format!("module_overview {spelling}: {overview}"));
+            }
+            let dead = server
+                .dispatch_tool(
+                    "find_dead_code",
+                    &json!({ "ignore_paths": [spelling], "min_lines": 1 }),
+                )
+                .unwrap()
+                .to_string();
+            if dead.contains("bnd_src_dead") || !dead.contains("bnd_src2_dead") {
+                wrong.push(format!("find_dead_code ignore_paths {spelling}: {dead}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// CORE-11's MCP half. `get_ast_node include_impact` derives `risk_level`,
     /// `direct_callers` and `affected_files` from the same truncatable caller
     /// traversal `get_call_graph` reports `limit_hit` for — and reported them

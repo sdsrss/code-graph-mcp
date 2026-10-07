@@ -507,7 +507,11 @@ pub fn dead_code_report(
     let pre_count = raw.len();
     let filtered: Vec<DeadCodeResult> = raw
         .into_iter()
-        .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+        .filter(|r| {
+            !ignore_prefixes
+                .iter()
+                .any(|p| super::helpers::path_is_under(&r.file_path, p))
+        })
         .collect();
     let mut ignored_count = pre_count - filtered.len();
 
@@ -531,9 +535,11 @@ pub fn dead_code_report(
             1,
             DEAD_CODE_SCAN_LIMIT,
         )?;
-        let (kept, ignored_short): (Vec<_>, Vec<_>) = probe
-            .into_iter()
-            .partition(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)));
+        let (kept, ignored_short): (Vec<_>, Vec<_>) = probe.into_iter().partition(|r| {
+            !ignore_prefixes
+                .iter()
+                .any(|p| super::helpers::path_is_under(&r.file_path, p))
+        });
         ignored_count += ignored_short.len();
         kept.len()
     } else {
@@ -2362,6 +2368,69 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'orphan_short', 'orphan_short', 7, 8, 'fn orphan_short() {}')", []).unwrap();
         // orphan in an ignored path (vendor/)
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'vendor_fn', 'vendor_fn', 1, 6, 'fn vendor_fn() {}')", []).unwrap();
+    }
+
+    /// An ignore path covers that directory or file, not a sibling sharing its
+    /// name prefix. `starts_with("src")` also ignored `src2/` and `src.rs`, and
+    /// `dead-code --ignore src` answered "No dead code found" over dead code in
+    /// `src2/`. Both filter sites: the visible list, and the probe that counts
+    /// candidates below `min_lines` when nothing is visible.
+    #[test]
+    fn dead_code_report_ignore_paths_stop_at_a_path_boundary() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        for path in ["src/a.rs", "src2/b.rs", "src.rs"] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, 'h', 0, 'rust', 0)",
+                [path],
+            )
+            .unwrap();
+        }
+        // Five-line orphans for the visible list, two-line ones for the probe.
+        for (file_id, name, lines) in [
+            (1, "in_src", 5),
+            (2, "in_src2", 5),
+            (3, "in_srcrs", 5),
+            (1, "short_src", 2),
+            (2, "short_src2", 2),
+        ] {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (?1, 'function', ?2, ?2, 10, 9 + ?3, '')",
+                rusqlite::params![file_id, name, lines],
+            )
+            .unwrap();
+        }
+        let visible = |ignore: &[&str]| {
+            let ignore: Vec<String> = ignore.iter().map(|p| p.to_string()).collect();
+            let rep = dead_code_report(conn, None, None, false, 3, &ignore).unwrap();
+            let mut names: Vec<String> = rep.items.into_iter().map(|r| r.name).collect();
+            names.sort();
+            (names.join(" "), rep.ignored_count)
+        };
+        let all = "in_src in_src2 in_srcrs".to_string();
+        let outside_src = ("in_src2 in_srcrs".to_string(), 1);
+        assert_eq!(visible(&["src"]), outside_src);
+        assert_eq!(visible(&["src/"]), outside_src);
+        assert_eq!(visible(&["src/a.rs"]), outside_src);
+        assert_eq!(
+            visible(&["src/a"]),
+            (all.clone(), 0),
+            "not a file-name prefix"
+        );
+        // Nothing is ignored by an entry naming no path; `""` used to ignore all.
+        assert_eq!(visible(&[""]), (all.clone(), 0));
+        assert_eq!(visible(&["/"]), (all, 0));
+
+        // The probe: every candidate below the threshold, none visible.
+        conn.execute("DELETE FROM nodes WHERE name LIKE 'in_%'", [])
+            .unwrap();
+        let rep = dead_code_report(conn, None, None, false, 3, &["src".to_string()]).unwrap();
+        assert!(rep.items.is_empty());
+        assert_eq!(
+            (rep.hidden_below_threshold, rep.ignored_count),
+            (1, 1),
+            "short_src2 is below the threshold, short_src is ignored"
+        );
     }
 
     #[test]
