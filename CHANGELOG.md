@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+MCP tools take an absolute path under the project, and no spelling of a
+path adds a second copy of a file to the index.
+
+**Upgrading.** Nothing to run, and no index rebuilds (`INDEX_VERSION` is
+unchanged). An MCP tool given an absolute path under the project root, a
+leading `./`, or `.` / `..` segments that stay inside the root now answers
+for that file or directory instead of "not found". A path that goes through
+a symlink (`link/a.rs` where `link` points at `src`) is answered "not found"
+by MCP tools and by `affected` / `deps`, where 0.165.2 indexed the file a
+second time under that path. To keep 0.165.2's behaviour, pin
+`@sdsrs/code-graph@0.165.2`.
+
+### Fixed
+
+- A path that reaches a file through a symlink, or spells it differently
+  from the indexer's own scan, no longer adds a second `files` row for it.
+  When a tool was given such a path, the query-time refresh indexed it under
+  that spelling: `src/./a.rs`, `./src/a.rs` (MCP), `link/a.rs` through
+  `link -> src`, or a symlinked file. Every symbol in the file then existed
+  twice: `show` printed both copies, and `callgraph` / `refs` answered
+  "Ambiguous symbol … 2 matches". Through a link to a directory outside
+  the project (`ext/secret.rs`) it indexed a file from outside the
+  project. Reached by MCP `file_path` / `path` arguments and by the file
+  arguments of `affected` and `deps`; with 0.165.2, `affected link/a.rs`
+  added `link/a.rs` and `affected <root>/ext/secret.rs` added
+  `ext/secret.rs`.
+  The refresh now indexes a path only under the key the scan stores: names
+  joined by `/`, no `.`, `..` or empty segment, no symlink below the
+  project root, and, for a file not yet indexed, each name spelled as its
+  directory lists it (on macOS and Windows that keeps `SRC/a.rs` out
+  beside `src/a.rs`). A row an older version stored under such a path is
+  dropped the next time the path is refreshed; the next incremental index
+  already dropped it.
+- MCP tools that take a path accept an absolute path under the project
+  root, a leading `./`, and `.` / `..` segments that stay inside the root,
+  mapping them onto the stored path. Haiku sent absolute paths in 2 of its
+  22 MCP calls in the 0.165.1 tokio pilot, and every path-taking tool
+  answered "not found" or an empty result. The mapping is by string only: a
+  path outside the root, or one that reaches the root through a symlink, is
+  left as given and misses as before. A path ending in `/.` or `/..` stays a
+  directory, so `src/.` does not also match `src2/`.
+
+### Not covered
+
+- A path through a symlink is answered "not found" without saying why;
+  symlinked sources are still not indexed at all (the scan does not follow
+  links).
+- On a case-insensitive filesystem, a wrong-case spelling of an indexed file
+  (`SRC/a.rs`) misses instead of answering for `src/a.rs`.
+- `callgraph`, `impact` and `get_ast_node include_impact` still fold two
+  same-named callers in one file into one (29 of 4,433 tokio call pairs, as
+  in 0.165.2).
+- An answer of 0 callers is still given without saying how far to trust it
+  (`tasks/specs/d229-zero-answer-disclosure.md`).
+
 ## 0.165.2
 
 `refs` and `find_references` list every caller they have an edge for, and
