@@ -338,7 +338,7 @@ pub fn plan_file_refresh(
     // stores that key, and the next incremental pass deletes a row held under
     // it, so refreshing it would only duplicate the file, or index one from
     // outside the project, until then.
-    if !crate::indexer::merkle::names_a_scanned_file(project_root, rel_path, false) {
+    if !crate::indexer::merkle::names_a_scanned_file(project_root, rel_path) {
         let exists_in_db: Option<i64> = db
             .conn()
             .query_row("SELECT id FROM files WHERE path = ?1", [rel_path], |row| {
@@ -397,10 +397,11 @@ pub fn plan_file_refresh(
         if scope == RefreshScope::IndexedOnly {
             return Ok(FileRefresh::Fresh);
         }
-        // About to create a row: the key must also spell every name as the
-        // directory lists it, or a case-insensitive filesystem lets
-        // `SRC/a.rs` in beside `src/a.rs`.
-        if !crate::indexer::merkle::names_a_scanned_file(project_root, rel_path, true) {
+        // About to create a row: the scan must store this very key. It spells
+        // every name as the directory lists it (or a case-insensitive
+        // filesystem lets `SRC/a.rs` in beside `src/a.rs`), and its walker
+        // skips ignored, hidden and build-directory files (D#262).
+        if !crate::indexer::merkle::scan_would_store(project_root, rel_path) {
             return Ok(FileRefresh::Fresh);
         }
     }

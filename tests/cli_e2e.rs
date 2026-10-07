@@ -6371,6 +6371,21 @@ fn test_cli_deps_file_not_in_index_says_so() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["error"], "File not in index", "got: {v}");
 
+    // D#262: a file the index scan skips is not indexed on demand either; it
+    // was, and its symbols then made every same-named one ambiguous.
+    let pkg = project.path().join("node_modules/pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("index.ts"), "export function formatDate() {}\n").unwrap();
+    let (_, stderr, code) = run_cli(&project, &["deps", "node_modules/pkg/index.ts"]);
+    assert_eq!(code, 1, "got: {stderr}");
+    assert!(
+        stderr.contains("File not in index: node_modules/pkg/index.ts"),
+        "got: {stderr}"
+    );
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "formatDate"]);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(!stderr.contains("Ambiguous"), "got: {stderr}");
+
     // Control: an indexed file with no dependency edges keeps its answer.
     let (_, stderr, code) = run_cli(&project, &["deps", "src/utils.ts"]);
     assert_eq!(code, 1, "got: {stderr}");

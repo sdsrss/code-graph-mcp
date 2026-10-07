@@ -5613,6 +5613,86 @@ fn test_refresh_adds_no_row_for_a_key_the_scan_never_stores() {
     );
 }
 
+/// D#262: the scan also stores no key for a file its walker filters out —
+/// ignored by `.gitignore` (at any level), `.ignore` or `.git/info/exclude`,
+/// inside a hidden directory, or under `node_modules` / `vendor` / `target` —
+/// but the refresh indexed any such file a caller named. One `deps` on each
+/// turned a unique name into "Ambiguous symbol … 4 matches" (0.166.0) until
+/// the next incremental scan deleted the rows, and the next query re-added
+/// them.
+#[test]
+fn test_refresh_adds_no_row_for_a_file_the_scan_filters_out() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    // `.gitignore` applies inside a git repository only.
+    fs::create_dir_all(root.join(".git/info")).unwrap();
+    fs::write(root.join(".git/info/exclude"), "src/excluded.rs\n").unwrap();
+    fs::write(root.join(".gitignore"), "src/gen.rs\nbuild/\n").unwrap();
+    fs::write(root.join(".ignore"), "src/skip.rs\n").unwrap();
+    fs::create_dir_all(root.join("src/sub")).unwrap();
+    fs::write(root.join("src/sub/.gitignore"), "local.rs\n").unwrap();
+    let decoy = "pub fn d262_x() {}\n";
+    fs::write(root.join("src/a.rs"), decoy).unwrap();
+    let filtered = [
+        "src/gen.rs",
+        "build/out.rs",
+        "src/skip.rs",
+        "src/excluded.rs",
+        "src/sub/local.rs",
+        ".hidden/x.rs",
+        "node_modules/pkg/index.js",
+        "vendor/v.rs",
+        "target/debug/t.rs",
+    ];
+    for rel in filtered {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let src = if rel.ends_with(".js") {
+            "export function d262_x() {}\n"
+        } else {
+            decoy
+        };
+        fs::write(path, src).unwrap();
+    }
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+    let keys = |db: &Database| {
+        let mut keys: Vec<String> = get_all_file_hashes(db.conn())
+            .unwrap()
+            .into_keys()
+            .collect();
+        keys.sort();
+        keys
+    };
+    // The scan's own verdict, so the fixture cannot pass by filtering nothing.
+    let before = keys(&db);
+    assert_eq!(before, ["src/a.rs"], "the scan stores one key");
+
+    let mut indexed = Vec::new();
+    for rel in filtered {
+        let did = ensure_file_indexed(&db, root, rel, None).unwrap();
+        let after = keys(&db);
+        if did || after != before {
+            indexed.push(format!("{rel} (re-indexed: {did}, files: {after:?})"));
+            apply_file_refreshes(&db, root, &[rel.to_string()], &[], None).unwrap();
+        }
+    }
+    assert!(
+        indexed.is_empty(),
+        "indexed a file the scan filters out: {indexed:#?}"
+    );
+    assert_eq!(get_nodes_by_name(db.conn(), "d262_x").unwrap().len(), 1);
+
+    // Not over-blocked: new files the scan would store, beside ignored ones
+    // and under a directory with its own `.gitignore`, are still indexed.
+    fs::write(root.join("src/b.rs"), "pub fn d262_b() {}\n").unwrap();
+    fs::write(root.join("src/sub/kept.rs"), "pub fn d262_kept() {}\n").unwrap();
+    assert!(ensure_file_indexed(&db, root, "src/b.rs", None).unwrap());
+    assert!(ensure_file_indexed(&db, root, "src/sub/kept.rs", None).unwrap());
+    assert_eq!(keys(&db), ["src/a.rs", "src/b.rs", "src/sub/kept.rs"]);
+}
+
 /// D#240, the other half: a row an older version created under such a key is
 /// dropped when that key is refreshed again — what the next incremental scan
 /// does to it anyway, since its walk never sees the path.

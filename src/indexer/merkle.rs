@@ -325,13 +325,12 @@ fn symlink_skip_candidate(entry: &ignore::DirEntry, root: &Path) -> Option<Strin
 /// stores them, so indexing one adds a second row for the file, or a row for a
 /// file outside the project.
 ///
-/// `exact_names` also requires each segment to appear verbatim in its
-/// directory's listing. On a case-insensitive filesystem (macOS, Windows)
-/// `SRC/a.rs` passes every `lstat`, and only the listing tells it from
-/// `src/a.rs`. That costs a directory read per segment, so callers pay it only
-/// where a row would be created: a key already stored came from the scan, or
-/// from a refresh that paid it.
-pub(crate) fn names_a_scanned_file(root: &Path, rel: &str, exact_names: bool) -> bool {
+/// `lstat` only, so on a case-insensitive filesystem (macOS, Windows)
+/// `SRC/a.rs` passes too: only a directory listing tells it from `src/a.rs`.
+/// [`scan_would_store`] reads the listings, and the ignore rules, where a row
+/// would be created; a key already stored came from the scan, or from a
+/// refresh that paid that check.
+pub(crate) fn names_a_scanned_file(root: &Path, rel: &str) -> bool {
     let mut segments = rel.split('/').peekable();
     let mut dir = root.to_path_buf();
     while let Some(segment) = segments.next() {
@@ -344,20 +343,10 @@ pub(crate) fn names_a_scanned_file(root: &Path, rel: &str, exact_names: bool) ->
         {
             return false;
         }
-        // Neither lookup follows a symlink: `DirEntry::file_type` and
-        // `symlink_metadata` both describe the link itself.
-        let file_type = if exact_names {
-            std::fs::read_dir(&dir).ok().and_then(|entries| {
-                entries
-                    .flatten()
-                    .find(|entry| entry.file_name() == std::ffi::OsStr::new(segment))
-                    .and_then(|entry| entry.file_type().ok())
-            })
-        } else {
-            std::fs::symlink_metadata(dir.join(segment))
-                .ok()
-                .map(|meta| meta.file_type())
-        };
+        // `symlink_metadata` describes a link itself; it does not follow it.
+        let file_type = std::fs::symlink_metadata(dir.join(segment))
+            .ok()
+            .map(|meta| meta.file_type());
         let Some(file_type) = file_type else {
             return false;
         };
@@ -416,6 +405,59 @@ pub(crate) fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     Ok(hash_files_parallel(&walk_indexable_files(root)?))
 }
 
+/// The walker both scans use: hidden entries skipped, and every ignore file the
+/// `ignore` crate reads (`.gitignore` at each level inside a git repository,
+/// `.ignore`, the global gitignore and `.git/info/exclude`) applied. One
+/// builder, so [`scan_would_store`] cannot drift from the scans it mirrors.
+fn scan_walk_builder(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true) // skip hidden files
+        .git_ignore(true) // respect .gitignore
+        .git_global(true)
+        .git_exclude(true);
+    builder
+}
+
+/// The filters both scans apply to a file the walker yields, by its key.
+fn scan_keeps_key(rel_str: &str) -> bool {
+    !(rel_str == ".git" || rel_str.starts_with(".git/") || is_excluded_build_dir(rel_str))
+        && detect_language(rel_str).is_some()
+}
+
+/// True when the scan would store `rel` as a key: [`names_a_scanned_file`]
+/// (one on-disk spelling, no symlink), each name spelled as its directory
+/// lists it, and not filtered out by the walker or [`scan_keeps_key`]. The
+/// test a query-time refresh applies before it creates a row (D#240, D#262).
+///
+/// It walks the scan's own walker down `rel`'s directories only, so it reads
+/// one directory, and any ignore file in it, per segment. Callers pay that
+/// only where a row would be created.
+///
+/// D#262: the refresh checked spelling only and indexed any file a caller
+/// named. A gitignored file, one in a hidden directory or one under
+/// `node_modules` got a row the next incremental scan deleted, and while it
+/// lived its symbols made same-named ones ambiguous.
+pub(crate) fn scan_would_store(root: &Path, rel: &str) -> bool {
+    if !names_a_scanned_file(root, rel) || !scan_keeps_key(rel) {
+        return false;
+    }
+    // Component-wise and byte-exact, so `SRC/a.rs` does not follow the
+    // walker's `src` on a case-insensitive filesystem.
+    let target = root.join(rel);
+    scan_walk_builder(root)
+        .filter_entry(move |entry| target.starts_with(entry.path()))
+        .build()
+        .flatten()
+        .any(|entry| {
+            entry.file_type().is_some_and(|ft| ft.is_file())
+                && entry
+                    .path()
+                    .strip_prefix(root)
+                    .is_ok_and(|r| normalize_rel_path(r) == rel)
+        })
+}
+
 /// The walk WITHOUT the hashing — every eligible `(relative, absolute)` pair.
 ///
 /// A full index does not need pre-computed hashes: nothing is being diffed
@@ -427,12 +469,7 @@ pub(crate) fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 /// did not go away, it changed address.)
 pub fn walk_indexable_files(root: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
     // Collect eligible file paths first, then hash in parallel
-    let walker = WalkBuilder::new(root)
-        .hidden(true) // skip hidden files
-        .git_ignore(true) // respect .gitignore
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = scan_walk_builder(root).build();
 
     let mut file_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut skipped_symlinks: Vec<String> = Vec::new();
@@ -456,13 +493,7 @@ pub fn walk_indexable_files(root: &Path) -> Result<Vec<(String, std::path::PathB
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = normalize_rel_path(rel);
-            if rel_str == ".git" || rel_str.starts_with(".git/") {
-                continue;
-            }
-            if is_excluded_build_dir(&rel_str) {
-                continue;
-            }
-            if detect_language(&rel_str).is_none() {
+            if !scan_keeps_key(&rel_str) {
                 continue;
             }
             file_paths.push((rel_str, path.to_path_buf()));
@@ -571,11 +602,7 @@ pub fn scan_directory_cached(
 
     // Collect all entries, logging (not propagating) per-entry errors so that
     // a single unreadable subdir doesn't kill the whole scan.
-    let entries: Vec<_> = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+    let entries: Vec<_> = scan_walk_builder(root)
         .build()
         .filter_map(|e| match e {
             Ok(entry) => Some(entry),
@@ -631,13 +658,7 @@ pub fn scan_directory_cached(
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = normalize_rel_path(rel);
-            if rel_str == ".git" || rel_str.starts_with(".git/") {
-                continue;
-            }
-            if is_excluded_build_dir(&rel_str) {
-                continue;
-            }
-            if detect_language(&rel_str).is_none() {
+            if !scan_keeps_key(&rel_str) {
                 continue;
             }
 
