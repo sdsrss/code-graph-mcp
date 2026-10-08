@@ -87,11 +87,24 @@ On tokio-1.41.1, the call edges at the default confidence floor fold 99
 distinct callers into another on 65 functions by name and file, and 43 on 29
 by qualified name and file; on flask 3.1.0, 47 on 15 and 42 on 11.
 
+### JavaScript and TypeScript index faster
+
+Every bare JS/TS call walked its enclosing scopes and re-read each scope's
+declarations, the file's top level included, to decide whether the name is a
+Node built-in or a package import. Each scope is now read once per name and
+file. Full index CPU time, median of interleaved runs of two builds of the
+same tree: hono 1.313 s → 1.197 s (7 runs each), this repository 4.581 s →
+4.106 s (5 each); nodes and edges are identical on hono, express and this
+repository.
+
 ### Not covered
 
 - Two different functions with one qualified name in one file still fold:
   nested functions of different parents, such as the `def index()` that many
   flask tests define inside each test function (24 of flask's 42 above).
+- The JS/TS scope walk above is still most of its cost: a probe build with
+  the checks turned off indexed hono in 0.96 s of CPU against 1.35 s with
+  them (5 runs each), and this change takes 0.12 s of that 0.39 s off.
 
 ## 0.168.0
 

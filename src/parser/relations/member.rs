@@ -35,12 +35,19 @@ thread_local! {
     /// `const b = require().a`). Only a prefilter: whether a call's `b` IS that
     /// binding is decided at the call by [`js_renamed_import_call`].
     static RENAMED_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    /// [`hoisted_var`] per (function body or program node id, name): a body is
-    /// scanned once per name, not once per call in it. Per file (node ids are
-    /// unique only within a tree): reset by `reset_import_bound`.
+    /// [`binding_in`]'s answer per scope node id and name, all but the
+    /// `for (… of …)` head, which depends on where the name is read: a scope is
+    /// scanned once per name, not once per call under it. Every bare JS call
+    /// walks its scopes up to the binding, most of them to the program, whose
+    /// top-level statements were re-read for each call (D#193: hono's full
+    /// index +42.6% CPU). Per file (node ids are unique only within a tree):
+    /// reset by `reset_import_bound`.
     #[allow(clippy::type_complexity)]
-    static HOISTED: RefCell<HashMap<(usize, String), Option<Option<(String, String)>>>> =
+    static SCOPE_BINDING: RefCell<HashMap<usize, HashMap<String, Option<Option<(String, String)>>>>> =
         RefCell::new(HashMap::new());
+    /// [`js_package_binding`]'s program-level answer per name: the package a
+    /// top-level `var resolve = path.resolve` stands for. Per file, as above.
+    static PACKAGE_MEMBER: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
@@ -55,7 +62,8 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
-    HOISTED.with(|h| h.borrow_mut().clear());
+    SCOPE_BINDING.with(|m| m.borrow_mut().clear());
+    PACKAGE_MEMBER.with(|m| m.borrow_mut().clear());
 }
 
 fn collect(
@@ -524,8 +532,12 @@ fn js_package_binding(from: tree_sitter::Node, name: &str, source: &str) -> Opti
     };
     // `var send = require('send')`, `import send from 'send'`, or a member of one:
     // `var resolve = path.resolve` with `path` a package (express's view.js
-    // bound `resolve(root, name)` to its own `View.prototype.resolve`).
-    package(name).or_else(|| {
+    // bound `resolve(root, name)` to its own `View.prototype.resolve`). One
+    // answer per name and file: the binding is the program's.
+    if let Some(hit) = PACKAGE_MEMBER.with(|m| m.borrow().get(name).cloned()) {
+        return hit;
+    }
+    let found = package(name).or_else(|| {
         (0..program.named_child_count())
             .filter_map(|i| program.named_child(i))
             .filter(|c| matches!(c.kind(), "lexical_declaration" | "variable_declaration"))
@@ -550,7 +562,9 @@ fn js_package_binding(from: tree_sitter::Node, name: &str, source: &str) -> Opti
                         .filter(|spec| !spec.starts_with('.') && !spec.starts_with('/')),
                 }
             })
-    })
+    });
+    PACKAGE_MEMBER.with(|m| m.borrow_mut().insert(name.to_string(), found.clone()));
+    found
 }
 
 /// Function-like nodes: a scope whose parameters bind names and whose `var`s
@@ -620,6 +634,45 @@ fn binding_in_memo(
     source: &str,
     memo: bool,
 ) -> Option<Option<(String, String)>> {
+    // `for (const m of xs)` binds `m` in its body, not in `xs`: the one answer
+    // that depends on `from`, so it stays out of the memo.
+    if scope.kind() == "for_in_statement"
+        && scope
+            .child_by_field_name("left")
+            .is_some_and(|l| l.id() != from.id() && binds(l, name, source))
+    {
+        return Some(None);
+    }
+    if !memo {
+        return scope_binding(scope, name, source);
+    }
+    let id = scope.id();
+    if let Some(hit) = SCOPE_BINDING.with(|m| {
+        m.borrow()
+            .get(&id)
+            .and_then(|by_name| by_name.get(name))
+            .cloned()
+    }) {
+        return hit;
+    }
+    let found = scope_binding(scope, name, source);
+    SCOPE_BINDING.with(|m| {
+        m.borrow_mut()
+            .entry(id)
+            .or_default()
+            .insert(name.to_string(), found.clone())
+    });
+    found
+}
+
+/// [`binding_in_memo`] without the `for (… of …)` head: what `scope` binds
+/// `name` to wherever in it the name is read.
+#[allow(clippy::option_option)]
+fn scope_binding(
+    scope: tree_sitter::Node,
+    name: &str,
+    source: &str,
+) -> Option<Option<(String, String)>> {
     let kind = scope.kind();
     if is_function_like(kind) {
         let params = scope
@@ -639,17 +692,12 @@ fn binding_in_memo(
             return Some(None);
         }
     }
-    // `catch (m)`, `for (const m of xs)`.
-    let caught_or_looped = match kind {
-        "catch_clause" => scope
+    // `catch (m)`.
+    if kind == "catch_clause"
+        && scope
             .child_by_field_name("parameter")
-            .is_some_and(|p| binds(p, name, source)),
-        "for_in_statement" => scope
-            .child_by_field_name("left")
-            .is_some_and(|l| l.id() != from.id() && binds(l, name, source)),
-        _ => false,
-    };
-    if caught_or_looped {
+            .is_some_and(|p| binds(p, name, source))
+    {
         return Some(None);
     }
     for i in 0..scope.named_child_count() {
@@ -668,17 +716,7 @@ fn binding_in_memo(
     } else {
         None
     };
-    let body = body?;
-    if !memo {
-        return hoisted_var(body, name, source, 0);
-    }
-    let key = (body.id(), name.to_string());
-    if let Some(memo) = HOISTED.with(|h| h.borrow().get(&key).cloned()) {
-        return memo;
-    }
-    let found = hoisted_var(body, name, source, 0);
-    HOISTED.with(|h| h.borrow_mut().insert(key, found.clone()));
-    found
+    hoisted_var(body?, name, source, 0)
 }
 
 /// What a statement directly in a scope declares `name` as, if it does.
