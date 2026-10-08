@@ -34,7 +34,7 @@ only `health-check` said so. Every query command (`callgraph`, `impact`,
 `refs`, `show`, `search`, `grep`, …) now says it on stderr:
 
 ```
-[code-graph] This index was built by an older code-graph (index v114, this binary v115): answers come from it until it is rebuilt — run: code-graph-mcp reindex
+[code-graph] This index was built by an older code-graph (index v114, this binary v117): answers come from it until it is rebuilt — run: code-graph-mcp reindex
 ```
 
 `--json` output on stdout is unchanged, and `health-check`, which the status

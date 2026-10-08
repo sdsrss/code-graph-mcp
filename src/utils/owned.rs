@@ -163,6 +163,10 @@ enum Intent {
     Hold,
     /// Look without disturbing: no create, no truncate, and **no write**.
     Probe,
+    /// Create if absent and keep the inode, to hold a `flock` on it and never
+    /// write: the index-run lock (`indexer::pipeline::in_flight`). Write access
+    /// is only what `create` requires.
+    Share,
 }
 
 impl Intent {
@@ -173,6 +177,7 @@ impl Intent {
             Intent::Rewrite => o.create(true).write(true),
             Intent::Hold => o.write(true).create(true).truncate(false),
             Intent::Probe => o.write(true),
+            Intent::Share => o.write(true).create(true).truncate(false),
         };
         o
     }
@@ -194,7 +199,7 @@ impl Intent {
     // `refuse_unowned_handle`.
     #[cfg_attr(not(unix), allow(dead_code))]
     fn writes(self) -> bool {
-        !matches!(self, Intent::Probe)
+        !matches!(self, Intent::Probe | Intent::Share)
     }
 }
 
@@ -249,6 +254,17 @@ pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
 #[cfg(unix)]
 pub(crate) fn hold_owned(path: &Path) -> io::Result<File> {
     open_owned(path, Intent::Hold)
+}
+
+/// Open (creating it if absent) a lock file the tool owns, to hold a `flock`
+/// through and never write: the index-run lock. A hard link is accepted, as
+/// for [`probe_owned`]: the refusal stops a WRITE reaching a second path, and
+/// refusing here left every run unheld beside a `cp -al` copy, so a run in
+/// flight read as a crashed one again (pre-tag review round 2). The symlink
+/// layers still apply.
+#[cfg(unix)]
+pub(crate) fn share_owned(path: &Path) -> io::Result<File> {
+    open_owned(path, Intent::Share)
 }
 
 /// Open an EXISTING file the tool owns, for writing, without creating or

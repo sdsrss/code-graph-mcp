@@ -74,16 +74,26 @@ pub(super) fn finish(db: &Database, mark: RunMark) -> Result<()> {
 /// The tokens of the runs that died in flight, or None when there are none —
 /// or when a run is in flight now, which says nothing about the tokens beside
 /// its own and leaves them for a probe with nobody running.
+///
+/// The lock is taken before the marker is read, and held while it is. Read
+/// first, a run finishing in between — token removed, then lock released —
+/// left its token in what was read and was reported dead (pre-tag review
+/// round 2: a flock delayed by 1 s re-indexed 4 of 4 files).
 pub(super) fn dead_runs(db: &Database) -> Result<Option<Vec<String>>> {
-    let Some(value) = crate::storage::queries::get_meta(db.conn(), META_KEY_INDEX_RUN_IN_FLIGHT)?
-    else {
-        return Ok(None);
+    let held = match probe_exclusive(db) {
+        Probe::InFlight => return Ok(None),
+        Probe::Held(file) => Some(file),
+        Probe::NoLock => None,
     };
-    let tokens: Vec<String> = value.split_whitespace().map(str::to_string).collect();
-    if tokens.is_empty() || a_run_is_in_flight(db) {
-        return Ok(None);
-    }
-    Ok(Some(tokens))
+    let value = crate::storage::queries::get_meta(db.conn(), META_KEY_INDEX_RUN_IN_FLIGHT)?;
+    drop(held);
+    let tokens: Vec<String> = value
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    Ok((!tokens.is_empty()).then_some(tokens))
 }
 
 /// Remove `tokens` from the marker, and the marker once it is empty. Two
@@ -115,7 +125,7 @@ fn run_lock_path(db: &Database) -> Option<std::path::PathBuf> {
 #[cfg(unix)]
 fn hold_shared(db: &Database) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
-    let file = crate::utils::owned::hold_owned(&run_lock_path(db)?).ok()?;
+    let file = crate::utils::owned::share_owned(&run_lock_path(db)?).ok()?;
     for _ in 0..200 {
         // SAFETY: `file` is an open File owned by this scope, so its fd is valid
         // for the call; flock has no other precondition.
@@ -138,35 +148,48 @@ fn hold_shared(_db: &Database) -> Option<std::fs::File> {
     None
 }
 
-/// Whether some run holds [`RUN_LOCK`] now. Only a conflict means yes: an
-/// absent lock file, an open that fails or any other error means no, which
-/// reads every token as dead — the behaviour without this lock.
+/// What an exclusive try on [`RUN_LOCK`] found.
+enum Probe {
+    /// Some run holds it: every token may be live.
+    InFlight,
+    /// Taken, by this probe: no run is in flight while the handle lives.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Held(std::fs::File),
+    /// No answer — no lock file, an open that fails, any other error — which
+    /// reads every token as dead: the behaviour without this lock.
+    NoLock,
+}
+
 #[cfg(unix)]
-fn a_run_is_in_flight(db: &Database) -> bool {
+fn probe_exclusive(db: &Database) -> Probe {
     use std::os::unix::io::AsRawFd;
     let Some(path) = run_lock_path(db) else {
-        return false;
+        return Probe::NoLock;
     };
     let Ok(file) = crate::utils::owned::probe_owned(&path) else {
-        return false;
+        return Probe::NoLock;
     };
     for _ in 0..5 {
-        // SAFETY: as in `hold_shared`; the lock taken here is released at once.
+        // SAFETY: as in `hold_shared`. The lock is released when `file` is
+        // dropped, which closes the only descriptor of its open file.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-            return false;
+            return Probe::Held(file);
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {
-            return crate::indexer::lock::is_flock_conflict(err.raw_os_error());
+            return if crate::indexer::lock::is_flock_conflict(err.raw_os_error()) {
+                Probe::InFlight
+            } else {
+                Probe::NoLock
+            };
         }
     }
-    false
+    Probe::NoLock
 }
 
 #[cfg(not(unix))]
-fn a_run_is_in_flight(_db: &Database) -> bool {
-    false
+fn probe_exclusive(_db: &Database) -> Probe {
+    Probe::NoLock
 }
 
 #[cfg(test)]
@@ -195,6 +218,28 @@ mod tests {
         assert_eq!(marker(&db), None);
     }
 
+    /// A hard-linked lock file (what `cp -al` / `rsync --link-dest` leave) is
+    /// still held: the hold never writes through it (pre-tag review round 2).
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_run_lock_is_still_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        std::fs::write(dir.path().join(RUN_LOCK), b"").unwrap();
+        std::fs::hard_link(dir.path().join(RUN_LOCK), dir.path().join("backup.lock")).unwrap();
+        let run = begin(&db).unwrap();
+        assert!(
+            run._hold.is_some(),
+            "a hard link must not leave the run unheld"
+        );
+        assert_eq!(
+            dead_runs(&db).unwrap(),
+            None,
+            "and a probe must see it in flight"
+        );
+        finish(&db, run).unwrap();
+    }
+
     /// A run's token is covered by its hold for as long as it is in the
     /// marker: a probe meanwhile finds a run in flight, not a dead one; once
     /// the run finishes, its token is gone; dropped unfinished, it is a crash.
@@ -209,6 +254,12 @@ mod tests {
             "the hold must be taken beside a file database"
         );
         assert_eq!(dead_runs(&db).unwrap(), None, "a held token is no crash");
+        assert!(
+            crate::storage::queries::get_meta(db.conn(), META_KEY_INDEX_RUN_IN_FLIGHT)
+                .unwrap()
+                .is_some(),
+            "the probe leaves a live run's token alone"
+        );
         finish(&db, live).unwrap();
         assert_eq!(marker(&db), None);
 
