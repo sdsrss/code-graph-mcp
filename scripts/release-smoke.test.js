@@ -55,6 +55,33 @@ test('marketplace points at the plugin directory and matching plugin name', () =
   assert.equal(marketplace.name, pluginManifest.name);
 });
 
+// D#279: the order and the waits live in scripts/npm-publish.js. A workflow
+// step running `npm publish` itself would skip both, and a job bound shorter
+// than the waits would cut the run off mid-wait.
+test('npm packages are published only through scripts/npm-publish.js, inside a long enough job', () => {
+  const workflows = path.join(root, '.github', 'workflows');
+  for (const file of fs.readdirSync(workflows).filter((f) => /\.ya?ml$/.test(f))) {
+    const code = fs
+      .readFileSync(path.join(workflows, file), 'utf8')
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line));
+    const direct = code.filter((line) => /\bnpm\s+publish\b/.test(line));
+    assert.deepEqual(direct, [], `${file} runs npm publish directly`);
+  }
+  const release = fs.readFileSync(path.join(workflows, 'release.yml'), 'utf8');
+  const calls = release.split('\n').filter((l) => l.includes('scripts/npm-publish.js') && !/^\s*#/.test(l));
+  assert.deepEqual(calls.map((l) => l.trim()), ['run: node scripts/npm-publish.js "$VERSION"']);
+
+  const job = release.match(/\n {2}publish:\n([\s\S]*?)\n {2}[a-z][\w-]*:\n/);
+  assert.ok(job, 'release.yml has a `publish` job');
+  const bound = job[1].match(/^ {4}timeout-minutes: (\d+)$/m);
+  assert.ok(bound, 'the publish job sets timeout-minutes');
+  const { WAIT_SECONDS, MAIN_WAIT_SECONDS } = require('./npm-publish');
+  const waits = (WAIT_SECONDS + MAIN_WAIT_SECONDS) / 60;
+  // 10 minutes for the rest of the job (measured 132 s before the waits).
+  assert.ok(Number(bound[1]) >= waits + 10, `publish timeout-minutes ${bound[1]} < ${waits} min of waits + 10`);
+});
+
 // Opt-in real-network smoke. Off by default (CI / local dev runs all mocked
 // auto-update tests). Set CODE_GRAPH_AUTO_UPDATE_E2E=1 once per release to
 // catch GitHub-API shape regressions that mocked tests will never see.

@@ -414,9 +414,12 @@ jobs:
   publish:
     name: Publish
     needs: build
-    # Measured 132 s. Generous because this job is irreversible once npm
-    # accepts the package — the bound exists for a wedged registry call.
-    timeout-minutes: 30
+    # Measured 162-219 s before the publish step started waiting for packages
+    # to become installable. That step waits up to 60 min for the platform
+    # packages and 20 min for the main package (scripts/npm-publish.js; the
+    # longest measured delay is 55.5 min), so the bound is the two waits plus
+    # 10 min for the rest of the job — and the 90 tests/hardening.rs allows.
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     # `id-token: write` is what `npm publish --provenance` mints its attestation
     # with; without it the publish step FAILS rather than degrading, so the flag
@@ -487,6 +490,9 @@ jobs:
           SYNC_VERSIONS_SKIP_BUILD: '1'
 
       - name: JS test suite (full — includes install-e2e)
+        # Measured 80-92 s. Bounded here because the job's own timeout now
+        # also covers the npm waits below.
+        timeout-minutes: 15
         # Broadened from release-smoke only (which the glob still includes):
         # the local pre-commit hook was the ONLY gate running install-e2e.test.js
         # (ci.yml excludes it — needs a built binary), and that hook exists only
@@ -534,6 +540,8 @@ jobs:
           done
 
       - name: Package model files
+        # Measured 4-7 s; the bound is explained by the curl comment below.
+        timeout-minutes: 20
         # Model weights are mirrored as assets on this repo's own stable
         # `model-assets-v1` release — a byte-for-byte copy of
         # sentence-transformers/all-MiniLM-L6-v2 @ HF revision
@@ -564,9 +572,10 @@ jobs:
             # not per operation: measured, `--retry 3 --max-time 10` against a
             # dribbling server exited after 47 s (4 attempts + 1+2+4 s backoff),
             # so this loop's worst case is 3 files x (4 x 300 + 6) ~= 60 min.
-            # What actually bounds that is this job's `timeout-minutes: 30`; the
-            # flag turns an infinite stall into a finite one, and the job bound
-            # turns the finite one into a fast failure. Both are load-bearing.
+            # What actually bounds that is this step's `timeout-minutes: 20` (a
+            # step bound, since the job's covers the npm waits); the flag turns
+            # an infinite stall into a finite one, and the step bound turns the
+            # finite one into a fast failure. Both are load-bearing.
             # Either way it fails BEFORE `npm publish` below, so a stall costs a
             # re-run, never a half-release.
             curl -L --fail --retry 3 --retry-delay 2 --max-time 300 -o models-pkg/$f \
@@ -622,53 +631,25 @@ jobs:
       # "Package model files" + "Create GitHub Release", so a transient HF failure
       # (or a forgotten sha bump) shipped npm packages for a version whose
       # models.tar.gz release asset never existed → every user on that version
-      # silently degraded to FTS5-only until the workflow was re-run. The
-      # EPUBLISHCONFLICT skip keeps re-runs idempotent.
-      - name: Publish platform packages
-        run: |
-          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            cd npm/$pkg
-            # Capture publish output so we can distinguish "already published"
-            # (E403 / EPUBLISHCONFLICT — safe to skip on workflow re-run) from
-            # auth / 404 / network failures (must fail the job). Old "|| echo
-            # warning" swallowed everything and made smoke tests the only fail
-            # signal — 15 min of red retries before anyone noticed in v0.30.0.
-            # --provenance: a signed, verifiable link from this tarball back to
-            # the workflow run and commit that built it. Standard hardening for a
-            # package that ships NATIVE BINARIES, where "did this .node come from
-            # that source?" is not answerable any other way. Requires the
-            # `id-token: write` above; the failure mode if it is ever removed is
-            # a loud publish failure, not a silent unsigned release.
-            if ! out=$(npm publish --access public --provenance 2>&1); then
-              if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
-                echo "::warning::$pkg already published at $VERSION — skipping"
-              else
-                echo "$out"
-                echo "::error::$pkg publish failed (not 'already exists' — check NPM_TOKEN / registry)"
-                exit 1
-              fi
-            else
-              echo "$out"
-            fi
-            cd ../..
-          done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish main package
-        run: |
-          # --provenance, same as the platform packages above.
-          if ! out=$(npm publish --access public --provenance 2>&1); then
-            if echo "$out" | grep -qE "EPUBLISHCONFLICT|cannot publish over the previously published versions|You cannot publish over"; then
-              echo "::warning::main package already published at $VERSION — skipping"
-            else
-              echo "$out"
-              echo "::error::main package publish failed (not 'already exists' — check NPM_TOKEN / registry)"
-              exit 1
-            fi
-          else
-            echo "$out"
-          fi
+      # silently degraded to FTS5-only until the workflow was re-run.
+      #
+      # The script publishes the five platform packages, waits until each one
+      # can be installed, and only then publishes the main package, which pins
+      # them as optionalDependencies, and waits for it too (D#279). `npm
+      # publish` exiting 0 does not mean public: 0.167.0's linux-arm64 became
+      # public 55 min after its `+` line, 49 min after the main package, and
+      # npm skips an optional dependency it cannot resolve without failing the
+      # install. A re-run is idempotent: "already published" and E409
+      # "previously staged" are waited for, not published again. Any other npm
+      # error fails the job (an old `|| echo warning` once left the smokes as
+      # the only fail signal, v0.30.0).
+      #
+      # --provenance (in the script): a signed, verifiable link from each
+      # tarball back to the workflow run and commit that built it, for packages
+      # that ship NATIVE BINARIES. Requires the `id-token: write` above; without
+      # it the publish fails loudly instead of shipping unsigned.
+      - name: Publish to npm (platform packages first, main package last)
+        run: node scripts/npm-publish.js "$VERSION"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
