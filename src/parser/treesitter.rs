@@ -725,9 +725,15 @@ fn extract_nodes(
     }
 
     // Check if this specific node has #[test] or #[cfg(test)] attributes, or a
-    // body that opens with an inner `#![cfg(test)]`.
+    // body that opens with an inner `#![cfg(test)]`. An attribute or a comment is
+    // not an item and has no attributes of its own: reading the ones above it
+    // made a stack of N attributes cost N²/2 predicate reads.
     let node_is_test = in_test_context
         || (config.has_test_attributes
+            && !matches!(
+                kind,
+                "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
+            )
             && (has_test_attribute(&node, source) || body_inner_cfg_requires_test(&node, source)));
 
     match kind {
@@ -5182,5 +5188,30 @@ impl Open {
             );
         }
         assert_eq!(MAX_CFG_PREDICATE_DEPTH, 32, "the CHANGELOG names 32 levels");
+    }
+
+    // Every node used to read its own preceding attributes, attribute items
+    // included, so each attribute in a stack walked back over all the ones above
+    // it and parsed their `cfg` predicates: quadratic (review of 2056ace7, D#282:
+    // 5,000 stacked `cfg` attributes took 14 s in a release build). The ceiling
+    // is absolute, not scaled from `n`. The `#[cfg(test)]` sits at the top of the
+    // stack so the item's own walk still has to reach it.
+    #[test]
+    fn rust_stacked_attributes_are_read_once_per_item() {
+        let n = 3_000;
+        let mut code = String::from("#[cfg(test)]\n");
+        for i in 0..n {
+            code.push_str(&format!("#[cfg(feature = \"f{i}\")]\n"));
+        }
+        code.push_str("fn stacked_under_test() {}\nfn after_stack() {}\n");
+        let start = std::time::Instant::now();
+        let got = rust_is_test_by_name(&code);
+        let elapsed = start.elapsed();
+        assert_eq!(got.get("stacked_under_test"), Some(&true), "{got:?}");
+        assert_eq!(got.get("after_stack"), Some(&false), "{got:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{n} stacked attributes took {elapsed:?}"
+        );
     }
 }
