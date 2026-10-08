@@ -56,6 +56,30 @@ run-to-run spread: −0.8% in one set of five interleaved runs per build,
 - CLI `search` no longer returns the helper, as it already did not return
   `#[cfg(test)]` code; `show` and `grep` still find it.
 
+### Many attributes on one Rust item
+
+Indexing time grew with the square of the number of attributes stacked on
+one item, because each attribute read every attribute above it. A file
+with 5,000 `#[cfg(feature = …)]` lines on one function took 7.8 s to index
+with the published 0.167.0 linux-x64 binary and takes 62 ms now (three
+runs each). Each attribute is now read once, by the item it belongs to.
+This changes no node or edge: full indexes of tokio-1.41.1 and of this
+repository are identical with and without it.
+
+### npm: the main package waits for its platform packages
+
+`@sdsrs/code-graph` names its five platform packages as optional
+dependencies, and npm skips one it cannot find without failing the
+install. Every new version now spends a while in processing at npm before
+anyone can install it, and the release published the main package as soon
+as npm had accepted the platform packages. In 0.167.0, linux-arm64 became
+installable 49 minutes after the main package; in 0.166.0, linux-x64 10
+minutes after. An install in that window printed `added 1 package` instead
+of 2, and on a machine with no other copy of the binary `code-graph-mcp`
+then reported it not found; running the install again fixes it. The
+release now publishes the main package only once every platform package
+can be installed.
+
 ### Not covered
 
 - An out-of-line module declared `#[cfg(test)] mod mocks;` does not make
