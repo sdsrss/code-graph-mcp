@@ -477,11 +477,6 @@ pub fn file_is_test_code(tree: &tree_sitter::Tree, source: &str, language: &str)
         && inner_cfg_requires_test(&tree.root_node(), source)
 }
 
-/// Check if a node has a preceding test attribute: a harness attribute
-/// (`#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = …)]`, `#[rstest]`, …
-/// see [`TEST_HARNESS_ATTRIBUTES`]) or a `#[cfg(…)]`
-/// whose predicate requires `test`. Inner attributes are skipped: they gate their
-/// container, which [`inner_cfg_requires_test`] reads.
 /// Last path segments of the attributes that make the function under them a
 /// test: the standard harness's `test` (also `tokio::test` and every other
 /// `….::test`), and the harness macros of rstest, test-case,
@@ -494,6 +489,11 @@ const TEST_HARNESS_ATTRIBUTES: &[&str] = &[
     "quickcheck",
 ];
 
+/// Check if a node has a preceding test attribute: a harness attribute
+/// (`#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = …)]`, `#[rstest]`, …
+/// see [`TEST_HARNESS_ATTRIBUTES`]) or a `#[cfg(…)]`
+/// whose predicate requires `test`. Inner attributes are skipped: they gate their
+/// container, which [`inner_cfg_requires_test`] reads.
 fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {

@@ -12975,6 +12975,7 @@ fn test_cli_queries_on_an_older_index_say_so() {
             stderr.contains(&older) && stderr.contains("code-graph-mcp reindex"),
             "{args:?}: {stderr}"
         );
+        assert_eq!(stderr.matches(&older).count(), 1, "{args:?}: {stderr}");
     }
     let (out, stderr, _) = run_cli(&project, &["health-check"]);
     assert!(out.contains("Index version: STALE"), "{out}");
@@ -13004,6 +13005,7 @@ fn test_cli_queries_on_an_older_index_say_so() {
     let (_, stderr, code) = run_cli(&newer, &["callgraph", "alpha"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stderr.matches("newer code-graph").count(), 1, "{stderr}");
+    assert!(!stderr.contains("older code-graph"), "{stderr}");
     let (out, _, _) = run_cli(&newer, &["health-check"]);
     assert!(
         out.contains("Index version: NEWER") && !out.contains("run: code-graph-mcp reindex"),

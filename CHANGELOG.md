@@ -83,8 +83,9 @@ A function under `#[rstest]`, `#[test_case(…)]`, `#[wasm_bindgen_test]` or
 `#[quickcheck]` is now test code, as one under `#[test]` or `#[tokio::test]`
 already was; `#[fixture]` stays production. In a file that opens with
 `#![cfg(test)]`, code outside any function (a `static` initializer) is test
-code too, so `refs` and `impact` no longer list its unresolved calls among
-the production ones. tokio-1.41.1
+code too, so `refs` and `impact` no longer list its unresolved calls, as
+they already did not for a `#[test]` function's, with or without
+`--include-tests`. tokio-1.41.1
 and this repository hold none of these shapes and index identically.
 
 When `refs` finds no caller, the list of calls with no resolved target now
