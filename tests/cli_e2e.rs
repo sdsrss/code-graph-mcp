@@ -12896,3 +12896,92 @@ fn test_cli_defined_in_lists_disclose_the_cap_and_deps_names_the_size_limit() {
         "{stderr}"
     );
 }
+
+// D#274: for one `--file` miss, `impact` and `refs` said "Symbol 'x' not found
+// in file 'y'" whether or not the index holds `y`, and `refs` never named the
+// files that define `x` (nor did its JSON); `callgraph` (D#253) says "File 'y'
+// not found in index" for an unindexed path and lists them. One input, one
+// answer, on all three commands and both faces.
+#[test]
+fn test_cli_impact_and_refs_name_a_file_selector_miss_like_callgraph() {
+    let project = setup_indexed_project();
+    for cmd in ["callgraph", "impact", "refs"] {
+        let (_, stderr, code) =
+            run_cli(&project, &[cmd, "validateToken", "--file", "src/utils.ts"]);
+        assert_eq!(code, 1, "{cmd}: {stderr}");
+        assert!(
+            stderr.contains("Symbol 'validateToken' not found in file 'src/utils.ts'")
+                && stderr.contains("Defined in: src/auth.ts"),
+            "{cmd}: {stderr}"
+        );
+        let (stdout, _, code) = run_cli(
+            &project,
+            &[cmd, "validateToken", "--file", "src/utils.ts", "--json"],
+        );
+        assert_eq!(code, 1, "{cmd}: {stdout}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["error"], "Symbol not found in file", "{cmd}: {v}");
+        assert_eq!(v["file"], "src/utils.ts", "{cmd}: {v}");
+        assert_eq!(v["candidates"][0]["file_path"], "src/auth.ts", "{cmd}: {v}");
+
+        let (_, stderr, code) = run_cli(&project, &[cmd, "validateToken", "--file", "src/nope.ts"]);
+        assert_eq!(code, 1, "{cmd}: {stderr}");
+        assert!(
+            stderr.contains("File 'src/nope.ts' not found in index")
+                && stderr.contains("'validateToken' is defined in: src/auth.ts"),
+            "{cmd}: {stderr}"
+        );
+        let (stdout, _, code) = run_cli(
+            &project,
+            &[cmd, "validateToken", "--file", "src/nope.ts", "--json"],
+        );
+        assert_eq!(code, 1, "{cmd}: {stdout}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["error"], "File not found in index", "{cmd}: {v}");
+        assert_eq!(v["candidates"][0]["file_path"], "src/auth.ts", "{cmd}: {v}");
+        assert!(v["candidates"][0]["node_id"].is_i64(), "{cmd}: {v}");
+        if cmd == "refs" {
+            // refs keeps its own envelope around the miss.
+            assert_eq!(v["references"], serde_json::json!([]), "{v}");
+            assert_eq!(v["total_references"], 0, "{v}");
+        }
+    }
+}
+
+// D#291(1): on an index an older INDEX_VERSION built, query commands exit 0
+// and answer from the old graph; only `health-check` said so. Each query says
+// it on stderr. `health-check`, which the statusline polls, keeps its own
+// STALE line and prints no second notice, and a current index prints none.
+#[test]
+fn test_cli_queries_on_an_older_index_say_so() {
+    let project = setup_tiny_indexed_project();
+    make_index_version_stale(&project);
+    let older = format!(
+        "built by an older code-graph (index v{}, this binary v{})",
+        code_graph_mcp::domain::INDEX_VERSION - 1,
+        code_graph_mcp::domain::INDEX_VERSION
+    );
+    for args in [
+        &["callgraph", "alpha"][..],
+        &["impact", "alpha"],
+        &["refs", "alpha"],
+        &["show", "alpha"],
+        &["search", "alpha"],
+        &["grep", "alpha"],
+    ] {
+        let (_, stderr, code) = run_cli(&project, args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(&older) && stderr.contains("code-graph-mcp reindex"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let (out, stderr, _) = run_cli(&project, &["health-check"]);
+    assert!(out.contains("Index version: STALE"), "{out}");
+    assert!(!stderr.contains(&older), "{stderr}");
+
+    let current = setup_tiny_indexed_project();
+    let (_, stderr, code) = run_cli(&current, &["callgraph", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("code-graph (index v"), "{stderr}");
+}

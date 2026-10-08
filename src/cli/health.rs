@@ -232,7 +232,7 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         // Worktree-aware, like every read command: the raw project_root check
         // reported {"healthy":false,"reason":"no_index"} from a linked worktree
         // whose MAIN checkout has a perfectly good index, while the human
-        // format (via CliContext::open below) said "OK" — same command, two
+        // format (via CliContext::open_for_status below) said "OK" — same command, two
         // formats, opposite verdicts, and doctor.js consumes the JSON one, so
         // every worktree showed a phantom broken install (audit 2026-08-02
         // MED-3).
@@ -269,7 +269,7 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
     // Same `issue` wording and same `integrity.quick_check` shape as a
     // quick_check failure below, so doctor's `index-corrupt` repair routes off
     // it unchanged.
-    let ctx = match CliContext::open(project_root) {
+    let ctx = match CliContext::open_for_status(project_root) {
         Ok(c) => c,
         Err(e) if Database::is_corrupt_index_error(&e) => {
             let detail = e.to_string();

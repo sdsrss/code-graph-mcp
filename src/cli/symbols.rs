@@ -59,6 +59,62 @@ pub(crate) fn emit_exact_ambiguity(
     std::process::exit(1);
 }
 
+/// The empty answer a command's file-selector miss is merged into, so one
+/// parser reads the command's found, empty and miss outputs alike.
+pub(crate) enum MissEnvelope {
+    /// `callgraph`: `results: []`.
+    Results,
+    /// `impact`: the miss keys alone, as it has always printed them.
+    Plain,
+    /// `refs`: `references: []`, `by_relation: {}`, `total_references: 0`.
+    References,
+}
+
+/// A `--file` that holds no definition of `name` (D#253, D#274): the sentence
+/// MCP `get_call_graph` and `find_references` give, and a JSON envelope of
+/// `error` (`File not found in index` / `Symbol not found in file`),
+/// `symbol`, `file` and the `candidates` in other files, in the command's own
+/// [`MissEnvelope`]. Shared by `callgraph`, `impact` and `refs`, which had
+/// named one miss three ways. Exits 1.
+pub(crate) fn emit_file_selector_miss(
+    miss: &crate::resolve::FileSelectorMiss,
+    name: &str,
+    file: &str,
+    json_mode: bool,
+    envelope: MissEnvelope,
+) -> ! {
+    if json_mode {
+        let mut out = serde_json::json!({
+            "error": if miss.file_indexed {
+                "Symbol not found in file"
+            } else {
+                "File not found in index"
+            },
+            "symbol": name,
+            "file": file,
+            "candidates": crate::resolve::candidates_to_json(&miss.elsewhere)
+                .into_iter()
+                .take(crate::resolve::SUGGESTION_CAP)
+                .collect::<Vec<_>>(),
+        });
+        if miss.elsewhere.len() > crate::resolve::SUGGESTION_CAP {
+            out["candidates_total"] = serde_json::json!(miss.elsewhere.len());
+        }
+        match envelope {
+            MissEnvelope::Results => out["results"] = serde_json::json!([]),
+            MissEnvelope::Plain => {}
+            MissEnvelope::References => {
+                out["references"] = serde_json::json!([]);
+                out["by_relation"] = serde_json::json!({});
+                out["total_references"] = serde_json::json!(0);
+            }
+        }
+        println!("{out}");
+    }
+    eprintln!("[code-graph] {}", miss.message(name, file));
+    std::process::exit(1);
+}
+
 /// Which JSON envelope a command wraps its fuzzy-ambiguity candidates in.
 ///
 /// ARC-01: `callgraph` and `refs` are the only two fuzzy-Ambiguous sites, and the

@@ -41,6 +41,35 @@ and no test. A new Python module now re-extracts the files whose relative
 import binds its package. On that fixture `affected pkg/consts.py` names
 `pkg/app.py` and its test `tests/test_app.py`, as after a rebuild.
 
+### The command line says when it answers from an index another version built
+
+After an upgrade that changes `INDEX_VERSION`, as this one does, a query
+command answered from the old index with exit 0 until something rebuilt it;
+only `health-check` said so. Every query command (`callgraph`, `impact`,
+`refs`, `show`, `search`, `grep`, …) now says it on stderr:
+
+```
+[code-graph] This index was built by an older code-graph (index v114, this binary v115): answers come from it until it is rebuilt — run: code-graph-mcp reindex
+```
+
+An index a newer version built gets the same line, naming the newer version.
+`--json` output on stdout is unchanged, and `health-check`, which the status
+line polls, keeps its own `Index version: STALE` line and prints no second one.
+
+### One answer for a `--file` that does not hold the symbol
+
+`impact` and `refs` said "Symbol 'x' not found in file 'y'" whether or not
+the index holds `y`, and `refs` never named the files that do define `x`.
+They now answer as `callgraph` has since 0.167.0: "File 'y' not found in
+index" for a path the index does not hold, and the defining files either
+way. MCP `find_references` words it as `get_call_graph` does. For scripts:
+`impact --json` and `refs --json` report `"error": "File not found in
+index"` for such a path, where `impact` said `"Symbol not found in file"`
+and `refs` said `"Symbol not found"`; for an indexed file without the
+symbol `refs` now says `"Symbol not found in file"` too. `refs --json` now
+carries `file` and `candidates`, and each candidate in both carries
+`node_id` and `start_line`.
+
 ## 0.168.0
 
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is

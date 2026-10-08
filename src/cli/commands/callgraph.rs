@@ -131,7 +131,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             // Only reached with --file (see `select_cli_symbol`).
             let fp = explicit_file.unwrap_or_default();
             let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
-            emit_file_selector_miss(&miss, raw_symbol, fp, json_mode)
+            emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::Results)
         }
     };
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
@@ -183,7 +183,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     if let (Some(fp), false, None) = (file_filter, has_seed, &node_target) {
         let miss = crate::resolve::file_selector_miss(conn, symbol, fp)?;
         if !miss.defined_nowhere() {
-            emit_file_selector_miss(&miss, symbol, fp, json_mode);
+            emit_file_selector_miss(&miss, symbol, fp, json_mode, MissEnvelope::Results);
         }
     }
     let mut resolved_symbol: String = symbol.to_string();
@@ -201,7 +201,13 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                     if let Some(fp) = file_filter {
                         if !result.nodes.iter().any(|n| n.depth == 0) {
                             let miss = crate::resolve::file_selector_miss(conn, &resolved, fp)?;
-                            emit_file_selector_miss(&miss, &resolved, fp, json_mode);
+                            emit_file_selector_miss(
+                                &miss,
+                                &resolved,
+                                fp,
+                                json_mode,
+                                MissEnvelope::Results,
+                            );
                         }
                     }
                 }
@@ -530,39 +536,6 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     stdout.write_all(&footer)?;
 
     Ok(())
-}
-
-/// A `--file` that holds no definition of `name`: the sentence MCP
-/// `get_call_graph` gives, and `impact`'s JSON envelope (`error`, `symbol`,
-/// `file`, `candidates`) with callgraph's `results: []`. Exits 1.
-fn emit_file_selector_miss(
-    miss: &crate::resolve::FileSelectorMiss,
-    name: &str,
-    file: &str,
-    json_mode: bool,
-) -> ! {
-    if json_mode {
-        let mut out = serde_json::json!({
-            "results": [],
-            "error": if miss.file_indexed {
-                "Symbol not found in file"
-            } else {
-                "File not found in index"
-            },
-            "symbol": name,
-            "file": file,
-            "candidates": crate::resolve::candidates_to_json(&miss.elsewhere)
-                .into_iter()
-                .take(crate::resolve::SUGGESTION_CAP)
-                .collect::<Vec<_>>(),
-        });
-        if miss.elsewhere.len() > crate::resolve::SUGGESTION_CAP {
-            out["candidates_total"] = serde_json::json!(miss.elsewhere.len());
-        }
-        println!("{out}");
-    }
-    eprintln!("[code-graph] {}", miss.message(name, file));
-    std::process::exit(1);
 }
 
 /// The lines after the tree: hidden-test counts, traversal limits, hidden

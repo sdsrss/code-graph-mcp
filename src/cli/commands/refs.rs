@@ -37,7 +37,8 @@ pub struct RefsArgs {
 /// envelope shape (object with `references`/`by_relation`) plus an `error` key,
 /// so a single consumer parser handles found, empty, and not-found alike — and
 /// every `--json` exit path produces parseable stdout (empty-JSON contract).
-/// Used by all three not-found branches: symbol, --file miss, and --node-id miss.
+/// Used by the symbol and --node-id not-found branches; a --file miss goes
+/// through `emit_file_selector_miss` with the same keys.
 pub(crate) fn print_refs_notfound_json(symbol: &str) {
     println!(
         "{}",
@@ -275,15 +276,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
             }
             Err(CliSymbolSelectionError::QualifiedNotFound) => {
-                if json_mode {
-                    print_refs_notfound_json(raw_symbol);
-                }
-                eprintln!(
-                    "[code-graph] Symbol '{}' not found in file '{}'.",
-                    raw_symbol,
-                    explicit_file.unwrap_or_default()
-                );
-                std::process::exit(1);
+                // Only reached with --file (see `select_cli_symbol`).
+                let fp = explicit_file.unwrap_or_default();
+                let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
+                emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::References)
             }
         };
         if selection.lookup == CliSymbolLookup::ExactQualified {
@@ -308,12 +304,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 let matched: Vec<&queries::NodeResult> =
                     nodes.iter().filter(|n| n.name == base).collect();
                 if matched.is_empty() {
-                    // Empty-JSON contract: emit a parseable envelope, not empty stdout.
-                    if json_mode {
-                        print_refs_notfound_json(base);
-                    }
-                    eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
-                    std::process::exit(1);
+                    // Empty-JSON contract: a parseable envelope, not empty
+                    // stdout, naming the miss as `callgraph` / `impact` do and
+                    // the files that define the symbol (D#274).
+                    let miss = crate::resolve::file_selector_miss(conn, base, fp)?;
+                    emit_file_selector_miss(&miss, base, fp, json_mode, MissEnvelope::References);
                 }
                 // SURF-17 (audit 2026-09-07): a file selector cannot split same-file
                 // overloads, so merging them produced ONE reference total for TWO

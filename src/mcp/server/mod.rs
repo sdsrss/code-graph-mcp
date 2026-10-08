@@ -3259,6 +3259,55 @@ function handleLogin(req: Request) {
         assert!(!is_error && text.contains("\"callers\":[]"), "got: {text}");
     }
 
+    /// D#274: `find_references` named every `file_path` miss "Symbol 'x' not
+    /// found in file 'y'", for a path the index does not hold too, and never
+    /// listed the files that define `x`; `get_call_graph` (D#253) does both.
+    #[test]
+    fn test_find_references_file_path_miss_is_worded_like_get_call_graph() {
+        let project_dir = TempDir::new().unwrap();
+        let src = project_dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("a.rs"),
+            "pub fn d_a() -> i32 { 1 }\npub fn caller_one() -> i32 { d_a() + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("c.rs"), "pub fn lonely() -> i32 { 7 }\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod c;\n").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+        for tool in ["find_references", "get_call_graph"] {
+            let call = |args: serde_json::Value| -> (bool, String) {
+                let resp = server
+                    .handle_message(&tool_call_json(tool, args))
+                    .unwrap()
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                (
+                    parsed["result"]["isError"].as_bool().unwrap_or(false),
+                    parsed["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            };
+            let (is_error, text) = call(json!({"symbol_name": "d_a", "file_path": "src/c.rs"}));
+            assert!(is_error, "{tool}: {text}");
+            assert!(
+                text.contains("Symbol 'd_a' not found in file 'src/c.rs'")
+                    && text.contains("Defined in: src/a.rs"),
+                "{tool}: {text}"
+            );
+            let (is_error, text) = call(json!({"symbol_name": "d_a", "file_path": "nope/a.rs"}));
+            assert!(is_error, "{tool}: {text}");
+            assert!(
+                text.contains("File 'nope/a.rs' not found in index")
+                    && text.contains("'d_a' is defined in: src/a.rs"),
+                "{tool}: {text}"
+            );
+        }
+    }
+
     /// C5: the dead-code summary says a non-Rust candidate list is experimental.
     #[test]
     fn test_find_dead_code_marks_non_rust_candidates_experimental() {

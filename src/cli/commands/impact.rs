@@ -116,54 +116,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
         }
         Err(CliSymbolSelectionError::QualifiedNotFound) => {
-            let bare_name = strip_qualified_prefix(raw_symbol);
-            let candidates: Vec<queries::NameCandidate> =
-                queries::get_nodes_with_files_by_name(conn, bare_name)?
-                    .into_iter()
-                    .filter(|candidate| {
-                        crate::resolve::is_selectable_definition(&candidate.file_path)
-                    })
-                    .map(|candidate| queries::NameCandidate {
-                        name: candidate.node.name,
-                        file_path: candidate.file_path,
-                        node_type: candidate.node.node_type,
-                        node_id: candidate.node.id,
-                        start_line: candidate.node.start_line,
-                    })
-                    .collect();
-            if json_mode {
-                let suggestions = candidates
-                    .iter()
-                    .take(crate::resolve::SUGGESTION_CAP)
-                    .map(|candidate| {
-                        serde_json::json!({
-                            "name": candidate.name,
-                            "type": candidate.node_type,
-                            "file_path": candidate.file_path,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": "Symbol not found in file",
-                        "symbol": raw_symbol,
-                        "file": explicit_file.unwrap_or_default(),
-                        "candidates": suggestions,
-                    })
-                );
-            }
-            eprintln!(
-                "[code-graph] Symbol '{}' not found in file '{}'.",
-                raw_symbol,
-                explicit_file.unwrap_or_default()
-            );
-            if let Some(files) =
-                crate::resolve::file_list(candidates.iter().map(|c| c.file_path.as_str()))
-            {
-                eprintln!("[code-graph] Defined in: {files}");
-            }
-            std::process::exit(1);
+            // Only reached with --file (see `select_cli_symbol`).
+            let fp = explicit_file.unwrap_or_default();
+            let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
+            emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::Plain)
         }
     };
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
@@ -246,50 +202,11 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 .any(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
         };
         if !present {
-            if json_mode {
-                // Same in-band miss contract as `show`: {error, symbol, …} +
-                // exit 1, with the files that DO define the symbol so the
-                // caller can correct the path instead of re-querying.
-                let candidates: Vec<serde_json::Value> = symbol_nodes
-                    .iter()
-                    .take(crate::resolve::SUGGESTION_CAP)
-                    .map(|n| {
-                        serde_json::json!({
-                            "name": n.name,
-                            "type": n.node_type,
-                            "file_path": queries::get_file_path(conn, n.file_id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default(),
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        // Echo what the user TYPED. Reporting the stripped
-                        // `symbol` for a qualified miss reads as if the bare
-                        // name were absent, when the file may well define it
-                        // under a different qualifier.
-                        "error": "Symbol not found in file",
-                        "symbol": raw_symbol,
-                        "file": fp,
-                        "candidates": candidates,
-                    })
-                );
-            }
-            eprintln!(
-                "[code-graph] Symbol '{}' not found in file '{}'.",
-                raw_symbol, fp
-            );
-            let defined_in: Vec<String> = symbol_nodes
-                .iter()
-                .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
-                .collect();
-            if let Some(files) = crate::resolve::file_list(defined_in.iter().map(String::as_str)) {
-                eprintln!("[code-graph] Defined in: {files}");
-            }
-            std::process::exit(1);
+            // Same in-band miss contract as `show`: {error, symbol, …} + exit 1,
+            // with the files that DO define the symbol, worded as `callgraph`
+            // and `refs` word it (D#274).
+            let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
+            emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::Plain);
         }
     }
 

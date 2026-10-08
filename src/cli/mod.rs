@@ -219,7 +219,17 @@ pub struct CliContext {
 }
 
 impl CliContext {
+    /// Open for a query: a command that answers from the index. An index another
+    /// `INDEX_VERSION` built is said so on stderr ([`announce_index_version`]).
     pub fn open(project_root: &Path) -> Result<Self> {
+        let ctx = Self::open_inner(project_root, false)?;
+        announce_index_version(&ctx.db);
+        Ok(ctx)
+    }
+
+    /// Open for `health-check`, which reports the index's version in its own
+    /// output and is polled by the statusline every few seconds.
+    pub fn open_for_status(project_root: &Path) -> Result<Self> {
         Self::open_inner(project_root, false)
     }
 
@@ -229,7 +239,9 @@ impl CliContext {
     /// that constructor also revalidates (wipes) on `INDEX_VERSION` mismatch,
     /// which a read command must never do.
     pub fn open_with_vec(project_root: &Path) -> Result<Self> {
-        Self::open_inner(project_root, true)
+        let ctx = Self::open_inner(project_root, true)?;
+        announce_index_version(&ctx.db);
+        Ok(ctx)
     }
 
     fn open_inner(project_root: &Path, with_vec: bool) -> Result<Self> {
@@ -273,10 +285,36 @@ impl CliContext {
             return None;
         }
         cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
-        Database::open_nondestructive(&db_path).ok().map(|db| Self {
+        let db = Database::open_nondestructive(&db_path).ok()?;
+        announce_index_version(&db);
+        Some(Self {
             db,
             project_root: project_root.to_path_buf(),
         })
+    }
+}
+
+/// Say on stderr that the index was built by another `INDEX_VERSION` (D#291).
+///
+/// A reader open never rebuilds (only an indexer open does), so until something
+/// does, every query answers from the old extractor's graph and exits 0. Only
+/// `health-check` said so. Once per command, on stderr, so `--json` stdout
+/// stays one parseable object.
+fn announce_index_version(db: &Database) {
+    let Some(stored) = db.index_version_stale() else {
+        return;
+    };
+    let current = crate::domain::INDEX_VERSION;
+    if stored < current {
+        eprintln!(
+            "[code-graph] This index was built by an older code-graph (index v{stored}, this \
+binary v{current}): answers come from it until it is rebuilt — run: code-graph-mcp reindex"
+        );
+    } else {
+        eprintln!(
+            "[code-graph] This index was built by a newer code-graph (index v{stored}, this \
+binary v{current}): answers follow that version's index — update this binary to match it"
+        );
     }
 }
 

@@ -150,11 +150,10 @@ impl McpServer {
                 .map(|n| n.id)
                 .collect();
             if matching.is_empty() {
-                return Err(anyhow!(
-                    "Symbol '{}' not found in file '{}'.",
-                    symbol_name,
-                    fp
-                ));
+                // Worded as `get_call_graph` words it, with the files that do
+                // define the symbol (D#274).
+                let miss = crate::resolve::file_selector_miss(self.db.conn(), symbol_name, fp)?;
+                return Err(anyhow!(miss.message(symbol_name, fp)));
             }
             // Multi-def in same file — report ambiguity with node_ids and start_lines
             // so callers can pick the specific definition.
