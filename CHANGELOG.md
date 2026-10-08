@@ -6,14 +6,13 @@
 because Rust test flags change (below). The MCP server rebuilds the index when it
 starts; from the command line, `code-graph-mcp reindex` does.
 
-### Python: an incremental run moves an edge onto a method only as a rebuild would
+### Python: an incremental run no longer moves an import and its calls onto a method that replaced the function
 
 When `util.py` lost `def helper` and gained a method `Box.helper`, an
 incremental run moved the edges that pointed at the function — an
 importer's `from pkg import helper` and its `helper()` call — onto the
-method, where a rebuild of the same tree binds neither. A Python edge now
-moves onto a method only if it pointed at that same method; otherwise it is
-resolved again, as a rebuild would resolve it.
+method, where a rebuild of the same tree binds neither. An incremental run
+now moves a Python edge onto a method only if it pointed at that same method.
 
 ### Python: a module created after its relative import
 
@@ -84,8 +83,7 @@ A function under `#[rstest]`, `#[test_case(…)]`, `#[wasm_bindgen_test]` or
 already was; `#[fixture]` stays production. In a file that opens with
 `#![cfg(test)]`, code outside any function (a `static` initializer) is test
 code too, so `refs` and `impact` no longer list its unresolved calls, as
-they already did not for a `#[test]` function's, with or without
-`--include-tests`. tokio-1.41.1
+they already did not for a `#[test]` function's. tokio-1.41.1
 and this repository hold none of these shapes and index identically.
 
 When `refs` finds no caller, the list of calls with no resolved target now
@@ -96,17 +94,18 @@ ended the scan.
 
 An index run writes a marker that it clears once its cross-file edges are
 saved; a marker left behind means the run died, and the next incremental run
-re-indexes every file to recover what it lost. The marker named no run. While
-the MCP server ran, a CLI query that indexed a new file left its marker in
-place for the length of its run, and the server's next incremental run took
-it for a crash and re-indexed the whole project (tokio: 2 of 12 rounds in one
-measurement and 2 of 24 in another, 2.6–5.1 s each). Whichever run finished first also cleared the marker, so a
-crash beside another run went unrecovered. Each run now records its own entry
-in the marker and holds `.code-graph/index-run.lock` while it runs: an entry
-is a crash only when no run holds the lock, and a run clears only its own.
-With a second process holding that lock, a one-file edit re-indexed 4 of 4
-files before this change and re-indexes 1 now; once that process is gone,
-the next run re-indexes all 4 and clears the marker.
+re-indexes every file to recover what it lost. The marker named no run.
+While the MCP server ran, a CLI query that indexed a new file left its
+marker in place for the length of its run, and the server's next incremental
+run took it for a crash and re-indexed the whole project (tokio: 2 of 12
+rounds in one measurement and 2 of 24 in another, 2.6–5.1 s each). Whichever
+run finished first also cleared the marker, so a crash beside another run
+went unrecovered. Each run now records its own entry in the marker and holds
+`.code-graph/index-run.lock` while it runs: an entry is a crash only when no
+run holds the lock, and a run clears only its own. With a second process
+holding that lock, a one-file edit re-indexed 4 of 4 files before this
+change and re-indexes 1 now; once that process is gone, the next run
+re-indexes all 4 and clears the marker.
 
 ### JavaScript and TypeScript index faster
 
@@ -122,16 +121,17 @@ repository.
 
 Its `min_confidence` description told the model that `inferred` means
 import-resolved and `extracted` means same-file precise. A call or
-reference bound by name to another file's definition is `inferred` when the
-name is unique in its language or an import, module path or receiver type
-confirms it, and `ambiguous` otherwise: a call `b.py` makes to `a.py`'s
-`unique_fn` with no import at all is `inferred`. Two same-file shapes are
-labelled the same way, a Rust method call on a field or a call result whose
-type the source leaves unwritten (`self.0.m()`, `f().m()`) and a Python call
-on a `self` attribute or on a name a relative import binds; every other edge is `extracted`, which does not
-make it right. The description now says this, and `get_call_graph`'s says
-`extracted` keeps same-file calls only. Only the text the model reads
-changes; no answer does.
+reference bound by name to another file's definition is `ambiguous` when
+other definitions in its language share the name and no import, module path
+or receiver type confirms this one (in Rust only a `self` or `Self`
+receiver counts, so `rt.block_on()` on a typed local is `ambiguous`), and
+`inferred` otherwise: a call `b.py` makes to `a.py`'s `unique_fn` with no
+import at all is `inferred`. Some same-file calls are labelled the same way,
+for example a Rust method call on a field or a call result (`self.0.m()`,
+`f().m()`) and a Python call on a `self` attribute. Every other edge is
+`extracted`, which does not make it right. The description now says this,
+and `get_call_graph`'s says `extracted` keeps same-file calls only. Only the
+text the model reads changes; no answer does.
 
 ### Not covered
 
@@ -142,7 +142,12 @@ changes; no answer does.
   bound method by alias (`register = _default.register`).
 - Two different functions with one qualified name in one file still fold:
   nested functions of different parents, such as the `def index()` that many
-  flask tests define inside each test function (24 of flask's 44 above).
+  flask tests define inside each test function or method (37 of flask's 44
+  above).
+- When a Python module keeps `def helper` and gains a method `Box.helper`,
+  a rebuild binds `from pkg.util import helper` and its `helper()` call to
+  the method as well as the function; an incremental run keeps them on the
+  function alone until the next rebuild. 0.168.0 bound both either way.
 - For a symbol defined in no file, `impact --file` still answers "Symbol
   not found" whatever the file, where `refs` and `callgraph` check the file
   first.
