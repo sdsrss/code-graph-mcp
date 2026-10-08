@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 115
-because Python edges change (below). The MCP server rebuilds the index when it
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 116
+because Python edges and Rust test flags change (below). The MCP server rebuilds the index when it
 starts; from the command line, `code-graph-mcp reindex` does.
 
 ### Python: a bare name never reaches another file's method
@@ -86,6 +86,19 @@ referrers the same way.
 On tokio-1.41.1, the call edges at the default confidence floor fold 99
 distinct callers into another on 65 functions by name and file, and 43 on 29
 by qualified name and file; on flask 3.1.0, 47 on 15 and 42 on 11.
+
+### More Rust test code is recognised as test code
+
+A function under `#[rstest]`, `#[test_case(…)]`, `#[wasm_bindgen_test]` or
+`#[quickcheck]` is now test code, as one under `#[test]` or `#[tokio::test]`
+already was; `#[fixture]` stays production. In a file that opens with
+`#![cfg(test)]`, code outside any function (a `static` initializer) is test
+code too, so its calls no longer count as production callers. tokio-1.41.1
+and this repository hold none of these shapes and index identically.
+
+When `refs` finds no caller, the list of calls with no resolved target now
+also finds `x.name::<[u8; 4]>(…)`: a `;` inside the turbofish's array type
+ended the scan.
 
 ### A run in progress is no longer taken for a crashed one
 

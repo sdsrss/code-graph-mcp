@@ -240,6 +240,9 @@ struct FilePreParsed {
     hash: String,
     last_modified: i64,
     parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+    /// The file is test code by its own text (`#![cfg(test)]`), and so is its
+    /// `<module>` node (D#291(2)).
+    module_is_test: bool,
     /// The file's relations, extracted here beside its nodes: a pure function
     /// of the tree, and the costliest one (django: 3.6 s of a 12.5 s full index
     /// while it ran sequentially in Phase 2). The tree is dropped with the
@@ -583,6 +586,7 @@ fn pre_parse_batch(
         }
 
         let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+        let module_is_test = crate::parser::treesitter::file_is_test_code(&tree, &source, language);
         let relations = extract_relations_from_tree(&tree, &source, language);
         let cpp_fields = if language == "cpp" {
             cpp_class_fields(&tree, &source)
@@ -597,6 +601,7 @@ fn pre_parse_batch(
             hash,
             last_modified,
             parsed_nodes,
+            module_is_test,
             has_parse_errors,
             relations,
             cpp_fields,
@@ -719,7 +724,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
                 name_tokens: None,
                 return_type: None,
                 param_types: None,
-                is_test: false,
+                is_test: pp.module_is_test,
             },
         )?;
         node_ids.push(module_node_id);

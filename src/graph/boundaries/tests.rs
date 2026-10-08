@@ -1164,6 +1164,8 @@ const CALL_CORPUS: &[CallRow] = &[
     ("rust", "remove(a);\n", "remove", &[1]),
     ("rust", "x.remove::<u8>(a);\n", "remove", &[1]),
     ("rust", "Foo::remove::<u8>(a);\n", "remove", &[1]),
+    // An array type inside the turbofish holds a `;` (D#278(2)).
+    ("rust", "x.remove::<[u8; 4]>(a);\n", "remove", &[1]),
     ("rust", "let n = list\n    .remove(node);\n", "remove", &[2]),
     ("rust", "if remove(x) {\n}\n", "remove", &[1]),
     (

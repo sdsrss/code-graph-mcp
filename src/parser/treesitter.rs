@@ -455,7 +455,7 @@ pub fn extract_nodes_from_tree(
     let mut nodes = Vec::new();
     let config = LanguageConfig::for_language(language);
     let root = tree.root_node();
-    let file_is_test = config.has_test_attributes && inner_cfg_requires_test(&root, source);
+    let file_is_test = file_is_test_code(tree, source, language);
     extract_nodes(
         root,
         source,
@@ -469,10 +469,31 @@ pub fn extract_nodes_from_tree(
     nodes
 }
 
+/// Whether the whole file is test code by its own text: a Rust file that
+/// opens with an inner `#![cfg(test)]` (or any `cfg` predicate requiring
+/// `test`). Its `<module>` node is test code then too (D#291(2)).
+pub fn file_is_test_code(tree: &tree_sitter::Tree, source: &str, language: &str) -> bool {
+    LanguageConfig::for_language(language).has_test_attributes
+        && inner_cfg_requires_test(&tree.root_node(), source)
+}
+
 /// Check if a node has a preceding test attribute: a harness attribute
-/// (`#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = …)]`) or a `#[cfg(…)]`
+/// (`#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = …)]`, `#[rstest]`, …
+/// see [`TEST_HARNESS_ATTRIBUTES`]) or a `#[cfg(…)]`
 /// whose predicate requires `test`. Inner attributes are skipped: they gate their
 /// container, which [`inner_cfg_requires_test`] reads.
+/// Last path segments of the attributes that make the function under them a
+/// test: the standard harness's `test` (also `tokio::test` and every other
+/// `….::test`), and the harness macros of rstest, test-case,
+/// wasm-bindgen-test and quickcheck (D#278(3)).
+const TEST_HARNESS_ATTRIBUTES: &[&str] = &[
+    "test",
+    "rstest",
+    "test_case",
+    "wasm_bindgen_test",
+    "quickcheck",
+];
+
 fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
     let mut sibling = node.prev_sibling();
     while let Some(s) = sibling {
@@ -480,7 +501,11 @@ fn has_test_attribute(node: &tree_sitter::Node, source: &str) -> bool {
             "attribute_item" => {
                 if let Some(attr) = attribute_of(&s) {
                     let path = attribute_path(&attr, source);
-                    if path.rsplit("::").next().map(unraw) == Some("test")
+                    if path
+                        .rsplit("::")
+                        .next()
+                        .map(unraw)
+                        .is_some_and(|last| TEST_HARNESS_ATTRIBUTES.contains(&last))
                         || cfg_attribute_requires_test(&attr, source)
                     {
                         return true;
@@ -5058,6 +5083,44 @@ fn production() {}
                 ("other_attribute_with_test_argument", false),
                 ("cfg_suffixed_attribute", false),
                 ("attribute_named_tests", false),
+                ("production", false),
+            ],
+        );
+    }
+
+    // D#278(3): test harnesses other than `#[test]` / `#[….::test]` generate
+    // test functions too. Their own helper attributes (`#[fixture]`, `#[case]`)
+    // and an unrelated attribute of a similar name do not.
+    #[test]
+    fn rust_harness_attributes_beyond_test_mark_test_code() {
+        let code = r#"
+#[rstest]
+fn rstest_case(#[case] x: u8) {}
+#[rstest::rstest]
+fn rstest_by_path() {}
+#[test_case(1 ; "one")]
+#[test_case(2)]
+fn test_case_rows(x: u8) {}
+#[wasm_bindgen_test]
+fn wasm_test() {}
+#[quickcheck]
+fn quickcheck_property(x: u8) -> bool { true }
+#[fixture]
+fn rstest_fixture() -> u8 { 1 }
+#[case_insensitive]
+fn similar_name() {}
+fn production() {}
+"#;
+        assert_rust_is_test(
+            code,
+            &[
+                ("rstest_case", true),
+                ("rstest_by_path", true),
+                ("test_case_rows", true),
+                ("wasm_test", true),
+                ("quickcheck_property", true),
+                ("rstest_fixture", false),
+                ("similar_name", false),
                 ("production", false),
             ],
         );

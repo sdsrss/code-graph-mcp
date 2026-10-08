@@ -1410,9 +1410,12 @@ const MEMBER_MODIFIERS: &[&str] = &[
 ];
 
 /// Past a balanced `<…>` opened at `lt` (not counting the `>` of a `->`):
-/// the position after its `>`, or `None` when it does not close nearby.
+/// the position after its `>`, or `None` when it does not close nearby. A `;`
+/// ends the scan only outside `[…]`: an array type holds one (`::<[u8; 4]>`,
+/// D#278(2)).
 fn past_angle(m: &[u8], lt: usize) -> Option<usize> {
     let mut depth = 0usize;
+    let mut square = 0usize;
     for (k, &b) in m.iter().enumerate().skip(lt).take(512) {
         match b {
             b'<' => depth += 1,
@@ -1422,7 +1425,10 @@ fn past_angle(m: &[u8], lt: usize) -> Option<usize> {
                     return Some(k + 1);
                 }
             }
-            b';' | b'{' | b'}' => return None,
+            b'[' => square += 1,
+            b']' => square = square.saturating_sub(1),
+            b';' if square == 0 => return None,
+            b'{' | b'}' => return None,
             _ => {}
         }
     }

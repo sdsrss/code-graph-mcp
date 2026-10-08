@@ -12405,3 +12405,29 @@ fn a_full_index_retires_a_crashed_run_s_marker() {
     run_full_index(&db, project.path(), None, None).unwrap();
     assert_eq!(run_marker(&db), None);
 }
+
+// D#291(2): the `<module>` node of a file gated by `#![cfg(test)]` was always
+// production code, so a call in its `static` initializer counted as a
+// production caller (and was listed among an empty answer's unresolved calls).
+#[test]
+fn a_cfg_test_file_s_module_node_is_test_code() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "src/mocks.rs",
+            "#![cfg(test)]\nstatic COUNT: usize = crate::lib_fn();\nfn mock() {}\n",
+        ),
+        ("src/lib.rs", "pub const fn lib_fn() -> usize { 1 }\n"),
+    ]);
+    let module_is_test = |path: &str| -> bool {
+        db.conn()
+            .query_row(
+                "SELECT n.is_test FROM nodes n JOIN files f ON f.id = n.file_id \
+                 WHERE f.path = ?1 AND n.name = '<module>'",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(module_is_test("src/mocks.rs"));
+    assert!(!module_is_test("src/lib.rs"));
+}
