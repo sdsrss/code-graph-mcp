@@ -56,9 +56,9 @@ pub use nodes::{
     get_nodes_by_file_path, get_nodes_by_name, get_nodes_missing_context,
     get_nodes_with_files_by_filters, get_nodes_with_files_by_ids, get_nodes_with_files_by_name,
     get_nodes_with_files_by_qualified_name, get_nodes_with_files_by_symbol,
-    get_structural_dependent_files, inherits_edges, insert_cpp_fields, insert_node,
-    insert_node_cached, reap_orphan_external_nodes, update_context_strings_batch, NameEntry,
-    NodeRecord, NodeResult, NodeWithFile,
+    get_relative_python_importers_of, get_structural_dependent_files, inherits_edges,
+    insert_cpp_fields, insert_node, insert_node_cached, reap_orphan_external_nodes,
+    update_context_strings_batch, NameEntry, NodeRecord, NodeResult, NodeWithFile,
 };
 pub use project_map::{get_project_map, EntryPoint, HotFunction, ModuleDep, ModuleStats};
 pub use routes::{

@@ -12228,3 +12228,66 @@ fn a_python_edge_is_never_restored_onto_a_method_it_did_not_point_at() {
         .iter()
         .any(|x| x == "app.py.main --calls--> pkg/util.py.helper"));
 }
+
+// D#192(2): `from . import newmod` written before `newmod.py` exists binds the
+// package's `__init__.py` (D10: a name that is no node of the module binds the
+// file it names). When `newmod.py` appears, a rebuild binds the import to it,
+// but the incremental run never re-extracted the importer: the edge stayed on
+// `__init__.py` and `affected pkg/newmod.py` named no dependent. An appearing
+// module re-extracts the files whose relative import sits on its package.
+#[test]
+fn a_python_module_appearing_after_its_relative_import_takes_the_import() {
+    let mut diverged = Vec::new();
+    for (before, appearing) in [
+        (
+            vec![
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/app.py",
+                    "from . import newmod\n\n\ndef main():\n    return newmod.f()\n",
+                ),
+            ],
+            ("pkg/newmod.py", "def f():\n    return 1\n"),
+        ),
+        (
+            vec![
+                ("pkg/__init__.py", ""),
+                ("pkg/sub/__init__.py", ""),
+                (
+                    "pkg/sub/app.py",
+                    "from .. import consts\nfrom . import tools\n\n\ndef main():\n    return consts.VALUE\n",
+                ),
+            ],
+            ("pkg/consts.py", "VALUE = 1\n\n\ndef helper():\n    return 2\n"),
+        ),
+        (
+            vec![
+                ("pkg/__init__.py", ""),
+                ("pkg/sub/__init__.py", ""),
+                ("pkg/sub/app.py", "from . import tools\n"),
+            ],
+            ("pkg/sub/tools/__init__.py", "def run():\n    return 0\n"),
+        ),
+    ] {
+        let (project, _d, db) = fresh_index_of(&before);
+        let path = project.path().join(appearing.0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, appearing.1).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let mut tree = before.clone();
+        tree.push(appearing);
+        let (_p2, _d2, control) = fresh_index_of(&tree);
+        let (incremental, rebuild) = (edge_set(&db), edge_set(&control));
+        if incremental != rebuild {
+            diverged.push(format!(
+                "{} appeared:\n  incremental {incremental:?}\n  rebuild     {rebuild:?}",
+                appearing.0
+            ));
+        }
+    }
+    assert!(
+        diverged.is_empty(),
+        "incremental must equal a rebuild:\n{}",
+        diverged.join("\n")
+    );
+}

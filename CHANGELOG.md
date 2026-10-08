@@ -31,6 +31,16 @@ otherwise it is resolved again.
 On flask 3.1.0, 5 `references` edges go, all from production code to test
 methods named `g` or `gen`; no node and no call edge changes.
 
+### Python: a module created after its relative import
+
+`from . import consts` written before `consts.py` exists binds the package's
+`__init__.py`. When `consts.py` was then created, a rebuild bound the import
+to it, but an incremental run left the import on `__init__.py`: with
+`consts` only read (`consts.VALUE`), `affected pkg/consts.py` named no file
+and no test. A new Python module now re-extracts the files whose relative
+import binds its package. On that fixture `affected pkg/consts.py` names
+`pkg/app.py` and its test `tests/test_app.py`, as after a rebuild.
+
 ## 0.168.0
 
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is

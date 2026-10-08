@@ -434,6 +434,34 @@ pub fn get_external_sentinel_importers(conn: &Connection) -> Result<Vec<(String,
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// Files whose relative Python import (`from . import x`) binds the `<module>`
+/// node of `init_path`, a package's `__init__.py`.
+///
+/// A relative import of a name that is no node of the package binds the
+/// package itself (D10): a variable of `__init__.py`, or a submodule that does
+/// not exist yet. When that submodule appears, a rebuild binds the import to
+/// it, so its importers are re-extracted (D#192(2)). The edge does not record
+/// which name it imported, so every relative importer of the package is a
+/// candidate: over-inclusive, which costs a re-extraction that comes out
+/// identical, where the miss left the import on `__init__.py` for good.
+pub fn get_relative_python_importers_of(conn: &Connection, init_path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT fs.path
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files ft ON ft.id = nt.file_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE ft.path = ?1
+           AND nt.name = '<module>'
+           AND e.relation = 'imports'
+           AND json_extract(e.metadata, '$.python_module') LIKE '.%'
+         ORDER BY fs.path",
+    )?;
+    let rows = stmt.query_map([init_path], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Delete `<external>` sentinel nodes that no edge touches any more.
 ///
 /// Sentinels are minted as edge TARGETS only, but pruning

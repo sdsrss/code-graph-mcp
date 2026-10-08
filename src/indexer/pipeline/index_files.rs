@@ -1242,7 +1242,52 @@ fn existence_change_dependents(
         }
     }
 
+    // `from . import newmod` written before `newmod.py` existed bound the
+    // package's `__init__.py` (D10), not a sentinel, so the scan above cannot
+    // see it (D#192(2)).
+    for init in appearing_python_package_inits(db, files)? {
+        for importer in crate::storage::queries::get_relative_python_importers_of(db.conn(), &init)?
+        {
+            if !in_run.contains(importer.as_str()) && !deleting.contains(importer.as_str()) {
+                extra.insert(importer);
+            }
+        }
+    }
+
     Ok(extra.into_iter().collect())
+}
+
+/// The `__init__.py` of each package a Python module NEW to the index joins:
+/// `pkg/__init__.py` for `pkg/newmod.py` and for `pkg/newmod/__init__.py`.
+/// Probed per path like [`appearing_file_stems`], so the single-file refresh
+/// path pays one indexed lookup.
+fn appearing_python_package_inits(db: &Database, files: &[String]) -> Result<Vec<String>> {
+    let mut known = db
+        .conn()
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut inits: Vec<String> = Vec::new();
+    for f in files {
+        if !f.ends_with(".py") || known.exists([f.as_str()])? {
+            continue;
+        }
+        let (dir, file) = f.rsplit_once('/').unwrap_or(("", f.as_str()));
+        let package_dir = if file == "__init__.py" {
+            if dir.is_empty() {
+                continue; // the root's own `__init__.py` joins no package
+            }
+            dir.rsplit_once('/').map_or("", |(parent, _)| parent)
+        } else {
+            dir
+        };
+        inits.push(if package_dir.is_empty() {
+            "__init__.py".to_string()
+        } else {
+            format!("{package_dir}/__init__.py")
+        });
+    }
+    inits.sort_unstable();
+    inits.dedup();
+    Ok(inits)
 }
 
 /// Module stems of the files in this run that the index has never seen.
