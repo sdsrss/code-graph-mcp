@@ -131,12 +131,28 @@ test('a platform package that never becomes installable fails the run before the
   const w = world({ visibleAfter: { [lost]: Infinity } });
   assert.equal(await publishRelease(opts(w)), 1);
   assert.ok(!w.events.includes(`publish ${MAIN.name}`), w.events.join('\n'));
-  // It waited the whole budget, not one probe.
-  assert.ok(w.elapsed() >= 60 * 60_000, `waited ${w.elapsed()} ms`);
+  // It waited the whole budget, not one probe, and stopped within a poll of it.
+  assert.ok(w.elapsed() >= 60 * 60_000 && w.elapsed() <= 60 * 60_000 + 30_000, `waited ${w.elapsed()} ms`);
   const error = w.lines.find((l) => l.startsWith('::error::'));
-  assert.ok(error && error.includes(lost) && error.includes('not published'), w.lines.join('\n'));
+  assert.ok(error && error.includes(`${lost}@${VERSION} (not installable yet)`) && error.includes('not published'), error);
   // Only the missing package is named.
   assert.ok(!error.includes('linux-x64'), error);
+});
+
+test('the final error repeats what the last probe saw, so a broken probe does not read as an npm delay', async () => {
+  const w = world();
+  const probe = async (name) => (name.endsWith('win32-x64') ? 'packument: curl: (6) Could not resolve host' : true);
+  assert.equal(await publishRelease(opts(w, { probe })), 1);
+  const error = w.lines.find((l) => l.startsWith('::error::'));
+  assert.ok(error.includes('@sdsrs/code-graph-win32-x64@1.2.3 (packument: curl: (6) Could not resolve host)'), error);
+});
+
+test('a main package publish error fails the run after the platform packages are out', async () => {
+  const w = world({ publishResults: { [MAIN.name]: AUTH } });
+  assert.equal(await publishRelease(opts(w)), 1);
+  assert.equal(w.events.at(-1), `publish ${MAIN.name}`);
+  assert.ok(!w.events.includes(`visible ${MAIN.name}`), w.events.join('\n'));
+  assert.ok(w.lines.some((l) => l.startsWith('::error::') && l.includes(MAIN.name)), w.lines.join('\n'));
 });
 
 test('any other publish error fails at once: no later publish, no wait', async () => {
@@ -151,7 +167,8 @@ test('a main package that does not become installable fails the run', async () =
   const w = world({ visibleAfter: { [MAIN.name]: Infinity } });
   assert.equal(await publishRelease(opts(w)), 1);
   assert.ok(w.events.includes(`publish ${MAIN.name}`));
-  assert.ok(w.elapsed() >= 30 * 60_000);
+  // The main package has its own, shorter budget (mainWaitMs, not waitMs).
+  assert.ok(w.elapsed() >= 30 * 60_000 && w.elapsed() <= 30 * 60_000 + 30_000, `waited ${w.elapsed()} ms`);
   assert.ok(w.lines.some((l) => l.startsWith('::error::') && l.includes(MAIN.name)), w.lines.join('\n'));
 });
 
@@ -220,16 +237,17 @@ test('probeRegistry: installable means listed in the install packument AND the t
   try {
     const { probeRegistry } = require('./npm-publish');
     assert.equal(await probeRegistry('@sdsrs/listed', VERSION, registry), true);
-    assert.equal(await probeRegistry('@sdsrs/no-tarball', VERSION, registry), false);
-    assert.equal(await probeRegistry('@sdsrs/other-version', VERSION, registry), false);
-    assert.equal(await probeRegistry('@sdsrs/absent', VERSION, registry), false);
-    assert.equal(await probeRegistry('@sdsrs/broken', VERSION, registry), false);
+    // Anything else is a string saying what the probe saw.
+    assert.match(await probeRegistry('@sdsrs/no-tarball', VERSION, registry), /^tarball: .*404/);
+    assert.equal(await probeRegistry('@sdsrs/other-version', VERSION, registry), `${VERSION} not listed yet`);
+    assert.match(await probeRegistry('@sdsrs/absent', VERSION, registry), /^packument: .*404/);
+    assert.match(await probeRegistry('@sdsrs/broken', VERSION, registry), /^packument: .*500/);
     // Read what `npm install` reads, and only the first byte of the tarball.
     assert.deepEqual(seen[0], ['/@sdsrs%2flisted', 'application/vnd.npm.install-v1+json', undefined]);
     assert.deepEqual([seen[1][0], seen[1][2]], ['/t/ok.tgz', 'bytes=0-0']);
     server.close();
     // Nothing listening: a network error is "not yet", not a crash.
-    assert.equal(await probeRegistry('@sdsrs/listed', VERSION, registry), false);
+    assert.match(await probeRegistry('@sdsrs/listed', VERSION, registry), /^packument: curl: \(7\)/);
   } finally {
     server.close();
     for (const [key, value] of [['no_proxy', savedProxy[0]], ['NO_PROXY', savedProxy[1]]]) {

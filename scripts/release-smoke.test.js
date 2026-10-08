@@ -63,6 +63,7 @@ test('npm packages are published only through scripts/npm-publish.js, inside a l
   for (const file of fs.readdirSync(workflows).filter((f) => /\.ya?ml$/.test(f))) {
     const code = fs
       .readFileSync(path.join(workflows, file), 'utf8')
+      .replace(/\\\n\s*/g, ' ') // a shell line continuation joins its lines
       .split('\n')
       .filter((line) => !/^\s*#/.test(line));
     const direct = code.filter((line) => /\bnpm\s+publish\b/.test(line));
@@ -74,11 +75,25 @@ test('npm packages are published only through scripts/npm-publish.js, inside a l
 
   const job = release.match(/\n {2}publish:\n([\s\S]*?)\n {2}[a-z][\w-]*:\n/);
   assert.ok(job, 'release.yml has a `publish` job');
+  // The step exactly: no continue-on-error, no budget override, no step bound
+  // shorter than the waits, and the token npm authenticates with.
+  const step = job[1].match(/\n( {6}- name: Publish to npm[^\n]*\n(?: {8}[^\n]*\n)*)/);
+  assert.ok(step, 'the publish job has the "Publish to npm" step');
+  assert.deepEqual(
+    step[1].split('\n').filter((l) => l.trim() && !/^\s*#/.test(l)).map((l) => l.trim()),
+    [
+      '- name: Publish to npm (platform packages first, main package last)',
+      'run: node scripts/npm-publish.js "$VERSION"',
+      'env:',
+      'NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}',
+    ],
+  );
+  assert.match(job[1], /\n {6}id-token: write\n/, '--provenance needs id-token: write');
   const bound = job[1].match(/^ {4}timeout-minutes: (\d+)$/m);
   assert.ok(bound, 'the publish job sets timeout-minutes');
   const { WAIT_SECONDS, MAIN_WAIT_SECONDS } = require('./npm-publish');
   const waits = (WAIT_SECONDS + MAIN_WAIT_SECONDS) / 60;
-  // 10 minutes for the rest of the job (measured 132 s before the waits).
+  // 10 minutes for the rest of the job (measured 162-219 s before the waits).
   assert.ok(Number(bound[1]) >= waits + 10, `publish timeout-minutes ${bound[1]} < ${waits} min of waits + 10`);
 });
 

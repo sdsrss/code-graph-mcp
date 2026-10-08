@@ -56,15 +56,17 @@ run-to-run spread: −0.8% in one set of five interleaved runs per build,
 - CLI `search` no longer returns the helper, as it already did not return
   `#[cfg(test)]` code; `show` and `grep` still find it.
 
-### Many attributes on one Rust item
+### Many attributes or comment lines above one Rust item
 
-Indexing time grew with the square of the number of attributes stacked on
-one item, because each attribute read every attribute above it. A file
-with 5,000 `#[cfg(feature = …)]` lines on one function took 7.8 s to index
-with the published 0.167.0 linux-x64 binary and takes 62 ms now (three
-runs each). Each attribute is now read once, by the item it belongs to.
-This changes no node or edge: full indexes of tokio-1.41.1 and of this
-repository are identical with and without it.
+Indexing time grew faster than the number of attributes or comment lines
+stacked above one item, because each of them read every one above it. With
+the published 0.167.0 linux-x64 binary, a file with 5,000
+`#[cfg(feature = …)]` lines on one function took 7.8 s to index, and one
+with 2,500 `//` lines before a function took 25.8 s; they take 62 ms and
+50 ms now (three runs each). Each attribute and comment is now read once,
+by the item it belongs to.
+Full indexes of tokio-1.41.1 and of this repository are identical with and
+without it; the one shape it changes is under Not covered.
 
 ### npm: the main package waits for its platform packages
 
@@ -76,9 +78,12 @@ as npm had accepted the platform packages. In 0.167.0, linux-arm64 became
 installable 49 minutes after the main package; in 0.166.0, linux-x64 10
 minutes after. An install in that window printed `added 1 package` instead
 of 2, and on a machine with no other copy of the binary `code-graph-mcp`
-then reported it not found; running the install again fixes it. The
-release now publishes the main package only once every platform package
-can be installed.
+then reported it not found. Running `npm install -g @sdsrs/code-graph`
+again fixes a global install. `npx` keeps the incomplete copy in its
+cache, so running it again does not; deleting the `_npx` directory in
+npm's cache directory (`npm config get cache`) does. The release now
+publishes the main package only once every platform package can be
+installed.
 
 ### Not covered
 
@@ -98,6 +103,9 @@ can be installed.
 - In a file gated by `#![cfg(test)]`, code outside any function (a `static`
   initializer, say) still counts as production: the unresolved-call list of
   an empty `refs` answer can still show its calls.
+- An item defined inside an attribute's value under `#[cfg(test)]`
+  (`#[doc = { fn f() {} "" }]`, which does not compile as a test build)
+  was test code in 0.167.0 and is now production.
 
 ## 0.167.0
 

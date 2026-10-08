@@ -83,34 +83,41 @@ function npmPublish(pkg) {
   return { status: r.status, output: `${r.stdout || ''}${r.stderr || ''}${r.error ? r.error.message : ''}` };
 }
 
-/** curl's stdout, or null on any failure. curl, not Node's `fetch`: fetch
- * ignores `https_proxy`, so behind a proxy every probe timed out and read as
- * "not yet" (measured: 10.5 s per probe, 0.167.0 reported absent). */
+/** `{ stdout }`, or `{ error }` saying why curl failed. curl, not Node's
+ * `fetch`: fetch ignores `https_proxy`, so behind a proxy every probe timed out
+ * and read as "not yet" (measured: 10.5 s per probe, 0.167.0 reported absent).
+ * `--max-time 15` keeps one probe pass over the five platform packages (two
+ * requests each) at 2.5 min at worst, which the Publish job's bound in
+ * release.yml counts. */
 function curl(args) {
   return new Promise((resolve) => {
     execFile(
       'curl',
-      ['-sS', '--fail', '-L', '--max-time', '30', '-H', 'cache-control: no-cache', ...args],
+      ['-sS', '--fail', '-L', '--max-time', '15', '-H', 'cache-control: no-cache', ...args],
       { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true },
-      (err, stdout) => resolve(err ? null : stdout),
+      (err, stdout, stderr) =>
+        resolve(err ? { error: (stderr || '').trim().split('\n').pop() || err.message } : { stdout }),
     );
   });
 }
 
-/** True once `npm install` can get `name@version`: the install-format
- * packument lists it and its tarball is served. Any failure reads as "not yet". */
+/** `true` once `npm install` can get `name@version`: the install-format
+ * packument lists it and its tarball is served. Otherwise a string saying what
+ * the probe saw, which the final error repeats: a probe that can never succeed
+ * (no curl, TLS, a changed registry) must not read as an npm delay. */
 async function probeRegistry(name, version, registry) {
   const doc = await curl(['-H', 'accept: application/vnd.npm.install-v1+json', `${registry}/${name.replace('/', '%2f')}`]);
-  if (doc === null) return false;
+  if (doc.error) return `packument: ${doc.error}`;
   let tarball;
   try {
-    tarball = JSON.parse(doc).versions?.[version]?.dist?.tarball;
+    tarball = JSON.parse(doc.stdout).versions?.[version]?.dist?.tarball;
   } catch {
-    return false;
+    return 'packument: not JSON';
   }
-  if (!tarball) return false;
-  const status = await curl(['-r', '0-0', '-o', os.devNull, '-w', '%{http_code}', tarball]);
-  return status === '200' || status === '206';
+  if (!tarball) return `${version} not listed yet`;
+  const t = await curl(['-r', '0-0', '-o', os.devNull, '-w', '%{http_code}', tarball]);
+  if (t.error) return `tarball: ${t.error}`;
+  return t.stdout === '200' || t.stdout === '206' ? true : `tarball: HTTP ${t.stdout}`;
 }
 
 /** Publish one package; false (with the npm output and an ::error:: printed)
@@ -130,18 +137,23 @@ function publishOne(pkg, version, { publish, log }) {
 }
 
 /** Poll until every name is installable or `budgetMs` has passed; returns the
- * names still missing. */
+ * ones still missing as `name@version (what the last probe saw)`. */
 async function waitInstallable(names, version, budgetMs, { probe, sleep, now, pollMs, log }) {
   const start = now();
-  const pending = new Set(names);
+  const pending = new Map(names.map((name) => [name, 'not probed']));
   for (;;) {
-    for (const name of [...pending]) {
-      if (await probe(name, version)) {
+    for (const name of [...pending.keys()]) {
+      const seen = await probe(name, version);
+      if (seen === true) {
         pending.delete(name);
         log(`${name}@${version} is installable (${Math.round((now() - start) / 1000)} s after the wait began)`);
+      } else {
+        pending.set(name, typeof seen === 'string' ? seen : 'not installable yet');
       }
     }
-    if (pending.size === 0 || now() - start >= budgetMs) return [...pending];
+    if (pending.size === 0 || now() - start >= budgetMs) {
+      return [...pending].map(([name, seen]) => `${name}@${version} (${seen})`);
+    }
     await sleep(pollMs);
   }
 }
@@ -154,7 +166,7 @@ async function publishRelease(o) {
   const missing = await waitInstallable(o.platforms.map((p) => p.name), o.version, o.waitMs, o);
   if (missing.length) {
     o.log(
-      `::error::${missing.join(', ')}@${o.version} not installable after ${minutes(o.waitMs)} min, so ` +
+      `::error::${missing.join(', ')} not installable after ${minutes(o.waitMs)} min, so ` +
         `${o.main.name} was not published. Rerun the workflow once \`npm view <pkg>@${o.version}\` lists it; ` +
         `a version held for approval shows in \`npm stage list\`.`,
     );
@@ -164,7 +176,7 @@ async function publishRelease(o) {
   const mainMissing = await waitInstallable([o.main.name], o.version, o.mainWaitMs, o);
   if (mainMissing.length) {
     o.log(
-      `::error::${o.main.name}@${o.version} was published but is not installable after ${minutes(o.mainWaitMs)} min. ` +
+      `::error::${mainMissing[0]} was published but is not installable after ${minutes(o.mainWaitMs)} min. ` +
         'Rerun the failed jobs; this step waits for it again.',
     );
     return 1;
