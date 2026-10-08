@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.168.0
 
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is
 test code, so it no longer counts as a production caller.
