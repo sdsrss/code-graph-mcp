@@ -118,22 +118,6 @@ same tree: hono 1.313 s → 1.197 s (7 runs each), this repository 4.581 s →
 4.106 s (5 each); nodes and edges are identical on hono, express and this
 repository.
 
-### MCP `find_references` says what its confidence tiers mean
-
-Its `min_confidence` description told the model that `inferred` means
-import-resolved and `extracted` means same-file precise. Neither holds: a
-call `b.py` makes to `a.py`'s `unique_fn` with no import at all is
-`inferred`, because the name has one definition, and a wrong same-file bind
-can be `extracted`. The description now says what each tier is: `extracted`
-is the default label, `inferred` a by-name pick of the only same-language
-definition or of one an import, path or receiver pinned, and `ambiguous` a
-by-name pick among several definitions without such a pin. Correct callers
-land in `ambiguous` too (for example Java and Go method calls, Python
-`mod.f()` and Rust typed receivers such as `rt.block_on()`), so it advises
-against narrowing a rename audit to `inferred`. `get_call_graph`'s says
-`extracted` keeps same-file calls only. Only the text the model reads
-changes; no answer does.
-
 ### Not covered
 
 - A bare Python name imported from a package still binds a same-named
