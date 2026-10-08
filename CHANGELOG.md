@@ -60,11 +60,12 @@ run-to-run spread: −0.8% in one set of five interleaved runs per build,
 
 Indexing time grew faster than the number of attributes or comment lines
 stacked above one item, because each of them read every one above it. With
-the published 0.167.0 linux-x64 binary, a file with 5,000
-`#[cfg(feature = …)]` lines on one function took 7.8 s to index, and one
-with 2,500 `//` lines before a function took 25.8 s; they take 62 ms and
-50 ms now (three runs each). Each attribute and comment is now read once,
-by the item it belongs to.
+the published linux-x64 binaries, a file with 5,000 `#[cfg(feature = …)]`
+lines on one function took 7.8 s to index with 0.167.0 and takes 0.25 s
+with 0.168.0; one with 2,500 `//` lines before a function, 25.8 s and
+1.1 s (three runs each; a file with two short functions takes 0.19 s with
+either, most of it the embedding model). Each attribute and comment is now
+read once, by the item it belongs to.
 Full indexes of tokio-1.41.1 and of this repository are identical with and
 without it; the one shape it changes is under Not covered.
 
