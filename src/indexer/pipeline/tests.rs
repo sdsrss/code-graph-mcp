@@ -12291,3 +12291,117 @@ fn a_python_module_appearing_after_its_relative_import_takes_the_import() {
         diverged.join("\n")
     );
 }
+
+/// Hold `index-run.lock` beside the index SHARED, as a run of another process
+/// does while its in-flight marker is set (D#192(3)). Released on drop.
+#[cfg(unix)]
+fn hold_run_lock_as_another_run(db_dir: &std::path::Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(db_dir.join("index-run.lock"))
+        .unwrap();
+    // SAFETY: a valid open fd owned by `file` for the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    file
+}
+
+// D#192(3): the in-flight marker was "1" with no owner. A CLI query that indexes
+// a new file sets it for the length of its run, and an MCP server's incremental
+// run starting meanwhile read it as a crashed run and re-indexed every file
+// (tokio: 2 of 12 rounds, 3.9-5.1 s each). A run still in flight is no crash;
+// and a run that finishes beside it must not erase the evidence of one.
+#[cfg(unix)]
+#[test]
+fn a_run_another_process_has_in_flight_is_not_an_interrupted_run() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for (name, body) in [
+        ("a.ts", "export const a = 1;\n"),
+        ("b.ts", "export const b = 1;\n"),
+        ("c.ts", "export const c = 1;\n"),
+    ] {
+        fs::write(src.join(name), body).unwrap();
+    }
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Another process's run: its marker set, its lock held.
+    set_run_marker(&db);
+    let live = hold_run_lock_as_another_run(db_dir.path());
+    fs::write(src.join("a.ts"), "export const a = 2;\n").unwrap();
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 1,
+        "a run another process still has in flight must not escalate this one"
+    );
+    assert!(
+        run_marker(&db).is_some_and(|m| m.split_whitespace().any(|t| t == "1")),
+        "this run must not erase the marker of a run it does not own, got {:?}",
+        run_marker(&db)
+    );
+
+    // That run dies without finishing: its marker stays and nobody holds the
+    // lock, which is the crash the marker exists to report.
+    drop(live);
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 3,
+        "a marker no live run holds is a crash: the whole tree is re-indexed"
+    );
+    assert_eq!(
+        run_marker(&db),
+        None,
+        "the recovery run retires the dead run's marker"
+    );
+}
+
+// D#192(3), the other half: a run that crashed while another was in flight. The
+// live run's finish must leave the dead run's token, so the crash is still
+// recovered once nobody is running.
+#[cfg(unix)]
+#[test]
+fn a_crash_beside_a_live_run_is_recovered_after_it() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.ts"), "export const a = 1;\n").unwrap();
+    fs::write(src.join("b.ts"), "export const b = 1;\n").unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // The crashed run's marker, beside a live run's lock.
+    set_run_marker(&db);
+    let live = hold_run_lock_as_another_run(db_dir.path());
+    fs::write(src.join("a.ts"), "export const a = 2;\n").unwrap();
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 1,
+        "nothing is recovered while a run is in flight"
+    );
+    drop(live); // the live run finishes and holds nothing any more
+
+    let result = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.files_indexed, 2,
+        "the crash is recovered once nobody runs"
+    );
+    assert_eq!(run_marker(&db), None);
+}
+
+// A full index re-extracts every file, so it recovers a crashed run as the
+// escalated incremental does, and retires its marker token.
+#[test]
+fn a_full_index_retires_a_crashed_run_s_marker() {
+    let (project, _d, db) = fresh_index_of(&[("src/a.ts", "export const a = 1;\n")]);
+    set_run_marker(&db);
+    run_full_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(run_marker(&db), None);
+}

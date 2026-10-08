@@ -17,6 +17,7 @@ use crate::storage::queries::{get_all_file_hashes, get_dirty_node_ids};
 
 mod context;
 mod embed;
+mod in_flight;
 mod index_files;
 mod js_modules;
 mod python_modules;
@@ -190,6 +191,8 @@ pub fn run_full_index(
         .map(|(rel, _abs)| rel)
         .collect();
     let root_mods = resolve::collect_rust_crates(project_root).root_mods_json();
+    // Every file is re-extracted below, which recovers any run found dead.
+    let dead_runs = index_run_was_interrupted(db)?;
     let result = index_files(
         db,
         project_root,
@@ -199,6 +202,9 @@ pub fn run_full_index(
         &[],
         progress,
     )?;
+    if let Some(dead) = &dead_runs {
+        in_flight::retire(db, dead)?;
+    }
     crate::storage::queries::set_meta(
         db.conn(),
         crate::storage::schema::META_KEY_RUST_ROOT_MODS,
@@ -470,13 +476,11 @@ pub fn apply_file_refreshes(
     let dirty_seed: Vec<String> = [files.as_slice(), drop_rows].concat();
     let dirty_node_ids = collect_dirty_node_ids(db, &dirty_seed)?;
 
-    // `index_files` clears the interrupted-run marker when it finishes, which is
-    // right for a run that covered the whole diff and wrong for this one: a
-    // query-time refresh re-extracts the relations of the files it was handed and
-    // leaves every other file the killed run abandoned exactly as it was. Clearing
-    // here would retire the evidence before the full re-index it exists to
-    // trigger, so a marker that was already set goes back (audit 2026-08-16 P1-2).
-    let was_interrupted = index_run_was_interrupted(db)?;
+    // A killed run's marker token survives this refresh: `index_files` removes
+    // only its own, and the refresh re-extracts only the files it was handed,
+    // leaving every other file the killed run abandoned as it was. The full
+    // re-index the token exists to trigger still happens (audit 2026-08-16 P1-2;
+    // the refresh used to re-set a marker its own run had cleared).
     // `drop_rows` goes through `index_files`' own `delete_paths`, not a bare
     // `delete_files_by_paths` before it. That parameter is what runs Phase 0
     // `buffer_then_delete_files` — the mechanism added in v59 precisely so a
@@ -487,32 +491,12 @@ pub fn apply_file_refreshes(
     // them into `pending_unresolved_calls` (audit 2026-08-29 PIPE-01).
     resolve::snapshot_definition_counts(db.conn(), &dirty_seed)?;
     index_files(db, project_root, &files, &hashes, model, drop_rows, None)?;
-    // Before the marker restore below, not after: the fan-out round is another
-    // `index_files` call, and `index_files` clears that marker when it finishes.
-    // Restoring first would hand the clear something to destroy.
-    //
-    // This ordering does widen the window in which an EARLIER run's interrupted
-    // marker is absent, and that is a real cost, not a free choice. Round two
-    // sets and clears its own marker, so round two's body is covered; what is
-    // newly exposed is the discovery query, `collect_dirty_node_ids`, and round
-    // two's post-clear tail — context strings, post passes, the sentinel reap.
-    // A kill inside that window loses the evidence that a previous run never
-    // committed its cross-file edges, and the full re-index it exists to trigger
-    // never happens. The alternative destroys the marker outright, so this is
-    // the lesser of the two; it is not nothing.
     fan_out_to_new_duplicate_definitions(db, project_root, &hashes, model)?;
     if let Some(root_mods) = root_mods {
         crate::storage::queries::set_meta(
             db.conn(),
             crate::storage::schema::META_KEY_RUST_ROOT_MODS,
             &root_mods,
-        )?;
-    }
-    if was_interrupted {
-        crate::storage::queries::set_meta(
-            db.conn(),
-            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
-            "1",
         )?;
     }
 
@@ -601,7 +585,9 @@ pub fn run_incremental_index_cached(
         diff_files.extend(moved);
         record
     };
-    let to_index = to_index_after_interrupt_check(db, diff_files, &current_hashes)?;
+    let dead_runs = index_run_was_interrupted(db)?;
+    let to_index =
+        to_index_after_interrupt_check(db, diff_files, &current_hashes, dead_runs.is_some())?;
 
     // CORE-12: deletions are dirty too. A file's removal cascade-deletes the
     // edges INTO it, but the callers live in files nobody touched, so their
@@ -645,6 +631,10 @@ pub fn run_incremental_index_cached(
         &deleted_files,
         progress,
     )?;
+    // The whole tree was re-extracted: the runs found dead are recovered.
+    if let Some(dead) = &dead_runs {
+        in_flight::retire(db, dead)?;
+    }
 
     if fanout_possible {
         fan_out_to_new_duplicate_definitions(db, project_root, &current_hashes, model)?;
@@ -829,25 +819,25 @@ fn fan_out_to_new_duplicate_definitions(
     Ok(callers.len())
 }
 
-/// True when a previous index run was killed after committing file hashes but
-/// before its cross-file edges reached the database (audit 2026-08-16 P1-2).
+/// The runs killed after committing file hashes but before their cross-file
+/// edges reached the database (audit 2026-08-16 P1-2), as their marker tokens;
+/// None when there are none, or when a run is in flight now (D#192(3)): see
+/// [`in_flight`].
 ///
 /// The killed run's hashes make `compute_diff` report those files as unchanged
 /// forever, so the missing edges have no other route back — the caller escalates
-/// its incremental to a full re-index, which re-extracts every relation. Reading
-/// an absent key as "clean" is what makes this safe on indexes built before the
-/// marker existed: they are no worse off than before, just not covered.
-fn index_run_was_interrupted(db: &Database) -> Result<bool> {
-    Ok(crate::storage::queries::get_meta(
-        db.conn(),
-        crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
-    )?
-    .is_some())
+/// its incremental to a full re-index, which re-extracts every relation, and
+/// then retires these tokens. Reading an absent key as "clean" is what makes
+/// this safe on indexes built before the marker existed: they are no worse off
+/// than before, just not covered.
+fn index_run_was_interrupted(db: &Database) -> Result<Option<Vec<String>>> {
+    in_flight::dead_runs(db)
 }
 
 /// The file set an incremental run should process: its diff normally, or the
-/// whole tree when the previous run was interrupted. `index_files` re-sets and
-/// clears the marker itself, so the escalated run needs no extra bookkeeping.
+/// whole tree when a previous run was interrupted. `index_files` adds and
+/// removes its own marker token; the caller retires the dead runs' tokens once
+/// the escalated run is done.
 ///
 /// A normal run also re-parses every still-present file whose damaged-parse
 /// verdict another binary wrote. Such a file hashes as unchanged, so the diff
@@ -857,8 +847,9 @@ fn to_index_after_interrupt_check(
     db: &Database,
     mut diff_files: Vec<String>,
     current_hashes: &HashMap<String, String>,
+    interrupted: bool,
 ) -> Result<Vec<String>> {
-    if !index_run_was_interrupted(db)? {
+    if !interrupted {
         let unverified: Vec<String> = db
             .unverified_parse_error_files()?
             .into_iter()

@@ -87,6 +87,22 @@ On tokio-1.41.1, the call edges at the default confidence floor fold 99
 distinct callers into another on 65 functions by name and file, and 43 on 29
 by qualified name and file; on flask 3.1.0, 47 on 15 and 42 on 11.
 
+### A run in progress is no longer taken for a crashed one
+
+An index run writes a marker that it clears once its cross-file edges are
+saved; a marker left behind means the run died, and the next incremental run
+re-indexes every file to recover what it lost. The marker named no run. While
+the MCP server ran, a CLI query that indexed a new file left its marker in
+place for the length of its run, and the server's next incremental run took
+it for a crash and re-indexed the whole project (tokio: 2 of 12 rounds,
+3.9–5.1 s each). Whichever run finished first also cleared the marker, so a
+crash beside another run went unrecovered. Each run now records its own entry
+in the marker and holds `.code-graph/index-run.lock` while it runs: an entry
+is a crash only when no run holds the lock, and a run clears only its own.
+With a second process holding that lock, a one-file edit re-indexed 4 of 4
+files before this change and re-indexes 1 now; once that process is gone,
+the next run re-indexes all 4 and clears the marker.
+
 ### JavaScript and TypeScript index faster
 
 Every bare JS/TS call walked its enclosing scopes and re-read each scope's
@@ -102,6 +118,8 @@ repository.
 - Two different functions with one qualified name in one file still fold:
   nested functions of different parents, such as the `def index()` that many
   flask tests define inside each test function (24 of flask's 42 above).
+- On Windows the lock is not taken, and a run in progress still reads as a
+  crashed one there.
 - The JS/TS scope walk above is still most of its cost: a probe build with
   the checks turned off indexed hono in 0.96 s of CPU against 1.35 s with
   them (5 runs each), and this change takes 0.12 s of that 0.39 s off.

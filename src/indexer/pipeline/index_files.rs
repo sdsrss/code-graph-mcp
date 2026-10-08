@@ -2560,13 +2560,14 @@ Restart every code-graph server on this project so they run one version.",
     };
 
     let has_work = !files.is_empty() || !delete_paths.is_empty();
-    if has_work {
-        crate::storage::queries::set_meta(
-            db.conn(),
-            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
-            "1",
-        )?;
-    }
+    // This run's token in the in-flight marker, held until its cross-file edges
+    // are committed (`super::in_flight`). An error return drops it with the
+    // token left in place: the crash the marker reports.
+    let run_mark = if has_work {
+        Some(super::in_flight::begin(db)?)
+    } else {
+        None
+    };
 
     // Phase 0-routes (D6): routes another file wrote into this run's files, and
     // the ones this run's files wrote elsewhere, before any purge takes them.
@@ -2835,12 +2836,9 @@ Restart every code-graph server on this project so they run one version.",
         );
     }
 
-    // Cross-file edges are durable from here on — clear the marker set above.
-    if has_work {
-        crate::storage::queries::delete_meta(
-            db.conn(),
-            crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT,
-        )?;
+    // Cross-file edges are durable from here on — remove this run's token.
+    if let Some(mark) = run_mark {
+        super::in_flight::finish(db, mark)?;
     }
 
     // Fold this run's parse verdicts into the index's durable set, so a reader
