@@ -437,9 +437,16 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # Node 24, not 20: npm trusted publishing (OIDC) needs npm >= 11.5.1 and
+      # Node >= 22.14 (docs.npmjs.com/trusted-publishers), and Node 22 still
+      # bundles npm 10. With the id-token permission above, npm tries OIDC first
+      # and falls back to NODE_AUTH_TOKEN while a package has no trusted
+      # publisher configured, so this alone changes nothing (D#290). Once all
+      # six packages trust release.yml, remove NODE_AUTH_TOKEN below so a
+      # failed OIDC exchange fails the job instead of using the token.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Download all artifacts
