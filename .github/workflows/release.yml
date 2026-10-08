@@ -441,14 +441,14 @@ jobs:
       # Node >= 22.14 (docs.npmjs.com/trusted-publishers), and Node 22 still
       # bundles npm 10. With the id-token permission above, npm tries OIDC first
       # and falls back to NODE_AUTH_TOKEN while a package has no trusted
-      # publisher configured, so publishing keeps using the token (D#290). Two
-      # npm 11 differences, both refusals without --tag (npm-publish.js passes
-      # none): a version lower than the highest one already published
-      # ("Cannot implicitly apply the latest tag"), and any prerelease such as
-      # a v*-rc* tag ("You must specify a tag"). Either fails here, after the
-      # GitHub Release step; npm 10 published both as `latest`. Once all
-      # six packages trust release.yml, remove NODE_AUTH_TOKEN below so a
-      # failed OIDC exchange fails the job instead of using the token.
+      # publisher configured, so publishing keeps using the token (D#290). One
+      # npm 11 difference: without --tag (npm-publish.js passes none) it
+      # refuses a version lower than the highest published one that is neither
+      # a prerelease nor deprecated ('Cannot implicitly apply the "latest" tag'),
+      # where npm 10 tagged it `latest`. A tag pushed out of version order now
+      # fails here, after the GitHub Release step. Once all six
+      # packages trust release.yml, remove NODE_AUTH_TOKEN below so a failed
+      # OIDC exchange fails the job instead of using the token.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24

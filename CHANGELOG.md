@@ -6,13 +6,14 @@
 because Rust test flags change (below). The MCP server rebuilds the index when it
 starts; from the command line, `code-graph-mcp reindex` does.
 
-### Python: an incremental run no longer moves an import and its calls onto a method that replaced the function
+### Python: an incremental run re-resolves an import whose function became a method
 
 When `util.py` lost `def helper` and gained a method `Box.helper`, an
 incremental run moved the edges that pointed at the function — an
 importer's `from pkg import helper` and its `helper()` call — onto the
 method, where a rebuild of the same tree binds neither. An incremental run
-now moves a Python edge onto a method only if it pointed at that same method.
+now restores a Python edge onto a method only if it pointed at that same
+method; an edge whose function is gone is resolved again.
 
 ### Python: a module created after its relative import
 
@@ -120,18 +121,18 @@ repository.
 ### MCP `find_references` says what its confidence tiers mean
 
 Its `min_confidence` description told the model that `inferred` means
-import-resolved and `extracted` means same-file precise. A call or
-reference bound by name to another file's definition is `ambiguous` when
-other definitions in its language share the name and no import, module path
-or receiver type confirms this one (in Rust only a `self` or `Self`
-receiver counts, so `rt.block_on()` on a typed local is `ambiguous`), and
-`inferred` otherwise: a call `b.py` makes to `a.py`'s `unique_fn` with no
-import at all is `inferred`. Some same-file calls are labelled the same way,
-for example a Rust method call on a field or a call result (`self.0.m()`,
-`f().m()`) and a Python call on a `self` attribute. Every other edge is
-`extracted`, which does not make it right. The description now says this,
-and `get_call_graph`'s says `extracted` keeps same-file calls only. Only the
-text the model reads changes; no answer does.
+import-resolved and `extracted` means same-file precise. Neither holds: a
+call `b.py` makes to `a.py`'s `unique_fn` with no import at all is
+`inferred`, because the name has one definition, and a wrong same-file bind
+can be `extracted`. The description now says what each tier is: `extracted`
+is the default label, `inferred` a by-name pick of the only same-language
+definition or of one an import, path or receiver pinned, and `ambiguous` a
+by-name pick among several definitions without such a pin. Correct callers
+land in `ambiguous` too (for example Java and Go method calls, Python
+`mod.f()` and Rust typed receivers such as `rt.block_on()`), so it advises
+against narrowing a rename audit to `inferred`. `get_call_graph`'s says
+`extracted` keeps same-file calls only. Only the text the model reads
+changes; no answer does.
 
 ### Not covered
 
@@ -147,7 +148,8 @@ text the model reads changes; no answer does.
 - When a Python module keeps `def helper` and gains a method `Box.helper`,
   a rebuild binds `from pkg.util import helper` and its `helper()` call to
   the method as well as the function; an incremental run keeps them on the
-  function alone until the next rebuild. 0.168.0 bound both either way.
+  function alone until the next rebuild or an edit of the importing file.
+  0.168.0 bound both either way.
 - For a symbol defined in no file, `impact --file` still answers "Symbol
   not found" whatever the file, where `refs` and `callgraph` check the file
   first.
