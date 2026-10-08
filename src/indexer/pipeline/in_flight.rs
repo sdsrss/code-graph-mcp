@@ -151,6 +151,7 @@ fn hold_shared(_db: &Database) -> Option<std::fs::File> {
 /// What an exclusive try on [`RUN_LOCK`] found.
 enum Probe {
     /// Some run holds it: every token may be live.
+    #[cfg_attr(not(unix), allow(dead_code))]
     InFlight,
     /// Taken, by this probe: no run is in flight while the handle lives.
     #[cfg_attr(not(unix), allow(dead_code))]
