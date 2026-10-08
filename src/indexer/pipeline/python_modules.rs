@@ -22,7 +22,6 @@
 //! `map` as fact. A phantom bound to a real node is this repository's worst
 //! failure mode precisely because nothing in the answer says it is wrong.
 
-use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 
 /// Directories Python would import from: the project root, plus every
@@ -170,46 +169,36 @@ pub(super) fn project_module_files_from(
 /// Resolve Python import targets within the files [`project_module_files`]
 /// resolved the module to.
 /// For `import X` (is_module_import): finds `<module>` nodes in those files.
-/// For `from X import Y`: finds the module-level nodes named Y in those files.
-/// A class member or a nested `def` (both typed `method`) is no attribute of
-/// its module: `from .util import helper` bound `Box.helper` (D#192).
+/// For `from X import Y`: finds nodes named Y only in those files.
 /// Returns None if no matching node exists yet.
 pub(super) fn resolve_python_module_targets(
-    conn: &rusqlite::Connection,
     module_files: &[String],
     is_module_import: bool,
     target_name: &str,
     node_id_to_path: &HashMap<i64, String>,
     name_to_ids: &HashMap<String, Vec<i64>>,
-) -> anyhow::Result<Option<Vec<i64>>> {
+) -> Option<Vec<i64>> {
     let lookup_name = if is_module_import {
         "<module>"
     } else {
         target_name
     };
-    let Some(all_ids) = name_to_ids.get(lookup_name) else {
-        return Ok(None);
-    };
-    let mut is_method = conn.prepare_cached("SELECT type = 'method' FROM nodes WHERE id = ?1")?;
-    let mut targets = Vec::new();
-    for &nid in all_ids {
-        let in_module = node_id_to_path
-            .get(&nid)
-            .is_some_and(|p| module_files.iter().any(|f| f == p));
-        if !in_module {
-            continue;
-        }
-        if !is_module_import
-            && is_method
-                .query_row([nid], |row| row.get::<_, bool>(0))
-                .optional()?
+    let all_ids = name_to_ids.get(lookup_name)?;
+    let targets: Vec<i64> = all_ids
+        .iter()
+        .filter(|nid| {
+            node_id_to_path
+                .get(nid)
+                .map(|p| module_files.iter().any(|f| f == p))
                 .unwrap_or(false)
-        {
-            continue;
-        }
-        targets.push(nid);
+        })
+        .copied()
+        .collect();
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
     }
-    Ok((!targets.is_empty()).then_some(targets))
 }
 
 #[cfg(test)]

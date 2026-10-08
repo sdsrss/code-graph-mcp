@@ -12091,86 +12091,53 @@ fn a_member_call_on_a_node_builtin_module_binds_no_project_function() {
     );
 }
 
-// D#193(2): a bare Python name in a value position (`@cache`, `register(cache)`)
-// bound a same-named METHOD of another file: `@cache` from functools drew
-// `references -> Store.cache`. A bare name reaches a module-level binding, a
-// builtin or an enclosing function's local; a class member of another file is
-// none of them. Same-file methods stay reachable (`x = property(getx)` in the
-// class body), and so does another file's module-level function.
+// Pre-tag review of the D#192/D#193 batch: a module can export a bound method
+// under a module-level alias (`register = _default.register`), which is no
+// node. `from pkg.registry import register` then names `Registry.register`,
+// and a rule that "a from-import or a bare name never reaches a method" bound
+// the import, its call and a `@register` decorator to an unrelated
+// `plugins/admin.py:register` instead. Pinned so that rule cannot come back
+// without a way to see the alias.
 #[test]
-fn a_python_bare_name_reference_binds_no_method_of_another_file() {
+fn a_python_method_exported_by_alias_keeps_its_importers() {
     let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
         (
-            "app/store.py",
-            "class Store:\n    def cache(self):\n        return {}\n\n\n\
-             class Ctx:\n    def contextmanager(self):\n        return None\n",
+            "pkg/registry.py",
+            "class Registry:\n    def register(self, f):\n        return f\n\n\n\
+             _default = Registry()\nregister = _default.register\n",
         ),
-        ("app/hooks.py", "def on_load():\n    return 0\n"),
+        ("plugins/__init__.py", ""),
+        ("plugins/admin.py", "def register(f):\n    return f\n"),
         (
-            "app/util.py",
-            "from functools import cache\nfrom contextlib import contextmanager\n\
-             from app.hooks import on_load\n\n\n\
-             @cache\ndef load():\n    return 1\n\n\n\
-             @contextmanager\ndef opened():\n    yield 1\n\n\n\
-             def register(f):\n    return f\n\n\n\
-             def wire():\n    register(cache)\n    return register(on_load)\n\n\n\
-             class Prop:\n    def getx(self):\n        return 1\n    x = property(getx)\n",
+            "app.py",
+            "from pkg.registry import register\n\n\ndef setup():\n    return register(1)\n\n\n\
+             @register\ndef handler():\n    return 2\n",
+        ),
+        (
+            "pkg/rel.py",
+            "from .registry import register\n\n\ndef setup2():\n    return register(3)\n",
         ),
     ];
     let (_p, _d, db) = fresh_index_of(files);
     let edges = edge_set(&db);
     let has = |e: &str| edges.iter().any(|x| x == e);
     for e in [
-        "app/util.py.load --references--> app/store.py.cache",
-        "app/util.py.opened --references--> app/store.py.contextmanager",
-        "app/util.py.wire --references--> app/store.py.cache",
+        "app.py.<module> --imports--> pkg/registry.py.register",
+        "app.py.setup --calls--> pkg/registry.py.register",
+        "app.py.handler --references--> pkg/registry.py.register",
+        "pkg/rel.py.<module> --imports--> pkg/registry.py.register",
+        "pkg/rel.py.setup2 --calls--> pkg/registry.py.register",
     ] {
-        assert!(
-            !has(e),
-            "a bare name reached another file's method: {e}: {edges:#?}"
-        );
+        assert!(has(e), "missing {e}: {edges:#?}");
     }
-    assert!(
-        has("app/util.py.wire --references--> app/hooks.py.on_load"),
-        "another file's module-level function stays reachable: {edges:#?}"
-    );
-    assert!(
-        edges
-            .iter()
-            .any(|x| x.ends_with("--references--> app/util.py.getx")),
-        "a method referenced from its own class body stays reachable: {edges:#?}"
-    );
-}
-
-// D#192(1) full-index half: `from .util import helper` looked `helper` up among
-// ALL nodes of util.py and bound the method `Box.helper`. A module attribute is
-// never a class member; with no module-level `helper`, the relative import
-// binds the module it names (D10), as for a variable.
-#[test]
-fn a_python_module_resolved_from_import_binds_no_method() {
-    let files: &[(&str, &str)] = &[
-        ("pkg/__init__.py", "from .util import helper as helper\n"),
-        (
-            "pkg/util.py",
-            "class Box:\n    def helper(self):\n        return 2\n\n\ndef other():\n    return 0\n",
-        ),
-        ("pkg/plain.py", "from .util import other\n"),
-    ];
-    let (_p, _d, db) = fresh_index_of(files);
-    let edges = edge_set(&db);
-    let has = |e: &str| edges.iter().any(|x| x == e);
-    assert!(
-        !has("pkg/__init__.py.<module> --imports--> pkg/util.py.helper"),
-        "{edges:#?}"
-    );
-    assert!(
-        has("pkg/__init__.py.<module> --imports--> pkg/util.py.<module>"),
-        "{edges:#?}"
-    );
-    assert!(
-        has("pkg/plain.py.<module> --imports--> pkg/util.py.other"),
-        "a module-level function still binds by its module: {edges:#?}"
-    );
+    for e in [
+        "app.py.<module> --imports--> plugins/admin.py.register",
+        "app.py.setup --calls--> plugins/admin.py.register",
+        "pkg/rel.py.setup2 --calls--> plugins/admin.py.register",
+    ] {
+        assert!(!has(e), "{e}: {edges:#?}");
+    }
 }
 
 // D#192(1) incremental half: util.py loses `def helper` and gains a method of
@@ -12267,6 +12234,21 @@ fn a_python_module_appearing_after_its_relative_import_takes_the_import() {
                 ("pkg/sub/app.py", "from . import tools\n"),
             ],
             ("pkg/sub/tools/__init__.py", "def run():\n    return 0\n"),
+        ),
+        // The package's own `__init__.py` imports it (pre-tag review): that
+        // import bound the file's own `<module>`, a self-edge that is dropped.
+        (
+            vec![
+                (
+                    "pkg/__init__.py",
+                    "from . import consts\n\n\ndef limit():\n    return consts.VALUE\n",
+                ),
+                (
+                    "tests/test_pkg.py",
+                    "from pkg import limit\n\n\ndef test_limit():\n    assert limit()\n",
+                ),
+            ],
+            ("pkg/consts.py", "VALUE = 1\n"),
         ),
     ] {
         let (project, _d, db) = fresh_index_of(&before);

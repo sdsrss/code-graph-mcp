@@ -294,12 +294,14 @@ impl CliContext {
     }
 }
 
-/// Say on stderr that the index was built by another `INDEX_VERSION` (D#291).
+/// Say on stderr that an older `INDEX_VERSION` built the index (D#291).
 ///
 /// A reader open never rebuilds (only an indexer open does), so until something
 /// does, every query answers from the old extractor's graph and exits 0. Only
 /// `health-check` said so. Once per command, on stderr, so `--json` stdout
-/// stays one parseable object.
+/// stays one parseable object. An index a NEWER binary built already gets a
+/// warning from the open itself (`Database::open_nondestructive`), so it gets
+/// no second line here.
 fn announce_index_version(db: &Database) {
     let Some(stored) = db.index_version_stale() else {
         return;
@@ -309,11 +311,6 @@ fn announce_index_version(db: &Database) {
         eprintln!(
             "[code-graph] This index was built by an older code-graph (index v{stored}, this \
 binary v{current}): answers come from it until it is rebuilt — run: code-graph-mcp reindex"
-        );
-    } else {
-        eprintln!(
-            "[code-graph] This index was built by a newer code-graph (index v{stored}, this \
-binary v{current}): answers follow that version's index — update this binary to match it"
         );
     }
 }

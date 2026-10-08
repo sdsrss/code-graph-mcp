@@ -12984,6 +12984,39 @@ fn test_cli_queries_on_an_older_index_say_so() {
     let (_, stderr, code) = run_cli(&current, &["callgraph", "alpha"]);
     assert_eq!(code, 0, "{stderr}");
     assert!(!stderr.contains("code-graph (index v"), "{stderr}");
+
+    // An index a NEWER binary built: the open already warns, once, and
+    // health-check does not send the user to a `reindex` that refuses it
+    // (pre-tag review).
+    let newer = setup_tiny_indexed_project();
+    let db_path = newer
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open_nondestructive(&db_path).unwrap();
+    db.conn()
+        .execute_batch(&format!(
+            "PRAGMA application_id = {};",
+            code_graph_mcp::domain::INDEX_VERSION + 1
+        ))
+        .unwrap();
+    drop(db);
+    let (_, stderr, code) = run_cli(&newer, &["callgraph", "alpha"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stderr.matches("newer code-graph").count(), 1, "{stderr}");
+    let (out, _, _) = run_cli(&newer, &["health-check"]);
+    assert!(
+        out.contains("Index version: NEWER") && !out.contains("run: code-graph-mcp reindex"),
+        "{out}"
+    );
+    let (out, _, _) = run_cli(&newer, &["health-check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        v["issue"]
+            .as_str()
+            .is_some_and(|i| i.contains("update this binary")),
+        "{v}"
+    );
 }
 
 /// Two methods named `new` of different types in one file, cfg twins of one

@@ -2,34 +2,18 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 116
-because Python edges and Rust test flags change (below). The MCP server rebuilds the index when it
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 117
+because Rust test flags change (below). The MCP server rebuilds the index when it
 starts; from the command line, `code-graph-mcp reindex` does.
 
-### Python: a bare name never reaches another file's method
+### Python: an incremental run no longer moves an edge onto a method
 
-A bare Python name used as a value — a decorator `@cache`, an argument
-`register(cache)` — was bound to any same-named method in another file, so
-`from functools import cache` followed by `@cache` gave the decorated
-function a reference to an unrelated `Store.cache`. A bare name reaches a
-module-level name, a builtin or a local; another file's class member is none of
-them, and such candidates are now dropped. A method referenced from its own
-class body (`x = property(getx)`) and another file's module-level function
-still bind.
-
-`from .util import helper` looked `helper` up among every node of
-`util.py`, so with no module-level `helper` it bound the method
-`Box.helper`. It now considers only module-level definitions and, finding
-none, binds `util.py` itself, as it already did for a variable.
-
-Incremental runs had a third path to the same edge: when `util.py` lost
-`def helper` and gained a method `Box.helper`, the importer's import and its
-`helper()` call were moved onto the method, where a rebuild binds neither. A
-Python edge now moves onto a method only if it pointed at that same method;
-otherwise it is resolved again.
-
-On flask 3.1.0, 5 `references` edges go, all from production code to test
-methods named `g` or `gen`; no node and no call edge changes.
+When `util.py` lost `def helper` and gained a method `Box.helper`, an
+incremental run moved the edges that pointed at the function — an
+importer's `from pkg import helper` and its `helper()` call — onto the
+method, where a rebuild of the same tree binds neither. A Python edge now
+moves onto a method only if it pointed at that same method; otherwise it is
+resolved again, as a rebuild would resolve it.
 
 ### Python: a module created after its relative import
 
@@ -38,8 +22,9 @@ methods named `g` or `gen`; no node and no call edge changes.
 to it, but an incremental run left the import on `__init__.py`: with
 `consts` only read (`consts.VALUE`), `affected pkg/consts.py` named no file
 and no test. A new Python module now re-extracts the files whose relative
-import binds its package. On that fixture `affected pkg/consts.py` names
-`pkg/app.py` and its test `tests/test_app.py`, as after a rebuild.
+import binds its package, and the package's own `__init__.py`, whose
+`from . import consts` left no edge at all. On those fixtures `affected
+pkg/consts.py` names the importer and its test, as after a rebuild.
 
 ### The command line says when it answers from an index another version built
 
@@ -52,9 +37,12 @@ only `health-check` said so. Every query command (`callgraph`, `impact`,
 [code-graph] This index was built by an older code-graph (index v114, this binary v115): answers come from it until it is rebuilt — run: code-graph-mcp reindex
 ```
 
-An index a newer version built gets the same line, naming the newer version.
 `--json` output on stdout is unchanged, and `health-check`, which the status
 line polls, keeps its own `Index version: STALE` line and prints no second one.
+For an index a newer version built, which the command already warned about,
+`health-check` no longer says to run `reindex` (which refuses to overwrite it):
+it says `Index version: NEWER … update this binary`, and its JSON `issue`
+reads `index built by newer version (…); update this binary`.
 
 ### One answer for a `--file` that does not hold the symbol
 
@@ -128,6 +116,11 @@ repository.
 
 ### Not covered
 
+- A bare Python name imported from a package still binds a same-named
+  project method or function: `from functools import cache` then `@cache`
+  references `Store.cache` in another file. A fix that dropped every method
+  candidate was withdrawn before release, because a module may export a
+  bound method by alias (`register = _default.register`).
 - Two different functions with one qualified name in one file still fold:
   nested functions of different parents, such as the `def index()` that many
   flask tests define inside each test function (24 of flask's 42 above).

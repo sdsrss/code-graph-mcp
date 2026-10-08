@@ -1250,11 +1250,21 @@ fn existence_change_dependents(
     // `from . import newmod` written before `newmod.py` existed bound the
     // package's `__init__.py` (D10), not a sentinel, so the scan above cannot
     // see it (D#192(2)).
+    // The package's own `__init__.py` is re-extracted too: its `from . import
+    // newmod` resolved to its own `<module>`, a self-edge the index drops, so
+    // no edge records it (pre-tag review).
+    let mut indexed = db
+        .conn()
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
     for init in appearing_python_package_inits(db, files)? {
-        for importer in crate::storage::queries::get_relative_python_importers_of(db.conn(), &init)?
-        {
-            if !in_run.contains(importer.as_str()) && !deleting.contains(importer.as_str()) {
-                extra.insert(importer);
+        let mut dependents =
+            crate::storage::queries::get_relative_python_importers_of(db.conn(), &init)?;
+        if indexed.exists([init.as_str()])? {
+            dependents.push(init);
+        }
+        for dependent in dependents {
+            if !in_run.contains(dependent.as_str()) && !deleting.contains(dependent.as_str()) {
+                extra.insert(dependent);
             }
         }
     }
@@ -1755,13 +1765,12 @@ fn resolve_batch_relations(
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
-                            db.conn(),
                             &module_files,
                             is_module_import,
                             &rel.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        )? {
+                        ) {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,
@@ -3435,9 +3444,11 @@ fn restore_inbound_edges(
                         .iter()
                         .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
                         // A Python edge moves onto a method only if it pointed
-                        // at that method: an import or a bare name never names
-                        // a class member, so a `def helper` that became
-                        // `Box.helper` is re-resolved, not restored (D#192).
+                        // at that same method: a `def helper` that became
+                        // `Box.helper` is another symbol, and whether the name
+                        // still reaches it (a module-level alias such as
+                        // `helper = _box.helper` can) is the resolver's call,
+                        // so the edge is re-resolved, not restored (D#192).
                         .filter(|(_, q, ty)| {
                             src_lang != "python"
                                 || *ty != "method"
@@ -3828,13 +3839,12 @@ fn resolve_deferred_relations(
                     project_module_files_from(python_module, &d.rel_path, python_module_map)
                 {
                     if let Some(module_targets) = resolve_python_module_targets(
-                        db.conn(),
                         &module_files,
                         is_module_import,
                         &d.target_name,
                         &node_id_to_path,
                         &name_to_ids,
-                    )? {
+                    ) {
                         edges_created += insert_relation_edges(
                             db,
                             &source_ids,
@@ -3860,13 +3870,12 @@ fn resolve_deferred_relations(
                             project_module_files_from(&submodule, &d.rel_path, python_module_map)
                                 .unwrap_or(module_files);
                         if let Some(module_nodes) = resolve_python_module_targets(
-                            db.conn(),
                             &files,
                             true,
                             &d.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        )? {
+                        ) {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,
@@ -4453,8 +4462,7 @@ fn resolve_deferred_relations(
         }
         // `from flask import url_for` imports no method (C4).
         if d.relation == REL_IMPORTS {
-            all_target_ids =
-                classes.python_module_level_candidates(db, &d.language, all_target_ids)?;
+            all_target_ids = classes.python_import_candidates(db, &d.language, all_target_ids)?;
         }
         // A supertype is a type, as at batch time.
         if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
@@ -4472,15 +4480,11 @@ fn resolve_deferred_relations(
         // Batch-time exclusion is BY SOURCE FILE, not by source node ids — a
         // routes_to whose target IS its (cross-file) source must stay in the
         // pool; insert_relation_edges handles self-pairs via allow_self.
-        let mut cross_file: Vec<i64> = all_target_ids
+        let cross_file: Vec<i64> = all_target_ids
             .iter()
             .copied()
             .filter(|id| node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str()))
             .collect();
-        // `@cache` names no method of another file (D#193).
-        if d.relation == REL_REFERENCES {
-            cross_file = classes.python_module_level_candidates(db, &d.language, cross_file)?;
-        }
         let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
 
         let target_ids: Vec<i64> = if !same_file_targets.is_empty() {

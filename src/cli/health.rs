@@ -529,12 +529,22 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 // Has data + correct schema, but built by an older extractor
                 // generation. Usable now (FTS/AST), but results sharpen after a
                 // rebuild — which an indexer (reindex / incremental-index / server
-                // startup), not this poll, performs.
-                json["issue"] = serde_json::json!(format!(
-                    "index built by older version (v{} ≠ v{}); rebuild pending",
-                    old,
-                    crate::domain::INDEX_VERSION
-                ));
+                // startup), not this poll, performs. An index a NEWER binary built
+                // is never rebuilt by this one (`reindex` refuses), so it owes an
+                // update of the binary instead.
+                json["issue"] = serde_json::json!(if old > crate::domain::INDEX_VERSION {
+                    format!(
+                        "index built by newer version (v{} > v{}); update this binary",
+                        old,
+                        crate::domain::INDEX_VERSION
+                    )
+                } else {
+                    format!(
+                        "index built by older version (v{} ≠ v{}); rebuild pending",
+                        old,
+                        crate::domain::INDEX_VERSION
+                    )
+                });
             }
             println!("{}", json);
             if !healthy {
@@ -640,12 +650,22 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 // printed a bare "OK" — the same command telling a human and a
                 // script opposite things about the same database.
                 if let Some(old) = index_version_stale {
-                    println!(
-                        "Index version: STALE (built by v{} ≠ v{}); results sharpen after a \
-                         rebuild — run: code-graph-mcp reindex",
-                        old,
-                        crate::domain::INDEX_VERSION
-                    );
+                    if old > crate::domain::INDEX_VERSION {
+                        // `reindex` refuses to overwrite a newer index.
+                        println!(
+                            "Index version: NEWER (built by v{} > this binary v{}); \
+                             update this binary — it does not rebuild a newer index",
+                            old,
+                            crate::domain::INDEX_VERSION
+                        );
+                    } else {
+                        println!(
+                            "Index version: STALE (built by v{} ≠ v{}); results sharpen after a \
+                             rebuild — run: code-graph-mcp reindex",
+                            old,
+                            crate::domain::INDEX_VERSION
+                        );
+                    }
                 }
                 // Same reason the STALE line above exists: usable, but not
                 // everything the user thinks it is, and until now only the
