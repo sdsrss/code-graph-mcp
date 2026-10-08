@@ -419,8 +419,9 @@ jobs:
     # packages and 20 min for the main package (scripts/npm-publish.js; the
     # longest measured delay is 55.5 min). Worst case: a wait can overrun its
     # budget by one 30 s poll plus one probe pass (2.5 min for five packages,
-    # 0.5 for one), so 63 + 21 + 3.7 + under 1 min of publishing = 88.4 min,
-    # inside the 90 tests/hardening.rs allows.
+    # 0.5 for one): 63 + 21 + 3.7 (the longest measured run of the earlier
+    # steps) + under 1 min of publishing is under 88.7 min, inside the 90
+    # tests/hardening.rs allows.
     timeout-minutes: 90
     runs-on: ubuntu-latest
     # `id-token: write` is what `npm publish --provenance` mints its attestation

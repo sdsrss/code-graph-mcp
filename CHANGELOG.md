@@ -72,18 +72,21 @@ without it; the one shape it changes is under Not covered.
 
 `@sdsrs/code-graph` names its five platform packages as optional
 dependencies, and npm skips one it cannot find without failing the
-install. Every new version now spends a while in processing at npm before
-anyone can install it, and the release published the main package as soon
-as npm had accepted the platform packages. In 0.167.0, linux-arm64 became
+install. For every package the 0.167.0 release published, npm answered
+"Your package is being processed and may take a few minutes to become
+available", and the release published the main package as soon as npm
+had accepted the platform packages. In 0.167.0, linux-arm64 became
 installable 49 minutes after the main package; in 0.166.0, linux-x64 10
-minutes after. An install in that window printed `added 1 package` instead
-of 2, and on a machine with no other copy of the binary `code-graph-mcp`
-then reported it not found. Running `npm install -g @sdsrs/code-graph`
-again fixes a global install. `npx` keeps the incomplete copy in its
-cache, so running it again does not; deleting the `_npx` directory in
-npm's cache directory (`npm config get cache`) does. The release now
-publishes the main package only once every platform package can be
-installed.
+minutes after. An install in that window printed `added 1 package`
+instead of 2, and on a machine with no other copy of the binary
+`code-graph-mcp` then reported it not found. Running `npm install -g
+@sdsrs/code-graph` again fixes a global install. `npx` keeps the
+incomplete copy in its cache, so running it again does not; deleting the
+`_npx` directory in npm's cache directory (`npm config get cache`) does.
+Either works only once npm's own copy of the registry's answer has
+expired (the registry allows 5 minutes), which it long has for 0.166.0
+and 0.167.0. The release now publishes the main package only once every
+platform package can be installed.
 
 ### Not covered
 
@@ -103,9 +106,9 @@ installed.
 - In a file gated by `#![cfg(test)]`, code outside any function (a `static`
   initializer, say) still counts as production: the unresolved-call list of
   an empty `refs` answer can still show its calls.
-- An item defined inside an attribute's value under `#[cfg(test)]`
-  (`#[doc = { fn f() {} "" }]`, which does not compile as a test build)
-  was test code in 0.167.0 and is now production.
+- An item defined inside an attribute's value under `#[cfg(test)]` or
+  `#[test]` (`#[doc = { fn f() {} "" }]`, which does not compile as a test
+  build) was test code in 0.167.0 and is now production.
 
 ## 0.167.0
 
