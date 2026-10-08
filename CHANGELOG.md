@@ -114,6 +114,17 @@ same tree: hono 1.313 s → 1.197 s (7 runs each), this repository 4.581 s →
 4.106 s (5 each); nodes and edges are identical on hono, express and this
 repository.
 
+### MCP `find_references` says what its confidence tiers mean
+
+Its `min_confidence` description told the model that `inferred` means
+import-resolved and `extracted` means same-file. An `inferred` reference is
+bound by name: the name is unique in its language, or an import, module
+path or receiver type confirms it. A call `b.py` makes to `a.py`'s
+`unique_fn` with no import at all is `inferred`. And a method call on an
+untyped receiver is bound by name even inside one file, so it is not
+`extracted`. The description now says this. Only the text the model reads
+changes; no answer does.
+
 ### Not covered
 
 - A bare Python name imported from a package still binds a same-named
