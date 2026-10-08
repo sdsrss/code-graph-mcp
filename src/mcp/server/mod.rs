@@ -3259,6 +3259,67 @@ function handleLogin(req: Request) {
         assert!(!is_error && text.contains("\"callers\":[]"), "got: {text}");
     }
 
+    /// D#237: `get_call_graph` and `get_ast_node include_impact` folded callers
+    /// on (name, file, depth), so `Waiter.new` and `Recv.new` — two symbols —
+    /// answered as one. Only the cfg twins of one function fold now, and rows a
+    /// name and a file cannot tell apart carry `qualified_name`.
+    #[test]
+    fn test_same_named_callers_in_one_file_are_counted_apart() {
+        let project_dir = TempDir::new().unwrap();
+        let src = project_dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod a;\npub mod b;\npub fn target() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("a.rs"),
+            "use crate::target;\npub struct Waiter;\npub struct Recv;\n\
+             impl Waiter {\n    pub fn new() -> Self { target(); Waiter }\n}\n\
+             impl Recv {\n    pub fn new() -> Self { target(); Recv }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("b.rs"),
+            "use crate::target;\n#[cfg(unix)]\npub fn twin() -> i32 { target() }\n\
+             #[cfg(not(unix))]\npub fn twin() -> i32 { target() }\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_call_graph",
+                json!({"symbol_name": "target", "direction": "callers"}),
+            ))
+            .unwrap();
+        let result = parse_tool_result(&resp);
+        let rows = result["callers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{result}"));
+        let mut shown: Vec<&str> = rows
+            .iter()
+            .map(|r| {
+                r["qualified_name"]
+                    .as_str()
+                    .unwrap_or_else(|| r["name"].as_str().unwrap())
+            })
+            .collect();
+        shown.sort_unstable();
+        assert_eq!(shown, ["Recv.new", "Waiter.new", "twin"], "{result}");
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_ast_node",
+                json!({"symbol_name": "target", "include_impact": true}),
+            ))
+            .unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["impact"]["direct_callers"], 3, "{result}");
+    }
+
     /// D#274: `find_references` named every `file_path` miss "Symbol 'x' not
     /// found in file 'y'", for a path the index does not hold too, and never
     /// listed the files that define `x`; `get_call_graph` (D#253) does both.

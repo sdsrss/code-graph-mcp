@@ -43,12 +43,42 @@ pub struct CallGraphNode {
     /// the root (depth=0). When a node is reachable via multiple paths, this
     /// records one parent on the shortest path.
     pub parent_id: Option<i64>,
+    /// `nodes.qualified_name` (`Waiter.new`): what tells two same-named nodes of
+    /// one file apart when they are different symbols (D#237), where cfg twins
+    /// of one function share it.
+    pub qualified_name: Option<String>,
     /// The node's authoritative AST-level test flag (`nodes.is_test`), set by the
     /// parser for `#[cfg(test)] mod tests` / `#[test]` / `@Test` etc. Carried so
     /// caller-partitioning surfaces (impact risk, covering-tests) can classify an
     /// inline unit test whose descriptive snake_case name the `is_test_symbol`
     /// name/path heuristic misses (see [`crate::domain::is_test_symbol`]).
     pub is_test: bool,
+}
+
+impl CallGraphNode {
+    /// What one symbol is called: its qualified name, else its name. Callers
+    /// are folded on `(identity, file, depth)`, which folds the cfg twins of one
+    /// function and nothing else (D#237).
+    pub fn identity(&self) -> &str {
+        self.qualified_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The `(name, file)` pairs shared by two or more distinct symbols among `rows`
+/// of `(name, identity, file)`: the rows a reader cannot tell apart by name and
+/// file, which print their qualified names (D#237).
+pub fn names_shared_by_distinct_symbols<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> std::collections::HashSet<(&'a str, &'a str)> {
+    let mut identities: HashMap<(&str, &str), std::collections::HashSet<&str>> = HashMap::new();
+    for (name, identity, file) in rows {
+        identities.entry((name, file)).or_default().insert(identity);
+    }
+    identities
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// Wraps `Vec<CallGraphNode>` with truncation provenance. Returned by
@@ -422,13 +452,14 @@ fn query_direction_seeded(
     // Node metadata. The `files` INNER JOIN is the CTE's: a node with no file
     // row is expanded during traversal but never emitted.
     let ids: Vec<i64> = seen.keys().copied().collect();
-    let mut meta: HashMap<i64, (String, String, String, bool)> = HashMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut meta: HashMap<i64, (String, String, String, bool, Option<String>)> = HashMap::new();
     for chunk in ids.chunks(FRONTIER_CHUNK) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT n.id, n.name, n.type, f.path, n.is_test
+            "SELECT n.id, n.name, n.type, f.path, n.is_test, n.qualified_name
              FROM nodes n JOIN files f ON f.id = n.file_id
              WHERE n.id IN ({placeholders})"
         );
@@ -444,11 +475,12 @@ fn query_direction_seeded(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         for row in rows {
-            let (id, name, ty, path, is_test) = row?;
-            meta.insert(id, (name, ty, path, is_test));
+            let (id, name, ty, path, is_test, qualified_name) = row?;
+            meta.insert(id, (name, ty, path, is_test, qualified_name));
         }
     }
 
@@ -489,7 +521,8 @@ fn query_direction_seeded(
 
     let mut rows: Vec<(i32, i64, i64, CallGraphNode)> = Vec::new(); // (depth, -callers, id, node)
     for (id, (node_depth, parent_id)) in seen {
-        let Some((name, node_type, file_path, is_test)) = meta.get(&id).cloned() else {
+        let Some((name, node_type, file_path, is_test, qualified_name)) = meta.get(&id).cloned()
+        else {
             continue; // no `files` row → not emitted, same as the CTE's inner join
         };
         let callers = caller_counts.get(&id).copied().unwrap_or(0);
@@ -505,6 +538,7 @@ fn query_direction_seeded(
                 depth: node_depth,
                 direction,
                 parent_id,
+                qualified_name,
                 is_test,
             },
         ));
@@ -748,9 +782,9 @@ mod tests {
                 WHERE relation = ?4
                 GROUP BY target_id
             )
-            SELECT node_id, name, type, file_path, depth, parent_id, is_test FROM (
+            SELECT node_id, name, type, file_path, depth, parent_id, is_test, qualified_name FROM (
                 SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
-                       n.is_test AS is_test,
+                       n.is_test AS is_test, n.qualified_name AS qualified_name,
                        COALESCE(cc.callers, 0) AS caller_count,
                        ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
                 FROM call_graph cg
@@ -774,6 +808,7 @@ mod tests {
                 depth: row.get(4)?,
                 direction,
                 parent_id: row.get(5)?,
+                qualified_name: row.get(7)?,
                 is_test: row.get(6)?,
             })
         };

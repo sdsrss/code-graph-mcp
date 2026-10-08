@@ -20,7 +20,8 @@ use crate::storage::queries::CallerWithRouteInfo;
 /// caller slice — the callers stay owned by the calling surface for rendering.
 pub struct ImpactClassification<'a> {
     /// Production callers (test/bench excluded), deduplicated by
-    /// `(name, file, depth)`, preserving input order. Surfaces render these: the
+    /// `(identity, file, depth)` (see [`CallerWithRouteInfo::identity`]),
+    /// preserving input order. Surfaces render these: the
     /// CLI lists them; the MCP path splits them into direct (`depth == 1`) and
     /// transitive (`depth > 1`).
     pub prod_callers: Vec<&'a CallerWithRouteInfo>,
@@ -37,7 +38,7 @@ pub struct ImpactClassification<'a> {
     /// Always equals `test_callers.len()` — same dedup, single source.
     pub test_count: usize,
     /// The distinct test/bench callers themselves — the identities behind
-    /// `test_count`, deduped by `(name, file, depth)` in input order. Surfaces use
+    /// `test_count`, deduped by `(identity, file, depth)` in input order. Surfaces use
     /// these for edit-time covering-test targeting (which tests exercise the
     /// symbol → a runnable test command) and MAY cap the rendered list, while
     /// `test_count` keeps the true total.
@@ -67,17 +68,20 @@ pub fn classify_impact<'a>(
 ) -> ImpactClassification<'a> {
     use std::collections::HashSet;
 
-    // Exclude the queried symbol itself (depth 0), then dedup by (name, file,
+    // Exclude the queried symbol itself (depth 0), then dedup by (identity, file,
     // depth). get_callers_with_route_info returns shortest-path-distinct node_ids,
-    // but two distinct same-named nodes in one file at the same depth would
-    // otherwise be double-counted — dedup keeps both surfaces' counts identical
-    // and correct. Test callers are deduped on the same key.
+    // and the cfg twins of one function (`#[cfg(unix)] fn f` beside
+    // `#[cfg(not(unix))] fn f`) are two of them; folding them keeps both
+    // surfaces' counts identical and correct. The key was (name, file, depth),
+    // which also folded DIFFERENT symbols sharing a name in one file —
+    // `Waiter.new` and `Recv.new`, Python's `A.run` and `B.run` — so one of
+    // them went uncounted (D#237). Test callers are deduped on the same key.
     let mut seen_prod: HashSet<(&str, &str, i32)> = HashSet::new();
     let mut seen_test: HashSet<(&str, &str, i32)> = HashSet::new();
     let mut prod_callers: Vec<&CallerWithRouteInfo> = Vec::new();
     let mut test_callers: Vec<&CallerWithRouteInfo> = Vec::new();
     for c in callers.iter().filter(|c| c.depth > 0) {
-        let key = (c.name.as_str(), c.file_path.as_str(), c.depth);
+        let key = (c.identity(), c.file_path.as_str(), c.depth);
         // Authoritative AST flag first, then the name/path heuristic as a fallback
         // (mirrors `centrality.rs`). The flag catches inline `#[cfg(test)] mod
         // tests` fns whose descriptive names the heuristic misses; the heuristic
@@ -186,8 +190,27 @@ mod tests {
             file_path: file.to_string(),
             depth,
             route_info: route.map(|s| s.to_string()),
+            qualified_name: None,
             is_test,
         }
+    }
+
+    /// D#237: the fold is for the cfg twins of ONE function (one qualified
+    /// name), not for different symbols that share a name in one file.
+    #[test]
+    fn folds_one_qualified_name_not_one_bare_name() {
+        let named = |q: &str| CallerWithRouteInfo {
+            qualified_name: Some(q.to_string()),
+            ..caller("new", "src/a.rs", 1, None)
+        };
+        let callers = vec![
+            named("Waiter.new"),
+            named("Recv.new"),
+            named("Recv.new"), // cfg twin of Recv.new
+        ];
+        let cls = classify_impact(&callers, "behavior", true);
+        let kept: Vec<&str> = cls.prod_callers.iter().map(|c| c.identity()).collect();
+        assert_eq!(kept, ["Waiter.new", "Recv.new"]);
     }
 
     #[test]

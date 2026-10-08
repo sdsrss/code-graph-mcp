@@ -607,7 +607,7 @@ impl McpServer {
         // the single source that also drives `cmd_impact`. Trusts the AST `is_test`
         // flag (catches inline `#[cfg(test)]` unit tests whose descriptive names the
         // name heuristic misses), excludes routes reachable only through test callers,
-        // and dedups callers by (name, file, depth). Previously this summary
+        // and dedups callers by (identity, file, depth). Previously this summary
         // reimplemented the partition with the weaker `is_test_symbol` heuristic and
         // counted unparseable/test-only routes — the v0.79.1 audit sibling-hole.
         let is_function_like = crate::domain::is_function_node_type(node_type);
@@ -657,7 +657,7 @@ impl McpServer {
                 Some(crate::domain::REL_REFERENCES),
             )? {
                 if !crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
-                    seen.insert((r.name, r.file_path));
+                    seen.insert((r.qualified_name.unwrap_or(r.name), r.file_path));
                 }
             }
             seen.len()

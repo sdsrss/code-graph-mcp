@@ -318,6 +318,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
     let impact = crate::graph::impact::classify_impact(callers, change_type, is_function_like);
     let prod_callers = &impact.prod_callers;
+    // Two kept callers that a name and a file cannot tell apart (`Waiter.new`
+    // and `Recv.new`) are shown by their qualified names (D#237).
+    let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
+        prod_callers
+            .iter()
+            .map(|c| (c.name.as_str(), c.identity(), c.file_path.as_str())),
+    );
     let routes = &impact.route_callers;
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
     let risk = impact.risk_level;
@@ -343,7 +350,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 // feeds a PRODUCTION coupling signal, and an inline `#[cfg(test)]`
                 // reference used to land in it (2026-08-16 audit §四).
                 if !crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
-                    seen.insert((r.name, r.file_path));
+                    // By symbol, not by name: two same-named referrers of one
+                    // file are two couplings (D#237).
+                    seen.insert((r.qualified_name.unwrap_or(r.name), r.file_path));
                 }
             }
         }
@@ -386,13 +395,19 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             "affected_files": impact.affected_files,
             "affected_routes": routes.len(),
             "value_references": value_references,
-            "callers": prod_callers.iter().map(|c| serde_json::json!({
-                "name": c.name,
-                "type": c.node_type,
-                "file": c.file_path,
-                "depth": c.depth,
-                "route": c.route_info,
-            })).collect::<Vec<_>>(),
+            "callers": prod_callers.iter().map(|c| {
+                let mut row = serde_json::json!({
+                    "name": c.name,
+                    "type": c.node_type,
+                    "file": c.file_path,
+                    "depth": c.depth,
+                    "route": c.route_info,
+                });
+                if shared_names.contains(&(c.name.as_str(), c.file_path.as_str())) {
+                    row["qualified_name"] = serde_json::json!(c.identity());
+                }
+                row
+            }).collect::<Vec<_>>(),
             // Covering tests behind `tests_affected` — name + file is enough for a
             // hook to build a runnable test command (e.g. `cargo test`/`pytest`).
             // Full list (not capped here); display-side capping is the surface's job.
@@ -479,10 +494,15 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         writeln!(stdout, "Callers:")?;
         for c in prod_callers {
             let indent = "  ".repeat(c.depth as usize);
+            let label = if shared_names.contains(&(c.name.as_str(), c.file_path.as_str())) {
+                c.identity()
+            } else {
+                c.name.as_str()
+            };
             writeln!(
                 stdout,
                 "{}{}  ({}) {}",
-                indent, c.name, c.node_type, c.file_path
+                indent, label, c.node_type, c.file_path
             )?;
         }
     }

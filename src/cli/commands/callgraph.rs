@@ -370,11 +370,17 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // (`format_call_graph_response` filters `n.depth > 0`). With
         // `direction=both` the seed appears twice (once per direction),
         // inflating result counts.
+        let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
+            display_nodes
+                .iter()
+                .filter(|n| n.depth > 0)
+                .map(|n| (n.name.as_str(), n.identity(), n.file_path.as_str())),
+        );
         let results: Vec<serde_json::Value> = display_nodes
             .iter()
             .filter(|n| n.depth > 0)
             .map(|n| {
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "node_id": n.node_id,
                     "name": n.name,
                     "type": n.node_type,
@@ -382,7 +388,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                     "depth": n.depth,
                     "direction": n.direction.as_str(),
                     "parent_id": n.parent_id,
-                })
+                });
+                // Rows a name and a file cannot tell apart (D#237).
+                if shared_names.contains(&(n.name.as_str(), n.file_path.as_str())) {
+                    row["qualified_name"] = serde_json::json!(n.identity());
+                }
+                row
             })
             .collect();
         let mut output = serde_json::json!({
@@ -438,8 +449,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         if n.depth == 0 {
             continue;
         }
-        // Dedup cfg-gated duplicates (same name+file+direction+depth, different node_id).
-        if !dedup.insert((&n.name, &n.file_path, n.direction.as_str(), n.depth)) {
+        // Dedup cfg-gated duplicates: one symbol (qualified name), file,
+        // direction and depth, different node_id. Keyed on the bare name, it
+        // folded `Waiter.new` into `Recv.new` too (D#237).
+        if !dedup.insert((n.identity(), &n.file_path, n.direction.as_str(), n.depth)) {
             continue;
         }
         let parent = n.parent_id.unwrap_or(root_id);
@@ -449,9 +462,19 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             .push(n);
     }
 
+    // Two kept rows a name and a file cannot tell apart print their qualified
+    // names (D#237).
+    let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
+        display_nodes
+            .iter()
+            .filter(|n| n.depth > 0)
+            .map(|n| (n.name.as_str(), n.identity(), n.file_path.as_str())),
+    );
+
     fn render_subtree<W: std::io::Write>(
         out: &mut W,
         children: &HashMap<(i64, &'static str), Vec<&crate::graph::query::CallGraphNode>>,
+        shared_names: &std::collections::HashSet<(&str, &str)>,
         parent_id: i64,
         direction: &'static str,
         compact: bool,
@@ -471,7 +494,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 // function" and it reached the tree verbatim: `← called by:
                 // <module> (users.test.ts) [module]` reads as a symbol the reader
                 // cannot find in their file. --json keeps the raw name.
-                let label = crate::domain::display_node_name(&n.name);
+                let label = if shared_names.contains(&(n.name.as_str(), n.file_path.as_str())) {
+                    n.identity()
+                } else {
+                    crate::domain::display_node_name(&n.name)
+                };
                 if compact {
                     writeln!(out, "{}{} {} ({})", indent, arrow, label, n.file_path)?;
                 } else {
@@ -481,7 +508,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                         indent, arrow_text, label, n.file_path, n.node_type
                     )?;
                 }
-                render_subtree(out, children, n.node_id, direction, compact)?;
+                render_subtree(out, children, shared_names, n.node_id, direction, compact)?;
             }
         }
         Ok(())
@@ -531,8 +558,22 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         return Ok(());
     }
 
-    render_subtree(&mut stdout, &children, root_id, "callers", compact)?;
-    render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
+    render_subtree(
+        &mut stdout,
+        &children,
+        &shared_names,
+        root_id,
+        "callers",
+        compact,
+    )?;
+    render_subtree(
+        &mut stdout,
+        &children,
+        &shared_names,
+        root_id,
+        "callees",
+        compact,
+    )?;
     stdout.write_all(&footer)?;
 
     Ok(())
@@ -642,6 +683,15 @@ fn callgraph_budget_text(
     let mut lines: Vec<TreeLine> = Vec::new();
     collect(children, root_id, None, "callers", &mut lines);
     collect(children, root_id, None, "callees", &mut lines);
+    // The tree's own rows: labelled as the unbudgeted tree labels them (D#237).
+    let shared_names =
+        crate::graph::query::names_shared_by_distinct_symbols(lines.iter().map(|l| {
+            (
+                l.node.name.as_str(),
+                l.node.identity(),
+                l.node.file_path.as_str(),
+            )
+        }));
     let ids: Vec<i64> = lines.iter().map(|l| l.node.node_id).collect();
     let in_degree = budget::caller_counts(conn, &ids)?;
     let n = lines.len();
@@ -655,7 +705,11 @@ fn callgraph_budget_text(
     let steps = budget::standard_steps(&order, |_| true);
     let line_text = |l: &TreeLine, level: Level| -> String {
         let indent = "  ".repeat(l.node.depth as usize);
-        let label = crate::domain::display_node_name(&l.node.name);
+        let label = if shared_names.contains(&(l.node.name.as_str(), l.node.file_path.as_str())) {
+            l.node.identity()
+        } else {
+            crate::domain::display_node_name(&l.node.name)
+        };
         let (arrow, arrow_text) = match l.direction {
             "callers" => ("←", "← called by"),
             _ => ("→", "→ calls"),

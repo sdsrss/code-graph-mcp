@@ -12985,3 +12985,104 @@ fn test_cli_queries_on_an_older_index_say_so() {
     assert_eq!(code, 0, "{stderr}");
     assert!(!stderr.contains("code-graph (index v"), "{stderr}");
 }
+
+/// Two methods named `new` of different types in one file, cfg twins of one
+/// function in another, and two Python methods named `run` of different classes.
+fn setup_same_named_callers_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\npub fn target() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("a.rs"),
+        "use crate::target;\npub struct Waiter;\npub struct Recv;\n\
+         impl Waiter {\n    pub fn new() -> Self { target(); Waiter }\n}\n\
+         impl Recv {\n    pub fn new() -> Self { target(); Recv }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("b.rs"),
+        "use crate::target;\n#[cfg(unix)]\npub fn twin() -> i32 { target() }\n\
+         #[cfg(not(unix))]\npub fn twin() -> i32 { target() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("app.py"),
+        "def helper():\n    return 1\n\n\nclass A:\n    def run(self):\n        return helper()\n\n\n\
+         class B:\n    def run(self):\n        return helper()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    project
+}
+
+// D#237: impact and callgraph keyed their caller dedup on (name, file, depth),
+// meant to fold the cfg twins of ONE function. `Waiter.new` and `Recv.new` fold
+// too, so `impact target` said "1 direct" for two callers, and Python's `A.run`
+// and `B.run` became one `run`. The key is the qualified name now; cfg twins
+// (one qualified name) still fold, and two kept rows that would print alike
+// print their qualified names.
+#[test]
+fn test_cli_same_named_callers_in_one_file_are_counted_apart() {
+    let project = setup_same_named_callers_project();
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "target", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["direct_callers"], 3, "Waiter.new, Recv.new, twin: {v}");
+    let shown: Vec<String> = v["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["qualified_name"]
+                .as_str()
+                .unwrap_or_else(|| c["name"].as_str().unwrap())
+                .to_string()
+        })
+        .collect();
+    assert_eq!(shown.len(), 3, "{v}");
+    for q in ["Waiter.new", "Recv.new", "twin"] {
+        assert!(shown.contains(&q.to_string()), "{q}: {v}");
+    }
+    assert!(
+        v["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "twin" || c.get("qualified_name").is_none()),
+        "a row whose name collides with nothing keeps the old shape: {v}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "target"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("3 direct"), "{stdout}");
+    assert!(
+        stdout.contains("Waiter.new  (function) src/a.rs")
+            && stdout.contains("Recv.new  (function) src/a.rs")
+            && stdout.matches("twin  (function) src/b.rs").count() == 1,
+        "{stdout}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "target", "--direction", "callers"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Waiter.new (src/a.rs)")
+            && stdout.contains("Recv.new (src/a.rs)")
+            && stdout.matches("twin (src/b.rs)").count() == 1,
+        "{stdout}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "helper", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["direct_callers"], 2, "A.run and B.run: {v}");
+}

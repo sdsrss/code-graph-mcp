@@ -64,11 +64,22 @@ pub struct CallerWithRouteInfo {
     pub file_path: String,
     pub depth: i32,
     pub route_info: Option<String>, // JSON metadata from routes_to edge
+    /// `nodes.qualified_name`, carried from the call graph (D#237): see
+    /// [`CallerWithRouteInfo::identity`].
+    pub qualified_name: Option<String>,
     /// Authoritative AST-level test flag (`nodes.is_test`) carried from the call
     /// graph. Drives the prod/test partition in `classify_impact` so an inline
     /// unit test the `is_test_symbol` name/path heuristic misses is still excluded
     /// from the production blast radius.
     pub is_test: bool,
+}
+
+impl CallerWithRouteInfo {
+    /// Its qualified name, else its name: the dedup identity of a caller
+    /// (`crate::graph::query::CallGraphNode::identity`).
+    pub fn identity(&self) -> &str {
+        self.qualified_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Batch-fetch `routes_to` edge metadata for the given caller node ids

@@ -70,6 +70,29 @@ symbol `refs` now says `"Symbol not found in file"` too. `refs --json` now
 carries `file` and `candidates`, and each candidate in both carries
 `node_id` and `start_line`.
 
+### Callers that share a name in one file are counted apart
+
+`impact`, `callgraph`, MCP `get_call_graph` and `get_ast_node`'s impact
+summary fold the copies of one function that `#[cfg(…)]` gates differently
+into one caller. They did it by name and file, so different symbols sharing a
+name in one file folded too: with `Waiter::new` and `Recv::new` both calling
+`target`, `impact target` reported 1 direct caller, and Python's `A.run` and
+`B.run` were one `run`. Callers now fold only when they share a qualified
+name. Two callers a name and a file cannot tell apart are shown by their
+qualified names (`Waiter.new (src/a.rs)`), and their JSON rows carry
+`qualified_name`; every other row is unchanged. `value_references` counts
+referrers the same way.
+
+On tokio-1.41.1, the call edges at the default confidence floor fold 99
+distinct callers into another on 65 functions by name and file, and 43 on 29
+by qualified name and file; on flask 3.1.0, 47 on 15 and 42 on 11.
+
+### Not covered
+
+- Two different functions with one qualified name in one file still fold:
+  nested functions of different parents, such as the `def index()` that many
+  flask tests define inside each test function (24 of flask's 42 above).
+
 ## 0.168.0
 
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is

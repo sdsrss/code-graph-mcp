@@ -340,14 +340,26 @@ impl McpServer {
             crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
         };
         let mut seen_nodes = std::collections::HashSet::new();
-        let all_nodes: Vec<serde_json::Value> = results
+        let kept: Vec<&crate::graph::query::CallGraphNode> = results
             .nodes
             .iter()
             .filter(|n| n.depth > 0 && (include_tests || !is_test(n)))
-            // Deduplicate cfg-gated functions (same name+file+depth+direction, different node_id)
-            .filter(|n| seen_nodes.insert((&n.name, &n.file_path, n.depth, n.direction.as_str())))
+            // Deduplicate cfg-gated functions: one symbol (qualified name), file,
+            // depth and direction, different node_id. Keyed on the bare name it
+            // also folded `Waiter.new` into `Recv.new` (D#237).
+            .filter(|n| {
+                seen_nodes.insert((n.identity(), &n.file_path, n.depth, n.direction.as_str()))
+            })
+            .collect();
+        // Rows a name and a file cannot tell apart carry their qualified names.
+        let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
+            kept.iter()
+                .map(|n| (n.name.as_str(), n.identity(), n.file_path.as_str())),
+        );
+        let all_nodes: Vec<serde_json::Value> = kept
+            .iter()
             .map(|n| {
-                if compact {
+                let mut row = if compact {
                     // Compact: keep node_id for chaining to get_ast_node, drop type (usually "function")
                     json!({
                         "node_id": n.node_id,
@@ -365,7 +377,11 @@ impl McpServer {
                         "depth": n.depth,
                         "direction": n.direction.as_str(),
                     })
+                };
+                if shared_names.contains(&(n.name.as_str(), n.file_path.as_str())) {
+                    row["qualified_name"] = json!(n.identity());
                 }
+                row
             })
             .collect();
         // Counted PER DIRECTION. One bucket named `test_callers_filtered` was

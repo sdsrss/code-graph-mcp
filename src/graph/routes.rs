@@ -117,6 +117,7 @@ pub fn get_callers_with_route_info_seeded(
             file_path: caller.file_path.clone(),
             depth: caller.depth,
             route_info: route_map.get(&caller.node_id).cloned(),
+            qualified_name: caller.qualified_name.clone(),
             is_test: caller.is_test,
         })
         .collect();

@@ -29,6 +29,9 @@ pub struct PendingCallRow {
 pub struct IncomingReference {
     pub node_id: i64,
     pub name: String,
+    /// The referencing node's `qualified_name`: tells two same-named
+    /// referrers of one file apart (D#237).
+    pub qualified_name: Option<String>,
     pub node_type: String,
     pub file_path: String,
     pub start_line: i64,
@@ -314,14 +317,16 @@ pub fn get_incoming_references(
     relation_filter: Option<&str>,
 ) -> Result<Vec<IncomingReference>> {
     let sql = if relation_filter.is_some() {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
+                n.qualified_name
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
          WHERE e.target_id = ?1 AND e.relation = ?2
          ORDER BY f.path, n.start_line"
     } else {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
+                n.qualified_name
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
@@ -347,6 +352,7 @@ fn map_incoming_ref(row: &rusqlite::Row) -> rusqlite::Result<IncomingReference> 
         relation: row.get(5)?,
         confidence: row.get(6)?,
         is_test: row.get::<_, i64>(7)? != 0,
+        qualified_name: row.get(8)?,
     })
 }
 
