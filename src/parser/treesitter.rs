@@ -5196,19 +5196,22 @@ impl Open {
     // 2056ace7, D#282: 5,000 stacked `cfg` attributes took 14 s in a release
     // build, 5,000 comment lines 80 s). One case per kind the walk skips. The
     // ceiling is absolute, not scaled from `n`. The `#[cfg(test)]` sits at the
-    // top of each stack so the item's own walk still has to reach it.
+    // top of each stack so the item's own walk still has to reach it. Comment
+    // stacks are half as deep: that one walk costs O(n²) by itself, because
+    // tree-sitter's `prev_sibling` scans from the parent's first child — 3,000
+    // took 0.75 s on Linux and 5.3 s on a Windows CI runner, both debug.
     #[test]
     fn rust_stacked_attributes_are_read_once_per_item() {
         let n = 3_000;
-        // (kind, text before the line number, text after it)
+        // (kind, text before the line number, text after it, stack depth)
         let stacks = [
-            ("outer attributes", "#[cfg(feature = \"f", "\")]\n"),
-            ("line comments", "// line ", "\n"),
-            ("block comments", "/* block ", " */\n"),
+            ("outer attributes", "#[cfg(feature = \"f", "\")]\n", n),
+            ("line comments", "// line ", "\n", n / 2),
+            ("block comments", "/* block ", " */\n", n / 2),
         ];
-        for (kind, before, after) in stacks {
+        for (kind, before, after, depth) in stacks {
             let mut code = String::from("#[cfg(test)]\n");
-            for i in 0..n {
+            for i in 0..depth {
                 code.push_str(&format!("{before}{i}{after}"));
             }
             code.push_str("fn stacked_under_test() {}\nfn after_stack() {}\n");
@@ -5223,7 +5226,7 @@ impl Open {
             assert_eq!(got.get("after_stack"), Some(&false), "{kind}: {got:?}");
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
-                "{n} stacked {kind} took {elapsed:?}"
+                "{depth} stacked {kind} took {elapsed:?}"
             );
         }
         // Inner attributes gate their container, so a stack of them opens the
