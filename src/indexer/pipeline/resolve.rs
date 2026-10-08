@@ -4245,7 +4245,7 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
-    /// Every `method` node ([`Self::python_import_candidates`]); None until loaded.
+    /// Every `method` node ([`Self::python_module_level_candidates`]); None until loaded.
     methods: Option<HashSet<i64>>,
     /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
     /// until loaded.
@@ -4758,7 +4758,12 @@ impl ProjectClassNames {
     /// evaluation). With the import unique, `prune_import_contradicted_call_edges`
     /// drops the method from the calls too. Calls are left alone: a Python call
     /// without metadata may still be `self.app.f()` or `imported_obj.f()`.
-    pub(super) fn python_import_candidates(
+    ///
+    /// A bare name in a value position (`@cache`, `register(cache)`) is read the
+    /// same way when the candidate sits in another file: it names a module-level
+    /// binding, a builtin or an enclosing function's local, never another
+    /// file's class member (D#193: functools' `@cache` drew `Store.cache`).
+    pub(super) fn python_module_level_candidates(
         &mut self,
         db: &crate::storage::db::Database,
         language: &str,

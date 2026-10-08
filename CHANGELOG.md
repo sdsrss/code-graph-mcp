@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 115
+because Python edges change (below). The MCP server rebuilds the index when it
+starts; from the command line, `code-graph-mcp reindex` does.
+
+### Python: a bare name never reaches another file's method
+
+A bare Python name used as a value — a decorator `@cache`, an argument
+`register(cache)` — was bound to any same-named method in another file, so
+`from functools import cache` followed by `@cache` gave the decorated
+function a reference to an unrelated `Store.cache`. A bare name reaches a
+module-level name, a builtin or a local; another file's class member is none of
+them, and such candidates are now dropped. A method referenced from its own
+class body (`x = property(getx)`) and another file's module-level function
+still bind.
+
+`from .util import helper` looked `helper` up among every node of
+`util.py`, so with no module-level `helper` it bound the method
+`Box.helper`. It now considers only module-level definitions and, finding
+none, binds `util.py` itself, as it already did for a variable.
+
+Incremental runs had a third path to the same edge: when `util.py` lost
+`def helper` and gained a method `Box.helper`, the importer's import and its
+`helper()` call were moved onto the method, where a rebuild binds neither. A
+Python edge now moves onto a method only if it pointed at that same method;
+otherwise it is resolved again.
+
+On flask 3.1.0, 5 `references` edges go, all from production code to test
+methods named `g` or `gen`; no node and no call edge changes.
+
 ## 0.168.0
 
 Rust code gated by a compound `cfg` such as `cfg(all(test, not(loom)))` is

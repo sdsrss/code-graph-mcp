@@ -12090,3 +12090,141 @@ fn a_member_call_on_a_node_builtin_module_binds_no_project_function() {
         "a package the project holds stays reachable: {edges:#?}"
     );
 }
+
+// D#193(2): a bare Python name in a value position (`@cache`, `register(cache)`)
+// bound a same-named METHOD of another file: `@cache` from functools drew
+// `references -> Store.cache`. A bare name reaches a module-level binding, a
+// builtin or an enclosing function's local; a class member of another file is
+// none of them. Same-file methods stay reachable (`x = property(getx)` in the
+// class body), and so does another file's module-level function.
+#[test]
+fn a_python_bare_name_reference_binds_no_method_of_another_file() {
+    let files: &[(&str, &str)] = &[
+        (
+            "app/store.py",
+            "class Store:\n    def cache(self):\n        return {}\n\n\n\
+             class Ctx:\n    def contextmanager(self):\n        return None\n",
+        ),
+        ("app/hooks.py", "def on_load():\n    return 0\n"),
+        (
+            "app/util.py",
+            "from functools import cache\nfrom contextlib import contextmanager\n\
+             from app.hooks import on_load\n\n\n\
+             @cache\ndef load():\n    return 1\n\n\n\
+             @contextmanager\ndef opened():\n    yield 1\n\n\n\
+             def register(f):\n    return f\n\n\n\
+             def wire():\n    register(cache)\n    return register(on_load)\n\n\n\
+             class Prop:\n    def getx(self):\n        return 1\n    x = property(getx)\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    for e in [
+        "app/util.py.load --references--> app/store.py.cache",
+        "app/util.py.opened --references--> app/store.py.contextmanager",
+        "app/util.py.wire --references--> app/store.py.cache",
+    ] {
+        assert!(
+            !has(e),
+            "a bare name reached another file's method: {e}: {edges:#?}"
+        );
+    }
+    assert!(
+        has("app/util.py.wire --references--> app/hooks.py.on_load"),
+        "another file's module-level function stays reachable: {edges:#?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|x| x.ends_with("--references--> app/util.py.getx")),
+        "a method referenced from its own class body stays reachable: {edges:#?}"
+    );
+}
+
+// D#192(1) full-index half: `from .util import helper` looked `helper` up among
+// ALL nodes of util.py and bound the method `Box.helper`. A module attribute is
+// never a class member; with no module-level `helper`, the relative import
+// binds the module it names (D10), as for a variable.
+#[test]
+fn a_python_module_resolved_from_import_binds_no_method() {
+    let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", "from .util import helper as helper\n"),
+        (
+            "pkg/util.py",
+            "class Box:\n    def helper(self):\n        return 2\n\n\ndef other():\n    return 0\n",
+        ),
+        ("pkg/plain.py", "from .util import other\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    assert!(
+        !has("pkg/__init__.py.<module> --imports--> pkg/util.py.helper"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("pkg/__init__.py.<module> --imports--> pkg/util.py.<module>"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("pkg/plain.py.<module> --imports--> pkg/util.py.other"),
+        "a module-level function still binds by its module: {edges:#?}"
+    );
+}
+
+// D#192(1) incremental half: util.py loses `def helper` and gains a method of
+// that name. Phase 2c restored the importer's `imports` and `calls` edges by
+// bare name onto `Box.helper`; a rebuild binds neither. The whole edge set,
+// not only calls, must equal the rebuild's.
+#[test]
+fn a_python_edge_is_never_restored_onto_a_method_it_did_not_point_at() {
+    let before: &[(&str, &str)] = &[
+        (
+            "app.py",
+            "from pkg import helper\n\n\ndef main():\n    return helper()\n",
+        ),
+        ("pkg/__init__.py", "from .util import helper as helper\n"),
+        ("pkg/util.py", "def helper():\n    return 1\n"),
+    ];
+    let after_util =
+        "\n\nclass Box:\n    def helper(self):\n        return 2\n\n\ndef other():\n    return 0\n";
+    let (project, _d, db) = fresh_index_of(before);
+    fs::write(project.path().join("pkg/util.py"), after_util).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) = fresh_index_of(&[before[0], before[1], ("pkg/util.py", after_util)]);
+    assert_eq!(
+        edge_set(&db),
+        edge_set(&control),
+        "incremental must equal a rebuild"
+    );
+    // A method that kept its qualified name is still restored in place.
+    let before: &[(&str, &str)] = &[
+        (
+            "app.py",
+            "from pkg.util import Box\n\n\ndef main(b):\n    return Box().helper()\n",
+        ),
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/util.py",
+            "class Box:\n    def helper(self):\n        return 2\n",
+        ),
+    ];
+    let after_util =
+        "class Box:\n    def helper(self):\n        return 3\n\n\ndef tail():\n    return 0\n";
+    let (project, _d, db) = fresh_index_of(before);
+    let edges_before = edge_set(&db);
+    assert!(
+        edges_before
+            .iter()
+            .any(|x| x == "app.py.main --calls--> pkg/util.py.helper"),
+        "{edges_before:#?}"
+    );
+    fs::write(project.path().join("pkg/util.py"), after_util).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, control) = fresh_index_of(&[before[0], before[1], ("pkg/util.py", after_util)]);
+    assert_eq!(edge_set(&db), edge_set(&control));
+    assert!(edge_set(&db)
+        .iter()
+        .any(|x| x == "app.py.main --calls--> pkg/util.py.helper"));
+}
