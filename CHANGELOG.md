@@ -6,7 +6,7 @@
 because Rust test flags change (below). The MCP server rebuilds the index when it
 starts; from the command line, `code-graph-mcp reindex` does.
 
-### Python: an incremental run no longer moves an edge onto a method
+### Python: an incremental run moves an edge onto a method only as a rebuild would
 
 When `util.py` lost `def helper` and gained a method `Box.helper`, an
 incremental run moved the edges that pointed at the function — an
@@ -30,8 +30,9 @@ pkg/consts.py` names the importer and its test, as after a rebuild.
 
 After an upgrade that changes `INDEX_VERSION`, as this one does, a query
 command answered from the old index with exit 0 until something rebuilt it;
-only `health-check` said so. Every query command (`callgraph`, `impact`,
-`refs`, `show`, `search`, `grep`, …) now says it on stderr:
+only `health-check` said so. Every query command that reads the index
+(`callgraph`, `impact`, `refs`, `show`, `search`, `grep`, …; not `grep -l`
+or `grep -c`, which never open it) now says it on stderr:
 
 ```
 [code-graph] This index was built by an older code-graph (index v114, this binary v117): answers come from it until it is rebuilt — run: code-graph-mcp reindex
@@ -44,17 +45,18 @@ For an index a newer version built, which the command already warned about,
 it says `Index version: NEWER … update this binary`, and its JSON `issue`
 reads `index built by newer version (…); update this binary`.
 
-### One answer for a `--file` that does not hold the symbol
+### One answer when `--file` names a file without the symbol
 
-`impact` and `refs` said "Symbol 'x' not found in file 'y'" whether or not
-the index holds `y`, and `refs` never named the files that do define `x`.
-They now answer as `callgraph` has since 0.167.0: "File 'y' not found in
-index" for a path the index does not hold, and the defining files either
-way. MCP `find_references` words it as `get_call_graph` does. For scripts:
-`impact --json` and `refs --json` report `"error": "File not found in
-index"` for such a path, where `impact` said `"Symbol not found in file"`
-and `refs` said `"Symbol not found"`; for an indexed file without the
-symbol `refs` now says `"Symbol not found in file"` too. `refs --json` now
+When `x` is defined in other files, `impact` and `refs` said "Symbol 'x'
+not found in file 'y'" whether or not the index holds `y`, and `refs` never
+named the files that do define `x`. They now answer as `callgraph` has
+since 0.167.0: "File 'y' not found in index" for a path the index does not
+hold, and the defining files either way. MCP `find_references` words it as
+`get_call_graph` does. For scripts: `impact --json` and `refs --json`
+report `"error": "File not found in index"` for such a path, where `impact`
+said `"Symbol not found in file"` and `refs` said `"Symbol not found"`; for
+an indexed file without the symbol `refs` now says `"Symbol not found in
+file"` too. `refs --json` now
 carries `file` and `candidates`, and each candidate in both carries
 `node_id` and `start_line`.
 
@@ -73,7 +75,7 @@ referrers the same way.
 
 On tokio-1.41.1, the call edges at the default confidence floor fold 99
 distinct callers into another on 65 functions by name and file, and 43 on 29
-by qualified name and file; on flask 3.1.0, 47 on 15 and 42 on 11.
+by qualified name and file; on flask (3.2.0.dev), 48 on 15 and 44 on 12.
 
 ### More Rust test code is recognised as test code
 
@@ -81,7 +83,8 @@ A function under `#[rstest]`, `#[test_case(…)]`, `#[wasm_bindgen_test]` or
 `#[quickcheck]` is now test code, as one under `#[test]` or `#[tokio::test]`
 already was; `#[fixture]` stays production. In a file that opens with
 `#![cfg(test)]`, code outside any function (a `static` initializer) is test
-code too, so its calls no longer count as production callers. tokio-1.41.1
+code too, so `refs` and `impact` no longer list its unresolved calls among
+the production ones. tokio-1.41.1
 and this repository hold none of these shapes and index identically.
 
 When `refs` finds no caller, the list of calls with no resolved target now
@@ -95,8 +98,8 @@ saved; a marker left behind means the run died, and the next incremental run
 re-indexes every file to recover what it lost. The marker named no run. While
 the MCP server ran, a CLI query that indexed a new file left its marker in
 place for the length of its run, and the server's next incremental run took
-it for a crash and re-indexed the whole project (tokio: 2 of 12 rounds,
-3.9–5.1 s each). Whichever run finished first also cleared the marker, so a
+it for a crash and re-indexed the whole project (tokio: 2 of 12 rounds in one
+measurement and 2 of 24 in another, 2.6–5.1 s each). Whichever run finished first also cleared the marker, so a
 crash beside another run went unrecovered. Each run now records its own entry
 in the marker and holds `.code-graph/index-run.lock` while it runs: an entry
 is a crash only when no run holds the lock, and a run clears only its own.
@@ -117,12 +120,16 @@ repository.
 ### MCP `find_references` says what its confidence tiers mean
 
 Its `min_confidence` description told the model that `inferred` means
-import-resolved and `extracted` means same-file. An `inferred` reference is
-bound by name: the name is unique in its language, or an import, module
-path or receiver type confirms it. A call `b.py` makes to `a.py`'s
-`unique_fn` with no import at all is `inferred`. And a method call on an
-untyped receiver is bound by name even inside one file, so it is not
-`extracted`. The description now says this. Only the text the model reads
+import-resolved and `extracted` means same-file precise. A call or
+reference bound by name to another file's definition is `inferred` when the
+name is unique in its language or an import, module path or receiver type
+confirms it, and `ambiguous` otherwise: a call `b.py` makes to `a.py`'s
+`unique_fn` with no import at all is `inferred`. Two same-file shapes are
+labelled the same way, a Rust method call on a field or a call result whose
+type the source leaves unwritten (`self.0.m()`, `f().m()`) and a Python call
+on a `self` attribute or on a name a relative import binds; every other edge is `extracted`, which does not
+make it right. The description now says this, and `get_call_graph`'s says
+`extracted` keeps same-file calls only. Only the text the model reads
 changes; no answer does.
 
 ### Not covered
@@ -134,7 +141,10 @@ changes; no answer does.
   bound method by alias (`register = _default.register`).
 - Two different functions with one qualified name in one file still fold:
   nested functions of different parents, such as the `def index()` that many
-  flask tests define inside each test function (24 of flask's 42 above).
+  flask tests define inside each test function (24 of flask's 44 above).
+- For a symbol defined in no file, `impact --file` still answers "Symbol
+  not found" whatever the file, where `refs` and `callgraph` check the file
+  first.
 - On Windows the lock is not taken, and a run in progress still reads as a
   crashed one there.
 - The JS/TS scope walk above is still most of its cost: a probe build with
