@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.169.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 117
 because Rust test flags change (below). The MCP server rebuilds the index when it
