@@ -13874,3 +13874,50 @@ fn test_cli_impact_counts_only_excluded_callers_within_depth() {
         "{d2}"
     );
 }
+
+/// E2E 2026-10-16 round 2 (verification QA, P0-2): in flask, `callgraph Flask`
+/// printed `Flask (tests/test_config.py)` — a test's local subclass — then
+/// "(48 test callers hidden…)" and no callers, while `--json` held the three
+/// real callers under src/flask/app.py. The text view rendered only the first
+/// depth-0 node, and the query orders seeds by their call-edge count, which the
+/// test class won on test callers.
+#[test]
+fn test_cli_callgraph_text_roots_at_the_definition_with_callers() {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    for d in ["src/flask", "tests", "examples", ".git"] {
+        std::fs::create_dir_all(p.join(d)).unwrap();
+    }
+    std::fs::write(
+        p.join("src/flask/__init__.py"),
+        "from .app import Flask as Flask\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("src/flask/app.py"),
+        "class Flask:\n    def __init__(self, name):\n        self.name = name\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("examples/factory.py"),
+        "from flask import Flask\n\n\ndef create_app():\n    return Flask(__name__)\n",
+    )
+    .unwrap();
+    // The test's own `Flask` has more callers than the real one.
+    std::fs::write(
+        p.join("tests/test_config.py"),
+        "import flask\n\n\nclass Flask(flask.Flask):\n    pass\n\n\ndef test_a():\n    assert Flask(\"a\")\n\n\ndef test_b():\n    assert Flask(\"b\")\n\n\ndef test_c():\n    assert Flask(\"c\")\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let (stdout, stderr, code) =
+        run_cli(&project, &["callgraph", "Flask", "--direction", "callers"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.starts_with("Flask (src/flask/app.py)"), "{stdout}");
+    assert!(
+        stdout.contains("create_app (examples/factory.py)"),
+        "{stdout}"
+    );
+}

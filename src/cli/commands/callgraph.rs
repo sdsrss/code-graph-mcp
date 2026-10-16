@@ -436,8 +436,28 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Find root node (depth 0)
-    let root = display_nodes.iter().find(|n| n.depth == 0);
+    // Find the root node (depth 0). Several definitions of the name can seed
+    // the graph, and the query orders them by call-edge count, test callers
+    // included: in flask a test's local `class Flask(flask.Flask)` came first,
+    // so the tree showed it, "(48 test callers hidden)" and none of the real
+    // class's callers (E2E 2026-10-16 round 2). Root at a seed with a displayed
+    // child, else a non-test one, else the first.
+    let has_child = |id: i64| {
+        display_nodes
+            .iter()
+            .any(|n| n.depth == 1 && n.parent_id == Some(id))
+    };
+    let seeds: Vec<_> = display_nodes.iter().filter(|n| n.depth == 0).collect();
+    let root = seeds
+        .iter()
+        .find(|n| has_child(n.node_id))
+        .or_else(|| {
+            seeds
+                .iter()
+                .find(|n| !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path))
+        })
+        .or(seeds.first())
+        .copied();
     if let Some(root) = root {
         writeln!(stdout, "{} ({})", root.name, root.file_path)?;
     } else {
