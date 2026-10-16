@@ -268,11 +268,12 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
-        // `Type::method` → `Type.method` unless the index stores the `::` spelling.
-        let canonical_input = crate::resolve::canonical_symbol_spelling(conn, raw_symbol);
-        let raw_symbol = canonical_input.as_str();
         // A symbol in a file added since the last index (D2).
         crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
+        // `Type::method` → `Type.method` unless the index stores the `::` spelling:
+        // after the new-file step, which can add a stored `::` name (round 3).
+        let canonical_input = crate::resolve::canonical_symbol_spelling(conn, raw_symbol);
+        let raw_symbol = canonical_input.as_str();
         let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
             Ok(selection) => selection,
             Err(CliSymbolSelectionError::Ambiguous(candidates)) => {

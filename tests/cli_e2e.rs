@@ -14101,3 +14101,30 @@ fn test_cli_callgraph_text_roots_at_a_non_test_definition() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.starts_with("handler (src/hono-base.ts)"), "{stdout}");
 }
+
+/// E2E 2026-10-16 round 3: a `::` name in a file added since the last index
+/// was rewritten to `.` before the query indexed the new file (the spelling
+/// was not stored yet), so `show kube::zz::fresh_helper` said "Symbol not
+/// found" once and found it on the second try. The new file is indexed first.
+#[test]
+fn test_cli_a_colon_colon_name_in_a_new_file_is_found_the_first_time() {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    std::fs::create_dir_all(p.join("lib")).unwrap();
+    std::fs::write(
+        p.join("lib/log.sh"),
+        "kube::log::status() { echo \"$@\"; }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    std::fs::write(
+        p.join("lib/fresh.sh"),
+        "kube::zz::fresh_helper() { echo hi; }\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["show", "kube::zz::fresh_helper"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("lib/fresh.sh"), "{stdout}");
+}

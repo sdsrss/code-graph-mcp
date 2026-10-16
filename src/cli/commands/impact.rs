@@ -83,9 +83,6 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
-    // `Type::method` → `Type.method` unless the index stores the `::` spelling.
-    let canonical_input = crate::resolve::canonical_symbol_spelling(ctx.db.conn(), raw_symbol);
-    let raw_symbol = canonical_input.as_str();
     let conn = ctx.db.conn();
     let not_found_extra = serde_json::json!({});
     let mut node_target = match args.node_id {
@@ -101,6 +98,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     if node_target.is_none() {
         crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
     }
+    // `Type::method` → `Type.method` unless the index stores the `::` spelling:
+    // after the new-file step, which can add a stored `::` name (round 3).
+    let canonical_input = crate::resolve::canonical_symbol_spelling(ctx.db.conn(), raw_symbol);
+    let raw_symbol = canonical_input.as_str();
     let target_name: Option<String> = node_target.as_ref().map(|target| target.name.clone());
     let raw_symbol = target_name.as_deref().unwrap_or(raw_symbol);
 
