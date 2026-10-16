@@ -36,10 +36,15 @@ SEARCH_TOOLS = {"Grep", "Glob", "Read"}
 SEARCH_COMMANDS = {"grep", "rg", "egrep", "fgrep", "find", "fd", "cat", "head", "tail", "sed", "awk", "ls", "tree", "ag"}
 # Words that run the next word as the command.
 WRAPPERS = {"timeout", "time", "env", "npx", "nice", "command", "exec"}
+# Words that open or continue a compound command; the command follows them.
+KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "eval"}
+# `$(...)` without nesting: its body runs as a command of its own.
+SUBSTITUTION = re.compile(r"\$\(([^()]*)\)")
 HOOK_MARK = "code-graph AST index"
 
 
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# `<<<` is a here-string (one word on stdin), not a heredoc.
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def without_heredoc_bodies(command):
@@ -96,7 +101,15 @@ def command_words(stage):
         words = stage.strip().split()
     i = 0
     while i < len(words):
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]):
+        if words[i].startswith("(") and not words[i].startswith("$("):
+            # A subshell: `(cmd args)`.
+            words[i] = words[i].lstrip("(")
+            if not words[i]:
+                i += 1
+            continue
+        if words[i] in KEYWORDS:
+            i += 1
+        elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]):
             i += 1
         elif os.path.basename(words[i]) in WRAPPERS:
             if words[i] == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
@@ -122,7 +135,9 @@ def classify_bash(command):
     named code-graph-mcp (`cd ~/code-graph-mcp`, `cargo run --bin
     code-graph-mcp`) is not a code-graph call."""
     kinds = set()
-    for stage in stages(without_heredoc_bodies(command)):
+    command = without_heredoc_bodies(command)
+    bodies = SUBSTITUTION.findall(command)
+    for stage in stages(command) + [st for b in bodies for st in stages(b)]:
         words = command_words(stage)
         if not words:
             continue

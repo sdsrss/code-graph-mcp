@@ -1,6 +1,6 @@
 ---
 status: approved
-revision: 1
+revision: 2
 ---
 
 # Outside-path grep inject: the definition, not a command to run
@@ -20,14 +20,15 @@ definition's line range and signature.
 ## Evidence (2026-10-16, `scripts/plugin_usage.py` + transcript replay)
 
 - Since 0.164.0 the pointer fired 39 times in neutral-project main sessions
-  and 6 in subagents; a code-graph call followed within 10 tool calls 0/39
-  and 0/6. Across all projects from 2026-09-30: 60 events, 4 followed by any
-  code-graph call, 26 by a read of the defining file, e.g. `grep -n "fn
-  resolve_python_module_targets" -B25 -A45 src/indexer/pipeline/python_modules.rs`.
-- `show <X> --file <F> --json` on all 60 real (project, symbol, file) pairs:
-  57 one definition, 3 several (`model` ×3, `storage` ×12, test fixtures),
-  0 none. Signatures run to 900+ characters over many lines (FastAPI `Query`
-  defaults), classes have none.
+  and 6 in subagents; a code-graph call followed within 10 tool calls 0/45.
+  Within those 10 calls, 23/45 read or named the defining file (2/45 as the
+  very next call), e.g. `grep -n "fn resolve_python_module_targets" -B25 -A45
+  src/indexer/pipeline/python_modules.rs`.
+- `show <X> --file <F> --json` on the 61 real events since 2026-09-30 (54
+  distinct (project, symbol, file) pairs): 58 one definition, 3 several
+  (`model` ×3, `storage` ×12, test fixtures), 0 none. Signatures run to 900+
+  characters over many lines (FastAPI `Query` defaults), classes have none,
+  and C/C++ write the return type first (`char (int a)`, review 2026-10-16).
 
 ## Non-goals
 
@@ -47,14 +48,16 @@ definition's line range and signature.
   delay past the budget).
 - Accepted shapes for the lookup (table-driven test before the code):
 
-  | `show --json` result | injected |
+  | `show --json --compact` result | injected |
   |---|---|
-  | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <name><signature>` |
+  | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <label>` |
+  | … signature starting with `(` | label `<name><signature>` |
+  | … signature ending with `param_types` (C/C++ `ret (params)`) | label `<ret> <name><params>` |
+  | … any other signature, or `null` (class, Kotlin, Swift, Bash) | label `<name>` |
   | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no signature |
   | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no signature |
-  | signature `null` (class) | `: class Name` |
-  | signature with newlines / runs of spaces | collapsed to single spaces |
-  | signature + name longer than 160 characters | cut to 160, ends with `…` |
+  | whitespace, including U+0085 | collapsed to single spaces; `( ` → `(`, `, )` / ` )` → `)` (also inside literals) |
+  | `<type> <label>` longer than 160 characters | cut to 160, ends with `…` |
 
 - The line stays one line; file and search path keep `shellQuoteArg`.
 
@@ -92,3 +95,10 @@ None.
 # Change log
 
 - r1 (2026-10-16): initial, from the usage audit.
+- r2 (2026-10-16): pre-ship review round 1 (0 HIGH, 2 MEDIUM). C/C++
+  return-type-first signatures; `--compact` (no `code_content` in the rows);
+  U+0085 collapsed; the 160 cap is on the whole label; evidence recounted
+  (61 events / 54 pairs; 23/45 touched the definition within 10 calls, not
+  "the next step"). Left as LOW: a signature whose source text holds a
+  `code-graph-mcp` command shows it; a quoted path puts `:lines` outside the
+  quotes.

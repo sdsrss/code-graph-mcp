@@ -553,6 +553,12 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     OtherFile: [row({ name: 'OtherFile', file_path: 'src/other.py' })],
     Prefix: [row({ name: 'PrefixLonger' })],
     Long: [row({ name: 'Long', signature: `(${'arg_with_a_long_name: int, '.repeat(12)})` })],
+    // C/C++ put the return type first (review 2026-10-16): `<ret> (<params>)`.
+    CFree: [row({ name: 'CFree', signature: 'char (int a, const char *b)', param_types: '(int a, const char *b)', return_type: 'char' })],
+    CppTmpl: [row({ name: 'Widget.CppTmpl', type: 'method', signature: 'std::vector<T> (const T& v)', param_types: '(const T& v)', return_type: 'std::vector<T>' })],
+    RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
+    NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
+    Nel: [row({ name: 'Nel', signature: '(a,\u0085 b)' })],
   };
   let defStub;
   test.before(() => {
@@ -561,7 +567,7 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
 'use strict';
 const a = process.argv.slice(2);
 // Exactly the argv the runner must send; anything else is a wrong call.
-if (a.length !== 5 || a[0] !== 'show' || a[2] !== '--file' || a[3] !== ${JSON.stringify(F)} || a[4] !== '--json') process.exit(2);
+if (a.length !== 6 || a[0] !== 'show' || a[2] !== '--file' || a[3] !== ${JSON.stringify(F)} || a[4] !== '--json' || a[5] !== '--compact') process.exit(2);
 const answers = ${JSON.stringify(ANSWERS)};
 if (a[1] === 'Missing') process.exit(1);
 if (a[1] === 'Explode') process.exit(3);
@@ -578,6 +584,11 @@ process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
       ['Method', { status: 'hits', start: 1393, end: 1422, label: 'method Cls.Method(self, x: int) -> str' }],
       ['Klass', { status: 'hits', start: 10, end: 20, label: 'class Klass' }],
       ['Rusty', { status: 'hits', start: 10, end: 20, label: 'function outer::Rusty(path: &Path) -> io::Result<File>' }],
+      ['CFree', { status: 'hits', start: 10, end: 20, label: 'function char CFree(int a, const char *b)' }],
+      ['CppTmpl', { status: 'hits', start: 10, end: 20, label: 'method std::vector<T> Widget.CppTmpl(const T& v)' }],
+      ['RetOnly', { status: 'hits', start: 10, end: 20, label: 'function RetOnly' }],
+      ['NoSig', { status: 'hits', start: 10, end: 20, label: 'function NoSig' }],
+      ['Nel', { status: 'hits', start: 10, end: 20, label: 'function Nel(a, b)' }],
       ['Twins', { status: 'several' }],
       ['OtherFile', { status: 'no-hits' }],
       ['Prefix', { status: 'no-hits' }],

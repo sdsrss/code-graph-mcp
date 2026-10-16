@@ -35,6 +35,16 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ss.classify_bash("cat > p.sh <<'EOF'\ncode-graph-mcp callgraph X\nEOF\nls"), "search")
         self.assertEqual(ss.classify_bash("command -v code-graph-mcp"), None)
         self.assertEqual(ss.classify_bash("cat <<EOF | code-graph-mcp grep x\nbody\nEOF"), "cg")
+        # Compound commands start with a keyword, not the command (review 2026-10-16).
+        for cmd in ("for f in a b; do code-graph-mcp show $f; done",
+                    "if true; then code-graph-mcp callgraph f; fi",
+                    "if false; then :; else code-graph-mcp impact f; fi",
+                    "while read f; do code-graph-mcp show \"$f\"; done < list",
+                    "(code-graph-mcp grep x src/)", "{ code-graph-mcp show f; }",
+                    "! code-graph-mcp refs f", "echo $(code-graph-mcp show f)"):
+            self.assertEqual(ss.classify_bash(cmd), "cg", cmd)
+        # A here-string is not a heredoc: the next line is still a command.
+        self.assertEqual(ss.classify_bash('grep x <<<"abc"\ncode-graph-mcp grep x'), "cg")
 
     def test_tools(self):
         self.assertEqual(ss.classify_tool("Grep", {}), "search")

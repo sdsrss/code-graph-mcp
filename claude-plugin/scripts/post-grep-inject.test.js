@@ -1488,7 +1488,7 @@ test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and 
     `const sub = process.argv[2], arg = process.argv[3], a = process.argv.slice(2);\n` +
     `if (sub === 'callgraph') { process.stdout.write(arg + ' (${file})\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
     (show
-      ? `if (sub === 'show' && a.length === 5 && a[2] === '--file' && a[3] === '${file}' && a[4] === '--json') {\n` +
+      ? `if (sub === 'show' && a.length === 6 && a[2] === '--file' && a[3] === '${file}' && a[4] === '--json' && a[5] === '--compact') {\n` +
         `  process.stdout.write(JSON.stringify([{ file_path: '${file}', name: arg, type: 'function', signature: '(root: &Path)', start_line: 41, end_line: 77 }]));\n` +
         `  process.exit(0);\n}\n`
       : '') +

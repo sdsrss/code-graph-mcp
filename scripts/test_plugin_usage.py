@@ -160,6 +160,29 @@ class ScanTest(unittest.TestCase):
         ])
         self.assertEqual((s["cg_deny"], s["cg_rewrite"]), (1, 1))
 
+    def test_subagent_start_context_counts(self):
+        # code-graph's SubagentStart text has no `[code-graph` prefix (review 2026-10-16).
+        txt = ("This repository has a code-graph AST index of 418 files. Who calls a function: "
+               "code-graph-mcp callgraph <fn>")
+        js = json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": txt}})
+        s = self.scan([header("2026-10-01T00:00:00Z"), success("SubagentStart", js), ctx("SubagentStart", txt),
+                       ctx("PreToolUse:Read", "This repository has a code-graph AST index (quoted elsewhere)")])
+        self.assertEqual(s["cg_inject"], {"SubagentStart": 1})
+
+    def test_failed_code_graph_call_is_not_a_deny(self):
+        call = bash("code-graph-mcp grep zzz src/")
+        s = self.scan([header("2026-10-01T00:00:00Z"), call,
+                       {"type": "user", "message": {"content": [{
+                           "type": "tool_result", "tool_use_id": call["message"]["content"][0]["id"],
+                           "is_error": True, "content": "[code-graph] No matches for: zzz"}]}}])
+        self.assertEqual((s["cg_deny"], s["cg_explicit"]), (0, {"bash": 1}))
+
+    def test_non_dict_hook_output_does_not_abort(self):
+        s = self.scan([header("2026-10-01T00:00:00Z"),
+                       success("PreToolUse:Bash", json.dumps({"hookSpecificOutput": "text"})),
+                       success("PreToolUse:Bash", json.dumps({"hookSpecificOutput": None}))])
+        self.assertEqual(s["cg_rewrite"], 0)
+
     def test_pointer_follow_through_window(self):
         ptr = "[code-graph] f is defined in a.py, outside the path your grep searched. Its callers: code-graph-mcp callgraph f"
         recs = [header("2026-10-01T00:00:00Z"), bash("grep -rn f tests/"), ctx("PostToolUse:Bash", ptr)]
@@ -219,6 +242,12 @@ class CollectTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def test_window_must_be_positive(self):
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            pu.main(["--window", "0"])
+
     def test_json_and_table(self):
         t = Tree()
         try:

@@ -564,6 +564,22 @@ function runCallgraphAnswer(opts = {}) {
 const DEFINITION_LABEL_MAX = 160;
 
 /**
+ * `name(params)…` for a `show --json` row. Most extractors write the signature
+ * from the parameter list on (`(a, b) -> T`); C and C++ write the return type
+ * first (`char (int a)`), where `param_types` is the trailing `(…)` and the
+ * name goes between them (`char f(int a)`). Any other shape gets the name alone.
+ */
+function definitionSignature(r) {
+  const sig = typeof r.signature === 'string' ? r.signature.trim() : '';
+  if (sig.startsWith('(')) return `${r.name}${sig}`;
+  const params = typeof r.param_types === 'string' ? r.param_types.trim() : '';
+  if (params.startsWith('(') && sig.endsWith(params) && sig.length > params.length) {
+    return `${sig.slice(0, -params.length).trim()} ${r.name}${params}`;
+  }
+  return r.name;
+}
+
+/**
  * Where exactly `symbol` is defined in `file`: `show <symbol> --file <file>
  * --json`, kept only when ONE row in that file carries the name (`X`, a
  * qualified `Cls.X` or `mod::X`). The outside-path grep inject names this in
@@ -586,7 +602,8 @@ function runDefinitionAnswer(opts = {}) {
     }
     const binary = resolveAnswerBinary(opts);
     if (!binary) return { status: 'no-binary' };
-    const res = runCg(binary, ['show', symbol, '--file', file, '--json'], { cwd, timeoutMs });
+    // --compact: the rows without `code_content` (a whole class body otherwise).
+    const res = runCg(binary, ['show', symbol, '--file', file, '--json', '--compact'], { cwd, timeoutMs });
     const verdict = classifyRun(res, { exitOneIsNoHits: true });
     if (verdict !== 'ok') {
       return { status: verdict, ...(res.budgetExhausted ? { reason: 'budget' } : {}) };
@@ -604,10 +621,12 @@ function runDefinitionAnswer(opts = {}) {
     if (named.length > 1) return { status: 'several' };
     const r = named[0];
     if (!Number.isInteger(r.start_line) || !Number.isInteger(r.end_line)) return { status: 'unavailable' };
-    // A signature written one parameter per line collapses to `( a, b, )`:
-    // drop the padding inside the parentheses and the trailing comma.
-    let label = `${r.type || 'symbol'} ${r.name}${typeof r.signature === 'string' ? r.signature : ''}`
-      .replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/,? \)/g, ')').trim();
+    let label = `${r.type || 'symbol'} ${definitionSignature(r)}`
+      // U+0085 too: JS `\s` lacks it, and a reader splitting lines counts it.
+      .replace(/[\s\u0085]+/g, ' ')
+      // A signature written one parameter per line collapses to `( a, b, )`:
+      // drop the padding inside the parentheses and the trailing comma.
+      .replace(/\( /g, '(').replace(/,? \)/g, ')').trim();
     const chars = [...label];
     if (chars.length > DEFINITION_LABEL_MAX) label = chars.slice(0, DEFINITION_LABEL_MAX - 1).join('') + '…';
     return { status: 'hits', start: r.start_line, end: r.end_line, label };

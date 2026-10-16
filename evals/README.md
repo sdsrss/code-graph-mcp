@@ -306,12 +306,16 @@ code-graph call (claude-mem-lite's counts sit beside them as a reference):
 
 On this machine (2026-10-16), main sessions in projects that develop neither
 plugin made 24.7 explicit code-graph calls per 1k tool calls before 0.154.0
-and 1.1 from 0.164.0. Before 0.154.0, the 27 sessions that met no deny made
-0.2 per 1k (1 of them used code-graph) and the 23 that met one made 40.2 (16
-used it), so the drop is the deny's forcing effect going away, not the model
-turning away from the tool. Run it before and after any change to a hook
-or to the steering text, and pair a moved number with an outcome eval: counts
-are not results.
+and 1.1 from 0.164.0. That total mixes projects: the earlier sessions come
+from five projects, the later ones from two. Within the one code project on
+both sides, `daagu`, it went from 68.0 (8 of 10 sessions used code-graph) to
+1.5 (2 of 15); in `claudemd`, mostly Markdown, it stayed between 0.0 and 0.4.
+Before 0.154.0, the 27 neutral sessions that met no deny made 0.2 per 1k (1
+of them used code-graph) and the 23 that met one made 40.2 (16 used it), so
+the drop is the deny's forcing effect going away, not the model turning away
+from the tool. Run it before and after any change to a hook or to the
+steering text, compare within a project, and pair a moved number with an
+outcome eval: counts are not results.
 
 ## What `run.sh` sets up, and why
 

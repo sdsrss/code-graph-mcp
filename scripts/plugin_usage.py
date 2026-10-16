@@ -45,6 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from subagent_share import classify_bash, command_words, stages, without_heredoc_bodies  # noqa: E402
 
 CG_PREFIX = "[code-graph"
+# code-graph's SubagentStart context opens with prose, not the prefix
+# (subagent_share.HOOK_MARK).
+CG_SUBAGENT_MARK = "code-graph AST index"
 MEM_PREFIXES = ("[mem", "[claude-mem-lite")
 CG_MCP = "mcp__plugin_code-graph"
 MEM_MCP = "mcp__plugin_claude-mem"
@@ -89,9 +92,9 @@ def pointer_verb(text):
     return (m.group(1) or m.group(2)) if m else None
 
 
-def _source(text):
+def _source(text, event=None):
     s = text.lstrip()
-    if s.startswith(CG_PREFIX):
+    if s.startswith(CG_PREFIX) or (event == "SubagentStart" and CG_SUBAGENT_MARK in s):
         return "cg"
     if s.startswith(MEM_PREFIXES):
         return "mem"
@@ -146,6 +149,7 @@ def scan_transcript(path, window=10):
          "mem_inject": Counter(), "cg_deny": 0, "cg_rewrite": 0,
          "pointers": 0, "pointers_followed": 0, "pointer_kinds": Counter()}
     events = []  # ("ptr", kind) | ("tool", is_cg), in transcript order
+    cg_calls = set()  # tool_use ids of explicit code-graph calls
 
     def inject(src, hook):
         s["cg_inject" if src == "cg" else "mem_inject"][hook or "?"] += 1
@@ -167,7 +171,7 @@ def scan_transcript(path, window=10):
                 hook = att.get("hookName")
                 if att.get("type") == "hook_additional_context":
                     for text in att.get("content") or []:
-                        src = _source(str(text))
+                        src = _source(str(text), att.get("hookEvent"))
                         if src:
                             inject(src, hook)
                         verb = pointer_verb(str(text)) if src == "cg" else None
@@ -184,15 +188,19 @@ def scan_transcript(path, window=10):
                             if verb:
                                 events.append(("ptr", f"{hook} {verb}"))
                     elif att.get("hookEvent") == "PreToolUse":
-                        hso = doc.get("hookSpecificOutput") or {}
+                        hso = doc.get("hookSpecificOutput")
+                        if not isinstance(hso, dict):
+                            continue
                         why = str(hso.get("permissionDecisionReason") or hso.get("additionalContext") or "")
-                        if isinstance(hso, dict) and hso.get("updatedInput") and _source(why) == "cg":
+                        if hso.get("updatedInput") and _source(why) == "cg":
                             s["cg_rewrite"] += 1
             elif kind == "user":
                 content = (rec.get("message") or {}).get("content")
                 if isinstance(content, list):
                     for block in content:
+                        # A code-graph command that ran and failed is not a deny.
                         if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") \
+                                and block.get("tool_use_id") not in cg_calls \
                                 and CG_PREFIX in _result_text(block.get("content"))[:300]:
                             s["cg_deny"] += 1
             elif kind == "assistant":
@@ -205,6 +213,8 @@ def scan_transcript(path, window=10):
                     if hit:
                         s[hit[0] + "_explicit"][hit[1]] += 1
                     events.append(("tool", bool(hit and hit[0] == "cg")))
+                    if hit and hit[0] == "cg":
+                        cg_calls.add(block.get("id"))
 
     for i, (what, val) in enumerate(events):
         if what != "ptr":
@@ -301,6 +311,13 @@ def aggregate(sessions, splits=(), by_project=False):
     return rows
 
 
+def _positive_int(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
 def _split_arg(text):
     ts, _, label = text.partition("=")
     return ts, label or ts
@@ -324,7 +341,7 @@ def main(argv=None):
     ap.add_argument("--all-entrypoints", action="store_true", help="include claude -p / SDK sessions")
     ap.add_argument("--by-project", action="store_true")
     ap.add_argument("--detail", action="store_true", help="per-hook injections and pointer kinds")
-    ap.add_argument("--window", type=int, default=10, help="tool calls a pointer is followed within (10)")
+    ap.add_argument("--window", type=_positive_int, default=10, help="tool calls a pointer is followed within (10)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     sessions = collect(a.projects_dir, a.since, a.until, None if a.all_entrypoints else ("cli",),
