@@ -1055,8 +1055,13 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         } else if let Some((done, total)) =
             crate::indexer::pipeline::index_build_in_progress(&effective_read_root(project_root))
         {
+            let progress = if total > 0 {
+                format!(" ({done}/{total} files)")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[code-graph] The index is still being built ({done}/{total} files); retry in a few seconds for AST context."
+                "[code-graph] The index is still being built{progress}; retry in a few seconds for AST context."
             );
         } else if db_path.exists() {
             eprintln!(

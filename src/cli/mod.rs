@@ -321,9 +321,14 @@ impl CliContext {
 fn refuse_during_build(project_root: &Path) -> Result<()> {
     let root = effective_read_root(project_root);
     if let Some((done, total)) = crate::indexer::pipeline::index_build_in_progress(&root) {
+        let progress = if total > 0 {
+            format!(" ({done}/{total} files)")
+        } else {
+            String::new()
+        };
         anyhow::bail!(
-            "The index is still being built ({done}/{total} files); answers from it would be \
-             incomplete. Retry in a few seconds."
+            "The index is still being built{progress}; answers from it would be incomplete. \
+             Retry in a few seconds."
         );
     }
     Ok(())

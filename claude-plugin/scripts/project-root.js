@@ -140,10 +140,27 @@ function indexBuildInProgress(root, now = Date.now()) {
   try {
     if (now - fs.statSync(file).mtimeMs >= INDEXING_STALE_MS) return false;
     const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // A killed server leaves its last status behind; it names its pid.
+    if (!writerAlive(p)) return false;
+    // "starting": written before the server's tree walk, no file count yet.
+    if (p.s === 'starting') return true;
     return (p.s === 'indexing' || p.s === 'finalizing') && p.t > 0;
   } catch {
     return false;
   }
 }
 
-module.exports = { resolveProjectRoot, indexBuildInProgress, INDEXING_STALE_MS };
+// Whether the status file's writer is still running. A file with no pid (an
+// older server) counts as live, as before. Signal 0 only checks: ESRCH is gone,
+// EPERM is alive under another user.
+function writerAlive(p) {
+  if (!p || !Number.isInteger(p.pid) || p.pid <= 0) return true;
+  try {
+    process.kill(p.pid, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
+module.exports = { resolveProjectRoot, indexBuildInProgress, writerAlive, INDEXING_STALE_MS };

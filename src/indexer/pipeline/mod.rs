@@ -141,16 +141,11 @@ fn try_write_source_roots(db: &Database) -> Result<()> {
 /// threshold (INDEXING_STALE_MS in statusline.js) before trusting the file.
 pub const INDEXING_STATUS_STALE_SECS: u64 = 120;
 
-/// Remove a leftover `.code-graph/indexing-status.json` older than
-/// [`INDEXING_STATUS_STALE_SECS`]. A killed session (SIGKILL, session exit)
-/// skips the IndexGuard drop that normally deletes the file, pinning the
-/// statusline at a phantom "indexing N/M" forever. Safe against a live indexer:
-/// its file is fresh and left alone, and even a racing removal is repaired by
-/// the indexer's next heartbeat write.
 /// The build the MCP server is running now, as the statusline and the hooks
 /// read it (`project-root.js` `indexBuildInProgress`): a fresh
-/// [`INDEXING_STATUS_FILE`] saying `indexing` or `finalizing`. `Some((done,
-/// total))` while it lasts. Only a small regular file is read: a FIFO in its
+/// [`INDEXING_STATUS_FILE`] saying `starting`, `indexing` or `finalizing`,
+/// written by a live process. `Some((done, total))` while it lasts (`total`
+/// is 0 while starting). Only a small regular file is read: a FIFO in its
 /// place would block the read.
 pub fn index_build_in_progress(project_root: &Path) -> Option<(u64, u64)> {
     let dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
@@ -172,11 +167,51 @@ pub fn index_build_in_progress(project_root: &Path) -> Option<(u64, u64)> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-    let total = v["t"].as_u64()?;
-    let building = matches!(v["s"].as_str(), Some("indexing" | "finalizing")) && total > 0;
+    // A server killed mid-build leaves its last status behind; the file names
+    // its pid, and a writer that is gone is no build.
+    if let Some(pid) = v["pid"].as_u64() {
+        if !process_is_alive(pid) {
+            return None;
+        }
+    }
+    let total = v["t"].as_u64().unwrap_or(0);
+    let building = match v["s"].as_str() {
+        // Written before the tree walk, when the file count is not known yet.
+        Some("starting") => true,
+        Some("indexing" | "finalizing") => total > 0,
+        _ => false,
+    };
     building.then(|| (v["d"].as_u64().unwrap_or(0), total))
 }
 
+/// Whether `pid` names a live process. `kill(pid, 0)` checks without sending:
+/// ESRCH is gone, EPERM is alive under another user. Elsewhere, assume alive.
+fn process_is_alive(pid: u64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 performs only the existence and permission check.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Remove a leftover `.code-graph/indexing-status.json` older than
+/// [`INDEXING_STATUS_STALE_SECS`]. A killed session (SIGKILL, session exit)
+/// skips the IndexGuard drop that normally deletes the file, pinning the
+/// statusline at a phantom "indexing N/M" forever. Safe against a live indexer:
+/// its file is fresh and left alone, and even a racing removal is repaired by
+/// the indexer's next heartbeat write.
 pub fn remove_stale_indexing_status(project_root: &Path) {
     remove_indexing_status_older_than(
         project_root,

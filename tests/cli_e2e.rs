@@ -13921,3 +13921,47 @@ fn test_cli_callgraph_text_roots_at_the_definition_with_callers() {
         "{stdout}"
     );
 }
+
+/// E2E 2026-10-16 round 2 (verification and plugin QA): (a) between the MCP
+/// server's start and its first progress tick (the tree walk) no status file
+/// existed, so queries answered from, and wrote into, the index being built;
+/// the server now writes `{"s":"starting"}` before it walks. (b) After a
+/// server was killed mid-build, its last status file refused queries for up
+/// to 120 s; the file names the server's pid, and a dead pid is no build.
+#[cfg(unix)]
+#[test]
+fn test_cli_build_status_starting_and_a_dead_writer() {
+    let project = setup_indexed_project();
+    let status = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("indexing-status.json");
+    let live = std::process::id();
+    std::fs::write(&status, format!(r#"{{"s":"starting","pid":{live}}}"#)).unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_ne!(code, 0, "{stdout}{stderr}");
+    assert!(stderr.contains("still being built"), "{stderr}");
+
+    // A writer that has exited.
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    std::fs::write(
+        &status,
+        format!(r#"{{"s":"indexing","d":3,"t":50,"pid":{dead}}}"#),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_eq!(
+        code, 0,
+        "a dead writer's status is no build: {stdout}{stderr}"
+    );
+    // Control: the same file with the live pid refuses.
+    std::fs::write(
+        &status,
+        format!(r#"{{"s":"indexing","d":3,"t":50,"pid":{live}}}"#),
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_ne!(code, 0, "{stderr}");
+}

@@ -296,6 +296,21 @@ test('finalizing progress renders an explicit phase label', (t) => {
   assert.equal(runStatusline(home, project), 'code-graph: ↻ finalizing 2331/2331');
 });
 
+test('a starting build renders as indexing; a dead writer\'s progress is ignored', (t) => {
+  // E2E 2026-10-16 round 2: the server writes {"s":"starting","pid":N} before
+  // its tree walk, and its pid in every progress write; after a kill the last
+  // "finalizing 3452/3453" pinned the segment for the stale window.
+  const { spawnSync } = require('node:child_process');
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, { report: { healthy: true, nodes: 30753, files: 2331 }, exitCode: 0 });
+  writeProgress(project, { s: 'starting', pid: process.pid });
+  assert.equal(runStatusline(home, project), 'code-graph: ↻ indexing…');
+  const deadPid = Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout);
+  writeProgress(project, { s: 'finalizing', d: 3452, t: 3453, pid: deadPid });
+  assert.equal(runStatusline(home, project), 'code-graph: ✓ 30753 nodes | 2331 files');
+});
+
 test('stale progress file is ignored — falls through to health check', (t) => {
   // A killed server (session exit, SIGKILL, MCP connect-timeout kill) skips the
   // IndexGuard drop that deletes the progress file. A live indexer heartbeats at

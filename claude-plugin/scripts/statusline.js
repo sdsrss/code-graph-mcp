@@ -111,7 +111,14 @@ try {
   // src/indexer/pipeline/mod.rs, which drives server/CLI-side stale cleanup.)
   const INDEXING_STALE_MS = 120000;
   const fresh = (Date.now() - fs.statSync(progressFile).mtimeMs) < INDEXING_STALE_MS;
-  const p = fresh ? JSON.parse(fs.readFileSync(progressFile, 'utf8')) : null;
+  let p = fresh ? JSON.parse(fs.readFileSync(progressFile, 'utf8')) : null;
+  // A killed server's last write names its pid: ignore it at once rather than
+  // pinning "finalizing N/M" for the stale window.
+  if (p && !require('./project-root').writerAlive(p)) p = null;
+  if (p && p.s === 'starting') {
+    process.stdout.write('code-graph: \u21BB indexing\u2026');
+    process.exit(0);
+  }
   if (p && p.s === 'indexing' && p.t > 0) {
     // floor, not round: skipped files (parse errors, oversized) keep d below t
     // even in the terminal progress write, and rounding displayed that state as

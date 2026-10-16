@@ -53,3 +53,20 @@ test('INDEXING_STALE_MS mirrors statusline.js and the Rust INDEXING_STATUS_STALE
   const rust = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'indexer', 'pipeline', 'mod.rs'), 'utf8');
   assert.match(rust, /pub const INDEXING_STATUS_STALE_SECS: u64 = 120;/);
 });
+
+test('indexBuildInProgress: "starting" is a build; a status whose writer has exited is not', (t) => {
+  // E2E 2026-10-16 round 2: the MCP server now says "starting" before its tree
+  // walk (no file count yet), and names its pid so a killed server's leftover
+  // file stops reading as a build at once instead of after the stale window.
+  const { spawnSync } = require('node:child_process');
+  const root = project(t);
+  writeStatus(root, { s: 'starting', pid: process.pid });
+  assert.equal(indexBuildInProgress(root), true, 'starting, live writer');
+  const exited = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  const deadPid = Number(exited.stdout);
+  assert.ok(deadPid > 0);
+  writeStatus(root, { s: 'indexing', d: 3, t: 50, pid: deadPid });
+  assert.equal(indexBuildInProgress(root), false, 'writer gone');
+  writeStatus(root, { s: 'indexing', d: 3, t: 50, pid: process.pid });
+  assert.equal(indexBuildInProgress(root), true, 'control: same file, live writer');
+});

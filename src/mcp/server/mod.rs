@@ -945,6 +945,14 @@ impl McpServer {
         // so no other process is writing this file — remove it unconditionally; our
         // own progress writes recreate it.
         let _ = std::fs::remove_file(&progress_file);
+        // Say a build is starting before the tree walk, which can take a second
+        // on a large repo and writes no progress: queries in that window read,
+        // and wrote into, the index being built (E2E 2026-10-16 round 2). The
+        // pid lets a reader tell a killed server's leftover file from a build.
+        let _ = std::fs::write(
+            &progress_file,
+            format!(r#"{{"s":"starting","pid":{}}}"#, std::process::id()),
+        );
         let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
         let embedding_yield = Arc::clone(&self.indexing.embedding_yield);
         // Kept out of the closure so the spawn-failure path below can still clear
@@ -1008,7 +1016,13 @@ impl McpServer {
                             IndexPhase::Files => "indexing",
                             IndexPhase::Finalizing => "finalizing",
                         };
-                        let json = format!(r#"{{"s":"{}","d":{},"t":{}}}"#, s, current, total);
+                        let json = format!(
+                            r#"{{"s":"{}","d":{},"t":{},"pid":{}}}"#,
+                            s,
+                            current,
+                            total,
+                            std::process::id()
+                        );
                         let _ = std::fs::write(&pf, json);
                     };
 
