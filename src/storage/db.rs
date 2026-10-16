@@ -378,7 +378,13 @@ impl Database {
             Self::ensure_embedding_dim_consistency(&conn)?;
         }
 
-        conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
+        // Only when it changes: setting it is a committed write even to the same
+        // value, and a reader's open (the statusline's health-check, every render)
+        // then failed a concurrent build that had read in its transaction with
+        // "database is locked" (E2E 2026-10-16 round 3).
+        if existing_version != schema::SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
+        }
 
         // Check INDEX_VERSION (stored in application_id pragma).
         // When parser/indexer logic changes, INDEX_VERSION is bumped. An INDEXER
@@ -990,6 +996,30 @@ impl Drop for UncheckedSavepoint<'_> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// E2E 2026-10-16 round 3: every open, readers included, re-stamped
+    /// `user_version`, a committed write. A writer that had read inside its
+    /// transaction then could not write ("database is locked", no busy wait):
+    /// a `health-check` beside a CLI build failed it 2 of 3 times on flask,
+    /// and the statusline runs one on every render.
+    #[test]
+    fn test_reopening_a_current_index_commits_no_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("index.db");
+        drop(Database::open(&path).unwrap());
+        let writer = Database::open(&path).unwrap();
+        writer.conn().execute_batch("BEGIN").unwrap();
+        let _: i64 = writer
+            .conn()
+            .query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        drop(Database::open_nondestructive(&path).unwrap());
+        writer
+            .conn()
+            .execute("INSERT INTO meta (key, value) VALUES ('probe', '1')", [])
+            .expect("a reader's open committed a write under this transaction");
+        writer.conn().execute_batch("COMMIT").unwrap();
+    }
 
     #[test]
     fn test_savepoint_standalone_commit_and_rollback() {
