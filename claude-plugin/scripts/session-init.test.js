@@ -937,11 +937,16 @@ test('a missing binary on a fresh install reads as auto-install, not as a failed
   assert.ok(!/cannot start/i.test(auto), 'no failure framing while the fetch is running');
   assert.ok(!/npm install -g/.test(auto), 'no manual instruction the user does not need');
 
-  // Opted out of auto-update → nothing else will fetch it, so the manual
-  // instruction is the only correct answer.
+  // Opted out of auto-update: the MCP launcher still installs a MISSING
+  // binary (README; launcher-install.js reads no opt-out), so the message says
+  // so, and keeps the manual command only as the fallback. The earlier premise
+  // here, "nothing else will fetch it", was false: a sandboxed first session
+  // under the opt-out had the binary 3.3 s after this said to install by hand
+  // (E2E 2026-10-16).
   const optedOut = missingBinaryMessage({ CODE_GRAPH_NO_AUTO_UPDATE: '1' });
-  assert.match(optedOut, /npm install -g @sdsrs\/code-graph/);
-  assert.match(optedOut, /CODE_GRAPH_NO_AUTO_UPDATE=1/);
+  assert.match(optedOut, /installing it in the background/);
+  assert.match(optedOut, /CODE_GRAPH_NO_AUTO_UPDATE=1 stops updates, not this install/);
+  assert.match(optedOut, /Still missing next session\? Install it yourself: +npm install -g @sdsrs\/code-graph/);
 });
 
 // ── SessionStart budget (audit 2026-09-05 NEW-05) ─────────────────────────

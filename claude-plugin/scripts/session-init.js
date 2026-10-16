@@ -413,9 +413,14 @@ function ensureIndexFresh() {
  * are testable without a binary-less machine.
  */
 function missingBinaryMessage(env = process.env) {
+  // CODE_GRAPH_NO_AUTO_UPDATE=1 stops updates, not the install of a missing
+  // binary: the MCP launcher installs it either way (README, Environment
+  // variables). Telling this user to install by hand was false while the
+  // launcher's install was already running (E2E 2026-10-16).
   if (env.CODE_GRAPH_NO_AUTO_UPDATE === '1') {
-    return '[code-graph] Binary not found, and auto-download is off (CODE_GRAPH_NO_AUTO_UPDATE=1).\n' +
-           '            Install it yourself:  npm install -g @sdsrs/code-graph\n';
+    return '[code-graph] Binary not found — installing it in the background (~40MB, first run only).\n' +
+           '            CODE_GRAPH_NO_AUTO_UPDATE=1 stops updates, not this install.\n' +
+           '            Still missing next session? Install it yourself:  npm install -g @sdsrs/code-graph\n';
   }
   return '[code-graph] Binary not found — fetching it in the background (~40MB, first run only).\n' +
          '            Tools appear as soon as it lands; no restart needed.\n' +
