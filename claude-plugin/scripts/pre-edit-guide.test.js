@@ -660,3 +660,29 @@ test('Q4: no candidate at or before the edited line → silent, never a guess', 
   assert.equal(res.status, 0, res.stderr);
   assert.equal(res.stdout.trim(), '');
 });
+
+// E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`
+// reported 7 direct callers AND `ambiguous_callers_excluded: 32`; the CLI's text
+// prints the ⚠ line, the hook printed "7 direct callers" alone — an undercount
+// presented to the model as the blast radius. Same for a truncated traversal.
+test('emit(subprocess): the summary carries the callers impact left out, not just its counts', (t) => {
+  const stubExec = `(bin, args) => JSON.stringify({
+    direct_callers: 7, total_callers: 8, affected_files: 3, risk: 'high',
+    callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }],
+    test_callers: [],
+    ambiguous_callers_excluded: 32,
+    callers_truncated: true,
+    callers_truncated_note: 'Caller traversal hit the depth cap, so the caller counts … below …',
+  })`;
+  const { res } = runPreEditHook(t, { stubExec });
+  assert.equal(res.status, 0, res.stderr);
+  const ctx = JSON.parse(res.stdout.trim()).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /7 direct callers/);
+  assert.match(ctx, /32 more caller\(s\) matched only by name/, ctx);
+  assert.match(ctx, /caller traversal stopped early, so these counts are a floor/, ctx);
+
+  // Control: a payload without them adds neither line.
+  const plain = runPreEditHook(t);
+  const plainCtx = JSON.parse(plain.res.stdout.trim()).hookSpecificOutput.additionalContext;
+  assert.doesNotMatch(plainCtx, /matched only by name|counts are a floor/);
+});

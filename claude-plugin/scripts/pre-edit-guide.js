@@ -301,6 +301,16 @@ summary += `  ${directCallers} direct callers, ${totalCallers} total across ${af
 if (routeCount > 0) summary += `, ${routeCount} routes affected`;
 if (testCount > 0) summary += ` (${testCount} tests)`;
 summary += '\n';
+// The counts above are what `impact` could resolve, and it says when that is a
+// floor; the CLI prints both caveats, so the model must get them too. Without
+// them, flask's `url_for` read as 7 callers with 32 more excluded.
+const ambiguous = jsonResult.ambiguous_callers_excluded || 0;
+if (ambiguous > 0) {
+  summary += `  ⚠ ${ambiguous} more caller(s) matched only by name were not counted; the blast radius may be larger\n`;
+}
+if (jsonResult.callers_truncated) {
+  summary += '  ⚠ the caller traversal stopped early, so these counts are a floor, not a total\n';
+}
 
 // List direct callers compactly
 const callers = (jsonResult.callers || []).filter(c => c.depth === 1);
