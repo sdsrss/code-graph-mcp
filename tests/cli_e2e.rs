@@ -13365,3 +13365,69 @@ fn test_cli_refuses_a_code_graph_that_is_not_a_directory() {
         assert_health_json_refused(&project, "exists and is not a directory");
     }
 }
+
+/// E2E 2026-10-16 (CLI-user QA, P0): on leveldb every `affected` answered
+/// "0 test file(s) to re-run" — `util/coding_test.cc` among them — because
+/// `is_test_path` knows no C/C++ test file naming. The gtest cases in those
+/// files are already marked `is_test` on their nodes at parse time.
+#[test]
+fn test_cli_affected_finds_cpp_gtest_files() {
+    let project = TempDir::new().unwrap();
+    let util = project.path().join("util");
+    std::fs::create_dir_all(&util).unwrap();
+    std::fs::write(
+        util.join("coding.h"),
+        "#pragma once\nvoid EncodeFixed32(char* dst, unsigned value);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        util.join("coding.cc"),
+        "#include \"util/coding.h\"\nvoid EncodeFixed32(char* dst, unsigned value) { dst[0] = value; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        util.join("coding_test.cc"),
+        "#include \"util/coding.h\"\n#include \"gtest/gtest.h\"\n\nTEST(Coding, Fixed32) {\n  char buf[4];\n  EncodeFixed32(buf, 7);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        util.join("writer.cc"),
+        "#include \"util/coding.h\"\nvoid PutFixed32(char* dst) { EncodeFixed32(dst, 1); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, stderr, code) = run_cli(&project, &["affected", "util/coding.cc", "--json"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let tests: Vec<&str> = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.as_str())
+        .collect();
+    assert_eq!(tests, ["util/coding_test.cc"], "{v}");
+    let flag = |path: &str| {
+        v["affected_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .map(|f| f["is_test"].clone())
+    };
+    assert_eq!(
+        flag("util/coding_test.cc"),
+        Some(serde_json::json!(true)),
+        "{v}"
+    );
+    // Control: a production dependent stays production.
+    assert_eq!(
+        flag("util/writer.cc"),
+        Some(serde_json::json!(false)),
+        "{v}"
+    );
+}

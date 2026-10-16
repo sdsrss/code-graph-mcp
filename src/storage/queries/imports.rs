@@ -243,6 +243,18 @@ pub fn file_is_indexed(conn: &Connection, file_path: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// True when the parser marked any node in `file_path` as a test (`#[test]`,
+/// a gtest `TEST(...)` case, …).
+pub fn file_has_test_node(conn: &Connection, file_path: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes n JOIN files f ON n.file_id = f.id \
+         WHERE f.path = ?1 AND n.is_test = 1)",
+        rusqlite::params![file_path],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Reverse transitive dependents of `file_path` over EVERY "A depends on B" relation
 /// (imports ∪ calls ∪ references ∪ implements ∪ inherits), file-level, breadth-first
 /// (see [`file_closure`] — the global visited set is what bounds a cyclic graph).

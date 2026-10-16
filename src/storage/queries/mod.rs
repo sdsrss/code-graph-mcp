@@ -40,7 +40,8 @@ pub use files::{
     upsert_file, FileRecord, IndexStatus,
 };
 pub use imports::{
-    all_file_import_edges, file_is_indexed, get_import_tree, get_reverse_dependents, FileDependency,
+    all_file_import_edges, file_has_test_node, file_is_indexed, get_import_tree,
+    get_reverse_dependents, FileDependency,
 };
 pub use meta::{delete_meta, get_meta, set_meta};
 #[cfg(test)]

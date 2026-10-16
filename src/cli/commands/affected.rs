@@ -152,13 +152,35 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     // 4. Primary output: test files among the dependents ∪ changed files that are
     //    themselves tests. `changed` is indexed-only, so a nonexistent test path can no
     //    longer land in both `tests` and `not_indexed` (F3).
+    //
+    //    C/C++ has no test file naming `is_test_path` can know (`*_test.cc`,
+    //    `*_unittest.cc`, `test_*.cpp` all occur), but the parser marks its gtest
+    //    cases `is_test`. Without this leg every leveldb change answered "0 test
+    //    file(s) to re-run" (E2E 2026-10-16). Scoped to C/C++ on purpose: in Rust
+    //    the same flag marks inline `#[cfg(test)]` modules, which would list most
+    //    of `src/` as test files.
+    let is_test_file = |p: &str| -> Result<bool> {
+        if crate::domain::is_test_path(p) {
+            return Ok(true);
+        }
+        if matches!(crate::utils::config::detect_language(p), Some("c" | "cpp")) {
+            return queries::file_has_test_node(conn, p);
+        }
+        Ok(false)
+    };
+    let mut test_flags: HashMap<String, bool> = HashMap::new();
+    for p in affected.keys().chain(changed.iter()) {
+        if !test_flags.contains_key(p) {
+            test_flags.insert(p.clone(), is_test_file(p)?);
+        }
+    }
     let mut tests: Vec<String> = affected
         .keys()
-        .filter(|p| crate::domain::is_test_path(p))
+        .filter(|p| test_flags[p.as_str()])
         .cloned()
         .collect();
     for f in &changed {
-        if crate::domain::is_test_path(f) && !tests.contains(f) {
+        if test_flags[f.as_str()] && !tests.contains(f) {
             tests.push(f.clone());
         }
     }
@@ -171,7 +193,7 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             .iter()
             .map(|(p, d)| {
                 serde_json::json!({
-                    "path": p, "depth": d, "is_test": crate::domain::is_test_path(p),
+                    "path": p, "depth": d, "is_test": test_flags[p.as_str()],
                 })
             })
             .collect();
