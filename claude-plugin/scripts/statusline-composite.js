@@ -127,7 +127,16 @@ function runProvider(command, needsStdin, stdin, id) {
     // to `_previous`/third-party providers, which ignore the unknown var. The
     // CODE_GRAPH_ prefix (not CLAUDE_) keeps it out of Claude Code's own namespace.
     const cwd = cwdFromStdin(stdin);
-    const env = cwd ? { ...process.env, CODE_GRAPH_STATUSLINE_CWD: cwd } : process.env;
+    // Likewise the session id: the code-graph segment counts this session's
+    // answers and calls by it. Only a UUID-shaped id is forwarded.
+    const session = sessionFromStdin(stdin);
+    const env = (cwd || session)
+      ? {
+        ...process.env,
+        ...(cwd ? { CODE_GRAPH_STATUSLINE_CWD: cwd } : {}),
+        ...(session ? { CODE_GRAPH_STATUSLINE_SESSION: session } : {}),
+      }
+      : process.env;
 
     const out = execFileSync(argv[0], argv.slice(1), hidden({
       timeout: 3000,
@@ -214,6 +223,18 @@ function cwdFromStdin(stdin) {
     const ctx = JSON.parse(stdin);
     const v = ctx && (ctx.cwd || (ctx.workspace && ctx.workspace.current_dir));
     return typeof v === 'string' && v ? v : null;
+  } catch { return null; }
+}
+
+// Claude Code's session id from the stdin JSON context, when UUID-shaped
+// (the only shape both session-tag rules accept); null otherwise.
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function sessionFromStdin(stdin) {
+  if (!stdin) return null;
+  try {
+    const v = JSON.parse(stdin);
+    const id = v && v.session_id;
+    return typeof id === 'string' && SESSION_ID.test(id) ? id : null;
   } catch { return null; }
 }
 

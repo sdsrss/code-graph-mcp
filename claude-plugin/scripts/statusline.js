@@ -214,4 +214,70 @@ try {
   errText = [(e && e.stderr) || '', (e && e.stdout) || ''].map(String).join('\n');
 }
 
-process.stdout.write(report ? renderHealth(report) : statusUnavailable(errText));
+// This session's code-graph activity (tasks/specs/statusline-session-counts.md):
+// answers a hook delivered to the model, and code-graph commands the model ran
+// itself. Without it the user cannot see code-graph working at all — every
+// answer reaches the model silently. Rows are matched by the `session` tag
+// both recorders stamp; the id comes from the composite's stdin payload.
+// Kinds that delivered code-graph content (an unanswered hint or deny carried
+// only advice; observe/bypass/follow-up rows delivered nothing).
+const ANSWER_KINDS = [
+  ['grep', 'deny', true], ['grep', 'inject', true], ['edit', 'hint', true], ['read', 'hint', true],
+  ['subagent', 'subagent_context', null], ['stop', 'stop_check', null],
+];
+// Read no more than the rotation's keep size: the log is ~1 MB at most, and a
+// render runs on every frame.
+const COUNTS_TAIL_BYTES = 524288;
+
+function sessionCounts(dir, tag) {
+  const { isOwnedPath, openOwned, REC_FILE } = require('./recommendation-log');
+  const what = 'statusline';
+  let dirStat;
+  try { dirStat = fs.lstatSync(dir); } catch { return null; }
+  if (!isOwnedPath(dir, 'dir', dirStat, what)) return null;
+  const file = path.join(dir, REC_FILE);
+  if (!isOwnedPath(file, 'file', undefined, what)) return null;
+  let fd;
+  try {
+    // O_NONBLOCK: a FIFO planted in the repo must not hold the render.
+    fd = openOwned(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0), what);
+  } catch { return null; }
+  if (fd === null) return null;
+  let text;
+  try {
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, COUNTS_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    text = buf.toString('utf8');
+  } catch { return null; } finally { fs.closeSync(fd); }
+  let answers = 0;
+  let calls = 0;
+  for (const line of text.split('\n')) {
+    // Cheap prefilter on the tag alone; the parsed field decides.
+    if (!line.includes(tag)) continue;
+    let r;
+    try { r = JSON.parse(line); } catch { continue; }
+    if (!r || r.session !== tag) continue;
+    if (r.hook === 'cli' && r.action === 'use') calls++;
+    else if (ANSWER_KINDS.some(([h, a, ans]) => r.hook === h && r.action === a && (ans === null || r.answered === ans))) answers++;
+  }
+  return { answers, calls };
+}
+
+function renderSessionCounts() {
+  if (process.env.CODE_GRAPH_STATUSLINE_COUNTS === '0') return '';
+  try {
+    const { sessionTag } = require('./recommendation-log');
+    const tag = sessionTag(process.env.CODE_GRAPH_STATUSLINE_SESSION);
+    if (!tag) return '';
+    const c = sessionCounts(codeGraphDir, tag);
+    if (!c) return '';
+    const parts = [];
+    if (c.answers) parts.push(`${c.answers} answer${c.answers === 1 ? '' : 's'}`);
+    if (c.calls) parts.push(`${c.calls} call${c.calls === 1 ? '' : 's'}`);
+    return parts.length ? ` | ${parts.join(' · ')}` : '';
+  } catch { return ''; }
+}
+
+process.stdout.write(report ? renderHealth(report) + renderSessionCounts() : statusUnavailable(errText));

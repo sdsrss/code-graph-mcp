@@ -158,6 +158,16 @@ function rotateIfNeeded(file) {
   }
 }
 
+// The first 8 hex digits, lowercased, of a UUID-shaped Claude Code session id
+// (CLAUDE_CODE_SESSION_ID, which Claude Code sets for every hook and tool
+// child), else null. Rust `cli::session_tag` is the twin for the CLI's `use`
+// rows, so one session's rows from both writers share a tag; the statusline
+// counts this session's answers and calls by it.
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function sessionTag(raw) {
+  return typeof raw === 'string' && SESSION_ID.test(raw) ? raw.slice(0, 8).toLowerCase() : null;
+}
+
 /**
  * Append one recommendation event to <cwd>/.code-graph/recommendations.jsonl.
  * @param {string} cwd        project root (the hook's process.cwd())
@@ -187,7 +197,9 @@ function recordRecommendation(cwd, event = {}) {
     const file = path.join(dir, REC_FILE);
     if (!isOwnedPath(file, 'file')) return false;
     rotateIfNeeded(file); // rotate-before-append so the file never exceeds ~max + one line
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
+    const { session: _ignored, ...fields } = event;
+    const session = sessionTag(process.env.CLAUDE_CODE_SESSION_ID);
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...fields, ...(session ? { session } : {}) }) + '\n';
     const fd = openOwned(
       file,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND
@@ -204,4 +216,4 @@ function recordRecommendation(cwd, event = {}) {
   }
 }
 
-module.exports = { recordRecommendation, REC_FILE, isOwnedPath, openOwned };
+module.exports = { recordRecommendation, REC_FILE, isOwnedPath, openOwned, sessionTag };

@@ -310,3 +310,104 @@ test('stale progress file is ignored — falls through to health check', (t) => 
   writeProgress(project, { s: 'indexing', d: 2331, t: 2331 }, { ageMs: 10 * 60 * 1000 });
   assert.equal(runStatusline(home, project), 'code-graph: ✓ 30753 nodes | 2331 files');
 });
+
+// ── This session's code-graph activity (tasks/specs/statusline-session-counts.md) ──
+// The user could not see code-graph working: its answers reach the model
+// silently. The segment now ends with what this session got: answers a hook
+// delivered, and code-graph commands the model ran itself. Rows are matched by
+// the `session` tag both recorders stamp (recommendation-log.js sessionTag,
+// Rust cli::session_tag); the session id arrives from the composite as
+// CODE_GRAPH_STATUSLINE_SESSION.
+{
+  const SID = 'abcdef12-3456-4789-8abc-def012345678';
+  const TAG = 'abcdef12';
+  const HEALTHY = { healthy: true, nodes: 3145, files: 205, watching: false };
+  const BASE = 'code-graph: ✓ 3145 nodes | 205 files';
+  const row = (o) => JSON.stringify({ ts: '2026-10-16T00:00:00.000Z', session: TAG, ...o });
+  const COUNTED_ANSWERS = [
+    { hook: 'grep', action: 'deny', answered: true, mode: 'grep', delivery: 'rewrite' },
+    { hook: 'grep', action: 'inject', answered: true, mode: 'callgraph' },
+    { hook: 'edit', action: 'hint', answered: true, ack: true },
+    { hook: 'read', action: 'hint', answered: true },
+    { hook: 'subagent', action: 'subagent_context', agent: 'Explore' },
+    { hook: 'stop', action: 'stop_check', symbols: 1, callers: 2 },
+  ];
+  const NOT_COUNTED = [
+    { hook: 'grep', action: 'observe' }, { hook: 'read', action: 'observe' },
+    { hook: 'grep', action: 'deny', answered: false }, { hook: 'grep', action: 'inject', answered: false },
+    { hook: 'read', action: 'hint', answered: false }, { hook: 'grep', action: 'hint' },
+    { hook: 'grep', action: 'bypass' }, { hook: 'stop', action: 'stop_followup' },
+    { hook: 'session', action: 'live_impact' },
+  ];
+  const calls = (n) => Array.from({ length: n }, () => ({ hook: 'cli', action: 'use', cmd: 'callgraph' }));
+
+  function withLog(t, lines) {
+    const home = mkHome(t);
+    const project = mkProject(home);
+    installStubBinary(home, { report: HEALTHY, exitCode: 0 });
+    fs.writeFileSync(path.join(project, '.code-graph', 'recommendations.jsonl'), lines.join('\n') + '\n');
+    return { home, project };
+  }
+  const render = ({ home, project }, env = {}) =>
+    runStatuslineIn(home, project, { CODE_GRAPH_STATUSLINE_SESSION: SID, CODE_GRAPH_STATUSLINE_COUNTS: '', ...env });
+
+  test('session counts: each delivered answer kind and each model call, nothing else', (t) => {
+    const lines = [
+      ...COUNTED_ANSWERS.map(row), ...calls(2).map(row), ...NOT_COUNTED.map(row),
+      // Another session, and a row from before the tag existed.
+      ...COUNTED_ANSWERS.map((o) => row({ ...o, session: 'ffffffff' })),
+      JSON.stringify({ ts: 'x', hook: 'cli', action: 'use' }),
+      'not json', '',
+    ];
+    assert.equal(render(withLog(t, lines)), `${BASE} | 6 answers · 2 calls`);
+  });
+
+  test('session counts: singular forms, and either half alone', (t) => {
+    assert.equal(render(withLog(t, [row(COUNTED_ANSWERS[0]), ...calls(1).map(row)])), `${BASE} | 1 answer · 1 call`);
+    assert.equal(render(withLog(t, COUNTED_ANSWERS.slice(0, 3).map(row))), `${BASE} | 3 answers`);
+    assert.equal(render(withLog(t, calls(4).map(row))), `${BASE} | 4 calls`);
+  });
+
+  test('session counts: nothing added at zero, without a valid session, or when switched off', (t) => {
+    const ctx = withLog(t, [...NOT_COUNTED.map(row), ...COUNTED_ANSWERS.map((o) => row({ ...o, session: 'ffffffff' }))]);
+    assert.equal(render(ctx), BASE);
+    const full = withLog(t, [...COUNTED_ANSWERS.map(row), ...calls(2).map(row)]);
+    assert.equal(render(full, { CODE_GRAPH_STATUSLINE_SESSION: '' }), BASE);
+    assert.equal(render(full, { CODE_GRAPH_STATUSLINE_SESSION: 'not-a-uuid' }), BASE);
+    assert.equal(render(full, { CODE_GRAPH_STATUSLINE_SESSION: TAG }), BASE, 'the bare tag is not a session id');
+    assert.equal(render(full, { CODE_GRAPH_STATUSLINE_COUNTS: '0' }), BASE);
+    assert.equal(render(full), `${BASE} | 6 answers · 2 calls`, 'control: the same log counts when on');
+  });
+
+  test('session counts: a row written with spaced JSON separators still counts', (t) => {
+    // Both writers emit compact JSON today; the match must not depend on it.
+    const spaced = (o) => JSON.stringify({ session: TAG, ...o }, null, 0).replace(/":/g, '": ').replace(/,"/g, ', "');
+    assert.equal(render(withLog(t, [spaced(COUNTED_ANSWERS[0]), spaced(calls(1)[0])])), `${BASE} | 1 answer · 1 call`);
+  });
+
+  test('session counts: only the last 512 KB of the log is read', (t) => {
+    const pad = JSON.stringify({ hook: 'read', action: 'observe', pad: 'x'.repeat(1000) });
+    const lines = [...calls(3).map(row), ...Array.from({ length: 600 }, () => pad), row(COUNTED_ANSWERS[1])];
+    assert.equal(render(withLog(t, lines)), `${BASE} | 1 answer`, 'the 3 calls sit beyond the tail');
+  });
+
+  test('session counts: a symlinked log is not followed', (t) => {
+    const ctx = withLog(t, ['placeholder']);
+    const outside = path.join(ctx.home, 'outside.jsonl');
+    fs.writeFileSync(outside, [...COUNTED_ANSWERS.map(row), ...calls(2).map(row)].join('\n') + '\n');
+    const log = path.join(ctx.project, '.code-graph', 'recommendations.jsonl');
+    fs.rmSync(log);
+    fs.symlinkSync(outside, log);
+    assert.equal(render(ctx), BASE);
+  });
+
+  test('session counts: a FIFO in place of the log neither blocks nor counts', { skip: process.platform === 'win32' }, (t) => {
+    const ctx = withLog(t, ['placeholder']);
+    const log = path.join(ctx.project, '.code-graph', 'recommendations.jsonl');
+    fs.rmSync(log);
+    execFileSync('mkfifo', [log]);
+    const t0 = Date.now();
+    assert.equal(render(ctx), BASE);
+    assert.ok(Date.now() - t0 < 2500, 'returned without waiting on the FIFO');
+  });
+}

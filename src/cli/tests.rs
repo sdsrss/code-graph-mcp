@@ -798,6 +798,53 @@ fn test_record_cli_use_rotates_recommendations_jsonl() {
 }
 
 #[test]
+fn test_session_tag_takes_a_uuid_prefix_only() {
+    // The statusline counts this session's rows by this tag; the JS recorder
+    // (recommendation-log.js sessionTag) applies the same rule.
+    let cases: &[(Option<&str>, Option<&str>)] = &[
+        (
+            Some("cde9a42e-defc-4eb5-8f4b-6e2294ae206e"),
+            Some("cde9a42e"),
+        ),
+        (
+            Some("CDE9A42E-DEFC-4EB5-8F4B-6E2294AE206E"),
+            Some("cde9a42e"),
+        ),
+        (Some(" cde9a42e-defc-4eb5-8f4b-6e2294ae206e"), None),
+        (Some("cde9a42e-defc-4eb5-8f4b-6e2294ae206"), None),
+        (Some("cde9a42e-defc-4eb5-8f4b-6e2294ae206e0"), None),
+        (Some("cde9a42g-defc-4eb5-8f4b-6e2294ae206e"), None),
+        (Some("cde9a42edefc4eb58f4b6e2294ae206e"), None),
+        (Some("../../etc"), None),
+        (Some(""), None),
+        (None, None),
+    ];
+    for (raw, want) in cases {
+        assert_eq!(session_tag(*raw).as_deref(), *want, "{raw:?}");
+    }
+}
+
+#[test]
+fn test_record_cli_use_stamps_the_session_tag() {
+    // Wiring, without mutating the process env (tests run in parallel): the
+    // row carries exactly the tag of whatever CLAUDE_CODE_SESSION_ID this test
+    // process inherited — present under Claude Code, absent in CI.
+    std::env::remove_var("CODE_GRAPH_INTERNAL");
+    let tmp = tempfile::tempdir().unwrap();
+    let cg = tmp.path().join(CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&cg).unwrap();
+    record_cli_use(tmp.path(), "impact", None);
+    let content = std::fs::read_to_string(cg.join("recommendations.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+    let want = session_tag(std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref());
+    match want {
+        Some(tag) => assert_eq!(row["session"], tag.as_str(), "{row}"),
+        None => assert!(row.get("session").is_none(), "{row}"),
+    }
+    assert_eq!(row["cmd"], "impact");
+}
+
+#[test]
 fn test_record_cli_use_skips_when_no_metrics_sentinel_present() {
     // A `.code-graph/.no-metrics` sentinel silences the recommendations-log
     // writer so a dev/dogfood checkout's own CLI runs (functionality testing,

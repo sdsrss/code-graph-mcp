@@ -183,3 +183,44 @@ test('recordRecommendation refuses a symlinked .code-graph directory', (t) => {
   assert.equal(recordRecommendation(cwd, { hook: 'read', action: 'observe' }), false);
   assert.deepEqual(fs.readdirSync(outside), [], 'nothing may be written outside the project');
 });
+
+// The statusline counts one session's rows by this tag. Rust cli::session_tag
+// applies the same rule to the CLI's `use` rows (test_session_tag_takes_a_uuid_prefix_only).
+test('sessionTag: the first 8 hex digits of a UUID-shaped id, else null', () => {
+  const { sessionTag } = require('./recommendation-log');
+  const cases = [
+    ['cde9a42e-defc-4eb5-8f4b-6e2294ae206e', 'cde9a42e'],
+    ['CDE9A42E-DEFC-4EB5-8F4B-6E2294AE206E', 'cde9a42e'],
+    [' cde9a42e-defc-4eb5-8f4b-6e2294ae206e', null],
+    ['cde9a42e-defc-4eb5-8f4b-6e2294ae206', null],
+    ['cde9a42e-defc-4eb5-8f4b-6e2294ae206e0', null],
+    ['cde9a42g-defc-4eb5-8f4b-6e2294ae206e', null],
+    ['cde9a42edefc4eb58f4b6e2294ae206e', null],
+    ['../../etc', null], ['', null], [undefined, null], [42, null],
+  ];
+  for (const [raw, want] of cases) assert.equal(sessionTag(raw), want, String(raw));
+});
+
+test('recordRecommendation stamps the session tag from CLAUDE_CODE_SESSION_ID, or none', (t) => {
+  const saved = process.env.CLAUDE_CODE_SESSION_ID;
+  t.after(() => {
+    if (saved === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+    else process.env.CLAUDE_CODE_SESSION_ID = saved;
+  });
+  const cwd = tmpProject(t, true);
+  const last = () => JSON.parse(fs.readFileSync(path.join(cwd, '.code-graph', REC_FILE), 'utf8').trim().split('\n').pop());
+  process.env.CLAUDE_CODE_SESSION_ID = 'cde9a42e-defc-4eb5-8f4b-6e2294ae206e';
+  recordRecommendation(cwd, { hook: 'grep', action: 'inject', answered: true });
+  assert.equal(last().session, 'cde9a42e');
+  assert.equal(last().hook, 'grep');
+  process.env.CLAUDE_CODE_SESSION_ID = 'not-a-session';
+  recordRecommendation(cwd, { hook: 'edit', action: 'hint' });
+  assert.equal('session' in last(), false);
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  recordRecommendation(cwd, { hook: 'read', action: 'observe' });
+  assert.equal('session' in last(), false);
+  // An event's own `session` key never overrides the stamp's absence or value.
+  process.env.CLAUDE_CODE_SESSION_ID = 'cde9a42e-defc-4eb5-8f4b-6e2294ae206e';
+  recordRecommendation(cwd, { hook: 'grep', action: 'deny', session: 'spoofed' });
+  assert.equal(last().session, 'cde9a42e');
+});

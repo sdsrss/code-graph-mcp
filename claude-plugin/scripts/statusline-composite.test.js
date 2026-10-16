@@ -233,3 +233,22 @@ test('a generated command is not reinterpreted by a shell', (t) => {
     'no id means no shell — only a known `_previous` earns shell semantics',
   );
 });
+
+// The code-graph segment counts this session's rows; the session id is only in
+// Claude Code's stdin payload, so the composite forwards it like the cwd.
+test('runProvider forwards a UUID-shaped stdin session_id as CODE_GRAPH_STATUSLINE_SESSION', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-composite-session-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fixture = path.join(dir, 'echo-session.js');
+  fs.writeFileSync(fixture, "process.stdout.write('S='+(process.env.CODE_GRAPH_STATUSLINE_SESSION||'NONE'));");
+  const saved = process.env.CODE_GRAPH_STATUSLINE_SESSION;
+  delete process.env.CODE_GRAPH_STATUSLINE_SESSION;
+  t.after(() => { if (saved !== undefined) process.env.CODE_GRAPH_STATUSLINE_SESSION = saved; });
+  const sid = 'abcdef12-3456-4789-8abc-def012345678';
+  const cmd = `node ${JSON.stringify(fixture)}`;
+  assert.equal(runProvider(cmd, false, JSON.stringify({ cwd: '/x', session_id: sid })), `S=${sid}`);
+  for (const bad of [{ cwd: '/x' }, { session_id: '../../x' }, { session_id: 42 }, { session_id: '' }]) {
+    assert.equal(runProvider(cmd, false, JSON.stringify(bad)), 'S=NONE', JSON.stringify(bad));
+  }
+  assert.equal(runProvider(cmd, false, 'not json'), 'S=NONE');
+});

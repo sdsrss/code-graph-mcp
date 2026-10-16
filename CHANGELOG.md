@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### The statusline says what code-graph did in this session
+
+code-graph's answers reach Claude without showing up anywhere you look: a grep
+rewritten to its AST-aware equivalent, an edit-time impact line, a post-grep
+answer, a subagent's index facts. The statusline segment now ends with this
+session's count:
+
+    code-graph: ✓ 41230 nodes | 1204 files | 5 answers · 2 calls
+
+**answers** counts what a hook delivered: a grep answered in place (rewritten or
+denied with its answer), an answered post-grep injection, an edit-time impact
+line, a read-fanout overview, a subagent's index facts, and a Stop check.
+Advice without an answer is not counted. **calls** counts `code-graph-mcp`
+commands Claude ran itself; the plugin's own answer runs are not among them.
+Nothing is added while both are 0. `CODE_GRAPH_STATUSLINE_COUNTS=0` turns the
+counts off.
+
+To tell sessions apart, every row in `.code-graph/recommendations.jsonl`, from
+the hooks and from the CLI, now carries `session`: the first 8 hex digits of
+the session id Claude Code passes to hooks and tools (`CLAUDE_CODE_SESSION_ID`).
+A row without a UUID-shaped id carries none. `code-graph-mcp stats` reads the
+same rows as before. The statusline reads at most the last 512 KB of that log
+and refuses a symlink, a hard link or a FIFO in its place.
+
 ### A grep that missed names the definition's lines, not a command to run
 
 When a grep finds nothing and the symbol it looked for is defined outside the

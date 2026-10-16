@@ -201,7 +201,7 @@ What you get:
 - **Skills** — `explore` (structure-first navigation before reading files) and `index` (health-check / re-index / full rebuild); see [Plugin Skills](#plugin-skills)
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
 - **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
-- **StatusLine** — Real-time health display (nodes, files, watch status) — compatible with other plugins' StatusLine via composite multiplexer
+- **StatusLine** — Real-time health display (nodes, files, watch status) and what code-graph did in this session (`5 answers · 2 calls`: answers its hooks delivered to Claude, code-graph commands Claude ran) — compatible with other plugins' StatusLine via composite multiplexer
 - **Auto-update** — Checks for a new version at session start (throttled to at most one check every 2 minutes). Between forced checks the re-check interval is 30 minutes after an "up to date" answer and 6 hours while an update is already pending. Updates install silently.
 
 #### Manual Update
@@ -552,6 +552,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
+| `CODE_GRAPH_STATUSLINE_COUNTS=0` | Drop the session counts (`5 answers · 2 calls`) from the statusline. |
 | `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
@@ -609,6 +610,7 @@ plugins' entries. An installer that reads exit codes must not treat it as
 | Variable | Set by | Purpose |
 |---|---|---|
 | `CODE_GRAPH_STATUSLINE_CWD` | statusline-composite | Forwards Claude Code's authoritative cwd to each statusline provider. |
+| `CODE_GRAPH_STATUSLINE_SESSION` | statusline-composite | Forwards the stdin `session_id` (UUID-shaped only), so the code-graph segment counts this session's answers and calls. |
 | `CODE_GRAPH_STATUSLINE_DEBUG` | test suite | Makes statusline-composite print why it dropped a provider instead of swallowing the error. Off by default so a broken third-party provider stays silent in a real statusline. |
 | `CODE_GRAPH_INSTALL_LOCK_HELD` | launcher | Tells a child that the parent already holds the install lock, so it does not deadlock. |
 | `CODE_GRAPH_AUTO_UPDATE_SILENT` | session-init | Runs the update check without console output. |

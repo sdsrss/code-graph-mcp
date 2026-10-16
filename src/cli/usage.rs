@@ -1,5 +1,24 @@
 use super::*;
 
+/// The first 8 hex digits, lowercased, of a UUID-shaped Claude Code session id
+/// (`CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every tool and hook
+/// child); `None` for anything else. recommendation-log.js `sessionTag` is the
+/// JS twin: a row from either writer carries the same tag for one session.
+pub fn session_tag(raw: Option<&str>) -> Option<String> {
+    let s = raw?;
+    let groups: Vec<&str> = s.split('-').collect();
+    let shape = [8, 4, 4, 4, 12];
+    if groups.len() != shape.len()
+        || groups
+            .iter()
+            .zip(shape)
+            .any(|(g, n)| g.len() != n || !g.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some(groups[0].to_ascii_lowercase())
+}
+
 /// Append a `{hook:"cli",action:"use",cmd}` line to recommendations.jsonl so the
 /// deny→use funnel can see model-initiated CLI conversions (the 2026-06-12 daagu
 /// night: 3 post-deny CLI calls, all invisible to the funnel). Mirrors the JS
@@ -45,12 +64,17 @@ pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
     if exe.is_some_and(is_cargo_build_output) {
         return;
     }
-    let line = serde_json::json!({
+    let mut line = serde_json::json!({
         "ts": crate::utils::telemetry::iso8601_now(),
         "hook": "cli",
         "action": "use",
         "cmd": cmd,
     });
+    // The statusline counts this session's calls by this tag (and its hook
+    // answers by the same tag, written by recommendation-log.js).
+    if let Some(tag) = session_tag(std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref()) {
+        line["session"] = serde_json::Value::String(tag);
+    }
     // `.code-graph/recommendations.jsonl` is opened by fixed name inside a
     // directory that is repo content; `append_owned` refuses to follow a
     // symlink planted there (audit 2026-08-29 SEC-02).
