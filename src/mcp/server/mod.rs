@@ -7447,6 +7447,12 @@ app.post('/api/login', handleLogin);
             r["content"][0]["text"].as_str().unwrap().contains("build"),
             "{r}"
         );
+        // Round 3: get_call_graph's fuzzy step listed the class and its
+        // constructor as "No exact match for 'Owner'. Did you mean one of these?"
+        let r = call("get_call_graph", json!({"function_name": "Owner"}));
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("No exact match"), "{r}");
+        assert!(!text.contains("candidates"), "{r}");
     }
 
     /// E2E 2026-10-16 round 2: get_ast_node's impact counted pruned edges into

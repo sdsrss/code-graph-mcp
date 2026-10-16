@@ -261,6 +261,12 @@ impl McpServer {
                         args,
                     );
                 }
+                // The fuzzy step found only the name itself, which the ambiguity
+                // check above cleared (a heading, a constructor beside its
+                // class): the answer is that symbol's empty graph, as the CLI
+                // gives, not "No exact match" over an exact one (round 3).
+                FuzzyResolution::Ambiguous(cands)
+                    if has_seed && cands.iter().all(|c| c.name == function_name) => {}
                 FuzzyResolution::Ambiguous(cands) => {
                     // Deliberately NOT `resolve::ambiguity_response`: this arm is
                     // the "no exact match, here are near misses" case, not "one
