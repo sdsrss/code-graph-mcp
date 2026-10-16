@@ -4,7 +4,9 @@
 # lets first-time clones of your repo skip the initial full code-graph index.
 # Install refuses one that is over 100 MB uncompressed (django's is 156 MB).
 #
-# Requires: @sdsrs/code-graph >= 0.23.0 published to npm.
+# Requires: @sdsrs/code-graph >= 0.36.0, the first `snapshot create` that
+# writes the `.blake3` checksum this workflow uploads (installs since 0.94.0
+# refuse a snapshot without one). The step below pins a newer version.
 #
 # The package name is `@sdsrs/code-graph` (the `code-graph-mcp` binary lives
 # inside it). Do NOT shorten this to `npx -y code-graph-mcp` — that unscoped
