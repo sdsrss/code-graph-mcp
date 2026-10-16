@@ -1,7 +1,8 @@
 # Copy this file into .github/workflows/ in your project to publish a
 # code-graph snapshot alongside each GitHub release. The snapshot is a
-# small (~3-5MB) zstd-compressed SQLite database that lets first-time
-# clones of your repo skip the initial full code-graph index.
+# zstd-compressed SQLite database (1.6 MB for click, 25 MB for django) that
+# lets first-time clones of your repo skip the initial full code-graph index.
+# Install refuses one that is over 100 MB uncompressed (django's is 156 MB).
 #
 # Requires: @sdsrs/code-graph >= 0.23.0 published to npm.
 #
@@ -33,14 +34,16 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
+      # `--out <name>.db.zst` makes create compress the snapshot itself and write
+      # its checksum beside it as `<name>.db.zst.blake3`. Upload both: install
+      # refuses a snapshot that has no checksum sidecar.
       - name: Build snapshot
         run: |
-          npx -y -p @sdsrs/code-graph@0.170.1 code-graph-mcp snapshot create --out snapshot.db
-          zstd -9 snapshot.db -o snapshot.db.zst
-          mv snapshot.db.zst "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
+          npx -y -p @sdsrs/code-graph@0.170.1 code-graph-mcp snapshot create --out "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
-            "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
+            "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst" \
+            "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst.blake3"

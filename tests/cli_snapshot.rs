@@ -281,3 +281,61 @@ fn cli_snapshot_unknown_subcommand_exits_2() {
         "unknown snapshot subcommand must exit 2"
     );
 }
+
+/// E2E 2026-10-16 round 2 (plugin QA, P1-1): the shipped workflow template
+/// compressed with an external `zstd` and uploaded the `.db.zst` alone, while
+/// install fails closed without its `.blake3` sidecar — so the documented team
+/// flow could never install. The template must upload exactly what `snapshot
+/// create --out X.db.zst` writes: X.db.zst and X.db.zst.blake3.
+#[test]
+fn the_snapshot_template_uploads_the_checksum_sidecar_create_writes() {
+    let template = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("claude-plugin/templates/code-graph-snapshot.yml"),
+    )
+    .unwrap();
+    let out = template
+        .split("snapshot create --out ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the template runs `snapshot create --out <file>`")
+        .trim_matches('"');
+    assert!(
+        out.ends_with(".db.zst"),
+        "create must compress itself, writing the sidecar: {out}"
+    );
+    let upload = template
+        .split("gh release upload")
+        .nth(1)
+        .expect("the template uploads to the release");
+    assert!(
+        upload.contains(&format!("\"{out}\"")),
+        "uploads {out}: {upload}"
+    );
+    assert!(
+        upload.contains(&format!("\"{out}.blake3\"")),
+        "uploads {out}.blake3: {upload}"
+    );
+    assert!(
+        !template.contains("zstd -9"),
+        "no external compression: it writes no sidecar"
+    );
+
+    // And `create` does write that sidecar.
+    let repo = init_git_repo();
+    let snap = repo.path().join("s.db.zst");
+    let status = Command::new(cli_bin())
+        .args([
+            "snapshot",
+            "create",
+            "--out",
+            snap.to_str().unwrap(),
+            "--quiet",
+        ])
+        .current_dir(repo.path())
+        .env("CODE_GRAPH_INTERNAL", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(repo.path().join("s.db.zst.blake3").is_file());
+}
