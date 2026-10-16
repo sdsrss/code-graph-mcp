@@ -53,7 +53,7 @@ definition's line range, type and name.
   | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <name>` (the signature, of any shape, is not shown) |
   | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no name |
   | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no name |
-  | whitespace in the name (a heading's text), including U+0085 and U+001C-1E | collapsed to single spaces |
+  | whitespace in a qualified name (C++ and Go keep the declaration's text), including U+0085 and U+001C-1E | collapsed to single spaces |
   | `<type> <name>` longer than 160 characters | cut to 160, ends with `…` |
 
 - The line stays one line; file and search path keep `shellQuoteArg`.
@@ -66,8 +66,8 @@ definition's line range, type and name.
 - e2e (stub binary answering `callgraph` and `show --json`): outside grep →
   `F:N-M` and `<type> <name>`; `show` exit 1 → location sentence only.
 - Full JS suite and `cargo test --test hardening --test doc_cli_alignment`
-  green; the replayed 60 real pairs produce 57 line-range texts and 3
-  location-only texts.
+  green; the 61 real events (54 pairs) replayed produce 58 line-range texts
+  and 3 location-only texts.
 - After release, `plugin_usage.py` shows the outside-path pointer gone from
   the pointer table, and a follow-up read of the defining file is measured
   as before/after share (monitor, not a gate).
@@ -116,3 +116,10 @@ None.
   the 61 events: 58 ranges (by pair: 30 functions, 16 methods, 6 classes),
   3 location only, 0 multi-line, 0 with a command; median 4 ms, max 93 ms.
   D#348's "a signature quoting a cg command" is gone with it.
+- r4, pre-tag review (2026-10-16): the index stores every Rust signature from
+  `(` (4,070 of 4,070 in this repo, generics included), so the `<T>` shape
+  above did not come from a Rust signature as stored. A C++ or Go qualified
+  name keeps its declaration's text, comments and control characters (ESC,
+  BEL) included; the label shows them on its one line. Headings never reach
+  this path: `show --file` matches `name == X`. Left as is (LOW, the
+  extractors own it); deferred.

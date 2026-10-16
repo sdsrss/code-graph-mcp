@@ -539,10 +539,10 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
 // `show <symbol> --file <file> --json` for the lines, and keeps them only when
 // exactly one definition in that file carries the name
 // (tasks/specs/outside-path-definition-answer.md, shape table). Real pairs:
-// 57 of 60 had one, 3 had several (test fixtures), none had zero. The
+// 58 of 61 events had one, 3 had several (test fixtures), none had zero. The
 // signature is never shown: each extractor writes its own shape (C/C++ put
-// the return type first, Rust generics lead with `<T>`), and three review
-// rounds each found one the renderer got wrong.
+// the return type first), and three review rounds each found one the
+// renderer got wrong.
 {
   const { runDefinitionAnswer } = require('./cg-answer');
   const F = 'src/app/core.py';
@@ -563,8 +563,8 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     CmdSig: [row({ name: 'CmdSig', signature: '(cmd = "code-graph-mcp callgraph X")' })],
     RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
     NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
-    // A heading's name is its text: whitespace a line reader splits on
-    // (U+0085, U+001C-1E, newline) collapses to one space.
+    // A qualified name can carry its declaration's whitespace (C++, Go):
+    // what a line reader splits on (U+0085, U+001C-1E, newline) collapses.
     Nel: [row({ name: 'Guide\u0085 to\n api.Nel', type: 'heading', signature: null })],
     Ctrl: [row({ name: 'a\u001cb\u001ec.Ctrl', signature: '(a,\u001c b,\u001e c)' })],
     LongRet: [row({ name: 'LongRet', signature: `${'std::map<std::string, '.repeat(7)}int> (int a)`, param_types: '(int a)', return_type: 'x' })],

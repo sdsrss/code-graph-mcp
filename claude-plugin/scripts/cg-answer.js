@@ -559,7 +559,8 @@ function runCallgraphAnswer(opts = {}) {
   }
 }
 
-// A definition label longer than this is cut (a heading's name is its text).
+// A definition label longer than this is cut (a C++ or Go qualified name keeps
+// its declaration's text).
 const DEFINITION_LABEL_MAX = 160;
 
 /**
@@ -568,7 +569,8 @@ const DEFINITION_LABEL_MAX = 160;
  * qualified `Cls.X` or `mod::X`). The outside-path grep inject names this in
  * place of a command to run (tasks/specs/outside-path-definition-answer.md):
  * the model's next step after that pointer was a read of the definition, not
- * a code-graph call (26 vs 4 of 60 real events).
+ * a code-graph call (0 of 45 such pointers was followed by a code-graph call
+ * within 10 tool calls; 23 by a read of the defining file).
  *
  * `label` is `<type> <name>` on one line, whitespace collapsed, at most
  * DEFINITION_LABEL_MAX characters (`…` when cut). No signature: each

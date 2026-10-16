@@ -10506,6 +10506,50 @@ fn a_query_through_the_dev_build_records_no_funnel_use() {
     );
 }
 
+// The unit tests pin the names `record_cli_use_with_env` looks up; this pins
+// that `record_cli_use` hands it the process environment (pre-tag review of
+// 0.170.0: the lookup replaced by `|_| None` kept every test green). Run
+// through a link or copy outside the target dir, since a cargo build output
+// records nothing.
+#[test]
+fn an_installed_copy_stamps_the_session_and_skips_internal_runs() {
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_code-graph-mcp"));
+    let bin_dir = TempDir::new().unwrap();
+    let copy = bin_dir.path().join(exe.file_name().unwrap());
+    if std::fs::hard_link(exe, &copy).is_err() {
+        std::fs::copy(exe, &copy).unwrap();
+    }
+    assert!(
+        !code_graph_mcp::cli::is_cargo_build_output(&copy),
+        "precondition: {} reads as a cargo build output",
+        copy.display()
+    );
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir(&cg).unwrap();
+    let rec = cg.join("recommendations.jsonl");
+    let run = |internal: &str| {
+        let out = Command::new(&copy)
+            .current_dir(project.path())
+            .args(["callgraph", "--help"])
+            .env(
+                "CLAUDE_CODE_SESSION_ID",
+                "cde9a42e-defc-4eb5-8f4b-6e2294ae206e",
+            )
+            .env("CODE_GRAPH_INTERNAL", internal)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::read_to_string(&rec).unwrap_or_default()
+    };
+    assert_eq!(run("1"), "", "a hook-internal run records nothing");
+    let rows = run("0");
+    let row: serde_json::Value = serde_json::from_str(rows.trim()).unwrap();
+    assert_eq!(row["cmd"], "callgraph", "{rows}");
+    assert_eq!(row["session"], "cde9a42e", "{rows}");
+}
+
 // CON-17 (audit 2026-08-29): the funnel-telemetry write rotates
 // `recommendations.jsonl`, and its "something else owns this name" warning was
 // raised through `tracing` from a call site that ran BEFORE `init_tracing` —

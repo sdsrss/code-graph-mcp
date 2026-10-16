@@ -31,7 +31,9 @@ or SessionStart adds, since they record nothing. **calls** counts the
 `code-graph-mcp` queries Claude ran itself (`callgraph`, `impact`, `show`,
 `grep`, …; not `health-check`, `stats` or `--version`), including a query's
 `--help` and a query that fails; the plugin's own answer runs are not among
-them. Nothing is added while both are 0.
+them, nor are MCP tool calls. In a project with a `.code-graph/.no-metrics`
+file nothing is recorded, so neither half counts. Nothing is added while both
+are 0.
 `CODE_GRAPH_STATUSLINE_COUNTS=0` turns the counts off.
 
 To tell sessions apart, every row in `.code-graph/recommendations.jsonl`, from
@@ -49,8 +51,10 @@ written more than that, they can go down.
 Each query command appends a row to `.code-graph/recommendations.jsonl`.
 When `.code-graph` itself was a symlink, as a cloned repository can carry,
 the row, and the log's rotation, landed in the directory it pointed to,
-outside the project. The CLI now writes nothing there, as the hooks
-(`recommendation-log.js`) and the index already refused.
+outside the project. The CLI now writes neither there, as the hooks' writer
+(`recommendation-log.js`) already refused. Not covered: the CLI's queries and
+`incremental-index` still open `.code-graph/index.db` through such a link, as
+0.169.0 did.
 
 ### A grep that missed names the definition's lines, not a command to run
 
@@ -69,8 +73,10 @@ This takes one `show --json --compact` call, made only in this case. When
 `show` does not name exactly one definition in that file (several same-named
 test fixtures, a failed or timed-out call), the line keeps the location alone
 and names no command. The signature is not shown: each language's extractor
-stores it in its own shape (C and C++ put the return type first, a Rust
-generic starts with `<T>`), and the range is what the next read needs. The
+stores it in its own shape (C and C++ put the return type first), and the
+range is what the next read needs. A C++ or Go method's qualified name keeps
+the text of its declaration, so a comment written inside one
+(`Qual/* … */::f`) shows in the line. The
 line stays one line, its type and name at most 160 characters. Replayed on
 the 61 real events (54 distinct symbol/file pairs), 58 got their line range
 and 3 the location alone; in that replay the extra call took a median of

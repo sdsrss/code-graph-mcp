@@ -106,3 +106,9 @@ None.
   removed); the FIFO test's timeout is 2.5 s, under the composite's 3 s kill.
   O_NONBLOCK alone stays unpinned: the file's lstat check refuses a FIFO
   first, so only the lstat-to-open race reaches it.
+  Pre-tag review: the symlinked-log test stays green with the file's lstat
+  check or `O_NOFOLLOW` alone removed, and the FIFO test with the lstat check
+  or `O_NONBLOCK` alone; each goes red only with both of its pair removed.
+  Singly pinned: the directory's `isOwnedPath` and the `nlink` check. An e2e
+  test (`an_installed_copy_stamps_the_session_and_skips_internal_runs`) pins
+  that `record_cli_use` passes the real environment.
