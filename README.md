@@ -200,7 +200,7 @@ What you get:
 - **MCP Server** — All code-graph tools available to Claude
 - **Skills** — `explore` (structure-first navigation before reading files) and `index` (health-check / re-index / full rebuild); see [Plugin Skills](#plugin-skills)
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
-- **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
+- **Auto-indexing** — The MCP server's file watcher re-indexes edited files; a PostToolUse hook that does it per edit is off by default (`CODE_GRAPH_HOOK_INDEX=on` turns it on for CLI-only use)
 - **StatusLine** — Real-time health display (nodes, files, watch status) and what code-graph did in this session (`5 answers · 2 calls`: answers its grep, edit, read, subagent and Stop hooks delivered to Claude, code-graph queries Claude ran) — compatible with other plugins' StatusLine via composite multiplexer
 - **Auto-update** — Checks for a new version at session start (throttled to at most one check every 2 minutes). Between forced checks the re-check interval is 30 minutes after an "up to date" answer and 6 hours while an update is already pending. Updates install silently.
 
@@ -244,7 +244,7 @@ By default, every user prompt the plugin deems code-related gets a small context
      "env": { "CODE_GRAPH_QUIET_HOOKS": "1" }
    }
    ```
-3. Restart Claude Code. Session startup skips the project-map injection, UserPromptSubmit stops auto-injecting context, and the MCP `instructions` shrink to a one-line command pointer.
+3. Restart Claude Code. The hooks inject nothing (the grep, read, edit, prompt, subagent and Stop hooks stay silent, and session startup skips the project-map injection), and the MCP `instructions` shrink to a one-line command pointer.
 
 ### Option 2: Claude Code MCP Server Only
 
@@ -503,8 +503,10 @@ marker, so a manually filled copy is treated as not-current and re-downloaded.
 # (the archive has no wrapping folder: model.safetensors, tokenizer.json, config.json).
 curl -sL -o models.tar.gz \
   https://github.com/sdsrss/code-graph-mcp/releases/download/v<version>/models.tar.gz
-curl -sL https://github.com/sdsrss/code-graph-mcp/releases/download/v<version>/models.tar.gz.sha256
-sha256sum -c models.tar.gz.sha256
+curl -sL -o models.tar.gz.sha256 \
+  https://github.com/sdsrss/code-graph-mcp/releases/download/v<version>/models.tar.gz.sha256
+# The .sha256 file holds the bare hash; sha256sum -c wants "<hash>  <file>".
+echo "$(cat models.tar.gz.sha256)  models.tar.gz" | sha256sum -c -
 mkdir -p ~/.cache/code-graph/models-manual
 tar -xzf models.tar.gz -C ~/.cache/code-graph/models-manual
 export CODE_GRAPH_MODEL_DIR=~/.cache/code-graph/models-manual
@@ -548,12 +550,12 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_NO_AUTO_ADOPT=1` | Skip SessionStart's adoption check: no cleanup of this plugin's legacy memory-dir files and no notice about an out-of-date steering block. SessionStart never writes `CLAUDE.md` itself; `code-graph-mcp adopt` does. |
 | `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` | Do not report a steering block that has drifted from the current template (SessionStart only reports it; `code-graph-mcp adopt` refreshes it). |
 | `CODE_GRAPH_NO_GITIGNORE=1` | Do not write the `.code-graph/` ignore rule. It goes to the repository's local `.git/info/exclude`, never to the tracked `.gitignore`, and only when neither file names the directory already. |
-| `CODE_GRAPH_QUIET_HOOKS=1` | Hooks inject a one-line pointer instead of the full decision table. |
+| `CODE_GRAPH_QUIET_HOOKS=1` | The hooks inject nothing (grep, read, edit, prompt, subagent and Stop stay silent), and the MCP `instructions` shrink to a one-line pointer to the full decision table. |
 | `CODE_GRAPH_VERBOSE_HOOKS=1` | The opposite: opt into the noisy form. |
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
 | `CODE_GRAPH_STATUSLINE_COUNTS=0` | Drop the session counts (`5 answers · 2 calls`) from the statusline. |
-| `CODE_GRAPH_HOOK_INDEX=on\|off` | Force the incremental-index hook on or off instead of letting it decide. |
+| `CODE_GRAPH_HOOK_INDEX=on\|off` | Turn the per-edit incremental-index hook on (it is off by default; the MCP server's watcher re-indexes edits) or keep it off. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
 | `CODE_GRAPH_REQUIRE_MODEL=1` | Test-only: make the embedding tests FAIL when no model can be loaded instead of self-skipping. Set by the release gate and the cache-warm cron, which supply pinned weights — without it those tests pass by doing nothing on any runner with no cached model. |
