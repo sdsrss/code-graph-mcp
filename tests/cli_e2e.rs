@@ -14068,3 +14068,36 @@ fn test_cli_a_method_beside_a_same_named_struct_is_no_constructor() {
         );
     }
 }
+
+/// E2E 2026-10-16 round 3: 5874e842 rooted the text tree at a seed with a
+/// shown child before a non-test one, so in hono `callgraph handler` printed
+/// `handler (src/compose.test.ts)` with the test's callees, and in sinatra
+/// `run` rooted at test/integration_helper.rb. The non-test definition comes
+/// first; among those, the one with a shown child.
+#[test]
+fn test_cli_callgraph_text_roots_at_a_non_test_definition() {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(
+        p.join("src/hono-base.ts"),
+        "export function handler(req: string): string {\n  return req\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("src/context.ts"),
+        "export function json(c: string) { return c }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("src/compose.test.ts"),
+        "import { json } from './context'\nfunction handler(c: string) {\n  return json(c)\n}\ntest('compose', () => { handler('a') })\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "handler"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.starts_with("handler (src/hono-base.ts)"), "{stdout}");
+}
