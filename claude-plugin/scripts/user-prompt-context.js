@@ -611,17 +611,20 @@ function runMain() {
 }
 
 // The CLI's ambiguity refusal (stderr, exit 1) → context naming each
-// definition, or '' for any other failure. Only the refusal's own lines are
-// passed on.
+// definition, or '' for any other failure. The refusal's first line is passed
+// on after its "Ambiguous symbol 'X':" lead: it carries the advice that fits
+// (`--file` across files, `--node-id` within one) and the "Showing the first
+// 5 of 9" note when the list is cut (E2E 2026-10-16 round 2).
 function ambiguityContext(stderr) {
   const lines = String(stderr || '').split('\n');
   const head = lines.findIndex((l) => /^\[code-graph\] Ambiguous symbol '/.test(l));
   if (head === -1) return '';
   const defs = lines.slice(head + 1).filter((l) => /^ {2}\S.* in \S/.test(l));
   if (defs.length === 0) return '';
-  const name = /Ambiguous symbol '([^']+)'/.exec(lines[head])[1];
-  return `[code-graph:definitions] '${name}' is defined in more than one place — ` +
-    'name the file (`--file <path>`) to get one of them:\n' + defs.join('\n') + '\n';
+  const m = /Ambiguous symbol '([^']+)':\s*(.*)$/.exec(lines[head]);
+  if (!m) return '';
+  return `[code-graph:definitions] '${m[1]}' is defined in more than one place — ${m[2]}\n` +
+    defs.join('\n') + '\n';
 }
 
 if (require.main === module) {

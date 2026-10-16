@@ -1185,12 +1185,20 @@ test('a name defined in two places gets its definitions, not silence', { skip: p
   const sb = upcSandbox(t, stub);
   const proc = runUpc(sb, 'fix the bug in url_for where external URLs drop the port');
   assert.equal(proc.status, 0, proc.stderr);
-  assert.match(proc.stdout, /\[code-graph:definitions\] 'url_for' is defined in more than one place/, proc.stdout);
+  assert.match(proc.stdout, /\[code-graph:definitions\] 'url_for' is defined in more than one place — 2 matches in different files\. Specify --file to disambiguate\./, proc.stdout);
   assert.match(proc.stdout, /url_for \(function\) in src\/flask\/helpers\.py/);
   assert.match(proc.stdout, /url_for \(method\) in src\/flask\/app\.py/);
 
-  // Any other failure stays silent.
+  // Same-file definitions: the CLI's advice is --node-id, and a cut list says so.
   const { ambiguityContext } = require('./user-prompt-context');
+  const sameFile = ambiguityContext(
+    "[code-graph] Ambiguous symbol 'getPath': 9 definitions in the same file (src/a.ts). A file selector cannot split them — pass one of the node_ids below as `--node-id <N>` (callgraph, impact, refs, show). Showing the first 5 of 9.\n" +
+    '  getPath (method) in src/a.ts [node_id 3]\n  getPath (method) in src/a.ts [node_id 4]\n');
+  assert.match(sameFile, /--node-id <N>/);
+  assert.match(sameFile, /Showing the first 5 of 9\./);
+  assert.match(sameFile, /getPath \(method\) in src\/a\.ts \[node_id 4\]/);
+
+  // Any other failure stays silent.
   assert.equal(ambiguityContext('[code-graph] Symbol not found: url_for\n'), '');
   assert.equal(ambiguityContext(''), '');
   assert.equal(ambiguityContext(undefined), '');
