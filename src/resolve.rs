@@ -369,6 +369,21 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
     file_path != crate::domain::EXTERNAL_FILE_PATH
 }
 
+/// The index spells a member `Type.method`; Rust and C++ write `Type::method`,
+/// and that spelling was "Symbol not found" everywhere — or, through
+/// `callgraph`'s fuzzy step, an answer for `DBImpl::Writer` when asked for
+/// `DBImpl::Write` (E2E 2026-10-16). Every symbol a user or a model passes in
+/// goes through this first, so both spellings select the same definitions. No
+/// project definition stores `::` in its name; only `<external>` rows do, and
+/// those are never selectable.
+pub fn canonical_symbol_spelling(symbol: &str) -> String {
+    if symbol.contains("::") {
+        symbol.trim_start_matches("::").replace("::", ".")
+    } else {
+        symbol.to_string()
+    }
+}
+
 /// True when the candidates span ≥2 distinct files (cross-file collision, which
 /// `file_path` *can* disambiguate). False when every definition lives in one
 /// file (same-file overloads, which only `node_id` can split).

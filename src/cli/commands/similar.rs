@@ -31,6 +31,12 @@ pub struct SimilarArgs {
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
 pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
+    let args = SimilarArgs {
+        symbol: args
+            .symbol
+            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
+        ..args
+    };
     // Both spellings are named: `--top-k` is the declared flag and `--limit` its
     // alias, so quoting either one alone tells half the callers that a flag they
     // did not type was clamped.

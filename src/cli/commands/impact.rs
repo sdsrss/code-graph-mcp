@@ -41,6 +41,12 @@ pub struct ImpactArgs {
 ///
 /// Shows callers with route info and risk level.
 pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
+    let args = ImpactArgs {
+        symbol: args
+            .symbol
+            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
+        ..args
+    };
     // clap accepts an empty-string positional; preserve the non-empty guard.
     let raw_symbol = args.symbol.as_deref().unwrap_or("");
     if raw_symbol.is_empty() && args.node_id.is_none() {

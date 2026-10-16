@@ -199,6 +199,12 @@ impl RefsTarget {
 
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
 pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
+    let args = RefsArgs {
+        symbol: args
+            .symbol
+            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
+        ..args
+    };
     let explicit_file_owned: Option<String> = match args.file.as_deref() {
         Some(f) => Some(normalize_user_path(project_root, f)?),
         None => None,

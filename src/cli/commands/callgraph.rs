@@ -57,6 +57,12 @@ pub struct CallgraphArgs {
 ///   → calls: tool_semantic_search (src/mcp/server.rs:1360)
 /// ```
 pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
+    let args = CallgraphArgs {
+        symbol: args
+            .symbol
+            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
+        ..args
+    };
     // clap accepts an empty-string positional; preserve the non-empty guard.
     let raw_symbol = args.symbol.as_deref().unwrap_or("");
     if raw_symbol.is_empty() && args.node_id.is_none() {

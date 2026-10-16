@@ -2591,6 +2591,18 @@ impl McpServer {
     }
 
     fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // `Type::method` → the index's `Type.method`, once, for every tool that
+        // takes a symbol (see `resolve::canonical_symbol_spelling`).
+        let mut canonical: Option<serde_json::Value> = None;
+        for key in ["symbol_name", "function_name"] {
+            if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+                if s.contains("::") {
+                    canonical.get_or_insert_with(|| args.clone())[key] =
+                        json!(crate::resolve::canonical_symbol_spelling(s));
+                }
+            }
+        }
+        let args = canonical.as_ref().unwrap_or(args);
         match name {
             "semantic_code_search" => self.tool_semantic_search(args),
             "get_call_graph" => self.tool_get_call_graph(args),
@@ -7366,6 +7378,52 @@ app.post('/api/login', handleLogin);
         let result = parse_tool_result(&server.handle_message(&req).unwrap());
         assert!(result.get("error").is_none(), "{result}");
         assert_eq!(result["name"], "d240_target", "{result}");
+    }
+
+    /// E2E 2026-10-16: `Type::method` — how Rust and C++ spell a member, and how
+    /// a model writes it — was "not found" where `Type.method` answered. Every
+    /// tool taking a symbol must answer both spellings identically.
+    #[test]
+    fn test_symbol_args_accept_the_colon_colon_spelling() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/db.rs"),
+            "pub struct Database;\nimpl Database {\n    pub fn open() -> Database { Database }\n}\n\n\
+             pub fn boot() -> Database {\n    Database::open()\n}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        for (tool, key, extra) in [
+            ("get_ast_node", "symbol_name", json!({})),
+            (
+                "get_call_graph",
+                "symbol_name",
+                json!({"direction": "callers"}),
+            ),
+            (
+                "get_call_graph",
+                "function_name",
+                json!({"direction": "callers"}),
+            ),
+            ("find_references", "symbol_name", json!({})),
+        ] {
+            let call = |spelling: &str| {
+                let mut args = extra.clone();
+                args[key] = json!(spelling);
+                let resp = server
+                    .handle_message(&tool_call_json(tool, args))
+                    .unwrap()
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                parsed["result"].clone()
+            };
+            let dotted = call("Database.open");
+            assert_ne!(dotted["isError"], json!(true), "control {tool}: {dotted}");
+            let colons = call("Database::open");
+            assert_eq!(colons, dotted, "{tool} {key}: `::` must answer as `.` does");
+        }
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name

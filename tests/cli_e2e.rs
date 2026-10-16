@@ -13527,3 +13527,60 @@ fn test_cli_incremental_index_outside_git_names_a_command_that_indexes() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.contains("tool.py"), "{stdout}");
 }
+
+/// E2E 2026-10-16 (CLI-user QA): `Type::method`, the spelling Rust and C++
+/// write, was "Symbol not found" in show / impact / refs (with a stale-index
+/// hint), and `callgraph DBImpl::Write` answered for `DBImpl::Writer` through
+/// the fuzzy step with exit 0. The index spells a member `Type.method`; the
+/// `::` spelling now resolves exactly as the dotted one does.
+#[test]
+fn test_cli_type_colon_colon_method_resolves_like_the_dotted_spelling() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/db.rs"),
+        "pub struct Database;\nimpl Database {\n    pub fn open() -> Database { Database }\n}\n\npub fn boot() -> Database {\n    Database::open()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/db_impl.cc"),
+        "class DBImpl {\n public:\n  int Write(int x);\n  struct Writer { int v; };\n};\nint DBImpl::Write(int x) { return x; }\nint Flush(DBImpl* db) { return db->Write(1); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for (colons, dotted, caller) in [
+        ("Database::open", "Database.open", "boot"),
+        ("DBImpl::Write", "DBImpl.Write", "Flush"),
+    ] {
+        for cmd in ["show", "callgraph", "impact", "refs"] {
+            let mut args = vec![cmd, colons];
+            let mut dargs = vec![cmd, dotted];
+            if cmd == "callgraph" {
+                args.extend(["--direction", "callers"]);
+                dargs.extend(["--direction", "callers"]);
+            }
+            args.push("--json");
+            dargs.push("--json");
+            let (stdout, stderr, code) = run_cli(&project, &args);
+            let (dstdout, _, dcode) = run_cli(&project, &dargs);
+            assert_eq!(dcode, 0, "control {dargs:?} must answer");
+            assert_eq!(code, 0, "{args:?}: {stdout}{stderr}");
+            assert!(
+                !stderr.contains("Resolved '"),
+                "{args:?} went through the fuzzy step: {stderr}"
+            );
+            if cmd != "show" {
+                assert!(
+                    stdout.contains(caller),
+                    "{args:?} must name {caller}: {stdout}"
+                );
+            }
+            assert_eq!(stdout, dstdout, "{args:?} must answer exactly as {dargs:?}");
+        }
+    }
+}

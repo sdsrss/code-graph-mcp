@@ -297,6 +297,12 @@ pub(crate) fn resolve_show_nodes(
 }
 
 pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
+    let args = ShowArgs {
+        symbol: args
+            .symbol
+            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
+        ..args
+    };
     let json_mode = args.json;
     let compact = args.compact;
     let include_refs = args.refs;
