@@ -2850,11 +2850,6 @@ Restart every code-graph server on this project so they run one version.",
         );
     }
 
-    // Cross-file edges are durable from here on — remove this run's token.
-    if let Some(mark) = run_mark {
-        super::in_flight::finish(db, mark)?;
-    }
-
     // Fold this run's parse verdicts into the index's durable set, so a reader
     // can report a degraded index after the process that warned about it is
     // gone. Skipped when this run parsed nothing: the merge would then be the
@@ -2880,11 +2875,10 @@ Restart every code-graph server on this project so they run one version.",
     // Warn, do not `?`. The read side is already defensive on purpose
     // (`health.rs` and `management.rs` both `.unwrap_or_default()` — a status
     // poll must not fail over bookkeeping), and the write side using `?` was the
-    // asymmetry: the statement above has just CLEARED the in-flight marker, so a
-    // failure here (SQLITE_BUSY past the timeout, SQLITE_FULL) returned Err with
-    // the escalation evidence already gone, skipping Phase 3 — context strings,
-    // embeddings, the pending-call sweep — and nothing would re-trigger it.
-    // Losing an observability row is the smaller loss by far (pre-ship review).
+    // asymmetry: an Err here skipped Phase 3 — context strings, embeddings, the
+    // pending-call sweep. The in-flight token now outlives every phase, so such
+    // an Err reads as an interrupted run; losing an observability row is still
+    // the smaller loss than a full re-index next time (pre-ship review).
     if !parsed_paths.is_empty() {
         if let Err(e) = db.record_parse_error_files(&parsed_paths, &parse_error_paths) {
             tracing::warn!("could not record which files parsed with errors: {e}");
@@ -3082,6 +3076,17 @@ Restart every code-graph server on this project so they run one version.",
     if !all_indexed.is_empty() {
         finalize_tick();
         let _ = db.run_optimize();
+    }
+
+    // Every phase that writes the graph has run — remove this run's token. Not
+    // earlier: it used to go once the cross-file edges were durable, before
+    // Phase 3, 2c, 2d and 2e, so a run that failed or was killed in them left an
+    // index short of those passes that every later run read as complete
+    // (django: 5,356 unpruned, 297 unbound edges, served as healthy; E2E
+    // 2026-10-16). An error return above keeps the token, which the next run
+    // reads as a crash and answers with a full re-index.
+    if let Some(mark) = run_mark {
+        super::in_flight::finish(db, mark)?;
     }
 
     // The scope's temp tables live on a connection the MCP server keeps for the

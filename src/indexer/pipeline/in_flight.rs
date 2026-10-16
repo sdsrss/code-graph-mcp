@@ -219,6 +219,34 @@ mod tests {
         assert_eq!(marker(&db), None);
     }
 
+    /// E2E 2026-10-16 (MCP-client QA, P0): the token was retired once the
+    /// cross-file edges were durable, before Phase 3, 2c, 2d and 2e. A first
+    /// index that failed there (a CLI query held the database past
+    /// busy_timeout) or was cut short (the client closed stdin) left 5,356
+    /// unpruned and 297 unbound edges on django, and every later session read
+    /// it as complete. Every finalizing phase must run with the token present.
+    #[test]
+    fn the_token_stays_until_the_last_phase_has_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.py"), "def a():\n    return b()\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "def b():\n    return 1\n").unwrap();
+        let db = Database::open(&dir.path().join(".index.db")).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let progress = |phase: super::super::IndexPhase, _: usize, _: usize| {
+            if matches!(phase, super::super::IndexPhase::Finalizing) {
+                seen.borrow_mut().push(marker(&db).is_some());
+            }
+        };
+        super::super::run_full_index(&db, dir.path(), None, Some(&progress)).unwrap();
+        let seen = seen.into_inner();
+        assert!(!seen.is_empty(), "the run must reach a finalizing phase");
+        assert!(
+            seen.iter().all(|present| *present),
+            "a finalizing phase ran with the token already retired: {seen:?}"
+        );
+        assert_eq!(marker(&db), None, "and a finished run leaves none");
+    }
+
     /// A hard-linked lock file (what `cp -al` / `rsync --link-dest` leave) is
     /// still held: the hold never writes through it (pre-tag review round 2).
     #[cfg(unix)]
