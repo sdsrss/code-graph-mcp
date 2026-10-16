@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Dev tooling: plugin use in real sessions
+
+`scripts/plugin_usage.py` reads the transcripts Claude Code keeps under
+`~/.claude/projects/` and reports, per period and per 1,000 tool calls,
+explicit code-graph calls, hook injections by hook, PreToolUse denies and
+rewrites, and how often an injection naming a `code-graph-mcp` command is
+followed by a code-graph call, with claude-mem-lite's counts as a reference.
+Interactive sessions only by default; reads transcripts and writes nothing.
+On the maintainer's machine, main sessions in projects that develop neither
+plugin made 24.7 explicit code-graph calls per 1k tool calls before 0.154.0
+and 1.1 from 0.164.0; see `evals/README.md`.
+
 ## 0.169.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 114 → 117

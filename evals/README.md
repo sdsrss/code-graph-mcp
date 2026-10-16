@@ -290,6 +290,29 @@ starts, and two were already running when the sixth crossed it ($0.81).
   dropped from `find_references`), which a steering file would amplify, not
   fix: measure after that changes.
 
+## What an eval run cannot measure: use in real sessions
+
+An eval case says whether the plugin helps on a task; it does not say whether
+the model still reaches for code-graph in day-to-day sessions after a hook or
+steering change. `scripts/plugin_usage.py` reads the transcripts Claude Code
+keeps under `~/.claude/projects/` and reports, per period and per 1,000 tool
+calls, explicit code-graph calls, hook injections by hook, PreToolUse denies
+and rewrites, and how often an injection that names a command is followed by a
+code-graph call (claude-mem-lite's counts sit beside them as a reference):
+
+    python3 scripts/plugin_usage.py --since 2026-09-20 \
+      --exclude /code-graph-mcp --exclude /claude-mem-lite \
+      --split 2026-09-25T11:00=0.154 --split 2026-09-30=0.164 --detail
+
+On this machine (2026-10-16), main sessions in projects that develop neither
+plugin made 24.7 explicit code-graph calls per 1k tool calls before 0.154.0
+and 1.1 from 0.164.0. Before 0.154.0, the 27 sessions that met no deny made
+0.2 per 1k (1 of them used code-graph) and the 23 that met one made 40.2 (16
+used it), so the drop is the deny's forcing effect going away, not the model
+turning away from the tool. Run it before and after any change to a hook
+or to the steering text, and pair a moved number with an outcome eval: counts
+are not results.
+
 ## What `run.sh` sets up, and why
 
 Each eval run gets a temporary HOME, an empty workspace and a fresh Claude Code
