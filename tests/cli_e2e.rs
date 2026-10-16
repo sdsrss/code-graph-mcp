@@ -13431,3 +13431,68 @@ fn test_cli_affected_finds_cpp_gtest_files() {
         "{v}"
     );
 }
+
+/// E2E 2026-10-16 (CLI-user QA): in flask, `callgraph Flask`, `impact Flask`
+/// and `refs Flask` all stopped at "Ambiguous symbol 'Flask'", one candidate
+/// being README.md's `# Flask`. A project's README title is usually its main
+/// type's name, so the first symbol a user asks about refused. A heading has no
+/// edges; it is no candidate for a graph query when code defines the name.
+#[test]
+fn test_cli_a_readme_heading_does_not_make_a_code_symbol_ambiguous() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("README.md"),
+        "# Widget\n\nA widget library.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/widget.py"),
+        "class Widget:\n    def __init__(self, name):\n        self.name = name\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/app.py"),
+        "from widget import Widget\n\n\ndef build():\n    return Widget(\"w\")\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for args in [
+        &["callgraph", "Widget", "--direction", "callers"][..],
+        &["impact", "Widget"][..],
+        &["refs", "Widget"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_eq!(code, 0, "{args:?}: {stdout}{stderr}");
+        assert!(
+            !format!("{stdout}{stderr}").contains("Ambiguous"),
+            "{args:?}: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains("build"),
+            "{args:?} must name the caller: {stdout}"
+        );
+    }
+
+    // Control: two CODE definitions are still ambiguous.
+    std::fs::write(
+        project.path().join("src/other.py"),
+        "class Widget:\n    pass\n",
+    )
+    .unwrap();
+    let (_, _, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Widget"]);
+    assert_ne!(code, 0, "{stdout}{stderr}");
+    let out = format!("{stdout}{stderr}");
+    assert!(out.contains("Ambiguous"), "{out}");
+    assert!(
+        !out.contains("README.md"),
+        "the heading is no suggestion either: {out}"
+    );
+}

@@ -187,6 +187,21 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
             start_line: nf.node.start_line,
         })
         .collect();
+    // A markdown heading is not a definition and carries no edges, so beside a
+    // code definition of the same name it is no candidate: flask's README
+    // `# Flask` made `callgraph Flask` / `impact Flask` / `refs Flask` refuse
+    // (E2E 2026-10-16). Headings alone still disambiguate among themselves.
+    let is_heading = |c: &NameCandidate| {
+        matches!(
+            c.node_type.as_str(),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        )
+    };
+    let non_test: Vec<NameCandidate> = if non_test.iter().any(|c| !is_heading(c)) {
+        non_test.into_iter().filter(|c| !is_heading(c)).collect()
+    } else {
+        non_test
+    };
     if non_test.len() > 1 {
         Ok(Some(non_test))
     } else {
