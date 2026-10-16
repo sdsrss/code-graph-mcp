@@ -207,6 +207,11 @@ impl IndexIntegrity {
     }
 }
 
+/// What health-check says about an index whose last run died (killed or
+/// failed): `reason: "interrupted"` in JSON, for doctor and SessionStart.
+const INTERRUPTED_ISSUE: &str = "the last index run did not finish (killed or failed), so files \
+     and edges may be missing. Run: code-graph-mcp incremental-index (it re-indexes in full)";
+
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     cmd_health_check_opts(project_root, format, false)
@@ -338,7 +343,8 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
     // whose pages no longer read back reported OK right up until a query hit the
     // damaged page.
     let integrity = IndexIntegrity::probe(conn, status.db_size_bytes.max(0) as u64, deep);
-    let healthy = schema_ok && has_data && integrity.corruption_reason().is_none();
+    let interrupted = crate::indexer::pipeline::last_index_run_did_not_finish(&ctx.db);
+    let healthy = schema_ok && has_data && integrity.corruption_reason().is_none() && !interrupted;
 
     // Compute index age from last_indexed_at (unix timestamp in seconds)
     let age_str = status.last_indexed_at.map(|ts| {
@@ -536,6 +542,9 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                      code-graph-mcp rebuild-index --confirm",
                     reason
                 ));
+            } else if interrupted {
+                json["reason"] = serde_json::json!("interrupted");
+                json["issue"] = serde_json::json!(INTERRUPTED_ISSUE);
             } else if !schema_ok {
                 json["issue"] = serde_json::json!(format!(
                     "schema version mismatch: got {}, expected {}",
@@ -714,6 +723,10 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                     reason
                 );
                 eprintln!("{}", integrity.to_line());
+                print_resolution();
+                std::process::exit(1);
+            } else if interrupted {
+                eprintln!("UNHEALTHY: {INTERRUPTED_ISSUE}");
                 print_resolution();
                 std::process::exit(1);
             } else if !schema_ok {

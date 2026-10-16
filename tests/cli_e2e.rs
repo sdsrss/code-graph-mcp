@@ -13771,3 +13771,56 @@ fn test_cli_a_constructor_does_not_make_its_class_ambiguous() {
         "{stdout}{stderr}"
     );
 }
+
+/// E2E 2026-10-16 round 2 (plugin QA, P0-3): after a startup build failed or
+/// was killed, the partial index read as healthy everywhere — health-check
+/// `OK: 3294 nodes … 506 files` (of 3453), statusline ✓ — although the run's
+/// token was still in the marker. Only the indexer read it. A reader now asks
+/// whether a run died (the token present, no run holding the lock) and says so.
+#[cfg(unix)]
+#[test]
+fn test_cli_an_index_run_that_died_is_reported() {
+    let project = setup_indexed_project();
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    // "1" is the token an older binary wrote; any token with no live run holding
+    // the lock is a run that died.
+    {
+        let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+        code_graph_mcp::storage::queries::set_meta(db.conn(), "index_run_in_flight", "1").unwrap();
+    }
+
+    let (stdout, stderr, code) = run_cli(&project, &["health-check", "--format", "json"]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["healthy"], false, "{v}");
+    assert_eq!(v["reason"], "interrupted", "{v}");
+    assert!(
+        v["issue"].as_str().unwrap().contains("did not finish"),
+        "{v}"
+    );
+    let (_, stderr, code) = run_cli(&project, &["health-check"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("UNHEALTHY: the last index run did not finish"),
+        "{stderr}"
+    );
+    // Queries still answer, and say what they answer from.
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(
+        stderr.contains("The last index run did not finish"),
+        "{stderr}"
+    );
+
+    // The remedy it names recovers: the next run re-indexes and retires it.
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (stdout, stderr, code) = run_cli(&project, &["health-check"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.starts_with("OK:"), "{stdout}");
+    let (_, stderr, _) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert!(!stderr.contains("did not finish"), "{stderr}");
+}

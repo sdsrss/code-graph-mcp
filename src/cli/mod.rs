@@ -225,6 +225,7 @@ impl CliContext {
         refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, false)?;
         announce_index_version(&ctx.db);
+        announce_interrupted_run(&ctx.db);
         Ok(ctx)
     }
 
@@ -243,6 +244,7 @@ impl CliContext {
         refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, true)?;
         announce_index_version(&ctx.db);
+        announce_interrupted_run(&ctx.db);
         Ok(ctx)
     }
 
@@ -325,6 +327,17 @@ fn refuse_during_build(project_root: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Say on stderr that the last index run died, so the answer may miss files
+/// and edges. Once per command, on stderr, like [`announce_index_version`].
+fn announce_interrupted_run(db: &Database) {
+    if crate::indexer::pipeline::last_index_run_did_not_finish(db) {
+        eprintln!(
+            "[code-graph] The last index run did not finish (killed or failed); answers may miss \
+             files and edges. Run: code-graph-mcp incremental-index"
+        );
+    }
 }
 
 /// Say on stderr that an older `INDEX_VERSION` built the index (D#291).

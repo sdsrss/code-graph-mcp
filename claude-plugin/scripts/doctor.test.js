@@ -221,6 +221,7 @@ test('no classifyHealthReport row can gate the exit code without offering a repa
     'no-index': { reason: 'no_index' },
     corrupt: { reason: 'corrupt', integrity: { quick_check: 'malformed' } },
     refused: { reason: 'refused', issue: 'refusing to use a symlinked /p/.code-graph — remove it and re-run' },
+    interrupted: { reason: 'interrupted', schema_version: 10, nodes: 5, edges: 2, files: 3, issue: 'the last index run did not finish' },
     'schema-mismatch': { schema_version: 9, nodes: 5, edges: 2, files: 3, issue: 'schema version mismatch' },
     'empty-index': { schema_version: 10, nodes: 0, edges: 0, files: 0 },
     healthy: { schema_version: 10, nodes: 5, edges: 2, files: 3, index_age: '1s ago' },
@@ -599,6 +600,24 @@ test('a refused .code-graph is reported with its whole message, not as a broken 
   // Zeroed counters from an index nobody read are not a measurement.
   assert.equal(byName.Schema.status, 'skip');
   assert.equal(byName.Embeddings.status, 'skip');
+});
+
+test('an index whose last run did not finish routes to the index rebuild', () => {
+  // E2E 2026-10-16 round 2: the partial index a dead startup build left read as
+  // `Index ✅ 3294 nodes … 506 files`. health-check reports reason
+  // "interrupted"; the index-empty repair runs incremental-index, which
+  // re-indexes in full when the last run died.
+  const { classifyHealthReport } = require('./doctor');
+  const issue = 'the last index run did not finish (killed or failed), so files and edges may be missing. Run: code-graph-mcp incremental-index (it re-indexes in full)';
+  const rows = classifyHealthReport({
+    healthy: false, reason: 'interrupted', issue, schema_version: 10,
+    nodes: 3294, edges: 2463, files: 506, embedding_progress: '0/0', model_available: false,
+    integrity: { quick_check: 'ok', fts_drift: 0, orphan_vectors: null },
+  });
+  const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.equal(byName.Index.status, 'error');
+  assert.equal(byName.Index.fixId, 'index-empty');
+  assert.equal(byName.Index.detail, issue);
 });
 
 test('classifyHealthReport routes a corrupt index to index-corrupt, not binary-broken', () => {

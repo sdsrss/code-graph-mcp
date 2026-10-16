@@ -160,6 +160,17 @@ function classifyHealthReport(hc) {
   // the action. Broken, so not advisory: every command refuses this project.
   // Its repair arm only says what to do (the link may be the user's own), so it
   // stays unresolved, and doctor exits 1, until `.code-graph` is fixed.
+  // The last index run died (killed or failed) and left the index short of what
+  // it was writing, which read as `Index ✅` (E2E 2026-10-16 round 2). The
+  // index-empty repair runs incremental-index, which re-indexes in full then.
+  if (hc.reason === 'interrupted') {
+    return [
+      { name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` },
+      { name: 'Index', status: 'error', detail: String(hc.issue || 'last index run did not finish'), fixId: 'index-empty' },
+      classifyEmbeddings(hc),
+      classifyIntegrity(hc),
+    ];
+  }
   if (hc.reason === 'refused') {
     return [
       { name: 'Schema', status: 'skip', detail: 'index not read' },

@@ -849,6 +849,16 @@ fn fan_out_to_new_duplicate_definitions(
     Ok(callers.len())
 }
 
+/// True when an index run died (killed, or failed with an error) and left the
+/// index short of what it was writing: its token is still in the marker and no
+/// run holds the lock. For readers — health-check, the CLI — which otherwise
+/// answered from such an index as if it were complete (E2E 2026-10-16 round 2:
+/// a startup build that failed at 506 of 3453 files read `OK` and `✓`). The
+/// next indexer run re-indexes in full and clears it.
+pub fn last_index_run_did_not_finish(db: &Database) -> bool {
+    in_flight::a_run_died(db)
+}
+
 /// The runs killed after committing file hashes but before their cross-file
 /// edges reached the database (audit 2026-08-16 P1-2), as their marker tokens;
 /// None when there are none, or when a run is in flight now (D#192(3)): see

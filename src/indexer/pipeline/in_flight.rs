@@ -96,6 +96,21 @@ pub(super) fn dead_runs(db: &Database) -> Result<Option<Vec<String>>> {
     Ok((!tokens.is_empty()).then_some(tokens))
 }
 
+/// For a READER: did an index run die and leave its token? Only a probe that
+/// took the lock can tell: with no lock (a non-Unix target, a lock file that
+/// cannot be opened) a live run looks the same as a dead one, and a reader must
+/// not call a running build interrupted, so that reads as `false`.
+pub(super) fn a_run_died(db: &Database) -> bool {
+    let Probe::Held(held) = probe_exclusive(db) else {
+        return false;
+    };
+    let value = crate::storage::queries::get_meta(db.conn(), META_KEY_INDEX_RUN_IN_FLIGHT)
+        .ok()
+        .flatten();
+    drop(held);
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Remove `tokens` from the marker, and the marker once it is empty. Two
 /// statements, neither a read-modify-write: a token another run adds between
 /// them keeps the marker non-empty, and so keeps it.

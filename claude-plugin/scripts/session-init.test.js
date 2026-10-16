@@ -70,6 +70,17 @@ test('indexNeedsRevalidation recovers JSON from a non-zero exit (unhealthy index
   assert.equal(indexNeedsRevalidation(bin, cwd), true);
 });
 
+test('indexNeedsRevalidation true when the last index run did not finish', (t) => {
+  // E2E 2026-10-16 round 2: a startup build that died left an index short of
+  // what it was writing, and SessionStart read it as fresh. health-check now
+  // reports reason "interrupted"; the refresh it starts re-indexes in full.
+  const { bin, cwd } = stubHealthBin(t, {
+    json: JSON.stringify({ healthy: false, nodes: 3294, reason: 'interrupted', index_version_stale: false }),
+    exitCode: 1,
+  });
+  assert.equal(indexNeedsRevalidation(bin, cwd), true);
+});
+
 test('indexNeedsRevalidation false on garbage output (never forces work off a bad probe)', (t) => {
   const { bin, cwd } = stubHealthBin(t, { json: 'not json at all', exitCode: 0 });
   assert.equal(indexNeedsRevalidation(bin, cwd), false);
