@@ -351,6 +351,27 @@ pub(crate) enum CliSymbolSelectionError {
     QualifiedNotFound,
 }
 
+/// Say on stderr that a dotted name matched no definition and the answer is
+/// for its bare last component — the documented fallback, which was silent:
+/// `callgraph PetRepository.findById` answered for `OwnerRepository.findById`
+/// with exit 0 (E2E 2026-10-16 round 2). Only when no definition anywhere,
+/// test files included, has that qualified name, and the bare name exists.
+pub(crate) fn note_bare_fallback(
+    conn: &rusqlite::Connection,
+    raw_symbol: &str,
+    bare_name: &str,
+) -> Result<()> {
+    if bare_name != raw_symbol
+        && queries::get_nodes_with_files_by_qualified_name(conn, raw_symbol)?.is_empty()
+        && !queries::get_nodes_by_name(conn, bare_name)?.is_empty()
+    {
+        eprintln!(
+            "[code-graph] No definition is named '{raw_symbol}'; answering for '{bare_name}'."
+        );
+    }
+    Ok(())
+}
+
 /// Select a CLI symbol with exact-qualified precedence and compatible fallback.
 ///
 /// Exact qualified matches are filtered by `explicit_file`. One match keeps the
@@ -393,6 +414,7 @@ pub(crate) fn select_cli_symbol(
         if explicit_file.is_some() {
             return Ok(Err(CliSymbolSelectionError::QualifiedNotFound));
         }
+        note_bare_fallback(conn, raw_symbol, &bare_name)?;
     }
     Ok(Ok(CliSymbolSelection {
         lookup_name: if raw_symbol.contains('.') {

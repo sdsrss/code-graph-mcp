@@ -13671,3 +13671,42 @@ fn test_cli_a_stored_colon_colon_name_is_not_rewritten() {
         assert!(!stderr.contains("not found"), "{args:?}: {stderr}");
     }
 }
+
+/// E2E 2026-10-16 round 2 (language QA, P0-1): `callgraph PetRepository.findById`
+/// answered for `OwnerRepository.findById` with exit 0 and no word: the dotted
+/// input matched no definition and fell back to the bare name, as documented
+/// (`a_qualifier_matching_no_definition_still_falls_back_to_the_bare_name`),
+/// but silently. The fallback now says so, as the fuzzy step does.
+#[test]
+fn test_cli_the_dotted_to_bare_fallback_says_so() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/repo.py"),
+        "class OwnerRepository:\n    def find_by_id(self, i):\n        return i\n\n\ndef load():\n    return OwnerRepository().find_by_id(1)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for cmd in ["callgraph", "impact", "refs", "show"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "PetRepository.find_by_id"]);
+        assert_eq!(
+            code, 0,
+            "{cmd}: the documented fallback still answers: {stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "No definition is named 'PetRepository.find_by_id'; answering for 'find_by_id'"
+            ),
+            "{cmd}: {stderr}"
+        );
+    }
+    // Control: an exact qualified name says nothing of the kind.
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "OwnerRepository.find_by_id"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("No definition is named"), "{stderr}");
+}

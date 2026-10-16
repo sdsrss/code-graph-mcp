@@ -453,6 +453,17 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             nodes = resolve_show_nodes(conn, symbol, file_filter)?;
         }
         outcome.disclose();
+        // Same disclosure as refs/callgraph/impact when a dotted name fell back.
+        if !nodes.is_empty()
+            && symbol.contains('.')
+            && !nodes
+                .iter()
+                .any(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
+        {
+            if let Some(bare) = symbol.rsplit('.').next() {
+                crate::cli::symbols::note_bare_fallback(conn, symbol, bare)?;
+            }
+        }
 
         if nodes.is_empty() {
             let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
