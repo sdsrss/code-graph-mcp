@@ -13824,3 +13824,53 @@ fn test_cli_an_index_run_that_died_is_reported() {
     let (_, stderr, _) = run_cli(&project, &["callgraph", "validateToken"]);
     assert!(!stderr.contains("did not finish"), "{stderr}");
 }
+
+/// E2E 2026-10-16 round 2 (plugin and language QA, P2): impact's
+/// `ambiguous_callers_excluded` also counted the pruned edges INTO the deepest
+/// layer of callers, whose callers lie past `--depth` and would not appear at
+/// any confidence floor: hono `resolveHttpServer` said 39 excluded while
+/// `--min-confidence ambiguous` added none; the edit hook repeats the number.
+#[test]
+fn test_cli_impact_counts_only_excluded_callers_within_depth() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("core.py"), "def uniq_target():\n    return 1\n").unwrap();
+    std::fs::write(
+        src.join("a.py"),
+        "from core import uniq_target\n\ndef amb():\n    return uniq_target()\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("a2.py"), "def amb():\n    return 2\n").unwrap();
+    std::fs::write(src.join("b.py"), "def caller_b():\n    return amb()\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let impact = |depth: &str, floor: Option<&str>| {
+        let mut args = vec!["impact", "uniq_target", "--depth", depth, "--json"];
+        if let Some(f) = floor {
+            args.extend(["--min-confidence", f]);
+        }
+        let (stdout, stderr, code) = run_cli(&project, &args);
+        assert_eq!(code, 0, "{args:?}: {stdout}{stderr}");
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap()
+    };
+    // depth 1: caller_b is past the depth at every floor, so nothing is excluded.
+    let d1 = impact("1", None);
+    assert!(d1.get("ambiguous_callers_excluded").is_none(), "{d1}");
+    assert_eq!(
+        impact("1", Some("ambiguous"))["total_callers"],
+        d1["total_callers"]
+    );
+    // depth 2: caller_b is within reach and excluded; the ambiguous floor adds it.
+    let d2 = impact("2", None);
+    assert_eq!(d2["ambiguous_callers_excluded"], 1, "{d2}");
+    assert_eq!(
+        impact("2", Some("ambiguous"))["total_callers"].as_u64(),
+        d2["total_callers"].as_u64().map(|n| n + 1),
+        "{d2}"
+    );
+}

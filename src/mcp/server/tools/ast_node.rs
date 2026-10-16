@@ -571,11 +571,12 @@ impl McpServer {
         node_type: &str,
         min_confidence_rank: u8,
     ) -> Result<()> {
+        const IMPACT_DEPTH: i32 = 3;
         let caller_set = crate::graph::routes::get_callers_with_route_info(
             self.db.conn(),
             symbol_name,
             Some(file_path),
-            3,
+            IMPACT_DEPTH,
             min_confidence_rank,
         )?;
         // Read the provenance before consuming the set — the note is about the
@@ -591,7 +592,13 @@ impl McpServer {
         // under-states risk; min_confidence:"ambiguous" includes them.
         // Frontier-wide: seed direct + every kept caller's pruned callers, so a
         // transitive ambiguous caller is disclosed too (not just seed-direct).
-        let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
+        // Not into the deepest layer, whose callers lie past the depth at any
+        // floor (same rule as `cmd_impact`).
+        let caller_ids: Vec<i64> = callers
+            .iter()
+            .filter(|c| c.depth < IMPACT_DEPTH)
+            .map(|c| c.node_id)
+            .collect();
         let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
             self.db.conn(),
             symbol_name,

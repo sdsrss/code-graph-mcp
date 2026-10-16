@@ -7381,6 +7381,41 @@ app.post('/api/login', handleLogin);
         assert_eq!(result["name"], "d240_target", "{result}");
     }
 
+    /// E2E 2026-10-16 round 2: get_ast_node's impact counted pruned edges into
+    /// its deepest (third) layer of callers, whose callers lie past the depth at
+    /// any floor — same overcount as `cmd_impact`.
+    #[test]
+    fn test_impact_summary_counts_no_excluded_callers_past_its_depth() {
+        let project = TempDir::new().unwrap();
+        let w = |name: &str, body: &str| std::fs::write(project.path().join(name), body).unwrap();
+        w("core.py", "def uniq_target():\n    return 1\n");
+        w(
+            "c1.py",
+            "from core import uniq_target\n\ndef c1():\n    return uniq_target()\n",
+        );
+        w("c2.py", "from c1 import c1\n\ndef c2():\n    return c1()\n");
+        w("a.py", "from c2 import c2\n\ndef amb():\n    return c2()\n");
+        w("a2.py", "def amb():\n    return 2\n");
+        // An ambiguous call into `amb`, which sits at depth 3: past the depth.
+        w("b.py", "def caller_b():\n    return amb()\n");
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({ "symbol_name": "uniq_target", "include_impact": true }),
+        );
+        let result = parse_tool_result(&server.handle_message(&req).unwrap());
+        let impact = &result["impact"];
+        assert_eq!(
+            impact["transitive_callers"], 2,
+            "c2 and amb within depth 3: {result}"
+        );
+        assert!(
+            impact.get("ambiguous_callers_excluded").is_none(),
+            "caller_b is past the depth; nothing within it was excluded: {result}"
+        );
+    }
+
     /// E2E 2026-10-16: `Type::method` — how Rust and C++ spell a member, and how
     /// a model writes it — was "not found" where `Type.method` answered. Every
     /// tool taking a symbol must answer both spellings identically.

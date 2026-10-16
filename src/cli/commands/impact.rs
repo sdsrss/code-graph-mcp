@@ -299,9 +299,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
     // uniquely-named symbol is disclosed too. Surfaced (not silently dropped) so a
     // folded real caller never under-states risk; --min-confidence ambiguous counts them.
+    //
+    // Not into the deepest layer: those callers' callers lie past `--depth` and
+    // would appear at no floor. Counting them made hono `resolveHttpServer`
+    // report 39 excluded while `--min-confidence ambiguous` added none (E2E
+    // 2026-10-16 round 2).
     let caller_ids: Vec<i64> = callers
         .iter()
-        .filter(|c| c.depth > 0)
+        .filter(|c| c.depth > 0 && c.depth < depth)
         .map(|c| c.node_id)
         .collect();
     let ambiguous_callers_excluded =
@@ -425,7 +430,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         if ambiguous_callers_excluded > 0 {
             result["ambiguous_callers_excluded"] = serde_json::json!(ambiguous_callers_excluded);
             result["ambiguous_note"] = serde_json::json!(format!(
-                "{} direct caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-run with --min-confidence ambiguous to include them.",
+                "{} caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-run with --min-confidence ambiguous to include them.",
                 ambiguous_callers_excluded
             ));
         }
