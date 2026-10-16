@@ -3,21 +3,25 @@
 
 Hook and steering changes are judged on UX and side effects; whether the model
 still reaches for code-graph afterwards is only in the transcripts Claude Code
-keeps under <config dir>/projects/. 0.154.0 (deny -> rewrite) and 0.164.0 (hook
-de-noise) each cut explicit use from 27.5 to about 1 call per 1k tool calls in
-projects that develop neither plugin, and no eval saw it (tasks/specs/
-plugin-usage-audit.md). Per session this counts:
+keeps under <config dir>/projects/. Around 0.154.0 (deny -> rewrite) and
+0.164.0 (hook de-noise), explicit use in `daagu` fell from 68.0 to 1.5 calls
+per 1k tool calls, and no eval saw it (tasks/specs/plugin-usage-audit.md;
+compare within a project: a total over projects mixes their shares). Per
+session this counts:
 
   explicit    code-graph calls the model made: a Bash stage whose command word
               is code-graph-mcp (subagent_share.classify_bash), an MCP tool, a
               code-graph subagent or skill
   inject      hook context the model was given, by hook: `[code-graph...` text
-              in a hook_additional_context attachment, or the plain stdout of a
+              (or code-graph's SubagentStart index facts) in a
+              hook_additional_context attachment, or the plain stdout of a
               UserPromptSubmit / SessionStart hook (JSON stdout is recorded as
               both attachments, so only the context row counts)
-  deny        an error tool result whose text is a `[code-graph` reason
+  deny        an error tool result whose text is a `[code-graph` reason, unless
+              the call was itself a code-graph command that failed
   rewrite     a PreToolUse `updatedInput` whose reason or context is code-graph's
-  pointers    injections that name a code-graph command, and how many were
+  pointers    one- or two-line injections that name a code-graph command or
+              MCP tool (the SubagentStart facts among them), and how many were
               followed by a code-graph call within the next --window tool calls
 
 and the same explicit / inject counts for claude-mem-lite as a reference arm.
@@ -167,10 +171,13 @@ def scan_transcript(path, window=10):
             s["entrypoint"] = s["entrypoint"] or rec.get("entrypoint")
             kind = rec.get("type")
             if kind == "attachment":
-                att = rec.get("attachment") or {}
+                att = rec.get("attachment")
+                if not isinstance(att, dict):
+                    continue
                 hook = att.get("hookName")
                 if att.get("type") == "hook_additional_context":
-                    for text in att.get("content") or []:
+                    texts = att.get("content") or []
+                    for text in [texts] if isinstance(texts, str) else texts:
                         src = _source(str(text), att.get("hookEvent"))
                         if src:
                             inject(src, hook)
@@ -195,7 +202,8 @@ def scan_transcript(path, window=10):
                         if hso.get("updatedInput") and _source(why) == "cg":
                             s["cg_rewrite"] += 1
             elif kind == "user":
-                content = (rec.get("message") or {}).get("content")
+                msg = rec.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
                 if isinstance(content, list):
                     for block in content:
                         # A code-graph command that ran and failed is not a deny.
@@ -204,7 +212,8 @@ def scan_transcript(path, window=10):
                                 and CG_PREFIX in _result_text(block.get("content"))[:300]:
                             s["cg_deny"] += 1
             elif kind == "assistant":
-                content = (rec.get("message") or {}).get("content")
+                msg = rec.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
                 for block in content if isinstance(content, list) else []:
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue

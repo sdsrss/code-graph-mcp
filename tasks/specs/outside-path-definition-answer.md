@@ -1,6 +1,6 @@
 ---
 status: approved
-revision: 2
+revision: 3
 ---
 
 # Outside-path grep inject: the definition, not a command to run
@@ -53,10 +53,11 @@ definition's line range and signature.
   | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <label>` |
   | … signature starting with `(` | label `<name><signature>` |
   | … signature ending with `param_types` (C/C++ `ret (params)`) | label `<ret> <name><params>` |
+  | … C/C++ form whose `<ret>` is over 60 characters | label `<name><params>` |
   | … any other signature, or `null` (class, Kotlin, Swift, Bash) | label `<name>` |
   | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no signature |
   | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no signature |
-  | whitespace, including U+0085 | collapsed to single spaces; `( ` → `(`, `, )` / ` )` → `)` (also inside literals) |
+  | whitespace, including U+0085 and U+001C-1E | collapsed to single spaces; `( ` → `(`, `, )` / ` )` → `)` (also inside literals) |
   | `<type> <label>` longer than 160 characters | cut to 160, ends with `…` |
 
 - The line stays one line; file and search path keep `shellQuoteArg`.
@@ -102,3 +103,10 @@ None.
   "the next step"). Left as LOW: a signature whose source text holds a
   `code-graph-mcp` command shows it; a quoted path puts `:lines` outside the
   quotes.
+- r3 (2026-10-16): review round 2 (0 HIGH, 1 MEDIUM in the classifier, not
+  here). A return type over 60 characters is left out so the name survives
+  the cap; U+001C-1E collapse too. CHANGELOG: pointer/reference returns show
+  the name alone; 58 ranges = 52 with a signature + 6 classes; the extra call
+  measured a median of 5-25 ms across replays (max 104 ms); "touched the
+  definition" = a Read of the file or a Bash/Grep call naming it (23/45; 25/45
+  when any tool input naming it counts).

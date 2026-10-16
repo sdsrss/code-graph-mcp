@@ -37,9 +37,10 @@ SEARCH_COMMANDS = {"grep", "rg", "egrep", "fgrep", "find", "fd", "cat", "head", 
 # Words that run the next word as the command.
 WRAPPERS = {"timeout", "time", "env", "npx", "nice", "command", "exec"}
 # Words that open or continue a compound command; the command follows them.
-KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "eval"}
-# `$(...)` without nesting: its body runs as a command of its own.
-SUBSTITUTION = re.compile(r"\$\(([^()]*)\)")
+# Not `eval` (its argument is one quoted string) and no `$( )` bodies: neither
+# can be read without a quote-aware lexer, and a naive scan counted quoted
+# text and commit messages as calls (review round 2, 2026-10-16).
+KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{"}
 HOOK_MARK = "code-graph AST index"
 
 
@@ -135,9 +136,7 @@ def classify_bash(command):
     named code-graph-mcp (`cd ~/code-graph-mcp`, `cargo run --bin
     code-graph-mcp`) is not a code-graph call."""
     kinds = set()
-    command = without_heredoc_bodies(command)
-    bodies = SUBSTITUTION.findall(command)
-    for stage in stages(command) + [st for b in bodies for st in stages(b)]:
+    for stage in stages(without_heredoc_bodies(command)):
         words = command_words(stage)
         if not words:
             continue

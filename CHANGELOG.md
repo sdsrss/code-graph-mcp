@@ -33,21 +33,23 @@ grep's path, the PostToolUse hook adds one line saying where. That line used
 to end with `Its callers and callees: code-graph-mcp callgraph X`. In sessions
 in projects that develop neither plugin, none of the 45 such lines between
 0.164.0 and 2026-10-16 was followed by any code-graph call within the next 10
-tool calls; 23 of them were followed, within those 10, by a call that read or
-named the defining file. The line now carries the definition's line range and
-signature:
+tool calls; 23 of them were followed, within those 10, by a Read of the
+defining file or a Bash or Grep call naming it. The line now carries the
+definition's line range and signature:
 
     [code-graph] X is defined in src/a.py:120-145, outside the path your grep searched (tests/): method Cls.X(self, a: int) -> str
 
 This takes one `show --json --compact` call, made only in this case. When
 `show` does not name exactly one definition in that file (several same-named
 test fixtures, a failed or timed-out call), the line keeps the location alone
-and names no command. A C or C++ signature, written return type first, reads
-`function char f(int a)`; a signature in any other shape that does not start
-with `(` is left out. The whole label is one line, at most 160 characters.
-Replayed on the 61 real events (54 distinct symbol/file pairs), 58 got lines
-and a signature and 3 the location; the extra call took a median 5 ms, at
-most 104 ms.
+and names no command. A C or C++ signature the index stores as `char (int a)`
+reads `function char f(int a)`; one it stores without its parameters (a
+pointer or reference return type) shows the name alone, as does any other
+signature that does not start with `(`, and a return type over 60 characters
+is left out. The whole label is one line, at most 160 characters. Replayed on
+the 61 real events (54 distinct symbol/file pairs), 58 got their line range
+(52 with a signature, 6 classes, which have none) and 3 the location alone;
+across replays the extra call took a median of 5 to 25 ms and at most 104 ms.
 
 ### Dev tooling: plugin use in real sessions
 
@@ -55,17 +57,19 @@ most 104 ms.
 `~/.claude/projects/` and reports, per period and per 1,000 tool calls,
 explicit code-graph calls, hook injections by hook, PreToolUse denies and
 rewrites, and how often a one- or two-line injection that names a code-graph
-command or MCP tool is followed by a code-graph call, with claude-mem-lite's
-counts as a reference. Interactive sessions only by default; reads
+command or MCP tool (code-graph's SubagentStart index facts among them) is
+followed by a code-graph call, with claude-mem-lite's counts as a reference. Interactive sessions only by default; reads
 transcripts and writes nothing. On the maintainer's machine, main sessions in
 the one code project with sessions on both sides (`daagu`) made 68.0 explicit
 code-graph calls per 1k tool calls before 0.154.0 and 1.5 from 0.164.0; see
 `evals/README.md`.
 
 `scripts/subagent_share.py` also counts a code-graph call that opens a
-compound command (`for … do`, `if … then`, `( … )`, `{ …; }`, `!`, `eval`) or
-sits in a `$( … )`, and no longer reads a here-string (`<<<`) as a heredoc
-that hides the lines after it.
+compound command (`for … do`, `if … then`, `( … )`, `{ …; }`, `!`), and no
+longer reads a here-string (`<<<`) as a heredoc that hides the lines after
+it. A call inside `$( … )` or an `eval` string is still not counted: reading
+those needs quote-aware parsing, and a plain scan counted quoted text and
+commit messages as calls.
 
 ## 0.169.0
 

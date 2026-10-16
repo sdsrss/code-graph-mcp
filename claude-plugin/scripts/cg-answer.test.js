@@ -559,6 +559,8 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
     NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
     Nel: [row({ name: 'Nel', signature: '(a,\u0085 b)' })],
+    Ctrl: [row({ name: 'Ctrl', signature: '(a,\u001c b,\u001e c)' })],
+    LongRet: [row({ name: 'LongRet', signature: `${'std::map<std::string, '.repeat(7)}int> (int a)`, param_types: '(int a)', return_type: 'x' })],
   };
   let defStub;
   test.before(() => {
@@ -589,6 +591,9 @@ process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
       ['RetOnly', { status: 'hits', start: 10, end: 20, label: 'function RetOnly' }],
       ['NoSig', { status: 'hits', start: 10, end: 20, label: 'function NoSig' }],
       ['Nel', { status: 'hits', start: 10, end: 20, label: 'function Nel(a, b)' }],
+      ['Ctrl', { status: 'hits', start: 10, end: 20, label: 'function Ctrl(a, b, c)' }],
+      // A return type that would push the name past the cap is left out.
+      ['LongRet', { status: 'hits', start: 10, end: 20, label: 'function LongRet(int a)' }],
       ['Twins', { status: 'several' }],
       ['OtherFile', { status: 'no-hits' }],
       ['Prefix', { status: 'no-hits' }],

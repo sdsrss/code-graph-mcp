@@ -562,6 +562,7 @@ function runCallgraphAnswer(opts = {}) {
 // A definition label longer than this is cut: FastAPI handlers carry 900+
 // characters of `Query(...)` defaults in their signature.
 const DEFINITION_LABEL_MAX = 160;
+const DEFINITION_RET_MAX = 60;
 
 /**
  * `name(params)…` for a `show --json` row. Most extractors write the signature
@@ -574,7 +575,9 @@ function definitionSignature(r) {
   if (sig.startsWith('(')) return `${r.name}${sig}`;
   const params = typeof r.param_types === 'string' ? r.param_types.trim() : '';
   if (params.startsWith('(') && sig.endsWith(params) && sig.length > params.length) {
-    return `${sig.slice(0, -params.length).trim()} ${r.name}${params}`;
+    const ret = sig.slice(0, -params.length).trim();
+    // A return type this long would push the name past the label's cap.
+    return ret.length > DEFINITION_RET_MAX ? `${r.name}${params}` : `${ret} ${r.name}${params}`;
   }
   return r.name;
 }
@@ -622,8 +625,9 @@ function runDefinitionAnswer(opts = {}) {
     const r = named[0];
     if (!Number.isInteger(r.start_line) || !Number.isInteger(r.end_line)) return { status: 'unavailable' };
     let label = `${r.type || 'symbol'} ${definitionSignature(r)}`
-      // U+0085 too: JS `\s` lacks it, and a reader splitting lines counts it.
-      .replace(/[\s\u0085]+/g, ' ')
+      // U+0085 and U+001C-1E too: JS `\s` lacks them, and a reader splitting
+      // lines (Python's splitlines) breaks on them.
+      .replace(/[\s\u0085\u001c-\u001e]+/g, ' ')
       // A signature written one parameter per line collapses to `( a, b, )`:
       // drop the padding inside the parentheses and the trailing comma.
       .replace(/\( /g, '(').replace(/,? \)/g, ')').trim();

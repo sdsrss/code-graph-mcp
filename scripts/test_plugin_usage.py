@@ -177,6 +177,17 @@ class ScanTest(unittest.TestCase):
                            "is_error": True, "content": "[code-graph] No matches for: zzz"}]}}])
         self.assertEqual((s["cg_deny"], s["cg_explicit"]), (0, {"bash": 1}))
 
+    def test_non_object_records_do_not_abort(self):
+        s = self.scan([header("2026-10-01T00:00:00Z"),
+                       {"type": "attachment", "attachment": "text"},
+                       {"type": "user", "message": "text"},
+                       {"type": "assistant", "message": "text"},
+                       {"type": "attachment", "attachment": {"type": "hook_additional_context",
+                                                             "hookName": "SubagentStart", "hookEvent": "SubagentStart",
+                                                             "content": "code-graph AST index"}},
+                       bash("code-graph-mcp show f")])
+        self.assertEqual((s["tools"], s["cg_explicit"]), (1, {"bash": 1}))
+
     def test_non_dict_hook_output_does_not_abort(self):
         s = self.scan([header("2026-10-01T00:00:00Z"),
                        success("PreToolUse:Bash", json.dumps({"hookSpecificOutput": "text"})),

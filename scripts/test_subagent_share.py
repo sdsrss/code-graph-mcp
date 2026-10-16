@@ -41,8 +41,16 @@ class ClassifyTest(unittest.TestCase):
                     "if false; then :; else code-graph-mcp impact f; fi",
                     "while read f; do code-graph-mcp show \"$f\"; done < list",
                     "(code-graph-mcp grep x src/)", "{ code-graph-mcp show f; }",
-                    "! code-graph-mcp refs f", "echo $(code-graph-mcp show f)"):
+                    "! code-graph-mcp refs f"):
             self.assertEqual(ss.classify_bash(cmd), "cg", cmd)
+        # `$( )` bodies and `eval` strings are not read (review round 2): a scan
+        # that ignores quotes counted these as calls or searches.
+        for cmd in ("echo '$(code-graph-mcp show f)'",
+                    "git commit -m 'docs: run $(code-graph-mcp grep x) first'",
+                    "echo hi # $(code-graph-mcp show f)",
+                    'eval "ls ~/.cache/code-graph/bin/code-graph-mcp"',
+                    "git commit -m \"$(cat <<'EOF'\nfix: x\nEOF\n)\""):
+            self.assertIsNone(ss.classify_bash(cmd), cmd)
         # A here-string is not a heredoc: the next line is still a command.
         self.assertEqual(ss.classify_bash('grep x <<<"abc"\ncode-graph-mcp grep x'), "cg")
 
