@@ -79,8 +79,12 @@ def is_mem_bash(command):
 
 
 def pointer_verb(text):
-    """The code-graph command or MCP tool an injection tells the model to run,
-    or None when it names none."""
+    """The code-graph command or MCP tool a bare suggestion tells the model to
+    run, or None. Only a one- or two-line injection counts: a longer one is an
+    answer that may mention a command (a truncated map's tail, the rewrite
+    notice describing the command that already ran), not a request to act."""
+    if sum(1 for line in text.splitlines() if line.strip()) > 2:
+        return None
     m = POINTER.search(text)
     return (m.group(1) or m.group(2)) if m else None
 
@@ -228,7 +232,10 @@ def collect(projects_dir, since=None, until=None, entrypoints=("cli",), projects
                    + glob.glob(os.path.join(projects_dir, "*", "*", "subagents", "agent-*.jsonl")))
     out = []
     for p in paths:
-        s = scan_transcript(p, window)
+        try:
+            s = scan_transcript(p, window)
+        except OSError:
+            continue  # deleted since the glob (another session's throwaway project)
         if not s["start"] or not s["cwd"]:
             continue
         if since and s["start"] < since:

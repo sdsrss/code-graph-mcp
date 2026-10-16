@@ -80,6 +80,18 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(pu.pointer_verb(
             "[code-graph:hint] indexed repo — try `semantic_code_search \"<symptom>\"`"), "semantic_code_search")
         self.assertIsNone(pu.pointer_verb("[code-graph:impact] f() — Risk: LOW\n  1 direct caller"))
+        # An answer that mentions a command (the rewrite notice describing what ran,
+        # a truncated map's tail) is not a pointer: only a bare one- or two-line
+        # suggestion asks the model to act.
+        self.assertIsNone(pu.pointer_verb(
+            "[code-graph] Raw `grep` on indexed source was rewritten — this call's output comes from:\n"
+            "$ code-graph-mcp grep -m 0 'x' src/\nEach hit shows its containing fn/module — use these results directly."))
+        self.assertIsNone(pu.pointer_verb(
+            "[code-graph] 5+ Reads into src/ — module overview:\nsrc/a.rs\n  fn: f (2×)\n"
+            "(truncated — `code-graph-mcp overview src/` for the full map)"))
+        self.assertEqual(pu.pointer_verb(
+            "[code-graph] 5+ Reads into tests/ — `code-graph-mcp overview tests/` gives symbols+callers in one call"),
+            "overview")
 
 
 class ScanTest(unittest.TestCase):
@@ -183,6 +195,12 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(len(pu.collect(self.t.root, since="2026-10-01")), 3)
         self.assertEqual(len(pu.collect(self.t.root, until="2026-10-01")), 1)
         self.assertEqual(len(pu.collect(self.t.root, projects=["/w/app"])), 3)
+
+    def test_vanished_transcript_is_skipped(self):
+        # Another session's throwaway project can delete its transcript between
+        # the glob and the open; a dangling link is the same shape.
+        os.symlink(os.path.join(self.t.root, "gone.jsonl"), os.path.join(self.t.root, "-w-app", "e.jsonl"))
+        self.assertEqual(len(pu.collect(self.t.root)), 4)
 
     def test_aggregate_periods(self):
         rows = pu.aggregate(pu.collect(self.t.root, exclude=["/code-graph-mcp"]),
