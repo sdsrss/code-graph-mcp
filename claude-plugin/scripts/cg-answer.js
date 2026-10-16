@@ -559,8 +559,8 @@ function runCallgraphAnswer(opts = {}) {
   }
 }
 
-// A definition label longer than this is cut (a C++ qualified name keeps its
-// declaration's text).
+// A definition label longer than this is cut (a C++ or Go qualified name can
+// keep text from its declaration).
 const DEFINITION_LABEL_MAX = 160;
 
 /**

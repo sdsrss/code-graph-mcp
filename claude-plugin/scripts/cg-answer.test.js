@@ -563,8 +563,8 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     CmdSig: [row({ name: 'CmdSig', signature: '(cmd = "code-graph-mcp callgraph X")' })],
     RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
     NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
-    // A qualified name can carry its declaration's whitespace (C++): what a
-    // line reader splits on (U+0085, U+001C-1E, newline) collapses.
+    // A qualified name can carry its declaration's whitespace (C++, Go): what
+    // a line reader splits on (U+0085, U+001C-1E, newline) collapses.
     Nel: [row({ name: 'Guide\u0085 to\n api.Nel', type: 'method', signature: null })],
     Ctrl: [row({ name: 'a\u001cb\u001ec.Ctrl', signature: '(a,\u001c b,\u001e c)' })],
     LongRet: [row({ name: 'LongRet', signature: `${'std::map<std::string, '.repeat(7)}int> (int a)`, param_types: '(int a)', return_type: 'x' })],

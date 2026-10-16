@@ -53,7 +53,7 @@ definition's line range, type and name.
   | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <name>` (the signature, of any shape, is not shown) |
   | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no name |
   | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no name |
-  | whitespace in a qualified name (C++, and Go with a parenthesized receiver, keep the declaration's text), including U+0085 and U+001C-1E | collapsed to single spaces |
+  | whitespace in a qualified name (C++ and Go names can keep declaration text), including U+0085 and U+001C-1E | collapsed to single spaces |
   | `<type> <name>` longer than 160 characters | cut to 160, ends with `…` |
 
 - The line stays one line; file and search path keep `shellQuoteArg`.
@@ -116,13 +116,16 @@ None.
   the 61 events: 58 ranges (by pair: 30 functions, 16 methods, 6 classes),
   3 location only, 0 multi-line, 0 with a command; median 4 ms, max 93 ms.
   D#348's "a signature quoting a cg command" is gone with it.
-- r4, pre-tag review (2026-10-16): the index stores every Rust signature from
-  `(` (all 4,070 in this repo's index at 933db2f9, generics included), so the `<T>` shape
-  above did not come from a Rust signature as stored. A C++ qualified name
-  keeps its declaration's text, comments and control characters (ESC, BEL)
-  included, and so does a Go one with a parenthesized receiver type
-  (`(*R /* note */).Pc`; `func (r *T)` stores `T.Run`); the label shows them
-  on its one line. Left as is (LOW, the extractors own it); D#359. Headings
+- r4, pre-tag review (2026-10-16): Rust signatures are stored from `(`
+  (all 4,070 in this repo's index at 933db2f9) except blanket-impl methods,
+  which `mark_rust_blanket_methods` prefixes: `impl<T: Display> Shout for T`
+  stores `T.shout` with `<T> (&self) -> String`, round 3's shape. C++ and Go
+  qualified names can keep declaration text, comments and control
+  characters (ESC, BEL) included (`Qual/* note */.f`, `/* c1 */ U.Qa`,
+  `(*R /* note */).Pc`; a plain `func (r *T)` stores `T.Run`); the label
+  shows them on its one line. Closed by narrowing the CHANGELOG to "can",
+  not by naming a condition: three rounds each refuted the condition the
+  previous one named. Left as is (LOW, the extractors own it); D#359. Headings
   do not reach this path in practice: `show --file` does return one, but the
   outside branch needs a callgraph root with edges, and no heading carries an
   edge.

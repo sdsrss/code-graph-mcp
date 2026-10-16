@@ -74,10 +74,9 @@ This takes one `show --json --compact` call, made only in this case. When
 test fixtures, a failed or timed-out call), the line keeps the location alone
 and names no command. The signature is not shown: each language's extractor
 stores it in its own shape (C and C++ put the return type first), and the
-range is what the next read needs. A C++ method's qualified name keeps the
-text of its declaration (so does a Go method's, when its receiver type is in
-parentheses), so a comment written inside one (`Qual/* … */::f`) shows in
-the line. The
+range is what the next read needs. A C++ or Go method's qualified name can
+keep text from its declaration, so a comment written inside one
+(`Qual/* … */::f`) can show in the line. The
 line stays one line, its type and name at most 160 characters. Replayed on
 the 61 real events (54 distinct symbol/file pairs), 58 got their line range
 and 3 the location alone; in that replay the extra call took a median of
