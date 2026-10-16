@@ -1545,3 +1545,25 @@ test('with the plugin installed, a settings.json without our hooks is healthy', 
   assert.doesNotMatch(r.stdout + r.stderr, /missing \d+\/\d+ settings\.json entries/,
     'an empty settings.json is the healthy state for a plugin install');
 });
+
+test('runRepairs: index-empty builds the structural index only (--no-embed)', () => {
+  // E2E 2026-10-16: the repair ran plain `incremental-index`, which embeds when
+  // the model is installed; on flask it hit the 120 s timeout and printed
+  // "Index rebuild failed" for an index it had built. The repair asks for the
+  // structural index, and counts it fixed when that exits 0.
+  const { runRepairs } = require('./doctor');
+  const calls = [];
+  const origLog = console.log;
+  console.log = () => {};
+  let fixed;
+  try {
+    fixed = runRepairs([{ name: 'Index', status: 'warn', fixId: 'index-empty' }], {
+      locateBinary: () => '/bin/code-graph-mcp',
+      runIndexer: (bin, args) => { calls.push([bin, ...args]); },
+    });
+  } finally {
+    console.log = origLog;
+  }
+  assert.deepEqual(calls, [['/bin/code-graph-mcp', 'incremental-index', '--no-embed']]);
+  assert.equal(fixed, 1);
+});

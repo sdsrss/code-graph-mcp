@@ -1047,6 +1047,12 @@ function runRepairs(results, {
   rebuildIndex = rebuildIndexInPlace,
   binaryUsable = binaryBrokenResolved,
   buildBinary = buildBinaryFromSource,
+  locateBinary = findBinary,
+  runIndexer = (binary, args) => execFileSync(binary, args, hidden({
+    cwd: process.cwd(),
+    stdio: 'inherit',
+    timeout: 120000,
+  })),
 } = {}) {
   const fixable = results.filter(r => r.fixId);
   if (fixable.length === 0) return 0;
@@ -1200,17 +1206,17 @@ function runRepairs(results, {
       }
 
       case 'index-empty': {
-        const binary = findBinary();
+        const binary = locateBinary();
         if (binary) {
           console.log('\n  Rebuilding index...');
-          console.log('    \u2192 code-graph-mcp incremental-index');
+          console.log('    \u2192 code-graph-mcp incremental-index --no-embed');
+          // `--no-embed`: the structural index is what this repairs. With the
+          // model installed, embedding hono's 502 files took 357 s, so a
+          // 120 s run on flask timed out and reported failure for an index it
+          // had built (E2E 2026-10-16). The MCP server embeds in the background.
           try {
-            execFileSync(binary, ['incremental-index'], hidden({
-              cwd: process.cwd(),
-              stdio: 'inherit',
-              timeout: 120000,
-            }));
-            console.log('  \u2705 Index rebuilt');
+            runIndexer(binary, ['incremental-index', '--no-embed']);
+            console.log('  \u2705 Index rebuilt (embeddings are added in the background by the MCP server)');
             fixed++;
           } catch (e) {
             console.log(`  \u274c Index rebuild failed${silentFailureReason(e)}`);
