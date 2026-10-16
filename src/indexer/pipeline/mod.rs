@@ -147,6 +147,36 @@ pub const INDEXING_STATUS_STALE_SECS: u64 = 120;
 /// statusline at a phantom "indexing N/M" forever. Safe against a live indexer:
 /// its file is fresh and left alone, and even a racing removal is repaired by
 /// the indexer's next heartbeat write.
+/// The build the MCP server is running now, as the statusline and the hooks
+/// read it (`project-root.js` `indexBuildInProgress`): a fresh
+/// [`INDEXING_STATUS_FILE`] saying `indexing` or `finalizing`. `Some((done,
+/// total))` while it lasts. Only a small regular file is read: a FIFO in its
+/// place would block the read.
+pub fn index_build_in_progress(project_root: &Path) -> Option<(u64, u64)> {
+    let dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
+    // Nothing is read through a symlinked `.code-graph` (D#358); the caller's
+    // open refuses it right after.
+    crate::utils::owned::reject_symlinked_dir(&dir).ok()?;
+    let path = dir.join(INDEXING_STATUS_FILE);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    // A future mtime reads as fresh, as it does for the JS readers.
+    let age = meta
+        .modified()
+        .ok()?
+        .elapsed()
+        .unwrap_or(std::time::Duration::ZERO);
+    if age >= std::time::Duration::from_secs(INDEXING_STATUS_STALE_SECS) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let total = v["t"].as_u64()?;
+    let building = matches!(v["s"].as_str(), Some("indexing" | "finalizing")) && total > 0;
+    building.then(|| (v["d"].as_u64().unwrap_or(0), total))
+}
+
 pub fn remove_stale_indexing_status(project_root: &Path) {
     remove_indexing_status_older_than(
         project_root,

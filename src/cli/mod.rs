@@ -222,6 +222,7 @@ impl CliContext {
     /// Open for a query: a command that answers from the index. An index another
     /// `INDEX_VERSION` built is said so on stderr ([`announce_index_version`]).
     pub fn open(project_root: &Path) -> Result<Self> {
+        refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, false)?;
         announce_index_version(&ctx.db);
         Ok(ctx)
@@ -239,6 +240,7 @@ impl CliContext {
     /// that constructor also revalidates (wipes) on `INDEX_VERSION` mismatch,
     /// which a read command must never do.
     pub fn open_with_vec(project_root: &Path) -> Result<Self> {
+        refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, true)?;
         announce_index_version(&ctx.db);
         Ok(ctx)
@@ -286,6 +288,10 @@ impl CliContext {
     pub fn try_open(project_root: &Path) -> Option<Self> {
         // Same read-side worktree fallback as open() above.
         let project_root = &effective_read_root(project_root);
+        // Same refusal as open(); grep says why when it gets None.
+        if crate::indexer::pipeline::index_build_in_progress(project_root).is_some() {
+            return None;
+        }
         // Same refusal as open_inner; grep says why when it gets None.
         crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR)).ok()?;
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
@@ -300,6 +306,25 @@ impl CliContext {
             project_root: project_root.to_path_buf(),
         })
     }
+}
+
+/// Refuse a query while the MCP server is building the index it would read.
+///
+/// The answer would come from a partial graph — during django's first index
+/// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
+/// tool said "Indexing in progress" — and a reader writes (the freshness
+/// pass), which made the server's build fail on `database is locked` (E2E
+/// 2026-10-16). Not for `health-check`: it reports, and doctor and SessionStart
+/// read it during a build.
+fn refuse_during_build(project_root: &Path) -> Result<()> {
+    let root = effective_read_root(project_root);
+    if let Some((done, total)) = crate::indexer::pipeline::index_build_in_progress(&root) {
+        anyhow::bail!(
+            "The index is still being built ({done}/{total} files); answers from it would be \
+             incomplete. Retry in a few seconds."
+        );
+    }
+    Ok(())
 }
 
 /// Say on stderr that an older `INDEX_VERSION` built the index (D#291).

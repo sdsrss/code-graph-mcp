@@ -13584,3 +13584,59 @@ fn test_cli_type_colon_colon_method_resolves_like_the_dotted_spelling() {
         }
     }
 }
+
+/// E2E 2026-10-16 (MCP-client QA, P1-1): during the MCP server's first index,
+/// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
+/// tool answered "Indexing in progress"; and a CLI query's freshness writes in
+/// that window made the server's build fail on `database is locked`. A query
+/// now refuses while a fresh `indexing-status.json` says a build is running —
+/// the test the hooks (D5) and the statusline already make.
+#[cfg(unix)]
+#[test]
+fn test_cli_queries_refuse_while_the_index_is_being_built() {
+    let project = setup_indexed_project();
+    let status = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("indexing-status.json");
+    std::fs::write(&status, r#"{"s":"indexing","d":3,"t":50}"#).unwrap();
+
+    for args in [
+        &["callgraph", "validateToken"][..],
+        &["impact", "validateToken"][..],
+        &["show", "validateToken"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("still being built (3/50 files)"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "validateToken"]);
+    assert_eq!(code, 0, "grep keeps its plain fallback: {stdout}{stderr}");
+    assert!(stderr.contains("still being built"), "{stderr}");
+    // health-check reports, it does not refuse: doctor and SessionStart read it.
+    let (_, stderr, code) = run_cli(&project, &["health-check"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    // Stale: a killed server's file (older than INDEXING_STATUS_STALE_SECS).
+    std::fs::File::options()
+        .write(true)
+        .open(&status)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+        .unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_eq!(code, 0, "a stale status file is no build: {stdout}{stderr}");
+
+    // A FIFO in its place must not block the query.
+    std::fs::remove_file(&status).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&status)
+        .status()
+        .unwrap()
+        .success());
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+}

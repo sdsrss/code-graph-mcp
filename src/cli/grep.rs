@@ -1052,6 +1052,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         let db_path = cg_dir.join("index.db");
         if let Err(e) = crate::utils::owned::reject_symlinked_dir(&cg_dir) {
             eprintln!("[code-graph] {e}");
+        } else if let Some((done, total)) =
+            crate::indexer::pipeline::index_build_in_progress(&effective_read_root(project_root))
+        {
+            eprintln!(
+                "[code-graph] The index is still being built ({done}/{total} files); retry in a few seconds for AST context."
+            );
         } else if db_path.exists() {
             eprintln!(
                 "[code-graph] Index at {} could not be read (corrupt or unreadable). \
