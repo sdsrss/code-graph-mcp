@@ -17,7 +17,7 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go `net/http`, Rust axum)
 - **Dead code detection** — Find unreferenced symbols with smart Orphan/Exported-Unused classification
 - **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
-- **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates. Smart event filtering skips metadata-only changes (chmod, xattr)
+- **Incremental indexing** — Merkle tree change detection with a file system watcher; changed files are re-indexed when the next MCP query tool call arrives (`get_index_status` does not count). Smart event filtering skips metadata-only changes (chmod, xattr)
 - **Context compression** — Token-aware snippet extraction for LLM context windows (L0→full code, L1→summaries, L2→file groups, L3→directory overview). Every MCP tool except `ast_search` takes `compact: true`, which drops code bodies from the response; what else it trims is per-tool (`get_ast_node` keeps the signature, `module_overview` drops it), and how much it saves depends on the tool and the repo, so no fixed figure is quoted here
 - **Embedding model** — Optional local embedding via Candle (feature-gated `embed-model`). Context reordered to prioritize structural relations over code for better embedding quality
 - **Self-healing** — Automatic SQLite corruption recovery with rebuild. Startup repair for incomplete indexing (Phase 3 failures)
@@ -200,7 +200,7 @@ What you get:
 - **MCP Server** — All code-graph tools available to Claude
 - **Skills** — `explore` (structure-first navigation before reading files) and `index` (health-check / re-index / full rebuild); see [Plugin Skills](#plugin-skills)
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
-- **Auto-indexing** — The MCP server's file watcher re-indexes edited files; a PostToolUse hook that does it per edit is off by default (`CODE_GRAPH_HOOK_INDEX=on` turns it on for CLI-only use)
+- **Auto-indexing** — The MCP server's file watcher records edited files, and the next code-graph MCP query (`get_call_graph`, `find_references`, … — not `get_index_status`) re-indexes them before it answers; a PostToolUse hook that re-indexes per edit is off by default (`CODE_GRAPH_HOOK_INDEX=on` turns it on for CLI-only use)
 - **StatusLine** — Real-time health display (nodes, files, watch status) and what code-graph did in this session (`5 answers · 2 calls`: answers its grep, edit, read, subagent and Stop hooks delivered to Claude, code-graph queries Claude ran) — compatible with other plugins' StatusLine via composite multiplexer
 - **Auto-update** — Checks for a new version at session start (throttled to at most one check every 2 minutes). Between forced checks the re-check interval is 30 minutes after an "up to date" answer and 6 hours while an update is already pending. Updates install silently.
 
@@ -555,7 +555,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_NO_BLOCK_GREP=1` | Never turn a `grep` hint into a block — prefix a single command with it to get past one. |
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
 | `CODE_GRAPH_STATUSLINE_COUNTS=0` | Drop the session counts (`5 answers · 2 calls`) from the statusline. |
-| `CODE_GRAPH_HOOK_INDEX=on\|off` | Turn the per-edit incremental-index hook on (it is off by default; the MCP server's watcher re-indexes edits) or keep it off. |
+| `CODE_GRAPH_HOOK_INDEX=on\|off` | Turn the per-edit incremental-index hook on (it is off by default; the MCP server's watcher re-indexes edits at its next query tool call) or keep it off. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
 | `CODE_GRAPH_REQUIRE_MODEL=1` | Test-only: make the embedding tests FAIL when no model can be loaded instead of self-skipping. Set by the release gate and the cache-warm cron, which supply pinned weights — without it those tests pass by doing nothing on any runner with no cached model. |
