@@ -407,15 +407,20 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// Unless the index stores the `::` spelling itself: Ruby names `class
 /// Minitest::Test` exactly that, and its methods `Minitest::Test.run_case`.
 /// Rewriting those made them unfindable (E2E round 2), so an exact stored name
-/// or qualified name keeps the input as typed.
+/// or qualified name keeps the input as typed — less a leading `::`, Ruby's
+/// and C++'s root namespace. A markdown heading stores no symbol: README
+/// `# Rack::Protection` kept that spelling, and `refs Rack::Protection`
+/// answered for the heading (round 3).
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
+    let symbol = symbol.trim_start_matches("::");
     if !symbol.contains("::") {
         return symbol.to_string();
     }
     let stored: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM nodes n JOIN files f ON f.id = n.file_id \
-             WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> ?2)",
+             WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> ?2 \
+             AND n.type NOT IN ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))",
             rusqlite::params![symbol, crate::domain::EXTERNAL_FILE_PATH],
             |row| row.get(0),
         )
@@ -423,7 +428,7 @@ pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
     if stored {
         symbol.to_string()
     } else {
-        symbol.trim_start_matches("::").replace("::", ".")
+        symbol.replace("::", ".")
     }
 }
 
