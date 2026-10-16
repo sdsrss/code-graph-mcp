@@ -13710,3 +13710,64 @@ fn test_cli_the_dotted_to_bare_fallback_says_so() {
     assert_eq!(code, 0, "{stderr}");
     assert!(!stderr.contains("No definition is named"), "{stderr}");
 }
+
+/// E2E 2026-10-16 round 2 (language QA, P1-3): in Java, C# and C++ a class and
+/// its constructor share a name in one file, so `refs OwnerController`,
+/// `impact PetController` and `callgraph Visit` refused as "2 definitions in
+/// the same file" for every class with an explicit constructor. The name
+/// selects the type; its constructor stays reachable as `Class.Class`.
+#[test]
+fn test_cli_a_constructor_does_not_make_its_class_ambiguous() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/OwnerController.java"),
+        "package app;\npublic class OwnerController {\n    private final String repo;\n    public OwnerController(String repo) { this.repo = repo; }\n    public OwnerController() { this(\"default\"); }\n    public String show() { return repo; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/App.java"),
+        "package app;\npublic class App {\n    public static String run() {\n        OwnerController c = new OwnerController(\"r\");\n        return c.show();\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/widget.cc"),
+        "class Widget {\n public:\n  Widget();\n  int size() const;\n};\nWidget::Widget() {}\nint Widget::size() const { return 1; }\nint Use() { Widget w; return w.size(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for name in ["OwnerController", "Widget"] {
+        for cmd in ["refs", "impact", "callgraph"] {
+            let (stdout, stderr, code) = run_cli(&project, &[cmd, name]);
+            assert_eq!(code, 0, "{cmd} {name}: {stdout}{stderr}");
+            assert!(
+                !format!("{stdout}{stderr}").contains("Ambiguous"),
+                "{cmd} {name}: {stdout}{stderr}"
+            );
+        }
+    }
+    // The constructor itself is still there by its qualified name.
+    let (stdout, stderr, code) = run_cli(&project, &["show", "OwnerController.OwnerController"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("OwnerController(String repo)"), "{stdout}");
+
+    // Control: two classes of one name in different files are still ambiguous.
+    std::fs::write(
+        project.path().join("src/Other.java"),
+        "package other;\npublic class OwnerController {\n}\n",
+    )
+    .unwrap();
+    let (_, _, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run_cli(&project, &["refs", "OwnerController"]);
+    assert_ne!(code, 0, "{stdout}{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("Ambiguous"),
+        "{stdout}{stderr}"
+    );
+}

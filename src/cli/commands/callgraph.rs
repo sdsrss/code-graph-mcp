@@ -216,6 +216,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 }
                 resolved_symbol = resolved;
             }
+            // Every candidate IS the typed name: the exact-name guard above has
+            // already ruled those not ambiguous (a heading, a constructor beside
+            // its class), so the answer is that symbol's empty graph, not a
+            // refusal over the same name (E2E 2026-10-16 round 2).
+            CliFuzzyResolution::Ambiguous(cands) if cands.iter().all(|c| c.name == symbol) => {}
             CliFuzzyResolution::Ambiguous(cands) => {
                 // ARC-01: shared renderer, callgraph's published envelope
                 // (`results` + `candidates`) and its own suffixes. The JSON error

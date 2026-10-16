@@ -202,6 +202,24 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
     } else {
         non_test
     };
+    // A function beside a same-named type in its own file is that type's
+    // constructor (Java, C#, C++): every class with an explicit constructor
+    // made `refs` / `impact` / `callgraph` of the class refuse as "2
+    // definitions in the same file" (E2E 2026-10-16 round 2). The name selects
+    // the type; the constructor stays reachable as `Class.Class` or by node_id.
+    let is_type = |c: &NameCandidate| matches!(c.node_type.as_str(), "class" | "struct" | "enum");
+    let typed_files: std::collections::HashSet<String> = non_test
+        .iter()
+        .filter(|c| is_type(c))
+        .map(|c| c.file_path.clone())
+        .collect();
+    let non_test: Vec<NameCandidate> = non_test
+        .into_iter()
+        .filter(|c| {
+            !(matches!(c.node_type.as_str(), "function" | "method")
+                && typed_files.contains(&c.file_path))
+        })
+        .collect();
     if non_test.len() > 1 {
         Ok(Some(non_test))
     } else {
