@@ -13496,3 +13496,34 @@ fn test_cli_a_readme_heading_does_not_make_a_code_symbol_ambiguous() {
         "the heading is no suggestion either: {out}"
     );
 }
+
+/// E2E 2026-10-16 (CLI-user QA): outside a git repository `incremental-index`
+/// said "Run `git init` first" and every query said "Run: code-graph-mcp
+/// incremental-index" — a loop, while `rebuild-index --confirm` indexes the
+/// directory as it is. The skip message names that way out, and it works.
+#[test]
+fn test_cli_incremental_index_outside_git_names_a_command_that_indexes() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("tool.py"),
+        "def run_tool():\n    return 1\n",
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run_cli(&project, &["incremental-index"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("Skipping index"), "{stderr}");
+    assert!(
+        stderr.contains("code-graph-mcp rebuild-index --confirm"),
+        "{stderr}"
+    );
+
+    let (stdout, stderr, code) = run_cli(&project, &["rebuild-index", "--confirm", "--no-embed"]);
+    assert_eq!(
+        code, 0,
+        "the named command must index this directory: {stdout}{stderr}"
+    );
+    let (stdout, stderr, code) = run_cli(&project, &["show", "run_tool"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("tool.py"), "{stdout}");
+}

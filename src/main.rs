@@ -202,7 +202,8 @@ fn main() -> Result<()> {
                 if !quiet {
                     eprintln!(
                         "[code-graph] Skipping index: no .git anchor or existing .code-graph/ at {}.\n  \
-                         Run `git init` first, or cd into a git repository.",
+                         Run `git init` first, cd into a git repository, or index this directory \
+                         as it is: code-graph-mcp rebuild-index --confirm",
                         project_root.display()
                     );
                 }
