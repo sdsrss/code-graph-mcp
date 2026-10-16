@@ -1173,3 +1173,25 @@ test('e2e: impact passes --file when the prompt names one', { skip: posixOnly },
   const argv = fs.readFileSync(path.join(sb.markers, 'argv'), 'utf8').trim();
   assert.equal(argv, 'impact url_for --file src/flask/helpers.py');
 });
+
+test('a name defined in two places gets its definitions, not silence', { skip: posixOnly }, (t) => {
+  // E2E 2026-10-16 (plugin-user QA): 5 of 8 prompts naming a real flask/hono
+  // symbol got nothing, because impact/callgraph refuse an ambiguous name and
+  // the hook swallowed the refusal — which lists where each definition is.
+  const stub = '#!/bin/sh\n' +
+    "printf '%s\\n' \"[code-graph] Ambiguous symbol 'url_for': 2 matches in different files. Specify --file to disambiguate.\" " +
+    "'  url_for (function) in src/flask/helpers.py [node_id 12]' '  url_for (method) in src/flask/app.py [node_id 40]' >&2\n" +
+    'exit 1\n';
+  const sb = upcSandbox(t, stub);
+  const proc = runUpc(sb, 'fix the bug in url_for where external URLs drop the port');
+  assert.equal(proc.status, 0, proc.stderr);
+  assert.match(proc.stdout, /\[code-graph:definitions\] 'url_for' is defined in more than one place/, proc.stdout);
+  assert.match(proc.stdout, /url_for \(function\) in src\/flask\/helpers\.py/);
+  assert.match(proc.stdout, /url_for \(method\) in src\/flask\/app\.py/);
+
+  // Any other failure stays silent.
+  const { ambiguityContext } = require('./user-prompt-context');
+  assert.equal(ambiguityContext('[code-graph] Symbol not found: url_for\n'), '');
+  assert.equal(ambiguityContext(''), '');
+  assert.equal(ambiguityContext(undefined), '');
+});

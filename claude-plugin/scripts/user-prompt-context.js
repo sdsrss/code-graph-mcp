@@ -600,13 +600,32 @@ function runMain() {
       // for a file path and a preview.
       process.stdout.write(capContext(`${PREFIXES[query.type]}\n${result.trim()}\n`));
     }
-  } catch {
-    /* return silently */
+  } catch (e) {
+    // A name defined in more than one place makes impact / callgraph refuse.
+    // Swallowed, that was silence for 5 of 8 prompts naming a real flask or
+    // hono symbol (E2E 2026-10-16); the refusal lists where each definition
+    // is, which is worth knowing before an edit.
+    const text = ambiguityContext(e && e.stderr);
+    if (text) process.stdout.write(capContext(text));
   }
+}
+
+// The CLI's ambiguity refusal (stderr, exit 1) → context naming each
+// definition, or '' for any other failure. Only the refusal's own lines are
+// passed on.
+function ambiguityContext(stderr) {
+  const lines = String(stderr || '').split('\n');
+  const head = lines.findIndex((l) => /^\[code-graph\] Ambiguous symbol '/.test(l));
+  if (head === -1) return '';
+  const defs = lines.slice(head + 1).filter((l) => /^ {2}\S.* in \S/.test(l));
+  if (defs.length === 0) return '';
+  const name = /Ambiguous symbol '([^']+)'/.exec(lines[head])[1];
+  return `[code-graph:definitions] '${name}' is defined in more than one place — ` +
+    'name the file (`--file <path>`) to get one of them:\n' + defs.join('\n') + '\n';
 }
 
 if (require.main === module) {
   runMain();
 }
 
-module.exports = { COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv, childBudgetMs, CHILD_TIMEOUT_MS };
+module.exports = { ambiguityContext, COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv, childBudgetMs, CHILD_TIMEOUT_MS };
