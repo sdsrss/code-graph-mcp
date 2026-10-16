@@ -401,14 +401,28 @@ test('stale progress file is ignored — falls through to health check', (t) => 
     assert.equal(render(ctx), BASE);
   });
 
+  test('session counts: a hard-linked log is not read', (t) => {
+    const ctx = withLog(t, ['placeholder']);
+    const outside = path.join(ctx.home, 'outside.jsonl');
+    fs.writeFileSync(outside, [...COUNTED_ANSWERS.map(row), ...calls(2).map(row)].join('\n') + '\n');
+    const log = path.join(ctx.project, '.code-graph', 'recommendations.jsonl');
+    fs.rmSync(log);
+    fs.linkSync(outside, log);
+    assert.equal(render(ctx), BASE);
+    // Control: the same bytes as the log's only name count.
+    fs.rmSync(outside);
+    assert.equal(render(ctx), `${BASE} | 6 answers · 2 calls`);
+  });
+
   test('session counts: a FIFO in place of the log neither blocks nor counts', { skip: process.platform === 'win32' }, (t) => {
     const ctx = withLog(t, ['placeholder']);
     const log = path.join(ctx.project, '.code-graph', 'recommendations.jsonl');
     fs.rmSync(log);
     execFileSync('mkfifo', [log]);
-    // A timeout, so a regression fails here instead of hanging the suite.
+    // A timeout, so a regression fails here instead of hanging the suite;
+    // under the composite's 3 s kill, past which the user sees nothing.
     const out = execFileSync('node', [STATUSLINE], {
-      cwd: ctx.project, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL',
+      cwd: ctx.project, encoding: 'utf8', timeout: 2500, killSignal: 'SIGKILL',
       env: { ...process.env, HOME: ctx.home, USERPROFILE: ctx.home, CODE_GRAPH_STATUSLINE_SESSION: SID, CODE_GRAPH_STATUSLINE_COUNTS: '' },
     }).trim();
     assert.equal(out, BASE);

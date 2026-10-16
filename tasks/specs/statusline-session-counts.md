@@ -102,3 +102,7 @@ None.
   landed in the link's target). Measured with a copy of the release build
   in a Claude Code Bash child: `callgraph --help` and a failed query each
   record a call, stamped with this session's tag; CHANGELOG says so.
+  Tests: a hard-linked log is not read (red with openOwned's `nlink` check
+  removed); the FIFO test's timeout is 2.5 s, under the composite's 3 s kill.
+  O_NONBLOCK alone stays unpinned: the file's lstat check refuses a FIFO
+  first, so only the lstat-to-open race reaches it.
