@@ -559,28 +559,8 @@ function runCallgraphAnswer(opts = {}) {
   }
 }
 
-// A definition label longer than this is cut: FastAPI handlers carry 900+
-// characters of `Query(...)` defaults in their signature.
+// A definition label longer than this is cut (a heading's name is its text).
 const DEFINITION_LABEL_MAX = 160;
-const DEFINITION_RET_MAX = 60;
-
-/**
- * `name(params)…` for a `show --json` row. Most extractors write the signature
- * from the parameter list on (`(a, b) -> T`); C and C++ write the return type
- * first (`char (int a)`), where `param_types` is the trailing `(…)` and the
- * name goes between them (`char f(int a)`). Any other shape gets the name alone.
- */
-function definitionSignature(r) {
-  const sig = typeof r.signature === 'string' ? r.signature.trim() : '';
-  if (sig.startsWith('(')) return `${r.name}${sig}`;
-  const params = typeof r.param_types === 'string' ? r.param_types.trim() : '';
-  if (params.startsWith('(') && sig.endsWith(params) && sig.length > params.length) {
-    const ret = sig.slice(0, -params.length).trim();
-    // A return type this long would push the name past the label's cap.
-    return ret.length > DEFINITION_RET_MAX ? `${r.name}${params}` : `${ret} ${r.name}${params}`;
-  }
-  return r.name;
-}
 
 /**
  * Where exactly `symbol` is defined in `file`: `show <symbol> --file <file>
@@ -590,8 +570,9 @@ function definitionSignature(r) {
  * the model's next step after that pointer was a read of the definition, not
  * a code-graph call (26 vs 4 of 60 real events).
  *
- * `label` is `<type> <name><signature>` on one line, whitespace collapsed,
- * at most DEFINITION_LABEL_MAX characters (`…` when cut).
+ * `label` is `<type> <name>` on one line, whitespace collapsed, at most
+ * DEFINITION_LABEL_MAX characters (`…` when cut). No signature: each
+ * extractor writes its own shape, and the lines are what the next read needs.
  * @returns {{status: 'hits', start: number, end: number, label: string}
  *         | {status: 'several'} | {status: 'no-hits'}
  *         | {status: 'no-binary'} | {status: 'unavailable', reason?: 'budget'}}
@@ -624,13 +605,10 @@ function runDefinitionAnswer(opts = {}) {
     if (named.length > 1) return { status: 'several' };
     const r = named[0];
     if (!Number.isInteger(r.start_line) || !Number.isInteger(r.end_line)) return { status: 'unavailable' };
-    let label = `${r.type || 'symbol'} ${definitionSignature(r)}`
+    let label = `${r.type || 'symbol'} ${r.name}`
       // U+0085 and U+001C-1E too: JS `\s` lacks them, and a reader splitting
       // lines (Python's splitlines) breaks on them.
-      .replace(/[\s\u0085\u001c-\u001e]+/g, ' ')
-      // A signature written one parameter per line collapses to `( a, b, )`:
-      // drop the padding inside the parentheses and the trailing comma.
-      .replace(/\( /g, '(').replace(/,? \)/g, ')').trim();
+      .replace(/[\s\u0085\u001c-\u001e]+/g, ' ').trim();
     const chars = [...label];
     if (chars.length > DEFINITION_LABEL_MAX) label = chars.slice(0, DEFINITION_LABEL_MAX - 1).join('') + '…';
     return { status: 'hits', start: r.start_line, end: r.end_line, label };

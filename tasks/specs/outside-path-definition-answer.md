@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 3
+status: implemented
+revision: 4
 ---
 
 # Outside-path grep inject: the definition, not a command to run
@@ -13,9 +13,9 @@ grep's path, PostToolUse injects one line (B11, 0.164.0):
     [code-graph] X is defined in F, outside the path your grep searched (P). Its callers and callees: code-graph-mcp callgraph X
 
 Replace the command with the answer the model goes after next: the
-definition's line range and signature.
+definition's line range, type and name.
 
-    [code-graph] X is defined in F:120-145, outside the path your grep searched (P): method Cls.X(self, a: int) -> str
+    [code-graph] X is defined in F:120-145, outside the path your grep searched (P): method Cls.X
 
 ## Evidence (2026-10-16, `scripts/plugin_usage.py` + transcript replay)
 
@@ -50,15 +50,11 @@ definition's line range and signature.
 
   | `show --json --compact` result | injected |
   |---|---|
-  | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <label>` |
-  | … signature starting with `(` | label `<name><signature>` |
-  | … signature ending with `param_types` (C/C++ `ret (params)`) | label `<ret> <name><params>` |
-  | … C/C++ form whose `<ret>` is over 60 characters | label `<name><params>` |
-  | … any other signature, or `null` (class, Kotlin, Swift, Bash) | label `<name>` |
-  | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no signature |
-  | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no signature |
-  | whitespace, including U+0085 and U+001C-1E | collapsed to single spaces; `( ` → `(`, `, )` / ` )` → `)` (also inside literals) |
-  | `<type> <label>` longer than 160 characters | cut to 160, ends with `…` |
+  | exactly one row with `file_path == F` and name `X`, `*.X` or `*::X` | `F:start-end`, `: <type> <name>` (the signature, of any shape, is not shown) |
+  | several such rows (fixtures, cfg twins, overloads) | `F`, no lines, no name |
+  | none / exit ≠ 0 / not JSON / no binary / budget gone | `F`, no lines, no name |
+  | whitespace in the name (a heading's text), including U+0085 and U+001C-1E | collapsed to single spaces |
+  | `<type> <name>` longer than 160 characters | cut to 160, ends with `…` |
 
 - The line stays one line; file and search path keep `shellQuoteArg`.
 
@@ -68,7 +64,7 @@ definition's line range and signature.
   passes after; existing B11 tests updated (no `code-graph-mcp callgraph` in
   the pointer); in-path tree test unchanged and green.
 - e2e (stub binary answering `callgraph` and `show --json`): outside grep →
-  `F:N-M` and the signature; `show` exit 1 → location sentence only.
+  `F:N-M` and `<type> <name>`; `show` exit 1 → location sentence only.
 - Full JS suite and `cargo test --test hardening --test doc_cli_alignment`
   green; the replayed 60 real pairs produce 57 line-range texts and 3
   location-only texts.
@@ -110,3 +106,13 @@ None.
   measured a median of 5-25 ms across replays (max 104 ms); "touched the
   definition" = a Read of the file or a Bash/Grep call naming it (23/45; 25/45
   when any tool input naming it counts).
+- r4 (2026-10-16): the signature is withdrawn; the label is `<type> <name>`.
+  Each of rounds 1-3 found a signature shape the renderer got wrong (C/C++
+  return type first, a return type over 60 characters, a Rust generic
+  `<T>(&self)` read as C/C++ `<T> T.bare(&self)`), and the 60-character rule
+  had no test. The stop line says narrow the domain at round 3: an
+  extractor-specific format in 20 languages is an open domain, the line range
+  is an integer pair, and nothing measured what the signature adds. Replay on
+  the 61 events: 58 ranges (by pair: 30 functions, 16 methods, 6 classes),
+  3 location only, 0 multi-line, 0 with a command; median 4 ms, max 93 ms.
+  D#348's "a signature quoting a cg command" is gone with it.

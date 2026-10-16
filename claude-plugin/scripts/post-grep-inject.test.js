@@ -1466,14 +1466,14 @@ test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and 
 
   // The pointer used to end in `Its callers and callees: code-graph-mcp callgraph X`.
   // From 0.164.0 to 2026-10-16 no session ran it (0 of 45); the next step was a
-  // read of the definition. So the line now carries the definition's lines and
-  // signature when `show` names exactly one, and no command either way
+  // read of the definition. So the line now carries the definition's lines,
+  // type and name when `show` names exactly one, and no command either way
   // (tasks/specs/outside-path-definition-answer.md).
-  test('buildPointerText: the definition\'s lines and signature, never a command', () => {
-    const def = { status: 'hits', start: 10, end: 20, label: 'function indexed_project(root: &Path)' };
+  test('buildPointerText: the definition\'s lines, type and name, never a command', () => {
+    const def = { status: 'hits', start: 10, end: 20, label: 'function indexed_project' };
     const t = buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs', def);
     assert.equal(t, '[code-graph] indexed_project is defined in src/indexer/resync.rs:10-20, outside the path ' +
-      'your grep searched (tests/cli_e2e.rs): function indexed_project(root: &Path)');
+      'your grep searched (tests/cli_e2e.rs): function indexed_project');
     for (const other of [undefined, { status: 'several' }, { status: 'no-hits' }, { status: 'unavailable' }]) {
       assert.equal(buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs', other),
         '[code-graph] indexed_project is defined in src/indexer/resync.rs, outside the path your grep searched (tests/cli_e2e.rs).',
@@ -1503,7 +1503,7 @@ test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and 
       assert.equal(res.status, 0, res.stderr);
       const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
       assert.equal(ctx, `[code-graph] ${uniq} is defined in src/indexer/resync.rs:41-77, outside the path your grep ` +
-        `searched (tests/cli_e2e.rs): function ${uniq}(root: &Path)`);
+        `searched (tests/cli_e2e.rs): function ${uniq}`);
       assert.doesNotMatch(ctx, /called by|code-graph-mcp /);
       const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
       const rec = JSON.parse(recs.trim().split('\n').pop());

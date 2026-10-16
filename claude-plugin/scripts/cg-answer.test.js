@@ -534,12 +534,15 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
   }
 });
 
-// ── runDefinitionAnswer: one definition's line range and signature ──────────
+// ── runDefinitionAnswer: one definition's line range, type and name ─────────
 // The outside-path grep inject names where a symbol is defined. It asks
-// `show <symbol> --file <file> --json` for the lines and signature, and keeps
-// them only when exactly one definition in that file carries the name
+// `show <symbol> --file <file> --json` for the lines, and keeps them only when
+// exactly one definition in that file carries the name
 // (tasks/specs/outside-path-definition-answer.md, shape table). Real pairs:
-// 57 of 60 had one, 3 had several (test fixtures), none had zero.
+// 57 of 60 had one, 3 had several (test fixtures), none had zero. The
+// signature is never shown: each extractor writes its own shape (C/C++ put
+// the return type first, Rust generics lead with `<T>`), and three review
+// rounds each found one the renderer got wrong.
 {
   const { runDefinitionAnswer } = require('./cg-answer');
   const F = 'src/app/core.py';
@@ -552,14 +555,18 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     Twins: [row({ name: 'Twins' }), row({ name: 'Twins', start_line: 40, end_line: 44 })],
     OtherFile: [row({ name: 'OtherFile', file_path: 'src/other.py' })],
     Prefix: [row({ name: 'PrefixLonger' })],
-    Long: [row({ name: 'Long', signature: `(${'arg_with_a_long_name: int, '.repeat(12)})` })],
-    // C/C++ put the return type first (review 2026-10-16): `<ret> (<params>)`.
+    Long: [row({ name: `${'Section.'.repeat(30)}Long`, type: 'heading', signature: null })],
+    // Signatures of every shape stay out of the label (review rounds 1-3).
     CFree: [row({ name: 'CFree', signature: 'char (int a, const char *b)', param_types: '(int a, const char *b)', return_type: 'char' })],
     CppTmpl: [row({ name: 'Widget.CppTmpl', type: 'method', signature: 'std::vector<T> (const T& v)', param_types: '(const T& v)', return_type: 'std::vector<T>' })],
+    RustGen: [row({ name: 'Holder.RustGen', type: 'method', signature: '<T>(&self)', param_types: '(&self)' })],
+    CmdSig: [row({ name: 'CmdSig', signature: '(cmd = "code-graph-mcp callgraph X")' })],
     RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
     NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
-    Nel: [row({ name: 'Nel', signature: '(a,\u0085 b)' })],
-    Ctrl: [row({ name: 'Ctrl', signature: '(a,\u001c b,\u001e c)' })],
+    // A heading's name is its text: whitespace a line reader splits on
+    // (U+0085, U+001C-1E, newline) collapses to one space.
+    Nel: [row({ name: 'Guide\u0085 to\n api.Nel', type: 'heading', signature: null })],
+    Ctrl: [row({ name: 'a\u001cb\u001ec.Ctrl', signature: '(a,\u001c b,\u001e c)' })],
     LongRet: [row({ name: 'LongRet', signature: `${'std::map<std::string, '.repeat(7)}int> (int a)`, param_types: '(int a)', return_type: 'x' })],
   };
   let defStub;
@@ -582,18 +589,19 @@ process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
 
   test('runDefinitionAnswer: the shape table', () => {
     const cases = [
-      ['One', { status: 'hits', start: 10, end: 20, label: 'function One(a, b)' }],
-      ['Method', { status: 'hits', start: 1393, end: 1422, label: 'method Cls.Method(self, x: int) -> str' }],
+      ['One', { status: 'hits', start: 10, end: 20, label: 'function One' }],
+      ['Method', { status: 'hits', start: 1393, end: 1422, label: 'method Cls.Method' }],
       ['Klass', { status: 'hits', start: 10, end: 20, label: 'class Klass' }],
-      ['Rusty', { status: 'hits', start: 10, end: 20, label: 'function outer::Rusty(path: &Path) -> io::Result<File>' }],
-      ['CFree', { status: 'hits', start: 10, end: 20, label: 'function char CFree(int a, const char *b)' }],
-      ['CppTmpl', { status: 'hits', start: 10, end: 20, label: 'method std::vector<T> Widget.CppTmpl(const T& v)' }],
+      ['Rusty', { status: 'hits', start: 10, end: 20, label: 'function outer::Rusty' }],
+      ['CFree', { status: 'hits', start: 10, end: 20, label: 'function CFree' }],
+      ['CppTmpl', { status: 'hits', start: 10, end: 20, label: 'method Widget.CppTmpl' }],
+      ['RustGen', { status: 'hits', start: 10, end: 20, label: 'method Holder.RustGen' }],
+      ['CmdSig', { status: 'hits', start: 10, end: 20, label: 'function CmdSig' }],
       ['RetOnly', { status: 'hits', start: 10, end: 20, label: 'function RetOnly' }],
       ['NoSig', { status: 'hits', start: 10, end: 20, label: 'function NoSig' }],
-      ['Nel', { status: 'hits', start: 10, end: 20, label: 'function Nel(a, b)' }],
-      ['Ctrl', { status: 'hits', start: 10, end: 20, label: 'function Ctrl(a, b, c)' }],
-      // A return type that would push the name past the cap is left out.
-      ['LongRet', { status: 'hits', start: 10, end: 20, label: 'function LongRet(int a)' }],
+      ['Nel', { status: 'hits', start: 10, end: 20, label: 'heading Guide to api.Nel' }],
+      ['Ctrl', { status: 'hits', start: 10, end: 20, label: 'function a b c.Ctrl' }],
+      ['LongRet', { status: 'hits', start: 10, end: 20, label: 'function LongRet' }],
       ['Twins', { status: 'several' }],
       ['OtherFile', { status: 'no-hits' }],
       ['Prefix', { status: 'no-hits' }],
@@ -606,11 +614,11 @@ process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
     for (const [symbol, want] of cases) assert.deepEqual(def(symbol), want, symbol);
   });
 
-  test('runDefinitionAnswer: a long signature is cut to 160 characters ending in …', () => {
+  test('runDefinitionAnswer: a long name is cut to 160 characters ending in …', () => {
     const r = def('Long');
     assert.equal(r.status, 'hits');
     assert.equal([...r.label].length, 160, r.label);
-    assert.ok(r.label.startsWith('function Long(arg_with_a_long_name: int, '), r.label);
+    assert.ok(r.label.startsWith('heading Section.Section.'), r.label);
     assert.ok(r.label.endsWith('…'), r.label);
   });
 

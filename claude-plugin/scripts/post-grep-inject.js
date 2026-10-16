@@ -218,7 +218,7 @@ const CALLGRAPH_HEADER =
 // src/indexer/resync.rs). Its location was the useful part, so that is what it
 // gets: one line. It used to end in the `callgraph` command for the tree; no
 // session ran it (0 of 45, 0.164.0 to 2026-10-16) and the next step was a read
-// of the definition, so the line carries the definition's lines and signature
+// of the definition, so the line carries the definition's lines, type and name
 // instead when `show` names exactly one (tasks/specs/outside-path-definition-answer.md).
 
 /** The file on a `callgraph` answer's root line (`name (path)`), or null. */
@@ -241,7 +241,7 @@ function searchCovers(searchPath, file) {
   return file === p || file.startsWith(p + '/');
 }
 
-/** @param {object} [def] a runDefinitionAnswer result; only `hits` adds lines and a signature. */
+/** @param {object} [def] a runDefinitionAnswer result; only `hits` adds lines, type and name. */
 function buildPointerText(symbol, file, searchPath, def) {
   const where = `${symbol} is defined in ${shellQuoteArg(file)}`;
   const outside = `outside the path your grep searched (${shellQuoteArg(searchPath)})`;

@@ -39,21 +39,20 @@ in projects that develop neither plugin, none of the 45 such lines between
 0.164.0 and 2026-10-16 was followed by any code-graph call within the next 10
 tool calls; 23 of them were followed, within those 10, by a Read of the
 defining file or a Bash or Grep call naming it. The line now carries the
-definition's line range and signature:
+definition's line range, type and name:
 
-    [code-graph] X is defined in src/a.py:120-145, outside the path your grep searched (tests/): method Cls.X(self, a: int) -> str
+    [code-graph] X is defined in src/a.py:120-145, outside the path your grep searched (tests/): method Cls.X
 
 This takes one `show --json --compact` call, made only in this case. When
 `show` does not name exactly one definition in that file (several same-named
 test fixtures, a failed or timed-out call), the line keeps the location alone
-and names no command. A C or C++ signature the index stores as `char (int a)`
-reads `function char f(int a)`; one it stores without its parameters (a
-pointer or reference return type) shows the name alone, as does any other
-signature that does not start with `(`, and a return type over 60 characters
-is left out. The whole label is one line, at most 160 characters. Replayed on
+and names no command. The signature is not shown: each language's extractor
+stores it in its own shape (C and C++ put the return type first, a Rust
+generic starts with `<T>`), and the range is what the next read needs. The
+line stays one line, its type and name at most 160 characters. Replayed on
 the 61 real events (54 distinct symbol/file pairs), 58 got their line range
-(52 with a signature, 6 classes, which have none) and 3 the location alone;
-across replays the extra call took a median of 5 to 25 ms and at most 104 ms.
+and 3 the location alone; in that replay the extra call took a median of
+4 ms and at most 93 ms.
 
 ### Dev tooling: plugin use in real sessions
 
