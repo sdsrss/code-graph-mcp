@@ -14042,3 +14042,29 @@ fn test_cli_a_heading_with_colons_does_not_keep_the_colon_spelling() {
     assert!(stdout.contains("protection.rb"), "{stdout}");
     assert!(!stdout.contains("README.md"), "{stdout}");
 }
+
+/// E2E 2026-10-16 round 3: the constructor rule dropped any function or
+/// method named like a type in the type's file. Go declares a method beside a
+/// same-named struct (gin: `type Negotiate struct` and `Context.Negotiate`),
+/// so `callgraph Negotiate` answered for the struct with the method's edges,
+/// where 0.170.1 refused and listed both. A constructor is inside its type.
+#[test]
+fn test_cli_a_method_beside_a_same_named_struct_is_no_constructor() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("context.go"),
+        "package gin\n\ntype Negotiate struct {\n\tData any\n}\n\ntype Context struct{}\n\nfunc (c *Context) Negotiate(code int, config Negotiate) {\n\tc.JSON(code, config.Data)\n}\n\nfunc (c *Context) JSON(code int, obj any) {}\n\nfunc handle(c *Context) {\n\tc.Negotiate(200, Negotiate{})\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    for cmd in ["callgraph", "impact", "refs"] {
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "Negotiate"]);
+        assert_ne!(code, 0, "{cmd}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("Ambiguous symbol 'Negotiate'"),
+            "{cmd}: {stderr}"
+        );
+    }
+}

@@ -217,23 +217,38 @@ pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCa
     } else {
         non_test
     };
-    // A function beside a same-named type in its own file is that type's
+    // A function inside the body of a same-named type is that type's
     // constructor (Java, C#, C++): every class with an explicit constructor
     // made `refs` / `impact` / `callgraph` of the class refuse as "2
     // definitions in the same file" (E2E 2026-10-16 round 2). The name selects
     // the type; the constructor stays reachable as `Class.Class` or by node_id.
-    let is_type = |c: &NameCandidate| matches!(c.node_type.as_str(), "class" | "struct" | "enum");
-    let typed_files: std::collections::HashSet<String> = non_test
+    // Inside the body, or in C++ `T::T` outside it — not anywhere in the file:
+    // Go declares a method beside a same-named struct (gin's `type Negotiate
+    // struct` and `Context.Negotiate`), and that is two definitions (round 3).
+    let type_bodies: Vec<(&str, i64, i64)> = with_files
         .iter()
-        .filter(|c| is_type(c))
-        .map(|c| c.file_path.clone())
+        .filter(|nf| matches!(nf.node.node_type.as_str(), "class" | "struct" | "enum"))
+        .map(|nf| (nf.file_path.as_str(), nf.node.start_line, nf.node.end_line))
+        .collect();
+    let constructors: std::collections::HashSet<i64> = with_files
+        .iter()
+        .filter(|nf| matches!(nf.node.node_type.as_str(), "function" | "method"))
+        .filter(|nf| {
+            let out_of_line = matches!(
+                crate::utils::config::detect_language(&nf.file_path),
+                Some("c" | "cpp")
+            ) && nf.node.qualified_name.as_deref()
+                == Some(format!("{0}.{0}", nf.node.name).as_str());
+            type_bodies.iter().any(|&(file, start, end)| {
+                file == nf.file_path
+                    && (out_of_line || (start <= nf.node.start_line && nf.node.start_line <= end))
+            })
+        })
+        .map(|nf| nf.node.id)
         .collect();
     let non_test: Vec<NameCandidate> = non_test
         .into_iter()
-        .filter(|c| {
-            !(matches!(c.node_type.as_str(), "function" | "method")
-                && typed_files.contains(&c.file_path))
-        })
+        .filter(|c| !constructors.contains(&c.node_id))
         .collect();
     Ok(non_test)
 }
