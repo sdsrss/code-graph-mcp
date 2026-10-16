@@ -824,52 +824,87 @@ fn test_session_tag_takes_a_uuid_prefix_only() {
     }
 }
 
-#[test]
-fn test_record_cli_use_stamps_the_session_tag() {
-    // Wiring, without mutating the process env (tests run in parallel): the
-    // row carries exactly the tag of whatever CLAUDE_CODE_SESSION_ID this test
-    // process inherited — present under Claude Code, absent in CI.
-    std::env::remove_var("CODE_GRAPH_INTERNAL");
+/// The one row a `record_cli_use_with_env` call leaves in a fresh project,
+/// or `None` when it wrote nothing.
+fn recorded_row(env: impl Fn(&str) -> Option<String>) -> Option<serde_json::Value> {
     let tmp = tempfile::tempdir().unwrap();
     let cg = tmp.path().join(CODE_GRAPH_DIR);
     std::fs::create_dir_all(&cg).unwrap();
-    record_cli_use(tmp.path(), "impact", None);
-    let content = std::fs::read_to_string(cg.join("recommendations.jsonl")).unwrap();
-    let row: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-    let want = session_tag(std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref());
-    match want {
-        Some(tag) => assert_eq!(row["session"], tag.as_str(), "{row}"),
-        None => assert!(row.get("session").is_none(), "{row}"),
-    }
+    record_cli_use_with_env(tmp.path(), "impact", None, env);
+    let content = std::fs::read_to_string(cg.join("recommendations.jsonl")).unwrap_or_default();
+    let mut rows = content.lines().map(|l| serde_json::from_str(l).unwrap());
+    let row = rows.next();
+    assert!(rows.next().is_none(), "{content}");
+    row
+}
+
+const A_SESSION: &str = "cde9a42e-defc-4eb5-8f4b-6e2294ae206e";
+
+#[test]
+fn test_record_cli_use_reads_the_session_from_claude_code_session_id() {
+    // The environment comes in as a lookup, so the variable NAME is pinned
+    // here; reading the real env, CI (no session id) stayed green with the
+    // name misspelled (review 2026-10-16, D#352).
+    let row =
+        recorded_row(|k| (k == "CLAUDE_CODE_SESSION_ID").then(|| A_SESSION.into())).expect("a row");
+    assert_eq!(row["session"], "cde9a42e", "{row}");
     assert_eq!(row["cmd"], "impact");
+    // Another name with the same value stamps nothing.
+    let row = recorded_row(|k| (k == "CLAUDE_SESSION_ID").then(|| A_SESSION.into())).unwrap();
+    assert!(row.get("session").is_none(), "{row}");
 }
 
 #[test]
 fn test_record_cli_use_session_stamp_for_each_session_value() {
-    // Env-free (review 2026-10-16 M1): the env-reading test above passes with
-    // the stamp deleted wherever CLAUDE_CODE_SESSION_ID is unset, i.e. in CI.
-    std::env::remove_var("CODE_GRAPH_INTERNAL");
     let cases: &[(Option<&str>, Option<&str>)] = &[
-        (
-            Some("cde9a42e-defc-4eb5-8f4b-6e2294ae206e"),
-            Some("cde9a42e"),
-        ),
+        (Some(A_SESSION), Some("cde9a42e")),
         (Some("not-a-session"), None),
         (None, None),
     ];
     for (raw, want) in cases {
-        let tmp = tempfile::tempdir().unwrap();
-        let cg = tmp.path().join(CODE_GRAPH_DIR);
-        std::fs::create_dir_all(&cg).unwrap();
-        record_cli_use_in_session(tmp.path(), "callgraph", None, *raw);
-        let content = std::fs::read_to_string(cg.join("recommendations.jsonl")).unwrap();
-        let row: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let row = recorded_row(|k| {
+            (k == "CLAUDE_CODE_SESSION_ID")
+                .then(|| raw.map(String::from))
+                .flatten()
+        })
+        .unwrap();
         match want {
             Some(tag) => assert_eq!(row["session"], *tag, "{raw:?}: {row}"),
             None => assert!(row.get("session").is_none(), "{raw:?}: {row}"),
         }
-        assert_eq!(row["cmd"], "callgraph");
     }
+}
+
+#[test]
+fn test_record_cli_use_skips_a_hook_internal_run() {
+    // The hooks' own answer runs set CODE_GRAPH_INTERNAL=1: deliveries, not
+    // calls. Until the env became a parameter no test could set it safely.
+    let internal = |v: &'static str| move |k: &str| (k == "CODE_GRAPH_INTERNAL").then(|| v.into());
+    assert!(recorded_row(internal("1")).is_none());
+    assert!(recorded_row(internal("0")).is_some());
+    assert!(recorded_row(|_| None).is_some());
+}
+
+/// D#351: `dir.is_dir()` follows a symlink, so a cloned `.code-graph ->
+/// elsewhere` received this log (and its rotation) outside the project.
+/// `append_owned` judges only the final component; recommendation-log.js
+/// refuses the symlinked directory itself.
+#[cfg(unix)]
+#[test]
+fn record_cli_use_refuses_a_symlinked_code_graph_dir() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let outside = dir.path().join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(CODE_GRAPH_DIR)).unwrap();
+
+    record_cli_use_with_env(&root, "callgraph", None, |_| None);
+
+    let left: Vec<_> = std::fs::read_dir(&outside).unwrap().collect();
+    assert!(left.is_empty(), "written through the link: {left:?}");
+    // Positive control: a real directory in the same layout gets the row.
+    assert!(recorded_row(|_| None).is_some());
 }
 
 #[test]

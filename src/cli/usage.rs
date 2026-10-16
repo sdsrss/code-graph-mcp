@@ -31,24 +31,26 @@ pub fn session_tag(raw: Option<&str>) -> Option<String> {
 /// the installed binary in the transcripts of the same 20 days). `None` skips
 /// that check.
 pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
-    let session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-    record_cli_use_in_session(project_root, cmd, exe, session.as_deref());
+    record_cli_use_with_env(project_root, cmd, exe, |k| std::env::var(k).ok());
 }
 
-/// [`record_cli_use`] with the session id passed in rather than read from
-/// `CLAUDE_CODE_SESSION_ID`, so each session value is testable without
-/// mutating the process environment.
-pub fn record_cli_use_in_session(
+/// [`record_cli_use`] with the environment passed in as a lookup, so a test
+/// pins the variable names it reads (`CODE_GRAPH_INTERNAL`,
+/// `CLAUDE_CODE_SESSION_ID`) without mutating the process environment.
+pub fn record_cli_use_with_env(
     project_root: &Path,
     cmd: &str,
     exe: Option<&Path>,
-    session: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
 ) {
-    if std::env::var("CODE_GRAPH_INTERNAL").ok().as_deref() == Some("1") {
+    if env("CODE_GRAPH_INTERNAL").as_deref() == Some("1") {
         return;
     }
     let dir = project_root.join(CODE_GRAPH_DIR);
-    if !dir.is_dir() {
+    // `is_dir` follows a symlink: a cloned `.code-graph -> elsewhere` would get
+    // this log and its rotation outside the project (D#351), which
+    // `append_owned` cannot see, since it judges only the final component.
+    if !dir.is_dir() || crate::utils::owned::reject_symlinked_dir(&dir).is_err() {
         return;
     }
     // Opt-in per-project metrics silence. A `.code-graph/.no-metrics` sentinel marks
@@ -85,7 +87,7 @@ pub fn record_cli_use_in_session(
     });
     // The statusline counts this session's calls by this tag (and its hook
     // answers by the same tag, written by recommendation-log.js).
-    if let Some(tag) = session_tag(session) {
+    if let Some(tag) = session_tag(env("CLAUDE_CODE_SESSION_ID").as_deref()) {
         line["session"] = serde_json::Value::String(tag);
     }
     // `.code-graph/recommendations.jsonl` is opened by fixed name inside a

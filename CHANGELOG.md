@@ -17,8 +17,9 @@ line, a read-fanout overview, a subagent's index facts, and a Stop check.
 Advice without an answer is not counted, and neither is what the prompt hook
 or SessionStart adds, since they record nothing. **calls** counts the
 `code-graph-mcp` queries Claude ran itself (`callgraph`, `impact`, `show`,
-`grep`, …; not `health-check`, `stats` or `--version`); the plugin's own
-answer runs are not among them. Nothing is added while both are 0.
+`grep`, …; not `health-check`, `stats` or `--version`), including a query's
+`--help` and a query that fails; the plugin's own answer runs are not among
+them. Nothing is added while both are 0.
 `CODE_GRAPH_STATUSLINE_COUNTS=0` turns the counts off.
 
 To tell sessions apart, every row in `.code-graph/recommendations.jsonl`, from
@@ -28,7 +29,16 @@ A row without a UUID-shaped id carries none. `code-graph-mcp stats` reads the
 same rows as before. The statusline reads at most the last 512 KB of that log
 (about 4,900 rows) and refuses a symlink, a hard link or a FIFO in its place
 or in place of `.code-graph`. So the counts cover this session's rows within
-that window: in a session that has written more, they can go down.
+that window: once this session, or other sessions in the same project, have
+written more than that, they can go down.
+
+### The CLI no longer writes its log through a symlinked `.code-graph`
+
+Each query command appends a row to `.code-graph/recommendations.jsonl`.
+When `.code-graph` itself was a symlink, as a cloned repository can carry,
+the row, and the log's rotation, landed in the directory it pointed to,
+outside the project. The CLI now writes nothing there, as the hooks
+(`recommendation-log.js`) and the index already refused.
 
 ### A grep that missed names the definition's lines, not a command to run
 

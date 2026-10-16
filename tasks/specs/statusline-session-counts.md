@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 2
+revision: 3
 ---
 
 # Statusline: what code-graph did in this session
@@ -94,3 +94,11 @@ None.
   are not counted; the 512 KB window can lower the count. Left: counts also on
   an unhealthy (✗) report; a frame read during rotation shows none; a rewrite
   the user rejects at the permission prompt still counts (unverified).
+- r3 (2026-10-16): D#352 first item. `record_cli_use_with_env` takes the env
+  as a lookup, so tests pin both names it reads (`CLAUDE_CODE_SESSION_ID`,
+  `CODE_GRAPH_INTERNAL`; the latter had no test at all); each misspelling
+  mutation turns its test red. D#351 in the same function: a symlinked
+  `.code-graph` is refused (`reject_symlinked_dir`), RED first (the row
+  landed in the link's target). Measured with a copy of the release build
+  in a Claude Code Bash child: `callgraph --help` and a failed query each
+  record a call, stamped with this session's tag; CHANGELOG says so.
