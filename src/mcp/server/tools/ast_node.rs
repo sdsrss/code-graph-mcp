@@ -229,17 +229,12 @@ impl McpServer {
             if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), sym)? {
                 return Ok(crate::resolve::ambiguity_response(sym, &cands));
             }
-            let candidates = queries::get_nodes_with_files_by_symbol(self.db.conn(), sym)?;
-            let non_test: Vec<_> = candidates
-                .iter()
-                .filter(|nf| crate::resolve::is_selectable_definition(&nf.file_path))
-                .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
-                .collect();
-            // `detect_ambiguity` already returned above for >1, so this is 0 or 1.
-            return match non_test.first() {
+            // The same candidates `detect_ambiguity` counted, so 0 or 1 here.
+            let preferred = crate::resolve::preferred_definitions(self.db.conn(), sym)?;
+            return match preferred.first() {
                 None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
                 Some(nf) => {
-                    let nid = nf.node.id;
+                    let nid = nf.node_id;
                     let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, context_lines, compact, impact_conf_rank)?;
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;

@@ -7381,6 +7381,60 @@ app.post('/api/login', handleLogin);
         assert_eq!(result["name"], "d240_target", "{result}");
     }
 
+    /// E2E 2026-10-16 round 2 (verification QA, P0-1/P2-4): once a README
+    /// heading stopped counting as ambiguity beside code, `get_ast_node Flask`
+    /// answered with the README's `# Flask` (the lowest id of a list that still
+    /// held it) and `find_references Flask` still refused over it. Both take
+    /// the definition the CLI takes: the class, not the heading or the
+    /// constructor beside it.
+    #[test]
+    fn test_symbol_tools_take_the_code_definition_over_a_heading_or_constructor() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("README.md"), "# Widget\n\nDocs.\n").unwrap();
+        std::fs::write(
+            project.path().join("src/widget.py"),
+            "class Widget:\n    def __init__(self, n):\n        self.n = n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("src/app.py"),
+            "from widget import Widget\n\n\ndef build():\n    return Widget(1)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("src/Owner.java"),
+            "public class Owner {\n  public Owner() {}\n  public int id() { return 1; }\n}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let call = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone()
+        };
+        for (name, file, ty) in [
+            ("Widget", "src/widget.py", "class"),
+            ("Owner", "src/Owner.java", "class"),
+        ] {
+            let r = call("get_ast_node", json!({"symbol_name": name}));
+            assert_ne!(r["isError"], json!(true), "{name}: {r}");
+            let node: serde_json::Value =
+                serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(node["file_path"], file, "{name}: {node}");
+            assert_eq!(node["type"], ty, "{name}: {node}");
+        }
+        let r = call("find_references", json!({"symbol_name": "Widget"}));
+        assert_ne!(r["isError"], json!(true), "{r}");
+        assert!(
+            r["content"][0]["text"].as_str().unwrap().contains("build"),
+            "{r}"
+        );
+    }
+
     /// E2E 2026-10-16 round 2: get_ast_node's impact counted pruned edges into
     /// its deepest (third) layer of callers, whose callers lie past the depth at
     /// any floor — same overcount as `cmd_impact`.

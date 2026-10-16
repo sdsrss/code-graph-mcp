@@ -360,7 +360,15 @@ impl McpServer {
             if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), name)? {
                 return Ok(crate::resolve::ambiguity_response(name, &cands));
             }
-            match queries::get_first_node_id_by_name(self.db.conn(), name)? {
+            // The definition the ambiguity check cleared, not the lowest id (a
+            // README heading); a test-only name keeps the raw first row.
+            let preferred = crate::resolve::preferred_definitions(self.db.conn(), name)?
+                .first()
+                .map(|c| c.node_id);
+            match preferred.map_or_else(
+                || queries::get_first_node_id_by_name(self.db.conn(), name),
+                |id| Ok(Some(id)),
+            )? {
                 Some(id) => id,
                 None => return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", name)),
             }

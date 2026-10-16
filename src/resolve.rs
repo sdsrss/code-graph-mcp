@@ -174,6 +174,21 @@ pub fn identity_group_ids(
 /// refuses to and then offers `<external>` as the disambiguator — see
 /// [`is_selectable_definition`].
 pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<NameCandidate>>> {
+    let preferred = preferred_definitions(conn, name)?;
+    if preferred.len() > 1 {
+        Ok(Some(preferred))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The definitions a bare `name` selects, in index order: the candidates
+/// [`detect_ambiguity`] counts. A surface that takes "the" definition of a
+/// name must take the first of these, not the first row of a raw lookup:
+/// when only the ambiguity check used them, `get_ast_node Flask` passed it and
+/// then answered with flask's README `# Flask`, the lowest id (E2E 2026-10-16
+/// round 2).
+pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCandidate>> {
     let with_files = queries::get_nodes_with_files_by_symbol(conn, name)?;
     let non_test: Vec<NameCandidate> = with_files
         .iter()
@@ -220,11 +235,7 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
                 && typed_files.contains(&c.file_path))
         })
         .collect();
-    if non_test.len() > 1 {
-        Ok(Some(non_test))
-    } else {
-        Ok(None)
-    }
+    Ok(non_test)
 }
 
 /// [`detect_ambiguity`] under a file selector: the definitions of bare `name`

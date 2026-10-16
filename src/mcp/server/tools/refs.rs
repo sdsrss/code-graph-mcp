@@ -183,8 +183,22 @@ impl McpServer {
             (matching, symbol_name.to_string())
         } else {
             let symbol_name = symbol_name_arg.unwrap();
-            // No file_path: fuzzy resolve
-            match self.resolve_fuzzy_name(symbol_name)? {
+            // No file_path: fuzzy resolve. Candidates that all ARE the typed
+            // name, and that the exact-name check does not count as ambiguous
+            // (a README heading, a constructor beside its class), are that
+            // name: `find_references Flask` refused over flask's README h1
+            // while CLI `refs` answered (E2E 2026-10-16 round 2).
+            let fuzzy = match self.resolve_fuzzy_name(symbol_name)? {
+                FuzzyResolution::Ambiguous(cands)
+                    if cands.iter().all(|c| c.name == symbol_name)
+                        && crate::resolve::detect_ambiguity(self.db.conn(), symbol_name)?
+                            .is_none() =>
+                {
+                    FuzzyResolution::Unique(symbol_name.to_string())
+                }
+                other => other,
+            };
+            match fuzzy {
                 FuzzyResolution::Unique(resolved_name) => {
                     let all_nodes = queries::get_node_ids_by_name(self.db.conn(), &resolved_name)?;
                     let total = all_nodes.len();

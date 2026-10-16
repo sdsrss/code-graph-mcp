@@ -109,7 +109,16 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
-        match queries::get_first_node_id_by_name(conn, symbol)? {
+        // The definition the ambiguity check just cleared, not the lowest id
+        // (flask's README `# Flask`); a name with only test definitions keeps
+        // the raw first row.
+        let preferred = crate::resolve::preferred_definitions(conn, symbol)?
+            .first()
+            .map(|c| c.node_id);
+        match preferred.map_or_else(
+            || queries::get_first_node_id_by_name(conn, symbol),
+            |id| Ok(Some(id)),
+        )? {
             Some(id) => (id, symbol.to_string()),
             None => {
                 if json_mode {
