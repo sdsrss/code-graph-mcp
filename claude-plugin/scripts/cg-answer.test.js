@@ -563,9 +563,9 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
     CmdSig: [row({ name: 'CmdSig', signature: '(cmd = "code-graph-mcp callgraph X")' })],
     RetOnly: [row({ name: 'RetOnly', signature: 'char', param_types: null, return_type: 'char' })],
     NoSig: [row({ name: 'NoSig', signature: null, param_types: null })],
-    // A qualified name can carry its declaration's whitespace (C++, Go):
-    // what a line reader splits on (U+0085, U+001C-1E, newline) collapses.
-    Nel: [row({ name: 'Guide\u0085 to\n api.Nel', type: 'heading', signature: null })],
+    // A qualified name can carry its declaration's whitespace (C++): what a
+    // line reader splits on (U+0085, U+001C-1E, newline) collapses.
+    Nel: [row({ name: 'Guide\u0085 to\n api.Nel', type: 'method', signature: null })],
     Ctrl: [row({ name: 'a\u001cb\u001ec.Ctrl', signature: '(a,\u001c b,\u001e c)' })],
     LongRet: [row({ name: 'LongRet', signature: `${'std::map<std::string, '.repeat(7)}int> (int a)`, param_types: '(int a)', return_type: 'x' })],
   };
@@ -599,7 +599,7 @@ process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
       ['CmdSig', { status: 'hits', start: 10, end: 20, label: 'function CmdSig' }],
       ['RetOnly', { status: 'hits', start: 10, end: 20, label: 'function RetOnly' }],
       ['NoSig', { status: 'hits', start: 10, end: 20, label: 'function NoSig' }],
-      ['Nel', { status: 'hits', start: 10, end: 20, label: 'heading Guide to api.Nel' }],
+      ['Nel', { status: 'hits', start: 10, end: 20, label: 'method Guide to api.Nel' }],
       ['Ctrl', { status: 'hits', start: 10, end: 20, label: 'function a b c.Ctrl' }],
       ['LongRet', { status: 'hits', start: 10, end: 20, label: 'function LongRet' }],
       ['Twins', { status: 'several' }],

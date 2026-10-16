@@ -559,8 +559,8 @@ function runCallgraphAnswer(opts = {}) {
   }
 }
 
-// A definition label longer than this is cut (a C++ or Go qualified name keeps
-// its declaration's text).
+// A definition label longer than this is cut (a C++ qualified name keeps its
+// declaration's text).
 const DEFINITION_LABEL_MAX = 160;
 
 /**
@@ -570,7 +570,8 @@ const DEFINITION_LABEL_MAX = 160;
  * place of a command to run (tasks/specs/outside-path-definition-answer.md):
  * the model's next step after that pointer was a read of the definition, not
  * a code-graph call (0 of 45 such pointers was followed by a code-graph call
- * within 10 tool calls; 23 by a read of the defining file).
+ * within 10 tool calls; 23 by a Read of the defining file or a Bash/Grep call
+ * naming it).
  *
  * `label` is `<type> <name>` on one line, whitespace collapsed, at most
  * DEFINITION_LABEL_MAX characters (`…` when cut). No signature: each

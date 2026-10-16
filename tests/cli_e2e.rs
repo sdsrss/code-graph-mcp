@@ -10530,16 +10530,27 @@ fn an_installed_copy_stamps_the_session_and_skips_internal_runs() {
     std::fs::create_dir(&cg).unwrap();
     let rec = cg.join("recommendations.jsonl");
     let run = |internal: &str| {
-        let out = Command::new(&copy)
-            .current_dir(project.path())
+        let mut cmd = Command::new(&copy);
+        cmd.current_dir(project.path())
             .args(["callgraph", "--help"])
             .env(
                 "CLAUDE_CODE_SESSION_ID",
                 "cde9a42e-defc-4eb5-8f4b-6e2294ae206e",
             )
-            .env("CODE_GRAPH_INTERNAL", internal)
-            .output()
-            .unwrap();
+            .env("CODE_GRAPH_INTERNAL", internal);
+        // A fresh copy can be busy (ETXTBSY, 2 runs in 40 where /tmp is not
+        // the target's filesystem): a child another test thread forked while
+        // the copy was open for writing holds that handle until it execs.
+        let mut busy = 0;
+        let out = loop {
+            match cmd.output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 100 => {
+                    busy += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => break r.unwrap(),
+            }
+        };
         assert!(out.status.success(), "{out:?}");
         std::fs::read_to_string(&rec).unwrap_or_default()
     };
