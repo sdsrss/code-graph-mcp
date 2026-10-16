@@ -35,9 +35,12 @@ v0.127.0 的 CHANGELOG 写明：符号链接的 `.code-graph` 会被拒绝（exi
 ## 决策与进展
 
 - 拒绝而不是警告：0.127.0 已经把"拒绝"写进文档，MCP server 从那时起也一直拒绝。
-- doctor 那一行标 `advisory`，不给 `fixId`：要不要删链接由用户决定
-  （链接可能是用户有意建的），doctor 不替用户做。
-  这一行仍然是 `warn`，并带上完整消息。
+- doctor 那一行：链接要不要删由用户决定，doctor 不替用户删。
+  最初标成 `advisory`、不给 `fixId`。第 2 轮评审 F1 推翻了这个做法：
+  `advisory` 的定义是"本工具无法处理、且并没有坏"，而这个项目确实坏了；
+  0.170.0 在 4 种形态下 exit 1，标成 `advisory` 后变成了 exit 0。
+  现在改为 `error`，给 `fixId: code-graph-dir-refused`，修复动作只打印指引、不算修复，
+  所以链接修好之前 doctor 一直 exit 1。
 - 第 1 轮评审（新开的子代理，审 d8b4e367）：F1 High（doctor 判成 binary-broken）、
   F2 Medium（状态栏显示 offline）、F3 Medium（`--format json` 拒绝时 stdout 为 0 字节），
   在 d8b4e367 之后修复。
@@ -55,6 +58,17 @@ v0.127.0 的 CHANGELOG 写明：符号链接的 `.code-graph` 会被拒绝（exi
 要求：不做无意义的重构；不改变项目目标和核心设计；每处修改都要能说明原因；
 优先修真实使用中影响用户的问题；不确定时按上下文做出判断后继续推进；
 测试产生的文件要清理掉。
+
+- 第 2 轮评审（新开的子代理，审 ca6cd141）：F1、F2、F3 为 Medium。
+  F1 按上面的做法修复。F2（"used to" 那句在 0.170.0 上不成立）和
+  F3（pin-back 会被 auto-update 撤销）改 CHANGELOG。
+  F4 Low（普通文件或 FIFO 形态没有测试）补了测试；F6、F7、F8 改 CHANGELOG。
+  F5、F9、F10、F11、F12 不修：
+  - F5：新 JS 配旧二进制只是过渡期的状态。
+  - F9：sessionCounts 的守卫被新的检查前置，变成了多余的一层防护。
+  - F10：只影响 dev 模式 binary-broken 分支里给出的提示，被拒绝的项目已经走不到那个分支。
+  - F11：0.170.0 起就是这样，已写进 Not covered。
+  - F12：只是 Info。
 
 ## 验证记录
 

@@ -13198,7 +13198,7 @@ fn dir_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec
 /// stdout: doctor and the statusline parse stdout and route on `reason`, and an
 /// unparseable stdout read as "binary broken" and "offline" (D#358 review).
 #[cfg(unix)]
-fn assert_health_json_refused(project: &TempDir) {
+fn assert_health_json_refused(project: &TempDir, why: &str) {
     for flag in [&["--format", "json"][..], &["--json"][..]] {
         let mut args = vec!["health-check"];
         args.extend_from_slice(flag);
@@ -13210,10 +13210,8 @@ fn assert_health_json_refused(project: &TempDir) {
         assert_eq!(v["healthy"], false, "{args:?}: {v}");
         assert_eq!(v["reason"], "refused", "{args:?}: {v}");
         assert!(
-            v["issue"]
-                .as_str()
-                .is_some_and(|m| m.contains("refusing to use a symlinked") && m.ends_with("re-run")),
-            "{args:?}: the whole message, action included: {v}"
+            v["issue"].as_str().is_some_and(|m| m.contains(why)),
+            "{args:?}: the whole message: {v}"
         );
     }
 }
@@ -13282,7 +13280,7 @@ fn test_cli_refuses_a_symlinked_code_graph_holding_an_index() {
     assert!(stdout.contains("only_here.ts"), "{stdout}");
     assert!(stderr.contains("refusing to use a symlinked"), "{stderr}");
     assert!(!stderr.contains("corrupt"), "{stderr}");
-    assert_health_json_refused(&project);
+    assert_health_json_refused(&project, "refusing to use a symlinked");
 
     let after = dir_snapshot(&outside);
     assert_eq!(
@@ -13338,6 +13336,32 @@ fn test_cli_refuses_a_symlinked_code_graph_with_no_index_yet() {
             "{args:?} must name the reason: {stdout}{stderr}"
         );
     }
-    assert_health_json_refused(&project);
+    assert_health_json_refused(&project, "refusing to use a symlinked");
     assert!(status.exists(), "a file outside the project was removed");
+}
+
+/// D#358, the other shapes `reject_symlinked_dir` refuses: a `.code-graph` that
+/// exists and is not a directory. A query said "No index found" and
+/// `health-check --format json` answered `no_index` with exit 0; both now refuse.
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_code_graph_that_is_not_a_directory() {
+    for shape in ["file", "fifo"] {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+        if shape == "file" {
+            std::fs::write(&cg, "not a directory").unwrap();
+        } else {
+            let made = Command::new("mkfifo").arg(&cg).status().unwrap();
+            assert!(made.success(), "mkfifo {}", cg.display());
+        }
+        let (stdout, stderr, code) = run_cli(&project, &["show", "anything"]);
+        assert_ne!(code, 0, "{shape}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("exists and is not a directory"),
+            "{shape}: {stderr}"
+        );
+        assert_health_json_refused(&project, "exists and is not a directory");
+    }
 }

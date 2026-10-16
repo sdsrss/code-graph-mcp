@@ -572,12 +572,30 @@ test('a refused .code-graph is reported with its whole message, not as a broken 
   const rows = healthRows('/bin/code-graph-mcp', { runHealthCheck });
   const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
   assert.ok(rows.every((r) => r.fixId !== 'binary-broken'), JSON.stringify(rows));
-  // The link may be the user's own: removing it is theirs to do, so no repair
-  // runs, and the row does not pin doctor at exit 1 forever.
-  assert.ok(rows.every((r) => !r.fixId), JSON.stringify(rows));
-  assert.equal(byName.Index.status, 'warn');
-  assert.equal(byName.Index.advisory, true);
   assert.equal(byName.Index.detail, issue, 'the whole message, the action included — not cut at 100 chars');
+  // Broken, not advisory: every command refuses this project, so doctor must
+  // not exit 0 as it does for a healthy one. The user clears it by removing the
+  // link, so the exit code is not stuck at 1 for good.
+  assert.equal(byName.Index.status, 'error');
+  assert.notEqual(byName.Index.advisory, true);
+  assert.equal(byName.Index.fixId, 'code-graph-dir-refused');
+
+  // The repair arm only says what to do: the link may be the user's own, so
+  // removing it is theirs. It never counts as fixed, so the issue stays
+  // unresolved (exit 1) until the link is gone — and it runs nothing.
+  const { runRepairs, unresolvedCount } = require('./doctor');
+  const logged = [];
+  const origLog = console.log;
+  console.log = (...a) => logged.push(a.join(' '));
+  let fixed;
+  try {
+    fixed = runRepairs([byName.Index]);
+  } finally {
+    console.log = origLog;
+  }
+  assert.equal(fixed, 0);
+  assert.equal(unresolvedCount({ checkOnly: false, issueCount: 1, fixed }), 1);
+  assert.match(logged.join('\n'), /\.code-graph/, `the arm must say what to remove: ${logged.join('\n')}`);
   // Zeroed counters from an index nobody read are not a measurement.
   assert.equal(byName.Schema.status, 'skip');
   assert.equal(byName.Embeddings.status, 'skip');

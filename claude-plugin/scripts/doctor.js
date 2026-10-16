@@ -157,13 +157,13 @@ function classifyHealthReport(hc) {
   }
   // The binary refused `.code-graph` itself: a symlink, which a cloned repo can
   // carry, or not a directory (D#358). Nothing was read, and the message names
-  // the action. No fixId: the link may be the user's own, so removing it is
-  // theirs to do — and `advisory`, so a row with no repair does not hold doctor
-  // at exit 1.
+  // the action. Broken, so not advisory: every command refuses this project.
+  // Its repair arm only says what to do (the link may be the user's own), so it
+  // stays unresolved, and doctor exits 1, until `.code-graph` is fixed.
   if (hc.reason === 'refused') {
     return [
       { name: 'Schema', status: 'skip', detail: 'index not read' },
-      { name: 'Index', status: 'warn', advisory: true, detail: String(hc.issue || 'refused .code-graph') },
+      { name: 'Index', status: 'error', detail: String(hc.issue || 'refused .code-graph'), fixId: 'code-graph-dir-refused' },
       { name: 'Embeddings', status: 'skip', detail: 'index not read' },
     ];
   }
@@ -1357,6 +1357,14 @@ function runRepairs(results, {
       case 'schema-mismatch': {
         console.log('\n  Schema migration happens automatically when the binary runs.');
         console.log('  If binary is older than DB, update the binary first.');
+        break;
+      }
+
+      // Guidance only, never `fixed++`: removing a link the user may have made
+      // is theirs to do. The row stays unresolved until they have.
+      case 'code-graph-dir-refused': {
+        console.log('\n  .code-graph is a symlink or not a directory, so code-graph will not use it.');
+        console.log('  Remove it (or move the real directory back into the project), then re-run.');
         break;
       }
 
