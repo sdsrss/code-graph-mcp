@@ -253,6 +253,12 @@ impl CliContext {
         // a local index. Paths/line numbers in answers are the main checkout's,
         // same contract as the JS hooks/statusline side.
         let project_root = &effective_read_root(project_root);
+        // A reader writes too: the query-time freshness pass drops and
+        // re-indexes rows. Through a symlinked `.code-graph` it answered from,
+        // and edited, an index outside the project — four queries took a
+        // 5-file index there down to 1 (D#358). Refused here, as the index
+        // creators refuse it.
+        crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             anyhow::bail!(
@@ -280,6 +286,8 @@ impl CliContext {
     pub fn try_open(project_root: &Path) -> Option<Self> {
         // Same read-side worktree fallback as open() above.
         let project_root = &effective_read_root(project_root);
+        // Same refusal as open_inner; grep says why when it gets None.
+        crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR)).ok()?;
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             return None;

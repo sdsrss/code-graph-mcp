@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Every CLI command that reads `.code-graph` refuses a symlinked one
+
+0.127.0 made a symlinked `.code-graph` an error (exit 1), but only the commands
+that create or replace the index checked for one. With `.code-graph ->
+../outside` holding an index, the query commands answered from that index, and
+their freshness pass edited it: `show`, `callgraph`, `impact` and `search`, one
+run each, took a 5-file index there down to 1. `incremental-index` re-indexed
+it as this project, and before reaching the index it removed a stale
+`indexing-status.json` there. `stats` reported the logs it found there.
+
+The query commands, `health-check` in both formats, `incremental-index` and
+`stats` now exit 1 with `refusing to use a symlinked <path> — remove it and
+re-run`, and leave the directory as they found it. `grep` still prints its
+plain-grep results, and says why they carry no AST context.
+
+If you linked `.code-graph` elsewhere on purpose, move the directory back into
+the project; the MCP server, `rebuild-index` and `reindex` have refused the link
+since 0.127.0. In a linked worktree with no index of its own, the query
+commands already read the main checkout's index without a link. Not covered: a symlinked `index.db` inside a
+real `.code-graph` directory is still opened through the link.
+
 ## 0.170.0
 
 **Upgrading: nothing to do; the index is kept** (`INDEX_VERSION` is

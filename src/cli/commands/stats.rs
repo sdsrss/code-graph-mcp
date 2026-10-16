@@ -573,6 +573,9 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     let json_mode = args.json;
     let last_n = args.last;
 
+    // A symlinked `.code-graph` would report another directory's logs as
+    // this project's (D#358).
+    crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
     // A missing file is read as empty rather than short-circuiting here. Both
     // empty legs used to return their own hand-written envelope — three keys of

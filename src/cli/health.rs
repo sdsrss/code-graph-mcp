@@ -236,9 +236,11 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         // formats, opposite verdicts, and doctor.js consumes the JSON one, so
         // every worktree showed a phantom broken install (audit 2026-08-02
         // MED-3).
-        let db_path = effective_read_root(project_root)
-            .join(CODE_GRAPH_DIR)
-            .join("index.db");
+        let cg_dir = effective_read_root(project_root).join(CODE_GRAPH_DIR);
+        // Before the no_index answer, so both formats give the refusal that
+        // CliContext::open_for_status gives (D#358).
+        crate::utils::owned::reject_symlinked_dir(&cg_dir)?;
+        let db_path = cg_dir.join("index.db");
         if !db_path.exists() {
             let payload = serde_json::json!({
                 "healthy": false,

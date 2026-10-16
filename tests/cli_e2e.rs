@@ -13176,3 +13176,142 @@ fn test_cli_same_named_callers_in_one_file_are_counted_apart() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["direct_callers"], 2, "A.run and B.run: {v}");
 }
+
+/// Every file directly in `dir`, name → bytes. The whole listing, so a sidecar
+/// a command creates there (`index-run.lock`, `-wal`, `-shm`) shows up as a
+/// difference as surely as a rewritten `index.db`.
+#[cfg(unix)]
+fn dir_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// D#358: `.code-graph -> ../outside` holding another project's index. A query
+/// opened that index and its freshness pass dropped the rows for files this
+/// project does not have; `incremental-index` re-indexed it as this project and
+/// left `index-run.lock` and the WAL pair there. 0.127.0 documented a
+/// symlinked `.code-graph` as refused (exit 1); only the index-creating paths
+/// did. Every CLI door that reads the data directory refuses it now: the
+/// `CliContext` opens (query, vector, status), grep's `try_open`, the
+/// incremental path and `stats`.
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_symlinked_code_graph_holding_an_index() {
+    let other = setup_indexed_project();
+    let outside = other.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::write(
+        outside.join("usage.jsonl"),
+        "{\"type\":\"session_end\",\"session\":\"s1\",\"tool_calls\":3}\n",
+    )
+    .unwrap();
+    // Positive control: the same commands answer from this index when it is
+    // the project's own, so a refusal below is the link, not a broken fixture.
+    let (stdout, stderr, code) = run_cli(&other, &["show", "validateToken"]);
+    assert_eq!(code, 0, "control: {stdout}{stderr}");
+    let before = dir_snapshot(&outside);
+
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/only_here.ts"),
+        "export function onlyHere(): number { return 1; }\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR),
+    )
+    .unwrap();
+
+    let refused: &[&[&str]] = &[
+        &["show", "validateToken"],
+        &["callgraph", "validateToken"],
+        &["impact", "validateToken"],
+        &["search", "validateToken"],
+        &["similar", "validateToken"],
+        &["health-check"],
+        &["health-check", "--format", "json"],
+        &["stats"],
+        &["incremental-index", "--no-embed"],
+    ];
+    for args in refused {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?} must refuse: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("refusing to use a symlinked"),
+            "{args:?} must name the reason: {stdout}{stderr}"
+        );
+    }
+    // grep keeps its plain-grep fallback (the source files are this project's
+    // own) and says why there is no AST context, not "corrupt or unreadable".
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "onlyHere"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("only_here.ts"), "{stdout}");
+    assert!(stderr.contains("refusing to use a symlinked"), "{stderr}");
+    assert!(!stderr.contains("corrupt"), "{stderr}");
+
+    let after = dir_snapshot(&outside);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "a command created or removed a file outside the project"
+    );
+    for (name, bytes) in &before {
+        assert!(
+            after[name] == *bytes,
+            "{name} outside the project was rewritten"
+        );
+    }
+}
+
+/// D#358, the empty-target half: `.code-graph -> ../outside` with no index
+/// there yet. `health-check --format json` answered `no_index` from a
+/// short-circuit ahead of the open the oneline format refuses in, and
+/// `incremental-index` removed a stale `indexing-status.json` there before its
+/// full-index path refused the link.
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_symlinked_code_graph_with_no_index_yet() {
+    let dir = TempDir::new().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let status = outside.join(code_graph_mcp::indexer::pipeline::INDEXING_STATUS_FILE);
+    std::fs::write(&status, "{\"s\":\"indexing\",\"d\":1,\"t\":2}").unwrap();
+    // Older than INDEXING_STATUS_STALE_SECS, so the sweep would take it.
+    std::fs::File::options()
+        .write(true)
+        .open(&status)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let project = TempDir::new_in(dir.path()).unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR),
+    )
+    .unwrap();
+
+    for args in [
+        &["health-check", "--format", "json"][..],
+        &["incremental-index", "--no-embed"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?} must refuse: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("refusing to use a symlinked"),
+            "{args:?} must name the reason: {stdout}{stderr}"
+        );
+    }
+    assert!(status.exists(), "a file outside the project was removed");
+}

@@ -392,6 +392,11 @@ pub fn cmd_incremental_index_opts(
     json: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
+    // First, not inside the existing-index branch: the lock probe and the stale
+    // `indexing-status.json` removal below already act inside the directory.
+    // build_full_index_at refused a symlinked `.code-graph`; an index already
+    // there was re-indexed as this project (D#358).
+    crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR));
     // Covers the incremental path too, not just the full-index one inside

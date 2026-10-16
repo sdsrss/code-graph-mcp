@@ -1048,10 +1048,11 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // found" true by the time it printed. Readers no longer delete, so the
         // file survives and that sentence became false: it names the wrong
         // state and points at the wrong file. Distinguish by asking the disk.
-        let db_path = effective_read_root(project_root)
-            .join(CODE_GRAPH_DIR)
-            .join("index.db");
-        if db_path.exists() {
+        let cg_dir = effective_read_root(project_root).join(CODE_GRAPH_DIR);
+        let db_path = cg_dir.join("index.db");
+        if let Err(e) = crate::utils::owned::reject_symlinked_dir(&cg_dir) {
+            eprintln!("[code-graph] {e}");
+        } else if db_path.exists() {
             eprintln!(
                 "[code-graph] Index at {} could not be read (corrupt or unreadable). \
                  Run: code-graph-mcp rebuild-index --confirm",
