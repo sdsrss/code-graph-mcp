@@ -2,26 +2,50 @@
 
 ## Unreleased
 
+**Upgrading: nothing to do unless a project's `.code-graph` is a symlink, a
+file or a FIFO** (`INDEX_VERSION` is unchanged). Such a project now gets a
+refusal from every command that reads it, where it used to get answers from,
+and edits to, the directory the link points at. To pin back:
+`npm i -g @sdsrs/code-graph@0.170.0`, or `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.170.0`; plugin users, whose
+hooks, statusline and doctor come from the plugin, can set the version in the
+marketplace entry.
+
 ### Every CLI command that reads `.code-graph` refuses a symlinked one
 
 0.127.0 made a symlinked `.code-graph` an error (exit 1), but only the commands
 that create or replace the index checked for one. With `.code-graph ->
 ../outside` holding an index, the query commands answered from that index, and
-their freshness pass edited it: `show`, `callgraph`, `impact` and `search`, one
-run each, took a 5-file index there down to 1. `incremental-index` re-indexed
-it as this project, and before reaching the index it removed a stale
-`indexing-status.json` there. `stats` reported the logs it found there.
+their freshness pass dropped from it the files this project does not have.
+`incremental-index` re-indexed it as this project, and before reaching the
+index it removed a stale `indexing-status.json` there. `stats` reported the
+logs it found there.
 
-The query commands, `health-check` in both formats, `incremental-index` and
-`stats` now exit 1 with `refusing to use a symlinked <path> — remove it and
-re-run`, and leave the directory as they found it. `grep` still prints its
-plain-grep results, and says why they carry no AST context.
+The query commands, `health-check`, `incremental-index` and `stats` now exit 1
+with `refusing to use a symlinked <path> — remove it and re-run`, and leave the
+directory as they found it. A `.code-graph` that is a regular file or a FIFO
+is refused the same way, with `<path> exists and is not a directory`, where
+these commands used to say `No index found`. `health-check --format json` (and
+`--json`) prints a report with `"reason": "refused"` and the message in
+`issue`, then exits 1. `grep` still prints its plain-grep results, and says
+why they carry no AST context.
+
+The plugin follows suit. `doctor` shows the message on its Index line and
+offers no repair, since the link may be yours; it used to call the refusal a
+broken binary and re-download one. The statusline shows `code-graph: ✗
+.code-graph refused (see health-check)` instead of the progress and index
+counts of the directory the link points at.
 
 If you linked `.code-graph` elsewhere on purpose, move the directory back into
 the project; the MCP server, `rebuild-index` and `reindex` have refused the link
 since 0.127.0. In a linked worktree with no index of its own, the query
-commands already read the main checkout's index without a link. Not covered: a symlinked `index.db` inside a
-real `.code-graph` directory is still opened through the link.
+commands already read the main checkout's index without a link.
+
+### Not covered
+
+A symlinked `index.db` inside a real `.code-graph` directory is still opened
+through the link. The hooks still read `source-roots.json` and
+`recommendations.jsonl` through a symlinked `.code-graph`.
 
 ## 0.170.0
 

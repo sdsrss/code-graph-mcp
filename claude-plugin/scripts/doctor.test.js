@@ -220,6 +220,7 @@ test('no classifyHealthReport row can gate the exit code without offering a repa
   const payloads = {
     'no-index': { reason: 'no_index' },
     corrupt: { reason: 'corrupt', integrity: { quick_check: 'malformed' } },
+    refused: { reason: 'refused', issue: 'refusing to use a symlinked /p/.code-graph — remove it and re-run' },
     'schema-mismatch': { schema_version: 9, nodes: 5, edges: 2, files: 3, issue: 'schema version mismatch' },
     'empty-index': { schema_version: 10, nodes: 0, edges: 0, files: 0 },
     healthy: { schema_version: 10, nodes: 5, edges: 2, files: 3, index_age: '1s ago' },
@@ -544,6 +545,42 @@ test('healthRows: a nonzero exit carrying a report is a DIAGNOSIS, not a broken 
     }),
   });
   assert.equal(ok.find((r) => r.name === 'Integrity').status, 'ok');
+});
+
+test('a refused .code-graph is reported with its whole message, not as a broken binary', () => {
+  // D#358. The binary refuses a `.code-graph` that is a symlink (a cloned repo
+  // can carry one) or not a directory. Its first cut bailed with stdout empty,
+  // healthRows fell through to `binary-broken`, and the repair re-downloaded a
+  // binary that ran fine and told the user to reinstall it. The binary now
+  // answers with this payload — the ACTUAL keys `health-check --format json`
+  // printed for a symlinked `.code-graph`, exit 1.
+  const { healthRows } = require('./doctor');
+  const issue = 'refusing to use a symlinked /p/.code-graph — remove it and re-run';
+  const payload = {
+    db_size_bytes: 0, edges: 0, embedding_coverage_pct: 0, embedding_progress: '0/0',
+    embedding_status: 'unavailable', files: 0, healthy: false, issue, model_available: false,
+    nodes: 0, reason: 'refused', search_mode: 'fts_only',
+    snapshot: { commit_drift: null, fetched_at: null, source_commit: null, source_url: null, status: 'absent' },
+    watching: false,
+  };
+  const runHealthCheck = () => {
+    const e = new Error('Command failed: code-graph-mcp health-check --format json');
+    e.stdout = Buffer.from(JSON.stringify(payload) + '\n');
+    e.stderr = Buffer.from('');
+    throw e;
+  };
+  const rows = healthRows('/bin/code-graph-mcp', { runHealthCheck });
+  const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.ok(rows.every((r) => r.fixId !== 'binary-broken'), JSON.stringify(rows));
+  // The link may be the user's own: removing it is theirs to do, so no repair
+  // runs, and the row does not pin doctor at exit 1 forever.
+  assert.ok(rows.every((r) => !r.fixId), JSON.stringify(rows));
+  assert.equal(byName.Index.status, 'warn');
+  assert.equal(byName.Index.advisory, true);
+  assert.equal(byName.Index.detail, issue, 'the whole message, the action included — not cut at 100 chars');
+  // Zeroed counters from an index nobody read are not a measurement.
+  assert.equal(byName.Schema.status, 'skip');
+  assert.equal(byName.Embeddings.status, 'skip');
 });
 
 test('classifyHealthReport routes a corrupt index to index-corrupt, not binary-broken', () => {

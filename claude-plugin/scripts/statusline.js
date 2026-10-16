@@ -85,6 +85,20 @@ if (!root) {
 }
 const codeGraphDir = path.join(root, '.code-graph');
 
+// The binary refuses a `.code-graph` that is a symlink (a cloned repo can carry
+// one) or not a directory (D#358). Ahead of every read below: through a link
+// the progress file and an older binary's report describe another directory's
+// index, and this binary's refusal would otherwise render as "offline".
+{
+  const { isOwnedPath } = require('./recommendation-log');
+  let st = null;
+  try { st = fs.lstatSync(codeGraphDir); } catch { /* absent: the gates below decide */ }
+  if (st && !isOwnedPath(codeGraphDir, 'dir', st, 'statusline')) {
+    process.stdout.write('code-graph: ✗ .code-graph refused (see health-check)');
+    process.exit(0);
+  }
+}
+
 // Check for background indexing progress file first
 const progressFile = path.join(codeGraphDir, 'indexing-status.json');
 try {

@@ -13194,6 +13194,30 @@ fn dir_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec
         .collect()
 }
 
+/// `health-check` in JSON answers a refusal with a report, not 0 bytes on
+/// stdout: doctor and the statusline parse stdout and route on `reason`, and an
+/// unparseable stdout read as "binary broken" and "offline" (D#358 review).
+#[cfg(unix)]
+fn assert_health_json_refused(project: &TempDir) {
+    for flag in [&["--format", "json"][..], &["--json"][..]] {
+        let mut args = vec!["health-check"];
+        args.extend_from_slice(flag);
+        let (stdout, stderr, code) = run_cli(project, &args);
+        assert_eq!(code, 1, "{args:?}: {stdout}{stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{args:?}: stdout must be one JSON object ({e}): {stdout:?}")
+        });
+        assert_eq!(v["healthy"], false, "{args:?}: {v}");
+        assert_eq!(v["reason"], "refused", "{args:?}: {v}");
+        assert!(
+            v["issue"]
+                .as_str()
+                .is_some_and(|m| m.contains("refusing to use a symlinked") && m.ends_with("re-run")),
+            "{args:?}: the whole message, action included: {v}"
+        );
+    }
+}
+
 /// D#358: `.code-graph -> ../outside` holding another project's index. A query
 /// opened that index and its freshness pass dropped the rows for files this
 /// project does not have; `incremental-index` re-indexed it as this project and
@@ -13258,6 +13282,7 @@ fn test_cli_refuses_a_symlinked_code_graph_holding_an_index() {
     assert!(stdout.contains("only_here.ts"), "{stdout}");
     assert!(stderr.contains("refusing to use a symlinked"), "{stderr}");
     assert!(!stderr.contains("corrupt"), "{stderr}");
+    assert_health_json_refused(&project);
 
     let after = dir_snapshot(&outside);
     assert_eq!(
@@ -13313,5 +13338,6 @@ fn test_cli_refuses_a_symlinked_code_graph_with_no_index_yet() {
             "{args:?} must name the reason: {stdout}{stderr}"
         );
     }
+    assert_health_json_refused(&project);
     assert!(status.exists(), "a file outside the project was removed");
 }

@@ -311,6 +311,25 @@ test('stale progress file is ignored — falls through to health check', (t) => 
   assert.equal(runStatusline(home, project), 'code-graph: ✓ 30753 nodes | 2331 files');
 });
 
+test('a refused .code-graph says so — not offline, and not the link target\'s index', (t) => {
+  // D#358. The binary refuses a `.code-graph` that is a symlink (a cloned repo
+  // can carry one) or not a directory. Through a link the segment showed the
+  // TARGET's progress and, from an older binary that follows the link, its
+  // node counts; from this binary, whose refusal printed nothing on stdout,
+  // "offline". The stub plays the older binary: if the gate is missing, its
+  // report is what renders.
+  const home = mkHome(t);
+  installStubBinary(home, { report: { healthy: true, nodes: 12, files: 5 }, exitCode: 0 });
+  const outside = mkProject(path.join(home, 'elsewhere'));
+  writeProgress(outside, { s: 'indexing', d: 3, t: 7 });
+  const project = path.join(home, 'project');
+  fs.mkdirSync(path.join(project, '.git'), { recursive: true }); // a root without an index of its own
+  fs.symlinkSync(path.join(outside, '.code-graph'), path.join(project, '.code-graph'));
+  assert.equal(runStatusline(home, project), 'code-graph: ✗ .code-graph refused (see health-check)');
+  // A `.code-graph` that is a plain file holds no index.db, so resolveProjectRoot
+  // finds no root and the segment stays empty, as for any unindexed project.
+});
+
 // ── This session's code-graph activity (tasks/specs/statusline-session-counts.md) ──
 // The user could not see code-graph working: its answers reach the model
 // silently. The segment now ends with what this session got: answers a hook
@@ -433,7 +452,8 @@ test('stale progress file is ignored — falls through to health check', (t) => 
     const real = path.join(ctx.home, 'elsewhere');
     fs.renameSync(path.join(ctx.project, '.code-graph'), real);
     fs.symlinkSync(real, path.join(ctx.project, '.code-graph'));
-    assert.equal(render(ctx), BASE);
+    // Nor for the health line: the whole segment is the refusal (D#358).
+    assert.equal(render(ctx), 'code-graph: ✗ .code-graph refused (see health-check)');
   });
 
   test('session counts: the tag inside another field of another session\'s row does not count', (t) => {

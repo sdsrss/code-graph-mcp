@@ -237,15 +237,28 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         // every worktree showed a phantom broken install (audit 2026-08-02
         // MED-3).
         let cg_dir = effective_read_root(project_root).join(CODE_GRAPH_DIR);
-        // Before the no_index answer, so both formats give the refusal that
-        // CliContext::open_for_status gives (D#358).
-        crate::utils::owned::reject_symlinked_dir(&cg_dir)?;
         let db_path = cg_dir.join("index.db");
-        if !db_path.exists() {
+        // A refused `.code-graph` (a symlink, or not a directory) is the refusal
+        // CliContext::open_for_status gives the oneline format, checked ahead of
+        // the no_index answer (D#358) — and answered with a report, not a bail:
+        // a bail left stdout empty, which doctor read as a broken binary and the
+        // statusline as "offline". Exit 1 after it, like a corrupt index.
+        let refusal = crate::utils::owned::reject_symlinked_dir(&cg_dir).err();
+        if refusal.is_some() || !db_path.exists() {
+            let (reason, issue) = match &refusal {
+                Some(e) => ("refused", e.to_string()),
+                None => (
+                    "no_index",
+                    format!(
+                        "No index found at {}. Run: code-graph-mcp incremental-index",
+                        db_path.display()
+                    ),
+                ),
+            };
             let payload = serde_json::json!({
                 "healthy": false,
-                "reason": "no_index",
-                "issue": format!("No index found at {}. Run: code-graph-mcp incremental-index", db_path.display()),
+                "reason": reason,
+                "issue": issue,
                 "nodes": 0,
                 "edges": 0,
                 "files": 0,
@@ -259,6 +272,9 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
                 "snapshot": {"status": "absent", "source_url": null, "source_commit": null, "fetched_at": null, "commit_drift": null},
             });
             println!("{}", serde_json::to_string(&payload)?);
+            if refusal.is_some() {
+                std::process::exit(1);
+            }
             return Ok(());
         }
     }

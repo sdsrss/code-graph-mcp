@@ -155,6 +155,18 @@ function classifyHealthReport(hc) {
       classifyIntegrity(hc),
     ];
   }
+  // The binary refused `.code-graph` itself: a symlink, which a cloned repo can
+  // carry, or not a directory (D#358). Nothing was read, and the message names
+  // the action. No fixId: the link may be the user's own, so removing it is
+  // theirs to do — and `advisory`, so a row with no repair does not hold doctor
+  // at exit 1.
+  if (hc.reason === 'refused') {
+    return [
+      { name: 'Schema', status: 'skip', detail: 'index not read' },
+      { name: 'Index', status: 'warn', advisory: true, detail: String(hc.issue || 'refused .code-graph') },
+      { name: 'Embeddings', status: 'skip', detail: 'index not read' },
+    ];
+  }
   const rows = [];
   if (hc.issue && String(hc.issue).includes('schema')) {
     // advisory: its "repair" only prints guidance (migration happens when the
