@@ -574,7 +574,10 @@ defaults are what you get by doing nothing.
 code-graph claims Claude Code's single `statusLine` slot and runs a **composite**
 that calls each registered provider in turn, so other plugins keep their segment
 instead of losing the slot. Whatever occupied it at install time is captured
-automatically as the `_previous` provider and restored on uninstall.
+automatically as the `_previous` provider and restored on uninstall, unless
+another plugin has registered a segment through code-graph: then the slot goes
+to that plugin, so its segment keeps rendering, and your previous command stays
+listed in `~/.claude/statusline-providers.json` for you to put back.
 
 A third-party plugin registers itself through the shipped CLI:
 
