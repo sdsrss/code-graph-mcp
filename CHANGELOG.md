@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.170.0
+
+**Upgrading: nothing to do; the index is kept** (`INDEX_VERSION` is
+unchanged). Three things change what you see. The statusline's code-graph
+segment ends with this session's counts (`| 5 answers · 2 calls`) once
+code-graph has answered or been called in the session;
+`CODE_GRAPH_STATUSLINE_COUNTS=0` turns them off. The line added after a grep
+that missed a symbol defined outside its path gives the definition's line
+range and no longer names a command. Rows in `.code-graph/recommendations.jsonl`
+gain a `session` field. To pin back: `npm i -g @sdsrs/code-graph@0.169.0`, or
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.169.0`; plugin users, whose hooks and statusline come from the plugin, can
+set the version in the marketplace entry.
 
 ### The statusline says what code-graph did in this session
 
@@ -83,6 +95,13 @@ longer reads a here-string (`<<<`) as a heredoc that hides the lines after
 it. A call inside `$( … )` or an `eval` string is still not counted: reading
 those needs quote-aware parsing, and a plain scan counted quoted text and
 commit messages as calls.
+
+### Dependencies: rustls 0.23.46
+
+rustls goes 0.23.45 → 0.23.46 for RUSTSEC-2026-0346 to -0349, which
+`cargo audit` reported from 2026-10-14. The lockfile's quinn-proto goes
+0.11.15 → 0.11.19 for RUSTSEC-2026-0338 to -0342; it is not built into
+code-graph (it sits behind a reqwest feature code-graph does not enable).
 
 ## 0.169.0
 
