@@ -85,3 +85,10 @@ v0.127.0 的 CHANGELOG 写明：符号链接的 `.code-graph` 会被拒绝（exi
 
 - d8b4e367：pre-commit 跑了 31 个套件，2237 个通过、0 个失败、7 个忽略；
   变异 M1–M6 全部变红。
+- ca6cd141 / f1c053f3：pre-commit 通过（Rust 2237 → 2238，0 个失败）；
+  完整 JS 套件 1717/1719 通过、0 个失败、2 个跳过；
+  doctor 端到端（断网）：正常项目 exit 0，被拒绝的项目在 `--check-only` 和修复模式下都 exit 1。
+- 已发布 0.170.1：tag v0.170.1 = 02ac89b9。CI 7/7；Release 10/10；Routing Bench 和 cache warm 全绿。
+  6 个 npm 包都是 0.170.1；GitHub Release 不是草稿，14 个资产，发布说明 3,477 字符。
+  用发布出来的二进制实测（`added 2 packages`，44,351,896 B）：
+  show、incremental-index、stats 都 exit 1；health JSON `refused`；链接目标的 md5 不变。
