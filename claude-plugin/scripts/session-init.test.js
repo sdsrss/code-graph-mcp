@@ -70,15 +70,15 @@ test('indexNeedsRevalidation recovers JSON from a non-zero exit (unhealthy index
   assert.equal(indexNeedsRevalidation(bin, cwd), true);
 });
 
-test('indexNeedsRevalidation true when the last index run did not finish', (t) => {
-  // E2E 2026-10-16 round 2: a startup build that died left an index short of
-  // what it was writing, and SessionStart read it as fresh. health-check now
-  // reports reason "interrupted"; the refresh it starts re-indexes in full.
+test('indexNeedsRevalidation starts no refresh when the last index run did not finish', (t) => {
+  // E2E 2026-10-16 round 3: a CLI refresh started for reason "interrupted"
+  // raced the MCP server's own startup run, which repairs it, and both failed
+  // (FOREIGN KEY / database is locked), 4 of 4.
   const { bin, cwd } = stubHealthBin(t, {
     json: JSON.stringify({ healthy: false, nodes: 3294, reason: 'interrupted', index_version_stale: false }),
     exitCode: 1,
   });
-  assert.equal(indexNeedsRevalidation(bin, cwd), true);
+  assert.equal(indexNeedsRevalidation(bin, cwd), false);
 });
 
 test('indexNeedsRevalidation false on garbage output (never forces work off a bad probe)', (t) => {

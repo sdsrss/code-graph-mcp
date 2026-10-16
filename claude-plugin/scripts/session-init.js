@@ -316,9 +316,10 @@ function indexNeedsRevalidation(bin, cwd) {
     // caller must start one — before this it read as "not stale" and every
     // hook stayed dark with no word to the user (hook audit 2026-09-28 P1-7).
     if (report.reason === 'corrupt') return 'corrupt';
-    // A run that died left the index short of what it was writing; the refresh
-    // re-indexes in full (E2E 2026-10-16 round 2).
-    if (report.reason === 'interrupted') return true;
+    // reason "interrupted" (a run died) starts nothing here: the MCP server's
+    // own startup run re-indexes in full and clears it, and a CLI run started
+    // beside it raced its writes and failed both, 4 of 4 (E2E 2026-10-16
+    // round 3).
     return report.index_version_stale === true;
   } catch {
     return false;
