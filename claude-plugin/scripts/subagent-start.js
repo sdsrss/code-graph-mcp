@@ -63,9 +63,12 @@ function runMain() {
   const input = readStdinJson();
   if (!input) return;
 
-  const { resolveProjectRoot } = require('./project-root');
+  const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
   const root = resolveProjectRoot(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd());
   if (root === null) return;
+  // A partial index's counts are no facts, and the commands below would refuse
+  // while it is built (D5, as every other hook; E2E 2026-10-16 round 2).
+  if (indexBuildInProgress(root)) return;
 
   const binary = require('./find-binary').findBinary();
   if (!binary) return;

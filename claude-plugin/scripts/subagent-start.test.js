@@ -180,3 +180,20 @@ test('e2e: silent with no index, with a failing health check, and under CODE_GRA
   assert.equal(none.status, 0);
   assert.equal(none.stdout, '');
 });
+
+test('e2e: silent while the index is being built (D5, as every other hook)', { skip: posixOnly }, (t) => {
+  // E2E 2026-10-16 round 2: at 1000/3453 files SubagentStart said "index of
+  // 1000 files … code-graph-mcp callgraph <fn>" while those queries refused
+  // with "The index is still being built". A partial index's facts are not
+  // facts, and the commands it names would refuse.
+  const sb = sandbox(t, JSON.stringify(REPORT));
+  const status = path.join(sb.project, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(status, JSON.stringify({ s: 'indexing', d: 1000, t: 3453 }));
+  const payload = { hook_event_name: 'SubagentStart', agent_type: 'Explore', cwd: sb.project };
+  const during = run(sb, payload);
+  assert.equal(during.status, 0, during.stderr);
+  assert.equal(during.stdout, '', 'nothing from a partial index');
+  fs.rmSync(status);
+  const after = run(sb, payload);
+  assert.match(JSON.parse(after.stdout).hookSpecificOutput.additionalContext, /412 files/, 'control: answers once built');
+});
