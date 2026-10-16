@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A grep that missed names the definition's lines, not a command to run
+
+When a grep finds nothing and the symbol it looked for is defined outside the
+grep's path, the PostToolUse hook adds one line saying where. That line used
+to end with `Its callers and callees: code-graph-mcp callgraph X`. In sessions
+in projects that develop neither plugin, no session ran that command after
+any of the 45 such lines between 0.164.0 and 2026-10-16. What came next,
+when anything did, was a read of the definition. The line now carries the
+definition's line range and signature:
+
+    [code-graph] X is defined in src/a.py:120-145, outside the path your grep searched (tests/): method Cls.X(self, a: int) -> str
+
+This takes one `show --json` call, made only in this case. When `show` does
+not name exactly one definition in that file (several same-named test
+fixtures, a failed or timed-out call), the line keeps the location alone and
+names no command. Run on the 61 real symbol/file pairs, 58 got lines and a
+signature, and 3 got the location; the extra call took at most 17 ms. A
+signature is shown on one line and cut at 160 characters.
+
 ### Dev tooling: plugin use in real sessions
 
 `scripts/plugin_usage.py` reads the transcripts Claude Code keeps under

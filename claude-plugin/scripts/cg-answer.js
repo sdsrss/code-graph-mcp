@@ -559,8 +559,65 @@ function runCallgraphAnswer(opts = {}) {
   }
 }
 
+// A definition label longer than this is cut: FastAPI handlers carry 900+
+// characters of `Query(...)` defaults in their signature.
+const DEFINITION_LABEL_MAX = 160;
+
+/**
+ * Where exactly `symbol` is defined in `file`: `show <symbol> --file <file>
+ * --json`, kept only when ONE row in that file carries the name (`X`, a
+ * qualified `Cls.X` or `mod::X`). The outside-path grep inject names this in
+ * place of a command to run (tasks/specs/outside-path-definition-answer.md):
+ * the model's next step after that pointer was a read of the definition, not
+ * a code-graph call (26 vs 4 of 60 real events).
+ *
+ * `label` is `<type> <name><signature>` on one line, whitespace collapsed,
+ * at most DEFINITION_LABEL_MAX characters (`…` when cut).
+ * @returns {{status: 'hits', start: number, end: number, label: string}
+ *         | {status: 'several'} | {status: 'no-hits'}
+ *         | {status: 'no-binary'} | {status: 'unavailable', reason?: 'budget'}}
+ */
+function runDefinitionAnswer(opts = {}) {
+  const { cwd, symbol, file, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
+  try {
+    if (typeof symbol !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)
+        || typeof file !== 'string' || !file) {
+      return { status: 'unavailable' };
+    }
+    const binary = resolveAnswerBinary(opts);
+    if (!binary) return { status: 'no-binary' };
+    const res = runCg(binary, ['show', symbol, '--file', file, '--json'], { cwd, timeoutMs });
+    const verdict = classifyRun(res, { exitOneIsNoHits: true });
+    if (verdict !== 'ok') {
+      return { status: verdict, ...(res.budgetExhausted ? { reason: 'budget' } : {}) };
+    }
+    let rows;
+    try {
+      rows = JSON.parse(res.stdout || '');
+    } catch {
+      return { status: 'unavailable' };
+    }
+    if (!Array.isArray(rows)) return { status: 'unavailable' };
+    const named = rows.filter((r) => r && r.file_path === file && typeof r.name === 'string'
+      && (r.name === symbol || r.name.endsWith(`.${symbol}`) || r.name.endsWith(`::${symbol}`)));
+    if (named.length === 0) return { status: 'no-hits' };
+    if (named.length > 1) return { status: 'several' };
+    const r = named[0];
+    if (!Number.isInteger(r.start_line) || !Number.isInteger(r.end_line)) return { status: 'unavailable' };
+    // A signature written one parameter per line collapses to `( a, b, )`:
+    // drop the padding inside the parentheses and the trailing comma.
+    let label = `${r.type || 'symbol'} ${r.name}${typeof r.signature === 'string' ? r.signature : ''}`
+      .replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/,? \)/g, ')').trim();
+    const chars = [...label];
+    if (chars.length > DEFINITION_LABEL_MAX) label = chars.slice(0, DEFINITION_LABEL_MAX - 1).join('') + '…';
+    return { status: 'hits', start: r.start_line, end: r.end_line, label };
+  } catch {
+    return { status: 'unavailable' };
+  }
+}
+
 module.exports = {
-  runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer,
+  runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer, runDefinitionAnswer,
   truncateAtLine, sanitizeSearchPath,
   // The one argv builder + its renderer, so the deny copy and the child process
   // cannot describe different commands.

@@ -520,6 +520,7 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
       ['show', () => runShowAnswer({ cwd: stubDir, binary: bin, symbols: ['anySymbol'] })],
       ['overview', () => runOverviewAnswer({ cwd: stubDir, binary: bin, dir: 'src' })],
       ['callgraph', () => runCallgraphAnswer({ cwd: stubDir, binary: bin, symbol: 'anySymbol' })],
+      ['definition', () => require('./cg-answer').runDefinitionAnswer({ cwd: stubDir, binary: bin, symbol: 'anySymbol', file: 'a.rs' })],
     ]) {
       const r = call();
       assert.equal(r.status, 'unavailable', `${name}: a spent budget degrades to unavailable`);
@@ -527,8 +528,79 @@ test('every runner names a spent budget as reason:budget, not a bare unavailable
         `${name}: … and must say WHY, or a spent budget reads as a broken binary`);
       checked++;
     }
-    assert.equal(checked, 4, 'vacuity floor: all four runners were exercised');
+    assert.equal(checked, 5, 'vacuity floor: all five runners were exercised');
   } finally {
     resetHookDeadline();
   }
 });
+
+// ── runDefinitionAnswer: one definition's line range and signature ──────────
+// The outside-path grep inject names where a symbol is defined. It asks
+// `show <symbol> --file <file> --json` for the lines and signature, and keeps
+// them only when exactly one definition in that file carries the name
+// (tasks/specs/outside-path-definition-answer.md, shape table). Real pairs:
+// 57 of 60 had one, 3 had several (test fixtures), none had zero.
+{
+  const { runDefinitionAnswer } = require('./cg-answer');
+  const F = 'src/app/core.py';
+  const row = (o) => ({ file_path: F, start_line: 10, end_line: 20, type: 'function', signature: '(a, b)', ...o });
+  const ANSWERS = {
+    One: [row({ name: 'One' })],
+    Method: [row({ name: 'Cls.Method', type: 'method', signature: '(\n    self,\n    x: int,\n)  ->  str', start_line: 1393, end_line: 1422 })],
+    Klass: [row({ name: 'Klass', type: 'class', signature: null })],
+    Rusty: [row({ name: 'outer::Rusty', signature: '(path: &Path) -> io::Result<File>' })],
+    Twins: [row({ name: 'Twins' }), row({ name: 'Twins', start_line: 40, end_line: 44 })],
+    OtherFile: [row({ name: 'OtherFile', file_path: 'src/other.py' })],
+    Prefix: [row({ name: 'PrefixLonger' })],
+    Long: [row({ name: 'Long', signature: `(${'arg_with_a_long_name: int, '.repeat(12)})` })],
+  };
+  let defStub;
+  test.before(() => {
+    defStub = path.join(stubDir, 'def-stub.js');
+    fs.writeFileSync(defStub, `#!/usr/bin/env node
+'use strict';
+const a = process.argv.slice(2);
+// Exactly the argv the runner must send; anything else is a wrong call.
+if (a.length !== 5 || a[0] !== 'show' || a[2] !== '--file' || a[3] !== ${JSON.stringify(F)} || a[4] !== '--json') process.exit(2);
+const answers = ${JSON.stringify(ANSWERS)};
+if (a[1] === 'Missing') process.exit(1);
+if (a[1] === 'Explode') process.exit(3);
+if (a[1] === 'NotJson') { process.stdout.write('not json\\n'); process.exit(0); }
+if (a[1] === 'NotList') { process.stdout.write('{"name":"NotList"}\\n'); process.exit(0); }
+process.stdout.write(JSON.stringify(answers[a[1]] || []) + '\\n');
+`, { mode: 0o755 });
+  });
+  const def = (symbol, extra = {}) => runDefinitionAnswer({ cwd: stubDir, symbol, file: F, binary: defStub, ...extra });
+
+  test('runDefinitionAnswer: the shape table', () => {
+    const cases = [
+      ['One', { status: 'hits', start: 10, end: 20, label: 'function One(a, b)' }],
+      ['Method', { status: 'hits', start: 1393, end: 1422, label: 'method Cls.Method(self, x: int) -> str' }],
+      ['Klass', { status: 'hits', start: 10, end: 20, label: 'class Klass' }],
+      ['Rusty', { status: 'hits', start: 10, end: 20, label: 'function outer::Rusty(path: &Path) -> io::Result<File>' }],
+      ['Twins', { status: 'several' }],
+      ['OtherFile', { status: 'no-hits' }],
+      ['Prefix', { status: 'no-hits' }],
+      ['Nothing', { status: 'no-hits' }],
+      ['Missing', { status: 'no-hits' }],
+      ['Explode', { status: 'unavailable' }],
+      ['NotJson', { status: 'unavailable' }],
+      ['NotList', { status: 'unavailable' }],
+    ];
+    for (const [symbol, want] of cases) assert.deepEqual(def(symbol), want, symbol);
+  });
+
+  test('runDefinitionAnswer: a long signature is cut to 160 characters ending in …', () => {
+    const r = def('Long');
+    assert.equal(r.status, 'hits');
+    assert.equal([...r.label].length, 160, r.label);
+    assert.ok(r.label.startsWith('function Long(arg_with_a_long_name: int, '), r.label);
+    assert.ok(r.label.endsWith('…'), r.label);
+  });
+
+  test('runDefinitionAnswer: no call without a symbol-shaped name, a file and a binary', () => {
+    assert.deepEqual(def('a b'), { status: 'unavailable' });
+    assert.deepEqual(def('One', { file: '' }), { status: 'unavailable' });
+    assert.deepEqual(def('One', { binary: null }), { status: 'no-binary' });
+  });
+}

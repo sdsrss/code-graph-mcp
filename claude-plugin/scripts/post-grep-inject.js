@@ -36,7 +36,9 @@ const { recordRecommendation } = require('./recommendation-log');
 // `sanitizeSearchPath` is deliberately NOT imported any more: this hook passes
 // the RAW path so buildGrepArgs can split a glob into scope + `-g` instead of
 // widening it away. Leaving the require behind would read as "still used".
-const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, shellQuoteArg, formatCgCommand } = require('./cg-answer');
+const {
+  runGrepAnswer, runShowAnswer, runCallgraphAnswer, runDefinitionAnswer, shellQuoteArg,
+} = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
 const {
   splitTopLevelSegments,
@@ -214,7 +216,10 @@ const CALLGRAPH_HEADER =
 // is looking; a same-named symbol's 4 KB call tree from elsewhere is not about
 // that place (a grep in tests/cli_e2e.rs got `indexed_project`'s tree from
 // src/indexer/resync.rs). Its location was the useful part, so that is what it
-// gets: one pointer line.
+// gets: one line. It used to end in the `callgraph` command for the tree; no
+// session ran it (0 of 45, 0.164.0 to 2026-10-16) and the next step was a read
+// of the definition, so the line carries the definition's lines and signature
+// instead when `show` names exactly one (tasks/specs/outside-path-definition-answer.md).
 
 /** The file on a `callgraph` answer's root line (`name (path)`), or null. */
 function definitionFile(text) {
@@ -236,9 +241,14 @@ function searchCovers(searchPath, file) {
   return file === p || file.startsWith(p + '/');
 }
 
-function buildPointerText(symbol, file, searchPath) {
-  return `[code-graph] ${symbol} is defined in ${shellQuoteArg(file)}, outside the path your grep ` +
-    `searched (${shellQuoteArg(searchPath)}). Its callers and callees: ${formatCgCommand(['callgraph', symbol])}`;
+/** @param {object} [def] a runDefinitionAnswer result; only `hits` adds lines and a signature. */
+function buildPointerText(symbol, file, searchPath, def) {
+  const where = `${symbol} is defined in ${shellQuoteArg(file)}`;
+  const outside = `outside the path your grep searched (${shellQuoteArg(searchPath)})`;
+  if (def && def.status === 'hits') {
+    return `[code-graph] ${where}:${def.start}-${def.end}, ${outside}: ${def.label}`;
+  }
+  return `[code-graph] ${where}, ${outside}.`;
 }
 
 function buildInjectText(answer, mode) {
@@ -520,7 +530,8 @@ function runMain() {
     ...(outside ? { scope: 'outside' } : {}),
   });
   const text = outside
-    ? buildPointerText(answeredSymbol, rootFile, searchPath)
+    ? buildPointerText(answeredSymbol, rootFile, searchPath,
+      runDefinitionAnswer({ cwd: root, symbol: answeredSymbol, file: rootFile }))
     : buildInjectText(answer, answeredMode);
   process.stdout.write(emitPostToolContext(text) + '\n');
 }

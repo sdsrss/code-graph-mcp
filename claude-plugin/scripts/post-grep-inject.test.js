@@ -1464,29 +1464,65 @@ test('e2e review H-1/H-2: the inject declines on a ripgrep-only ignore file and 
     for (const [p, f, want] of cases) assert.equal(searchCovers(p, f), want, `${p} covers ${f}`);
   });
 
-  test('buildPointerText: location and the command, repo tokens shell-quoted', () => {
-    const t = buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs');
-    assert.match(t, /indexed_project is defined in src\/indexer\/resync\.rs, outside the path your grep searched \(tests\/cli_e2e\.rs\)/);
-    assert.match(t, /code-graph-mcp callgraph indexed_project/);
-    assert.ok(t.split('\n').length <= 2, t);
+  // The pointer used to end in `Its callers and callees: code-graph-mcp callgraph X`.
+  // From 0.164.0 to 2026-10-16 no session ran it (0 of 45); the next step was a
+  // read of the definition. So the line now carries the definition's lines and
+  // signature when `show` names exactly one, and no command either way
+  // (tasks/specs/outside-path-definition-answer.md).
+  test('buildPointerText: the definition\'s lines and signature, never a command', () => {
+    const def = { status: 'hits', start: 10, end: 20, label: 'function indexed_project(root: &Path)' };
+    const t = buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs', def);
+    assert.equal(t, '[code-graph] indexed_project is defined in src/indexer/resync.rs:10-20, outside the path ' +
+      'your grep searched (tests/cli_e2e.rs): function indexed_project(root: &Path)');
+    for (const other of [undefined, { status: 'several' }, { status: 'no-hits' }, { status: 'unavailable' }]) {
+      assert.equal(buildPointerText('indexed_project', 'src/indexer/resync.rs', 'tests/cli_e2e.rs', other),
+        '[code-graph] indexed_project is defined in src/indexer/resync.rs, outside the path your grep searched (tests/cli_e2e.rs).',
+        JSON.stringify(other));
+    }
     assert.match(buildPointerText('f', "src/a b'.rs", 'x'), /'src\/a b'\\''\.rs'/);
   });
 
-  const STUB_ROOTED = (file) =>
-    `const sub = process.argv[2], arg = process.argv[3];\n` +
+  // `show` answers for the callgraph root's file only when SHOW is set; the
+  // argv must be exactly the one runDefinitionAnswer sends.
+  const STUB_ROOTED = (file, show = false) =>
+    `const sub = process.argv[2], arg = process.argv[3], a = process.argv.slice(2);\n` +
     `if (sub === 'callgraph') { process.stdout.write(arg + ' (${file})\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    (show
+      ? `if (sub === 'show' && a.length === 5 && a[2] === '--file' && a[3] === '${file}' && a[4] === '--json') {\n` +
+        `  process.stdout.write(JSON.stringify([{ file_path: '${file}', name: arg, type: 'function', signature: '(root: &Path)', start_line: 41, end_line: 77 }]));\n` +
+        `  process.exit(0);\n}\n`
+      : '') +
     `process.exit(1);`;
 
-  test('e2e B11: a symbol defined outside the grep path gets a pointer, not its call graph', () => {
+  test('e2e B11: a symbol defined outside the grep path gets its definition, not its call graph', () => {
     const uniq = `Outside${Date.now()}`;
+    const fixture = e2eFixture(STUB_ROOTED('src/indexer/resync.rs', true));
+    const cmd = `echo "x" && grep "${uniq}" tests/cli_e2e.rs`;
+    try {
+      const res = runHook(cmd, fixture, {}, undefined, '');
+      assert.equal(res.status, 0, res.stderr);
+      const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+      assert.equal(ctx, `[code-graph] ${uniq} is defined in src/indexer/resync.rs:41-77, outside the path your grep ` +
+        `searched (tests/cli_e2e.rs): function ${uniq}(root: &Path)`);
+      assert.doesNotMatch(ctx, /called by|code-graph-mcp /);
+      const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+      const rec = JSON.parse(recs.trim().split('\n').pop());
+      assert.equal(rec.mode, 'callgraph');
+      assert.equal(rec.scope, 'outside');
+    } finally {
+      cleanupFixture(fixture, cmd);
+    }
+  });
+
+  test('e2e B11: when show names no single definition, the location alone', () => {
+    const uniq = `OutsideNoShow${Date.now()}`;
     const fixture = e2eFixture(STUB_ROOTED('src/indexer/resync.rs'));
     const cmd = `echo "x" && grep "${uniq}" tests/cli_e2e.rs`;
     try {
       const res = runHook(cmd, fixture, {}, undefined, '');
       assert.equal(res.status, 0, res.stderr);
       const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
-      assert.match(ctx, new RegExp(`${uniq} is defined in src/indexer/resync\\.rs, outside the path your grep searched`));
-      assert.doesNotMatch(ctx, /called by/);
+      assert.equal(ctx, `[code-graph] ${uniq} is defined in src/indexer/resync.rs, outside the path your grep searched (tests/cli_e2e.rs).`);
       const recs = fs.readFileSync(path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
       const rec = JSON.parse(recs.trim().split('\n').pop());
       assert.equal(rec.mode, 'callgraph');
