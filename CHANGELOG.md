@@ -1,18 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.170.1
 
 **Upgrading: nothing to do unless a project's `.code-graph` is a symlink, a
-regular file or a FIFO** (`INDEX_VERSION` is unchanged). Every command that
-reads such a project now refuses it (exit 1). Through a symlink these commands
-used to answer from, and edit, the index in the directory the link points at.
-To pin back an npm install: `npm i -g @sdsrs/code-graph@0.170.0`, set
-`CODE_GRAPH_NO_AUTO_UPDATE=1`, and delete
-`~/.cache/code-graph/bin/code-graph-mcp`; that auto-update copy is used ahead
-of an older npm binary, and auto-update would move you forward again. A
-source build: `cargo install --locked --git
+regular file or a FIFO** (`INDEX_VERSION` is unchanged). The commands that read
+such a project now refuse it (exit 1; `grep` falls back to plain grep).
+Through a symlink they used to answer from, and edit, the index in the
+directory the link points at. To pin the binary back: `npm i -g
+@sdsrs/code-graph@0.170.0` (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.170.0 --features
-embed-model` (without the feature, search is FTS5-only).
+embed-model`; without the feature, search is FTS5-only), then delete
+`~/.cache/code-graph/bin/code-graph-mcp`, the auto-update copy, which is used
+ahead of an older binary, and set `CODE_GRAPH_NO_AUTO_UPDATE=1` in the
+environment Claude Code runs in, so the plugin does not fetch it again. That
+pins the binary only: the plugin's statusline and doctor come with the plugin,
+and keep refusing the link.
 
 ### Every CLI command that reads `.code-graph` refuses a symlinked one
 
@@ -50,11 +52,13 @@ commands already read the main checkout's index without a link.
 
 ### Not covered
 
-A symlinked `index.db` inside a real `.code-graph` directory is still opened
-through the link. The hooks still read `source-roots.json`,
+A symlinked `index.db` inside a real `.code-graph` directory is still opened,
+and written, through the link. The hooks still read `source-roots.json`,
 `recommendations.jsonl` and `indexing-status.json` through a symlinked
-`.code-graph`. A linked worktree whose `.code-graph` is a dangling link reads
-as healthy from the main checkout's index, while `incremental-index` refuses it.
+`.code-graph`. In a linked worktree whose `.code-graph` is a dangling link or a
+regular file, the query commands, `health-check`, doctor and the statusline
+read the main checkout's index and report it as healthy, while `stats`,
+`incremental-index`, `reindex` and `rebuild-index` refuse it.
 
 ## 0.170.0
 

@@ -48,6 +48,28 @@ v0.127.0 的 CHANGELOG 写明：符号链接的 `.code-graph` 会被拒绝（exi
   F6（守卫相对锁探测的位置没被测试钉住，最坏后果是多一条误导性的 warn）
   按 Low 处理，不修，原因记在汇报里。
   F7 留作待办。
+- 第 2 轮评审（新开的子代理，审 ca6cd141）：F1、F2、F3 为 Medium。
+  F1 按上面的做法修复。F2（"used to" 那句在 0.170.0 上不成立）和
+  F3（pin-back 会被 auto-update 撤销）改 CHANGELOG。
+  F4 Low（普通文件或 FIFO 形态没有测试）补了测试；F6、F7、F8 改 CHANGELOG。
+  F5、F9、F10、F11、F12 不修：
+  - F5：新 JS 配旧二进制只是过渡期的状态。
+  - F9：sessionCounts 的守卫被新的检查前置，变成了多余的一层防护。
+  - F10：`detectEmbedModel` 在被拒绝的项目里返回 null，影响 dev 模式下两个修复分支选用的构建 feature：
+    binary-broken 分支，被拒绝的项目已经走不到；binary-stale / version-mismatch 分支，仍会用到它。
+    第 3 轮 F7 读代码判断：用 embed-model 构建的 dev 二进制，在那里会被重建成 `--no-default-features`。
+    只影响 dev 模式，留作待办。
+  - F11：0.170.0 起就是这样，已写进 Not covered。
+  - F12：只是 Info。
+
+- 第 3 轮评审（新开的子代理，审 f1c053f3）：代码层面通过。doctor 在 10 种形态 × 2 种模式下的
+  退出码正确，修复模式不执行任何动作，变异测试 6/7 变红。
+  F1 Medium 是 CHANGELOG 里 pin-back 的说法问题（只钉住了二进制，插件照旧拒绝）；
+  F4、F8 是措辞说过头，F6 是一条过时的测试注释：这几项都只改了文字。
+  按项目惯例（0.163.0、0.167.0、0.170.0），第 3 轮的文字问题收窄措辞后收尾，不开第 4 轮。
+  F2（`--check-only` 提示"Run without --check-only to fix"，但修复模式修不了这一项）、
+  F3（worktree 里的指引措辞）、F5（测试没断言"修复动作不执行任何东西"）属于 Low，
+  留作待办，不在本次发版周期里改代码。
 
 ## 后续任务（用户 2026-10-16 提出：本任务发版之后再做）
 
@@ -58,17 +80,6 @@ v0.127.0 的 CHANGELOG 写明：符号链接的 `.code-graph` 会被拒绝（exi
 要求：不做无意义的重构；不改变项目目标和核心设计；每处修改都要能说明原因；
 优先修真实使用中影响用户的问题；不确定时按上下文做出判断后继续推进；
 测试产生的文件要清理掉。
-
-- 第 2 轮评审（新开的子代理，审 ca6cd141）：F1、F2、F3 为 Medium。
-  F1 按上面的做法修复。F2（"used to" 那句在 0.170.0 上不成立）和
-  F3（pin-back 会被 auto-update 撤销）改 CHANGELOG。
-  F4 Low（普通文件或 FIFO 形态没有测试）补了测试；F6、F7、F8 改 CHANGELOG。
-  F5、F9、F10、F11、F12 不修：
-  - F5：新 JS 配旧二进制只是过渡期的状态。
-  - F9：sessionCounts 的守卫被新的检查前置，变成了多余的一层防护。
-  - F10：只影响 dev 模式 binary-broken 分支里给出的提示，被拒绝的项目已经走不到那个分支。
-  - F11：0.170.0 起就是这样，已写进 Not covered。
-  - F12：只是 Info。
 
 ## 验证记录
 
