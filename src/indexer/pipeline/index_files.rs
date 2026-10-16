@@ -2574,14 +2574,26 @@ Restart every code-graph server on this project so they run one version.",
     };
 
     let has_work = !files.is_empty() || !delete_paths.is_empty();
-    // This run's token in the in-flight marker, held until its cross-file edges
-    // are committed (`super::in_flight`). An error return drops it with the
-    // token left in place: the crash the marker reports.
+    // This run's token in the in-flight marker, held until its last graph phase
+    // has run (`super::in_flight`; retired near the end of this function). An
+    // error return drops it with the token left in place: the crash the marker
+    // reports.
     let run_mark = if has_work {
         Some(super::in_flight::begin(db)?)
     } else {
         None
     };
+
+    // Say a build is running before the first batch writes anything. The first
+    // tick used to come after batch 1, so for 0.3-1.1 s of django's first build
+    // no `indexing-status.json` existed: readers saw no build, answered from a
+    // nearly empty index, and their freshness writes failed the build 4 of 7
+    // times (E2E 2026-10-16 round 2).
+    if !files.is_empty() {
+        if let Some(cb) = progress {
+            cb(IndexPhase::Files, 0, files.len());
+        }
+    }
 
     // Phase 0-routes (D6): routes another file wrote into this run's files, and
     // the ones this run's files wrote elsewhere, before any purge takes them.

@@ -247,6 +247,38 @@ mod tests {
         assert_eq!(marker(&db), None, "and a finished run leaves none");
     }
 
+    /// E2E 2026-10-16 round 2 (plugin QA, P0-2): the first progress tick came
+    /// after batch 1, so for 0.3-1.1 s of django's first build no
+    /// `indexing-status.json` existed. Readers saw no build, answered from a
+    /// nearly empty index, and their freshness writes failed the build 4 of 7
+    /// times. A run that has files to index says so before it writes any.
+    #[test]
+    fn a_run_reports_progress_before_its_first_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.py"), "def a():\n    return 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "def b():\n    return 2\n").unwrap();
+        let db = Database::open(&dir.path().join(".index.db")).unwrap();
+        let first = std::cell::RefCell::new(None);
+        let progress = |phase: super::super::IndexPhase, done: usize, total: usize| {
+            let files: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            first.borrow_mut().get_or_insert((
+                matches!(phase, super::super::IndexPhase::Files),
+                done,
+                total,
+                files,
+            ));
+        };
+        super::super::run_full_index(&db, dir.path(), None, Some(&progress)).unwrap();
+        assert_eq!(
+            first.into_inner(),
+            Some((true, 0, 2, 0)),
+            "first tick: (Files phase, 0 done, 2 total, 0 files written yet)"
+        );
+    }
+
     /// A hard-linked lock file (what `cp -al` / `rsync --link-dest` leave) is
     /// still held: the hold never writes through it (pre-tag review round 2).
     #[cfg(unix)]
