@@ -16,6 +16,9 @@ before the session starts, git-excluded:
   rules     .claude/rules/code-graph.md
   local     CLAUDE.local.md
   claudemd  CLAUDE.md
+A variant written `<channel>@<file>` (e.g. `claudemd@/path/duty.md`) places
+that file's text instead of the shipped block, to compare block wordings in
+one channel; it is recorded as `<channel>@<file stem>`.
 
 Every run is a paid session on your login. Starts are staggered and the run
 refuses to begin unless the OAuth access token outlives it by a margin: two
@@ -53,6 +56,8 @@ TARGETS = {
     "local": "CLAUDE.local.md",
     "claudemd": "CLAUDE.md",
 }
+# `<channel>@<file>` variants: recorded label -> the block file it places.
+BLOCK_FILES = {}
 USED_CG = re.compile(
     r'"command":"[^"]*code-graph-mcp\s+(callgraph|impact|refs|show|search|grep|overview|map|tour|deps|dead-code|affected|ast-search)'
     r'|"name":"mcp__plugin_code-graph-mcp_code-graph__\w+"'
@@ -182,18 +187,21 @@ def build_workspace(case, variant, root, plugin, binary):
     cg_bin.mkdir(parents=True)
     shutil.copy2(binary, cg_bin / "code-graph-mcp")
     if variant != "none":
-        target = TARGETS[variant]
+        target = TARGETS[variant.split("@")[0]]
+        block = BLOCK_FILES.get(variant)
         run([shutil.which("node"), "-e", """
 const fs = require('fs'), path = require('path');
 const a = require(process.argv[1]);
 const [target] = process.argv.slice(2);
 const detail = path.join('.claude', a.TARGET_NAME);
 fs.mkdirSync(path.dirname(target), { recursive: true });
-fs.writeFileSync(target, a.buildBlock(a.detectProjectType(process.cwd())) + '\\n');
+const [, blockFile] = process.argv.slice(2);
+fs.writeFileSync(target, blockFile ? fs.readFileSync(blockFile, 'utf8')
+  : a.buildBlock(a.detectProjectType(process.cwd())) + '\\n');
 fs.mkdirSync(path.dirname(detail), { recursive: true });
 fs.writeFileSync(detail, Buffer.concat([Buffer.from(a.MANAGED_BY + '\\n'), fs.readFileSync(a.TEMPLATE_PATH)]));
 fs.appendFileSync(path.join('.git', 'info', 'exclude'), `/${target}\\n/${detail}\\n`);
-""", str(plugin / "scripts" / "adopt.js"), target], cwd=ws)
+""", str(plugin / "scripts" / "adopt.js"), target] + ([str(block)] if block else []), cwd=ws)
     cfg = root / "config"
     cfg.mkdir()
     (cfg / ".credentials.json").symlink_to(CREDENTIALS)
@@ -316,10 +324,15 @@ def main():
     ap.add_argument("--probe", action="store_true", help="run only the delivery probe")
     args = ap.parse_args()
 
-    variants = args.variants.split(",")
-    for v in variants:
-        if v != "none" and v not in TARGETS:
+    variants = []
+    for v in args.variants.split(","):
+        base, at, block = v.partition("@")
+        if base != "none" and base not in TARGETS or (at and (base == "none" or not Path(block).is_file())):
             sys.exit(f"unknown variant {v}")
+        if at:
+            v = f"{base}@{Path(block).stem}"
+            BLOCK_FILES[v] = Path(block).resolve()
+        variants.append(v)
     left = token_hours()
     if left < args.min_token_hours:
         sys.exit(f"OAuth access token expires in {left:.1f} h (< {args.min_token_hours}); "
@@ -355,7 +368,7 @@ def main():
                 time.sleep(wait)
             last_start[0] = time.time()
         root = WORK / "runs" / f"{stamp}-{idx:03d}-{case['name']}-{variant}-r{r}"
-        rec = {"case": case["name"], "variant": variant, "run": r}
+        rec = {"case": case["name"], "variant": variant, "run": r, "model": args.model}
         try:
             ws, home, cfg = build_workspace(case, variant, root, plugin, binary)
             trace, rc, err, secs = session(case, variant, root, plugin, tools, args.model, ws, home, cfg)
