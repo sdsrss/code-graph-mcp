@@ -406,8 +406,25 @@ test('stale progress file is ignored — falls through to health check', (t) => 
     const log = path.join(ctx.project, '.code-graph', 'recommendations.jsonl');
     fs.rmSync(log);
     execFileSync('mkfifo', [log]);
-    const t0 = Date.now();
+    // A timeout, so a regression fails here instead of hanging the suite.
+    const out = execFileSync('node', [STATUSLINE], {
+      cwd: ctx.project, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL',
+      env: { ...process.env, HOME: ctx.home, USERPROFILE: ctx.home, CODE_GRAPH_STATUSLINE_SESSION: SID, CODE_GRAPH_STATUSLINE_COUNTS: '' },
+    }).trim();
+    assert.equal(out, BASE);
+  });
+
+  test('session counts: a symlinked .code-graph directory is not read for counts', { skip: process.platform === 'win32' }, (t) => {
+    const ctx = withLog(t, [...COUNTED_ANSWERS.map(row), ...calls(2).map(row)]);
+    const real = path.join(ctx.home, 'elsewhere');
+    fs.renameSync(path.join(ctx.project, '.code-graph'), real);
+    fs.symlinkSync(real, path.join(ctx.project, '.code-graph'));
     assert.equal(render(ctx), BASE);
-    assert.ok(Date.now() - t0 < 2500, 'returned without waiting on the FIFO');
+  });
+
+  test('session counts: the tag inside another field of another session\'s row does not count', (t) => {
+    const lines = [row({ hook: 'cli', action: 'use', cmd: `grep ${TAG}`, session: 'ffffffff' }),
+      row({ ...COUNTED_ANSWERS[0], pattern: `"session":"${TAG}"`, session: 'ffffffff' })];
+    assert.equal(render(withLog(t, lines)), BASE);
   });
 }

@@ -31,6 +31,19 @@ pub fn session_tag(raw: Option<&str>) -> Option<String> {
 /// the installed binary in the transcripts of the same 20 days). `None` skips
 /// that check.
 pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    record_cli_use_in_session(project_root, cmd, exe, session.as_deref());
+}
+
+/// [`record_cli_use`] with the session id passed in rather than read from
+/// `CLAUDE_CODE_SESSION_ID`, so each session value is testable without
+/// mutating the process environment.
+pub fn record_cli_use_in_session(
+    project_root: &Path,
+    cmd: &str,
+    exe: Option<&Path>,
+    session: Option<&str>,
+) {
     if std::env::var("CODE_GRAPH_INTERNAL").ok().as_deref() == Some("1") {
         return;
     }
@@ -72,7 +85,7 @@ pub fn record_cli_use(project_root: &Path, cmd: &str, exe: Option<&Path>) {
     });
     // The statusline counts this session's calls by this tag (and its hook
     // answers by the same tag, written by recommendation-log.js).
-    if let Some(tag) = session_tag(std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref()) {
+    if let Some(tag) = session_tag(session) {
         line["session"] = serde_json::Value::String(tag);
     }
     // `.code-graph/recommendations.jsonl` is opened by fixed name inside a

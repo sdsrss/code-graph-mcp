@@ -845,6 +845,34 @@ fn test_record_cli_use_stamps_the_session_tag() {
 }
 
 #[test]
+fn test_record_cli_use_session_stamp_for_each_session_value() {
+    // Env-free (review 2026-10-16 M1): the env-reading test above passes with
+    // the stamp deleted wherever CLAUDE_CODE_SESSION_ID is unset, i.e. in CI.
+    std::env::remove_var("CODE_GRAPH_INTERNAL");
+    let cases: &[(Option<&str>, Option<&str>)] = &[
+        (
+            Some("cde9a42e-defc-4eb5-8f4b-6e2294ae206e"),
+            Some("cde9a42e"),
+        ),
+        (Some("not-a-session"), None),
+        (None, None),
+    ];
+    for (raw, want) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tmp.path().join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&cg).unwrap();
+        record_cli_use_in_session(tmp.path(), "callgraph", None, *raw);
+        let content = std::fs::read_to_string(cg.join("recommendations.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        match want {
+            Some(tag) => assert_eq!(row["session"], *tag, "{raw:?}: {row}"),
+            None => assert!(row.get("session").is_none(), "{raw:?}: {row}"),
+        }
+        assert_eq!(row["cmd"], "callgraph");
+    }
+}
+
+#[test]
 fn test_record_cli_use_skips_when_no_metrics_sentinel_present() {
     // A `.code-graph/.no-metrics` sentinel silences the recommendations-log
     // writer so a dev/dogfood checkout's own CLI runs (functionality testing,

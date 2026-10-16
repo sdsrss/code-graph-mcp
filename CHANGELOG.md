@@ -14,17 +14,21 @@ session's count:
 **answers** counts what a hook delivered: a grep answered in place (rewritten or
 denied with its answer), an answered post-grep injection, an edit-time impact
 line, a read-fanout overview, a subagent's index facts, and a Stop check.
-Advice without an answer is not counted. **calls** counts `code-graph-mcp`
-commands Claude ran itself; the plugin's own answer runs are not among them.
-Nothing is added while both are 0. `CODE_GRAPH_STATUSLINE_COUNTS=0` turns the
-counts off.
+Advice without an answer is not counted, and neither is what the prompt hook
+or SessionStart adds, since they record nothing. **calls** counts the
+`code-graph-mcp` queries Claude ran itself (`callgraph`, `impact`, `show`,
+`grep`, …; not `health-check`, `stats` or `--version`); the plugin's own
+answer runs are not among them. Nothing is added while both are 0.
+`CODE_GRAPH_STATUSLINE_COUNTS=0` turns the counts off.
 
 To tell sessions apart, every row in `.code-graph/recommendations.jsonl`, from
 the hooks and from the CLI, now carries `session`: the first 8 hex digits of
 the session id Claude Code passes to hooks and tools (`CLAUDE_CODE_SESSION_ID`).
 A row without a UUID-shaped id carries none. `code-graph-mcp stats` reads the
 same rows as before. The statusline reads at most the last 512 KB of that log
-and refuses a symlink, a hard link or a FIFO in its place.
+(about 4,900 rows) and refuses a symlink, a hard link or a FIFO in its place
+or in place of `.code-graph`. So the counts cover this session's rows within
+that window: in a session that has written more, they can go down.
 
 ### A grep that missed names the definition's lines, not a command to run
 

@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 1
+revision: 2
 ---
 
 # Statusline: what code-graph did in this session
@@ -85,3 +85,12 @@ None.
 # Change log
 
 - r1 (2026-10-16): initial.
+- r2 (2026-10-16): review round 1 (0 HIGH, 1 MEDIUM, 7 LOW). M1: the Rust
+  stamp test read the env, so CI (no session id) stayed green with the stamp
+  deleted; `record_cli_use_in_session` now takes the id, tested for UUID /
+  non-UUID / none. New tests: a symlinked `.code-graph`, the tag inside another
+  session's row, a FIFO test that times out instead of hanging (each pinned by
+  a mutation). Docs: calls = query subcommands; prompt/SessionStart injections
+  are not counted; the 512 KB window can lower the count. Left: counts also on
+  an unhealthy (✗) report; a frame read during rotation shows none; a rewrite
+  the user rejects at the permission prompt still counts (unverified).

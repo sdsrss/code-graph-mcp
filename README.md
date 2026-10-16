@@ -201,7 +201,7 @@ What you get:
 - **Skills** — `explore` (structure-first navigation before reading files) and `index` (health-check / re-index / full rebuild); see [Plugin Skills](#plugin-skills)
 - **Code Explorer Agent** — Deep code understanding expert via `code-explorer`
 - **Auto-indexing Hook** — Incremental index on every file edit (PostToolUse)
-- **StatusLine** — Real-time health display (nodes, files, watch status) and what code-graph did in this session (`5 answers · 2 calls`: answers its hooks delivered to Claude, code-graph commands Claude ran) — compatible with other plugins' StatusLine via composite multiplexer
+- **StatusLine** — Real-time health display (nodes, files, watch status) and what code-graph did in this session (`5 answers · 2 calls`: answers its grep, edit, read, subagent and Stop hooks delivered to Claude, code-graph queries Claude ran) — compatible with other plugins' StatusLine via composite multiplexer
 - **Auto-update** — Checks for a new version at session start (throttled to at most one check every 2 minutes). Between forced checks the re-check interval is 30 minutes after an "up to date" answer and 6 hours while an update is already pending. Updates install silently.
 
 #### Manual Update
