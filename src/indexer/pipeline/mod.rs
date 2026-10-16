@@ -168,9 +168,12 @@ pub fn index_build_in_progress(project_root: &Path) -> Option<(u64, u64)> {
     }
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
     // A server killed mid-build leaves its last status behind; the file names
-    // its pid, and a writer that is gone is no build.
+    // its pid, and a writer that is gone is no build. Gone means its pid AND
+    // the index lock it holds for its whole life: a CLI in another PID
+    // namespace (a sandbox's `--unshare-pid`) sees no such pid while the
+    // server builds, answered, and its writes failed the build (round 3).
     if let Some(pid) = v["pid"].as_u64() {
-        if !process_is_alive(pid) {
+        if !process_is_alive(pid) && !crate::indexer::lock::other_process_holds_index_lock(&dir) {
             return None;
         }
     }

@@ -13965,3 +13965,44 @@ fn test_cli_build_status_starting_and_a_dead_writer() {
     let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
     assert_ne!(code, 0, "{stderr}");
 }
+
+/// E2E 2026-10-16 round 3: the server holds `.code-graph/index.lock` for its
+/// whole life. A CLI in another PID namespace (Claude Code's Bash sandbox runs
+/// with `--unshare-pid`) cannot see the server's pid, read its build as a dead
+/// writer's, answered, and its freshness writes failed the build ("database
+/// is locked", 3 of 3). A pid that looks gone is a dead writer only when
+/// nobody holds that lock.
+#[cfg(unix)]
+#[test]
+fn test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer() {
+    use std::os::unix::io::AsRawFd;
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    let mut child = Command::new("true").spawn().unwrap();
+    let unseen = child.id();
+    child.wait().unwrap();
+    std::fs::write(
+        cg.join("indexing-status.json"),
+        format!(r#"{{"s":"indexing","d":3,"t":50,"pid":{unseen}}}"#),
+    )
+    .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cg.join("index.lock"))
+        .unwrap();
+    // SAFETY: `lock` is an open File owned by this scope.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_ne!(code, 0, "{stdout}{stderr}");
+    assert!(stderr.contains("still being built"), "{stderr}");
+
+    // Control: the lock let go, the same file is a dead writer's.
+    drop(lock);
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+}
