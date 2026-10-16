@@ -297,12 +297,6 @@ pub(crate) fn resolve_show_nodes(
 }
 
 pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
-    let args = ShowArgs {
-        symbol: args
-            .symbol
-            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
-        ..args
-    };
     let json_mode = args.json;
     let compact = args.compact;
     let include_refs = args.refs;
@@ -428,6 +422,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--refs] [--impact] [--context-lines N] [--compact] [--json]"
             ))?;
+        // `Type::method` → `Type.method` unless the index stores the `::` spelling.
+        let canonical_input = crate::resolve::canonical_symbol_spelling(conn, symbol);
+        let symbol = canonical_input.as_str();
         // A symbol in a file added since the last index (D2).
         crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, symbol);
 

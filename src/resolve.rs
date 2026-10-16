@@ -373,14 +373,28 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// and that spelling was "Symbol not found" everywhere — or, through
 /// `callgraph`'s fuzzy step, an answer for `DBImpl::Writer` when asked for
 /// `DBImpl::Write` (E2E 2026-10-16). Every symbol a user or a model passes in
-/// goes through this first, so both spellings select the same definitions. No
-/// project definition stores `::` in its name; only `<external>` rows do, and
-/// those are never selectable.
-pub fn canonical_symbol_spelling(symbol: &str) -> String {
-    if symbol.contains("::") {
-        symbol.trim_start_matches("::").replace("::", ".")
-    } else {
+/// goes through this first, so both spellings select the same definitions.
+///
+/// Unless the index stores the `::` spelling itself: Ruby names `class
+/// Minitest::Test` exactly that, and its methods `Minitest::Test.run_case`.
+/// Rewriting those made them unfindable (E2E round 2), so an exact stored name
+/// or qualified name keeps the input as typed.
+pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
+    if !symbol.contains("::") {
+        return symbol.to_string();
+    }
+    let stored: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> ?2)",
+            rusqlite::params![symbol, crate::domain::EXTERNAL_FILE_PATH],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if stored {
         symbol.to_string()
+    } else {
+        symbol.trim_start_matches("::").replace("::", ".")
     }
 }
 

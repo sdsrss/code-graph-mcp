@@ -57,12 +57,6 @@ pub struct CallgraphArgs {
 ///   → calls: tool_semantic_search (src/mcp/server.rs:1360)
 /// ```
 pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
-    let args = CallgraphArgs {
-        symbol: args
-            .symbol
-            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
-        ..args
-    };
     // clap accepts an empty-string positional; preserve the non-empty guard.
     let raw_symbol = args.symbol.as_deref().unwrap_or("");
     if raw_symbol.is_empty() && args.node_id.is_none() {
@@ -99,6 +93,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
+    // `Type::method` → `Type.method` unless the index stores the `::` spelling.
+    let canonical_input = crate::resolve::canonical_symbol_spelling(ctx.db.conn(), raw_symbol);
+    let raw_symbol = canonical_input.as_str();
     let conn = ctx.db.conn();
     // callgraph's in-band error envelope carries `results: []` (see the
     // not-found branch below).

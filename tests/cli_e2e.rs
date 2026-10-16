@@ -13640,3 +13640,34 @@ fn test_cli_queries_refuse_while_the_index_is_being_built() {
     let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
 }
+
+/// E2E 2026-10-16 round 2 (language QA): Ruby stores `class Minitest::Test`
+/// under the name `Minitest::Test`. Mapping every `::` to `.` at the input made
+/// `show Minitest::Test` "not found" — then suggest the spelling that had just
+/// failed. A `::` spelling the index stores is kept as it is.
+#[test]
+fn test_cli_a_stored_colon_colon_name_is_not_rewritten() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("lib")).unwrap();
+    std::fs::write(
+        project.path().join("lib/t.rb"),
+        "class Minitest::Test\n  def run_case\n    1\n  end\nend\n\nclass Runner\n  def go\n    Minitest::Test.new.run_case\n  end\nend\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for args in [
+        &["show", "Minitest::Test"][..],
+        &["show", "Minitest::Test.run_case"][..],
+        &["refs", "Minitest::Test"][..],
+        &["impact", "Minitest::Test.run_case"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_eq!(code, 0, "{args:?}: {stdout}{stderr}");
+        assert!(!stderr.contains("not found"), "{args:?}: {stderr}");
+    }
+}

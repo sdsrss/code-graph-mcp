@@ -199,12 +199,6 @@ impl RefsTarget {
 
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
 pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
-    let args = RefsArgs {
-        symbol: args
-            .symbol
-            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
-        ..args
-    };
     let explicit_file_owned: Option<String> = match args.file.as_deref() {
         Some(f) => Some(normalize_user_path(project_root, f)?),
         None => None,
@@ -274,6 +268,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
+        // `Type::method` → `Type.method` unless the index stores the `::` spelling.
+        let canonical_input = crate::resolve::canonical_symbol_spelling(conn, raw_symbol);
+        let raw_symbol = canonical_input.as_str();
         // A symbol in a file added since the last index (D2).
         crate::cli::freshness::index_new_files_if_absent(&ctx.db, &ctx.project_root, raw_symbol);
         let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {

@@ -31,12 +31,6 @@ pub struct SimilarArgs {
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
 pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
-    let args = SimilarArgs {
-        symbol: args
-            .symbol
-            .map(|s| crate::resolve::canonical_symbol_spelling(&s)),
-        ..args
-    };
     // Both spellings are named: `--top-k` is the declared flag and `--limit` its
     // alias, so quoting either one alone tells half the callers that a flag they
     // did not type was clamped.
@@ -95,12 +89,14 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         }
         (nid, format!("node_id {}", nid))
     } else {
-        let symbol = args.symbol.as_deref()
+        let raw_symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
-            .map(strip_qualified_prefix)
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp similar <symbol> [--node-id N] [--top-k N] [--max-distance N] [--json]"
             ))?;
+        // `Type::method` → `Type.method` unless the index stores the `::` spelling.
+        let canonical_input = crate::resolve::canonical_symbol_spelling(db.conn(), raw_symbol);
+        let symbol = strip_qualified_prefix(&canonical_input);
         // A symbol in a file added since the last index (D2).
         crate::cli::freshness::index_new_files_if_absent(db, &ctx.project_root, symbol);
         // Ambiguity FIRST, through the shared resolver — the same verdict

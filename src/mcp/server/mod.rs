@@ -2592,13 +2592,14 @@ impl McpServer {
 
     fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         // `Type::method` → the index's `Type.method`, once, for every tool that
-        // takes a symbol (see `resolve::canonical_symbol_spelling`).
+        // takes a symbol, unless the index stores the `::` spelling (see
+        // `resolve::canonical_symbol_spelling`).
         let mut canonical: Option<serde_json::Value> = None;
         for key in ["symbol_name", "function_name"] {
             if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
                 if s.contains("::") {
                     canonical.get_or_insert_with(|| args.clone())[key] =
-                        json!(crate::resolve::canonical_symbol_spelling(s));
+                        json!(crate::resolve::canonical_symbol_spelling(self.db.conn(), s));
                 }
             }
         }
@@ -7424,6 +7425,26 @@ app.post('/api/login', handleLogin);
             let colons = call("Database::open");
             assert_eq!(colons, dotted, "{tool} {key}: `::` must answer as `.` does");
         }
+
+        // A `::` spelling the index stores (Ruby `class Acme::Widget`) is kept.
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("lib")).unwrap();
+        std::fs::write(
+            project.path().join("lib/t.rb"),
+            "class Acme::Widget\n  def render\n    1\n  end\nend\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_ast_node",
+                json!({"symbol_name": "Acme::Widget"}),
+            ))
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_ne!(parsed["result"]["isError"], json!(true), "{parsed}");
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name
