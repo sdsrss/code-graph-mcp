@@ -306,7 +306,7 @@ summary += '\n';
 // them, flask's `url_for` read as 7 callers with 32 more excluded.
 const ambiguous = jsonResult.ambiguous_callers_excluded || 0;
 if (ambiguous > 0) {
-  summary += `  ⚠ ${ambiguous} more caller(s) matched only by name were not counted; the blast radius may be larger\n`;
+  summary += `  ⚠ ${ambiguous} more call edge(s) matched only by name were not counted; the blast radius may be larger\n`;
 }
 if (jsonResult.callers_truncated) {
   summary += '  ⚠ the caller traversal stopped early, so these counts are a floor, not a total\n';

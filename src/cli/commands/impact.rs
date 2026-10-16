@@ -304,7 +304,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Not into the deepest layer: those callers' callers lie past `--depth` and
     // would appear at no floor. Counting them made hono `resolveHttpServer`
     // report 39 excluded while `--min-confidence ambiguous` added none (E2E
-    // 2026-10-16 round 2).
+    // 2026-10-16 round 2). The count is of call edges, which the messages say:
+    // one caller reaches every same-named definition (flask `post --depth 1`:
+    // 215 edges, where the floor's removal adds 1 caller and 27 tests; round 3).
     let caller_ids: Vec<i64> = callers
         .iter()
         .filter(|c| c.depth > 0 && c.depth < depth)
@@ -431,7 +433,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         if ambiguous_callers_excluded > 0 {
             result["ambiguous_callers_excluded"] = serde_json::json!(ambiguous_callers_excluded);
             result["ambiguous_note"] = serde_json::json!(format!(
-                "{} caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-run with --min-confidence ambiguous to include them.",
+                "{} call edge(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-run with --min-confidence ambiguous to include them.",
                 ambiguous_callers_excluded
             ));
         }
@@ -466,7 +468,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     if ambiguous_callers_excluded > 0 {
         writeln!(
             stdout,
-            "  ⚠ {} ambiguous by-name caller(s) excluded from risk — actual blast radius may be larger; use --min-confidence ambiguous to include",
+            "  ⚠ {} ambiguous by-name call edge(s) excluded from risk — actual blast radius may be larger; use --min-confidence ambiguous to include",
             ambiguous_callers_excluded
         )?;
     }

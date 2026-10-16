@@ -678,7 +678,10 @@ test('emit(subprocess): the summary carries the callers impact left out, not jus
   assert.equal(res.status, 0, res.stderr);
   const ctx = JSON.parse(res.stdout.trim()).hookSpecificOutput.additionalContext;
   assert.match(ctx, /7 direct callers/);
-  assert.match(ctx, /32 more caller\(s\) matched only by name/, ctx);
+  // Call edges, not callers: one caller can reach several same-named
+  // definitions (round 3: flask `post` said 215 where 1 caller and 27 tests
+  // were added).
+  assert.match(ctx, /32 more call edge\(s\) matched only by name/, ctx);
   assert.match(ctx, /caller traversal stopped early, so these counts are a floor/, ctx);
 
   // Control: a payload without them adds neither line.

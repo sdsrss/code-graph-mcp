@@ -672,7 +672,7 @@ impl McpServer {
             // Note parity with cmd_impact — the count alone
             // doesn't tell the agent the risk may be larger or how to see them.
             impact["ambiguous_note"] = json!(format!(
-                "{} caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-query with min_confidence:\"ambiguous\" to include them.",
+                "{} call edge(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-query with min_confidence:\"ambiguous\" to include them.",
                 ambiguous_callers_excluded
             ));
         }
