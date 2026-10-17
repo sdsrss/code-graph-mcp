@@ -584,7 +584,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let caller_set = crate::graph::routes::get_callers_with_route_info_seeded(conn, impact_seed(node_id_arg.is_some(), node, fp), 3, SHOW_IMPACT_MIN_CONF_RANK)?;
+                let caller_set = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK)?;
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
                 let cls = crate::graph::impact::classify_impact(&caller_set.callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
@@ -686,9 +686,10 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         }
         let mut impact = String::new();
         if include_impact {
-            let caller_set = crate::graph::routes::get_callers_with_route_info_seeded(
+            let caller_set = crate::graph::routes::get_callers_with_route_info(
                 conn,
-                impact_seed(node_id_arg.is_some(), node, fp),
+                &node.name,
+                Some(fp.as_str()),
                 3,
                 SHOW_IMPACT_MIN_CONF_RANK,
             )?;
@@ -763,25 +764,6 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Where `show --impact` starts its caller traversal: `--node-id` asks about
-/// that node, as `impact --node-id` does; a name keeps the name + file seed of
-/// `impact <name>`, so a class still takes its same-named constructors. MCP
-/// `get_ast_node` seeds the same way (D#426 (4)).
-fn impact_seed<'a>(
-    by_node: bool,
-    node: &'a queries::NodeResult,
-    fp: &'a str,
-) -> crate::graph::query::CallGraphSeed<'a> {
-    if by_node {
-        crate::graph::query::CallGraphSeed::Node(node.id)
-    } else {
-        crate::graph::query::CallGraphSeed::Name {
-            name: &node.name,
-            file_path: Some(fp),
-        }
-    }
 }
 
 /// Read source code with context lines from the project file system.
