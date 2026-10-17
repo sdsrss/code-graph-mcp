@@ -431,10 +431,19 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// Unless the index stores the `::` spelling itself: Ruby names `class
 /// Minitest::Test` exactly that, and its methods `Minitest::Test.run_case`.
 /// Rewriting those made them unfindable (E2E round 2), so an exact stored name
-/// or qualified name keeps the input as typed. So does a name of separators
-/// alone (`::`): rewritten, it was the empty name, which every lookup matches.
+/// or qualified name keeps the input as typed.
+///
+/// Only a path of non-empty segments (`A::b`, `::A::b`), none holding `.`,
+/// `:` or whitespace, is rewritten. Any other spelling runs as typed, as in
+/// 0.170.1: `::`, `Flask::` and `::Rack::` rewrote to names ending in an
+/// empty part, which the dotted fallback took as the empty name that every
+/// lookup matches (`Ambiguous symbol ''`; E2E round 4, the 0.171.0 review).
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
-    if !symbol.contains("::") {
+    let path = symbol.strip_prefix("::").unwrap_or(symbol);
+    let plain_segments = path.split("::").all(|seg| {
+        !seg.is_empty() && !seg.contains(|c: char| c == '.' || c == ':' || c.is_whitespace())
+    });
+    if !symbol.contains("::") || !plain_segments {
         return symbol.to_string();
     }
     let stored: bool = conn
@@ -445,11 +454,10 @@ pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
             |row| row.get(0),
         )
         .unwrap_or(false);
-    let rewritten = symbol.trim_start_matches("::").replace("::", ".");
-    if stored || rewritten.is_empty() {
+    if stored {
         symbol.to_string()
     } else {
-        rewritten
+        path.replace("::", ".")
     }
 }
 
@@ -868,6 +876,49 @@ mod fuzzy_tests {
         }
         assert_eq!(canonical_symbol_spelling(db.conn(), "::alpha"), "alpha");
         assert_eq!(canonical_symbol_spelling(db.conn(), "A::b"), "A.b");
+    }
+
+    /// The pre-tag review of 0.171.0: `Flask::` rewrote to `Flask.`, whose
+    /// dotted fallback is its empty last part, so `refs Flask::` answered
+    /// `Ambiguous symbol ''`; `::Rack::` and `.::` did the same. Only a path of
+    /// non-empty segments, each without `.`, `:` or whitespace, is rewritten;
+    /// every other spelling runs as typed, as it did in 0.170.1.
+    #[test]
+    fn only_a_path_of_plain_segments_is_rewritten() {
+        let (_p, _d, db) = indexed(&[("src/a.rs", "pub fn alpha() {}\n")]);
+        for (typed, want) in [
+            ("A::b", "A.b"),
+            ("::A::b", "A.b"),
+            ("a::b::c", "a.b.c"),
+            ("::alpha", "alpha"),
+            ("DBImpl::Write", "DBImpl.Write"),
+            ("Foo::~Foo", "Foo.~Foo"),
+            ("Foo::operator==", "Foo.operator=="),
+        ] {
+            assert_eq!(canonical_symbol_spelling(db.conn(), typed), want, "{typed}");
+        }
+        for typed in [
+            "::",
+            "::::",
+            "Flask::",
+            "::Rack::",
+            "Rack::",
+            ".::",
+            ":::",
+            "A:::b",
+            "A::::b",
+            "A::b::",
+            "A.b::c",
+            "A::b.c",
+            "A:: b",
+            "SkipList<Key, Comparator>::SkipList",
+        ] {
+            assert_eq!(
+                canonical_symbol_spelling(db.conn(), typed),
+                typed,
+                "{typed}"
+            );
+        }
     }
 }
 
