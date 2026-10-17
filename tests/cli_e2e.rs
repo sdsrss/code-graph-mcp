@@ -14088,6 +14088,30 @@ fn test_cli_incremental_index_waits_for_another_build() {
     assert!(index_has_file(&project, "src/late.ts"), "{stderr}");
 }
 
+/// D#406, pre-tag review: a project's first index has no `.code-graph/` yet,
+/// and the build lock could not be opened there, so that build ran unlocked
+/// and a server starting beside it wrote into the same database (tokio x3:
+/// UNHEALTHY, 70,129 of 95,113 edges). The first build takes the lock too.
+#[cfg(unix)]
+#[test]
+fn test_cli_a_first_index_takes_the_build_lock() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("first.py"),
+        "def first():\n    return 1\n",
+    )
+    .unwrap();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    assert!(!cg.exists(), "precondition: no index directory yet");
+    let (stdout, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(
+        cg.join("index-build.lock").exists(),
+        "the first build ran without the build lock: {stderr}"
+    );
+}
+
 /// D#406: SessionStart's refresh runs with `CODE_GRAPH_YIELD_TO_SERVER=1` and
 /// does nothing while a process holds `index.lock` (an MCP server, which keeps
 /// the index fresh itself, or a `rebuild-index`). Neither the variable alone

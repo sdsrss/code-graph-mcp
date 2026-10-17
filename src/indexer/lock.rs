@@ -378,6 +378,7 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
 /// tree, and a server that looked during the CLI's walk saw no run. Nor could
 /// an early hold on it: a run's own dead-run probe would then read its holder
 /// as a run in flight, and a CLI run would never recover a dead one.
+#[cfg_attr(not(unix), allow(dead_code))] // only the Unix arm takes it
 pub(crate) const BUILD_LOCK: &str = "index-build.lock";
 
 /// How long a build waits for another one before building anyway. A holder

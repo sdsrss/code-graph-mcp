@@ -427,6 +427,9 @@ pub fn cmd_incremental_index_opts(
     // One build at a time (D#406), held to the end, embedding included. Taken
     // BEFORE the server check below: a server that starts after that check
     // takes `index.lock` first and this lock second, so it waits for this run.
+    // The directory first: a project's first build found none, could not open
+    // the lock in it, and ran unlocked beside a starting server (pre-tag review).
+    crate::utils::owned::ensure_owned_dir(&code_graph_dir)?;
     let _build = crate::indexer::lock::acquire_build_lock(
         &code_graph_dir,
         crate::indexer::lock::BUILD_WAIT,
