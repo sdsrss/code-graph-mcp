@@ -14090,8 +14090,9 @@ fn test_cli_incremental_index_waits_for_another_build() {
 
 /// D#406, pre-tag review: a project's first index has no `.code-graph/` yet,
 /// and the build lock could not be opened there, so that build ran unlocked
-/// and a server starting beside it wrote into the same database (tokio x3:
-/// UNHEALTHY, 70,129 of 95,113 edges). The first build takes the lock too.
+/// and a server starting beside it wrote into the same database (django, the
+/// server 1.5 s after the CLI: 3 of 3 UNHEALTHY, 163,381 of 250,731 edges).
+/// The first build takes the lock too.
 #[cfg(unix)]
 #[test]
 fn test_cli_a_first_index_takes_the_build_lock() {
@@ -14318,11 +14319,17 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
     }
     // Control: Java's constructor still is one, and so are C#'s, C++'s and
     // Dart's, whose extractors also store the constructor as a function or
-    // method named like the class. The rule's `c` has no case: a C file has no
-    // class body to hold one (and `.h` is read as C++).
+    // method named like the class. A C++ class in a `.h` header reaches the
+    // rule through its `c` arm: the rule reads the language from the path,
+    // which takes `.h` as C (the indexer still parses such a header as C++).
     std::fs::write(
         p.join("a.cpp"),
         "class CppCls {\npublic:\n  CppCls() {}\n  int id() { return 1; }\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("w.h"),
+        "class HCls {\npublic:\n  HCls() {}\n  int id() { return 1; }\n};\n",
     )
     .unwrap();
     std::fs::write(
@@ -14337,7 +14344,7 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
     .unwrap();
     let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
     assert_eq!(code, 0, "{stderr}");
-    for name in ["JCls", "CsCls", "CppCls", "DCls"] {
+    for name in ["JCls", "CsCls", "CppCls", "HCls", "DCls"] {
         let (stdout, stderr, code) = run_cli(&project, &["refs", name]);
         assert_eq!(code, 0, "{name}: {stdout}{stderr}");
     }

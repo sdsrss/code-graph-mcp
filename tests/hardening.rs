@@ -2603,6 +2603,7 @@ const AUDIT_IGNORES: &[(&str, &str, u64, &str, &str)] = &[
 #[test]
 fn audit_ignores_hold_only_while_their_reason_does() {
     use std::collections::BTreeSet;
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
     let mut ignored = BTreeSet::new();
@@ -2622,8 +2623,10 @@ fn audit_ignores_hold_only_while_their_reason_does() {
     );
 
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
-    // (name, version, dependency names) per `[[package]]`. A dependency entry
-    // is `"name"` or, when two versions are locked, `"name version"`.
+    // (name, "version source", dependency names) per `[[package]]`. A
+    // dependency entry is `"name"` or, when two versions are locked,
+    // `"name version"`. The source too: the reason is a reading of the
+    // crates.io release, and a `[patch]` or git fork keeps its version number.
     let packages: Vec<(String, String, Vec<String>)> = lock
         .split("[[package]]")
         .skip(1)
@@ -2644,7 +2647,11 @@ fn audit_ignores_hold_only_while_their_reason_does() {
                 .filter(|d| !d.is_empty())
                 .map(str::to_string)
                 .collect();
-            (field("name"), field("version"), deps)
+            (
+                field("name"),
+                format!("{} {}", field("version"), field("source")),
+                deps,
+            )
         })
         .collect();
     assert!(
@@ -2657,7 +2664,7 @@ fn audit_ignores_hold_only_while_their_reason_does() {
         let versions: Vec<&str> = packages
             .iter()
             .filter(|(name, ..)| name == krate)
-            .map(|(_, version, _)| version.as_str())
+            .map(|(_, version, _)| version.split(' ').next().unwrap_or(""))
             .collect();
         assert!(
             !versions.is_empty(),
@@ -2678,7 +2685,7 @@ fn audit_ignores_hold_only_while_their_reason_does() {
             .collect();
         assert_eq!(
             dependents,
-            vec![format!("{dependent} {dependent_version}")],
+            vec![format!("{dependent} {dependent_version} {CRATES_IO}")],
             "{id}: the ignore says only `{dependent} {dependent_version}` reaches \
              `{krate}`; check whether this dependent calls the vulnerable code \
              before keeping it"

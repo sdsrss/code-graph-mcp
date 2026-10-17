@@ -69,7 +69,8 @@ or when a package other than candle-core depends on zip.
 - A build that holds the build lock for more than 10 minutes is built beside,
   with a warning. A server that starts while an `incremental-index` run by
   hand computes embeddings waits for that too, and its tools answer
-  `Indexing in progress` meanwhile.
+  `Indexing in progress` meanwhile. So does one beside the SessionStart refresh
+  of a 0.171.0 plugin running this binary, which computes embeddings.
 - A server that becomes the primary when another session's server exits runs
   its first index without the build lock, so a SessionStart refresh started in
   between can still write beside it, as in 0.171.0.

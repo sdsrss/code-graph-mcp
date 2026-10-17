@@ -127,4 +127,17 @@ run-lock probe; `rebuild-index` does not take B.
   UNHEALTHY 163,381 edges; repaired 0/3, 250,731. Regression x2 each ordering:
   healthy. New e2e `test_cli_a_first_index_takes_the_build_lock` red before.
   Audit mutations 5/5 red (incl. candle-core 0.10.0); constructor mutations
-  cpp/csharp/dart 3/3 red.
+  cpp/csharp/dart 3/3 red. First-index x3 repaired: CLI exit 0 and the
+  server's index did not fail in all 3.
+- Delta review (round 2, fresh subagent) of 69e5d71c..7265a076: D1-D4 held
+  (9 refusal shapes identical to v0.171.0; vectors 2/91 -> 91/91 via the
+  server; flipped-cfg check --all-targets both legs). Repaired: the
+  constructor comment was wrong (`detect_language` reads `.h` as C, so the
+  rule's `c` arm covers a C++ class in a header; `c` removed kept the test
+  green) -> `.h` case added; the first-index test cited tokio numbers ->
+  django; the audit test now pins the dependent's crates.io source (a git
+  fork of candle-core 0.9.2 was green). Mutations: c/cpp/csharp/dart 4/4 red;
+  git-fork candle-core red (compiled binary run against an edited Cargo.lock,
+  restored and md5-checked). session-init.test.js 1-in-8 failure the reviewer
+  saw: 0/10 at HEAD and 0/10 at v0.171.0 here. Closed without a third
+  reviewer: test/comment/docs only, each mutation-verified (depth limit).
