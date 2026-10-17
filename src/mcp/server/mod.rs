@@ -7866,14 +7866,8 @@ end
             ("get_call_graph", "function_name", "function"),
             ("find_references", "symbol_name", "symbol"),
         ] {
-            // A typo, a prefix, a dotted name only edit distance reaches, and
-            // a name defined only in a test file.
-            for typed in [
-                "validate_tokn",
-                "validate_to",
-                "X.validate_token",
-                "validate",
-            ] {
+            // A typo, a prefix, and a dotted name only edit distance reaches.
+            for typed in ["validate_tokn", "validate_to", "X.validate_token"] {
                 let out = call(tool, json!({ key: typed }));
                 assert_eq!(out[name_key], "validate_token", "{tool} {typed}: {out}");
                 assert_eq!(
@@ -7881,6 +7875,17 @@ end
                     format!("Resolved '{typed}' → 'validate_token'."),
                     "{tool} {key} {typed}: {out}"
                 );
+            }
+            // A name defined only in a test file. Which name the step picks is
+            // D#440's to settle; a switch, whichever it is, says so.
+            let out = call(tool, json!({ key: "validate" }));
+            match out[name_key].as_str() {
+                Some(answered) if answered != "validate" => assert_eq!(
+                    out["note"],
+                    format!("Resolved 'validate' → '{answered}'."),
+                    "{tool} {key}: {out}"
+                ),
+                _ => assert!(out.get("note").is_none(), "{tool} {key}: {out}"),
             }
             let exact = call(tool, json!({ key: "validate_token" }));
             assert_eq!(exact[name_key], "validate_token", "{tool}: {exact}");

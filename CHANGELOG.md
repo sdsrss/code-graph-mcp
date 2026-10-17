@@ -17,14 +17,10 @@ each of the five `Slice` constructors reported 520 ambiguous call edges
 excluded where the CLI reported 104, and the three `Status` constructors
 reported 196 callers where the CLI reported 198. On flask, 13 of 392 (nested
 `decorator` and `view` functions). The summary now starts from that node, as
-`impact --node-id` does, and the two agree on all 1,544. A lookup by name
-answers as before: a class still counts its same-named constructors, as
-`impact <name>` does (leveldb `Slice`: 624 on both).
-
-`show --node-id N --impact` started from the name in that file as well, and
-disagreed with `impact --node-id N` on 45 of leveldb's 1,152 nodes and 7 of
-flask's 392. It now starts from the node too and agrees on all 1,544. `show
-<name> --impact` answers as before (80 leveldb names, the same output).
+`impact --node-id` does, and on the freshly indexed corpora the two agree on
+all 1,544. A lookup by name answers as before: a class still counts its
+same-named constructors, as `impact <name>` does (leveldb `Slice`: 624 on
+both).
 
 ### A symbol with whitespace around it
 
@@ -97,14 +93,22 @@ text's (1.0000). Both end at 123/123 embedded.
     `find_references {"symbol_name": "after"}` answers for `after_request`;
   - in `get_call_graph`, on a definition with no edges in the asked
     direction: leveldb `Block.size` with `direction: callees` answers for the
-    README heading `Block size`, where CLI `callgraph` answers an empty list.
+    `doc/index.md` heading `Block size`, where CLI `callgraph` answers an
+    empty list.
 
   The same names with whitespace around them now get these answers too.
-  `Flask.route`'s 8 padded spellings went from "not found" to `FlaskGroup`
-  in both tools (16 runs). For the 23 test-only names that get such an
-  answer in flask and leveldb, 4 paddings and 2 tools make 184 runs: 79 went
-  from a refusal or a candidate list to another name, 40 to the name itself,
-  and 65 answered for another name before and after.
+  Measured with a trailing space, a leading space, a tab and newline, and a
+  trailing NBSP, in both tools: all 8 padded spellings of `Flask.route` and
+  `Flask::route` went from "not found" to `FlaskGroup` (16 runs). For the 23
+  test-only names that get such an answer in flask and leveldb, the same
+  paddings make 184 runs: 79 went from a refusal (71) or a candidate list (8)
+  to another name; 40 now answer for the name itself (21 had been refused, 2
+  a candidate list, 17 another name); 65 answered for another name before and
+  after. Every answer for another name carries the note.
+- `show --node-id N --impact` still counts the callers of every definition
+  of N's name in N's file, so it can differ from `impact --node-id N` and
+  from MCP `get_ast_node` with that `node_id`: on 45 of leveldb's 1,152
+  functions and methods outside test files, and 7 of flask's 392.
 - Vectors an earlier release stored on the wrong text stay until their file
   changes; `incremental-index` does not replace them, `rebuild-index
   --confirm` does. In the race above, `incremental-index`'s closing line

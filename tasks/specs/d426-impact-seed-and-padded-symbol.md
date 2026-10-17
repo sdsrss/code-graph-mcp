@@ -92,3 +92,4 @@
 ## 发版前评审（0.171.3 第 1 轮）
 
 - F4 LOW（平行路径）：`show --node-id N --impact` 仍按"名字 + 文件"取种子。修复 `27824988`：`--node-id` 时按节点取种子，按名字不变。RED：`test_cli_show_impact_of_a_node_id_counts_that_node_only`（同一文件两个 `fn new`）修复前 show 报 3、impact 报 1。全量对照（`showimpact.py`，每个非测试函数/方法，`show --node-id N --impact --json` 与 `impact --node-id N --json` 比直接调用方和总数）：0.171.2 不一致 leveldb 45/1152、flask 7/392；修复后 0/1152、0/392。按名字的 `show <name> --impact`：leveldb 随机 80 个名字，0.171.2 与修复后输出相同。
+- 差量复审（第 2 轮）LOW（已复现）：上面的修复在"文件已在索引后改动"时比 0.171.2 差：`show --node-id N` 先用 `reresolve_node_by_identity` 重新找节点，它返回同一身份的第一个重载，按节点取种子后就数了那个重载的调用方（leveldb `Harness.ToString` 1696：4 个、MEDIUM；0.171.2 和 `impact --node-id` 是 3 个、LOW）。第 2 轮又在第 1 轮的修复里发现问题，按停止线撤回（`a10c3fc9` 回退 `27824988`），不再打第三个补丁；`show` 与 `impact --node-id` 的差异写进 Not covered，种子和重新定位一起移到 D#441。
