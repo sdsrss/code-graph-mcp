@@ -14199,10 +14199,13 @@ fn test_cli_incremental_index_yields_to_a_server_when_asked() {
 /// take `index-build.lock` the moment it is free, as a server starting then
 /// does. Not before: a lock taken ahead of the run's own makes the run wait for
 /// it. Returns whether the run was still going then, the vectors written by
-/// then, and the vectors written by the end — the lock is held until the run
-/// exits.
+/// then (`None`: the lock was never had), and the vectors written by the end —
+/// the lock is held until the run exits.
 #[cfg(all(unix, feature = "embed-model"))]
-fn take_the_build_lock_during_an_embedding_run(project: &TempDir, file: &str) -> (bool, i64, i64) {
+fn take_the_build_lock_during_an_embedding_run(
+    project: &TempDir,
+    file: &str,
+) -> (bool, Option<i64>, i64) {
     use std::os::unix::io::AsRawFd;
     let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     // Read-only: neither creates nor migrates the database the run is building.
@@ -14252,7 +14255,7 @@ fn take_the_build_lock_during_an_embedding_run(project: &TempDir, file: &str) ->
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let running = child.try_wait().unwrap().is_none();
-    let at_take = if held.is_some() { vectors() } else { -1 };
+    let at_take = held.as_ref().map(|_| vectors());
     let out = child.wait_with_output().unwrap();
     drop(held);
     assert!(
@@ -14302,10 +14305,11 @@ fn test_cli_incremental_index_embeds_without_the_build_lock() {
         .unwrap();
         let (running, at_take, at_end) =
             take_the_build_lock_during_an_embedding_run(&project, file);
+        // A probe that never had the lock (its deadline passed) is no answer.
         assert!(
-            running && at_take < at_end,
+            running && at_take.is_some_and(|n| n < at_end),
             "{run}: the build lock was free only once the run had embedded \
-             {at_take} of {at_end} vectors (still running: {running})"
+             {at_take:?} of {at_end} vectors (still running: {running})"
         );
     }
 }

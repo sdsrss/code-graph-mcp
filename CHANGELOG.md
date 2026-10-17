@@ -30,9 +30,17 @@ still covers writing the index, as in 0.171.1. In the same test: 12 of 12 calls 
 
 - A server that starts while `incremental-index` embeds computes embeddings
   for the same nodes beside it, until one of them has embedded them all, as
-  0.171.0's did. Run to the end on a 1,162-node project, 0.171.0 and this
-  version both left a healthy index with a vector for every node and no
-  orphan vector, and the CLI exited 0.
+  0.171.0's and 0.171.1's did. Run to the end on a project with 1,162 nodes
+  to embed (1,286 in all), 0.171.0 and this version both left a healthy index
+  with a vector for every one of them and no orphan vector, and the CLI
+  exited 0.
+- A file indexed again while `incremental-index` embeds, by a server or by
+  another `incremental-index`, can keep vectors computed from its previous
+  text: when its nodes were the newest in the index, the new ones get the
+  same ids, the embedding stores its result on them, and nothing embeds them
+  again until the file changes. 0.171.0 did the same, and 0.171.1 did beside
+  a server's own index runs; it prevented it only between two
+  `incremental-index` runs, by making the second one wait.
 - Apart from this wait, the items 0.171.1 listed under Not covered are
   unchanged.
 

@@ -56,16 +56,16 @@ The rest of D#423, judged by how a default install reaches it:
   or the opt-in per-edit hook beside a live server, both already warned.
   Fixing it touches the incremental path every tool call takes (four paths,
   each a skip-and-stay-owed arm and a test). Not observed in any E2E round.
-  Deferred, P3; revisit if an E2E round or a report shows it.
+  Deferred as D#425 (priority 1, low); revisit if an E2E round or a report shows it.
 - (b) Start-up open/wipe before the lock: the version wipe is stamped by the
   first opener, the sub-header guard window is the measured ~ms 0-byte window
   (`325b1d09`), and snapshot install needs an https snapshot configured.
-  Deferred, P3.
+  Deferred, D#425.
 - (c) `reindex --from-snapshot` under a build: the build's writes land in the
   replaced file, but the reindex's own pass leaves a complete index. Deferred,
-  P3 (the only harm is a success line from the replaced run).
+  D#425 (the only harm is a success line from the replaced run).
 - (e) D#406's unrelated remainder (C++ ctor, Rack::Protection, impact excluded
-  count, ...): each needs its own corpus; one session each.
+  count, ...): each needs its own corpus; one session each (D#426, priority 2).
 
 ## Acceptance
 
@@ -109,3 +109,17 @@ The rest of D#423, judged by how a default install reaches it:
 - fmt; clippy `--all-targets` both legs; `cargo test --features embed-model
   --no-fail-fast`: 2297 passed, 1 failed (the guard anchor above, fixed and
   re-run green); pre-commit default leg 2275 passed, 0 failed (31 binaries).
+- Pre-tag review (round 1, fresh subagent, 302e030e): all seven claims held.
+  MEDIUM, REPRODUCED: a node re-created under a reused id (re-indexed file whose
+  nodes held the top ids) gets the vector of its old text from the unlocked
+  embedding (fix = 0.171.0; 0.171.1 prevented it only between two CLI runs).
+  Not fixed here: the root is the shared vector store
+  (`insert_node_vectors_batch` checks existence, not content), every embed path
+  goes through it, and a content guard needs its own audit of the order in
+  which each path writes `context_string`. Disclosed in the 0.171.2 notes,
+  comment corrected, deferred as D#429. LOW: the probe passed when its deadline
+  ran out (`at_take = -1`) -> `Option`, asserted. LOW: no test pins the lock
+  through the index (the probe cannot tell "freed during" from "freed after"
+  the index without a seam) -> logged, not fixed. LOW: "1,162-node" -> 1,162 to
+  embed, 1,286 in all. Note: 0.171.1's server also embedded beside the CLI ->
+  "as 0.171.0's and 0.171.1's did".
