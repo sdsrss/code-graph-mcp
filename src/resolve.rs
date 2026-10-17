@@ -431,7 +431,8 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// Unless the index stores the `::` spelling itself: Ruby names `class
 /// Minitest::Test` exactly that, and its methods `Minitest::Test.run_case`.
 /// Rewriting those made them unfindable (E2E round 2), so an exact stored name
-/// or qualified name keeps the input as typed.
+/// or qualified name keeps the input as typed. So does a name of separators
+/// alone (`::`): rewritten, it was the empty name, which every lookup matches.
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
     if !symbol.contains("::") {
         return symbol.to_string();
@@ -444,10 +445,11 @@ pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
             |row| row.get(0),
         )
         .unwrap_or(false);
-    if stored {
+    let rewritten = symbol.trim_start_matches("::").replace("::", ".");
+    if stored || rewritten.is_empty() {
         symbol.to_string()
     } else {
-        symbol.trim_start_matches("::").replace("::", ".")
+        rewritten
     }
 }
 
@@ -852,6 +854,20 @@ mod fuzzy_tests {
             resolve_fuzzy(db.conn(), "no_such_symbol_anywhere").unwrap(),
             FuzzyResolution::NotFound
         ));
+    }
+
+    /// E2E round 4 (D#393(4)): a name made only of `::` rewrote to the empty
+    /// string, which every lookup matches: `refs ::` and `callgraph ::` said
+    /// `Ambiguous symbol ''` and listed every function, where 0.170.1 said
+    /// `Symbol not found: ::`.
+    #[test]
+    fn a_name_of_only_separators_is_kept_as_typed() {
+        let (_p, _d, db) = indexed(&[("src/a.rs", "pub fn alpha() {}\npub fn beta() {}\n")]);
+        for typed in ["::", "::::"] {
+            assert_eq!(canonical_symbol_spelling(db.conn(), typed), typed);
+        }
+        assert_eq!(canonical_symbol_spelling(db.conn(), "::alpha"), "alpha");
+        assert_eq!(canonical_symbol_spelling(db.conn(), "A::b"), "A.b");
     }
 }
 
