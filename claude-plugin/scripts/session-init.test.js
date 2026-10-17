@@ -66,7 +66,7 @@ test('ensureIndexFresh starts no CLI refresh while the MCP server is building', 
   fs.rmSync(status);
   assert.equal(ensureIndexFresh(deps), 'refreshing');
   assert.equal(spawned.length, 1);
-  assert.deepEqual(spawned[0][1], ['incremental-index', '--quiet']);
+  assert.deepEqual(spawned[0][1], ['incremental-index', '--quiet', '--no-embed']);
   // D#406: a server that starts after this look holds index.lock; the refresh
   // is asked to yield to it rather than write beside its startup run.
   assert.equal(spawned[0][2].env && spawned[0][2].env.CODE_GRAPH_YIELD_TO_SERVER, '1');

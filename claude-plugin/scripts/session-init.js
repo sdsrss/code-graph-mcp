@@ -398,8 +398,12 @@ function ensureIndexFresh(deps = {}) {
   // (D#406): asked to yield, the run takes the build lock and then does nothing
   // if a server holds index.lock; a server that starts later waits for its
   // build lock. An older binary ignores the variable and refreshes as before.
+  // --no-embed: the run holds that lock through its embedding too, and a
+  // server starting meanwhile would answer every tool call with "indexing in
+  // progress" until the vectors were done (pre-tag review); the server embeds
+  // the new nodes itself, as it does after the per-edit hook's runs.
   if (!require('./project-root').indexBuildInProgress(cwd)) {
-    const child = spawnRefresh(bin, ['incremental-index', '--quiet'], hidden({
+    const child = spawnRefresh(bin, ['incremental-index', '--quiet', '--no-embed'], hidden({
       cwd,
       detached: true,
       stdio: 'ignore',
