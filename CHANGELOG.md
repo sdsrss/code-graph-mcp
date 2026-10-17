@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.171.1
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). `incremental-index`
+can now take longer: while another index build runs it waits for it (printing
+`Waiting for another index build …` unless `--quiet`), where it used to write
+beside it. To pin the binary back: `npm i -g @sdsrs/code-graph@0.171.0` (or,
+from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.171.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### SessionStart's refresh and the MCP server's startup index no longer write at once
+
+When git HEAD is newer than the index, SessionStart starts `incremental-index`
+in the background, and the MCP server starts its own startup index at the same
+time. 0.171.0 skipped the refresh only while the server's build was already
+visible, so when the refresh started first, or the server started after
+SessionStart looked, two runs wrote one database. Measured on django (3,453
+files, 1,500 of them changed), the refresh started first and the server 0.3 s
+or 1.5 s later: 6 of 6 sessions ended with `health-check` UNHEALTHY
+(`interrupted`), the refresh failed in all 6 (`database is locked`, once
+`database disk image is malformed`), the server's startup index failed in 4,
+and the index held between 171,053 and 253,648 edges where a clean build has
+250,731. With the server first and the refresh 0.5 s or 3 s later, 3 of 4
+ended UNHEALTHY.
+
+An index build now holds `.code-graph/index-build.lock` from start to end: the
+MCP server's startup index, and every `incremental-index` (its embedding
+included). A build that finds it held waits for it. SessionStart also starts
+its refresh with `CODE_GRAPH_YIELD_TO_SERVER=1`, and then `incremental-index`
+indexes nothing (exit 0; under `--json`, `"mode": "skipped"` with the reason)
+while another process holds `.code-graph/index.lock`, that is, while an MCP
+server, which keeps the index fresh itself, or a `rebuild-index` runs. The
+refresh takes the build lock before it looks for a server, and the server
+takes `index.lock` before the build lock, so whichever starts second waits
+for or yields to the other. In the same tests: 0 of 6 and 0 of 4 unhealthy,
+no run failed, and the index held 250,731 edges every time. In the
+server-first test the refresh waited for the server's startup index and then
+skipped.
+
+A server that waited for a build which created the index (SessionStart
+rebuilds a version-stale index in full) now indexes only what changed since;
+it decided on a full build before waiting.
+
+### CI
+
+The daily `cargo audit` ignores RUSTSEC-2026-0367, -0368 and -0369 (zip 7.2.0,
+in `extract()`, which candle-core 0.9.2 never calls). A test keeps the ignore
+only while that holds: it fails once zip reaches 9.x or leaves `Cargo.lock`,
+or when a package other than candle-core depends on zip.
+
+### Not covered
+
+- The MCP server's watcher and tool-call index runs and its embedding backfill
+  do not take the build lock, so an `incremental-index` run by hand while a
+  server is up writes beside them, as before (it warns). `rebuild-index` does
+  not take it either.
+- On Windows there is no build lock: the refresh still yields to a running
+  server, but a server that starts during a refresh does not wait for it.
+- A build that holds the build lock for more than 10 minutes is built beside,
+  with a warning.
+- `doctor`'s index repair (120 s) and the opt-in per-edit hook
+  (`CODE_GRAPH_HOOK_INDEX=on`, 8 s) run `incremental-index` with a time limit.
+  During another build that outlasts it they now time out waiting, where they
+  used to write beside it.
+
 ## 0.171.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Two exit codes
