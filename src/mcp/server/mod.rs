@@ -7519,6 +7519,100 @@ app.post('/api/login', handleLogin);
         );
     }
 
+    /// D#426 (4): get_ast_node by node_id seeded its impact by name + file, so
+    /// it counted every same-named definition in that file. leveldb's five
+    /// `Slice` constructors reported 520 excluded edges each where
+    /// `impact --node-id` reported 104.
+    #[test]
+    fn test_impact_summary_of_a_node_id_counts_that_node_only() {
+        let project = TempDir::new().unwrap();
+        let w = |name: &str, body: &str| std::fs::write(project.path().join(name), body).unwrap();
+        w(
+            "Cargo.toml",
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n",
+        );
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        w(
+            "src/main.rs",
+            "mod a;\nmod b;\nfn main() {\n    let x = plat();\n    println!(\"{}\", x);\n}\n",
+        );
+        // cfg twins: two `plat` definitions in one file, plus one elsewhere, so
+        // main's bare `plat()` is an ambiguous edge into each of the three.
+        w(
+            "src/a.rs",
+            "#[cfg(unix)]\npub fn plat() -> i32 { 1 }\n#[cfg(not(unix))]\npub fn plat() -> i32 { 2 }\n",
+        );
+        w("src/b.rs", "pub fn plat() -> i32 { 3 }\n");
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let twins: Vec<i64> = queries::get_nodes_by_name(server.db.conn(), "plat")
+            .unwrap()
+            .into_iter()
+            .filter(|n| {
+                queries::get_file_path(server.db.conn(), n.file_id)
+                    .unwrap()
+                    .as_deref()
+                    == Some("src/a.rs")
+            })
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(twins.len(), 2, "{twins:?}");
+        for id in twins {
+            let req = tool_call_json(
+                "get_ast_node",
+                json!({ "node_id": id, "include_impact": true }),
+            );
+            let result = parse_tool_result(&server.handle_message(&req).unwrap());
+            assert_eq!(
+                result["impact"]["ambiguous_callers_excluded"], 1,
+                "one ambiguous edge into node {id}, not one per twin: {result}"
+            );
+        }
+    }
+
+    /// D#426 (4), the other side: by name, a class's impact still takes its
+    /// same-named constructors, as `impact Slice` does (3 here). Seeding every
+    /// path by node dropped leveldb's `get_ast_node Slice` from 624 to 104.
+    #[test]
+    fn test_impact_summary_by_name_keeps_the_same_named_constructors() {
+        let project = TempDir::new().unwrap();
+        let w = |name: &str, body: &str| std::fs::write(project.path().join(name), body).unwrap();
+        w(
+            "slice.h",
+            "class Slice {\n public:\n  Slice() {}\n  Slice(const char* s) {}\n};\n",
+        );
+        // `Slice("x")` is an ambiguous call edge into the class and both
+        // constructors.
+        w(
+            "use.cc",
+            "#include \"slice.h\"\n\nint Use() {\n  Slice s = Slice(\"x\");\n  return 0;\n}\n",
+        );
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let excluded = |args: serde_json::Value| {
+            let req = tool_call_json("get_ast_node", args);
+            let result = parse_tool_result(&server.handle_message(&req).unwrap());
+            (
+                result["type"].clone(),
+                result["impact"]["ambiguous_callers_excluded"].clone(),
+            )
+        };
+        assert_eq!(
+            excluded(json!({ "symbol_name": "Slice", "include_impact": true })),
+            (json!("class"), json!(3))
+        );
+        for n in queries::get_nodes_by_name(server.db.conn(), "Slice").unwrap() {
+            if n.node_type == "method" {
+                assert_eq!(
+                    excluded(json!({ "node_id": n.id, "include_impact": true })),
+                    (json!("method"), json!(1)),
+                    "constructor {}",
+                    n.id
+                );
+            }
+        }
+    }
+
     /// E2E 2026-10-16 round 4: a `::` name in a file added since the last index
     /// was mapped to `.` before the tool indexed that file, so the first
     /// `get_ast_node Zed::Gadgetron` said "Symbol 'Zed.Gadgetron' not found"

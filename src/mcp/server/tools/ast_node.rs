@@ -21,6 +21,20 @@ fn drop_content_range(result: &mut serde_json::Value) {
     }
 }
 
+/// Where `include_impact` starts its caller traversal: the seed `cmd_impact`
+/// takes for the same request.
+#[derive(Clone, Copy)]
+pub(in crate::mcp::server) enum ImpactSeed {
+    /// The one node the caller passed as `node_id` (`impact --node-id`). A
+    /// name + file seed also took every same-named definition in that file
+    /// (cfg twins, overloads): leveldb's five `Slice` constructors reported
+    /// 520 excluded edges each where `impact --node-id` reported 104 (D#426).
+    Node,
+    /// Every definition of the resolved node's name in its file (`impact
+    /// <name>`): a class and its same-named constructors together.
+    NameInFile,
+}
+
 /// Outcome of refreshing the file a `node_id` lives in (CON-10).
 pub(in crate::mcp::server) enum NodeIdRefresh {
     /// Nothing was re-indexed, so the id still names what it named.
@@ -185,7 +199,7 @@ impl McpServer {
                 nid,
                 include_refs,
                 include_tests,
-                include_impact,
+                include_impact.then_some(ImpactSeed::Node),
                 ctx,
                 compact,
                 impact_conf_rank,
@@ -235,7 +249,7 @@ impl McpServer {
                 None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
                 Some(nf) => {
                     let nid = nf.node_id;
-                    let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, context_lines, compact, impact_conf_rank)?;
+                    let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact.then_some(ImpactSeed::NameInFile), context_lines, compact, impact_conf_rank)?;
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;
                     }
@@ -369,7 +383,10 @@ impl McpServer {
                         &mut result,
                         n.id,
                         impact_symbol,
-                        file_path,
+                        crate::graph::query::CallGraphSeed::Name {
+                            name: impact_symbol,
+                            file_path: Some(file_path),
+                        },
                         &n.node_type,
                         impact_conf_rank,
                     )?;
@@ -447,14 +464,15 @@ impl McpServer {
         }
     }
 
-    /// Lookup AST node by node_id.
+    /// Lookup AST node by node_id. `impact` adds the impact summary, seeded as
+    /// [`ImpactSeed`] says.
     #[allow(clippy::too_many_arguments)] // flag-driven introspection: 7 independent display toggles + the impact-summary confidence floor; a struct would just relocate the same fields
     pub(in crate::mcp::server) fn ast_node_by_id(
         &self,
         node_id: i64,
         include_refs: bool,
         include_tests: bool,
-        include_impact: bool,
+        impact: Option<ImpactSeed>,
         context_lines: usize,
         compact: bool,
         min_confidence_rank: u8,
@@ -537,13 +555,20 @@ impl McpServer {
             }
         }
 
-        if include_impact {
+        if let Some(impact_seed) = impact {
             let impact_symbol = node.qualified_name.as_deref().unwrap_or(&node.name);
+            let seed = match impact_seed {
+                ImpactSeed::Node => crate::graph::query::CallGraphSeed::Node(node.id),
+                ImpactSeed::NameInFile => crate::graph::query::CallGraphSeed::Name {
+                    name: impact_symbol,
+                    file_path: Some(&file_path),
+                },
+            };
             self.append_impact_summary(
                 &mut result,
                 node.id,
                 impact_symbol,
-                &file_path,
+                seed,
                 &node.node_type,
                 min_confidence_rank,
             )?;
@@ -556,21 +581,21 @@ impl McpServer {
     /// Reuses the shared impact query logic (graph::impact) but returns a compact summary object.
     /// `node_type` is required so that impact on non-function symbols (constant /
     /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
-    /// plus a warning, rather than a misleading LOW.
+    /// plus a warning, rather than a misleading LOW. `seed` is where the caller
+    /// traversal starts, the same one `cmd_impact` takes for that request.
     pub(in crate::mcp::server) fn append_impact_summary(
         &self,
         result: &mut serde_json::Value,
         node_id: i64,
         symbol_name: &str,
-        file_path: &str,
+        seed: crate::graph::query::CallGraphSeed<'_>,
         node_type: &str,
         min_confidence_rank: u8,
     ) -> Result<()> {
         const IMPACT_DEPTH: i32 = 3;
-        let caller_set = crate::graph::routes::get_callers_with_route_info(
+        let caller_set = crate::graph::routes::get_callers_with_route_info_seeded(
             self.db.conn(),
-            symbol_name,
-            Some(file_path),
+            seed,
             IMPACT_DEPTH,
             min_confidence_rank,
         )?;
@@ -594,10 +619,9 @@ impl McpServer {
             .filter(|c| c.depth < IMPACT_DEPTH)
             .map(|c| c.node_id)
             .collect();
-        let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
+        let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges_seeded(
             self.db.conn(),
-            symbol_name,
-            Some(file_path),
+            seed,
             crate::graph::query::Direction::Callers,
             min_confidence_rank,
         )? + crate::graph::query::count_suppressed_into(
