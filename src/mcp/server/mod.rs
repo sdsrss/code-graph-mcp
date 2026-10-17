@@ -7666,6 +7666,56 @@ end
         assert!(text.contains("lib/new2.rb"), "{text}");
     }
 
+    /// D#432 (8): `skip_indexing` holds for a `::` name too. The step above
+    /// that indexes a new file before mapping `::` is skipped with it, so the
+    /// file stays out of the index; dropping that check survived every test.
+    #[test]
+    fn test_skip_indexing_holds_for_a_colon_colon_name() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("lib")).unwrap();
+        std::fs::write(
+            project.path().join("lib/old.rb"),
+            "class Old\n  def run\n    1\n  end\nend\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        std::fs::write(
+            project.path().join("lib/new2.rb"),
+            "class Zed::Gadgetron\n  def spin\n    2\n  end\nend\n",
+        )
+        .unwrap();
+        let indexed = || -> i64 {
+            server
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE path = 'lib/new2.rb'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let call = |args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json("get_ast_node", args))
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone()
+        };
+        let skipped = call(json!({"symbol_name": "Zed::Gadgetron", "skip_indexing": true}));
+        assert_eq!(skipped["isError"], json!(true), "{skipped}");
+        assert_eq!(
+            indexed(),
+            0,
+            "skip_indexing must leave the new file unindexed"
+        );
+        // Control: without it the file is indexed and the name found.
+        let found = call(json!({"symbol_name": "Zed::Gadgetron"}));
+        assert_ne!(found["isError"], json!(true), "{found}");
+        assert_eq!(indexed(), 1);
+    }
+
     /// E2E 2026-10-16: `Type::method` — how Rust and C++ spell a member, and how
     /// a model writes it — was "not found" where `Type.method` answered. Every
     /// tool taking a symbol must answer both spellings identically.

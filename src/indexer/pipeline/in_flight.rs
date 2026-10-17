@@ -302,6 +302,26 @@ mod tests {
         );
     }
 
+    /// No lock reads as no run (D#432 (8)): a reader's refresh still runs
+    /// where the lock cannot be opened, and always on a platform without
+    /// flock. Reading `NoLock` as in flight survived every test.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_run_lock_reads_as_no_run_in_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        std::fs::create_dir(dir.path().join(RUN_LOCK)).unwrap();
+        assert!(matches!(probe_exclusive(&db), Probe::NoLock));
+        assert!(!a_run_is_in_flight(&db));
+        // Control: a held lock reads as a run in flight, and a finished one not.
+        std::fs::remove_dir(dir.path().join(RUN_LOCK)).unwrap();
+        let run = begin(&db).unwrap();
+        assert!(run._hold.is_some(), "the hold must be taken");
+        assert!(a_run_is_in_flight(&db));
+        finish(&db, run).unwrap();
+        assert!(!a_run_is_in_flight(&db));
+    }
+
     /// A hard-linked lock file (what `cp -al` / `rsync --link-dest` leave) is
     /// still held: the hold never writes through it (pre-tag review round 2).
     #[cfg(unix)]
