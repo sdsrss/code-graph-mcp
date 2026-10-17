@@ -338,10 +338,13 @@ function indexNeedsRevalidation(bin, cwd) {
  * Returns 'fresh' | 'refreshing' | 'skipped' | 'unknown', where 'unknown' means
  * the SessionStart budget ran out before either trigger could be evaluated —
  * distinct from 'fresh' (both triggers asked and neither fired) and from
- * 'skipped' (no binary / no index, so there was nothing to ask).
+ * 'skipped' (no binary / no index, so there was nothing to ask). 'refreshing'
+ * also when the MCP server's own build is in progress and no refresh is
+ * started. `deps` replaces `findBinary` and `spawn` in tests.
  */
-function ensureIndexFresh() {
-  const { findBinary } = require('./find-binary');
+function ensureIndexFresh(deps = {}) {
+  const findBinary = deps.findBinary || require('./find-binary').findBinary;
+  const spawnRefresh = deps.spawn || spawn;
   const bin = findBinary();
   if (!bin) return 'skipped';
 
@@ -385,12 +388,19 @@ function ensureIndexFresh() {
   // from looking again.
   if (!needsRefresh) return unprobed ? 'unknown' : 'fresh';
 
-  const child = spawn(bin, ['incremental-index', '--quiet'], hidden({
-    cwd,
-    detached: true,
-    stdio: 'ignore',
-  }));
-  if (child && typeof child.unref === 'function') child.unref();
+  // The MCP server's startup run is already indexing (its status file names a
+  // live writer) and covers what this refresh would. A CLI run started beside
+  // it raced its writes and failed it: django, the server first and this hook
+  // 50 ms later, 3 of 3, and the server's watcher never started (E2E
+  // 2026-10-16 round 4).
+  if (!require('./project-root').indexBuildInProgress(cwd)) {
+    const child = spawnRefresh(bin, ['incremental-index', '--quiet'], hidden({
+      cwd,
+      detached: true,
+      stdio: 'ignore',
+    }));
+    if (child && typeof child.unref === 'function') child.unref();
+  }
   if (corrupt) {
     notices.push(
       '[code-graph] The index at .code-graph/index.db was corrupt, so every hook had nothing to say.\n' +

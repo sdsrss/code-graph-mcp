@@ -33,6 +33,42 @@ test('ensureIndexFresh is exported as a callable helper', () => {
   assert.equal(typeof ensureIndexFresh, 'function');
 });
 
+test('ensureIndexFresh starts no CLI refresh while the MCP server is building', (t) => {
+  // E2E 2026-10-16 round 4: with git HEAD newer than the index, SessionStart
+  // spawned incremental-index while the MCP server's startup run was indexing;
+  // the two raced writes and the server's run failed (django, server first and
+  // this hook 50 ms later: 3 of 3, its watcher never started). The server's run
+  // covers what the refresh would.
+  const { execFileSync } = require('node:child_process');
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fresh-build-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, stdio: 'ignore' });
+  git('init', '-q');
+  fs.writeFileSync(path.join(dir, 'a.py'), 'x = 1\n');
+  git('add', '-A');
+  git('commit', '-qm', 'i');
+  fs.mkdirSync(path.join(dir, '.code-graph'));
+  const db = path.join(dir, '.code-graph', 'index.db');
+  fs.writeFileSync(db, '');
+  fs.utimesSync(db, new Date('2001-01-01'), new Date('2001-01-01'));
+  const status = path.join(dir, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(status, JSON.stringify({ s: 'starting', pid: process.pid }));
+  const spawned = [];
+  const deps = { findBinary: () => '/bin/true', spawn: (...a) => { spawned.push(a); return { unref() {} }; } };
+  const origCwd = process.cwd();
+  process.chdir(dir);
+  t.after(() => process.chdir(origCwd));
+
+  assert.equal(ensureIndexFresh(deps), 'refreshing');
+  assert.equal(spawned.length, 0, 'the server is building: no CLI run beside it');
+
+  // Control: with no build in progress the same index is refreshed.
+  fs.rmSync(status);
+  assert.equal(ensureIndexFresh(deps), 'refreshing');
+  assert.equal(spawned.length, 1);
+  assert.deepEqual(spawned[0][1], ['incremental-index', '--quiet']);
+});
+
 test('ensureIndexFresh returns skipped when no index exists', () => {
   const origCwd = process.cwd();
   const tmpDir = require('node:os').tmpdir();
