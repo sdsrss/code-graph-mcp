@@ -14092,3 +14092,44 @@ fn test_cli_a_colon_colon_name_in_a_new_file_is_found_the_first_time() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.contains("lib/fresh.sh"), "{stdout}");
 }
+
+/// E2E 2026-10-16 round 4: the constructor rule took any function named like
+/// its type inside the type's body, in every language. Only Java, C#, C++ and
+/// Dart name a constructor after its class; a TS, Python or Ruby method of
+/// that name is a second definition, which 0.170.1 reported and round 3 hid.
+#[test]
+fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one() {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    std::fs::create_dir_all(p.join(".git")).unwrap();
+    std::fs::write(
+        p.join("t.ts"),
+        "export class TCls {\n  TCls(): number { return 1 }\n}\nexport function useT() { return new TCls().TCls() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("y.py"),
+        "class YCls:\n    def YCls(self):\n        return 1\n\n\ndef use_y():\n    return YCls().YCls()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("r.rb"),
+        "class RbCls\n  def RbCls\n    1\n  end\nend\n\ndef use_rb\n  RbCls.new.RbCls\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("J.java"),
+        "public class JCls {\n  public JCls() {}\n  public int id() { return 1; }\n}\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    for name in ["TCls", "YCls", "RbCls"] {
+        let (stdout, stderr, code) = run_cli(&project, &["refs", name]);
+        assert_ne!(code, 0, "{name}: {stdout}{stderr}");
+        assert!(stderr.contains("Ambiguous symbol"), "{name}: {stderr}");
+    }
+    // Control: Java's constructor still is one.
+    let (stdout, stderr, code) = run_cli(&project, &["refs", "JCls"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+}

@@ -225,6 +225,14 @@ pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCa
     // Inside the body, or in C++ `T::T` outside it — not anywhere in the file:
     // Go declares a method beside a same-named struct (gin's `type Negotiate
     // struct` and `Context.Negotiate`), and that is two definitions (round 3).
+    // And only where the language names a constructor after its class: a TS,
+    // Python or Ruby method named like its class is a method (round 4).
+    let names_constructors = |path: &str| {
+        matches!(
+            crate::utils::config::detect_language(path),
+            Some("java" | "csharp" | "cpp" | "c" | "dart")
+        )
+    };
     let type_bodies: Vec<(&str, i64, i64)> = with_files
         .iter()
         .filter(|nf| matches!(nf.node.node_type.as_str(), "class" | "struct" | "enum"))
@@ -233,6 +241,7 @@ pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCa
     let constructors: std::collections::HashSet<i64> = with_files
         .iter()
         .filter(|nf| matches!(nf.node.node_type.as_str(), "function" | "method"))
+        .filter(|nf| names_constructors(&nf.file_path))
         .filter(|nf| {
             let out_of_line = matches!(
                 crate::utils::config::detect_language(&nf.file_path),
