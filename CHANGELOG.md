@@ -157,9 +157,10 @@ used to be removed before those phases.
   query then indexes only the files it reads and answers from them, and
   `health-check` reads `OK` (flask: `show url_for` indexed 8 of 109 files and
   said `Symbol not found`), as in 0.170.1.
-- For the first milliseconds of a cold server start (up to 18 ms on django),
-  before its status write, `index.db` exists with 0 bytes, and the queries and
-  `health-check` call it corrupt, as in 0.170.1.
+- For the first milliseconds of a cold server start, before its status write
+  (up to ~20 ms on django and flask), the queries and `health-check` fail as
+  in 0.170.1: `index database is corrupt: file is 0 bytes` while `index.db` is
+  empty, then `database is locked`.
 - Where the run lock cannot be taken (Windows, a lock file that cannot be
   opened), an index run that died is not detected.
 - `similar` falls back to the bare name without the note, and `--json` and the
