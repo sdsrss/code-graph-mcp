@@ -246,7 +246,7 @@ pub(crate) fn rewrite_owned(path: &Path) -> io::Result<File> {
 /// the index lock, whose `flock` lives on the inode and which is truncated
 /// explicitly after the lock is held.
 ///
-/// `#[cfg(unix)]` because its only caller, `lock::try_acquire_index_lock`, is;
+/// `#[cfg(unix)]` because its only caller, `lock::acquire_index_lock_retrying`, is;
 /// the non-Unix lock is an exclusive open HANDLE and reaches the same guard
 /// through `open_lock_handle` → [`refuse_non_regular`]. Without the gate this is
 /// dead code on Windows, and `[lints.rust] warnings = "deny"` makes that a hard

@@ -153,11 +153,13 @@ used to be removed before those phases.
   0.170.1, which does not report an interrupted run, read `OK` in the same
   test.
 - A server killed before its first progress line, while its status says
-  `starting`, leaves no marker: `health-check` reports the index empty, and a
-  query then indexes the files it reads, as in 0.170.1.
-- In the first ~20 ms of a cold server start, before its status write,
-  `index.db` exists with 0 bytes, and the queries and `health-check` call it
-  corrupt, as in 0.170.1.
+  `starting`, leaves no marker. `health-check` reports the index empty; a
+  query then indexes only the files it reads and answers from them, and
+  `health-check` reads `OK` (flask: `show url_for` indexed 8 of 109 files and
+  said `Symbol not found`), as in 0.170.1.
+- For the first milliseconds of a cold server start (up to 18 ms on django),
+  before its status write, `index.db` exists with 0 bytes, and the queries and
+  `health-check` call it corrupt, as in 0.170.1.
 - Where the run lock cannot be taken (Windows, a lock file that cannot be
   opened), an index run that died is not detected.
 - `similar` falls back to the bare name without the note, and `--json` and the
