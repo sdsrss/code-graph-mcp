@@ -360,6 +360,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                     // Fuzzy auto-resolve: unique match → promote; multi → suggest; none → bail
                     match resolve_fuzzy_name_cli(conn, base)? {
                         CliFuzzyResolution::Unique(resolved) => {
+                            // As `callgraph` says it (D#431): this answered for
+                            // another name with nothing but `symbol` to show it.
+                            if resolved != base {
+                                eprintln!("[code-graph] Resolved '{}' → '{}'", base, resolved);
+                            }
                             let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
                             (
                                 resolved_ids.into_iter().map(|(id, _)| id).collect(),

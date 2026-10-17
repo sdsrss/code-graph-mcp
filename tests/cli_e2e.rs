@@ -13624,6 +13624,31 @@ fn test_cli_a_symbol_answers_without_the_whitespace_around_it() {
     }
 }
 
+/// D#431: `refs` answered a near-miss name through the fuzzy step without
+/// saying so, where `callgraph` prints "Resolved 'X' → 'Y'".
+#[test]
+fn test_cli_refs_says_which_symbol_a_fuzzy_answer_is_for() {
+    let project = setup_indexed_project();
+    let (exact, exact_err, exact_code) = run_cli(&project, &["refs", "validateToken", "--json"]);
+    assert_eq!(exact_code, 0, "control: {exact}{exact_err}");
+    assert!(!exact_err.contains("Resolved '"), "control: {exact_err}");
+    for json in [true, false] {
+        let mut args = vec!["refs", "validateTok"];
+        if json {
+            args.push("--json");
+        }
+        let (stdout, stderr, code) = run_cli(&project, &args);
+        assert_eq!(code, 0, "{args:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("Resolved 'validateTok' → 'validateToken'"),
+            "{args:?}: {stderr}"
+        );
+        if json {
+            assert_eq!(stdout, exact, "the answer is the exact name's");
+        }
+    }
+}
+
 /// E2E 2026-10-16 (MCP-client QA, P1-1): during the MCP server's first index,
 /// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
 /// tool answered "Indexing in progress"; and a CLI query's freshness writes in

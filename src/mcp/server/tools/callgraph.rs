@@ -259,6 +259,7 @@ impl McpServer {
                         include_tests,
                         max_tokens,
                         args,
+                        super::super::fuzzy_switch_note(function_name, &resolved).as_deref(),
                     );
                 }
                 // The fuzzy step found only the name itself, which the ambiguity
@@ -313,13 +314,16 @@ impl McpServer {
             include_tests,
             max_tokens,
             args,
+            None,
         )
     }
 
     /// `max_tokens` and `args` (P1 #2): with a budget, the flat answer is fitted
     /// to it instead of switching to the rollup; `args` rebuilds the CLI
-    /// command that returns what either leaves out.
-    #[allow(clippy::too_many_arguments)] // the six query facts plus the budget and the raw args the next-step command is built from
+    /// command that returns what either leaves out. `note` says the answer is
+    /// for another name than the one asked (D#431); it goes in before the
+    /// budget is fitted, so the budget counts it.
+    #[allow(clippy::too_many_arguments)] // the six query facts, the budget, the raw args the next-step command is built from, and the note
     pub(in crate::mcp::server) fn format_call_graph_response(
         &self,
         function_name: &str,
@@ -329,6 +333,7 @@ impl McpServer {
         include_tests: bool,
         max_tokens: Option<usize>,
         args: &serde_json::Value,
+        note: Option<&str>,
     ) -> Result<serde_json::Value> {
         let next = cli_next_command(
             "get_call_graph",
@@ -524,6 +529,9 @@ impl McpServer {
                     rollup["boundaries"] = b;
                 }
             }
+            if let Some(note) = note {
+                rollup["note"] = json!(note);
+            }
             return Ok(rollup);
         }
 
@@ -551,6 +559,9 @@ impl McpServer {
             if let Some(b) = self.empty_result_boundaries(function_name, &seed_ids(results))? {
                 result["boundaries"] = b;
             }
+        }
+        if let Some(note) = note {
+            result["note"] = json!(note);
         }
         if let Some(tokens) = max_tokens {
             return self.call_graph_budgeted(result, &all_nodes, tokens, &next);

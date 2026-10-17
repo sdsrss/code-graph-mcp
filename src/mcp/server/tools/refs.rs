@@ -77,6 +77,8 @@ impl McpServer {
                 Vec::new()
             };
 
+        // Set where the fuzzy step answers for another name (D#431).
+        let mut fuzzy_note: Option<String> = None;
         // Resolve symbol to node_id(s)
         let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
             // SURF-16 (audit 2026-09-07) is NOT fixed here, deliberately.
@@ -223,6 +225,7 @@ impl McpServer {
                         }
                         return Err(anyhow!("Symbol '{}' not found in index.", symbol_name));
                     }
+                    fuzzy_note = super::super::fuzzy_switch_note(symbol_name, &resolved_name);
                     (ids, resolved_name)
                 }
                 FuzzyResolution::Ambiguous(cands) => {
@@ -447,6 +450,9 @@ impl McpServer {
         }
         if let Some(b) = boundaries {
             out["boundaries"] = b;
+        }
+        if let Some(note) = fuzzy_note {
+            out["note"] = json!(note);
         }
         Ok(out)
     }

@@ -345,6 +345,16 @@ pub(super) enum FuzzyResolution {
     NotFound,
 }
 
+/// The `note` an answer carries when the fuzzy step resolved `typed` to
+/// another name (D#431). Without it `get_call_graph` and `find_references`
+/// answered flask's `Flask.route` for `FlaskGroup` with nothing but the
+/// changed `function` / `symbol` field to show it; CLI `callgraph` and `refs`
+/// print "Resolved 'X' → 'Y'" on stderr, which an MCP answer does not have.
+pub(super) fn fuzzy_switch_note(typed: &str, resolved: &str) -> Option<String> {
+    (typed != resolved)
+        .then(|| format!("No exact match for '{typed}'; answering for '{resolved}'."))
+}
+
 /// Result from background startup indexing, consumed by post-index processing.
 pub(super) struct StartupIndexResult {
     pub(super) files_indexed: usize,
@@ -7767,6 +7777,54 @@ end
                 );
             }
         }
+    }
+
+    /// D#431: when the fuzzy step finds one close name, get_call_graph and
+    /// find_references answer for it, and said nothing about the switch:
+    /// flask's `Flask.route` answered for `FlaskGroup`. CLI `callgraph` prints
+    /// "Resolved 'X' → 'Y'" for the same input.
+    #[test]
+    fn test_a_fuzzy_answer_says_which_symbol_it_answers_for() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("auth.py"),
+            "def validate_token(t):\n    return t\n\n\ndef login(t):\n    return validate_token(t)\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let call = |tool: &str, args: serde_json::Value| {
+            parse_tool_result(&server.handle_message(&tool_call_json(tool, args)).unwrap())
+        };
+        for (tool, key, name_key) in [
+            ("get_call_graph", "symbol_name", "function"),
+            ("get_call_graph", "function_name", "function"),
+            ("find_references", "symbol_name", "symbol"),
+        ] {
+            // A typo, a prefix, and a dotted name only edit distance reaches.
+            for typed in ["validate_tokn", "validate_to", "X.validate_token"] {
+                let out = call(tool, json!({ key: typed }));
+                assert_eq!(out[name_key], "validate_token", "{tool} {typed}: {out}");
+                assert_eq!(
+                    out["note"],
+                    format!("No exact match for '{typed}'; answering for 'validate_token'."),
+                    "{tool} {key} {typed}: {out}"
+                );
+            }
+            let exact = call(tool, json!({ key: "validate_token" }));
+            assert_eq!(exact[name_key], "validate_token", "{tool}: {exact}");
+            assert!(exact.get("note").is_none(), "{tool}: {exact}");
+        }
+        // With a file_path that holds the definition it resolves to.
+        let out = call(
+            "get_call_graph",
+            json!({"symbol_name": "validate_tokn", "file_path": "auth.py"}),
+        );
+        assert_eq!(out["function"], "validate_token", "{out}");
+        assert_eq!(
+            out["note"], "No exact match for 'validate_tokn'; answering for 'validate_token'.",
+            "{out}"
+        );
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name
