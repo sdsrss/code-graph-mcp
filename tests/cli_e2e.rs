@@ -13653,6 +13653,67 @@ fn test_cli_refs_says_which_symbol_a_fuzzy_answer_is_for() {
     }
 }
 
+/// D#426 (4)'s CLI twin (0.171.3 pre-tag review): `show --node-id N --impact`
+/// seeded by name and file, so a node took the callers of every same-named
+/// definition in its file, where `impact --node-id N` counts that node's.
+#[test]
+fn test_cli_show_impact_of_a_node_id_counts_that_node_only() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        "struct A;\nstruct B;\nimpl A {\n    fn new() -> A { A }\n}\nimpl B {\n    fn new() -> B { B }\n}\n\
+         fn use_a() -> A { A::new() }\nfn use_b() -> B { B::new() }\nfn use_b2() -> B { B::new() }\n\
+         fn main() { use_a(); use_b(); use_b2(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let id_of = |qualified: &str| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT id FROM nodes WHERE qualified_name = ?1",
+                [qualified],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let (a, b) = (id_of("A.new"), id_of("B.new"));
+    drop(db);
+
+    for (nid, callers) in [(a, 1), (b, 2)] {
+        let nid = nid.to_string();
+        let (out, err, code) = run_cli(&project, &["impact", "--node-id", &nid, "--json"]);
+        assert_eq!(code, 0, "{out}{err}");
+        let impact: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(
+            impact["direct_callers"], callers,
+            "impact --node-id {nid}: {out}"
+        );
+        let (out, err, code) =
+            run_cli(&project, &["show", "--node-id", &nid, "--impact", "--json"]);
+        assert_eq!(code, 0, "{out}{err}");
+        let shown: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(
+            shown[0]["impact"]["direct_callers"], callers,
+            "show --node-id {nid} --impact must count that node's callers: {out}"
+        );
+        let (text, err, code) = run_cli(&project, &["show", "--node-id", &nid, "--impact"]);
+        assert_eq!(code, 0, "{text}{err}");
+        assert!(
+            text.contains(&format!("{callers} direct")),
+            "the text arm, node {nid}: {text}"
+        );
+    }
+}
+
 /// E2E 2026-10-16 (MCP-client QA, P1-1): during the MCP server's first index,
 /// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
 /// tool answered "Indexing in progress"; and a CLI query's freshness writes in
