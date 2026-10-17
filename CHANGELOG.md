@@ -21,6 +21,11 @@ reported 196 callers where the CLI reported 198. On flask, 13 of 392 (nested
 answers as before: a class still counts its same-named constructors, as
 `impact <name>` does (leveldb `Slice`: 624 on both).
 
+`show --node-id N --impact` started from the name in that file as well, and
+disagreed with `impact --node-id N` on 45 of leveldb's 1,152 nodes and 7 of
+flask's 392. It now starts from the node too and agrees on all 1,544. `show
+<name> --impact` answers as before (80 leveldb names, the same output).
+
 ### A symbol with whitespace around it
 
 No indexed name starts or ends with whitespace, so `DBImpl::Write ` (with a
@@ -41,12 +46,12 @@ the note described next.
 
 ### A fuzzy answer says which symbol it answers for
 
-When a name matches no definition and the fuzzy step finds exactly one close
-name, MCP `get_call_graph` and `find_references` answer for that name, as
-before, and now say so in the answer: `"note": "No exact match for 'abot';
-answering for 'abort'."` They used to show the switch only by the name in
-`function` / `symbol`. CLI `refs` now prints `Resolved 'abot' → 'abort'` on
-stderr, as `callgraph` already did; its stdout is unchanged.
+When their fuzzy step answers for another name than the one asked (a typo, a
+prefix), MCP `get_call_graph` and `find_references` answer for that name, as
+before, and now say so in the answer: `"note": "Resolved 'abot' → 'abort'."`
+They used to show the switch only by the name in `function` / `symbol`. CLI
+`refs` now prints the same `Resolved 'abot' → 'abort'` on stderr, as
+`callgraph` already did; its stdout is unchanged.
 
 Measured on flask and leveldb with 329 generated names (exact names, typos,
 prefixes, `Class.method` and `Class::method` for members the class does not
@@ -68,8 +73,9 @@ that file's new nodes the ids of its old ones, and the vectors being computed
 from the old text then landed on the new nodes. Nothing re-embeds a node that
 has a vector, so semantic search ranked those nodes by text they no longer
 had until their file changed again. A vector is now stored only if its node
-still holds the text it was computed from, and `incremental-index` embeds a
-node re-created meanwhile from its new text in the same run.
+still holds the text it was computed from. A node re-created meanwhile is
+embedded from its new text by the same run when that text is written before
+the run finishes its queue, and otherwise by the next embedding run.
 
 Measured with 120 functions in two files, the file of 10 rewritten and
 re-indexed by `incremental-index --no-embed` while 64 of 123 nodes were
@@ -79,19 +85,31 @@ text's (1.0000). Both end at 123/123 embedded.
 
 ### Not covered
 
-- A dotted name no definition has is answered by the fuzzy step for whatever
-  single name is close to the whole string: flask's `Flask.route` (defined as
-  `Scaffold.route`) answers for `FlaskGroup`, now with the note above. The
-  CLI drops the qualifier instead (`No definition is named 'Flask.route';
-  answering for 'route'`). The 0.152.0 notes say the MCP tools fall back to
-  the bare name as well; they do not: `get_ast_node`, `get_call_graph` and
-  `find_references` refuse such a name or answer it from the fuzzy step.
-  Spellings of `Flask.route` with whitespace around them, which 0.171.2
-  refused, now get the same answer: 16 runs (8 spellings, 2 tools) went from
-  "not found" to `FlaskGroup` with the note.
+- The fuzzy step can answer for an unrelated name; the note above now says
+  so, and 0.171.2 gave the same answers without it. It runs:
+  - on a dotted name no definition has, over the whole string: flask's
+    `Flask.route` (defined as `Scaffold.route`) answers for `FlaskGroup`. The
+    CLI drops the qualifier instead (`No definition is named 'Flask.route';
+    answering for 'route'`). The 0.152.0 notes say the MCP tools fall back to
+    the bare name as well; they do not: `get_ast_node`, `get_call_graph` and
+    `find_references` refuse such a name or answer it from the fuzzy step;
+  - on a name defined only in test files, which it skips: flask
+    `find_references {"symbol_name": "after"}` answers for `after_request`;
+  - in `get_call_graph`, on a definition with no edges in the asked
+    direction: leveldb `Block.size` with `direction: callees` answers for the
+    README heading `Block size`, where CLI `callgraph` answers an empty list.
+
+  The same names with whitespace around them now get these answers too.
+  `Flask.route`'s 8 padded spellings went from "not found" to `FlaskGroup`
+  in both tools (16 runs). For the 23 test-only names that get such an
+  answer in flask and leveldb, 4 paddings and 2 tools make 184 runs: 79 went
+  from a refusal or a candidate list to another name, 40 to the name itself,
+  and 65 answered for another name before and after.
 - Vectors an earlier release stored on the wrong text stay until their file
   changes; `incremental-index` does not replace them, `rebuild-index
-  --confirm` does.
+  --confirm` does. In the race above, `incremental-index`'s closing line
+  counts each re-created node twice (`Embedded 133 nodes (123/123)`; 0.171.2
+  printed 123).
 - A file created or edited after the MCP server starts and before its first
   tool call that indexes (`get_index_status` is not one) is not seen by that
   call or the ones after it, measured for 120 s: the file watcher starts at
