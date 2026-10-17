@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.171.2` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.171.2
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### `get_ast_node include_impact` with a `node_id` counts that node
+
+Given a `node_id`, the impact summary counted every definition of the node's
+name in its file (cfg twins, overloaded constructors), so it disagreed with
+`impact --node-id`. On leveldb, 12 of 1,152 functions and methods disagreed:
+each of the five `Slice` constructors reported 520 ambiguous call edges
+excluded where the CLI reported 104, and the three `Status` constructors
+reported 196 callers where the CLI reported 198. On flask, 13 of 392 (nested
+`decorator` and `view` functions). The summary now starts from that node, as
+`impact --node-id` does, and the two agree on all 1,544. A lookup by name
+answers as before: a class still counts its same-named constructors, as
+`impact <name>` does (leveldb `Slice`: 624 on both).
+
+### A symbol with whitespace around it
+
+No indexed name starts or ends with whitespace, so `DBImpl::Write ` (with a
+trailing space) matched no definition. MCP `get_call_graph` and
+`find_references` answered for leveldb's `struct DBImpl::Writer` through their
+fuzzy step; the CLI's `show`, `callgraph`, `impact` and `refs` exited 1, and
+`get_ast_node` answered "not found". Both surfaces now drop the whitespace
+around a symbol argument before looking it up; whitespace inside a name
+(`SkipList<Key, Comparator>::Insert`) stays, and an argument of whitespace
+alone is answered as before. Measured on leveldb and flask over 100 spellings
+(46 of them `::`, template and blank shapes), each with whitespace before it,
+after it, around it or none, through CLI `show`, `callgraph`, `impact`,
+`refs`, `similar` and MCP `get_ast_node`, `get_call_graph`,
+`find_references`, `find_similar_code`: in 4,920 runs, each answer equals the
+one 0.171.2's source gives with the whitespace removed, or, for whitespace
+alone, as typed.
+
+### Not covered
+
+- When their fuzzy step finds one close name, MCP `get_call_graph` and
+  `find_references` answer for it without saying so. flask's `Flask.route`
+  (defined as `Scaffold.route`) answers for `FlaskGroup`, where the CLI says
+  `No definition is named 'Flask.route'; answering for 'route'`. Spellings of
+  such a name with whitespace around them now get that answer too, where
+  0.171.2 answered "not found": 16 of the 4,920 runs above.
+
 ## 0.171.2
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
