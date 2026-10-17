@@ -29,10 +29,10 @@ seconds.` They used to answer from the part built so far with exit 0, and
 their freshness writes could fail the server's build with `database is
 locked`. `health-check` still answers, and `grep` falls back to plain grep.
 
-A build counts from its start: the server writes `{"s":"starting"}` to
-`.code-graph/indexing-status.json` before it walks the tree, and the first
-progress line comes before the first batch, not after it. The statusline shows
-`code-graph: ↻ indexing…` for it, and SubagentStart says nothing while it
+A build counts from the server's first status write, `{"s":"starting"}` to
+`.code-graph/indexing-status.json`, made before it walks the tree, and the
+first progress line comes before the first batch, not after it. The
+statusline shows `code-graph: ↻ indexing…` for it, and SubagentStart says nothing while it
 runs. Each write names the server's pid, and a status file counts as a build
 only while that pid is found or some process holds `.code-graph/index.lock`,
 which the server holds for its whole life: a killed server's leftover file
@@ -52,11 +52,10 @@ statusline runs `health-check` on every render. The version is now written
 only when it changes; 5 of 5 runs passed beside about 90 health-checks each.
 
 A query beside another index run (a CLI build, the MCP server's run) no
-longer refreshes the files it reads. Its write contended with the run, failed
-fast and left a marker that read as a run that died: on django, 2 of 3 cold
-`incremental-index` runs beside a `show` loop finished with exit 0 and then
-`UNHEALTHY`. The query now answers from the index as it is and reports the
-files stale, as it did on contention.
+longer refreshes the files it reads. Its writes contended with the run's: a
+cold `incremental-index` on django beside a `show` loop could fail with
+`database is locked`. The query now answers from the index as it is and
+reports the files stale, as it did on contention.
 
 ### An index run that died is reported
 
@@ -93,8 +92,6 @@ used to be removed before those phases.
   other languages (TS, Python, Ruby) and a method beside a same-named type
   (Go's `type Negotiate struct` and `Context.Negotiate`) are still two
   definitions, as before.
-- A `::` name in a file added since the last index is found by the first
-  query, in the CLI and the MCP tools.
 - `callgraph`'s text tree roots at a code definition, neither a test nor a
   markdown heading, and among those at one with callers: flask's `callgraph
   Flask` printed a test's subclass and `(48 test callers hidden)` with none of
@@ -144,8 +141,23 @@ used to be removed before those phases.
   heading, as in 0.170.1, and a Ruby root-namespace spelling the index does not
   store (`show ::Minitest::Test`) is `Symbol not found`.
 - A query killed while its freshness pass writes leaves the interrupted
-  marker, and `health-check` reports the index unhealthy until the next
-  `incremental-index` or MCP server start.
+  marker, and `health-check` reports the index unhealthy until a run
+  re-indexes in full: `incremental-index`, or the MCP server's next index run
+  or start.
+- SessionStart's `incremental-index` (started when git HEAD is newer than the
+  index) can still run beside the MCP server's startup run when SessionStart
+  starts first. On django, with the server started 50 ms after it, 3 of 3
+  sessions ended with the interrupted marker (the release review): the CLI run
+  fails with `database is locked`, `health-check` reports the index unhealthy
+  and the statusline shows `✗`, until a run re-indexes in full as above.
+  0.170.1, which does not report an interrupted run, read `OK` in the same
+  test.
+- A server killed before its first progress line, while its status says
+  `starting`, leaves no marker: `health-check` reports the index empty, and a
+  query then indexes the files it reads, as in 0.170.1.
+- In the first ~20 ms of a cold server start, before its status write,
+  `index.db` exists with 0 bytes, and the queries and `health-check` call it
+  corrupt, as in 0.170.1.
 - Where the run lock cannot be taken (Windows, a lock file that cannot be
   opened), an index run that died is not detected.
 - `similar` falls back to the bare name without the note, and `--json` and the
