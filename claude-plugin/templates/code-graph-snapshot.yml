@@ -41,7 +41,7 @@ jobs:
       # refuses a snapshot that has no checksum sidecar.
       - name: Build snapshot
         run: |
-          npx -y -p @sdsrs/code-graph@0.171.1 code-graph-mcp snapshot create --out "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
+          npx -y -p @sdsrs/code-graph@0.171.2 code-graph-mcp snapshot create --out "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
