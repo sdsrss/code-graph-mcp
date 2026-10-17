@@ -2607,13 +2607,19 @@ impl McpServer {
     fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         // `Type::method` → the index's `Type.method`, once, for every tool that
         // takes a symbol, unless the index stores the `::` spelling (see
-        // `resolve::canonical_symbol_spelling`).
+        // `resolve::canonical_symbol_spelling`). A spelling not stored yet may be
+        // in a file the tool's own `ensure_indexed` is about to index, so that
+        // runs first, as the CLI indexes new files before it maps (E2E round 4).
         let mut canonical: Option<serde_json::Value> = None;
         for key in ["symbol_name", "function_name"] {
             if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
                 if s.contains("::") {
-                    canonical.get_or_insert_with(|| args.clone())[key] =
-                        json!(crate::resolve::canonical_symbol_spelling(self.db.conn(), s));
+                    let mut spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
+                    if spelled != s && !should_skip_indexing(args)? {
+                        self.ensure_indexed()?;
+                        spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
+                    }
+                    canonical.get_or_insert_with(|| args.clone())[key] = json!(spelled);
                 }
             }
         }
@@ -7488,6 +7494,44 @@ app.post('/api/login', handleLogin);
             impact.get("ambiguous_callers_excluded").is_none(),
             "caller_b is past the depth; nothing within it was excluded: {result}"
         );
+    }
+
+    /// E2E 2026-10-16 round 4: a `::` name in a file added since the last index
+    /// was mapped to `.` before the tool indexed that file, so the first
+    /// `get_ast_node Zed::Gadgetron` said "Symbol 'Zed.Gadgetron' not found"
+    /// and the second found it; 0.170.1 found it the first time.
+    #[test]
+    fn test_a_colon_colon_name_in_a_new_file_is_found_the_first_time() {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("lib")).unwrap();
+        std::fs::write(
+            project.path().join("lib/old.rb"),
+            "class Old
+  def run
+    1
+  end
+end
+",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        std::fs::write(
+            project.path().join("lib/new2.rb"),
+            "class Zed::Gadgetron
+  def spin
+    2
+  end
+end
+",
+        )
+        .unwrap();
+        let req = tool_call_json("get_ast_node", json!({"symbol_name": "Zed::Gadgetron"}));
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_ne!(v["result"]["isError"], json!(true), "{v}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("lib/new2.rb"), "{text}");
     }
 
     /// E2E 2026-10-16: `Type::method` — how Rust and C++ spell a member, and how
