@@ -350,9 +350,11 @@ pub(super) enum FuzzyResolution {
 /// answered flask's `Flask.route` for `FlaskGroup` with nothing but the
 /// changed `function` / `symbol` field to show it; CLI `callgraph` and `refs`
 /// print "Resolved 'X' → 'Y'" on stderr, which an MCP answer does not have.
+/// Their wording, which claims nothing about `X`: the step also runs on a name
+/// defined only in test files, or with no edges, so "no exact match" was false
+/// there (0.171.3 pre-tag review).
 pub(super) fn fuzzy_switch_note(typed: &str, resolved: &str) -> Option<String> {
-    (typed != resolved)
-        .then(|| format!("No exact match for '{typed}'; answering for '{resolved}'."))
+    (typed != resolved).then(|| format!("Resolved '{typed}' → '{resolved}'."))
 }
 
 /// Result from background startup indexing, consumed by post-index processing.
@@ -7826,19 +7828,32 @@ end
                     "{tool} {key} {padded:?} must answer as `DBImpl::Write` does"
                 );
             }
+            // A name without `::` too (trimming only `::` names survived).
+            let plain = call("Put");
+            for padded in ["Put ", " Put", "\tPut\n"] {
+                assert_eq!(call(padded), plain, "{tool} {key} {padded:?}");
+            }
         }
     }
 
     /// D#431: when the fuzzy step finds one close name, get_call_graph and
     /// find_references answer for it, and said nothing about the switch:
     /// flask's `Flask.route` answered for `FlaskGroup`. CLI `callgraph` prints
-    /// "Resolved 'X' → 'Y'" for the same input.
+    /// "Resolved 'X' → 'Y'" for the same input, and the note says what it says:
+    /// the step also runs on a name defined only in test files, so "no exact
+    /// match" was false there (0.171.3 pre-tag review).
     #[test]
     fn test_a_fuzzy_answer_says_which_symbol_it_answers_for() {
         let project = TempDir::new().unwrap();
         std::fs::write(
             project.path().join("auth.py"),
             "def validate_token(t):\n    return t\n\n\ndef login(t):\n    return validate_token(t)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        std::fs::write(
+            project.path().join("tests/test_auth.py"),
+            "def validate(t):\n    return t\n",
         )
         .unwrap();
         let server = McpServer::new_test_with_project(project.path());
@@ -7851,13 +7866,19 @@ end
             ("get_call_graph", "function_name", "function"),
             ("find_references", "symbol_name", "symbol"),
         ] {
-            // A typo, a prefix, and a dotted name only edit distance reaches.
-            for typed in ["validate_tokn", "validate_to", "X.validate_token"] {
+            // A typo, a prefix, a dotted name only edit distance reaches, and
+            // a name defined only in a test file.
+            for typed in [
+                "validate_tokn",
+                "validate_to",
+                "X.validate_token",
+                "validate",
+            ] {
                 let out = call(tool, json!({ key: typed }));
                 assert_eq!(out[name_key], "validate_token", "{tool} {typed}: {out}");
                 assert_eq!(
                     out["note"],
-                    format!("No exact match for '{typed}'; answering for 'validate_token'."),
+                    format!("Resolved '{typed}' → 'validate_token'."),
                     "{tool} {key} {typed}: {out}"
                 );
             }
@@ -7872,7 +7893,7 @@ end
         );
         assert_eq!(out["function"], "validate_token", "{out}");
         assert_eq!(
-            out["note"], "No exact match for 'validate_tokn'; answering for 'validate_token'.",
+            out["note"], "Resolved 'validate_tokn' → 'validate_token'.",
             "{out}"
         );
     }

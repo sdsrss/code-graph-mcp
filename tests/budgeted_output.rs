@@ -811,6 +811,36 @@ fn mcp_max_tokens_lands_within_fifteen_percent() {
     }
 }
 
+/// D#431: the note naming the name a fuzzy answer is for is part of both
+/// answer shapes, and goes in before the budget is fitted, so the budget
+/// counts it. Dropping it from the rollup, or adding it after the fit,
+/// survived every test (0.171.3 pre-tag review). The fitted answer's slack
+/// varies by up to one node row across budgets, so a note added after the fit
+/// overruns some of these.
+#[test]
+fn a_fuzzy_answer_note_is_in_the_rollup_and_inside_the_budget() {
+    let p = fixture();
+    let server = common::init_server(&p);
+    let note = "Resolved 'hubb' → 'hub'.";
+    let (v, _) = mcp(&server, "get_call_graph", json!({"symbol_name": "hubb"}));
+    assert_eq!(v["mode"], "rollup_call_graph", "{v}");
+    assert_eq!(v["function"], "hub", "{v}");
+    assert_eq!(v["note"], note, "{v}");
+    for tokens in (300..=700).step_by(13) {
+        let (v, bytes) = mcp(
+            &server,
+            "get_call_graph",
+            json!({"symbol_name": "hubb", "max_tokens": tokens}),
+        );
+        assert_eq!(v["note"], note, "@{tokens}: {v}");
+        assert!(v.get("budget").is_some(), "@{tokens}: expected a cut: {v}");
+        assert!(
+            bytes <= code_graph_mcp::budget::budget_bytes(tokens),
+            "@{tokens}: {bytes} B is over the budget"
+        );
+    }
+}
+
 #[test]
 fn mcp_budget_next_returns_what_it_left_out() {
     let p = fixture();
