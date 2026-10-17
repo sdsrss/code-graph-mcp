@@ -23,8 +23,9 @@ one at once.
 
 `incremental-index` now lets go of the build lock once its index is written,
 before it embeds, as the server's own startup index already did. The lock
-still covers writing the index, as in 0.171.1. In the same test: 12 of 12 calls over
-55 s answered, the first at once, while the CLI was still embedding.
+still covers writing the index, as in 0.171.1. In the same test: 12 of 12
+calls over 55 s answered, the first at once, while the CLI was still
+embedding.
 
 ### Not covered
 
@@ -34,13 +35,13 @@ still covers writing the index, as in 0.171.1. In the same test: 12 of 12 calls 
   to embed (1,286 in all), 0.171.0 and this version both left a healthy index
   with a vector for every one of them and no orphan vector, and the CLI
   exited 0.
-- A file indexed again while `incremental-index` embeds, by a server or by
-  another `incremental-index`, can keep vectors computed from its previous
-  text: when its nodes were the newest in the index, the new ones get the
-  same ids, the embedding stores its result on them, and nothing embeds them
-  again until the file changes. 0.171.0 did the same, and 0.171.1 did beside
-  a server's own index runs; it prevented it only between two
-  `incremental-index` runs, by making the second one wait.
+- An index run beside that embedding, a starting server's or another
+  `incremental-index`'s, can leave nodes with vectors computed from their
+  previous text: those of a file it indexed again, when the new nodes got
+  the old ones' ids, and callers elsewhere whose context it rewrote. 0.171.0
+  did the same. 0.171.1 avoided it in both cases by making that run wait, for
+  up to 10 minutes; that wait is what this release removes. A node's vector
+  is dropped when its text changes again, and the next embedding fills it in.
 - Apart from this wait, the items 0.171.1 listed under Not covered are
   unchanged.
 

@@ -14305,7 +14305,8 @@ fn test_cli_incremental_index_embeds_without_the_build_lock() {
         .unwrap();
         let (running, at_take, at_end) =
             take_the_build_lock_during_an_embedding_run(&project, file);
-        // A probe that never had the lock (its deadline passed) is no answer.
+        // A probe that never had the lock (its deadline passed, or the run
+        // ended before its file was indexed) is no answer.
         assert!(
             running && at_take.is_some_and(|n| n < at_end),
             "{run}: the build lock was free only once the run had embedded \

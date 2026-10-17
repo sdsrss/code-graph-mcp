@@ -112,7 +112,7 @@ The rest of D#423, judged by how a default install reaches it:
 - Pre-tag review (round 1, fresh subagent, 302e030e): all seven claims held.
   MEDIUM, REPRODUCED: a node re-created under a reused id (re-indexed file whose
   nodes held the top ids) gets the vector of its old text from the unlocked
-  embedding (fix = 0.171.0; 0.171.1 prevented it only between two CLI runs).
+  embedding (fix = 0.171.0; 0.171.1 avoided it by making the other run wait).
   Not fixed here: the root is the shared vector store
   (`insert_node_vectors_batch` checks existence, not content), every embed path
   goes through it, and a content guard needs its own audit of the order in
@@ -123,3 +123,16 @@ The rest of D#423, judged by how a default install reaches it:
   the index without a seam) -> logged, not fixed. LOW: "1,162-node" -> 1,162 to
   embed, 1,286 in all. Note: 0.171.1's server also embedded beside the CLI ->
   "as 0.171.0's and 0.171.1's did".
+- Delta review (round 2, fresh subagent, 892a969d): the probe repair held
+  (GREEN 3/3, each `drop(build)` mutation red). MEDIUM, REPRODUCED: the notes'
+  "0.171.1 prevented it only between two CLI runs" was false: a server starting
+  during the CLI's embedding also waited in 0.171.1 (stale vectors: fix 20,
+  0.171.0 20, 0.171.1 0). LOW, REPRODUCED: callers whose context is rewritten
+  in place (not re-created) also keep an old-text vector (cos 1.0000 to old,
+  0.9986 to new); LOW: "nothing embeds them again" too strong (a server's
+  backfill batch can land after the CLI's); LOW: the wait was capped at 10 min;
+  nit: test comment. All text: closed by narrowing the notes, the comment and
+  the test comment to what was reproduced or read in code, no round 3 (depth
+  limit). Also dropped a draft claim that `rebuild-index` recomputes them all:
+  `seed_embedding_cache_from_vectors` keys the cache on a node's current
+  `context_string`, so a stale vector seeded there would be reused (D#429).

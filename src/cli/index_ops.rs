@@ -489,8 +489,10 @@ pub fn cmd_incremental_index_opts(
         // progress" until it ended or 10 min passed (D#423). The embedding then
         // runs beside other processes' index runs, as the server's backfill
         // does (and as this did in 0.171.0): the store skips a node that
-        // vanished meanwhile (`insert_node_vectors_batch`), but a node
-        // re-created under the same id gets the vector of its old text (D#429).
+        // vanished meanwhile (`insert_node_vectors_batch`), but a node whose
+        // text changed meanwhile (re-created under the same id, or a caller
+        // whose context was rewritten) can get the vector of its old text
+        // (D#429).
         drop(build);
         finish_embedding(&db, quiet, no_embed)?;
         if json {
