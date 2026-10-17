@@ -2578,6 +2578,112 @@ fn ci_schedule_runs_only_the_audit_job() {
     );
 }
 
+/// The advisories ci.yml tells `cargo audit` to ignore: (id, crate, first fixed
+/// major, the one package allowed to depend on that crate). An ignore is a
+/// claim that the vulnerable code is unreachable from here, and the claim is
+/// about one dependent: the zip advisories (2026-10-09/10, all in
+/// `ZipArchive::extract` / `ZipStreamReader::extract`) hold for candle-core
+/// 0.9.2, which only opens archives by name and writes `.npz` files, and which
+/// this crate uses for safetensors alone. No candle release depends on zip 9
+/// yet (0.11.0 asks for `^8.6.0`), and no 7.x or 8.x release carries the fix.
+const AUDIT_IGNORES: &[(&str, &str, u64, &str)] = &[
+    ("RUSTSEC-2026-0367", "zip", 9, "candle-core"),
+    ("RUSTSEC-2026-0368", "zip", 9, "candle-core"),
+    ("RUSTSEC-2026-0369", "zip", 9, "candle-core"),
+];
+
+/// An audit ignore stays only while its reason does. The ignore cannot go
+/// stale loudly by itself: once candle moves to zip 9, `cargo audit` would
+/// pass with or without it, and the line would sit in ci.yml hiding the next
+/// zip advisory. This turns red when the locked crate reaches its fixed
+/// version (drop the ignore), when it leaves Cargo.lock, and when anything
+/// besides the named dependent starts depending on it (the reason no longer
+/// covers every caller).
+#[test]
+fn audit_ignores_hold_only_while_their_reason_does() {
+    use std::collections::BTreeSet;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let mut ignored = BTreeSet::new();
+    for line in yaml_directives(workflow_job(&ci, "audit")) {
+        let mut words = line.split_whitespace();
+        while let Some(w) = words.next() {
+            if w == "--ignore" {
+                ignored.insert(words.next().expect("--ignore takes an id").to_string());
+            }
+        }
+    }
+    let listed: BTreeSet<String> = AUDIT_IGNORES.iter().map(|r| r.0.to_string()).collect();
+    assert_eq!(
+        ignored, listed,
+        "ci.yml's audit ignores and AUDIT_IGNORES differ: each ignore needs a row \
+         saying why it holds, and a row whose ignore is gone should go too"
+    );
+
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    // (name, version, dependency names) per `[[package]]`. A dependency entry
+    // is `"name"` or, when two versions are locked, `"name version"`.
+    let packages: Vec<(String, String, Vec<String>)> = lock
+        .split("[[package]]")
+        .skip(1)
+        .map(|block| {
+            let field = |key: &str| {
+                block
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{key} = \"")))
+                    .map(|v| v.trim_end_matches('"').to_string())
+                    .unwrap_or_default()
+            };
+            let deps = block
+                .split_once("dependencies = [")
+                .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+                .unwrap_or("")
+                .split(',')
+                .filter_map(|d| d.trim().trim_matches('"').split(' ').next())
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect();
+            (field("name"), field("version"), deps)
+        })
+        .collect();
+    assert!(
+        packages.len() > 100,
+        "only {} packages parsed from Cargo.lock — the parse lost its grip",
+        packages.len()
+    );
+
+    for (id, krate, fixed_major, dependent) in AUDIT_IGNORES {
+        let versions: Vec<&str> = packages
+            .iter()
+            .filter(|(name, ..)| name == krate)
+            .map(|(_, version, _)| version.as_str())
+            .collect();
+        assert!(
+            !versions.is_empty(),
+            "{id}: `{krate}` is no longer in Cargo.lock — drop its ignore from ci.yml"
+        );
+        for version in &versions {
+            let major: u64 = version.split('.').next().unwrap().parse().unwrap();
+            assert!(
+                major < *fixed_major,
+                "{id}: `{krate}` is locked at {version}, at or past the fixed \
+                 {fixed_major}.x — drop its ignore from ci.yml"
+            );
+        }
+        let dependents: Vec<&str> = packages
+            .iter()
+            .filter(|(_, _, deps)| deps.iter().any(|d| d == krate))
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        assert_eq!(
+            dependents,
+            vec![*dependent],
+            "{id}: the ignore says only `{dependent}` reaches `{krate}`; check \
+             whether the new dependent calls the vulnerable code before keeping it"
+        );
+    }
+}
+
 /// The arm64 cross-compile install must be the SAME in both workflows.
 ///
 /// The two copies are twins, and on 2026-09-04 that was the whole finding: from

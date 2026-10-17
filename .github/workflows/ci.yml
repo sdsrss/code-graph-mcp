@@ -409,5 +409,11 @@ jobs:
           key: cargo-audit
       - name: Install cargo-audit
         run: cargo install --locked --version ^0.22 cargo-audit
+      # Ignored, each for a stated reason that tests/hardening.rs re-checks
+      # (`AUDIT_IGNORES`; it goes red once the reason stops holding):
+      # RUSTSEC-2026-0367/0368/0369 are in zip's `extract()`, and zip 7.2.0
+      # comes only through candle-core 0.9.2, which never calls it (it opens
+      # archives by name and writes .npz; this crate loads safetensors). No
+      # candle release takes the fixed zip 9 yet, and no 7.x/8.x has the fix.
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
