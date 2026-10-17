@@ -111,6 +111,14 @@ pub(super) fn a_run_died(db: &Database) -> bool {
     value.is_some_and(|v| !v.trim().is_empty())
 }
 
+/// Whether some index run holds the run lock now. For a READER about to write
+/// a courtesy refresh: beside a live run that write contends with it, fails
+/// fast, and leaves this refresh's own token behind (E2E 2026-10-16 round 4).
+/// No lock (non-Unix, unopenable) reads as no run.
+pub(super) fn a_run_is_in_flight(db: &Database) -> bool {
+    matches!(probe_exclusive(db), Probe::InFlight)
+}
+
 /// Remove `tokens` from the marker, and the marker once it is empty. Two
 /// statements, neither a read-modify-write: a token another run adds between
 /// them keeps the marker non-empty, and so keeps it.

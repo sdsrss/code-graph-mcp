@@ -153,6 +153,17 @@ pub fn resync_stale_files(
     // a unit (it runs inside one savepoint), which is also the honest report:
     // every file in it is still stale.
     let changed = drop_rows.len() + reindex.len();
+    // Beside another index run the write contends with it and fails fast, and
+    // the failed refresh leaves its run token, which reads as a run that died
+    // (E2E 2026-10-16 round 4). The rows stay as they are, as on contention.
+    if crate::indexer::pipeline::index_run_in_flight(db) {
+        outcome.failed += changed;
+        outcome.stale_paths.extend(drop_rows);
+        outcome
+            .stale_paths
+            .extend(reindex.into_iter().map(|(f, _)| f));
+        return outcome;
+    }
     match apply_file_refreshes(db, root, &drop_rows, &reindex, None) {
         Ok(()) => outcome.refreshed += changed,
         Err(_) => {
@@ -227,6 +238,51 @@ mod tests {
         assert!(!out.any_changed());
         assert!(!out.is_partial());
         assert!(out.stale_paths.is_empty());
+    }
+
+    /// E2E 2026-10-16 round 4: a query's refresh beside another index run (a
+    /// CLI build, the MCP server's run) contended with it, failed fast, and left
+    /// its run token: 5 of 5 django builds beside a query loop finished rc=0
+    /// and then read "the last index run did not finish". While a run holds the
+    /// run lock the refresh writes nothing and reports the files stale.
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_writes_nothing_while_another_index_run_is_in_flight() {
+        use std::os::unix::io::AsRawFd;
+        let f = indexed_project(2);
+        touch(&f.root, 1);
+        let run = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(f.root.join(".code-graph/index-run.lock"))
+            .unwrap();
+        // SAFETY: `run` is an open File owned by this scope.
+        assert_eq!(
+            unsafe { libc::flock(run.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+        let out = resync_stale_files(
+            &f.db,
+            &f.root,
+            &paths(2),
+            RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
+        );
+        assert_eq!(out.refreshed, 0, "nothing is written beside a live run");
+        assert_eq!(out.failed, 1);
+        assert!(out.stale_paths.contains("src/f1.rs"));
+
+        // Control: the run gone, the same refresh goes through.
+        drop(run);
+        let out = resync_stale_files(
+            &f.db,
+            &f.root,
+            &paths(2),
+            RESYNC_BUDGET,
+            RefreshScope::IndexedOnly,
+        );
+        assert_eq!(out.refreshed, 1);
     }
 
     #[test]

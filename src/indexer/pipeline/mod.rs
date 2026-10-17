@@ -897,6 +897,12 @@ pub fn last_index_run_did_not_finish(db: &Database) -> bool {
     in_flight::a_run_died(db)
 }
 
+/// True while another index run (a CLI build, the MCP server's run) holds the
+/// run lock; see [`in_flight`]. A query's refresh leaves the files stale then.
+pub fn index_run_in_flight(db: &Database) -> bool {
+    in_flight::a_run_is_in_flight(db)
+}
+
 /// The runs killed after committing file hashes but before their cross-file
 /// edges reached the database (audit 2026-08-16 P1-2), as their marker tokens;
 /// None when there are none, or when a run is in flight now (D#192(3)): see
