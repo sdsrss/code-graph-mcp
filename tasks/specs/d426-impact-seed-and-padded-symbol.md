@@ -77,6 +77,8 @@
   - 由错变对 16 次：leveldb `DBImpl::Write`/`DBImpl.Write` 加尾空格或 NBSP → `DBImpl::Writer`（8）；flask `about` → `abort`（6）、`route ` → `_method_route`（2）。
   - 由拒绝变错 16 次：flask `Flask.route` / `Flask::route` 的 4 种填充 × 2 个工具 → `FlaskGroup`。BASE 对不带空白的 `Flask.route` 本来就答 `FlaskGroup`，且不提示换了符号；CLI 对同一输入说 `No definition is named 'Flask.route'; answering for 'route'`。填充写法现在和不填充的一样，继承了这个已有缺陷。
 
+- 同特性复跑：上面的 `fix4b`、`fix7` 编译时没带 `embed-model`，而 BASE 带了。用 `cargo build --release --features embed-model` 在 ef4dd425 重建 HEAD（`/var/tmp/d426/bin/head-embed`，md5 `2677ac96…`），所有数字原样复现：空白差分 0/2610、0/2310（有回答 1256、937），CLI vs MCP 0/1152、0/392，A/B 节点模式 12、13，名字模式 0、0，flask 填充 `Flask.route` 答成 `FlaskGroup` 仍是 16 次。
+
 ## 遗留
 
 - MCP `get_call_graph` / `find_references` 的模糊步骤唯一命中时，按另一个名字回答且不提示（CLI 打印 `Resolved 'X' → 'Y'`，或对带点名字退回裸名并说明）。不带空白就能触发（flask `Flask.route` → `FlaskGroup`）。本任务不改，已立为 D#431。D#426 其余 6 项移到 D#432。
