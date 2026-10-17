@@ -14292,9 +14292,25 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
         assert_ne!(code, 0, "{name}: {stdout}{stderr}");
         assert!(stderr.contains("Ambiguous symbol"), "{name}: {stderr}");
     }
-    // Control: Java's constructor still is one.
-    let (stdout, stderr, code) = run_cli(&project, &["refs", "JCls"]);
-    assert_eq!(code, 0, "{stdout}{stderr}");
+    // Control: Java's constructor still is one, and so are C#'s and Dart's,
+    // whose extractors also store the constructor as a function named like
+    // the class (the rule's other two languages had no case here).
+    std::fs::write(
+        p.join("C.cs"),
+        "public class CsCls {\n  public CsCls() {}\n  public int Id() { return 1; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("d.dart"),
+        "class DCls {\n  DCls();\n  int id() => 1;\n}\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    for name in ["JCls", "CsCls", "DCls"] {
+        let (stdout, stderr, code) = run_cli(&project, &["refs", name]);
+        assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+    }
 }
 
 /// E2E 2026-10-16 round 4: with no shown child on any seed, the text tree took
