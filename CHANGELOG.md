@@ -20,13 +20,16 @@ A build counts from its start: the server writes `{"s":"starting"}` to
 `.code-graph/indexing-status.json` before it walks the tree, and the first
 progress line comes before the first batch, not after it. The statusline shows
 `code-graph: ↻ indexing…` for it, and SubagentStart says nothing while it
-runs. A status file a killed server left behind no longer counts as a build:
-each write names the server's pid, and a server is gone when that pid cannot
-be found and nobody holds `.code-graph/index.lock`. The lock matters in a
-sandbox with its own PID namespace (Claude Code's Bash sandbox), where the
-server's pid is never found.
+runs. Each write names the server's pid, and a status file counts as a build
+only while that pid is found or some process holds `.code-graph/index.lock`,
+which the server holds for its whole life: a killed server's leftover file
+stops refusing queries at once, unless another process (a `rebuild-index`)
+holds the lock, and then for up to 120 s. The lock matters in a sandbox with
+its own PID namespace (Claude Code's Bash sandbox), where the server's pid is
+never found: sandboxed queries answered during the server's build and failed
+2 of 3 flask builds.
 
-### A health-check beside a build no longer fails it
+### A health-check or query beside a build no longer fails it
 
 Every open of the index, `health-check` and the queries included, rewrote the
 schema version, which is a committed write. A build that had already read in
@@ -34,6 +37,13 @@ its transaction then failed at once with `database is locked`: on flask, 2 of 3
 `incremental-index` runs failed beside a `health-check` loop, and the
 statusline runs `health-check` on every render. The version is now written
 only when it changes; 5 of 5 runs passed beside about 90 health-checks each.
+
+A query beside another index run (a CLI build, the MCP server's run) no
+longer refreshes the files it reads. Its write contended with the run, failed
+fast and left a marker that read as a run that died: on django, 2 of 3 cold
+`incremental-index` runs beside a `show` loop finished with exit 0 and then
+`UNHEALTHY`. The query now answers from the index as it is and reports the
+files stale, as it did on contention.
 
 ### An index run that died is reported
 
@@ -46,8 +56,8 @@ exits 1; `--format json` gives `"reason": "interrupted"`. The CLI queries
 print the same warning on stderr and still answer. `doctor`'s index repair
 (`incremental-index`) clears it, and so does the MCP server's startup run;
 SessionStart starts nothing for it, since a CLI run beside the server's raced
-its writes. A run's marker now stays until its last
-graph phase has run; it used to be removed before those phases.
+its writes. A run's marker now stays until its last graph phase has run; it
+used to be removed before those phases.
 
 ### Symbol names
 
@@ -55,8 +65,7 @@ graph phase has run; it used to be removed before those phases.
   the CLI and the MCP tools. It was `Symbol not found`, and `callgraph
   DBImpl::Write` answered for `DBImpl::Writer`. A `::` spelling the index
   stores itself is kept: Ruby's `class Minitest::Test`, bash's
-  `kube::log::status`. A markdown heading is no such spelling, and a leading
-  `::` is dropped.
+  `kube::log::status`.
 - A dotted name that matches no definition still falls back to its last part,
   and now says so on stderr: `No definition is named 'PetRepository.findById';
   answering for 'findById'.`
@@ -64,15 +73,20 @@ graph phase has run; it used to be removed before those phases.
   the name ambiguous (flask's README `# Flask` made `callgraph Flask`, `impact
   Flask` and `refs Flask` refuse), and `get_ast_node`, `find_similar_code`,
   `find_references` and `similar` take the code definition, not the heading.
-- A constructor no longer makes its class ambiguous: a function named like its
-  type inside the type's body (Java, C#, C++), or a C/C++ `T::T` defined in the
-  type's file. `refs`, `impact`, `callgraph` and MCP `get_call_graph` answer for
-  the class. A method beside a same-named type (Go's `type Negotiate struct`
-  and `Context.Negotiate`) is still two definitions, as before.
-- A `::` name in a file added since the last index is found by the first query.
-- `callgraph`'s text tree roots at a non-test definition, and among those at
-  one with callers: flask's `callgraph Flask` printed a test's subclass and
-  `(48 test callers hidden)` with none of the real class's callers.
+- In Java, C#, C/C++ and Dart a constructor no longer makes its class
+  ambiguous: a function named like its type inside the type's body, or a
+  C/C++ `T::T` defined in the type's file. `refs`, `impact`, `callgraph` and
+  MCP `get_call_graph` answer for the class. A method named like its class in
+  other languages (TS, Python, Ruby) and a method beside a same-named type
+  (Go's `type Negotiate struct` and `Context.Negotiate`) are still two
+  definitions, as before.
+- A `::` name in a file added since the last index is found by the first
+  query, in the CLI and the MCP tools.
+- `callgraph`'s text tree roots at a code definition, neither a test nor a
+  markdown heading, and among those at one with callers: flask's `callgraph
+  Flask` printed a test's subclass and `(48 test callers hidden)` with none of
+  the real class's callers, and leveldb's `callgraph Cache` rooted at
+  `doc/index.md`.
 - `impact`'s count of what its confidence floor excluded leaves out edges past
   `--depth` (hono `resolveHttpServer` reported 39 that `--min-confidence
   ambiguous` did not add) and names what it counts: call edges, which can be
@@ -85,6 +99,10 @@ graph phase has run; it used to be removed before those phases.
 
 ### Plugin
 
+- SessionStart starts no `incremental-index` while the MCP server's build is
+  in progress. Started beside it (git HEAD newer than the index, the server
+  first), the CLI run raced the server's writes and failed its startup run:
+  django, 3 of 3.
 - The edit hook passes on impact's caveats with its counts: the excluded call
   edges and a traversal that stopped early.
 - The prompt hook passes on an ambiguous name's definitions and the CLI's own
@@ -97,8 +115,8 @@ graph phase has run; it used to be removed before those phases.
 - The snapshot workflow template has `snapshot create` compress the snapshot
   and uploads its `.blake3` checksum with it. It uploaded the snapshot alone,
   and installs refuse a snapshot without its checksum, so what it published
-  could not be installed. Its
-  header now gives the version that writes the checksum (0.36.0).
+  could not be installed. Its header now gives the version that writes the
+  checksum (0.36.0).
 - README: the statusline's uninstall handoff, auto-indexing (the per-edit hook
   is off by default; the server's watcher re-indexes edits at its next query
   tool call), `CODE_GRAPH_QUIET_HOOKS`, and a model-checksum command that
@@ -107,7 +125,15 @@ graph phase has run; it used to be removed before those phases.
 ### Not covered
 
 - A C++ constructor defined in another file than its class (leveldb's
-  `DBImpl::DBImpl` in `db_impl.cc`) still makes the class ambiguous.
+  `DBImpl::DBImpl` in `db_impl.cc`), or out of line for a class template
+  (`SkipList<Key, Comparator>::SkipList`), still makes the class ambiguous.
+- `refs Rack::Protection` beside a README `# Rack::Protection` answers for the
+  heading, as in 0.170.1, and a Ruby root-namespace spelling the index does not
+  store (`show ::Minitest::Test`) is `Symbol not found`.
+- A CLI query that probes `index.lock` the instant an MCP server starts can
+  make that server start read-only, until a tool call 30 s or more later
+  promotes it (the round-4 review, under 10 parallel query loops: 8 of 6,000
+  starts).
 - A query killed while its freshness pass writes leaves the interrupted
   marker, and `health-check` reports the index unhealthy until the next
   `incremental-index` or MCP server start.
@@ -115,7 +141,12 @@ graph phase has run; it used to be removed before those phases.
   opened), an index run that died is not detected.
 - `similar` falls back to the bare name without the note, and `--json` and the
   prompt hook do not carry it.
-- The statusline shows `✗` for an interrupted index without the reason.
+- The statusline shows `✗` for an interrupted index without the reason, and
+  with no MCP server running nothing clears it until `incremental-index` or
+  `doctor` runs.
+- `impact X` counts the excluded edges into every definition named X; MCP
+  `get_ast_node` counts them for the one it selected (flask `post`: 215 and
+  12).
 
 ## 0.170.1
 
