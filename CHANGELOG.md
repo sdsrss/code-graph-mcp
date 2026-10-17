@@ -171,6 +171,11 @@ used to be removed before those phases.
 - `impact X` counts the excluded edges into every definition named X; MCP
   `get_ast_node` counts them for the one it selected (flask `post`: 215 and
   12).
+- `cargo audit` reports RUSTSEC-2026-0367, -0368 and -0369 in `zip` 7.2.0,
+  which `candle-core` 0.9.2 requires for the embedding model. No candle
+  release takes the fixed `zip` 9 yet (0.11.0 requires `^8.6.0`); candle reads
+  and writes archives and never calls the `extract()` the advisories concern.
+  0.170.1 ships the same `zip`.
 
 ## 0.170.1
 
