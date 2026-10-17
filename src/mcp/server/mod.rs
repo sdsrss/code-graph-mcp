@@ -152,7 +152,9 @@ use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::domain::CODE_GRAPH_DIR;
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::lock::{release_index_lock, try_acquire_index_lock};
+use crate::indexer::lock::{
+    acquire_index_lock_at_startup, release_index_lock, try_acquire_index_lock,
+};
 use crate::indexer::pipeline::{
     remove_stale_indexing_status, run_full_index, run_incremental_index_cached, IndexPhase,
     IndexStats, INDEXING_STATUS_FILE,
@@ -575,7 +577,7 @@ impl McpServer {
         // from committing a multi-hundred-MB index (audit 2026-08-02 DB-4).
         crate::utils::gitignore::ensure_code_graph_dir_ignored(project_root);
 
-        let index_lock = try_acquire_index_lock(&db_dir);
+        let index_lock = acquire_index_lock_at_startup(&db_dir);
         let is_primary = index_lock.is_some();
 
         // Install snapshot BEFORE opening self.db to avoid the POSIX inode-swap problem.

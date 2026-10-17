@@ -101,9 +101,34 @@ fn open_lock_handle(lock_path: &Path, create: bool) -> std::io::Result<std::fs::
 /// The lock is automatically released when the returned File is dropped.
 ///
 /// CLI callers go through [`acquire_index_lock_guard`], which owns the
-/// platform-correct release; this raw form is the server's own acquisition.
+/// platform-correct release; this raw form is a secondary server's promotion
+/// attempt. The server's startup goes through [`acquire_index_lock_at_startup`].
 #[cfg(unix)]
 pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
+    acquire_index_lock_retrying(code_graph_dir, 0)
+}
+
+/// The MCP server's acquisition at startup: [`try_acquire_index_lock`], with a
+/// conflict retried for up to ~90 ms. `other_process_holds_index_lock` takes
+/// this lock for an instant, and a CLI query probes it while a build's status
+/// file names a pid it cannot see. One try that landed in that instant left a
+/// starting server read-only for 30 s or more (E2E round 4: 8 of 6,000 starts
+/// beside 10 query loops). A holder that stays — another server, a
+/// `rebuild-index` — outlasts the retries, as it should. Only startup waits:
+/// a secondary's promotion attempt runs on a tool call every 30 s, and it
+/// retries at the next one anyway.
+#[cfg(unix)]
+pub(crate) fn acquire_index_lock_at_startup(code_graph_dir: &Path) -> Option<std::fs::File> {
+    acquire_index_lock_retrying(code_graph_dir, 9)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_index_lock_at_startup(code_graph_dir: &Path) -> Option<std::fs::File> {
+    try_acquire_index_lock(code_graph_dir)
+}
+
+#[cfg(unix)]
+fn acquire_index_lock_retrying(code_graph_dir: &Path, retries: u32) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
 
     let lock_path = code_graph_dir.join("index.lock");
@@ -120,17 +145,12 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
         })
         .ok()?;
 
-    // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it.
-    // A conflict is retried for up to ~90 ms: `other_process_holds_index_lock`
-    // takes this lock for an instant, and a CLI query probes it while a build's
-    // status file names a pid it cannot see. One try that landed in that
-    // instant left a starting server read-only for 30 s or more (E2E round 4:
-    // 8 of 6,000 starts beside 10 query loops). A holder that stays — another
-    // server, a `rebuild-index` — outlasts the retries, as it should.
+    // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process
+    // holds it; a conflict is tried again `retries` times, 10 ms apart.
     // SAFETY: `file` is an open File owned by this scope, so `as_raw_fd()` yields a
     // valid, live fd for the duration of the call; flock has no other precondition.
     let mut rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    for _ in 0..9 {
+    for _ in 0..retries {
         if rc == 0 || !is_flock_conflict(std::io::Error::last_os_error().raw_os_error()) {
             break;
         }
@@ -428,8 +448,10 @@ mod tests {
     /// file names a pid it cannot see, taking the lock for an instant. A server
     /// whose one try at startup landed in that instant ran read-only until a
     /// tool call 30 s or more later promoted it (8 of 6,000 starts beside 10
-    /// query loops). The acquisition now waits out a hold that brief; one that
-    /// lasts still leaves it secondary.
+    /// query loops). The startup acquisition now waits out a hold that brief;
+    /// one that lasts still leaves it secondary. The other acquisitions stay one
+    /// try: a secondary's promotion attempt runs on a tool call, and waiting
+    /// there added ~90 ms to one call every 30 s (the 0.171.0 review).
     #[cfg(unix)]
     #[test]
     fn acquisition_waits_out_a_probe_but_not_a_holder() {
@@ -452,7 +474,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             drop(probe);
         });
-        let won = try_acquire_index_lock(cg);
+        let won = acquire_index_lock_at_startup(cg);
         release.join().unwrap();
         assert!(
             won.is_some(),
@@ -462,8 +484,15 @@ mod tests {
 
         let holder = take();
         assert!(
-            try_acquire_index_lock(cg).is_none(),
+            acquire_index_lock_at_startup(cg).is_none(),
             "a holder that stays must still leave this instance secondary"
+        );
+        let started = std::time::Instant::now();
+        assert!(try_acquire_index_lock(cg).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(45),
+            "a promotion attempt must not wait: {:?}",
+            started.elapsed()
         );
         drop(holder);
     }
