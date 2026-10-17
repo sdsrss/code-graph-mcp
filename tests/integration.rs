@@ -2940,7 +2940,7 @@ pub fn gamma() -> i32 { 3 }
         for (id, _) in queries::get_node_ids_by_name(server.db().conn(), name).unwrap() {
             let mut v = vec![0.0f32; EMBEDDING_DIM];
             v[i] = 1.0;
-            queries::insert_node_vectors_batch(server.db().conn(), &[(id, v)]).unwrap();
+            queries::insert_node_vector(server.db().conn(), id, &v).unwrap();
             seeded += 1;
         }
     }

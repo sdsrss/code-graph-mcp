@@ -12,16 +12,27 @@ pub fn insert_node_vector(conn: &Connection, node_id: i64, embedding: &[f32]) ->
 
 /// Batch insert vectors using a single prepared statement.
 /// For best performance, caller should wrap in a transaction (avoids per-statement fsync).
-pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)]) -> Result<()> {
+///
+/// `embedded_from` maps each node id to the context string its vector was
+/// computed from; a vector whose id is missing from it is skipped.
+pub fn insert_node_vectors_batch(
+    conn: &Connection,
+    vectors: &[(i64, Vec<f32>)],
+    embedded_from: &std::collections::HashMap<i64, &str>,
+) -> Result<()> {
     if vectors.is_empty() {
         return Ok(());
     }
     // vec0 virtual tables do not support INSERT OR REPLACE, so delete first.
-    let mut exists_stmt = conn.prepare_cached("SELECT 1 FROM nodes WHERE id = ?1")?;
+    let mut exists_stmt =
+        conn.prepare_cached("SELECT 1 FROM nodes WHERE id = ?1 AND context_string = ?2")?;
     let mut del_stmt = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
     let mut ins_stmt =
         conn.prepare_cached("INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)")?;
     for (node_id, embedding) in vectors {
+        let Some(text) = embedded_from.get(node_id) else {
+            continue;
+        };
         // Race guard: the background backfill snapshots node_ids, then spends a seconds-long
         // candle-inference window (embed.rs) before reaching this store, on a SEPARATE
         // connection from the server's incremental/version-bump deletes. If the node was
@@ -31,7 +42,12 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
         // daagu accumulated 157 orphans at rowids past the live range. Skip vanished nodes;
         // SQLite serializes writers so the set can't shrink under this batch once it holds the
         // write lock, and reap_orphan_vectors backstops the residual first-row window.
-        if !exists_stmt.exists(rusqlite::params![node_id])? {
+        //
+        // The text has to match too (D#429): `nodes.id` has no AUTOINCREMENT, so a file
+        // re-indexed in that window can give its new nodes the same ids, and the old text's
+        // vector would land on them for good — nothing re-embeds a node that has a vector.
+        // Every embed path writes `context_string` before it embeds that same string.
+        if !exists_stmt.exists(rusqlite::params![node_id, text])? {
             continue;
         }
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
@@ -1199,8 +1215,12 @@ mod tests {
         // Node deleted mid-inference (its file changed) — trigger fires, no vector yet.
         delete_nodes_by_file(conn, fid).unwrap();
         // Late backfill write for the now-dead node_id.
-        insert_node_vectors_batch(conn, &[(nid, vec![0.0f32; crate::domain::EMBEDDING_DIM])])
-            .unwrap();
+        insert_node_vectors_batch(
+            conn,
+            &[(nid, vec![0.0f32; crate::domain::EMBEDDING_DIM])],
+            &[(nid, "ctx")].into_iter().collect(),
+        )
+        .unwrap();
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0))
             .unwrap();
@@ -1208,6 +1228,67 @@ mod tests {
             vec_count, 0,
             "late insert for a deleted node must not create an orphan vector"
         );
+    }
+
+    #[test]
+    fn a_late_insert_skips_a_node_whose_text_changed() {
+        // D#429: the node under this id is not the one that was embedded (a re-index
+        // re-created it with other text), so the vector must not land on it.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let nid = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("new text".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let count = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0))
+                .unwrap()
+        };
+        let v = vec![0.0f32; crate::domain::EMBEDDING_DIM];
+        insert_node_vectors_batch(
+            conn,
+            &[(nid, v.clone())],
+            &[(nid, "old text")].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(count(), 0, "a vector of the old text must not be stored");
+        insert_node_vectors_batch(conn, &[(nid, v.clone())], &Default::default()).unwrap();
+        assert_eq!(count(), 0, "a vector with no text must not be stored");
+        insert_node_vectors_batch(
+            conn,
+            &[(nid, v)],
+            &[(nid, "new text")].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(count(), 1, "the node's own text stores");
     }
 
     #[test]

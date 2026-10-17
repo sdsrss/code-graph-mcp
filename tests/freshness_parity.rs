@@ -1519,7 +1519,9 @@ fn similar_noise_fixture() -> (TempDir, i64) {
         vectors.push((n.id, vec![0.1f32; 384]));
     }
     let seed = vectors[0].0;
-    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    for (id, v) in &vectors {
+        queries::insert_node_vector(conn, *id, v).unwrap();
+    }
     drop(db);
     (project, seed)
 }

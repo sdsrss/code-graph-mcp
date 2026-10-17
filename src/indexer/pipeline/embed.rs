@@ -15,12 +15,16 @@ use crate::storage::queries::insert_node_vectors_batch;
 /// Public so the background embedding thread in server.rs can call it.
 /// Wraps vector inserts in a transaction for atomicity and performance.
 ///
-/// Returns the node IDs that ACTUALLY got a vector (≤ input). The backfill driver uses
-/// this to advance past nodes that failed to embed — a deterministically un-embeddable
-/// node (or a transient per-node inference error in the sequential fallback) otherwise
-/// stays `WHERE node_vectors IS NULL` and, being ordered first by caller-count, would be
-/// re-fetched at the head of every batch and starve the embeddable nodes behind it.
-/// Indexing callers ignore the return.
+/// Returns the node IDs it is done with (≤ input): every one the model produced a vector
+/// for, stored or skipped because the node it read is gone (deleted, or re-created under
+/// the same id with other text — see `insert_node_vectors_batch`). The backfill driver
+/// uses this to advance past nodes that failed to embed — a deterministically
+/// un-embeddable node (or a transient per-node inference error in the sequential
+/// fallback) otherwise stays `WHERE node_vectors IS NULL` and, being ordered first by
+/// caller-count, would be re-fetched at the head of every batch and starve the
+/// embeddable nodes behind it. A re-created node is not such a failure: it is still
+/// unembedded, and the drain fetches it again under its new text. Indexing callers
+/// ignore the return.
 pub fn embed_and_store_batch(
     db: &Database,
     model: &EmbeddingModel,
@@ -57,13 +61,19 @@ pub fn embed_and_store_batch(
     // through this function.
     let (cached, to_embed) =
         crate::storage::queries::partition_by_cache(db.conn(), context_updates)?;
+    // The text each vector comes from, by node_id: the stores check it against the node
+    // (D#429), and fresh embeddings are cached under it.
+    let ctx_by_id: std::collections::HashMap<i64, &str> = context_updates
+        .iter()
+        .map(|(id, ctx)| (*id, ctx.as_str()))
+        .collect();
     let reused = cached.len();
     let mut embedded_ids: Vec<i64> = Vec::with_capacity(context_updates.len());
     if !cached.is_empty() {
         // insert_node_vectors_batch carries the orphan-race existence guard, so a hit for a
-        // node deleted since the chunk was fetched is silently skipped (no orphan).
+        // node deleted or re-created since the chunk was fetched is silently skipped.
         let tx = db.savepoint("sp_embed_cached")?;
-        insert_node_vectors_batch(db.conn(), &cached)?;
+        insert_node_vectors_batch(db.conn(), &cached, &ctx_by_id)?;
         tx.commit()?;
         embedded_ids.extend(cached.iter().map(|(id, _)| *id));
     }
@@ -80,13 +90,9 @@ pub fn embed_and_store_batch(
 
     let texts: Vec<&str> = to_embed.iter().map(|(_, ctx)| ctx.as_str()).collect();
     let ids: Vec<i64> = to_embed.iter().map(|(id, _)| *id).collect();
-    // Index context by node_id so both store paths can key content-hash cache entries. Every
+    // Both store paths key content-hash cache entries by `ctx_by_id`. Every
     // freshly-computed embedding is also written to embedding_cache, so a later full rebuild
     // reuses it by content instead of re-running the model.
-    let ctx_by_id: std::collections::HashMap<i64, &str> = to_embed
-        .iter()
-        .map(|(id, ctx)| (*id, ctx.as_str()))
-        .collect();
     let cache_entries_for = |vectors: &[(i64, Vec<f32>)]| -> Vec<([u8; 32], Vec<f32>)> {
         vectors
             .iter()
@@ -121,7 +127,7 @@ pub fn embed_and_store_batch(
             if !vectors.is_empty() {
                 let cache_entries = cache_entries_for(&vectors);
                 let tx = db.savepoint("sp_embed_sequential")?;
-                insert_node_vectors_batch(db.conn(), &vectors)?;
+                insert_node_vectors_batch(db.conn(), &vectors, &ctx_by_id)?;
                 crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
                 tx.commit()?;
             }
@@ -142,7 +148,7 @@ pub fn embed_and_store_batch(
     if !vectors.is_empty() {
         let cache_entries = cache_entries_for(&vectors);
         let tx = db.savepoint("sp_embed_batch")?;
-        insert_node_vectors_batch(db.conn(), &vectors)?;
+        insert_node_vectors_batch(db.conn(), &vectors, &ctx_by_id)?;
         crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
         tx.commit()?;
     }
@@ -246,6 +252,115 @@ mod tests {
         assert!(
             get_node_embedding(db.conn(), miss).is_err(),
             "miss must not receive a vector from a failing model"
+        );
+    }
+
+    /// D#429: `nodes.id` has no AUTOINCREMENT, so a file re-indexed while its
+    /// old text was being embedded hands the same ids to its new nodes, and
+    /// the late store put the old text's vector on them. Nothing re-embeds a
+    /// node that has a vector, so it stayed until the file changed again.
+    #[test]
+    fn a_vector_is_stored_only_on_the_text_it_was_computed_from() {
+        let (db, _tmp) = vec_db();
+        let old = add_node(&db, "src/z.py", "ctx-old");
+        // Re-indexed during inference: the node is replaced under the same id.
+        let fid: i64 = db
+            .conn()
+            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [old], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::storage::queries::delete_nodes_by_file(db.conn(), fid).unwrap();
+        let new = add_node(&db, "src/z.py", "ctx-new");
+        assert_eq!(new, old, "the fixture needs the id reused");
+        let dim = crate::domain::EMBEDDING_DIM;
+        cache_put_embeddings(
+            db.conn(),
+            &[
+                (cache_key("ctx-old"), vec![0.25f32; dim]),
+                (cache_key("ctx-new"), vec![0.5f32; dim]),
+            ],
+        )
+        .unwrap();
+
+        // The store of the old text's vector arrives after the re-index. The id
+        // is still reported done, not failed: a drain fetches the node again
+        // under its new text instead of counting it as un-embeddable residue.
+        let got = embed_and_store_batch(&db, &EmbeddingModel, &[(old, "ctx-old".into())]).unwrap();
+        assert_eq!(got, vec![old]);
+        assert!(
+            get_node_embedding(db.conn(), new).is_err(),
+            "the new node must not carry the old text's vector"
+        );
+
+        // Control: the node's own text still stores.
+        let got = embed_and_store_batch(&db, &EmbeddingModel, &[(new, "ctx-new".into())]).unwrap();
+        assert_eq!(got, vec![new]);
+        let bytes = get_node_embedding(db.conn(), new).unwrap();
+        assert_eq!(bytes, bytemuck::cast_slice::<f32, u8>(&vec![0.5f32; dim]));
+    }
+}
+
+// The model's own store path (`sp_embed_batch`), which the stub above cannot
+// reach. Runs where the model loads (`make test-embed` locally); CI's
+// with-embed job has no weights and skips it.
+#[cfg(all(test, feature = "embed-model"))]
+mod model_tests {
+    use super::*;
+    use crate::storage::queries::{
+        get_node_embedding, insert_node, upsert_file, FileRecord, NodeRecord,
+    };
+
+    /// D#429 through inference: the text embedded is no longer the node's.
+    #[test]
+    fn a_fresh_embedding_is_stored_only_on_the_text_it_was_computed_from() {
+        let Some(model) = EmbeddingModel::load().unwrap() else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::open_with_vec(&tmp.path().join("index.db")).unwrap();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/z.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let id = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("def f(): return 2".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+
+        let got = embed_and_store_batch(&db, &model, &[(id, "def f(): return 1".into())]).unwrap();
+        assert_eq!(got, vec![id]);
+        assert!(
+            get_node_embedding(db.conn(), id).is_err(),
+            "the node must not carry a vector of text it no longer has"
+        );
+        let got = embed_and_store_batch(&db, &model, &[(id, "def f(): return 2".into())]).unwrap();
+        assert_eq!(got, vec![id]);
+        assert!(
+            get_node_embedding(db.conn(), id).is_ok(),
+            "its own text stores"
         );
     }
 }

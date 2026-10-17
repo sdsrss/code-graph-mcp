@@ -10921,7 +10921,9 @@ fn test_cli_similar_discloses_noise_filtered_candidates() {
         vectors.push((n.id, vec![0.1f32; 384]));
     }
     let seed = vectors[0].0;
-    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    for (id, v) in &vectors {
+        queries::insert_node_vector(conn, *id, v).unwrap();
+    }
     drop(db);
 
     let (stdout, stderr, code) = run_cli(
@@ -10993,7 +10995,9 @@ fn similar_fixture(project: &TempDir, neighbours: &[(&str, f32)]) -> i64 {
     for (name, value) in neighbours {
         vectors.push((node_id(name), vec![*value; 384]));
     }
-    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    for (id, v) in &vectors {
+        queries::insert_node_vector(conn, *id, v).unwrap();
+    }
     drop(db);
     seed
 }
