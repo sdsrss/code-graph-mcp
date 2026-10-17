@@ -21,6 +21,7 @@ pub(crate) const SHOW_IMPACT_MIN_CONF_RANK: u8 = 1; // confidence_rank(CONF_INFE
 )]
 pub struct ShowArgs {
     /// Symbol name (required unless --node-id is given)
+    #[arg(value_parser = symbol_arg)]
     pub symbol: Option<String>,
     /// Look up by node ID instead of name
     #[arg(long = "node-id")]

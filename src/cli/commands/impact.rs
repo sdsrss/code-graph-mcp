@@ -8,6 +8,7 @@ use super::*;
 )]
 pub struct ImpactArgs {
     /// Symbol name to analyze (required unless --node-id is given)
+    #[arg(value_parser = symbol_arg)]
     pub symbol: Option<String>,
     /// Analyze exactly this definition: a node_id from a same-file ambiguity
     /// answer or `show --json` (authoritative over --file)

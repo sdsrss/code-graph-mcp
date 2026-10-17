@@ -422,11 +422,26 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
     file_path != crate::domain::EXTERNAL_FILE_PATH
 }
 
+/// A symbol argument without the whitespace around it, before
+/// [`canonical_symbol_spelling`]. No indexed name starts or ends with
+/// whitespace (identifiers cannot, and markdown headings are trimmed), so
+/// `DBImpl::Write ` names `DBImpl::Write`. Kept, it missed every exact lookup,
+/// and MCP's fuzzy step answered for leveldb's `DBImpl::Writer` (D#426). An
+/// argument of whitespace alone is returned as typed, so it meets the checks
+/// it met before.
+pub fn trim_symbol_arg(symbol: &str) -> &str {
+    match symbol.trim() {
+        "" => symbol,
+        trimmed => trimmed,
+    }
+}
+
 /// The index spells a member `Type.method`; Rust and C++ write `Type::method`,
 /// and that spelling was "Symbol not found" everywhere — or, through
 /// `callgraph`'s fuzzy step, an answer for `DBImpl::Writer` when asked for
 /// `DBImpl::Write` (E2E 2026-10-16). Every symbol a user or a model passes in
-/// goes through this first, so both spellings select the same definitions.
+/// goes through this, after [`trim_symbol_arg`], so both spellings select the
+/// same definitions.
 ///
 /// Unless the index stores the `::` spelling itself: Ruby names `class
 /// Minitest::Test` exactly that, and its methods `Minitest::Test.run_case`.
@@ -937,6 +952,31 @@ mod fuzzy_tests {
                 typed,
                 "{typed}"
             );
+        }
+    }
+
+    /// D#426 (7): only the whitespace around a name goes; inside it stays, and
+    /// an argument with nothing visible is kept as typed.
+    #[test]
+    fn trim_symbol_arg_drops_only_the_whitespace_around_a_name() {
+        for (typed, want) in [
+            ("DBImpl::Write ", "DBImpl::Write"),
+            (" DBImpl::Write", "DBImpl::Write"),
+            ("\tDBImpl.Write\n", "DBImpl.Write"),
+            ("alpha\u{a0}", "alpha"),
+            (
+                " SkipList<Key, Comparator>::Insert ",
+                "SkipList<Key, Comparator>::Insert",
+            ),
+            ("A:: b", "A:: b"),
+            (":: ", "::"),
+            ("Flask:: ", "Flask::"),
+            ("alpha", "alpha"),
+            ("   ", "   "),
+            ("\t", "\t"),
+            ("", ""),
+        ] {
+            assert_eq!(trim_symbol_arg(typed), want, "{typed:?}");
         }
     }
 }

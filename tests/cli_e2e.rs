@@ -13585,6 +13585,45 @@ fn test_cli_type_colon_colon_method_resolves_like_the_dotted_spelling() {
     }
 }
 
+/// D#426 (7): a symbol typed with whitespace around it (`DBImpl::Write `)
+/// missed every exact lookup: `show` suggested `DBImpl::Writer`, and
+/// `callgraph` and `refs` dropped the qualifier and listed ten `Write*`
+/// names. The whitespace is not part of the name.
+#[test]
+fn test_cli_a_symbol_answers_without_the_whitespace_around_it() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("db.h"),
+        "class DBImpl {\n public:\n  int Write(int x);\n private:\n  struct Writer;\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("db.cc"),
+        "#include \"db.h\"\n\nstruct DBImpl::Writer {\n  int n;\n};\n\nint DBImpl::Write(int x) { return x; }\n\nint Put(DBImpl* d) { return d->Write(1); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for cmd in ["show", "callgraph", "impact", "refs", "similar"] {
+        let (control, cerr, ccode) = run_cli(&project, &[cmd, "DBImpl::Write", "--json"]);
+        if cmd != "similar" {
+            assert_eq!(ccode, 0, "control {cmd}: {control}{cerr}");
+        }
+        for padded in ["DBImpl::Write ", " DBImpl::Write", "\tDBImpl::Write\n"] {
+            let (stdout, stderr, code) = run_cli(&project, &[cmd, padded, "--json"]);
+            assert_eq!(
+                (code, stdout.as_str(), stderr.as_str()),
+                (ccode, control.as_str(), cerr.as_str()),
+                "{cmd} {padded:?} must answer exactly as `DBImpl::Write`"
+            );
+        }
+    }
+}
+
 /// E2E 2026-10-16 (MCP-client QA, P1-1): during the MCP server's first index,
 /// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
 /// tool answered "Indexing in progress"; and a CLI query's freshness writes in

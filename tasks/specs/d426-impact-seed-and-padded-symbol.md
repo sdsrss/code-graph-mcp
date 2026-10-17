@@ -1,6 +1,6 @@
 # D#426 (4)(7)：MCP impact 按节点取种子；符号参数去掉两端空白
 
-状态：实现中（2026-10-17）。级别 L2（跨 `src/cli`、`src/mcp`、`src/resolve.rs`；两项都是 `fix:`，修的是答错的结果）。来源：D#426 第 4、7 项。
+状态：已实现并验证（2026-10-17），未发版。级别 L2（跨 `src/cli`、`src/mcp`、`src/resolve.rs`；两项都是 `fix:`，修的是答错的结果）。来源：D#426 第 4、7 项。
 
 ## 问题
 
@@ -65,9 +65,24 @@
 | leveldb（1152 个） | 12 → 0 | 12 个不同，正是那 12 个 | 0 |
 | flask（392 个） | 13 → 0（嵌套的 `decorator`） | 13 个不同 | 3 个不同，只差"只读从实例"提示：两台服务器开在同一语料上，第二台是从实例。答案相同 |
 
-- (7) 待补。
+- (7) RED：`test_symbol_args_answer_without_the_whitespace_around_them`（MCP，5 个工具/参数）修复前失败（`get_ast_node "DBImpl::Write "` 报 not found）；`test_cli_a_symbol_answers_without_the_whitespace_around_it`（CLI，5 个命令）修复前失败（`show` exit 1，提示 `DBImpl::Writer`）。修复后都通过；`trim_symbol_arg_drops_only_the_whitespace_around_a_name` 覆盖形态表。
+- (7) 差分，HEAD = `fix7`（md5 `82140c5e…`）。名字集：每个语料随机 12 个（seed 426，带 `.` 的再加 `::` 写法）+ 手选 7~9 个 + 23 个敌意写法（`::`、`:: `、`Flask:: `、` ::Flask`、`A:: b`、空串、纯空白等）；5 种填充（无、尾空格、首空格、`\t…\n`、尾 NBSP）；10 个入口（CLI 5 个命令 `--json`，比较 exit、stdout、stderr；MCP 5 个工具/参数，比较整个 result）。MCP 两台服务器先后运行，不并发。
+
+| 语料 | 运行次数 | HEAD(s) 与 BASE(trim(s)) 不同 | 对照：BASE(s) 与 BASE(trim(s)) 不同 | 有回答（BASE → HEAD） |
+|---|---|---|---|---|
+| leveldb | 2610 | 0 | 1877 | 568 → 1256 |
+| flask | 2310 | 0 | 1742 | 326 → 937 |
+
+- (7) 答成别的符号（MCP `get_call_graph` / `find_references`，填充过的输入，`wrongsym2.py`）：
+  - 由错变对 16 次：leveldb `DBImpl::Write`/`DBImpl.Write` 加尾空格或 NBSP → `DBImpl::Writer`（8）；flask `about` → `abort`（6）、`route ` → `_method_route`（2）。
+  - 由拒绝变错 16 次：flask `Flask.route` / `Flask::route` 的 4 种填充 × 2 个工具 → `FlaskGroup`。BASE 对不带空白的 `Flask.route` 本来就答 `FlaskGroup`，且不提示换了符号；CLI 对同一输入说 `No definition is named 'Flask.route'; answering for 'route'`。填充写法现在和不填充的一样，继承了这个已有缺陷。
+
+## 遗留
+
+- MCP `get_call_graph` / `find_references` 的模糊步骤唯一命中时，按另一个名字回答且不提示（CLI 打印 `Resolved 'X' → 'Y'`，或对带点名字退回裸名并说明）。不带空白就能触发（flask `Flask.route` → `FlaskGroup`）。本任务不改，另立延期项。
 
 ## 决定
 
 - 只做 D#426 的 4 和 7（上次汇报的建议顺序），其余各项留在 D#426。
 - (7) 选择"去空白后照常回答"而不是"拒绝"：两端空白不可能是名字的一部分（见前提），用户要的就是去掉空白后的那个符号。
+- (7) 接受上面"由拒绝变错 16 次"：它们是不带空白的同名输入已有的错误回答，根因在模糊步骤，不在去空白。只在本 diff 里修这一类的唯一办法是"去空白后查不到精确定义就保持原样"，这是个只为保留拒绝而加的保守分支，而且不修不带空白的那一半。另立延期项修模糊步骤本身。

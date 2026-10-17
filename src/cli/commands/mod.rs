@@ -29,6 +29,13 @@ pub mod trace;
 /// reason: a restated bound is a second copy that goes stale unwatched.
 pub(crate) use crate::graph::query::CALL_GRAPH_MAX_DEPTH;
 
+/// clap parser for a command's symbol positional, so every use of
+/// `args.symbol` in the handler sees [`crate::resolve::trim_symbol_arg`]'s
+/// spelling, as MCP's `dispatch_tool` gives its tools.
+pub(crate) fn symbol_arg(typed: &str) -> std::result::Result<String, std::convert::Infallible> {
+    Ok(crate::resolve::trim_symbol_arg(typed).to_string())
+}
+
 /// Clamp a count-like CLI argument into `lo..=hi` and say so when the value moved.
 ///
 /// The clamp and the disclosure are one call for the same reason `COUNT_RANGES`

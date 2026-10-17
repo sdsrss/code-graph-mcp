@@ -2633,15 +2633,20 @@ impl McpServer {
         // `resolve::canonical_symbol_spelling`). A spelling not stored yet may be
         // in a file the tool's own `ensure_indexed` is about to index, so that
         // runs first, as the CLI indexes new files before it maps (E2E round 4).
+        // The whitespace around a name goes before that (`resolve::trim_symbol_arg`).
         let mut canonical: Option<serde_json::Value> = None;
         for key in ["symbol_name", "function_name"] {
-            if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+            if let Some(typed) = args.get(key).and_then(|v| v.as_str()) {
+                let s = crate::resolve::trim_symbol_arg(typed);
+                let mut spelled = s.to_string();
                 if s.contains("::") {
-                    let mut spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
+                    spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
                     if spelled != s && !should_skip_indexing(args)? {
                         self.ensure_indexed()?;
                         spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
                     }
+                }
+                if spelled != typed {
                     canonical.get_or_insert_with(|| args.clone())[key] = json!(spelled);
                 }
             }
@@ -7715,6 +7720,53 @@ end
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_ne!(parsed["result"]["isError"], json!(true), "{parsed}");
+    }
+
+    /// D#426 (7): `DBImpl::Write ` with a trailing space missed every exact
+    /// lookup, and get_call_graph and find_references answered through the
+    /// fuzzy step for leveldb's out-of-line `struct DBImpl::Writer`, the one
+    /// name within edit distance. Whitespace around a name is not part of it.
+    #[test]
+    fn test_symbol_args_answer_without_the_whitespace_around_them() {
+        let project = TempDir::new().unwrap();
+        let w = |name: &str, body: &str| std::fs::write(project.path().join(name), body).unwrap();
+        w(
+            "db.h",
+            "class DBImpl {\n public:\n  int Write(int x);\n private:\n  struct Writer;\n};\n",
+        );
+        w(
+            "db.cc",
+            "#include \"db.h\"\n\nstruct DBImpl::Writer {\n  int n;\n};\n\n\
+             int DBImpl::Write(int x) { return x; }\n\nint Put(DBImpl* d) { return d->Write(1); }\n",
+        );
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        for (tool, key) in [
+            ("get_ast_node", "symbol_name"),
+            ("get_call_graph", "symbol_name"),
+            ("get_call_graph", "function_name"),
+            ("find_references", "symbol_name"),
+            ("find_similar_code", "symbol_name"),
+        ] {
+            let call = |spelling: &str| {
+                let resp = server
+                    .handle_message(&tool_call_json(tool, json!({ key: spelling })))
+                    .unwrap()
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone()
+            };
+            let control = call("DBImpl::Write");
+            if tool != "find_similar_code" {
+                assert_ne!(control["isError"], json!(true), "control {tool}: {control}");
+            }
+            for padded in ["DBImpl::Write ", " DBImpl::Write", "\tDBImpl::Write\n"] {
+                assert_eq!(
+                    call(padded),
+                    control,
+                    "{tool} {key} {padded:?} must answer as `DBImpl::Write` does"
+                );
+            }
+        }
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name

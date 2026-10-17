@@ -8,6 +8,7 @@ use super::*;
 )]
 pub struct SimilarArgs {
     /// Symbol name (required unless --node-id is given)
+    #[arg(value_parser = symbol_arg)]
     pub symbol: Option<String>,
     /// Look up by node ID instead of name
     #[arg(long = "node-id")]
