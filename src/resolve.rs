@@ -433,17 +433,18 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// Rewriting those made them unfindable (E2E round 2), so an exact stored name
 /// or qualified name keeps the input as typed.
 ///
-/// Only a path of non-empty segments (`A::b`, `::A::b`), none holding `.` or
-/// `:`, is rewritten. Any other spelling runs as typed, as in 0.170.1: `::`,
-/// `Flask::` and `::Rack::` rewrote to names ending in an empty part, which
-/// the dotted fallback took as the empty name that every lookup matches
-/// (`Ambiguous symbol ''`; E2E round 4, the 0.171.0 review). A segment may
-/// hold spaces, as a template's does (`SkipList<Key, Comparator>::Insert`).
+/// Only a path of segments that each hold a visible character and no `.` or
+/// `:` (`A::b`, `::A::b`) is rewritten. Any other spelling runs as typed, as
+/// in 0.170.1: `::`, `Flask::`, `::Rack::` and `:: ` rewrote to names with an
+/// empty or blank part, which the dotted fallback and the fuzzy step took as a
+/// name every lookup matches (`Ambiguous symbol ''`; E2E round 4, the 0.171.0
+/// review). A segment may hold spaces beside other characters, as a
+/// template's does (`SkipList<Key, Comparator>::Insert`).
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
     let path = symbol.strip_prefix("::").unwrap_or(symbol);
     let plain_segments = path
         .split("::")
-        .all(|seg| !seg.is_empty() && !seg.contains(['.', ':']));
+        .all(|seg| !seg.trim().is_empty() && !seg.contains(['.', ':']));
     if !symbol.contains("::") || !plain_segments {
         return symbol.to_string();
     }
@@ -886,7 +887,9 @@ mod fuzzy_tests {
     /// spelling runs as typed, as it did in 0.170.1. A segment may hold spaces:
     /// leveldb stores `SkipList<Key, Comparator>.Insert`, and kept as typed
     /// `DBImpl::Write ` reached the fuzzy step and answered for
-    /// `DBImpl::Writer` (the delta review of that repair).
+    /// `DBImpl::Writer` (the delta review of that repair). A segment of spaces
+    /// alone is as empty as no segment: `callgraph ::<TAB>` answered for an
+    /// unrelated class `H` through the fuzzy step (the next delta review).
     #[test]
     fn only_a_path_of_plain_segments_is_rewritten() {
         let (_p, _d, db) = indexed(&[("src/a.rs", "pub fn alpha() {}\n")]);
@@ -909,8 +912,25 @@ mod fuzzy_tests {
             assert_eq!(canonical_symbol_spelling(db.conn(), typed), want, "{typed}");
         }
         for typed in [
-            "::", "::::", "Flask::", "::Rack::", "Rack::", ".::", ":::", "A:::b", "A::::b",
-            "A::b::", "A.b::c", "A::b.c",
+            "::",
+            "::::",
+            "Flask::",
+            "::Rack::",
+            "Rack::",
+            ".::",
+            ":::",
+            "A:::b",
+            "A::::b",
+            "A::b::",
+            "A.b::c",
+            "A::b.c",
+            ":: ",
+            "::\t",
+            "Flask:: ",
+            "DBImpl:: ",
+            " ::Flask",
+            "A:: ::b",
+            "A::\u{a0}",
         ] {
             assert_eq!(
                 canonical_symbol_spelling(db.conn(), typed),
