@@ -366,6 +366,82 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     }
 }
 
+/// `.code-graph/index-build.lock`, held EXCLUSIVE by a whole index build: the
+/// MCP server's startup run, and a CLI `incremental-index` from its start to its
+/// end, embedding included (D#406).
+///
+/// SessionStart's refresh started first and the server's startup run started
+/// beside it, so two runs wrote one database: on django 6 of 6 such starts
+/// ended with a dead run's marker, the CLI failed every time, and the edge
+/// count landed anywhere from 171k to 254k. `index-run.lock` could not prevent
+/// it: a run takes that in `in_flight::begin`, after walking and diffing the
+/// tree, and a server that looked during the CLI's walk saw no run. Nor could
+/// an early hold on it: a run's own dead-run probe would then read its holder
+/// as a run in flight, and a CLI run would never recover a dead one.
+pub(crate) const BUILD_LOCK: &str = "index-build.lock";
+
+/// How long a build waits for another one before building anyway. A holder
+/// that outlasts it is hung, and writing beside a hung process is the lesser
+/// harm than never indexing.
+pub(crate) const BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Take [`BUILD_LOCK`], waiting at most `wait` while another build holds it.
+/// `on_wait` runs once, when the first try finds it held. `None`: build
+/// without it, as before this lock — it was held past `wait`, or it cannot be
+/// had at all (no `.code-graph/`, an open that fails, a non-Unix target).
+#[cfg(unix)]
+pub(crate) fn acquire_build_lock(
+    code_graph_dir: &Path,
+    wait: std::time::Duration,
+    on_wait: &mut dyn FnMut(),
+) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let path = code_graph_dir.join(BUILD_LOCK);
+    let file = crate::utils::owned::share_owned(&path).ok()?;
+    let deadline = std::time::Instant::now() + wait;
+    let mut waited = false;
+    loop {
+        // SAFETY: `file` is an open File owned by this scope, so its fd is valid
+        // for the call; flock has no other precondition.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        if !is_flock_conflict(err.raw_os_error()) {
+            tracing::warn!(
+                "could not take {} ({err}) — building without it",
+                path.display()
+            );
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "another index build has held {} for {} s — building beside it",
+                path.display(),
+                wait.as_secs()
+            );
+            return None;
+        }
+        if !waited {
+            waited = true;
+            on_wait();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_build_lock(
+    _code_graph_dir: &Path,
+    _wait: std::time::Duration,
+    _on_wait: &mut dyn FnMut(),
+) -> Option<std::fs::File> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,5 +830,32 @@ mod tests {
             try_acquire_index_lock(&cg).is_none(),
             "acquisition still refuses a hardlinked lock file: it WRITES a PID through it"
         );
+    }
+
+    /// D#406: a build waits for the build holding the lock, says so once, and
+    /// past its wait builds without the lock rather than never.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_waits_for_the_build_lock_and_then_gives_up() {
+        let dir = TempDir::new().unwrap();
+        let wait = std::time::Duration::from_millis(300);
+        let mut said = 0;
+        let first = acquire_build_lock(dir.path(), wait, &mut || said += 1);
+        assert!(first.is_some(), "an unheld build lock is taken");
+        assert_eq!(said, 0, "and nothing is said");
+
+        let started = std::time::Instant::now();
+        let second = acquire_build_lock(dir.path(), wait, &mut || said += 1);
+        assert!(second.is_none(), "held past the wait: build without it");
+        assert!(started.elapsed() >= wait, "but only after waiting it out");
+        assert_eq!(said, 1, "the wait is said once");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(first);
+        });
+        let third = acquire_build_lock(dir.path(), std::time::Duration::from_secs(10), &mut || {});
+        assert!(third.is_some(), "a lock let go mid-wait is taken");
+        releaser.join().unwrap();
     }
 }

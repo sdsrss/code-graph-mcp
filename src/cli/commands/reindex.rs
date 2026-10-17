@@ -68,7 +68,13 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
                 Ok(commit) => {
                     eprintln!("Snapshot installed at commit {commit}");
                     drop(index_lock);
-                    return cmd_incremental_index_opts(project_root, false, no_embed, args.json);
+                    return cmd_incremental_index_opts(
+                        project_root,
+                        false,
+                        no_embed,
+                        args.json,
+                        false,
+                    );
                 }
                 Err(e) => eprintln!("Snapshot install failed ({e}), falling back to full index"),
             }
@@ -78,5 +84,5 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     }
 
     drop(index_lock);
-    cmd_incremental_index_opts(project_root, false, no_embed, args.json)
+    cmd_incremental_index_opts(project_root, false, no_embed, args.json, false)
 }

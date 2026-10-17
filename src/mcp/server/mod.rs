@@ -1001,6 +1001,21 @@ impl McpServer {
                         progress_file: progress_file.clone(),
                     };
 
+                    // One build at a time (D#406): a CLI `incremental-index` —
+                    // SessionStart's refresh, started before this server — holds
+                    // the build lock to its end, and is waited for, not built
+                    // beside. The status file written above keeps reporting a
+                    // build meanwhile, which there is.
+                    let _build = crate::indexer::lock::acquire_build_lock(
+                        &project_root.join(CODE_GRAPH_DIR),
+                        crate::indexer::lock::BUILD_WAIT,
+                        &mut || {
+                            tracing::info!(
+                                "Another index build is running; the startup index waits for it"
+                            )
+                        },
+                    );
+
                     let db = match Database::open_with_vec(&db_path) {
                         Ok(db) => db,
                         Err(e) => {
@@ -1008,6 +1023,12 @@ impl McpServer {
                             return;
                         }
                     };
+                    // The build waited for may have created the index, and a
+                    // full index over it would redo the whole tree.
+                    let has_existing_index = has_existing_index
+                        || queries::get_index_status(db.conn(), false)
+                            .map(|s| s.files_count > 0)
+                            .unwrap_or(false);
 
                     let pf = progress_file.clone();
                     let progress_cb = move |phase: IndexPhase, current: usize, total: usize| {
@@ -8300,5 +8321,117 @@ end
             !server.is_primary(),
             "the lock is free, but the index belongs to a newer binary"
         );
+    }
+
+    /// D#406: SessionStart's CLI refresh started first and the server's startup
+    /// run started beside it, so two runs wrote one database. On django (1,500
+    /// changed files, the server 0.3-1.5 s after the CLI) 6 of 6 runs ended
+    /// UNHEALTHY with a dead run's marker, the CLI failed every time, and the
+    /// edge count landed anywhere from 171k to 254k (a clean index: 250,731).
+    /// The run lock could not prevent it: a run takes that only after walking
+    /// and diffing the tree. The startup run now waits while another build
+    /// holds `index-build.lock`, and reports a build meanwhile.
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_run_waits_for_another_build() {
+        use std::os::unix::io::AsRawFd;
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("alpha.py"),
+            "def alpha():\n    return 1\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        let cg_dir = project.path().join(CODE_GRAPH_DIR);
+        let build = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg_dir.join("index-build.lock"))
+            .unwrap();
+        // SAFETY: `build` is an open File owned by this scope.
+        assert_eq!(
+            unsafe { libc::flock(build.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let files = || {
+            queries::get_index_status(server.db.conn(), false)
+                .unwrap()
+                .files_count
+        };
+
+        server.spawn_startup_indexing(project.path().to_path_buf(), false, None);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert_eq!(files(), 0, "the startup run indexed beside another build");
+        assert!(
+            cg_dir.join(INDEXING_STATUS_FILE).exists(),
+            "a build is running, so the status file must say so"
+        );
+
+        drop(build);
+        let (lock, cvar) = &*server.indexing.startup_indexing_done;
+        let mut done = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !*done {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "the startup run never ran after the build ended"
+            );
+            done = cvar.wait_timeout(done, left).unwrap().0;
+        }
+        drop(done);
+        assert_eq!(files(), 1, "and it indexes once the other build is done");
+    }
+
+    /// D#406: the build a starting server waits for can be the one that creates
+    /// the index (SessionStart's refresh of a version-stale index rebuilds it in
+    /// full). The server decided "no index, full build" before waiting; after
+    /// the wait it indexes only what that build left undone.
+    #[cfg(unix)]
+    #[test]
+    fn test_startup_run_after_a_build_that_created_the_index_is_incremental() {
+        use std::os::unix::io::AsRawFd;
+        let project = TempDir::new().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::write(
+                project.path().join(format!("{name}.py")),
+                format!("def {name}():\n    return 1\n"),
+            )
+            .unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        let cg_dir = project.path().join(CODE_GRAPH_DIR);
+        let build = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg_dir.join("index-build.lock"))
+            .unwrap();
+        // SAFETY: `build` is an open File owned by this scope.
+        assert_eq!(
+            unsafe { libc::flock(build.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        server.spawn_startup_indexing(project.path().to_path_buf(), false, None);
+        {
+            let other = Database::open(&cg_dir.join("index.db")).unwrap();
+            crate::indexer::pipeline::run_full_index(&other, project.path(), None, None).unwrap();
+        }
+        drop(build);
+
+        let (lock, cvar) = &*server.indexing.startup_indexing_done;
+        let mut done = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !*done {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the startup run never finished");
+            done = cvar.wait_timeout(done, left).unwrap().0;
+        }
+        drop(done);
+        let result = server.indexing.startup_index_result.lock().unwrap().take();
+        let result = result.expect("the startup run must report a result");
+        assert!(!result.was_full, "a full build over the index just built");
+        assert_eq!(result.files_indexed, 0, "nothing changed since that build");
     }
 }

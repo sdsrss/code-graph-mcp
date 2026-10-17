@@ -213,22 +213,10 @@ fn main() -> Result<()> {
                 // keys as a real run, zeroed, plus the reason the counters are 0;
                 // a consumer that only reads files_indexed still parses.
                 if idx_args.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "mode": "skipped",
-                            "files_indexed": 0,
-                            "files_deleted": 0,
-                            "nodes_created": 0,
-                            "edges_created": 0,
-                            "files_with_parse_errors": 0,
-                            "elapsed_ms": 0,
-                            "skipped": format!(
-                                "no .git anchor or existing .code-graph/ at {}",
-                                project_root.display()
-                            ),
-                        })
-                    );
+                    code_graph_mcp::cli::emit_skipped_index_json(&format!(
+                        "no .git anchor or existing .code-graph/ at {}",
+                        project_root.display()
+                    ));
                 }
                 return Ok(());
             }
@@ -237,6 +225,7 @@ fn main() -> Result<()> {
                 quiet,
                 no_embed,
                 idx_args.json,
+                std::env::var("CODE_GRAPH_YIELD_TO_SERVER").as_deref() == Ok("1"),
             )
         }
         Some("rebuild-index") => {

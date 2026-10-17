@@ -556,6 +556,7 @@ defaults are what you get by doing nothing.
 | `CODE_GRAPH_NO_INJECT=1` | No post-tool AST context injection. |
 | `CODE_GRAPH_STATUSLINE_COUNTS=0` | Drop the session counts (`5 answers · 2 calls`) from the statusline. |
 | `CODE_GRAPH_HOOK_INDEX=on\|off` | Turn the per-edit incremental-index hook on (it is off by default; the MCP server's watcher re-indexes edits at its next query tool call) or keep it off. |
+| `CODE_GRAPH_YIELD_TO_SERVER=1` | Set by SessionStart on its background refresh: `incremental-index` indexes nothing (exit 0) while another process holds `.code-graph/index.lock` — an MCP server, which keeps the index fresh itself, or a `rebuild-index`. |
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load the embedding model from here (air-gapped installs). |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Never fetch the model; fail instead. |
 | `CODE_GRAPH_REQUIRE_MODEL=1` | Test-only: make the embedding tests FAIL when no model can be loaded instead of self-skipping. Set by the release gate and the cache-warm cron, which supply pinned weights — without it those tests pass by doing nothing on any runner with no cached model. |

@@ -379,17 +379,42 @@ pub(crate) fn lock_index_for_replace(
 }
 
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
-    cmd_incremental_index_opts(project_root, quiet, no_embed, false)
+    cmd_incremental_index_opts(project_root, quiet, no_embed, false, false)
+}
+
+/// The `--json` report of an `incremental-index` that indexed nothing on
+/// purpose: the keys of a real run, zeroed, plus why. A successful run must
+/// not leave stdout at 0 bytes under `--json`.
+pub fn emit_skipped_index_json(reason: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "mode": "skipped",
+            "files_indexed": 0,
+            "files_deleted": 0,
+            "nodes_created": 0,
+            "edges_created": 0,
+            "files_with_parse_errors": 0,
+            "elapsed_ms": 0,
+            "skipped": reason,
+        })
+    );
 }
 
 /// `cmd_incremental_index` plus the `--json` switch, split out the same way
 /// `cmd_health_check_opts` is: the three-positional-bool entry point has a dozen
 /// call sites (tests included) that have no opinion about output format.
+///
+/// `yield_to_server`: index nothing while another process holds `index.lock`
+/// — an MCP server, whose own runs keep the index fresh, or a `rebuild-index`.
+/// SessionStart's refresh asks for it (`CODE_GRAPH_YIELD_TO_SERVER=1`): written
+/// beside a server's startup run, both runs failed (D#406).
 pub fn cmd_incremental_index_opts(
     project_root: &Path,
     quiet: bool,
     no_embed: bool,
     json: bool,
+    yield_to_server: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     // First, not inside the existing-index branch: the lock probe and the stale
@@ -398,7 +423,34 @@ pub fn cmd_incremental_index_opts(
     // there was re-indexed as this project (D#358).
     crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
-    warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR));
+    let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
+    // One build at a time (D#406), held to the end, embedding included. Taken
+    // BEFORE the server check below: a server that starts after that check
+    // takes `index.lock` first and this lock second, so it waits for this run.
+    let _build = crate::indexer::lock::acquire_build_lock(
+        &code_graph_dir,
+        crate::indexer::lock::BUILD_WAIT,
+        &mut || {
+            if !quiet {
+                eprintln!(
+                    "Waiting for another index build (the MCP server's startup index, or \
+                     another incremental-index) to finish..."
+                );
+            }
+        },
+    );
+    if yield_to_server && crate::indexer::lock::other_process_holds_index_lock(&code_graph_dir) {
+        let reason = "another process (an MCP server, which keeps the index fresh itself, \
+                      or a rebuild-index) holds the index lock";
+        if !quiet {
+            eprintln!("Skipping index: {reason}.");
+        }
+        if json {
+            emit_skipped_index_json(reason);
+        }
+        return Ok(());
+    }
+    warn_if_index_locked(&code_graph_dir);
     // Covers the incremental path too, not just the full-index one inside
     // build_full_index_at: an index created before this existed (or by a user
     // who removed the line) gets the entry back on the next run (audit DB-4).

@@ -393,11 +393,17 @@ function ensureIndexFresh(deps = {}) {
   // it raced its writes and failed it: django, the server first and this hook
   // 50 ms later, 3 of 3, and the server's watcher never started (E2E
   // 2026-10-16 round 4).
+  //
+  // A server that starts after this look is covered by the binary instead
+  // (D#406): asked to yield, the run takes the build lock and then does nothing
+  // if a server holds index.lock; a server that starts later waits for its
+  // build lock. An older binary ignores the variable and refreshes as before.
   if (!require('./project-root').indexBuildInProgress(cwd)) {
     const child = spawnRefresh(bin, ['incremental-index', '--quiet'], hidden({
       cwd,
       detached: true,
       stdio: 'ignore',
+      env: { ...process.env, CODE_GRAPH_YIELD_TO_SERVER: '1' },
     }));
     if (child && typeof child.unref === 'function') child.unref();
   }

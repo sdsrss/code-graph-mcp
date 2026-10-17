@@ -14007,6 +14007,169 @@ fn test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer() {
     assert_eq!(code, 0, "{stdout}{stderr}");
 }
 
+/// Take `name` in the project's `.code-graph/` EXCLUSIVE, as another process
+/// would: the MCP server holds `index.lock`, a build holds `index-build.lock`.
+#[cfg(unix)]
+fn hold_code_graph_lock(project: &TempDir, name: &str) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(
+            project
+                .path()
+                .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+                .join(name),
+        )
+        .unwrap();
+    // SAFETY: `lock` is an open File owned by this scope.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    lock
+}
+
+/// Whether the index has a row for `path`, read with the library rather than a
+/// query command, whose own freshness pass would index the file itself.
+#[cfg(unix)]
+fn index_has_file(project: &TempDir, path: &str) -> bool {
+    let db = code_graph_mcp::storage::db::Database::open(
+        &project
+            .path()
+            .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+            .join("index.db"),
+    )
+    .unwrap();
+    db.conn()
+        .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [path], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+        == 1
+}
+
+/// D#406: SessionStart's refresh and the MCP server's startup run wrote one
+/// database at once (django: 6 of 6 runs UNHEALTHY, the CLI failed every
+/// time). An `incremental-index` waits while another build holds
+/// `index-build.lock`, and indexes once it is let go.
+#[cfg(unix)]
+#[test]
+fn test_cli_incremental_index_waits_for_another_build() {
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src/late.ts"),
+        "export function lateArrival(): number { return 1; }\n",
+    )
+    .unwrap();
+    let build = hold_code_graph_lock(&project, "index-build.lock");
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["incremental-index", "--no-embed"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let early = child.try_wait().unwrap();
+    drop(build);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        early.is_none(),
+        "it ran beside another build ({early:?}): {stderr}"
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Waiting for another index build"),
+        "a wait the user did not ask for is said: {stderr}"
+    );
+    assert!(index_has_file(&project, "src/late.ts"), "{stderr}");
+}
+
+/// D#406: SessionStart's refresh runs with `CODE_GRAPH_YIELD_TO_SERVER=1` and
+/// does nothing while a process holds `index.lock` (an MCP server, which keeps
+/// the index fresh itself, or a `rebuild-index`). Neither the variable alone
+/// nor the lock alone skips a run.
+#[cfg(unix)]
+#[test]
+fn test_cli_incremental_index_yields_to_a_server_when_asked() {
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src/late.ts"),
+        "export function lateArrival(): number { return 1; }\n",
+    )
+    .unwrap();
+    let yield_env = [("CODE_GRAPH_YIELD_TO_SERVER", "1")];
+    let server = hold_code_graph_lock(&project, "index.lock");
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
+        &["incremental-index", "--no-embed", "--json"],
+        &yield_env,
+    );
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("one JSON object ({e}): {stdout:?}"));
+    assert_eq!(v["mode"], "skipped", "{v}");
+    assert_eq!(v["files_indexed"], 0, "{v}");
+    assert!(
+        v["skipped"]
+            .as_str()
+            .is_some_and(|s| s.contains("index lock")),
+        "{v}"
+    );
+    assert!(
+        !index_has_file(&project, "src/late.ts"),
+        "it wrote: {stderr}"
+    );
+
+    // Control: the lock alone does not skip — without the variable the run
+    // indexes (and warns about the holder, as before).
+    let (stdout, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(index_has_file(&project, "src/late.ts"), "{stderr}");
+
+    // A server that starts while the run waits for another build is still
+    // yielded to: the run looks for one only once it holds the build lock. A
+    // look taken before the wait missed this server and indexed beside it.
+    let build = hold_code_graph_lock(&project, "index-build.lock");
+    drop(server);
+    std::fs::write(
+        project.path().join("src/during.ts"),
+        "export function duringWait(): number { return 3; }\n",
+    )
+    .unwrap();
+    let child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["incremental-index", "--no-embed", "--json"])
+        .env("CODE_GRAPH_YIELD_TO_SERVER", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let server = hold_code_graph_lock(&project, "index.lock");
+    drop(build);
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains(r#""mode":"skipped""#), "{stdout}");
+    assert!(!index_has_file(&project, "src/during.ts"));
+
+    // Control: nor does the variable alone.
+    drop(server);
+    std::fs::write(
+        project.path().join("src/later.ts"),
+        "export function laterStill(): number { return 2; }\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) =
+        run_cli_env(&project, &["incremental-index", "--no-embed"], &yield_env);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(index_has_file(&project, "src/later.ts"), "{stderr}");
+}
+
 /// E2E 2026-10-16 round 3: the constructor rule dropped any function or
 /// method named like a type in the type's file. Go declares a method beside a
 /// same-named struct (gin: `type Negotiate struct` and `Context.Negotiate`),

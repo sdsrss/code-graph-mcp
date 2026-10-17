@@ -67,6 +67,17 @@ test('ensureIndexFresh starts no CLI refresh while the MCP server is building', 
   assert.equal(ensureIndexFresh(deps), 'refreshing');
   assert.equal(spawned.length, 1);
   assert.deepEqual(spawned[0][1], ['incremental-index', '--quiet']);
+  // D#406: a server that starts after this look holds index.lock; the refresh
+  // is asked to yield to it rather than write beside its startup run.
+  assert.equal(spawned[0][2].env && spawned[0][2].env.CODE_GRAPH_YIELD_TO_SERVER, '1');
+
+  // A killed server's leftover status file names a pid that is gone: that is
+  // no build, and the refresh starts (until now only project-root's own tests
+  // covered the dead writer, not this caller of it).
+  const dead = require('node:child_process').spawnSync('true').pid;
+  fs.writeFileSync(status, JSON.stringify({ s: 'indexing', d: 3, t: 50, pid: dead }));
+  assert.equal(ensureIndexFresh(deps), 'refreshing');
+  assert.equal(spawned.length, 2, "a dead writer's status file must not block the refresh");
 });
 
 test('ensureIndexFresh returns skipped when no index exists', () => {
