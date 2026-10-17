@@ -1,6 +1,6 @@
 # D#423(d): the build lock does not cover the CLI's embedding
 
-Status: implemented (2026-10-17), for 0.171.2. Level L2 (CLI; restores
+Status: implemented and verified (2026-10-17), for 0.171.2. Level L2 (CLI; restores
 0.171.0's behaviour for the embedding phase, CHANGELOG fix). Follows
 `d406-one-build-at-a-time.md`.
 
@@ -83,8 +83,29 @@ The rest of D#423, judged by how a default install reaches it:
   tries the lock: a first version took the lock ahead of the run's own and the
   run waited the full 10 min (test passed in 607.84 s). The assertion is on
   vectors written by the time the lock was free, not on "still running": the
-  0.171.1 binary let the lock go at exit with the process still alive.
+  pre-fix debug binary let the lock go at exit with the process still alive
+  (`201 of 201 vectors (still running: true)`).
+- `reader_nondestructive.rs`'s allow-list anchor moved from
+  `build_full_index_at` to `index_full_at`, the function that now holds the
+  destructive open (same list size; the comment already said the anchor tracks
+  the holder).
 
 ## Verification record
 
-(filled in below as checks run)
+- RED on the pre-fix code: `the first index: ... embedded 4 of 4 vectors`
+  (3.88 s). GREEN after: 7.14 s.
+- Mutations (exact replace, restore md5 `447ebee9…` checked): first-index
+  `drop(build)` removed -> `the first index: 4 of 4`; incremental `drop(build)`
+  removed -> `an incremental run: 8 of 8`.
+- Guard: `reader_nondestructive` 7/7; a destructive open planted in
+  `build_full_index_at` -> red (`index_ops.rs:171 (in fn build_full_index_at)`),
+  restored md5 checked.
+- Real binary (`cg-fix` = `target/release` md5 `3ae9cbf0…`, embed-model):
+  12/12 calls answered over 55 s, first at 0.0 s, CLI still embedding.
+- `embed_complete.py` on a 1,286-node corpus (`git archive HEAD src/cli
+  src/indexer`): fix CLI exit 0 (316 s), healthy, 1162/1162 vectors, 0 orphan;
+  0.171.0 CLI exit 0 (281 s), healthy, 1162/1162, 0 orphan. Both servers ran
+  their backfill beside the CLI (0.171.0 log: 32 `[embed]` batches).
+- fmt; clippy `--all-targets` both legs; `cargo test --features embed-model
+  --no-fail-fast`: 2297 passed, 1 failed (the guard anchor above, fixed and
+  re-run green); pre-commit default leg 2275 passed, 0 failed (31 binaries).

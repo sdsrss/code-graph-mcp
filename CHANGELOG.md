@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.171.2
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.171.1` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.171.1
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### A starting MCP server no longer waits for `incremental-index` to embed
+
+0.171.1's `incremental-index` held `.code-graph/index-build.lock` until it
+exited, its embeddings included, and a starting MCP server waits for that lock
+before its startup index. A server started while an `incremental-index` run by
+hand (without `--no-embed`, as the 0.171.1 notes suggest for getting vectors)
+was computing embeddings therefore answered every tool call
+`Indexing in progress` until the embeddings were done or 10 minutes had
+passed. 0.171.1 listed this under Not covered. Measured on this repository
+(7,157 nodes to embed, about 5 a second), the server started 3 s after the
+CLI: 18 of 18 tool calls over 119 s failed, where 0.171.0 answered the first
+one at once.
+
+`incremental-index` now lets go of the build lock once its index is written,
+before it embeds, as the server's own startup index already did. The lock
+still covers writing the index, as in 0.171.1. In the same test: 12 of 12 calls over
+55 s answered, the first at once, while the CLI was still embedding.
+
+### Not covered
+
+- A server that starts while `incremental-index` embeds computes embeddings
+  for the same nodes beside it, until one of them has embedded them all, as
+  0.171.0's did. Run to the end on a 1,162-node project, 0.171.0 and this
+  version both left a healthy index with a vector for every node and no
+  orphan vector, and the CLI exited 0.
+- Apart from this wait, the items 0.171.1 listed under Not covered are
+  unchanged.
+
 ## 0.171.1
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). `incremental-index`
