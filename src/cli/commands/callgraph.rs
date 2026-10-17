@@ -441,23 +441,28 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // the graph, and the query orders them by call-edge count, test callers
     // included: in flask a test's local `class Flask(flask.Flask)` came first,
     // so the tree showed it, "(48 test callers hidden)" and none of the real
-    // class's callers (E2E 2026-10-16 round 2). Root at a non-test seed with a
-    // displayed child, else any non-test one, else a seed with a displayed
-    // child, else the first. Non-test first: a shown child alone rooted hono's
-    // `callgraph handler` at src/compose.test.ts (round 3).
+    // class's callers (E2E 2026-10-16 round 2). Root at a code seed (neither a
+    // test nor a markdown heading) with a displayed child, else any code seed,
+    // else a seed with a displayed child, else the first. Code first: a shown
+    // child alone rooted hono's `callgraph handler` at src/compose.test.ts
+    // (round 3), and leveldb `callgraph Cache` at doc/index.md (round 4).
     let has_child = |id: i64| {
         display_nodes
             .iter()
             .any(|n| n.depth == 1 && n.parent_id == Some(id))
     };
-    let non_test = |n: &crate::graph::query::CallGraphNode| {
+    let code_seed = |n: &crate::graph::query::CallGraphNode| {
         !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
+            && !matches!(
+                n.node_type.as_str(),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            )
     };
     let seeds: Vec<_> = display_nodes.iter().filter(|n| n.depth == 0).collect();
     let root = seeds
         .iter()
-        .find(|n| non_test(n) && has_child(n.node_id))
-        .or_else(|| seeds.iter().find(|n| non_test(n)))
+        .find(|n| code_seed(n) && has_child(n.node_id))
+        .or_else(|| seeds.iter().find(|n| code_seed(n)))
         .or_else(|| seeds.iter().find(|n| has_child(n.node_id)))
         .or(seeds.first())
         .copied();

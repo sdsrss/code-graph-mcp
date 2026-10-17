@@ -14133,3 +14133,22 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
     let (stdout, stderr, code) = run_cli(&project, &["refs", "JCls"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
 }
+
+/// E2E 2026-10-16 round 4: with no shown child on any seed, the text tree took
+/// the first non-test seed, and a markdown heading is one: leveldb `callgraph
+/// Cache` rooted at doc/index.md, hono `Layout` at docs/MAINTAINING.md. A
+/// heading is the root only when nothing else is.
+#[test]
+fn test_cli_callgraph_text_does_not_root_at_a_heading() {
+    let project = TempDir::new().unwrap();
+    let p = project.path();
+    std::fs::create_dir_all(p.join(".git")).unwrap();
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(p.join("README.md"), "# Cache\n\nNotes.\n").unwrap();
+    std::fs::write(p.join("src/cache.py"), "class Cache:\n    pass\n").unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (stdout, stderr, code) = run_cli(&project, &["callgraph", "Cache"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.starts_with("Cache (src/cache.py)"), "{stdout}");
+}
