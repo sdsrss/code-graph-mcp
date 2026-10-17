@@ -367,8 +367,10 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
 }
 
 /// `.code-graph/index-build.lock`, held EXCLUSIVE by a whole index build: the
-/// MCP server's startup run, and a CLI `incremental-index` from its start to its
-/// end, embedding included (D#406).
+/// MCP server's startup run, and a CLI `incremental-index` from its start to the
+/// end of its index (D#406). Neither holds it while embedding: a CLI run that
+/// did kept a starting server waiting, and every tool call failing, for up to
+/// 10 min (D#423).
 ///
 /// SessionStart's refresh started first and the server's startup run started
 /// beside it, so two runs wrote one database: on django 6 of 6 such starts

@@ -1003,8 +1003,8 @@ impl McpServer {
 
                     // One build at a time (D#406): a CLI `incremental-index` —
                     // SessionStart's refresh, started before this server — holds
-                    // the build lock to its end, and is waited for, not built
-                    // beside. The status file written above keeps reporting a
+                    // the build lock to the end of its index, and is waited for,
+                    // not built beside. The status file written above keeps reporting a
                     // build meanwhile, which there is.
                     let _build = crate::indexer::lock::acquire_build_lock(
                         &project_root.join(CODE_GRAPH_DIR),

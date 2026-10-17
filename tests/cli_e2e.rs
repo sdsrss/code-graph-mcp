@@ -14195,6 +14195,121 @@ fn test_cli_incremental_index_yields_to_a_server_when_asked() {
     assert!(index_has_file(&project, "src/later.ts"), "{stderr}");
 }
 
+/// Run `incremental-index` (embedding on) and, once `file` is in the index,
+/// take `index-build.lock` the moment it is free, as a server starting then
+/// does. Not before: a lock taken ahead of the run's own makes the run wait for
+/// it. Returns whether the run was still going then, the vectors written by
+/// then, and the vectors written by the end — the lock is held until the run
+/// exits.
+#[cfg(all(unix, feature = "embed-model"))]
+fn take_the_build_lock_during_an_embedding_run(project: &TempDir, file: &str) -> (bool, i64, i64) {
+    use std::os::unix::io::AsRawFd;
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    // Read-only: neither creates nor migrates the database the run is building.
+    let open = || code_graph_mcp::storage::db::Database::open_readonly(&cg.join("index.db"));
+    // Tolerant: the run may not have created its tables yet.
+    let indexed = || {
+        open().is_ok_and(|db| {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [file], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .is_ok_and(|n| n == 1)
+        })
+    };
+    // Strict: a read that fails must not pass for "no vectors yet".
+    let vectors = || {
+        code_graph_mcp::storage::queries::count_nodes_with_vectors(open().unwrap().conn())
+            .unwrap()
+            .0
+    };
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["incremental-index", "--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let held = loop {
+        if let Some(f) = indexed()
+            .then(|| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(cg.join("index-build.lock"))
+                    .ok()
+            })
+            .flatten()
+        {
+            // SAFETY: `f` is an open File owned by this scope.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break Some(f);
+            }
+        }
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let running = child.try_wait().unwrap().is_none();
+    let at_take = if held.is_some() { vectors() } else { -1 };
+    let out = child.wait_with_output().unwrap();
+    drop(held);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (running, at_take, vectors())
+}
+
+/// D#423(d): `incremental-index` held the build lock through its embedding,
+/// and a server that started meanwhile waited for it: every tool call answered
+/// "Indexing in progress" until the embedding ended or 10 min passed (0.171.1,
+/// this repo: 18 of 18 calls in 119 s, the CLI at 640 of 7,157 vectors). The
+/// lock covers the index, in a project's first run and in a later one; the
+/// embedding runs without it, as the server's own backfill does. Needs the
+/// model's weights, so it skips where they are absent (CI). A few functions
+/// are enough: the run loads the model after the index, so with the lock let
+/// go there the probe finds no vector yet.
+#[cfg(all(unix, feature = "embed-model"))]
+#[test]
+fn test_cli_incremental_index_embeds_without_the_build_lock() {
+    if code_graph_mcp::embedding::model::EmbeddingModel::load()
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        eprintln!("[skip] embedding model weights unavailable");
+        return;
+    }
+    let functions = |prefix: &str| -> String {
+        (0..3)
+            .map(|i| format!("def {prefix}_{i}(x):\n    return x + {i}\n\n"))
+            .collect()
+    };
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+
+    for (run, file) in [
+        ("the first index", "first.py"),
+        ("an incremental run", "second.py"),
+    ] {
+        std::fs::write(
+            project.path().join(file),
+            functions(&file[..file.len() - 3]),
+        )
+        .unwrap();
+        let (running, at_take, at_end) =
+            take_the_build_lock_during_an_embedding_run(&project, file);
+        assert!(
+            running && at_take < at_end,
+            "{run}: the build lock was free only once the run had embedded \
+             {at_take} of {at_end} vectors (still running: {running})"
+        );
+    }
+}
+
 /// E2E 2026-10-16 round 3: the constructor rule dropped any function or
 /// method named like a type in the type's file. Go declares a method beside a
 /// same-named struct (gin: `type Negotiate struct` and `Context.Negotiate`),

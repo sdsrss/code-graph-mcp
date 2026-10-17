@@ -227,8 +227,10 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
     // one: a full index into an explicit path, and the incremental refresh.
     // The name is matched EXACTLY, so it tracks the function that holds the
     // call: `cmd_incremental_index` is now a thin wrapper and the body (with the
-    // open) lives in `cmd_incremental_index_opts`.
-    const ALLOWED_ANCHORS: [&str; 2] = ["fn build_full_index_at", "fn cmd_incremental_index_opts"];
+    // open) lives in `cmd_incremental_index_opts`; `build_full_index_at` embeds
+    // and leaves the open to `index_full_at`, which the incremental refresh also
+    // calls so it can let go of the build lock before embedding (D#423).
+    const ALLOWED_ANCHORS: [&str; 2] = ["fn index_full_at", "fn cmd_incremental_index_opts"];
 
     // `Database::open` is the SAME destructive constructor with a different
     // vec flag (open_impl(path, false, revalidate=TRUE)) — the guard's first
@@ -237,7 +239,7 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
     // (audit 2026-08-02 MED-5). cmd_benchmark opens its OWN temp DB, which is
     // fine — it never touches the user's index.
     const ALLOWED_OPEN_ANCHORS: [&str; 3] = [
-        "fn build_full_index_at",
+        "fn index_full_at",
         "fn cmd_incremental_index_opts",
         "fn cmd_benchmark",
     ];

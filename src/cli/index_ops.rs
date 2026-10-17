@@ -168,6 +168,18 @@ pub(crate) fn build_full_index_at(
     quiet: bool,
     no_embed: bool,
 ) -> Result<crate::indexer::pipeline::IndexResult> {
+    let (db, result) = index_full_at(db_path, project_root, quiet)?;
+    finish_embedding(&db, quiet, no_embed)?;
+    Ok(result)
+}
+
+/// [`build_full_index_at`] up to its embedding: the caller embeds, with the
+/// returned connection, once it has let go of what the index alone needed.
+fn index_full_at(
+    db_path: &Path,
+    project_root: &Path,
+    quiet: bool,
+) -> Result<(Database, crate::indexer::pipeline::IndexResult)> {
     if let Some(parent) = db_path.parent() {
         // Not `create_dir_all`: that silently succeeds when `.code-graph` is a
         // repo-supplied symlink, putting `index.db` and every telemetry file
@@ -191,8 +203,7 @@ pub(crate) fn build_full_index_at(
         );
     }
     warn_parse_errors(&result.stats);
-    finish_embedding(&db, quiet, no_embed)?;
-    Ok(result)
+    Ok((db, result))
 }
 
 /// The `--json` object shared by `incremental-index`, `rebuild-index` and
@@ -424,13 +435,14 @@ pub fn cmd_incremental_index_opts(
     crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
-    // One build at a time (D#406), held to the end, embedding included. Taken
-    // BEFORE the server check below: a server that starts after that check
-    // takes `index.lock` first and this lock second, so it waits for this run.
-    // The directory first: a project's first build found none, could not open
-    // the lock in it, and ran unlocked beside a starting server (pre-tag review).
+    // One build at a time (D#406), held to the end of the index; the embedding
+    // runs without it. Taken BEFORE the server check below: a server that
+    // starts after that check takes `index.lock` first and this lock second,
+    // so it waits for this run. The directory first: a project's first build
+    // found none, could not open the lock in it, and ran unlocked beside a
+    // starting server (pre-tag review).
     crate::utils::owned::ensure_owned_dir(&code_graph_dir)?;
-    let _build = crate::indexer::lock::acquire_build_lock(
+    let build = crate::indexer::lock::acquire_build_lock(
         &code_graph_dir,
         crate::indexer::lock::BUILD_WAIT,
         &mut || {
@@ -465,13 +477,21 @@ pub fn cmd_incremental_index_opts(
     // Stale-only: a live server's file has a fresh mtime and is left alone.
     crate::indexer::pipeline::remove_stale_indexing_status(project_root);
 
-    // No existing DB → full index. Delegate to build_full_index_at so the
-    // full-index + embed path is shared with rebuild-index (no drift).
+    // No existing DB → full index. Delegate to index_full_at so the full-index
+    // path is shared with rebuild-index (no drift).
     if !db_path.exists() {
         if !quiet {
             eprintln!("No index found, creating full index...");
         }
-        let result = build_full_index_at(&db_path, project_root, quiet, no_embed)?;
+        let (db, result) = index_full_at(&db_path, project_root, quiet)?;
+        // Let go before embedding, which can take minutes: a server starting
+        // meanwhile waited for it, and answered every tool call "Indexing in
+        // progress" until it ended or 10 min passed (D#423). The embedding
+        // needs no lock: the server's own backfill also runs beside other
+        // processes' indexes, and the store skips a node that vanished
+        // meanwhile (`insert_node_vectors_batch`).
+        drop(build);
+        finish_embedding(&db, quiet, no_embed)?;
         if json {
             emit_index_json("full", &result, started);
         }
@@ -501,6 +521,8 @@ pub fn cmd_incremental_index_opts(
     }
     warn_parse_errors(&stats.stats);
 
+    // As in the first-index branch above.
+    drop(build);
     finish_embedding(&db, quiet, no_embed)?;
     if json {
         emit_index_json("incremental", &stats, started);
