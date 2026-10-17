@@ -2,9 +2,22 @@
 
 ## Unreleased
 
-**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Fixes from an
-end-to-end pass that used the CLI, the MCP server and the plugin the way a
-user does, on flask, hono, django, leveldb, cobra, gin, echo,
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Two exit codes
+change. While the MCP server builds the index, the CLI query commands exit 1
+and ask you to retry; they answered from the part built so far with exit 0.
+And `health-check` exits 1 after an index run that died, until
+`incremental-index` or the MCP server's next start re-indexes. To pin the
+binary back: `npm i -g @sdsrs/code-graph@0.170.1` (or, from source, `cargo
+install --locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.170.1
+--features embed-model`; without the feature, search is FTS5-only), then
+delete `~/.cache/code-graph/bin/code-graph-mcp`, the auto-update copy, which
+is used ahead of an older binary, and set `CODE_GRAPH_NO_AUTO_UPDATE=1` in the
+environment Claude Code runs in, so the plugin does not fetch it again. That
+pins the binary only: the plugin's hooks, statusline and doctor come with the
+plugin.
+
+Fixes from an end-to-end pass that used the CLI, the MCP server and the plugin
+the way a user does, on flask, hono, django, leveldb, cobra, gin, echo,
 spring-petclinic, rack, sinatra and kubernetes' `hack/lib`.
 
 ### Queries wait for the MCP server's build
@@ -130,10 +143,6 @@ used to be removed before those phases.
 - `refs Rack::Protection` beside a README `# Rack::Protection` answers for the
   heading, as in 0.170.1, and a Ruby root-namespace spelling the index does not
   store (`show ::Minitest::Test`) is `Symbol not found`.
-- A CLI query that probes `index.lock` the instant an MCP server starts can
-  make that server start read-only, until a tool call 30 s or more later
-  promotes it (the round-4 review, under 10 parallel query loops: 8 of 6,000
-  starts).
 - A query killed while its freshness pass writes leaves the interrupted
   marker, and `health-check` reports the index unhealthy until the next
   `incremental-index` or MCP server start.

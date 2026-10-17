@@ -120,10 +120,24 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
         })
         .ok()?;
 
-    // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it
+    // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it.
+    // A conflict is retried for up to ~90 ms: `other_process_holds_index_lock`
+    // takes this lock for an instant, and a CLI query probes it while a build's
+    // status file names a pid it cannot see. One try that landed in that
+    // instant left a starting server read-only for 30 s or more (E2E round 4:
+    // 8 of 6,000 starts beside 10 query loops). A holder that stays — another
+    // server, a `rebuild-index` — outlasts the retries, as it should.
     // SAFETY: `file` is an open File owned by this scope, so `as_raw_fd()` yields a
     // valid, live fd for the duration of the call; flock has no other precondition.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let mut rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    for _ in 0..9 {
+        if rc == 0 || !is_flock_conflict(std::io::Error::last_os_error().raw_os_error()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // SAFETY: as above.
+        rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    }
     if rc != 0 {
         // Only EWOULDBLOCK means somebody actually holds it. Reporting every
         // failure as a conflict accuses a holder that does not exist — on a
@@ -408,6 +422,50 @@ mod tests {
             "the lock file must hold exactly this PID — a tail from the previous \
              writer makes the diagnostic name a process that is not the holder"
         );
+    }
+
+    /// E2E round 4 (D#393(2)): a CLI query probes `index.lock` while a status
+    /// file names a pid it cannot see, taking the lock for an instant. A server
+    /// whose one try at startup landed in that instant ran read-only until a
+    /// tool call 30 s or more later promoted it (8 of 6,000 starts beside 10
+    /// query loops). The acquisition now waits out a hold that brief; one that
+    /// lasts still leaves it secondary.
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_waits_out_a_probe_but_not_a_holder() {
+        use std::os::unix::io::AsRawFd;
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        let lock = cg.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let take = || {
+            let f = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+            // SAFETY: `f` is an open File owned by this closure's caller, so the
+            // fd is live for the call.
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(rc, 0, "the test holder must take the lock first");
+            f
+        };
+
+        let probe = take();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(probe);
+        });
+        let won = try_acquire_index_lock(cg);
+        release.join().unwrap();
+        assert!(
+            won.is_some(),
+            "a hold of 20 ms must not leave the server secondary"
+        );
+        drop(won);
+
+        let holder = take();
+        assert!(
+            try_acquire_index_lock(cg).is_none(),
+            "a holder that stays must still leave this instance secondary"
+        );
+        drop(holder);
     }
 
     // L7: CLI rebuild/incremental warn before racing a running server. This guards the
