@@ -110,8 +110,11 @@ text's (1.0000). Both end at 123/123 embedded.
   from MCP `get_ast_node` with that `node_id`: on 45 of leveldb's 1,152
   functions and methods outside test files, and 7 of flask's 392.
 - Vectors an earlier release stored on the wrong text stay until their file
-  changes; `incremental-index` does not replace them, `rebuild-index
-  --confirm` does. In the race above, `incremental-index`'s closing line
+  changes; `incremental-index` does not replace them. `rebuild-index
+  --confirm` replaced them in the race above, but it reuses what the
+  embedding cache holds for a node's text, and the cache can hold such a
+  vector: an MCP server fills an empty cache from the vectors the nodes
+  have. In the race above, `incremental-index`'s closing line
   counts each re-created node twice (`Embedded 133 nodes (123/123)`; 0.171.2
   printed 123).
 - A file created or edited after the MCP server starts and before its first
