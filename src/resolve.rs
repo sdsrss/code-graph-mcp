@@ -433,16 +433,17 @@ pub fn is_selectable_definition(file_path: &str) -> bool {
 /// Rewriting those made them unfindable (E2E round 2), so an exact stored name
 /// or qualified name keeps the input as typed.
 ///
-/// Only a path of non-empty segments (`A::b`, `::A::b`), none holding `.`,
-/// `:` or whitespace, is rewritten. Any other spelling runs as typed, as in
-/// 0.170.1: `::`, `Flask::` and `::Rack::` rewrote to names ending in an
-/// empty part, which the dotted fallback took as the empty name that every
-/// lookup matches (`Ambiguous symbol ''`; E2E round 4, the 0.171.0 review).
+/// Only a path of non-empty segments (`A::b`, `::A::b`), none holding `.` or
+/// `:`, is rewritten. Any other spelling runs as typed, as in 0.170.1: `::`,
+/// `Flask::` and `::Rack::` rewrote to names ending in an empty part, which
+/// the dotted fallback took as the empty name that every lookup matches
+/// (`Ambiguous symbol ''`; E2E round 4, the 0.171.0 review). A segment may
+/// hold spaces, as a template's does (`SkipList<Key, Comparator>::Insert`).
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
     let path = symbol.strip_prefix("::").unwrap_or(symbol);
-    let plain_segments = path.split("::").all(|seg| {
-        !seg.is_empty() && !seg.contains(|c: char| c == '.' || c == ':' || c.is_whitespace())
-    });
+    let plain_segments = path
+        .split("::")
+        .all(|seg| !seg.is_empty() && !seg.contains(['.', ':']));
     if !symbol.contains("::") || !plain_segments {
         return symbol.to_string();
     }
@@ -881,8 +882,11 @@ mod fuzzy_tests {
     /// The pre-tag review of 0.171.0: `Flask::` rewrote to `Flask.`, whose
     /// dotted fallback is its empty last part, so `refs Flask::` answered
     /// `Ambiguous symbol ''`; `::Rack::` and `.::` did the same. Only a path of
-    /// non-empty segments, each without `.`, `:` or whitespace, is rewritten;
-    /// every other spelling runs as typed, as it did in 0.170.1.
+    /// non-empty segments, each without `.` or `:`, is rewritten; every other
+    /// spelling runs as typed, as it did in 0.170.1. A segment may hold spaces:
+    /// leveldb stores `SkipList<Key, Comparator>.Insert`, and kept as typed
+    /// `DBImpl::Write ` reached the fuzzy step and answered for
+    /// `DBImpl::Writer` (the delta review of that repair).
     #[test]
     fn only_a_path_of_plain_segments_is_rewritten() {
         let (_p, _d, db) = indexed(&[("src/a.rs", "pub fn alpha() {}\n")]);
@@ -894,24 +898,19 @@ mod fuzzy_tests {
             ("DBImpl::Write", "DBImpl.Write"),
             ("Foo::~Foo", "Foo.~Foo"),
             ("Foo::operator==", "Foo.operator=="),
+            (
+                "SkipList<Key, Comparator>::Insert",
+                "SkipList<Key, Comparator>.Insert",
+            ),
+            ("<Hello as Greeter>::greet", "<Hello as Greeter>.greet"),
+            ("DBImpl::Write ", "DBImpl.Write "),
+            ("A:: b", "A. b"),
         ] {
             assert_eq!(canonical_symbol_spelling(db.conn(), typed), want, "{typed}");
         }
         for typed in [
-            "::",
-            "::::",
-            "Flask::",
-            "::Rack::",
-            "Rack::",
-            ".::",
-            ":::",
-            "A:::b",
-            "A::::b",
-            "A::b::",
-            "A.b::c",
-            "A::b.c",
-            "A:: b",
-            "SkipList<Key, Comparator>::SkipList",
+            "::", "::::", "Flask::", "::Rack::", "Rack::", ".::", ":::", "A:::b", "A::::b",
+            "A::b::", "A.b::c", "A::b.c",
         ] {
             assert_eq!(
                 canonical_symbol_spelling(db.conn(), typed),
