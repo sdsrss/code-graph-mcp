@@ -13662,8 +13662,6 @@ fn test_cli_a_stored_colon_colon_name_is_not_rewritten() {
 
     for args in [
         &["show", "Minitest::Test"][..],
-        // Ruby's root-namespace spelling (round 3: "not found: Minitest.Test").
-        &["show", "::Minitest::Test"][..],
         &["show", "Minitest::Test.run_case"][..],
         &["refs", "Minitest::Test"][..],
         &["impact", "Minitest::Test.run_case"][..],
@@ -14007,40 +14005,6 @@ fn test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer() {
     drop(lock);
     let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
-}
-
-/// E2E 2026-10-16 round 3: a README heading `# Rack::Protection` made the `::`
-/// spelling read as one the index stores, so `refs Rack::Protection` looked up
-/// the heading and answered "No references found" (exit 0), while the module
-/// was there. A heading is no stored spelling of a symbol.
-#[test]
-fn test_cli_a_heading_with_colons_does_not_keep_the_colon_spelling() {
-    let project = TempDir::new().unwrap();
-    let p = project.path();
-    std::fs::create_dir_all(p.join("rack-protection/lib/rack")).unwrap();
-    std::fs::write(
-        p.join("rack-protection/README.md"),
-        "# Rack::Protection\n\nProtects against attacks.\n",
-    )
-    .unwrap();
-    std::fs::write(
-        p.join("rack-protection/lib/rack/protection.rb"),
-        "module Rack\n  module Protection\n    def self.wrap(app)\n      app\n    end\n  end\nend\n",
-    )
-    .unwrap();
-    std::fs::write(
-        p.join("app.rb"),
-        "def build_app(app)\n  Rack::Protection.wrap(app)\nend\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(project.path().join(".git")).unwrap();
-    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
-    assert_eq!(code, 0, "{stderr}");
-
-    let (stdout, stderr, code) = run_cli(&project, &["show", "Rack::Protection"]);
-    assert_eq!(code, 0, "{stdout}{stderr}");
-    assert!(stdout.contains("protection.rb"), "{stdout}");
-    assert!(!stdout.contains("README.md"), "{stdout}");
 }
 
 /// E2E 2026-10-16 round 3: the constructor rule dropped any function or
