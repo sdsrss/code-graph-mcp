@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.171.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Two exit codes
 change. While the MCP server builds the index, the CLI query commands exit 1
