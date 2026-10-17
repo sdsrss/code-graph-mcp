@@ -36,16 +36,68 @@ after it, around it or none, through CLI `show`, `callgraph`, `impact`,
 `refs`, `similar` and MCP `get_ast_node`, `get_call_graph`,
 `find_references`, `find_similar_code`: in 4,920 runs, each answer equals the
 one 0.171.2's source gives with the whitespace removed, or, for whitespace
-alone, as typed.
+alone, as typed. Where that answer is for another name, it now also carries
+the note described next.
+
+### A fuzzy answer says which symbol it answers for
+
+When a name matches no definition and the fuzzy step finds exactly one close
+name, MCP `get_call_graph` and `find_references` answer for that name, as
+before, and now say so in the answer: `"note": "No exact match for 'abot';
+answering for 'abort'."` They used to show the switch only by the name in
+`function` / `symbol`. CLI `refs` now prints `Resolved 'abot' → 'abort'` on
+stderr, as `callgraph` already did; its stdout is unchanged.
+
+Measured on flask and leveldb with 329 generated names (exact names, typos,
+prefixes, `Class.method` and `Class::method` for members the class does not
+define, missing members; some also with a `file_path` or `--file`) through
+CLI `callgraph` and `refs` and MCP `get_call_graph` and `find_references`:
+0.171.2 answered for another name without saying so 94 times in MCP and 44
+times in `refs`; this release 0 times. Every other answer of the 1,316 runs
+is byte for byte 0.171.2's, and the same names with whitespace around them
+(5,264 runs) get exactly the answers they get without it. Where a typo or
+prefix was switched, the name answered for was the one it came from in every
+case of this sample; a dotted name can be switched to an unrelated one (see
+Not covered).
+
+### A vector belongs to the text it was computed from
+
+0.171.2 listed this under Not covered. While `incremental-index` computed
+embeddings, another index run beside it that re-indexed a file could give
+that file's new nodes the ids of its old ones, and the vectors being computed
+from the old text then landed on the new nodes. Nothing re-embeds a node that
+has a vector, so semantic search ranked those nodes by text they no longer
+had until their file changed again. A vector is now stored only if its node
+still holds the text it was computed from, and `incremental-index` embeds a
+node re-created meanwhile from its new text in the same run.
+
+Measured with 120 functions in two files, the file of 10 rewritten and
+re-indexed by `incremental-index --no-embed` while 64 of 123 nodes were
+embedded: 0.171.2 left all 10 of its nodes with the old text's vectors
+(cosine 0.79–0.81 to the new text's), this release all 10 with the new
+text's (1.0000). Both end at 123/123 embedded.
 
 ### Not covered
 
-- When their fuzzy step finds one close name, MCP `get_call_graph` and
-  `find_references` answer for it without saying so. flask's `Flask.route`
-  (defined as `Scaffold.route`) answers for `FlaskGroup`, where the CLI says
-  `No definition is named 'Flask.route'; answering for 'route'`. Spellings of
-  such a name with whitespace around them now get that answer too, where
-  0.171.2 answered "not found": 16 of the 4,920 runs above.
+- A dotted name no definition has is answered by the fuzzy step for whatever
+  single name is close to the whole string: flask's `Flask.route` (defined as
+  `Scaffold.route`) answers for `FlaskGroup`, now with the note above. The
+  CLI drops the qualifier instead (`No definition is named 'Flask.route';
+  answering for 'route'`). The 0.152.0 notes say the MCP tools fall back to
+  the bare name as well; they do not: `get_ast_node`, `get_call_graph` and
+  `find_references` refuse such a name or answer it from the fuzzy step.
+  Spellings of `Flask.route` with whitespace around them, which 0.171.2
+  refused, now get the same answer: 16 runs (8 spellings, 2 tools) went from
+  "not found" to `FlaskGroup` with the note.
+- Vectors an earlier release stored on the wrong text stay until their file
+  changes; `incremental-index` does not replace them, `rebuild-index
+  --confirm` does.
+- A file created or edited after the MCP server starts and before its first
+  tool call that indexes (`get_index_status` is not one) is not seen by that
+  call or the ones after it, measured for 120 s: the file watcher starts at
+  that call, after the change, and without an event the server rescans every
+  5 minutes. `module_overview` on the file's path indexes it. 0.171.2
+  behaves the same.
 
 ## 0.171.2
 

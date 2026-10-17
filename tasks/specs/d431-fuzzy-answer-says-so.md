@@ -78,3 +78,9 @@
 ## 决定
 
 - 说明文字放在顶层 `note` 键：`get_call_graph`、`find_references` 的回答原来没有顶层 `note`；服务器包装层只加 `freshness`、`ignored_arguments`、`clamped_arguments`。
+- 同一批名字两端加空白（尾空格、首空格、`\t…\n`、尾 NBSP，`in-pad-*.jsonl`，HEAD = `d429` 构建 md5 `f0f75cec…`）：flask 2,624 次、leveldb 2,640 次，与不加空白的 HEAD 回答逐字节相同 5,264/5,264；与 0.171.2 不加空白的回答相比，相同 2,312 + 2,400，只多了 `note`/`Resolved` 312 + 240。0.171.2 与改动前 HEAD 在不加空白的 1,316 次上逐字节相同（0 处差异），所以上面 P→H 的数字也是 0.171.2→H 的。
+- flask `Flask.route`/`Flask::route` × 4 种填充 × 2 个工具：0.171.2 拒绝 16/16，HEAD 答 `FlaskGroup` 带 `note` 16/16；不填充的 4 次，0.171.2 答 `FlaskGroup` 不带 `note`，HEAD 带。
+
+## 遗留
+
+- 带点名字没有任何定义时，MCP 三个工具不退回裸名（0.152.0 的说明写了会退回）：D#433。
