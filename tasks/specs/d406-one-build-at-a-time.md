@@ -89,6 +89,20 @@ run-lock probe; `rebuild-index` does not take B.
 - Chose an env var over a hidden flag (see Design).
 - Cap 10 min: a live holder that never finishes is a hung process; past the cap
   writing beside it is the lesser harm than never indexing.
+- Pre-tag review (round 1, fresh subagent): HIGH non-Unix dead code
+  (`BUILD_LOCK`) -> `cfg_attr(not(unix), allow(dead_code))`; MEDIUM first index
+  had no `.code-graph/` to lock in -> `ensure_owned_dir` before the lock; MEDIUM
+  the refresh held the lock through embedding -> SessionStart passes
+  `--no-embed` (the server embeds; the per-edit hook already does this); LOW
+  audit table pins candle-core's version; LOW C++ constructor control added
+  (`c` cannot have a case: no class bodies, `.h` reads as C++).
+- Not fixed, disclosed: a promoted secondary's first index (and the server's
+  other runs) do not take the build lock. Chose disclosure over extending the
+  lock to every server write path: four paths (not-yet-indexed, owed
+  incremental, backstop, wipe-and-rebuild) would each need a skip-and-stay-owed
+  arm, the behaviour is 0.171.0's, and the review stop line applies. Deferred.
+  Also disclosed: start-up open/wipe before the lock; `reindex --from-snapshot`
+  unlinks under a build.
 
 ## Verification record
 
@@ -107,3 +121,10 @@ run-lock probe; `rebuild-index` does not take B.
 - fmt, clippy `--all-targets` both legs: pass. JS suite 1726 passed, 0 failed (2 skipped).
 - Also in this change: session-init's test covers a dead writer's status file
   (the refresh starts); red when `writerAlive` is skipped.
+- Review repairs: emulated non-Unix `cargo check --lib` (cfg arms flipped in a
+  `git archive` copy): HEAD exit 101 `BUILD_LOCK is never used`, repaired exit
+  0. django first index (`FRESH=1`, server 1.5 s later) x3: base 3/3
+  UNHEALTHY 163,381 edges; repaired 0/3, 250,731. Regression x2 each ordering:
+  healthy. New e2e `test_cli_a_first_index_takes_the_build_lock` red before.
+  Audit mutations 5/5 red (incl. candle-core 0.10.0); constructor mutations
+  cpp/csharp/dart 3/3 red.

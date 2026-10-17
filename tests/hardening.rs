@@ -2579,17 +2579,18 @@ fn ci_schedule_runs_only_the_audit_job() {
 }
 
 /// The advisories ci.yml tells `cargo audit` to ignore: (id, crate, first fixed
-/// major, the one package allowed to depend on that crate). An ignore is a
+/// major, the one package allowed to depend on that crate, and its version).
+/// The version too: the source read is that release's (pre-tag review). An ignore is a
 /// claim that the vulnerable code is unreachable from here, and the claim is
 /// about one dependent: the zip advisories (2026-10-09/10, all in
 /// `ZipArchive::extract` / `ZipStreamReader::extract`) hold for candle-core
 /// 0.9.2, which only opens archives by name and writes `.npz` files, and which
 /// this crate uses for safetensors alone. No candle release depends on zip 9
 /// yet (0.11.0 asks for `^8.6.0`), and no 7.x or 8.x release carries the fix.
-const AUDIT_IGNORES: &[(&str, &str, u64, &str)] = &[
-    ("RUSTSEC-2026-0367", "zip", 9, "candle-core"),
-    ("RUSTSEC-2026-0368", "zip", 9, "candle-core"),
-    ("RUSTSEC-2026-0369", "zip", 9, "candle-core"),
+const AUDIT_IGNORES: &[(&str, &str, u64, &str, &str)] = &[
+    ("RUSTSEC-2026-0367", "zip", 9, "candle-core", "0.9.2"),
+    ("RUSTSEC-2026-0368", "zip", 9, "candle-core", "0.9.2"),
+    ("RUSTSEC-2026-0369", "zip", 9, "candle-core", "0.9.2"),
 ];
 
 /// An audit ignore stays only while its reason does. The ignore cannot go
@@ -2652,7 +2653,7 @@ fn audit_ignores_hold_only_while_their_reason_does() {
         packages.len()
     );
 
-    for (id, krate, fixed_major, dependent) in AUDIT_IGNORES {
+    for (id, krate, fixed_major, dependent, dependent_version) in AUDIT_IGNORES {
         let versions: Vec<&str> = packages
             .iter()
             .filter(|(name, ..)| name == krate)
@@ -2670,16 +2671,17 @@ fn audit_ignores_hold_only_while_their_reason_does() {
                  {fixed_major}.x — drop its ignore from ci.yml"
             );
         }
-        let dependents: Vec<&str> = packages
+        let dependents: Vec<String> = packages
             .iter()
             .filter(|(_, _, deps)| deps.iter().any(|d| d == krate))
-            .map(|(name, ..)| name.as_str())
+            .map(|(name, version, _)| format!("{name} {version}"))
             .collect();
         assert_eq!(
             dependents,
-            vec![*dependent],
-            "{id}: the ignore says only `{dependent}` reaches `{krate}`; check \
-             whether the new dependent calls the vulnerable code before keeping it"
+            vec![format!("{dependent} {dependent_version}")],
+            "{id}: the ignore says only `{dependent} {dependent_version}` reaches \
+             `{krate}`; check whether this dependent calls the vulnerable code \
+             before keeping it"
         );
     }
 }

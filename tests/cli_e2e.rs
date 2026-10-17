@@ -14316,9 +14316,15 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
         assert_ne!(code, 0, "{name}: {stdout}{stderr}");
         assert!(stderr.contains("Ambiguous symbol"), "{name}: {stderr}");
     }
-    // Control: Java's constructor still is one, and so are C#'s and Dart's,
-    // whose extractors also store the constructor as a function named like
-    // the class (the rule's other two languages had no case here).
+    // Control: Java's constructor still is one, and so are C#'s, C++'s and
+    // Dart's, whose extractors also store the constructor as a function or
+    // method named like the class. The rule's `c` has no case: a C file has no
+    // class body to hold one (and `.h` is read as C++).
+    std::fs::write(
+        p.join("a.cpp"),
+        "class CppCls {\npublic:\n  CppCls() {}\n  int id() { return 1; }\n};\n",
+    )
+    .unwrap();
     std::fs::write(
         p.join("C.cs"),
         "public class CsCls {\n  public CsCls() {}\n  public int Id() { return 1; }\n}\n",
@@ -14331,7 +14337,7 @@ fn test_cli_a_same_named_method_is_a_constructor_only_where_the_language_has_one
     .unwrap();
     let (_, stderr, code) = run_cli(&project, &["incremental-index", "--no-embed", "--quiet"]);
     assert_eq!(code, 0, "{stderr}");
-    for name in ["JCls", "CsCls", "DCls"] {
+    for name in ["JCls", "CsCls", "CppCls", "DCls"] {
         let (stdout, stderr, code) = run_cli(&project, &["refs", name]);
         assert_eq!(code, 0, "{name}: {stdout}{stderr}");
     }

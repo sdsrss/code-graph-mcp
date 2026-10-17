@@ -24,21 +24,28 @@ or 1.5 s later: 6 of 6 sessions ended with `health-check` UNHEALTHY
 `database disk image is malformed`), the server's startup index failed in 4,
 and the index held between 171,053 and 253,648 edges where a clean build has
 250,731. With the server first and the refresh 0.5 s or 3 s later, 3 of 4
-ended UNHEALTHY.
+ended UNHEALTHY. A project's first `incremental-index`, with the server 1.5 s
+later, ended UNHEALTHY 3 of 3 with 163,381 edges.
 
 An index build now holds `.code-graph/index-build.lock` from start to end: the
-MCP server's startup index, and every `incremental-index` (its embedding
-included). A build that finds it held waits for it. SessionStart also starts
-its refresh with `CODE_GRAPH_YIELD_TO_SERVER=1`, and then `incremental-index`
-indexes nothing (exit 0; under `--json`, `"mode": "skipped"` with the reason)
-while another process holds `.code-graph/index.lock`, that is, while an MCP
-server, which keeps the index fresh itself, or a `rebuild-index` runs. The
-refresh takes the build lock before it looks for a server, and the server
-takes `index.lock` before the build lock, so whichever starts second waits
-for or yields to the other. In the same tests: 0 of 6 and 0 of 4 unhealthy,
-no run failed, and the index held 250,731 edges every time. In the
-server-first test the refresh waited for the server's startup index and then
-skipped.
+MCP server's startup index, and every `incremental-index`, a project's first
+included (its embedding too). A build that finds it held waits for it.
+SessionStart also starts its refresh with `CODE_GRAPH_YIELD_TO_SERVER=1`, and
+then `incremental-index` indexes nothing (exit 0; under `--json`,
+`"mode": "skipped"` with the reason) while another process holds
+`.code-graph/index.lock`, that is, while an MCP server, which keeps the index
+fresh itself, or a `rebuild-index` runs. The refresh takes the build lock
+before it looks for a server, and the server takes `index.lock` before the
+build lock, so whichever starts second waits for or yields to the other. In
+the same tests: 0 of 6, 0 of 4 and 0 of 3 unhealthy, no run failed, and the
+index held 250,731 edges every time. In the server-first test the refresh
+waited for the server's startup index and then skipped.
+
+The refresh no longer computes embeddings (`--no-embed`), so a server that
+starts during it waits only for the index. The MCP server embeds the new
+nodes itself, as it does after the per-edit hook's runs; with no server
+running they get vectors at the next `incremental-index` run without
+`--no-embed`.
 
 A server that waited for a build which created the index (SessionStart
 rebuilds a version-stale index in full) now indexes only what changed since;
@@ -60,7 +67,18 @@ or when a package other than candle-core depends on zip.
 - On Windows there is no build lock: the refresh still yields to a running
   server, but a server that starts during a refresh does not wait for it.
 - A build that holds the build lock for more than 10 minutes is built beside,
-  with a warning.
+  with a warning. A server that starts while an `incremental-index` run by
+  hand computes embeddings waits for that too, and its tools answer
+  `Indexing in progress` meanwhile.
+- A server that becomes the primary when another session's server exits runs
+  its first index without the build lock, so a SessionStart refresh started in
+  between can still write beside it, as in 0.171.0.
+- The server's start-up open of the index (a snapshot install, the wipe of a
+  version-stale or corrupt index) comes before it takes the build lock, as in
+  0.171.0.
+- `reindex --from-snapshot` replaces `index.db` without waiting for the build
+  lock: a build in progress then writes into the replaced file and still
+  reports success. The reindex's own index that follows is complete.
 - `doctor`'s index repair (120 s) and the opt-in per-edit hook
   (`CODE_GRAPH_HOOK_INDEX=on`, 8 s) run `incremental-index` with a time limit.
   During another build that outlasts it they now time out waiting, where they
