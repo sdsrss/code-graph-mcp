@@ -20,10 +20,13 @@ the name asked:
   near names under "No exact match" where `callgraph` exited 1 calling the
   name ambiguous over them; MCP `find_references` answered for a near name,
   or called the name ambiguous over a list of other names. `get_call_graph`
-  and `callgraph` now answer the name's own call graph, and
-  `find_references` refuses it as it refuses any name only test files
-  define: `Symbol 'after' exists but all 1 match(es) are in test/bench paths
-  (tests/test_async.py). Pass node_id … or file_path …`.
+  and `callgraph` now answer the name's own call graph, all its definitions
+  together when test code defines it more than once (13 of the 40 flask
+  names), as 0.171.3 already did where the name had edges. `find_references`
+  refuses it as it refuses any name only test files define: `Symbol 'after'
+  exists but all 1 match(es) are in test/bench paths (tests/test_async.py).
+  Pass node_id … or file_path …`; beside a same-named `<external>` import it
+  answers that import's references instead, without the test definition's.
 - An exact qualified name with no edge in the asked direction, in MCP
   `get_call_graph`: leveldb `Block.size` with `direction: callees` answered
   for the `doc/index.md` heading `Block size`. It now answers `Block.size`
@@ -57,11 +60,12 @@ they get without it (31,736 runs).
   classes as test code, and asks for its `node_id` or `file_path`, where CLI
   `refs` answers it: 749 names in flask, 33 in leveldb (all 33 in `*_test.cc`
   files, classed by their `*Test` names). Because the rule also goes by name,
-  this covers production code too: flask's `Flask.test_client`,
-  `test_request_context` and `test_cli_runner` in `src/flask/app.py` are
-  refused, and the refusal calls that file a test path, as in 0.171.3. Such
-  a production name that 0.171.3 answered for a near name is now refused
-  this way. The refusal can list one file twice (leveldb
+  this covers production code too: flask's `test_client`,
+  `test_request_context` and `test_cli_runner` (methods of `Flask` in
+  `src/flask/app.py`) are refused as bare names, and the refusal calls that
+  file a test path, as in 0.171.3; `Flask.test_client` is answered. Such a
+  production name that 0.171.3 answered for a near name is now refused this
+  way. The refusal can list one file twice (leveldb
   `AddBoundaryInputsTest`: `db/version_set_test.cc, db/version_set_test.cc`).
 - MCP `find_references` decides from the first ten definitions the index
   returns for a name. It reports at most 10 for an ambiguous name (18

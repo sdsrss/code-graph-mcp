@@ -1,6 +1,6 @@
 # D#440：有精确定义的名字不换成近似名
 
-状态：评审第 1 轮已修复，待差量复审（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
+状态：评审两轮已收口，待发版（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
 
 ## 问题
 
@@ -113,3 +113,16 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 - 另：评审观察到 `test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer` 在机器繁忙时失败 1 次，单独重跑 3 次通过，与本次改动无关。
 
 修复后复测（`git archive e195400a` 构建，md5 `9d672730…`）：两个语料 101,608 次运行与 `6efd11be` 逐字节相同（CHANGELOG 的语料数字对 `e195400a` 成立）；评审的 fx1 480 次与评审的变异 M4 完全相同，与 `7d2ff671` 只差 `test_support` 的 2 次（回到 0.171.3 的回答）；fx2 与 `7d2ff671` 相同。`e195400a` 的 pre-commit：31 个套件 2,291 通过、0 失败、7 忽略，fmt、clippy 两条腿通过。
+
+### 第 2 轮（差量，新开子代理，`7d2ff671..7f0e20e0`）
+
+0 个 HIGH。评审确认：与 `7d2ff671` 相比，语料 101,608/101,608 相同，7 个夹具里唯一的差别是 `test_support`（回到 0.171.3）；与 0.171.3 相比，改变的 660 次全是 D#440 的输入；逐个追踪四个调用方对 `NotFound` 的处理，都是对的（CLI `refs` 那一支到不了）。
+
+- F1–F3 MEDIUM（已复现）：三个变异能通过整套测试，并把语料上的修复改回去：`any` 改成 `!空 && all`（flask 345 次回退），条件加上"恰好一个近似名"（flask 203 次），规则移到非测试精确匹配之前（`find_references` 拒绝 flask `Config` 这种生产和测试都有定义的名字）。F4 LOW：大小写不敏感的变异也存活（语料上 0 次变化）。处理（`test(resolve)` 提交，只改测试和注释，不改行为）：单元测试加上测试代码里的近似名 `after_hook`、两个生产近似名的 `before`、生产和测试都定义的 `setup`、近似输入 `After`。变异复跑（副本 `/var/tmp/d440/src-mut`）：这四个各在自己那条断言上失败（after / before / setup / After），第 1 轮的三个仍分别有 2、3、3 个测试失败，未变异的对照通过。
+- F5 LOW（已复现）：同名有 `<external>` 导入时，`find_references` 按导入回答，不是测试路径提示。CHANGELOG 已补。
+- F6 LOW（已复现）：CHANGELOG 写的是 `Flask.test_client`，被拒绝的其实是裸名 `test_client`；限定名能回答（45 个引用，`e195400a` 上复现）。已改。
+- F7 LOW（已复现）：测试代码多处定义的名字，`get_call_graph`/`callgraph` 会合并回答（flask 改变的 40 个名字里有 13 个，SQL 复核）；0.171.3 在有边的方向上也是合并。CHANGELOG 已补。
+- F8 LOW：已写明。
+- F9 LOW：MCP 一侧 `NotFound` 的注释仍是 "No candidates found."，已改，`resolve.rs` 的注释写清各调用方怎么处理。
+
+评审深度到 2 轮的上限。第 2 轮没有发现行为缺陷，修复只补测试和文字，用变异结果收口，不开第 3 轮（先例：0.171.1）。
