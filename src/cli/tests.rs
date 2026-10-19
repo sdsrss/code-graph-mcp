@@ -3070,7 +3070,11 @@ fn replace_refuses_when_a_held_lock_file_has_a_hardlink() {
 
     // Negative control: released, the same hardlinked lock file stops refusing —
     // so the assertion above is about the holder, not about a call that always
-    // errors.
+    // errors. Unlocked before the close: a child another test thread is
+    // spawning holds a copy of this fd from its fork to its exec, and the
+    // flock lives on the open file description.
+    // SAFETY: `holder` is still open here.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(holder);
     assert!(
         crate::cli::index_ops::lock_index_for_replace(&cg, false).is_ok(),

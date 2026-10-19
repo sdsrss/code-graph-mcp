@@ -359,7 +359,7 @@ pub(crate) fn select_cli_symbol(
 ) -> Result<std::result::Result<CliSymbolSelection, CliSymbolSelectionError>> {
     let selection = crate::resolve::select_symbol(conn, raw_symbol, explicit_file)?;
     if let Ok(selected) = &selection {
-        if selected.lookup == CliSymbolLookup::Bare && raw_symbol.contains('.') {
+        if selected.lookup_name != raw_symbol {
             note_bare_fallback(conn, raw_symbol, &selected.bare_name)?;
         }
     }

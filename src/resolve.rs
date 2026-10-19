@@ -120,8 +120,9 @@ pub enum SymbolSelectionError {
 ///
 /// Exact qualified matches are filtered by `explicit_file`. One match keeps the
 /// qualified spelling for traversal; multiple matches are ambiguous. With no
-/// exact match, dotted input falls back to its final bare component only when
-/// no file filter was supplied. Bare input keeps the normal name lookup.
+/// exact match, a dotted input some node is named keeps that name; otherwise
+/// it falls back to its final bare component only when no file filter was
+/// supplied. Bare input keeps the normal name lookup.
 ///
 /// One function for both surfaces. The MCP tools each picked a symbol their
 /// own way: a dotted name nothing is qualified-named ran the fuzzy step over
@@ -163,6 +164,18 @@ pub fn select_symbol(
                 // would make a freshness refresh follow a pre-refresh path.
                 file_filter: explicit_file.map(str::to_string),
                 lookup: SymbolLookup::ExactQualified,
+            }));
+        }
+        // A node named the dotted string itself is that symbol, not its last
+        // part: a dotted Python import (the `<external>` `click.core`, which
+        // answered for `copy`), a markdown heading (`1. Scan`), a gtest case
+        // (pre-tag review of D#435).
+        if !queries::get_node_ids_by_name(conn, raw_symbol)?.is_empty() {
+            return Ok(Ok(SymbolSelection {
+                lookup_name: raw_symbol.to_string(),
+                bare_name,
+                file_filter: explicit_file.map(str::to_string),
+                lookup: SymbolLookup::Bare,
             }));
         }
         if explicit_file.is_some() {

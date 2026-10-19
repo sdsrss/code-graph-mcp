@@ -2644,10 +2644,13 @@ impl McpServer {
         // `Type::method` → the index's `Type.method`, once, for every tool that
         // takes a symbol, unless the index stores the `::` spelling; and a
         // dotted name nothing is called → the `::` spelling a C++ nested type
-        // is stored under (see `resolve::canonical_symbol_spelling`). A
-        // spelling not stored yet may be in a file the tool's own
-        // `ensure_indexed` is about to index, so that runs first, as the CLI
-        // indexes new files before it maps (E2E round 4).
+        // is stored under (see `resolve::canonical_symbol_spelling`). Either
+        // spelling may be in a file the tool's own `ensure_indexed` is about
+        // to index, so that runs first, as the CLI indexes new files before it
+        // maps (E2E round 4). Run only for a spelling the first reading
+        // rewrote, it missed a nested type a new file adds: `Blk.It` answered
+        // for its constructor on the first call and for the type on the
+        // second (pre-tag review of D#435).
         // The whitespace around a name goes before that (`resolve::trim_symbol_arg`).
         let mut canonical: Option<serde_json::Value> = None;
         for key in ["symbol_name", "function_name"] {
@@ -2655,11 +2658,10 @@ impl McpServer {
                 let s = crate::resolve::trim_symbol_arg(typed);
                 let mut spelled = s.to_string();
                 if s.contains("::") || s.contains('.') {
-                    spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
-                    if spelled != s && !should_skip_indexing(args)? {
+                    if !should_skip_indexing(args)? {
                         self.ensure_indexed()?;
-                        spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
                     }
+                    spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
                 }
                 if spelled != typed {
                     canonical.get_or_insert_with(|| args.clone())[key] = json!(spelled);
@@ -8013,10 +8015,11 @@ end
         };
         write(
             "app.py",
-            "import json\n\n\nclass Widget:\n    def spin(self):\n        return zap()\n\n\n\
+            "import json\nimport xml.etree.ElementTree\n\n\nclass Widget:\n    def spin(self):\n        return zap()\n\n\n\
              def zap():\n    return 1\n\n\ndef caller():\n    return zap()\n\n\n\
              def json_dump(v):\n    return json.dumps(v)\n",
         );
+        write("README.md", "# Guide\n\n## 1. Scan\n\nText.\n");
         write(
             "tests/test_views.py",
             "class Index:\n    def get(self):\n        return 1\n",
@@ -8156,6 +8159,23 @@ end
         let out = answer("find_references", json!({"symbol_name": "codec.json"}));
         assert_eq!(out["symbol"], "json", "{out}");
         assert_eq!(out["note"], "Resolved 'codec.json' → 'json'.", "{out}");
+        // A dotted name a node has is that node, not its last part: a dotted
+        // import (flask `click.core` answered for `copy`) and a heading.
+        let out = answer(
+            "find_references",
+            json!({"symbol_name": "xml.etree.ElementTree"}),
+        );
+        assert_eq!(out["symbol"], "xml.etree.ElementTree", "{out}");
+        assert_eq!(out["by_relation"], json!({"imports": 1}), "{out}");
+        assert!(out.get("note").is_none(), "{out}");
+        let out = answer("get_ast_node", json!({"symbol_name": "1. Scan"}));
+        assert_eq!(out["name"], "1. Scan", "{out}");
+        let out = answer(
+            "get_call_graph",
+            json!({"symbol_name": "1. Scan", "file_path": "README.md"}),
+        );
+        assert_eq!(out["function"], "1. Scan", "{out}");
+        assert!(out.get("error").is_none(), "{out}");
     }
 
     /// D#435: a C++ nested type typed with dots is that type. Its stored
@@ -8217,6 +8237,20 @@ end
             let out = answer("get_ast_node", json!({"symbol_name": typed}));
             assert_eq!(out["qualified_name"], "Block::Iter.Seek", "{typed}: {out}");
         }
+        // A file the index has yet to see is indexed before the spelling is
+        // read, on the first call (the tool's own indexing came after it).
+        std::fs::write(
+            project.path().join("table/blk.cc"),
+            "class Blk::It {\n public:\n  It() {}\n};\n",
+        )
+        .unwrap();
+        server
+            .indexing
+            .pending_incremental
+            .store(true, Ordering::Release);
+        let out = answer("get_ast_node", json!({"symbol_name": "Blk.It"}));
+        assert_eq!(out["qualified_name"], "Blk::It", "{out}");
+        assert!(out.get("note").is_none(), "{out}");
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name
@@ -8909,6 +8943,10 @@ end
         );
         let mut server = McpServer::from_project_root(project.path()).unwrap();
         assert!(!server.is_primary(), "precondition: secondary");
+        // Unlocked before the close, or a sibling test's fork-to-exec copy of
+        // the fd keeps it held and the server stays secondary for that reason.
+        // SAFETY: `holder` is still open here.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(holder);
 
         server.timing.promotion_retry = std::time::Duration::ZERO;
