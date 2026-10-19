@@ -636,8 +636,10 @@ pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
     }
     // A name only test code defines is still the name asked for. Filtered out
     // above, it was never exact, and the near matches below answered for
-    // another symbol: flask `after` for `after_request` (D#440).
-    if test_code.iter().any(|c| c.name == name) {
+    // another symbol: flask `after` for `after_request` (D#440). "Only" is
+    // asked of every definition: the query stops at ten rows, which can all
+    // be test code beside two production definitions.
+    if test_code.iter().any(|c| c.name == name) && preferred_definitions(conn, name)?.is_empty() {
         return Ok(FuzzyResolution::Unique(name.to_string()));
     }
     match candidates.len() {
@@ -919,6 +921,34 @@ mod fuzzy_tests {
             FuzzyResolution::Unique(n) => assert_eq!(n, "after_request"),
             _ => panic!("after_req must resolve to after_request"),
         }
+    }
+
+    /// The fuzzy query stops at ten rows, so they can all be test code while
+    /// production defines the name twice; "only test code" read off them
+    /// would answer for both definitions merged instead of refusing.
+    #[test]
+    fn a_name_production_defines_beyond_the_fuzzy_rows_is_not_test_only() {
+        let mut files: Vec<(String, String)> = (0..11)
+            .map(|i| (format!("src/a{i:02}_test.rs"), "fn run() {}\n".to_string()))
+            .collect();
+        files.push(("src/z1.rs".into(), "pub fn run() {}\n".into()));
+        files.push(("src/z2.rs".into(), "pub fn run() {}\n".into()));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let (_p, _d, db) = indexed(&refs);
+        let rows = queries::find_functions_by_fuzzy_name(db.conn(), "run").unwrap();
+        assert!(
+            rows.iter()
+                .all(|c| crate::domain::is_test_symbol(&c.name, &c.file_path)),
+            "precondition: the fuzzy rows are all test code, got {:?}",
+            rows.iter().map(|c| &c.file_path).collect::<Vec<_>>()
+        );
+        assert!(
+            !matches!(resolve_fuzzy(db.conn(), "run").unwrap(), FuzzyResolution::Unique(n) if n == "run"),
+            "two production `run`s must not resolve as one test-only name"
+        );
     }
 
     /// E2E round 4 (D#393(4)): a name made only of `::` rewrote to the empty
