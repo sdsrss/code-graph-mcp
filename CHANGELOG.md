@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.171.3` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.171.3
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### A defined name is answered, not a near one
+
+The fuzzy step is for a name nothing is called. 0.171.3 listed under Not
+covered two kinds of defined name it also ran on; both now get an answer for
+the name asked:
+
+- A name only test files define. When it had no edge in the asked direction,
+  MCP `get_call_graph` and CLI `callgraph` answered for a near name (flask
+  `after` for `after_request`, with the note), or `get_call_graph` listed
+  near names under "No exact match" where `callgraph` exited 1 calling the
+  name ambiguous over them; MCP `find_references` answered for a near name,
+  or called the name ambiguous over a list of other names. `get_call_graph`
+  and `callgraph` now answer the name's own call graph, and
+  `find_references` refuses it as it refuses any name only test files
+  define: `Symbol 'after' exists but all 1 match(es) are in test/bench paths
+  (tests/test_async.py). Pass node_id … or file_path …`.
+- An exact qualified name with no edge in the asked direction, in MCP
+  `get_call_graph`: leveldb `Block.size` with `direction: callees` answered
+  for the `doc/index.md` heading `Block size`. It now answers `Block.size`
+  with no callees; CLI `callgraph` already skipped the fuzzy step for an
+  exact qualified name.
+
+Measured on flask and leveldb over every indexed name (1,087 and 1,327) and
+every dotted qualified name (386 and 1,167), each also with the file that
+defines it, plus 200 typos and 200 prefixes per project, through MCP
+`get_call_graph` (three directions) and `find_references` and CLI `callgraph`
+(three directions) and `refs`, and the names with whitespace around them
+through the two MCP tools: 101,608 runs. 660 answers changed, for flask's 40
+names and 2 qualified names and leveldb's 18 and 14; 0.171.3 had answered each
+of them for another name, with a list of other names, or with "Ambiguous
+symbol" over other names, and each now names the symbol asked for. The other 100,948 runs are byte for byte 0.171.3's, typos and prefixes
+included. With whitespace around them, these names get exactly the answers
+they get without it (31,736 runs).
+
+### Not covered
+
+- A dotted name no definition has still goes through the fuzzy step in MCP
+  over the whole string: flask `Flask.route` (defined as `Scaffold.route`)
+  answers for `FlaskGroup`, with the note, with or without whitespace around
+  it. The CLI drops the qualifier instead (`No definition is named
+  'Flask.route'; answering for 'route'`).
+- MCP `find_references` refuses a name only test files define and asks for
+  its `node_id` or `file_path`, where CLI `refs` answers it: 749 names in
+  flask, 33 in leveldb. The refusal can list one file twice (leveldb
+  `AddBoundaryInputsTest`: `db/version_set_test.cc, db/version_set_test.cc`).
+- The other items under 0.171.3's Not covered are unchanged.
+
 ## 0.171.3
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary

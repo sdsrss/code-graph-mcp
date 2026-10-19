@@ -1,6 +1,6 @@
 # D#440：有精确定义的名字不换成近似名
 
-状态：进行中（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
+状态：已实现，待发版前评审（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
 
 ## 问题
 
@@ -81,15 +81,19 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
   - HEAD 上，有精确定义的输入"换了"或"近似名列表"：0（BASE 见上表）。
   - HEAD 上填充写法与不填充的回答逐字节相同：flask 11,784/11,784，leveldb 19,952/19,952。
   - flask `Flask.route`（没有定义叫这个名字，D#435 的范围）：BASE 和 HEAD 都答 `FlaskGroup`，带 `note`，加空白也一样。
+- 已提交树复跑：`git archive 6efd11be` 构建（默认特性，md5 `ce672edd…`），同一批 101,608 次运行，与上面工作树构建的 HEAD 逐字节相同 101,608/101,608，所以上表数字也是 `6efd11be` 的。截断判断在这两个语料上不触发。
+- 全量：`b2706adc` 的 pre-commit 31 个套件 2,290 通过、0 失败、7 忽略，fmt、clippy 两条腿通过；`6efd11be` 的 pre-commit 2,291 通过、0 失败、7 忽略，fmt、clippy 通过，embed-model 的 clippy 腿手动跑过，通过。
 
 ## 决定
 
 - `resolve_fuzzy` 对测试专属的精确名返回 `Unique(输入本身)`，同名的测试定义有几个都一样。`get_call_graph`/`callgraph` 的种子查询本来就合并同名的全部定义；`find_references` 在 `Unique` 分支里把它们全部判为测试路径，给出已有的提示。
 - MCP `get_call_graph` 用 CLI 同一个判断 `selectable_qualified_definitions(...)` 非空来认"精确限定名"，所以两边对同一输入做同一个决定。
 - `file_path` 分支不会出现"把 X 解析成 X"的说明：`file_selector_miss` 不过滤测试文件，测试专属名字在别的文件里有定义时，模糊步骤之前就已拒绝。
+- "只在测试代码里定义"用 `preferred_definitions`（`detect_ambiguity` 数的那份全量列表）为空来判断，不看模糊查询的行：那个查询 `LIMIT 10`，同名定义超过 10 个时，返回的 10 行可能全是测试代码，而生产代码里还有两个定义。第一版（`b2706adc`）只看那 10 行，这时会返回 `Unique`，`find_references` 就把两个生产定义的引用合并回答，而不是报歧义。自查发现，`a_name_production_defines_beyond_the_fuzzy_rows_is_not_test_only`（11 个测试文件里的 `run`、2 个生产的 `run`，前置断言 10 行全是测试代码）在 `b2706adc` 上失败（得到 `Unique("run")`），加上这个判断后通过。这种情况下的回答与 0.171.3 相同。
 
 ## 遗留
 
 - MCP `find_references` 拒绝只在测试文件里定义的名字（让调用方传 `node_id` 或 `file_path`），CLI `refs` 直接回答：flask 749 个名字、leveldb 33 个，CLI `refs` 全部回答。0.171.3 就是这样（flask 709 个），本次把有近似名的那 40 + 18 个也归到这一类。`include_tests` 默认 true 时这种拒绝是否合理，需要单独决定。
 - 这句提示里的路径没有去重：leveldb `AddBoundaryInputsTest` 列出 `db/version_set_test.cc, db/version_set_test.cc`。0.171.3 对没有近似名的测试专属名字就这样。
 - 带点名字没有任何定义时 MCP 不退回裸名：D#435。
+- 0.171.3 就有：`resolve_fuzzy` 的精确名判断建立在 `LIMIT 10` 的模糊查询上。`find_references` 对一个有歧义的名字最多报 10 个（leveldb `Append`：`find_references` 说 10 个，`get_call_graph` 说 12 个；leveldb 有 18 个名字正好报 10 个）。同名定义超过 10 个、而前 10 行全是测试代码时，`find_references` 会说"全部在测试路径"，但其实有生产定义。改法是让精确名判断用全量列表，会改变这些名字的歧义回答，单独做。
