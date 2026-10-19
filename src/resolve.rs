@@ -547,27 +547,52 @@ pub fn trim_symbol_arg(symbol: &str) -> &str {
 /// name every lookup matches (`Ambiguous symbol ''`; E2E round 4, the 0.171.0
 /// review). A segment may hold spaces beside other characters, as a
 /// template's does (`SkipList<Key, Comparator>::Insert`).
+///
+/// The other way round, C++ stores a nested type and its members with `::`
+/// (leveldb `class Block::Iter`, `Block::Iter.Seek`). Typed with dots,
+/// `Block.Iter` named no definition and answered for its last part: the type's
+/// constructor, or another class's (`Table.Rep` for `TableBuilder::Rep.Rep`),
+/// where 0.171.4's MCP tools reached the type through the fuzzy step (D#435).
+/// So a dotted name nothing is called becomes the `::` spelling that an exact
+/// qualified name has: the member's (every dot but the last), else the
+/// type's (every dot). `Block::Iter::Seek` gets there through `Block.Iter.Seek`.
 pub fn canonical_symbol_spelling(conn: &Connection, symbol: &str) -> String {
-    let path = symbol.strip_prefix("::").unwrap_or(symbol);
-    let plain_segments = path
-        .split("::")
-        .all(|seg| !seg.trim().is_empty() && !seg.contains(['.', ':']));
-    if !symbol.contains("::") || !plain_segments {
-        return symbol.to_string();
-    }
-    let stored: bool = conn
-        .query_row(
+    let stored = |spelling: &str| -> bool {
+        conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM nodes n JOIN files f ON f.id = n.file_id \
              WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> ?2)",
-            rusqlite::params![symbol, crate::domain::EXTERNAL_FILE_PATH],
+            rusqlite::params![spelling, crate::domain::EXTERNAL_FILE_PATH],
             |row| row.get(0),
         )
-        .unwrap_or(false);
-    if stored {
-        symbol.to_string()
-    } else {
+        .unwrap_or(false)
+    };
+    let dotted = if symbol.contains("::") {
+        let path = symbol.strip_prefix("::").unwrap_or(symbol);
+        let plain_segments = path
+            .split("::")
+            .all(|seg| !seg.trim().is_empty() && !seg.contains(['.', ':']));
+        if !plain_segments || stored(symbol) {
+            return symbol.to_string();
+        }
         path.replace("::", ".")
+    } else {
+        symbol.to_string()
+    };
+    let segments: Vec<&str> = dotted.split('.').collect();
+    let Some((member, path)) = segments.split_last() else {
+        return dotted;
+    };
+    if path.is_empty() || stored(&dotted) {
+        return dotted;
     }
+    [format!("{}.{member}", path.join("::")), segments.join("::")]
+        .into_iter()
+        .filter(|nested| *nested != dotted)
+        .find(|nested| {
+            queries::get_nodes_with_files_by_qualified_name(conn, nested)
+                .is_ok_and(|defs| !defs.is_empty())
+        })
+        .unwrap_or(dotted)
 }
 
 /// True when the candidates span ≥2 distinct files (cross-file collision, which
@@ -1133,6 +1158,43 @@ mod fuzzy_tests {
                 typed,
                 "{typed}"
             );
+        }
+    }
+
+    /// D#435: C++ stores a nested type and its members with `::`. Typed with
+    /// dots they are that spelling, not their last part (`Table.Rep` answered
+    /// for `TableBuilder::Rep.Rep`, the only `Rep` the ambiguity check counts).
+    #[test]
+    fn a_nested_type_typed_with_dots_takes_its_stored_spelling() {
+        let (_p, _d, db) = indexed(&[
+            ("block.h", "class Block {\n public:\n  class Iter;\n};\n"),
+            (
+                "block.cc",
+                "class Block::Iter {\n public:\n  void Seek() {}\n};\n",
+            ),
+            ("table.cc", "struct Table::Rep {\n  ~Rep() {}\n};\n"),
+            (
+                "table_builder.cc",
+                "struct TableBuilder::Rep {\n  Rep() {}\n};\n",
+            ),
+        ]);
+        for (typed, want) in [
+            ("Block.Iter", "Block::Iter"),
+            ("Block.Iter.Seek", "Block::Iter.Seek"),
+            ("Block::Iter::Seek", "Block::Iter.Seek"),
+            ("Table.Rep", "Table::Rep"),
+            ("Block::Iter", "Block::Iter"),
+            ("Block::Iter.Seek", "Block::Iter.Seek"),
+            // Nothing is stored under a `::` spelling of these.
+            ("Block.Nope", "Block.Nope"),
+            ("Block.Iter.Nope", "Block.Iter.Nope"),
+            ("Iter", "Iter"),
+            ("Block.", "Block."),
+            (".Iter", ".Iter"),
+            ("Block..Iter", "Block..Iter"),
+            ("table/block.cc", "table/block.cc"),
+        ] {
+            assert_eq!(canonical_symbol_spelling(db.conn(), typed), want, "{typed}");
         }
     }
 

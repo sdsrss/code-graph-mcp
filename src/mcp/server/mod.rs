@@ -2642,17 +2642,19 @@ impl McpServer {
 
     fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         // `Type::method` → the index's `Type.method`, once, for every tool that
-        // takes a symbol, unless the index stores the `::` spelling (see
-        // `resolve::canonical_symbol_spelling`). A spelling not stored yet may be
-        // in a file the tool's own `ensure_indexed` is about to index, so that
-        // runs first, as the CLI indexes new files before it maps (E2E round 4).
+        // takes a symbol, unless the index stores the `::` spelling; and a
+        // dotted name nothing is called → the `::` spelling a C++ nested type
+        // is stored under (see `resolve::canonical_symbol_spelling`). A
+        // spelling not stored yet may be in a file the tool's own
+        // `ensure_indexed` is about to index, so that runs first, as the CLI
+        // indexes new files before it maps (E2E round 4).
         // The whitespace around a name goes before that (`resolve::trim_symbol_arg`).
         let mut canonical: Option<serde_json::Value> = None;
         for key in ["symbol_name", "function_name"] {
             if let Some(typed) = args.get(key).and_then(|v| v.as_str()) {
                 let s = crate::resolve::trim_symbol_arg(typed);
                 let mut spelled = s.to_string();
-                if s.contains("::") {
+                if s.contains("::") || s.contains('.') {
                     spelled = crate::resolve::canonical_symbol_spelling(self.db.conn(), s);
                     if spelled != s && !should_skip_indexing(args)? {
                         self.ensure_indexed()?;
@@ -8150,6 +8152,71 @@ end
         assert_eq!(out["symbol"], "json", "{out}");
         assert_eq!(out["by_relation"], json!({"imports": 1}), "{out}");
         assert!(out.get("note").is_none(), "{out}");
+        // Reached as a dotted name's last part, it says so.
+        let out = answer("find_references", json!({"symbol_name": "codec.json"}));
+        assert_eq!(out["symbol"], "json", "{out}");
+        assert_eq!(out["note"], "Resolved 'codec.json' → 'json'.", "{out}");
+    }
+
+    /// D#435: a C++ nested type typed with dots is that type. Its stored
+    /// spelling is `Table::Rep`, so `Table.Rep` named no definition, and the
+    /// dotted fallback answered for its last part: the one `Rep` the ambiguity
+    /// check counts, `TableBuilder::Rep`'s constructor. 0.171.4 reached the
+    /// type through the fuzzy step's edit distance.
+    #[test]
+    fn test_a_nested_type_typed_with_dots_is_that_type() {
+        let project = TempDir::new().unwrap();
+        for (path, src) in [
+            (
+                "table/block.h",
+                "class Block {\n public:\n  class Iter;\n};\n",
+            ),
+            (
+                "table/block.cc",
+                "class Block::Iter {\n public:\n  void Seek() {}\n};\n",
+            ),
+            ("table/table.cc", "struct Table::Rep {\n  ~Rep() {}\n};\n"),
+            (
+                "table/table_builder.cc",
+                "struct TableBuilder::Rep {\n  Rep() {}\n};\n",
+            ),
+        ] {
+            let full = project.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, src).unwrap();
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let answer = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args.clone()))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            assert!(
+                !result["isError"].as_bool().unwrap_or(false),
+                "{tool} {args}: {text}"
+            );
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        for typed in ["Table.Rep", "Table::Rep"] {
+            let out = answer("get_ast_node", json!({"symbol_name": typed}));
+            assert_eq!(out["qualified_name"], "Table::Rep", "{typed}: {out}");
+            assert_eq!(out["file_path"], "table/table.cc", "{typed}: {out}");
+            assert!(out.get("note").is_none(), "{typed}: {out}");
+        }
+        let out = answer(
+            "get_call_graph",
+            json!({"symbol_name": "Block.Iter", "direction": "callees"}),
+        );
+        assert_eq!(out["function"], "Block::Iter", "{out}");
+        assert!(out.get("note").is_none(), "{out}");
+        for typed in ["Block.Iter.Seek", "Block::Iter::Seek"] {
+            let out = answer("get_ast_node", json!({"symbol_name": typed}));
+            assert_eq!(out["qualified_name"], "Block::Iter.Seek", "{typed}: {out}");
+        }
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name

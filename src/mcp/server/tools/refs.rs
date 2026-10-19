@@ -80,8 +80,6 @@ impl McpServer {
             _ => None,
         };
 
-        // Set where the fuzzy step answers for another name (D#431).
-        let mut fuzzy_note: Option<String> = None;
         // Resolve symbol to node_id(s)
         let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
             // SURF-16 (audit 2026-09-07) is NOT fixed here, deliberately.
@@ -225,7 +223,6 @@ impl McpServer {
                         }
                         return Err(anyhow!("Symbol '{}' not found in index.", symbol_name));
                     }
-                    fuzzy_note = super::super::fuzzy_switch_note(typed, &resolved_name);
                     (ids, resolved_name)
                 }
                 FuzzyResolution::Ambiguous(cands) => {
@@ -274,6 +271,13 @@ impl McpServer {
                     }
                 }
             }
+        };
+        // Said whenever the answer is for another name than the one asked:
+        // the fuzzy step's (D#431), or the last part of a dotted name, which
+        // an import alone can bind (leveldb `a.b.c` answered `c`, D#435).
+        let fuzzy_note = match (node_id, symbol_name_arg) {
+            (None, Some(typed)) => super::super::fuzzy_switch_note(typed, &symbol_name),
+            _ => None,
         };
 
         // Schema enum is ["calls", "imports", "inherits", "implements", "references", "all"].
