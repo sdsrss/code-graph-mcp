@@ -1,5 +1,120 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). The MCP tools now
+answer some names they refused, and refuse some they answered merged (below).
+To keep 0.171.4's answers: `npm i -g @sdsrs/code-graph@0.171.4` (or, from
+source, `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
+--tag v0.171.4 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0.
+
+### The MCP tools pick the symbol the CLI picks
+
+MCP `get_call_graph`, `find_references` and `get_ast_node` each picked a symbol
+their own way; CLI `callgraph`, `refs` and `impact` share one selection. The
+three tools now use it:
+
+- A dotted name that no definition is qualified-named answers for its last
+  part, with `"note": "Resolved 'Flask.route' → 'route'."`. The 0.152.0 notes
+  said the MCP tools did this, as the CLI does; they did not.
+  `get_call_graph` and `find_references` ran the fuzzy step over the whole
+  string (flask `Flask.route` answered for `FlaskGroup`, `App.route` for
+  `AppGroup`; leveldb `.Write` for `DBTest.WriteSyncError`), and
+  `get_ast_node` said not found. Of 400 generated `Class.member` names no
+  definition has (flask; leveldb in brackets), 0.171.4's `get_call_graph`
+  answered 6 (3) and refused the rest; it now answers 325 (319) for the
+  member and calls 75 (81) ambiguous, as the member's own name is.
+  `find_references` and `get_ast_node` answer 236 (290); the other 89 (29)
+  members only test code defines, which `find_references` refuses and
+  `get_ast_node` calls not found, as for the bare name (Not covered).
+- A member typo goes through the fuzzy step on its last part, as on the CLI:
+  of 200 (`Flask.rotue`), `get_call_graph` and `find_references` answer 72
+  (46) for a near name, with the note, list near names for 99 (148) and say
+  not found for 29 (6). 0.171.4 answered 3 (2).
+- Two definitions of one qualified name are ambiguous on `get_call_graph`, as
+  on the CLI and `find_references`. It merged them: 9 flask names that two
+  test files define (`Index.dispatch_request`; `get_ast_node` said not found
+  for them, and now lists them too), and, with a `file_path`, two in that
+  one file (flask 20 names such as `App.debug`, leveldb 32 such as
+  `Slice.Slice`).
+- A dotted name with a `file_path` that holds no definition of it:
+  `get_call_graph` says `Symbol 'X' not found in file 'F'.`, as
+  `find_references` and the CLI say, where it said the symbol was not in the
+  index or listed near names (100 of 100 per project).
+- `find_references` decides on every definition of a name, as CLI `refs`
+  does, not on the first ten rows of the fuzzy query. Names with more than
+  ten definitions (leveldb 13, flask 2) report all of them (`operator=` 43,
+  `Append` 12, where it said 10), and 27 leveldb names no longer count a
+  constructor or heading beside a class (`VersionSet`: 2, where it said 3),
+  as `get_call_graph` counts. A name only an import binds answers with that
+  import's references (flask `json`), where it listed near names. Answering
+  for another name than the one asked, `find_references` says so in `note`
+  also when an import alone binds a dotted name's last part.
+- An exact qualified name is not checked again as a bare name: leveldb
+  `CacheTest.Erase`, a gtest `TEST` and a method in one file, answers the
+  method without a `file_path` and is ambiguous with one, as on the CLI; it
+  was the other way round.
+
+### A C++ nested type written with dots is that type (CLI and MCP)
+
+C++ stores a nested type and its members with `::`: leveldb's `class
+Block::Iter`, `Block::Iter.Seek`. Written `Block.Iter`, the name matched no
+definition, and the CLI answered for its last part: the type's constructor,
+another class's (`Table.Rep` for `TableBuilder::Rep.Rep`), or "Ambiguous
+symbol 'Seek'" for `Block.Iter.Seek` and `Block::Iter::Seek`. A dotted name
+nothing is called now takes the `::` spelling that a qualified name has, and
+answers without a note. leveldb's 49 such nodes, each written with dots, with
+`::` throughout and as stored (139 inputs): CLI `callgraph` answered 89 for
+the node (40 of them with "No definition is named …"), 7 for a constructor
+and called 43 ambiguous; MCP `get_call_graph` and `find_references` answered
+57 and said not found for 82 (`get_ast_node`: 49 and 90). All 139
+now answer for the node on CLI `callgraph`, `refs` and `show` and on the
+three MCP tools (`impact` checked on four of them).
+
+### Measured
+
+On flask and leveldb (as for 0.171.4) against 0.171.4's source: every
+indexed name and dotted qualified name, each also with one file that
+defines it, 400 `Class.member` names no definition has, 200 member typos,
+100 of those names with their class's file, hand-picked shapes (file paths,
+leading, trailing and double dots, `a.b.c`, `::`, gtest names, whitespace),
+the 139 nested names, and 200 typos and 200 prefixes of bare names: 10,521
+inputs through the three MCP tools and CLI `callgraph` and `refs`, 100,382
+runs. 8,811 changed; 91,571 are byte for byte 0.171.4's. CLI answers changed
+only for the nested names and leveldb `DBImpl.Writer` (now the struct
+`DBImpl::Writer`). No answer that named the symbol asked for names another
+one now. The answers that became refusals are the merged ones above (flask
+29, leveldb 33) and 9 that 0.171.4's fuzzy step gave over the whole string,
+8 of them for another symbol than the one the input was made from
+(`Flask.rnu` for `FlaskGroup`, `.Write` for `DBTest.WriteSyncError`); the
+ninth, `EnvTest.Start` for `EnvTest.StartThread`, was a generated name with
+no intended symbol. The 20 of the 400 names tried with whitespace around
+them get exactly the answers they get without it.
+
+### Not covered
+
+- Names only test code defines (D#446): `find_references` still refuses them
+  and asks for a `node_id` or `file_path`, and `get_ast_node` still says such
+  a name is not in the index, which is false (flask 749 names, leveldb 37);
+  `get_call_graph` and CLI `refs` answer them. Dotted names now reach that
+  refusal through their last part (flask 89 of the 400 above, leveldb 29).
+- A file path passed as a symbol name now falls back to its extension, as on
+  CLI `refs` and `callgraph`: `find_references app.py` says `Ambiguous symbol
+  'py': 8 matches`, `get_call_graph` lists near names of `py`; 0.171.4 said
+  not found. `get_ast_node` still says not found.
+- CLI `refs` answers a name with one production definition for every
+  definition of the name, test code's included, where `find_references`
+  takes the production one (flask: 12 names, `invoke` 22 references against
+  2).
+- CLI `refs` says nothing when an import alone binds a dotted name's last
+  part (leveldb `a.b.c` answers the imports of `c`).
+- `get_ast_node` has no fuzzy step: typos and member typos stay not found.
+- Were there both a member `A::B.C` and a nested type `A::B::C`, `A.B.C`
+  would take the member; neither project has such a pair.
+- The other items under 0.171.4's Not covered are unchanged.
+
 ## 0.171.4
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
