@@ -130,3 +130,23 @@ BASE 上 MCP 与 CLI 不一致（`diff.py oracle base`，每格是不一致的�
 - 打分（按输入所指的节点，参照 `find_references(node_id)` / `callgraph --node-id`）：flask 带点导入 `find_references` 26/26（BASE 25）；md 带点标题三个工具 96/96、带文件 97/97（与 BASE 相同）；DC 139/139。
 - 仍比 BASE 差的（都写进 Not covered）：md 带点标题的拼错和前缀 38 个（BASE 靠整串模糊纠正到标题，现在 20 个 not found、18 个近似名列表，其中 14 个列表里有那个标题）；DCW 里 4 个 `Node`（模板空格与源码不同，BASE 靠模糊答对结构体，现在答构造函数，带说明）。不修的理由：这两类都是拼写的开放域（标题文本、模板空格），补规则要再开一轮评审；前者是拼错的标题，后者带着换了符号的说明。
 - CLI `refs` 对 flask 26 个带点导入：BASE 6 个答成别的名字、20 个拒绝 → 26 个都按导入回答（我直接跑的）。
+
+### 第 2 轮（差量，新开子代理，`f3674e7e..8aa9f813`）
+
+0 个 HIGH，4 个 MEDIUM，其中 3 个在第 1 轮的修复里：
+
+- F1（已复现）："有节点就叫这个名字"不看文件：带 `file_path` 的带点导入（`callgraph click.core --file src/flask/cli.py`）由"该文件里没有"变成"可能过期"的假提示，个别走回整串模糊（`jinja2.loaders` → `jinja_loader`）；flask 52 个输入，CLI `callgraph`/`impact` 和 MCP `get_call_graph`。
+- F2（夹具复现）：README 里 `## Widget.launch` 这样的标题把方法 `launch` 遮住：CLI `refs`/`callgraph`/`impact` 比 0.171.4 和 `f3674e7e` 都差。
+- F3（已复现）：分派处先索引改变了错误的先后（参数错误被"Indexing in progress"或 `skip_indexing` 类型错误盖住），还让 `get_index_status` 等从不索引的工具在带点参数时去索引。
+- F4（注入并发 spawn 复现）：另有 4 个锁测试先 drop 再断言，2 个用生产的 `IndexLockGuard`（没有解锁的 `Drop`）。
+- LOW：F5 `impact "1. Scan"` 的标签是 ` Scan`；F6 CHANGELOG 漏了 CLI `callgraph` 上 4 个带点导入（原来答别的名字，现在"No call graph results"）；F7 `CacheTest.Erase` 在 `get_call_graph` 上其实是把方法和 gtest 合并了，不是"答方法"；F8 两处措辞。
+
+处理（`33817fa0`，评审轮数到上限，按停止规则只收窄或撤回，不再开第 3 轮）：
+
+- F1：带文件时只算该文件里的节点。F2：不带文件时，叫这个名字的全是标题、而最后一段是代码（非标题、非 `<external>`）的名字时，标题让位，退回裸名（与 `preferred_definitions` 里标题让位给定义一致）。F5：这个分支的标签用整个名字。
+- F3：撤回分派处的改动，回到 `f3674e7e`；第 1 轮 MEDIUM-2（新文件里的嵌套类型首次调用答错）写进 Not covered。
+- F7：撤回 `get_call_graph` 对精确限定名跳过歧义检查，回到 0.171.4（拒绝）。
+- F4：延期 D#459（要改生产的锁守卫）。F6、F8：改 CHANGELOG。
+- 变异：F1、F2、F5、F7 各自被测试抓到；"标题也让位给 `<external>`"的变异存活（未钉住的选择）。
+- 收窄的验证（`decline.py`）：新增 EF（26 个带点导入 × 导入它的文件 / 不导入的文件）、第四个语料 fx2（评审的夹具）、CLI `impact` 面。`33817fa0` 的 114,475 次运行里 113,891 次等于 `baafe5ee`、385 次只等于 `355892f3`；其余 199 次：6 次 `CacheTest.Erase` 逐字节等于 0.171.4（`355892f3` 回答它，我原先以为它也拒绝，前提错了），193 次 CLI `impact` 只差 `symbol` 标签（F5，0.171.4 和 `355892f3` 拒绝这些输入）。
+- BASE → `33817fa0`：输入 11,926 个、运行 114,475 次，改变 10,969 次、相同 103,506 次；回答变拒绝和换了符号的输入都在 CHANGELOG 里列明。

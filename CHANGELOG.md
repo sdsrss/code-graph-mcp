@@ -16,13 +16,13 @@ MCP `get_call_graph`, `find_references` and `get_ast_node` each picked a symbol
 their own way; CLI `callgraph`, `refs` and `impact` share one selection. The
 three tools now use it:
 
-- A dotted name that no definition is qualified-named answers for its last
-  part, with `"note": "Resolved 'Flask.route' → 'route'."`. The 0.152.0 notes
-  said the MCP tools did this, as the CLI does; they did not.
-  `get_call_graph` and `find_references` ran the fuzzy step over the whole
-  string (flask `Flask.route` answered for `FlaskGroup`, `App.route` for
-  `AppGroup`; leveldb `.Write` for `DBTest.WriteSyncError`), and
-  `get_ast_node` said not found. Of 400 generated `Class.member` names no
+- A dotted name that no definition is qualified-named, and no node is named,
+  answers for its last part, with `"note": "Resolved 'Flask.route' →
+  'route'."`. The 0.152.0 notes said the MCP tools did this, as the CLI does;
+  they did not. `get_call_graph` and `find_references` ran the fuzzy step
+  over the whole string (flask `Flask.route` answered for `FlaskGroup`,
+  `App.route` for `AppGroup`; leveldb `.Write` for `DBTest.WriteSyncError`),
+  and `get_ast_node` said not found. Of 400 generated `Class.member` names no
   definition has (flask; leveldb in brackets), 0.171.4's `get_call_graph`
   answered 6 (3) and refused the rest; it now answers 325 (319) for the
   member and calls 75 (81) ambiguous, as the member's own name is.
@@ -42,7 +42,8 @@ three tools now use it:
 - A dotted name with a `file_path` that holds no definition of it:
   `get_call_graph` says `Symbol 'X' not found in file 'F'.`, as
   `find_references` and the CLI say, where it said the symbol was not in the
-  index or listed near names (flask 99 of 100, leveldb 100).
+  index or listed near names (flask 99 of 100 generated names and 52 of 52
+  dotted imports given a file, leveldb 100 of 100).
 - `find_references` decides on every definition of a name, as CLI `refs`
   does, not on the first ten rows of the fuzzy query. Names with more than
   ten definitions (leveldb 13, flask 2) report all of them (`operator=` 43,
@@ -52,23 +53,24 @@ three tools now use it:
   import's references (flask `json`), where it listed near names. Answering
   for another name than the one asked, `find_references` says so in `note`
   also when an import alone binds a dotted name's last part.
-- `get_call_graph` does not check an exact qualified name again as a bare
-  name: leveldb `CacheTest.Erase`, a gtest `TEST` and a method in one file,
-  answers the method without a `file_path` and is ambiguous with one, as
-  `find_references` and the CLI answer; it was the other way round.
 
 ### Dotted names the index stores (CLI and MCP)
 
-A dotted name some node is named is that node, not its last part: a dotted
-Python import (`<external>` `click.core`) or a Markdown heading (`1. Scan`).
-The CLI's fallback took the last part: of flask's 26 dotted imports, CLI
-`refs` answered 6 for another name (`click.core` for `copy`) and refused the
-other 20; it now answers all 26 with the import's references, as MCP
-`find_references` does (0.171.4: 25). Of this
-repository's 96 dotted headings, the CLI reached 80 only through the fuzzy
-step and listed near names for 15; it now answers 95 directly, and with the
-heading's file (97 pairs), where it said the file had no such symbol. The
-MCP tools answer them as 0.171.4 did.
+A dotted name a node is named is that node, not its last part: a dotted
+Python import (`<external>` `click.core`) or a Markdown heading (`1. Scan`);
+with a `file_path`, a node in that file. The CLI took the last part. Of
+flask's 26 dotted imports, CLI `refs` answered 6 for another name
+(`click.core` for `copy`) and refused the other 20; it now answers all 26
+with the import's references, as MCP `find_references` does (0.171.4: 25).
+Of this repository's 96 dotted headings, CLI `refs` and `callgraph` reached
+80 only through the fuzzy step and listed near names for 15, and `impact`
+listed near names for all 96; they now answer 95 directly (one is
+ambiguous), and with the heading's file (97 pairs), where they said the file
+had no such symbol. The MCP tools answer them as 0.171.4 did. A heading
+still yields to code its last part names: a README's `## Widget.launch`
+beside a method `launch` answers the method, with the note, on the CLI as
+before and now on MCP, where 0.171.4 answered the heading; with the README
+as `file_path` it answers the heading.
 
 C++ stores a nested type and its members with `::`: leveldb's `class
 Block::Iter`, `Block::Iter.Seek`. Written `Block.Iter`, the name matched no
@@ -80,32 +82,36 @@ answers without a note. leveldb's 49 such nodes, each written with dots, with
 `::` throughout and as stored (139 inputs): CLI `callgraph` answered 89 for
 the node (40 of them with "No definition is named …"), 7 for a constructor
 and called 43 ambiguous; MCP `get_call_graph` and `find_references` answered
-57 and said not found for 82 (`get_ast_node`: 49 and 90). All 139
-now answer for the node on CLI `callgraph`, `refs` and `show` and on the
-three MCP tools (`impact` checked on four of them).
+57 and said not found for 82 (`get_ast_node`: 49 and 90). All 139 now answer
+for the node on CLI `callgraph`, `refs` and `show` and on the three MCP
+tools (`impact` checked on four of them).
 
 ### Measured
 
 Against 0.171.4's source, on flask and leveldb (as for 0.171.4): every name
 the index defines and every dotted qualified name, each also with one file
-that defines it, every `<external>` name, 400 `Class.member` names no
+that defines it, every `<external>` name (flask's dotted ones also with a
+file that imports them and one that does not), 400 `Class.member` names no
 definition has, 200 member typos, 100 of those names with their class's
 file, hand-picked shapes (file paths, leading, trailing and double dots,
 `a.b.c`, `::`, gtest names, whitespace), the 139 nested names and 34 of them
 with other template spacing; on this repository's 201 Markdown files: every
-name, the dotted headings with and without their file; and 200 typos and 200
-prefixes of names in each of the three. 11,771 inputs through the three MCP
-tools and CLI `callgraph` and `refs`, 112,422 runs. 10,508 changed; 101,914 are
-byte for byte 0.171.4's. CLI answers changed only for the nested names,
-leveldb `DBImpl.Writer` (now the struct `DBImpl::Writer`), the dotted
-imports and the dotted headings. Four answers that named the symbol asked
-for name another one now (template spacing, Not covered). The answers that
-became refusals are the merged ones above (flask 29, leveldb 33), 9 that
-0.171.4's fuzzy step gave over the whole string, 8 of them for another
-symbol than the one the input was made from (`Flask.rnu` for `FlaskGroup`,
-`.Write` for `DBTest.WriteSyncError`; the ninth, `EnvTest.Start` for
-`EnvTest.StartThread`, was a generated name with no intended symbol), and
-38 typos and prefixes of dotted headings (Not covered). The 20 of the 400
+name, the dotted headings with and without their file; on a 10-node fixture
+with a README heading spelled like a method: every name and the heading
+with and without each file; and typos and prefixes of names in each. 11,926
+inputs through the three MCP tools and CLI `callgraph` and `refs` (and CLI
+`impact` for the imports, headings and fixture), 114,475 runs. 10,969
+changed; 103,506 are byte for byte 0.171.4's. CLI answers changed only for
+the nested names, leveldb `DBImpl.Writer` (now the struct `DBImpl::Writer`),
+the dotted imports and the dotted headings. Four answers that named the
+symbol asked for name another one now (template spacing, Not covered). The
+answers that became refusals are the merged ones above (flask 29, leveldb
+33); 9 that 0.171.4's fuzzy step gave over the whole string, 8 of them for
+another symbol than the one the input was made from (`Flask.rnu` for
+`FlaskGroup`, `.Write` for `DBTest.WriteSyncError`; the ninth,
+`EnvTest.Start` for `EnvTest.StartThread`, was a generated name with no
+intended symbol); 44 typos and prefixes of dotted headings (Not covered);
+and 4 dotted imports on CLI `callgraph` (Not covered). The 20 of the 400
 names tried with whitespace around them get exactly the answers they get
 without it.
 
@@ -118,21 +124,30 @@ without it.
   CLI `refs` answer them. Dotted names now reach that refusal through their
   last part (flask 89 of the 400 above, leveldb 29).
 - A typo or prefix of a heading with a dot in it goes to the part after its
-  last dot: of 400 typos and prefixes of this repository's headings, 38 that
-  0.171.4's fuzzy step corrected to the heading now get "not found" (20) or a
-  near-name list (18, 14 of them listing the heading).
+  last dot: 38 of 400 typos and prefixes of this repository's names that
+  0.171.4's fuzzy step corrected to the heading now get "not found" (20) or
+  a near-name list (18, 14 of them listing the heading), and so do 6 prefixes
+  of the fixture's `Widget.launch` (lists).
 - A nested C++ type written with other template spacing than the source's
   (`SkipList<Key,Comparator>.Node` for `SkipList<Key, Comparator>::Node`)
-  answers the constructor `Node`, with the note; 0.171.4 reached the struct
-  through the fuzzy step. Of 34 such inputs, these are 4; on
-  `find_references` and `get_call_graph` 24 more go from not found to the
-  node and 6 to an ambiguity.
-- `get_ast_node` still checks an exact qualified name again as a bare name:
-  leveldb `CacheTest.Erase` is ambiguous there, as in 0.171.4, where
-  `get_call_graph`, `find_references` and the CLI answer the method.
-- `get_call_graph` on an import-only name still runs the fuzzy step (flask
-  19 such names answer another symbol or list near names, leveldb 34), as in
-  0.171.4; `find_references` answers the import.
+  answers the constructor `Node`, with the note, where 0.171.4's
+  `find_references` and `get_call_graph` reached the struct through the
+  fuzzy step (its `get_ast_node` said not found). Of 34 such inputs, these
+  are 4; on those two tools 24 more go from not found to the node and 6 to
+  an ambiguity.
+- A nested type in a file added since the last index, written with dots,
+  answers for its last part on MCP's first call after the file appears and
+  for the type from the next one; the CLI indexes new files first.
+- `get_call_graph` and `get_ast_node` refuse leveldb `CacheTest.Erase` (a
+  gtest `TEST` and the method it is named after, in one file) as ambiguous,
+  as in 0.171.4; `find_references` and CLI `refs` answer the method, and CLI
+  `callgraph` merges the two.
+- CLI `callgraph` on a dotted import says `No call graph results`, with a
+  stale-index hint that does not apply; for 4 of flask's 26 it answered
+  another name (`click.core` for `copy`). MCP `get_call_graph` on an
+  import-only name still runs the fuzzy step (flask 19 such names answer
+  another symbol or list near names, leveldb 34), as in 0.171.4;
+  `find_references` answers the import.
 - A file path passed as a symbol name now falls back to its extension, as on
   CLI `refs` and `callgraph`: `find_references app.py` says `Ambiguous symbol
   'py': 8 matches`, `get_call_graph` lists near names of `py`; 0.171.4 said
