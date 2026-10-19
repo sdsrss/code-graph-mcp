@@ -923,9 +923,18 @@ fn test_cli_doctor_rejects_an_unknown_flag_instead_of_repairing() {
     // written `<home>/settings.json` and the assertion would still have passed.
     let home = TempDir::new().unwrap();
     let claude_home = home.path().join(".claude");
+    // The temp dir too: `--check-only` reaches find-binary's `npm root -g`, and
+    // npm turns on node's compile cache under os.tmpdir(), which left
+    // `node-compile-cache/` (73 files) in the real /tmp on every run. TMP and
+    // TEMP are what node reads on Windows.
+    let tmp = home.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
     let sandbox_env: Vec<(&str, &str)> = vec![
         ("HOME", home.path().to_str().unwrap()),
         ("CLAUDE_CONFIG_DIR", claude_home.to_str().unwrap()),
+        ("TMPDIR", tmp.to_str().unwrap()),
+        ("TMP", tmp.to_str().unwrap()),
+        ("TEMP", tmp.to_str().unwrap()),
     ];
 
     // `doctor` is JS-dispatched: main.rs spawns claude-plugin/scripts/doctor.js
@@ -14107,7 +14116,13 @@ fn test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer() {
     assert_ne!(code, 0, "{stdout}{stderr}");
     assert!(stderr.contains("still being built"), "{stderr}");
 
-    // Control: the lock let go, the same file is a dead writer's.
+    // Control: the lock let go, the same file is a dead writer's. Unlock
+    // before the close: the flock lives on the open file description, and a
+    // child another test thread is spawning holds a copy of this fd from its
+    // fork to its exec, so `drop` alone left the lock held for a few ms and
+    // this control read "still being built".
+    // SAFETY: `lock` is still open here.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(lock);
     let (stdout, stderr, code) = run_cli(&project, &["callgraph", "validateToken"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
@@ -14288,7 +14303,19 @@ fn test_cli_incremental_index_yields_to_a_server_when_asked() {
     assert!(stdout.contains(r#""mode":"skipped""#), "{stdout}");
     assert!(!index_has_file(&project, "src/during.ts"));
 
-    // Control: nor does the variable alone.
+    // Control: nor does the variable alone. Unlocked before the close, as in
+    // the dead-writer test above: a sibling's fork-to-exec copy of the fd
+    // kept it held, and this run skipped.
+    // SAFETY: `server` is still open here.
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&server),
+                libc::LOCK_UN,
+            )
+        },
+        0
+    );
     drop(server);
     std::fs::write(
         project.path().join("src/later.ts"),

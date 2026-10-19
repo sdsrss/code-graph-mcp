@@ -604,7 +604,14 @@ mod tests {
             "a held flock must be detected"
         );
 
-        drop(holder); // releases the flock
+        // Unlock before the close: the flock lives on the open file
+        // description, and a child another test thread is spawning holds a
+        // copy of this fd from its fork to its exec, so `drop` alone can leave
+        // it held for a few ms (cli_e2e's dead-writer test failed 8 of 60
+        // loaded runs that way).
+        // SAFETY: `holder` is still open here.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(holder);
         assert!(
             !other_process_holds_index_lock(cg),
             "a released lock must read as free"
@@ -823,7 +830,10 @@ mod tests {
 
         // Negative control: with no holder, the same hardlinked lock file reads as
         // free and is acquirable — so the assertions above are about the holder,
-        // not about a probe that refuses everything.
+        // not about a probe that refuses everything. Unlocked before the close,
+        // as above: a sibling's fork-to-exec copy of the fd keeps it held.
+        // SAFETY: `holder` is still open here.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(holder);
         assert!(
             !other_process_holds_index_lock(&cg),
