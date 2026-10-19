@@ -11,6 +11,10 @@ pub(crate) fn strip_qualified_prefix(name: &str) -> &str {
 /// into opposite answers for one input (audit 2026-06-03 #6; the hand-written
 /// CLI copy this replaces was the same defect shape, and had zero tests).
 pub(crate) use crate::resolve::FuzzyResolution as CliFuzzyResolution;
+pub(crate) use crate::resolve::{
+    SymbolLookup as CliSymbolLookup, SymbolSelection as CliSymbolSelection,
+    SymbolSelectionError as CliSymbolSelectionError,
+};
 
 pub(crate) fn resolve_fuzzy_name_cli(
     conn: &rusqlite::Connection,
@@ -325,32 +329,6 @@ impl CliNodeTarget {
     }
 }
 
-/// The lookup chosen for a CLI symbol after qualified-name selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CliSymbolLookup {
-    /// An exact `qualified_name` match. Traversals must retain the qualifier.
-    ExactQualified,
-    /// A bare-name lookup, including the historical dotted-to-bare fallback.
-    Bare,
-}
-
-/// Shared symbol selection consumed by `refs`, `callgraph`, and `impact`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CliSymbolSelection {
-    pub(crate) lookup_name: String,
-    pub(crate) bare_name: String,
-    pub(crate) file_filter: Option<String>,
-    pub(crate) lookup: CliSymbolLookup,
-}
-
-/// A qualified CLI lookup can fail before command-specific querying begins.
-pub(crate) enum CliSymbolSelectionError {
-    /// More than one exact qualified definition survived the optional file filter.
-    Ambiguous(Vec<queries::NameCandidate>),
-    /// `--file` makes a missing qualifier a strict miss.
-    QualifiedNotFound,
-}
-
 /// Say on stderr that a dotted name matched no definition and the answer is
 /// for its bare last component — the documented fallback, which was silent:
 /// `callgraph PetRepository.findById` answered for `OwnerRepository.findById`
@@ -372,60 +350,20 @@ pub(crate) fn note_bare_fallback(
     Ok(())
 }
 
-/// Select a CLI symbol with exact-qualified precedence and compatible fallback.
-///
-/// Exact qualified matches are filtered by `explicit_file`. One match keeps the
-/// qualified spelling for traversal; multiple matches are ambiguous. With no
-/// exact match, dotted input falls back to its final bare component only when
-/// no file filter was supplied. Bare input keeps the normal name lookup.
+/// [`crate::resolve::select_symbol`], saying on stderr when a dotted name
+/// fell back to its last part (see [`note_bare_fallback`]).
 pub(crate) fn select_cli_symbol(
     conn: &rusqlite::Connection,
     raw_symbol: &str,
     explicit_file: Option<&str>,
 ) -> Result<std::result::Result<CliSymbolSelection, CliSymbolSelectionError>> {
-    let bare_name = strip_qualified_prefix(raw_symbol).to_string();
-    if raw_symbol.contains('.') {
-        let matches =
-            crate::resolve::selectable_qualified_definitions(conn, raw_symbol, explicit_file)?;
-        if matches.len() > 1 {
-            let candidates = matches
-                .into_iter()
-                .map(|candidate| queries::NameCandidate {
-                    name: candidate.node.name,
-                    file_path: candidate.file_path,
-                    node_type: candidate.node.node_type,
-                    node_id: candidate.node.id,
-                    start_line: candidate.node.start_line,
-                })
-                .collect();
-            return Ok(Err(CliSymbolSelectionError::Ambiguous(candidates)));
+    let selection = crate::resolve::select_symbol(conn, raw_symbol, explicit_file)?;
+    if let Ok(selected) = &selection {
+        if selected.lookup == CliSymbolLookup::Bare && raw_symbol.contains('.') {
+            note_bare_fallback(conn, raw_symbol, &selected.bare_name)?;
         }
-        if matches.into_iter().next().is_some() {
-            return Ok(Ok(CliSymbolSelection {
-                lookup_name: raw_symbol.to_string(),
-                bare_name,
-                // The exact qualifier is already the selector. Retain only a
-                // file filter the user supplied; caching the matched path here
-                // would make a freshness refresh follow a pre-refresh path.
-                file_filter: explicit_file.map(str::to_string),
-                lookup: CliSymbolLookup::ExactQualified,
-            }));
-        }
-        if explicit_file.is_some() {
-            return Ok(Err(CliSymbolSelectionError::QualifiedNotFound));
-        }
-        note_bare_fallback(conn, raw_symbol, &bare_name)?;
     }
-    Ok(Ok(CliSymbolSelection {
-        lookup_name: if raw_symbol.contains('.') {
-            bare_name.clone()
-        } else {
-            raw_symbol.to_string()
-        },
-        bare_name,
-        file_filter: explicit_file.map(str::to_string),
-        lookup: CliSymbolLookup::Bare,
-    }))
+    Ok(selection)
 }
 
 // --- Output formatting ---

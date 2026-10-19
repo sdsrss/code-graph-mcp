@@ -63,19 +63,22 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        let qualified_matches =
-            if let Some(symbol_name) = symbol_name_arg.filter(|s| s.contains('.')) {
-                crate::resolve::selectable_qualified_definitions(
-                    self.db.conn(),
-                    symbol_name,
-                    file_path,
-                )?
-                .into_iter()
-                .map(|candidate| (candidate.node.id, candidate.file_path))
-                .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        // The symbol CLI `refs` selects (`resolve::select_symbol`): an exact
+        // qualified name, several of them (refused), or a name to look up. A
+        // dotted name nothing is qualified-named is its last part (D#435).
+        let selection = match symbol_name_arg {
+            Some(name) if node_id.is_none() => {
+                match crate::resolve::select_symbol(self.db.conn(), name, file_path)? {
+                    Ok(selection) => Some(selection),
+                    Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {
+                        return Ok(crate::resolve::ambiguity_response(name, &cands));
+                    }
+                    // Only with a file_path: the file branch below reports it.
+                    Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => None,
+                }
+            }
+            _ => None,
+        };
 
         // Set where the fuzzy step answers for another name (D#431).
         let mut fuzzy_note: Option<String> = None;
@@ -113,31 +116,20 @@ impl McpServer {
             let node = queries::get_node_by_id(self.db.conn(), nid)?
                 .ok_or_else(|| anyhow!("node_id {} not found in index", nid))?;
             (vec![nid], node.name)
-        } else if !qualified_matches.is_empty() {
+        } else if selection
+            .as_ref()
+            .is_some_and(|s| s.lookup == crate::resolve::SymbolLookup::ExactQualified)
+        {
             let symbol_name = symbol_name_arg.unwrap();
-            if qualified_matches.len() > 1 {
-                let suggestions: Vec<_> = qualified_matches
-                    .iter()
-                    .filter_map(|(id, fp)| {
-                        queries::get_node_by_id(self.db.conn(), *id)
-                            .ok()
-                            .flatten()
-                            .map(|n| queries::NameCandidate {
-                                name: n.name,
-                                file_path: fp.clone(),
-                                node_type: n.node_type,
-                                node_id: n.id,
-                                start_line: n.start_line,
-                            })
-                    })
-                    .collect();
-                return Ok(crate::resolve::ambiguity_response(
-                    symbol_name,
-                    &suggestions,
-                ));
-            }
             (
-                qualified_matches.iter().map(|(id, _)| *id).collect(),
+                crate::resolve::selectable_qualified_definitions(
+                    self.db.conn(),
+                    symbol_name,
+                    file_path,
+                )?
+                .into_iter()
+                .map(|candidate| candidate.node.id)
+                .collect(),
                 symbol_name.to_string(),
             )
         } else if let Some(fp) = file_path {
@@ -184,21 +176,29 @@ impl McpServer {
             }
             (matching, symbol_name.to_string())
         } else {
-            let symbol_name = symbol_name_arg.unwrap();
-            // No file_path: fuzzy resolve. Candidates that all ARE the typed
-            // name, and that the exact-name check does not count as ambiguous
-            // (a README heading, a constructor beside its class), are that
-            // name: `find_references Flask` refused over flask's README h1
-            // while CLI `refs` answered (E2E 2026-10-16 round 2).
-            let fuzzy = match self.resolve_fuzzy_name(symbol_name)? {
-                FuzzyResolution::Ambiguous(cands)
-                    if cands.iter().all(|c| c.name == symbol_name)
-                        && crate::resolve::detect_ambiguity(self.db.conn(), symbol_name)?
-                            .is_none() =>
-                {
-                    FuzzyResolution::Unique(symbol_name.to_string())
-                }
-                other => other,
+            let typed = symbol_name_arg.unwrap();
+            let symbol_name = selection.as_ref().map_or(typed, |s| s.lookup_name.as_str());
+            // No file_path: every definition of the name decides, in the order
+            // CLI `refs` decides. Read off the fuzzy query, whose rows stop at
+            // 10, leveldb's 12 `Append`s were "10 matches", and a name
+            // production defines beyond 10 test rows was "all in test/bench
+            // paths" (D#445). Definitions the ambiguity check does not count
+            // (a README heading, a constructor beside its class) are the name
+            // itself: `find_references Flask` refused over flask's README h1
+            // while CLI `refs` answered (E2E 2026-10-16 round 2). The fuzzy
+            // step is for a name no row has.
+            if let Some(cands) = crate::resolve::detect_ambiguity(self.db.conn(), symbol_name)? {
+                return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
+            }
+            let fuzzy = if !crate::resolve::preferred_definitions(self.db.conn(), symbol_name)?
+                .is_empty()
+            {
+                FuzzyResolution::Unique(symbol_name.to_string())
+            } else if !queries::get_node_ids_by_name(self.db.conn(), symbol_name)?.is_empty() {
+                // Test code or `<external>` alone: the `NotFound` arm.
+                FuzzyResolution::NotFound
+            } else {
+                self.resolve_fuzzy_name(symbol_name)?
             };
             match fuzzy {
                 FuzzyResolution::Unique(resolved_name) => {
@@ -225,7 +225,7 @@ impl McpServer {
                         }
                         return Err(anyhow!("Symbol '{}' not found in index.", symbol_name));
                     }
-                    fuzzy_note = super::super::fuzzy_switch_note(symbol_name, &resolved_name);
+                    fuzzy_note = super::super::fuzzy_switch_note(typed, &resolved_name);
                     (ids, resolved_name)
                 }
                 FuzzyResolution::Ambiguous(cands) => {
@@ -234,14 +234,14 @@ impl McpServer {
                     return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
                 }
                 FuzzyResolution::NotFound => {
-                    // resolve_fuzzy_name filters test/bench candidates upstream.
-                    // Distinguish "truly absent" from "found-but-filtered" by
-                    // re-querying without that filter — the latter means the
-                    // user is on a dead-code → find_references reverse-trace and
-                    // needs to know they can bypass with node_id/file_path.
+                    // No definition outside test code. Distinguish "truly
+                    // absent" from "found-but-filtered" by querying without the
+                    // test filter — the latter means the user is on a dead-code
+                    // → find_references reverse-trace and needs to know they
+                    // can bypass with node_id/file_path.
                     let unfiltered = queries::get_node_ids_by_name(self.db.conn(), symbol_name)?;
-                    // `<external>` sentinels are excluded by resolve_fuzzy (that
-                    // is deliberate — symbol *resolution* must keep preferring a
+                    // `<external>` sentinels are no definition (that is
+                    // deliberate — symbol *resolution* must keep preferring a
                     // project symbol over an imported std name), so an
                     // import-only name lands here. Answering with its `imports`
                     // edges is what CHANGELOG promises for both refs surfaces,
@@ -270,7 +270,7 @@ impl McpServer {
                             example_paths.join(", ")
                         ));
                     } else {
-                        return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name.", symbol_name));
+                        return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name.", typed));
                     }
                 }
             }

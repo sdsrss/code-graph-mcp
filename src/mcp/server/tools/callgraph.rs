@@ -119,7 +119,7 @@ impl McpServer {
         }
 
         // Accept both "symbol_name" (canonical) and "function_name" (legacy alias)
-        let function_name = nonblank(args["symbol_name"].as_str())
+        let typed = nonblank(args["symbol_name"].as_str())
             .or_else(|| nonblank(args["function_name"].as_str()))
             .ok_or_else(|| anyhow!("symbol_name or route_path is required"))?;
         let direction_raw = args["direction"].as_str().unwrap_or("both");
@@ -172,21 +172,11 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        // Disambiguate: the symbol may match several distinct nodes (cross-file
-        // OR same-file overloads), and a file_path cannot split same-file ones
-        // either. Message + suggestion shape are shared with the CLI via
-        // crate::resolve (audit #6).
-        let ambiguous = match file_path {
-            None => self.disambiguate_symbol(function_name)?,
-            Some(fp) => {
-                crate::resolve::detect_same_file_ambiguity(self.db.conn(), function_name, fp)?
-            }
-        };
-        if let Some(cands) = ambiguous {
-            return Ok(json!({
-                "function": function_name,
+        let ambiguity = |cands: &[crate::storage::queries::NameCandidate], name: &str| {
+            json!({
+                "function": typed,
                 "direction": direction,
-                "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
+                "error": crate::resolve::ambiguity_message(name, cands, crate::resolve::Surface::Mcp),
                 // MUST stay capped in step with `ambiguity_message`, which
                 // now says "Showing the first 5 of N" whenever it hides
                 // something. This site renders the message but built its own
@@ -195,11 +185,52 @@ impl McpServer {
                 // under a note claiming 5. `ambiguity_response` (the other
                 // four MCP sites) caps internally; this arm is hand-rolled
                 // because it also carries `function`/`direction`.
-                "suggestions": crate::resolve::candidates_to_json(&cands)
+                "suggestions": crate::resolve::candidates_to_json(cands)
                     .into_iter()
                     .take(crate::resolve::SUGGESTION_CAP)
                     .collect::<Vec<_>>(),
-            }));
+            })
+        };
+        // The symbol CLI `callgraph` selects (`resolve::select_symbol`). Two
+        // definitions of one qualified name are ambiguous: two test-code ones
+        // were merged (D#447), and so were two in the one file a file_path
+        // names. A dotted name nothing is qualified-named is its last part: the
+        // fuzzy step ran over the whole string, and flask `Flask.route`
+        // answered for `FlaskGroup` (D#435).
+        let selection = match crate::resolve::select_symbol(self.db.conn(), typed, file_path)? {
+            Ok(selection) => selection,
+            Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {
+                return Ok(ambiguity(&cands, typed));
+            }
+            // Only with a file_path (see `select_symbol`): that file holds no
+            // definition of the qualified name, which "not found in the
+            // index" misreported.
+            Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => {
+                let fp = file_path.unwrap_or_default();
+                let miss = crate::resolve::file_selector_miss(self.db.conn(), typed, fp)?;
+                return Err(anyhow!(miss.message(typed, fp)));
+            }
+        };
+        let function_name = selection.lookup_name.as_str();
+        // CLI `callgraph` skips the fuzzy step for an exact qualified name
+        // (`is_exact_qualified`); here it answered leveldb `Block.size`
+        // callees, which has none, for the heading `Block size` (D#440).
+        let is_exact_qualified = selection.lookup == crate::resolve::SymbolLookup::ExactQualified;
+
+        // Disambiguate: the symbol may match several distinct nodes (cross-file
+        // OR same-file overloads), and a file_path cannot split same-file ones
+        // either. Message + suggestion shape are shared with the CLI via
+        // crate::resolve (audit #6). An exact qualified name was settled by the
+        // selection above, as in the CLI.
+        let ambiguous = match file_path {
+            _ if is_exact_qualified => None,
+            None => self.disambiguate_symbol(function_name)?,
+            Some(fp) => {
+                crate::resolve::detect_same_file_ambiguity(self.db.conn(), function_name, fp)?
+            }
+        };
+        if let Some(cands) = ambiguous {
+            return Ok(ambiguity(&cands, function_name));
         }
 
         let results = crate::graph::query::get_call_graph_filtered(
@@ -226,16 +257,6 @@ impl McpServer {
                 return Err(anyhow!(miss.message(function_name, fp)));
             }
         }
-        // CLI `callgraph` skips the fuzzy step for an exact qualified name
-        // (`is_exact_qualified`); here it answered leveldb `Block.size`
-        // callees, which has none, for the heading `Block size` (D#440).
-        let is_exact_qualified = function_name.contains('.')
-            && !crate::resolve::selectable_qualified_definitions(
-                self.db.conn(),
-                function_name,
-                file_path,
-            )?
-            .is_empty();
         if !(is_exact_qualified || has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
@@ -269,7 +290,7 @@ impl McpServer {
                         include_tests,
                         max_tokens,
                         args,
-                        super::super::fuzzy_switch_note(function_name, &resolved).as_deref(),
+                        super::super::fuzzy_switch_note(typed, &resolved).as_deref(),
                     );
                 }
                 // The fuzzy step found only the name itself, which the ambiguity
@@ -286,7 +307,7 @@ impl McpServer {
                     // still works. Only the candidate rendering is shared (audit
                     // §四/§六 — the other three sites now use `ambiguity_response`).
                     return Ok(json!({
-                        "function": function_name,
+                        "function": typed,
                         "direction": direction,
                         "callees": [],
                         "callers": [],
@@ -298,7 +319,7 @@ impl McpServer {
                         // two verdicts" shape SURF-17 and audit #6 both were.
                         "suggestion": format!(
                             "No exact match for '{}'. Did you mean one of these?{}",
-                            function_name,
+                            typed,
                             crate::resolve::suggestion_cap_note(cands.len()),
                         ),
                         "candidates": crate::resolve::candidates_to_json(&cands)
@@ -309,7 +330,7 @@ impl McpServer {
                 }
                 FuzzyResolution::NotFound => {
                     if !has_seed {
-                        return Err(anyhow!("Symbol '{}' not found in the index. Use semantic_code_search to find the correct symbol name, or check spelling.", function_name));
+                        return Err(anyhow!("Symbol '{}' not found in the index. Use semantic_code_search to find the correct symbol name, or check spelling.", typed));
                     }
                     // Function exists but has no callers/callees — fall through
                 }
@@ -324,7 +345,7 @@ impl McpServer {
             include_tests,
             max_tokens,
             args,
-            None,
+            super::super::fuzzy_switch_note(typed, function_name).as_deref(),
         )
     }
 

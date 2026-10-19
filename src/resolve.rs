@@ -89,6 +89,98 @@ pub fn selectable_qualified_definitions(
     })
 }
 
+/// The lookup chosen for a symbol after qualified-name selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolLookup {
+    /// An exact `qualified_name` match. Traversals must retain the qualifier.
+    ExactQualified,
+    /// A bare-name lookup, including the historical dotted-to-bare fallback.
+    Bare,
+}
+
+/// Shared symbol selection consumed by CLI `refs`, `callgraph` and `impact`
+/// and by MCP `get_call_graph`, `find_references` and `get_ast_node`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSelection {
+    pub lookup_name: String,
+    pub bare_name: String,
+    pub file_filter: Option<String>,
+    pub lookup: SymbolLookup,
+}
+
+/// A qualified lookup can fail before command-specific querying begins.
+pub enum SymbolSelectionError {
+    /// More than one exact qualified definition survived the optional file filter.
+    Ambiguous(Vec<NameCandidate>),
+    /// A file selector makes a missing qualifier a strict miss.
+    QualifiedNotFound,
+}
+
+/// Select a symbol with exact-qualified precedence and compatible fallback.
+///
+/// Exact qualified matches are filtered by `explicit_file`. One match keeps the
+/// qualified spelling for traversal; multiple matches are ambiguous. With no
+/// exact match, dotted input falls back to its final bare component only when
+/// no file filter was supplied. Bare input keeps the normal name lookup.
+///
+/// One function for both surfaces. The MCP tools each picked a symbol their
+/// own way: a dotted name nothing is qualified-named ran the fuzzy step over
+/// the whole string (flask `Flask.route` answered for `FlaskGroup`, D#435),
+/// and `get_call_graph` merged two test-code definitions of one qualified
+/// name that the CLI refused (D#447).
+pub fn select_symbol(
+    conn: &Connection,
+    raw_symbol: &str,
+    explicit_file: Option<&str>,
+) -> Result<std::result::Result<SymbolSelection, SymbolSelectionError>> {
+    // As `cli::symbols::strip_qualified_prefix`.
+    let bare_name = raw_symbol
+        .rsplit('.')
+        .next()
+        .unwrap_or(raw_symbol)
+        .to_string();
+    if raw_symbol.contains('.') {
+        let matches = selectable_qualified_definitions(conn, raw_symbol, explicit_file)?;
+        if matches.len() > 1 {
+            let candidates = matches
+                .into_iter()
+                .map(|candidate| NameCandidate {
+                    name: candidate.node.name,
+                    file_path: candidate.file_path,
+                    node_type: candidate.node.node_type,
+                    node_id: candidate.node.id,
+                    start_line: candidate.node.start_line,
+                })
+                .collect();
+            return Ok(Err(SymbolSelectionError::Ambiguous(candidates)));
+        }
+        if matches.into_iter().next().is_some() {
+            return Ok(Ok(SymbolSelection {
+                lookup_name: raw_symbol.to_string(),
+                bare_name,
+                // The exact qualifier is already the selector. Retain only a
+                // file filter the user supplied; caching the matched path here
+                // would make a freshness refresh follow a pre-refresh path.
+                file_filter: explicit_file.map(str::to_string),
+                lookup: SymbolLookup::ExactQualified,
+            }));
+        }
+        if explicit_file.is_some() {
+            return Ok(Err(SymbolSelectionError::QualifiedNotFound));
+        }
+    }
+    Ok(Ok(SymbolSelection {
+        lookup_name: if raw_symbol.contains('.') {
+            bare_name.clone()
+        } else {
+            raw_symbol.to_string()
+        },
+        bare_name,
+        file_filter: explicit_file.map(str::to_string),
+        lookup: SymbolLookup::Bare,
+    }))
+}
+
 /// Which surface is rendering the message — only affects flag/tool wording
 /// (`--file` vs `file_path`, `show --node-id` vs `get_ast_node`), never the
 /// ambiguity decision itself.

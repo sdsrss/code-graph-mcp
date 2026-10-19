@@ -7991,6 +7991,167 @@ end
         }
     }
 
+    /// The MCP tools pick a symbol by the rules CLI `callgraph` / `refs` pick
+    /// it by (`resolve::select_symbol`), where each had its own:
+    /// - D#435: a dotted name nothing is qualified-named answers for its last
+    ///   part, as the CLI does and 0.152.0 said; MCP ran the fuzzy step over
+    ///   the whole string (flask `Flask.route` → `FlaskGroup`) or said not found.
+    /// - D#447: two test-code definitions of one qualified name are ambiguous;
+    ///   `get_call_graph` merged them.
+    /// - D#445: `find_references` judged exact names on the fuzzy query's first
+    ///   10 rows: 12 definitions read as 10, and a name production defines
+    ///   beyond 10 test rows read as test-only.
+    #[test]
+    fn test_mcp_selects_the_symbol_the_cli_selects() {
+        let project = TempDir::new().unwrap();
+        let write = |path: &str, src: &str| {
+            let full = project.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, src).unwrap();
+        };
+        write(
+            "app.py",
+            "import json\n\n\nclass Widget:\n    def spin(self):\n        return zap()\n\n\n\
+             def zap():\n    return 1\n\n\ndef caller():\n    return zap()\n\n\n\
+             def json_dump(v):\n    return json.dumps(v)\n",
+        );
+        write(
+            "tests/test_views.py",
+            "class Index:\n    def get(self):\n        return 1\n",
+        );
+        write(
+            "tests/test_more.py",
+            "class Index:\n    def get(self):\n        return 2\n",
+        );
+        for i in 0..11 {
+            write(
+                &format!("tests/a{i:02}.py"),
+                "def run_job():\n    return 0\n\n\ndef job_once():\n    return 0\n",
+            );
+        }
+        // Indexed after `tests/`, so beyond the fuzzy query's 10 rows.
+        write(
+            "worker/z1.py",
+            "def run_job():\n    return 1\n\n\ndef job_once():\n    return 1\n",
+        );
+        write("worker/z2.py", "def run_job():\n    return 2\n");
+        for i in 0..12 {
+            write(
+                &format!("src/p{i:02}.py"),
+                "def append_row():\n    return 0\n",
+            );
+        }
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let rows = queries::find_functions_by_fuzzy_name(server.db.conn(), "run_job").unwrap();
+        assert!(
+            rows.iter()
+                .all(|c| crate::domain::is_test_symbol(&c.name, &c.file_path)),
+            "precondition: the fuzzy rows are all test code, got {:?}",
+            rows.iter().map(|c| &c.file_path).collect::<Vec<_>>()
+        );
+        let call = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            (result["isError"].as_bool().unwrap_or(false), text)
+        };
+        let answer = |tool: &str, args: serde_json::Value| {
+            let (is_error, text) = call(tool, args.clone());
+            assert!(!is_error, "{tool} {args}: {text}");
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+
+        // D#435: answered for `zap`, and saying so.
+        let note = "Resolved 'Widget.zap' → 'zap'.";
+        for direction in ["both", "callers", "callees"] {
+            let out = answer(
+                "get_call_graph",
+                json!({"symbol_name": "Widget.zap", "direction": direction}),
+            );
+            assert_eq!(out["function"], "zap", "{direction}: {out}");
+            assert_eq!(out["note"], note, "{direction}: {out}");
+        }
+        let out = answer("find_references", json!({"symbol_name": "Widget.zap"}));
+        assert_eq!(out["symbol"], "zap", "{out}");
+        assert_eq!(out["note"], note, "{out}");
+        assert_eq!(out["by_relation"], json!({"calls": 2}), "{out}");
+        let out = answer("get_ast_node", json!({"symbol_name": "Widget.zap"}));
+        assert_eq!(out["name"], "zap", "{out}");
+        assert_eq!(out["note"], note, "{out}");
+        // With a file_path the dotted name is a miss in that file, as on the
+        // CLI and `find_references`; `get_call_graph` said "not found in the
+        // index".
+        for tool in ["get_call_graph", "find_references"] {
+            let (is_error, text) = call(
+                tool,
+                json!({"symbol_name": "Widget.zap", "file_path": "app.py"}),
+            );
+            assert!(is_error, "{tool}: {text}");
+            assert_eq!(
+                text, "Error: Symbol 'Widget.zap' not found in file 'app.py'.",
+                "{tool}"
+            );
+        }
+        // An exact qualified name is its own answer, with nothing to say.
+        let out = answer(
+            "get_call_graph",
+            json!({"symbol_name": "Widget.spin", "direction": "callees"}),
+        );
+        assert_eq!(out["function"], "Widget.spin", "{out}");
+        assert!(out.get("note").is_none(), "{out}");
+
+        // D#447: two test-code `Index.get`s are two symbols on every tool.
+        for direction in ["both", "callers", "callees"] {
+            let out = answer(
+                "get_call_graph",
+                json!({"symbol_name": "Index.get", "direction": direction}),
+            );
+            assert!(
+                out["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("Ambiguous symbol 'Index.get': 2 matches")),
+                "{direction}: {out}"
+            );
+        }
+        for tool in ["find_references", "get_ast_node"] {
+            let out = answer(tool, json!({"symbol_name": "Index.get"}));
+            assert!(
+                out["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("Ambiguous symbol 'Index.get': 2 matches")),
+                "{tool}: {out}"
+            );
+        }
+
+        // D#445: every definition counts, not the fuzzy query's first 10 rows.
+        for (typed, n) in [("run_job", 2), ("append_row", 12)] {
+            let out = answer("find_references", json!({"symbol_name": typed}));
+            assert!(
+                out["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with(&format!(
+                        "Ambiguous symbol '{typed}': {n} matches in different files"
+                    ))),
+                "{typed}: {out}"
+            );
+        }
+        // One production definition beyond 10 test rows is the answer, not
+        // "all in test/bench paths".
+        let out = answer("find_references", json!({"symbol_name": "job_once"}));
+        assert_eq!(out["symbol"], "job_once", "{out}");
+        assert!(out.get("note").is_none(), "{out}");
+        // A name only an import binds is that import, not a near definition.
+        let out = answer("find_references", json!({"symbol_name": "json"}));
+        assert_eq!(out["symbol"], "json", "{out}");
+        assert_eq!(out["by_relation"], json!({"imports": 1}), "{out}");
+        assert!(out.get("note").is_none(), "{out}");
+    }
+
     /// D#228: an absolute path under the project root, and a `./` spelling, name
     /// the same file as the root-relative path the index stores. Every tool that
     /// takes a path answered "not found" (or a false-clean empty result) for

@@ -229,7 +229,21 @@ impl McpServer {
         let file_path = file_path_arg.as_deref();
 
         // If only symbol_name provided (no file_path), resolve by name lookup
-        if let (Some(sym), None) = (symbol_name, file_path) {
+        if let (Some(typed), None) = (symbol_name, file_path) {
+            // The symbol CLI `refs` / `callgraph` select (`resolve::select_symbol`):
+            // two definitions of one qualified name are ambiguous, and a dotted
+            // name nothing is qualified-named is its last part, where this said
+            // "not found" (D#435).
+            let sym = match crate::resolve::select_symbol(self.db.conn(), typed, None)? {
+                Ok(selection) => selection.lookup_name,
+                Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {
+                    return Ok(crate::resolve::ambiguity_response(typed, &cands));
+                }
+                // Only with a file_path (see `select_symbol`).
+                Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => typed.to_string(),
+            };
+            let note = super::super::fuzzy_switch_note(typed, &sym);
+            let sym = sym.as_str();
             // Ambiguity verdict + response from the shared resolver (2026-08-16
             // audit §四/§六). This site had its own copy of both, and the copy was
             // not equivalent: it re-rendered the candidate JSON by hand (one of
@@ -246,12 +260,15 @@ impl McpServer {
             // The same candidates `detect_ambiguity` counted, so 0 or 1 here.
             let preferred = crate::resolve::preferred_definitions(self.db.conn(), sym)?;
             return match preferred.first() {
-                None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
+                None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", typed)),
                 Some(nf) => {
                     let nid = nf.node_id;
                     let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact.then_some(ImpactSeed::NameInFile), context_lines, compact, impact_conf_rank)?;
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;
+                    }
+                    if let Some(note) = note {
+                        out["note"] = json!(note);
                     }
                     Ok(budgeted(out))
                 }
