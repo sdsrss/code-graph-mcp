@@ -7910,13 +7910,18 @@ end
         let project = TempDir::new().unwrap();
         std::fs::write(
             project.path().join("app.py"),
-            "def after_request(f):\n    return f\n\n\nclass Block:\n    def size(self):\n        return 1\n",
+            "import test_support\n\n\ndef after_request(f):\n    return f\n\n\nclass Block:\n    def size(self):\n        return 1\n",
         )
         .unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
         std::fs::write(
             project.path().join("tests/test_app.py"),
             "def after(r):\n    return r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("tests/conftest.py"),
+            "def test_support():\n    return 1\n",
         )
         .unwrap();
         std::fs::create_dir_all(project.path().join("doc")).unwrap();
@@ -7962,17 +7967,26 @@ end
             ),
             "{text}"
         );
-        // A name nothing is called still gets the near match, and says so.
+        // Beside an `<external>` import of the same name, that answer is the
+        // import's references, as 0.171.3 gave: the test-path refusal named
+        // `<external>` a test path (pre-tag review).
+        let out = answer("find_references", json!({"symbol_name": "test_support"}));
+        assert_eq!(out["by_relation"], json!({"imports": 1}), "{out}");
+        // A name nothing is called still gets the near match, and says so,
+        // whether or not test code is among its near rows.
         for (tool, key) in [
             ("get_call_graph", "function"),
             ("find_references", "symbol"),
         ] {
-            let out = answer(tool, json!({"symbol_name": "after_req"}));
-            assert_eq!(out[key], "after_request", "{tool}: {out}");
-            assert_eq!(
-                out["note"], "Resolved 'after_req' → 'after_request'.",
-                "{tool}: {out}"
-            );
+            for typed in ["after_req", "afte"] {
+                let out = answer(tool, json!({"symbol_name": typed}));
+                assert_eq!(out[key], "after_request", "{tool} {typed}: {out}");
+                assert_eq!(
+                    out["note"],
+                    format!("Resolved '{typed}' → 'after_request'."),
+                    "{tool} {typed}: {out}"
+                );
+            }
         }
     }
 

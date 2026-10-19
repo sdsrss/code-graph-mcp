@@ -592,13 +592,14 @@ pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Va
 
 /// Outcome of fuzzy (substring-tolerant) name resolution.
 pub enum FuzzyResolution {
-    /// The name to answer for: the one exact match outside test code, the
-    /// typed name when only test code defines it (D#440), else the one near
-    /// match.
+    /// The name to answer for: the one exact match outside test code, else
+    /// the one near match.
     Unique(String),
     /// Multiple candidates — the caller renders suggestions.
     Ambiguous(Vec<NameCandidate>),
-    /// No candidates found.
+    /// No candidate outside test code: nothing is named like the name, or
+    /// test code alone defines it (D#440). Callers that answer test code look
+    /// the name up unfiltered.
     NotFound,
 }
 
@@ -634,13 +635,14 @@ pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
         // suggestions to the exact matches so the caller sees the real collision.
         return Ok(FuzzyResolution::Ambiguous(exact));
     }
-    // A name only test code defines is still the name asked for. Filtered out
-    // above, it was never exact, and the near matches below answered for
-    // another symbol: flask `after` for `after_request` (D#440). "Only" is
-    // asked of every definition: the query stops at ten rows, which can all
-    // be test code beside two production definitions.
-    if test_code.iter().any(|c| c.name == name) && preferred_definitions(conn, name)?.is_empty() {
-        return Ok(FuzzyResolution::Unique(name.to_string()));
+    // A name only test code defines is still the name asked for, not a near
+    // one: filtered out above, it was never exact, and the near matches below
+    // answered for another symbol (flask `after` for `after_request`, D#440).
+    // It gets what it got with no near match: nothing outside test code. Not
+    // `Unique(name)`, which `find_references` splits by the test rule alone,
+    // calling a same-named `<external>` import a test path (pre-tag review).
+    if test_code.iter().any(|c| c.name == name) {
+        return Ok(FuzzyResolution::NotFound);
     }
     match candidates.len() {
         0 => Ok(FuzzyResolution::NotFound),
@@ -894,10 +896,11 @@ mod fuzzy_tests {
     /// D#440: the test filter ran before the exact-name check, so a name only
     /// test code defines was never exact and resolved to its one non-test
     /// near match: flask's `after` (its tests define it, its code does not)
-    /// answered for `after_request` on three surfaces. `test_mode` is the
+    /// answered for `after_request` on three surfaces. It now gets what it got
+    /// with no near match: nothing outside test code. `test_mode` is the
     /// filter's name leg: a production function it calls a test.
     #[test]
-    fn a_name_defined_only_in_test_code_resolves_to_itself() {
+    fn a_name_defined_only_in_test_code_is_not_switched() {
         let (_p, _d, db) = indexed(&[
             (
                 "src/app.rs",
@@ -908,24 +911,27 @@ mod fuzzy_tests {
         ]);
         for typed in ["after", "test_mode"] {
             match resolve_fuzzy(db.conn(), typed).unwrap() {
-                FuzzyResolution::Unique(n) => assert_eq!(n, typed),
+                FuzzyResolution::NotFound => {}
+                FuzzyResolution::Unique(n) => panic!("{typed}: got Unique({n})"),
                 FuzzyResolution::Ambiguous(c) => panic!(
                     "{typed}: got {:?}",
                     c.iter().map(|c| &c.name).collect::<Vec<_>>()
                 ),
-                FuzzyResolution::NotFound => panic!("{typed} is indexed"),
             }
         }
-        // A name nothing is called still reaches its near match.
-        match resolve_fuzzy(db.conn(), "after_req").unwrap() {
-            FuzzyResolution::Unique(n) => assert_eq!(n, "after_request"),
-            _ => panic!("after_req must resolve to after_request"),
+        // A name nothing is called still reaches its near match, whether or
+        // not test code is among the near rows (`afte` also matches `after`).
+        for typed in ["after_req", "afte"] {
+            match resolve_fuzzy(db.conn(), typed).unwrap() {
+                FuzzyResolution::Unique(n) => assert_eq!(n, "after_request", "{typed}"),
+                _ => panic!("{typed} must resolve to after_request"),
+            }
         }
     }
 
     /// The fuzzy query stops at ten rows, so they can all be test code while
-    /// production defines the name twice; "only test code" read off them
-    /// would answer for both definitions merged instead of refusing.
+    /// production defines the name twice; a test-only verdict read off them
+    /// must not become a unique answer, which would merge both definitions.
     #[test]
     fn a_name_production_defines_beyond_the_fuzzy_rows_is_not_test_only() {
         let mut files: Vec<(String, String)> = (0..11)
