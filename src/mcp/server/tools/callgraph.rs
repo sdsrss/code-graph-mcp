@@ -220,10 +220,11 @@ impl McpServer {
         // Disambiguate: the symbol may match several distinct nodes (cross-file
         // OR same-file overloads), and a file_path cannot split same-file ones
         // either. Message + suggestion shape are shared with the CLI via
-        // crate::resolve (audit #6). An exact qualified name was settled by the
-        // selection above, as in the CLI.
+        // crate::resolve (audit #6). An exact qualified name is checked here
+        // too, where the CLI skips it: a gtest `TEST(CacheTest, Erase)` beside
+        // the method `CacheTest.Erase` refuses, where the CLI's traversal
+        // merges the two (pre-tag review of D#435).
         let ambiguous = match file_path {
-            _ if is_exact_qualified => None,
             None => self.disambiguate_symbol(function_name)?,
             Some(fp) => {
                 crate::resolve::detect_same_file_ambiguity(self.db.conn(), function_name, fp)?

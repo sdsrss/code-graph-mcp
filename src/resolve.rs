@@ -166,14 +166,10 @@ pub fn select_symbol(
                 lookup: SymbolLookup::ExactQualified,
             }));
         }
-        // A node named the dotted string itself is that symbol, not its last
-        // part: a dotted Python import (the `<external>` `click.core`, which
-        // answered for `copy`), a markdown heading (`1. Scan`), a gtest case
-        // (pre-tag review of D#435).
-        if !queries::get_node_ids_by_name(conn, raw_symbol)?.is_empty() {
+        if named_as_typed(conn, raw_symbol, explicit_file)? {
             return Ok(Ok(SymbolSelection {
                 lookup_name: raw_symbol.to_string(),
-                bare_name,
+                bare_name: raw_symbol.to_string(),
                 file_filter: explicit_file.map(str::to_string),
                 lookup: SymbolLookup::Bare,
             }));
@@ -192,6 +188,40 @@ pub fn select_symbol(
         file_filter: explicit_file.map(str::to_string),
         lookup: SymbolLookup::Bare,
     }))
+}
+
+/// Whether [`select_symbol`] keeps a dotted name no definition is
+/// qualified-named as typed: some node is named it. A dotted Python import
+/// (the `<external>` `click.core`, which answered for `copy`), a Markdown
+/// heading (`1. Scan`) is that node, not its last part (pre-tag review of
+/// D#435). With a file selector, only a node in that file counts: an import
+/// is in none, and `click.core --file cli.py` lost its file miss. Without
+/// one, a heading yields to code its last part names, as it yields to a
+/// definition in [`preferred_definitions`]: a README's `## Widget.launch` hid
+/// the method `launch` (review round 2).
+fn named_as_typed(conn: &Connection, dotted: &str, explicit_file: Option<&str>) -> Result<bool> {
+    let named = |name: &str, file: Option<&str>| -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare(
+            "SELECT n.type, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE n.name = ?1 AND (?2 IS NULL OR f.path = ?2)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![name, file], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    let is_heading = |node_type: &str| matches!(node_type, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+    let typed = named(dotted, explicit_file)?;
+    if typed.is_empty() {
+        return Ok(false);
+    }
+    if explicit_file.is_some() || typed.iter().any(|(node_type, _)| !is_heading(node_type)) {
+        return Ok(true);
+    }
+    let last = dotted.rsplit('.').next().unwrap_or(dotted);
+    Ok(!named(last, None)?
+        .iter()
+        .any(|(node_type, path)| !is_heading(node_type) && is_selectable_definition(path)))
 }
 
 /// Which surface is rendering the message — only affects flag/tool wording
@@ -1209,6 +1239,40 @@ mod fuzzy_tests {
         ] {
             assert_eq!(canonical_symbol_spelling(db.conn(), typed), want, "{typed}");
         }
+    }
+
+    /// The pre-tag review of D#435: a dotted name a node is named is that node
+    /// (a dotted import, a heading), not its last part, and its label is the
+    /// whole name — unless a file selector names a file without that node, or
+    /// every such node is a heading and its last part names code.
+    #[test]
+    fn a_dotted_name_a_node_has_is_kept_where_that_node_is_meant() {
+        let (_p, _d, db) = indexed(&[
+            (
+                "app.py",
+                "import xml.etree.ElementTree\n\n\ndef zap():\n    return 1\n",
+            ),
+            ("README.md", "# Guide\n\n## 1. Scan\n\n## Widget.zap\n"),
+        ]);
+        let pick = |typed: &str, file: Option<&str>| match select_symbol(db.conn(), typed, file)
+            .unwrap()
+        {
+            Ok(s) => (s.lookup_name, s.bare_name),
+            Err(SymbolSelectionError::QualifiedNotFound) => ("<miss>".into(), String::new()),
+            Err(SymbolSelectionError::Ambiguous(_)) => ("<ambiguous>".into(), String::new()),
+        };
+        let kept = |typed: &str| (typed.to_string(), typed.to_string());
+        assert_eq!(
+            pick("xml.etree.ElementTree", None),
+            kept("xml.etree.ElementTree")
+        );
+        assert_eq!(pick("1. Scan", None), kept("1. Scan"));
+        assert_eq!(pick("1. Scan", Some("README.md")), kept("1. Scan"));
+        assert_eq!(pick("Widget.zap", Some("README.md")), kept("Widget.zap"));
+        // A heading yields to the code its last part names.
+        assert_eq!(pick("Widget.zap", None), ("zap".into(), "zap".into()));
+        // An import is in no file a selector can name.
+        assert_eq!(pick("xml.etree.ElementTree", Some("app.py")).0, "<miss>");
     }
 
     /// D#426 (7): only the whitespace around a name goes; inside it stays, and
