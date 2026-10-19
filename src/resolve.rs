@@ -598,8 +598,9 @@ pub enum FuzzyResolution {
     /// Multiple candidates — the caller renders suggestions.
     Ambiguous(Vec<NameCandidate>),
     /// No candidate outside test code: nothing is named like the name, or
-    /// test code alone defines it (D#440). Callers that answer test code look
-    /// the name up unfiltered.
+    /// test code alone defines it (D#440). `get_call_graph` and `callgraph`
+    /// then answer the seed they already found; `find_references` looks the
+    /// name up unfiltered. CLI `refs` asks only for a name no row has.
     NotFound,
 }
 
@@ -898,18 +899,29 @@ mod fuzzy_tests {
     /// near match: flask's `after` (its tests define it, its code does not)
     /// answered for `after_request` on three surfaces. It now gets what it got
     /// with no near match: nothing outside test code. `test_mode` is the
-    /// filter's name leg: a production function it calls a test.
+    /// filter's name leg: a production function it calls a test. `after`
+    /// also has a test-code near name (`after_hook`, as flask has
+    /// `test_after_request…`) and `before` two production near names; `setup`
+    /// is defined in production and test code, where production wins.
     #[test]
     fn a_name_defined_only_in_test_code_is_not_switched() {
         let (_p, _d, db) = indexed(&[
             (
                 "src/app.rs",
-                "pub fn after_request() {}\npub fn test_mode() {}\npub fn is_test_mode() {}\n",
+                "pub fn after_request() {}\npub fn test_mode() {}\npub fn is_test_mode() {}\n\
+                 pub fn before_request() {}\npub fn before_render() {}\npub fn setup() {}\n",
             ),
-            ("src/hooks_test.rs", "fn after() {}\n"),
+            (
+                "src/hooks_test.rs",
+                "fn after() {}\nfn after_hook() {}\nfn before() {}\nfn setup() {}\n",
+            ),
             ("src/more_test.rs", "fn after() {}\n"),
         ]);
-        for typed in ["after", "test_mode"] {
+        match resolve_fuzzy(db.conn(), "setup").unwrap() {
+            FuzzyResolution::Unique(n) => assert_eq!(n, "setup"),
+            _ => panic!("setup: the production definition must answer"),
+        }
+        for typed in ["after", "test_mode", "before"] {
             match resolve_fuzzy(db.conn(), typed).unwrap() {
                 FuzzyResolution::NotFound => {}
                 FuzzyResolution::Unique(n) => panic!("{typed}: got Unique({n})"),
@@ -921,7 +933,8 @@ mod fuzzy_tests {
         }
         // A name nothing is called still reaches its near match, whether or
         // not test code is among the near rows (`afte` also matches `after`).
-        for typed in ["after_req", "afte"] {
+        // `After` is no definition's name: the test name is matched exactly.
+        for typed in ["after_req", "afte", "After"] {
             match resolve_fuzzy(db.conn(), typed).unwrap() {
                 FuzzyResolution::Unique(n) => assert_eq!(n, "after_request", "{typed}"),
                 _ => panic!("{typed} must resolve to after_request"),

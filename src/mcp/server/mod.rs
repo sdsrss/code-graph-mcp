@@ -341,7 +341,8 @@ pub(super) enum FuzzyResolution {
     /// verdict (2026-08-16 audit §四/§六). Render with
     /// `crate::resolve::ambiguity_response` or `candidates_to_json`.
     Ambiguous(Vec<queries::NameCandidate>),
-    /// No candidates found.
+    /// No candidate outside test code, as `crate::resolve::FuzzyResolution`
+    /// says: test code alone may define the name (D#440).
     NotFound,
 }
 
