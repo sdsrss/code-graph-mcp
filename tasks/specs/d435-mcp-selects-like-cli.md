@@ -103,3 +103,30 @@ BASE 上 MCP 与 CLI 不一致（`diff.py oracle base`，每格是不一致的�
 - CLI `refs` 对只有一个生产定义的名字，把测试代码里的同名定义也算作目标（flask 12 个名字，`invoke` 22 对 2）。
 - CLI `refs` 在只有导入绑定裸名时不带说明（leveldb `a.b.c`）。
 - 负载下的两个不稳定测试（见验证记录）。
+
+## 发版前评审
+
+### 第 1 轮（新开子代理，`29d3b812..f3674e7e`）
+
+评审自己用 `git archive` 构建了两个版本（md5 与上面一致），重新生成输入逐字节相同，CHANGELOG 里语料内的数字逐个复算都对上；缺陷都在生成器没有覆盖的输入形态里。
+
+- HIGH-1（已复现）：带点的 Python 导入名（flask `<external>` `click.core`、`werkzeug.routing`、`collections.abc`，共 26 个）。0.171.4 `find_references` 答其中 25 个的导入；`f3674e7e` 退回最后一段：4 个答成别的符号（`click.core` → `copy`）、13 个 not found、7 个歧义、1 个测试路径提示。CLI `refs` 本来就这样。原因：`select_symbol` 只看有没有这个限定名（排除 `<external>`），不看有没有节点就叫这个名字。也推翻了 CHANGELOG 的"答对的不会变成别的符号"和"每个定义名"（生成器排除了 `<external>`）。
+- MEDIUM-2（已复现）：新文件里的嵌套类型，第一次调用答成构造函数。MCP 分派只在第一次读拼写就会改写时才先索引，`.`→`::` 方向在类型还没进索引时不改写，于是先选了裸名。
+- MEDIUM-3（已复现，0.171.4 就有）：`get_ast_node` 对精确限定名仍走 `detect_ambiguity`，leveldb `CacheTest.Erase` 按歧义拒绝，而 `get_call_graph`、`find_references`、CLI 回答方法。CHANGELOG 那句只对两个工具成立。
+- MEDIUM-4（已复现）：带点的 markdown 标题（`1. Scan`）退回最后一段：`get_ast_node` 由回答标题变成 not found，`get_call_graph` 带 `file_path` 时说该文件里没有（假话）。两个语料都没有带点的标题。
+- LOW-5：标题和嵌套类型同名时拼写不换算（标题算"已存储"）。LOW-6：模板参数逗号后不带空格（`SkipList<Key,Comparator>::Node`）0.171.4 靠模糊答对，现在答构造函数。LOW-7：说明里显示的是换算后的拼写（0.171.4 的模糊说明也这样）。LOW-8：还有两处测试是先 drop 再断言锁已空闲。LOW-9：DF 的"100 of 100"在 flask 是 99（有 1 个本来就是文件未命中的说法）；leveldb 测试专属名字 `find_references` 拒绝的是 33 个，不是 37 个（4 个带点的 gtest 名能回答）。
+
+处理（`baafe5ee`）：
+
+- HIGH-1、MEDIUM-4：`select_symbol` 在没有精确限定名时，如果有节点（任何文件，含 `<external>`）就叫这个带点的名字，保留原名不退回；CLI 的退回说明改成"查找名与输入不同才打印"。RED：变异去掉这个检查，MCP 测试在 `xml.etree.ElementTree` 上失败（not found）。
+- MEDIUM-2：带 `.` 或 `::` 的输入在分派处一律先 `ensure_indexed` 再读拼写。RED：变异改回旧条件，嵌套类型测试在新文件 `Blk.It` 上失败（答成构造函数 `It`，带说明）。
+- LOW-8：两处测试改成先解锁再关闭。
+- MEDIUM-3、LOW-5、LOW-6、LOW-7：不修，CHANGELOG 收窄说法、写进 Not covered（MEDIUM-3 是 0.171.4 就有的；LOW-6 是开放的拼写域）。LOW-9：改数字。
+
+修复后复测（`baafe5ee`，md5 `945c0bec…`）：新增输入类 E（每个 `<external>` 名字，flask 97 个、其中带点 26 个，leveldb 66 个）、DCW（17 个带 ", " 的嵌套名，去掉空格和两个空格各一份，共 34 个），第三个语料 md（本仓库 201 个 markdown 文件：B 460、X 400、带点标题 HD 96、带文件 HDF 97）。共 11,771 个输入、每个版本 112,422 次。
+
+- `355892f3` → `baafe5ee`：flask 只在 E 的带点名字上改变（173 次），leveldb 0 次，md 只在带点标题上改变（1,863 次）；没有别的改变。
+- BASE → `baafe5ee`：改变 flask 3,931、leveldb 5,241、md 1,336 次，共 10,508；相同 101,914 次。
+- 打分（按输入所指的节点，参照 `find_references(node_id)` / `callgraph --node-id`）：flask 带点导入 `find_references` 26/26（BASE 25）；md 带点标题三个工具 96/96、带文件 97/97（与 BASE 相同）；DC 139/139。
+- 仍比 BASE 差的（都写进 Not covered）：md 带点标题的拼错和前缀 38 个（BASE 靠整串模糊纠正到标题，现在 20 个 not found、18 个近似名列表，其中 14 个列表里有那个标题）；DCW 里 4 个 `Node`（模板空格与源码不同，BASE 靠模糊答对结构体，现在答构造函数，带说明）。不修的理由：这两类都是拼写的开放域（标题文本、模板空格），补规则要再开一轮评审；前者是拼错的标题，后者带着换了符号的说明。
+- CLI `refs` 对 flask 26 个带点导入：BASE 6 个答成别的名字、20 个拒绝 → 26 个都按导入回答（我直接跑的）。
