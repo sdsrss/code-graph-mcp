@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.172.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). The MCP tools now
 answer some names they refused, and refuse some they answered merged (below).
