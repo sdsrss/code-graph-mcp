@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.171.4
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). To pin the binary
 back: `npm i -g @sdsrs/code-graph@0.171.3` (or, from source, `cargo install
