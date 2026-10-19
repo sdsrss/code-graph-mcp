@@ -1,6 +1,6 @@
 # D#440：有精确定义的名字不换成近似名
 
-状态：已实现，待发版前评审（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
+状态：评审第 1 轮已修复，待差量复审（2026-10-19）。级别 L2（`src/resolve.rs` 共用解析器 + `src/mcp`；`fix:`，恢复"按输入的名字回答"）。来源：D#440（0.171.3 发版前评审 F1/F2），也是 0.171.3 写进 Not covered 的"填充写法由拒绝变成别的符号"的根因。
 
 ## 问题
 
@@ -36,9 +36,9 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 
 规则：一个名字只要有精确定义（名字或限定名），就按它回答；模糊步骤只处理没有任何定义叫这个名字的输入。
 
-- `resolve_fuzzy`：非测试的精确匹配照旧优先；没有时，如果测试代码里有精确匹配，返回 `Unique(输入本身)`，不再看近似名。
-  - MCP `get_call_graph`、CLI `callgraph`：回答这个名字自己的调用图（种子查询本来就不过滤测试）。
-  - MCP `find_references`：走 `Unique` 分支里已有的"全部定义都在测试路径"提示，和 0.171.3 对没有近似名的测试专属名字给的回答一样。
+- `resolve_fuzzy`：非测试的精确匹配照旧优先；没有时，如果测试代码里有精确匹配，返回 `NotFound`（评审第 1 轮后；第一版返回 `Unique(输入本身)`，见"发版前评审"），不再看近似名。这正是 0.171.3 对没有近似名的测试专属名字走的路，各调用方的 `NotFound` 分支本来就处理测试代码：
+  - MCP `get_call_graph`、CLI `callgraph`：有种子，回答这个名字自己的调用图（种子查询本来就不过滤测试）。
+  - MCP `find_references`：不过滤再查一次，先分出 `<external>` 导入哨兵（有就按导入回答），其余给"全部定义都在测试路径"提示。
 - MCP `get_call_graph`：精确限定名（`selectable_qualified_definitions` 非空，和 CLI `select_cli_symbol` 同一个判断）跳过模糊步骤。
 
 不选的：
@@ -48,7 +48,7 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 
 ## 输入形态表
 
-性质：HEAD 的回答 == BASE 的回答，唯一例外是 BASE 换了名字或给了近似名列表、而输入有精确定义的那些；它们在 HEAD 上按输入本身回答（`find_references`：测试路径提示）。HEAD 上有精确定义的输入"换了"和"近似名列表"都是 0。
+性质：HEAD 的回答 == BASE 的回答，唯一例外是 BASE 换了名字或给了近似名列表、而输入有精确定义的那些；它们在 HEAD 上按输入本身回答（`find_references`：测试路径提示，同名有 `<external>` 导入时按导入回答）。HEAD 上有精确定义的输入"换了"和"近似名列表"都是 0。
 
 | 形态 | 例子 | BASE | HEAD |
 |---|---|---|---|
@@ -65,7 +65,7 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 ## 验证记录
 
 - RED（修复前）：
-  - `resolve::fuzzy_tests::a_name_defined_only_in_test_code_resolves_to_itself`：得到 `after_request`，期望 `after`。
+  - `resolve::fuzzy_tests::a_name_defined_only_in_test_code_resolves_to_itself`：得到 `after_request`，期望 `after`（评审第 1 轮后改名为 `a_name_defined_only_in_test_code_is_not_switched`，期望改为 `NotFound`）。
   - `mcp::server::tests::test_an_exact_definition_is_answered_not_a_near_name`：先在 `after` 上失败（`function: after_request` 带 `note`）；第一处修好后在 `Block.size` 上单独失败（得到 `Block size`）。两半都不是空过。
   - `test_cli_callgraph_answers_a_name_only_tests_define`：放进 0.171.3 源码树跑，失败在 stderr `Resolved 'after' → 'after_request'`。
   - 修复后三个都通过。D#431 的测试里原来"两种都接受"的 `validate` 分支，改成钉住 `get_call_graph` 按 `validate` 回答、不带 `note`。
@@ -86,10 +86,10 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 
 ## 决定
 
-- `resolve_fuzzy` 对测试专属的精确名返回 `Unique(输入本身)`，同名的测试定义有几个都一样。`get_call_graph`/`callgraph` 的种子查询本来就合并同名的全部定义；`find_references` 在 `Unique` 分支里把它们全部判为测试路径，给出已有的提示。
+- `resolve_fuzzy` 对测试专属的精确名返回 `NotFound`，同名的测试定义有几个都一样。`get_call_graph`/`callgraph` 有种子时 `NotFound` 落到回答种子本身；`find_references` 的 `NotFound` 分支先分出 `<external>`，再给测试路径提示。
 - MCP `get_call_graph` 用 CLI 同一个判断 `selectable_qualified_definitions(...)` 非空来认"精确限定名"，所以两边对同一输入做同一个决定。
 - `file_path` 分支不会出现"把 X 解析成 X"的说明：`file_selector_miss` 不过滤测试文件，测试专属名字在别的文件里有定义时，模糊步骤之前就已拒绝。
-- "只在测试代码里定义"用 `preferred_definitions`（`detect_ambiguity` 数的那份全量列表）为空来判断，不看模糊查询的行：那个查询 `LIMIT 10`，同名定义超过 10 个时，返回的 10 行可能全是测试代码，而生产代码里还有两个定义。第一版（`b2706adc`）只看那 10 行，这时会返回 `Unique`，`find_references` 就把两个生产定义的引用合并回答，而不是报歧义。自查发现，`a_name_production_defines_beyond_the_fuzzy_rows_is_not_test_only`（11 个测试文件里的 `run`、2 个生产的 `run`，前置断言 10 行全是测试代码）在 `b2706adc` 上失败（得到 `Unique("run")`），加上这个判断后通过。这种情况下的回答与 0.171.3 相同。
+- 截断（同名定义超过 10 个、模糊查询返回的 10 行全是测试代码）：`6efd11be` 曾用 `preferred_definitions` 为空才认"只在测试代码里定义"，防止 `Unique` 把两个生产定义合并回答。改成返回 `NotFound` 后，截断时两条路都得到 `NotFound`（10 行全是精确名，非测试候选为空），这个判断不再改变任何回答，已删除。测试 `a_name_production_defines_beyond_the_fuzzy_rows_is_not_test_only` 保留，钉住"不会是 `Unique`"（把规则改回 `Unique` 的变异会被它抓到）。这种情况下的回答与 0.171.3 相同（`find_references` 的假"全部在测试路径"，见遗留）。
 
 ## 遗留
 
@@ -97,3 +97,19 @@ CLI `refs` 0；CLI `callgraph` 限定名 0。填充写法和不填充的数字�
 - 这句提示里的路径没有去重：leveldb `AddBoundaryInputsTest` 列出 `db/version_set_test.cc, db/version_set_test.cc`。0.171.3 对没有近似名的测试专属名字就这样。
 - 带点名字没有任何定义时 MCP 不退回裸名：D#435。
 - 0.171.3 就有：`resolve_fuzzy` 的精确名判断建立在 `LIMIT 10` 的模糊查询上。`find_references` 对一个有歧义的名字最多报 10 个（leveldb `Append`：`find_references` 说 10 个，`get_call_graph` 说 12 个；leveldb 有 18 个名字正好报 10 个）。同名定义超过 10 个、而前 10 行全是测试代码时，`find_references` 会说"全部在测试路径"，但其实有生产定义。改法是让精确名判断用全量列表，会改变这些名字的歧义回答，单独做。
+
+## 发版前评审
+
+### 第 1 轮（新开子代理，`2171df30..7d2ff671`）
+
+3 个 MEDIUM、3 个 LOW。逐条核对后：
+
+- F1 MEDIUM（已复现，是本次改动带进来的）：规则返回 `Unique(名字)`，`find_references` 的 `Unique` 分支只按名字规则划分测试代码，把同名的 `<external>` 导入哨兵也算成测试。`import test_support` + 测试里的 `def test_support()`：0.171.3 答 `imports: 1`，`7d2ff671` 拒绝并把 `<external>` 叫作测试路径。修复 `e195400a`：返回 `NotFound`，删掉 `preferred_definitions` 判断（见决定）。RED：MCP 测试新加的 `test_support` 断言在 `6efd11be` 上失败（就是评审的复现文字）。
+- F2 MEDIUM（已复现）：变异 `!test_code.is_empty()` 跑完整套测试仍是绿的（2,291 通过）。原因是没有测试让测试代码的名字出现在拼错输入的近似行里。补了 `afte`（近似行里有测试的 `after`），单元测试和 MCP 测试各一处。变异结果（变异副本在 `/var/tmp/d440/src-mut`，不碰工作树）：`!test_code.is_empty()` 2 个红，改回 `Unique(name)` 3 个红，删掉规则 3 个红，未变异对照全绿。
+- F3 MEDIUM：CHANGELOG 把这一类写成"只在测试文件里定义的名字"，不准确。核对：flask 749 个里 3 个是 `src/flask/app.py` 里的生产方法（`test_client`、`test_request_context`、`test_cli_runner`，0.171.3 就被拒绝）；leveldb 33 个都在 `*_test.cc` 里，路径规则不认，名字规则 `*Test` 认。另外，名字规则判为测试的生产名字如果有近似名，0.171.3 答近似名，现在被拒绝，提示还把生产文件说成测试路径（评审的 fx1：`test_mode`、`LoadTest`、`ParserTest`，`e195400a` 上复现）。CHANGELOG 已改写。
+- F4 LOW（已复现，0.171.3 就有）：MCP `get_call_graph` 对两个测试代码定义共用的限定名合并回答，其他三个面按歧义拒绝。flask 9 个限定名在 BASE 和 HEAD 上一样；没有边时 0.171.3 答近似名，现在合并回答（fx2 `Index.get`）。写进 Not covered，不在本轮修。
+- F5 LOW（已复现，0.171.3 就有）：同名定义超过 10 个时 `find_references` 的假拒绝；写进 Not covered（D#445）。
+- F6 LOW：生成器每个名字只带一个定义它的文件（flask 121 个、leveldb 168 个名字定义在多个文件里）。CHANGELOG 改成"各带一个定义它的文件"。
+- 另：评审观察到 `test_cli_a_build_whose_server_holds_the_index_lock_is_not_a_dead_writer` 在机器繁忙时失败 1 次，单独重跑 3 次通过，与本次改动无关。
+
+修复后复测（`git archive e195400a` 构建，md5 `9d672730…`）：两个语料 101,608 次运行与 `6efd11be` 逐字节相同（CHANGELOG 的语料数字对 `e195400a` 成立）；评审的 fx1 480 次与评审的变异 M4 完全相同，与 `7d2ff671` 只差 `test_support` 的 2 次（回到 0.171.3 的回答）；fx2 与 `7d2ff671` 相同。`e195400a` 的 pre-commit：31 个套件 2,291 通过、0 失败、7 忽略，fmt、clippy 两条腿通过。

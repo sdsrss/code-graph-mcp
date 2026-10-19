@@ -30,15 +30,19 @@ the name asked:
   with no callees; CLI `callgraph` already skipped the fuzzy step for an
   exact qualified name.
 
+"Test files" here is the test rule's verdict: a test path, or a name like
+`test_*`, `*Test` or `*Tests`.
+
 Measured on flask and leveldb over every indexed name (1,087 and 1,327) and
-every dotted qualified name (386 and 1,167), each also with the file that
+every dotted qualified name (386 and 1,167), each also with one file that
 defines it, plus 200 typos and 200 prefixes per project, through MCP
 `get_call_graph` (three directions) and `find_references` and CLI `callgraph`
 (three directions) and `refs`, and the names with whitespace around them
 through the two MCP tools: 101,608 runs. 660 answers changed, for flask's 40
-names and 2 qualified names and leveldb's 18 and 14; 0.171.3 had answered each
-of them for another name, with a list of other names, or with "Ambiguous
-symbol" over other names, and each now names the symbol asked for. The other 100,948 runs are byte for byte 0.171.3's, typos and prefixes
+names and 2 qualified names and leveldb's 18 and 14; 0.171.3 had answered
+each of them for another name, with a list of other names, or with
+"Ambiguous symbol" over other names, and each now names the symbol asked
+for. The other 100,948 runs are byte for byte 0.171.3's, typos and prefixes
 included. With whitespace around them, these names get exactly the answers
 they get without it (31,736 runs).
 
@@ -49,10 +53,27 @@ they get without it (31,736 runs).
   answers for `FlaskGroup`, with the note, with or without whitespace around
   it. The CLI drops the qualifier instead (`No definition is named
   'Flask.route'; answering for 'route'`).
-- MCP `find_references` refuses a name only test files define and asks for
-  its `node_id` or `file_path`, where CLI `refs` answers it: 749 names in
-  flask, 33 in leveldb. The refusal can list one file twice (leveldb
+- MCP `find_references` refuses a name whose every definition the test rule
+  classes as test code, and asks for its `node_id` or `file_path`, where CLI
+  `refs` answers it: 749 names in flask, 33 in leveldb (all 33 in `*_test.cc`
+  files, classed by their `*Test` names). Because the rule also goes by name,
+  this covers production code too: flask's `Flask.test_client`,
+  `test_request_context` and `test_cli_runner` in `src/flask/app.py` are
+  refused, and the refusal calls that file a test path, as in 0.171.3. Such
+  a production name that 0.171.3 answered for a near name is now refused
+  this way. The refusal can list one file twice (leveldb
   `AddBoundaryInputsTest`: `db/version_set_test.cc, db/version_set_test.cc`).
+- MCP `find_references` decides from the first ten definitions the index
+  returns for a name. It reports at most 10 for an ambiguous name (18
+  leveldb names say "10 matches"; `Append` has 12, as `get_call_graph`
+  says), and when those ten are all test code it refuses the name as above
+  although production code defines it. 0.171.3 does the same.
+- MCP `get_call_graph` answers a qualified name that two test-code
+  definitions share with both merged, where CLI `callgraph` and `refs` and
+  `find_references` refuse it as ambiguous: 9 flask qualified names (such as
+  `Index.dispatch_request`), as in 0.171.3. Where such a name has no edge in
+  the asked direction, 0.171.3 answered for a near name when there was one;
+  this release answers it merged.
 - The other items under 0.171.3's Not covered are unchanged.
 
 ## 0.171.3
