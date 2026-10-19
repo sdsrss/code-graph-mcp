@@ -592,7 +592,9 @@ pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Va
 
 /// Outcome of fuzzy (substring-tolerant) name resolution.
 pub enum FuzzyResolution {
-    /// Exactly one candidate matched — use this name.
+    /// The name to answer for: the one exact match outside test code, the
+    /// typed name when only test code defines it (D#440), else the one near
+    /// match.
     Unique(String),
     /// Multiple candidates — the caller renders suggestions.
     Ambiguous(Vec<NameCandidate>),
@@ -612,11 +614,11 @@ pub enum FuzzyResolution {
 /// module exists to prevent, where the two copies gave opposite answers for one
 /// input. The MCP twin was regression-pinned; the CLI copy had zero tests.
 pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
-    let candidates: Vec<NameCandidate> = queries::find_functions_by_fuzzy_name(conn, name)?
-        .into_iter()
-        .filter(|c| is_selectable_definition(&c.file_path))
-        .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
-        .collect();
+    let (candidates, test_code): (Vec<NameCandidate>, Vec<NameCandidate>) =
+        queries::find_functions_by_fuzzy_name(conn, name)?
+            .into_iter()
+            .filter(|c| is_selectable_definition(&c.file_path))
+            .partition(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path));
 
     // Prefer exact name matches if any exist.
     let exact: Vec<NameCandidate> = candidates
@@ -631,6 +633,12 @@ pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
         // Same name in multiple files — still ambiguous, but scope the
         // suggestions to the exact matches so the caller sees the real collision.
         return Ok(FuzzyResolution::Ambiguous(exact));
+    }
+    // A name only test code defines is still the name asked for. Filtered out
+    // above, it was never exact, and the near matches below answered for
+    // another symbol: flask `after` for `after_request` (D#440).
+    if test_code.iter().any(|c| c.name == name) {
+        return Ok(FuzzyResolution::Unique(name.to_string()));
     }
     match candidates.len() {
         0 => Ok(FuzzyResolution::NotFound),
@@ -879,6 +887,38 @@ mod fuzzy_tests {
             resolve_fuzzy(db.conn(), "no_such_symbol_anywhere").unwrap(),
             FuzzyResolution::NotFound
         ));
+    }
+
+    /// D#440: the test filter ran before the exact-name check, so a name only
+    /// test code defines was never exact and resolved to its one non-test
+    /// near match: flask's `after` (its tests define it, its code does not)
+    /// answered for `after_request` on three surfaces. `test_mode` is the
+    /// filter's name leg: a production function it calls a test.
+    #[test]
+    fn a_name_defined_only_in_test_code_resolves_to_itself() {
+        let (_p, _d, db) = indexed(&[
+            (
+                "src/app.rs",
+                "pub fn after_request() {}\npub fn test_mode() {}\npub fn is_test_mode() {}\n",
+            ),
+            ("src/hooks_test.rs", "fn after() {}\n"),
+            ("src/more_test.rs", "fn after() {}\n"),
+        ]);
+        for typed in ["after", "test_mode"] {
+            match resolve_fuzzy(db.conn(), typed).unwrap() {
+                FuzzyResolution::Unique(n) => assert_eq!(n, typed),
+                FuzzyResolution::Ambiguous(c) => panic!(
+                    "{typed}: got {:?}",
+                    c.iter().map(|c| &c.name).collect::<Vec<_>>()
+                ),
+                FuzzyResolution::NotFound => panic!("{typed} is indexed"),
+            }
+        }
+        // A name nothing is called still reaches its near match.
+        match resolve_fuzzy(db.conn(), "after_req").unwrap() {
+            FuzzyResolution::Unique(n) => assert_eq!(n, "after_request"),
+            _ => panic!("after_req must resolve to after_request"),
+        }
     }
 
     /// E2E round 4 (D#393(4)): a name made only of `::` rewrote to the empty

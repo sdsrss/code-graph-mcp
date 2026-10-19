@@ -13653,6 +13653,44 @@ fn test_cli_refs_says_which_symbol_a_fuzzy_answer_is_for() {
     }
 }
 
+/// D#440: `callgraph` answered a name only test files define for its one
+/// non-test near match: flask `after` for `after_request`.
+#[test]
+fn test_cli_callgraph_answers_a_name_only_tests_define() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        "def after_request(f):\n    return f\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("tests/test_app.py"),
+        "def after(r):\n    return r\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    for direction in ["both", "callers", "callees"] {
+        let args = ["callgraph", "after", "--direction", direction, "--json"];
+        let (stdout, stderr, _) = run_cli(&project, &args);
+        assert!(!stderr.contains("Resolved '"), "{args:?}: {stderr}");
+        let out: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(out["symbol"], "after", "{args:?}: {stdout}");
+    }
+    // A name nothing is called still gets the near match.
+    let (stdout, stderr, _) = run_cli(&project, &["callgraph", "after_req", "--json"]);
+    assert!(
+        stderr.contains("Resolved 'after_req' → 'after_request'"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("after_request"), "{stdout}");
+}
+
 /// E2E 2026-10-16 (MCP-client QA, P1-1): during the MCP server's first index,
 /// `callgraph` printed an empty caller list with exit 0 for 20 s while the MCP
 /// tool answered "Indexing in progress"; and a CLI query's freshness writes in

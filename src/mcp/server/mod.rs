@@ -7876,16 +7876,13 @@ end
                     "{tool} {key} {typed}: {out}"
                 );
             }
-            // A name defined only in a test file. Which name the step picks is
-            // D#440's to settle; a switch, whichever it is, says so.
-            let out = call(tool, json!({ key: "validate" }));
-            match out[name_key].as_str() {
-                Some(answered) if answered != "validate" => assert_eq!(
-                    out["note"],
-                    format!("Resolved 'validate' → '{answered}'."),
-                    "{tool} {key}: {out}"
-                ),
-                _ => assert!(out.get("note").is_none(), "{tool} {key}: {out}"),
+            // A name defined only in a test file is that name, not a switch
+            // (D#440). find_references refuses it as it refuses any name only
+            // tests define: `test_an_exact_definition_is_answered_not_a_near_name`.
+            if tool == "get_call_graph" {
+                let out = call(tool, json!({ key: "validate" }));
+                assert_eq!(out[name_key], "validate", "{tool} {key}: {out}");
+                assert!(out.get("note").is_none(), "{tool} {key}: {out}");
             }
             let exact = call(tool, json!({ key: "validate_token" }));
             assert_eq!(exact[name_key], "validate_token", "{tool}: {exact}");
@@ -7901,6 +7898,82 @@ end
             out["note"], "Resolved 'validate_tokn' → 'validate_token'.",
             "{out}"
         );
+    }
+
+    /// D#440: the fuzzy step is for a name nothing is called, and it ran over
+    /// two kinds of exact definition. A name only test files define: flask
+    /// `after` answered for `after_request`. An exact qualified name with no
+    /// edge in the asked direction: leveldb `Block.size` callees answered for
+    /// the heading `Block size`, where CLI `callgraph` skips the step.
+    #[test]
+    fn test_an_exact_definition_is_answered_not_a_near_name() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("app.py"),
+            "def after_request(f):\n    return f\n\n\nclass Block:\n    def size(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        std::fs::write(
+            project.path().join("tests/test_app.py"),
+            "def after(r):\n    return r\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("doc")).unwrap();
+        std::fs::write(
+            project.path().join("doc/index.md"),
+            "# Index\n\n## Block size\n\nText.\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let call = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            (result["isError"].as_bool().unwrap_or(false), text)
+        };
+        let answer = |tool: &str, args: serde_json::Value| {
+            let (is_error, text) = call(tool, args.clone());
+            assert!(!is_error, "{tool} {args}: {text}");
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        for direction in ["both", "callers", "callees"] {
+            for typed in ["after", "Block.size"] {
+                let out = answer(
+                    "get_call_graph",
+                    json!({"symbol_name": typed, "direction": direction}),
+                );
+                assert_eq!(out["function"], typed, "{direction}: {out}");
+                assert!(out.get("note").is_none(), "{direction}: {out}");
+            }
+        }
+        // find_references gives the answer it gives any name only test files
+        // define, whatever else is named like it.
+        let (is_error, text) = call("find_references", json!({"symbol_name": "after"}));
+        assert!(is_error, "{text}");
+        assert!(
+            text.starts_with(
+                "Error: Symbol 'after' exists but all 1 match(es) are in test/bench paths"
+            ),
+            "{text}"
+        );
+        // A name nothing is called still gets the near match, and says so.
+        for (tool, key) in [
+            ("get_call_graph", "function"),
+            ("find_references", "symbol"),
+        ] {
+            let out = answer(tool, json!({"symbol_name": "after_req"}));
+            assert_eq!(out[key], "after_request", "{tool}: {out}");
+            assert_eq!(
+                out["note"], "Resolved 'after_req' → 'after_request'.",
+                "{tool}: {out}"
+            );
+        }
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name

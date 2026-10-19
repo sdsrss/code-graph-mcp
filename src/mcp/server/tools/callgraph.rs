@@ -226,7 +226,17 @@ impl McpServer {
                 return Err(anyhow!(miss.message(function_name, fp)));
             }
         }
-        if !(has_edges || (has_seed && file_path.is_some())) {
+        // CLI `callgraph` skips the fuzzy step for an exact qualified name
+        // (`is_exact_qualified`); here it answered leveldb `Block.size`
+        // callees, which has none, for the heading `Block size` (D#440).
+        let is_exact_qualified = function_name.contains('.')
+            && !crate::resolve::selectable_qualified_definitions(
+                self.db.conn(),
+                function_name,
+                file_path,
+            )?
+            .is_empty();
+        if !(is_exact_qualified || has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
                     let results2 = crate::graph::query::get_call_graph_filtered(
