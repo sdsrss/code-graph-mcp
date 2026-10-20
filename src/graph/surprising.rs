@@ -134,7 +134,8 @@ fn confidence_surprise(c: &str) -> i32 {
 
 fn confidence_reason(c: &str) -> String {
     if c == CONF_AMBIGUOUS {
-        "ambiguous: bare-name target has multiple candidates".to_string()
+        "ambiguous: bare-name target not decided (several candidates, or a TypeScript type)"
+            .to_string()
     } else if c == CONF_INFERRED {
         "inferred: cross-file bare-name resolution".to_string()
     } else {

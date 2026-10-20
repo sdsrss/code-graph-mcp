@@ -910,7 +910,7 @@ impl McpServer {
             }
 
             // Already indexed — just start watcher + embedding
-            self.start_post_index_services(&project_root);
+            self.start_post_index_services_late(&project_root);
             return;
         }
 
@@ -1217,25 +1217,38 @@ impl McpServer {
 
         // Start watcher + embedding
         if let Some(ref root) = self.project_root {
-            // The watcher starts only now, at the first message after the
-            // startup index (D#436(5)), so a change made since that index
-            // scanned raised no event, and with a watcher live the next rescan
-            // is the backstop's: a file created there was "not found" 130 s
-            // later on flask. Catch up here, before the embedding backfill
-            // below is spawned and this incremental would have to wait for it.
-            if self.start_watcher(root) && self.may_write_index() {
-                match self.run_incremental_with_cache_restore(root, None) {
-                    Ok(()) => {
-                        *lock_or_recover(&self.last_incremental_check, "last_incremental_check") =
-                            std::time::Instant::now();
-                    }
-                    Err(e) => tracing::warn!(
-                        "Catch-up index after the file watcher started failed (still owed): {e}"
-                    ),
-                }
-            }
-            self.start_post_index_services(root);
+            self.start_post_index_services_late(root);
         }
+    }
+
+    /// [`Self::start_post_index_services`] for a watcher that starts after the
+    /// index it watches was built — at the first message after the startup
+    /// index, or at `initialized` after a tool call indexed synchronously
+    /// (D#436(5)). A change made in between raised no event, and with a watcher
+    /// live the next rescan is the backstop's: a file created there was "not
+    /// found" 130 s later on flask. When the disk differs, the incremental is
+    /// owed, and the next `ensure_indexed` runs it once. Only then: an
+    /// incremental waits for the embedding backfill to yield, the startup
+    /// thread runs one itself, and a batch of 32 took 6.8–10.3 s in review.
+    fn start_post_index_services_late(&self, project_root: &Path) {
+        if self.start_post_index_services(project_root)
+            && self.disk_differs_from_index(project_root)
+        {
+            self.indexing
+                .pending_incremental
+                .store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether the tree on disk differs from the index, read without writing
+    /// or waiting. Unknown counts as different: the incremental decides.
+    fn disk_differs_from_index(&self, project_root: &Path) -> bool {
+        let cache = lock_or_recover(&self.dir_cache, "dir_cache").clone();
+        crate::indexer::pipeline::index_differs_from_disk(&self.db, project_root, cache.as_ref())
+            .unwrap_or_else(|e| {
+                tracing::warn!("Could not compare the tree with the index: {e}");
+                true
+            })
     }
 
     /// Start the file watcher unless one is running. True when this call
@@ -1262,9 +1275,10 @@ impl McpServer {
         }
     }
 
-    /// Start file watcher and background embedding (called after indexing completes).
-    fn start_post_index_services(&self, project_root: &Path) {
-        self.start_watcher(project_root);
+    /// Start file watcher and background embedding (called after indexing
+    /// completes). True when this call started the watcher.
+    fn start_post_index_services(&self, project_root: &Path) -> bool {
+        let watcher_started = self.start_watcher(project_root);
 
         // Repair Phase-3 casualties (NULL context_string from prior-session crashes)
         // BEFORE spawning embedding, so rebuilt context strings get vectorized in the
@@ -1281,6 +1295,8 @@ impl McpServer {
 
         #[cfg(feature = "embed-model")]
         self.spawn_model_download();
+
+        watcher_started
     }
 
     /// Spawn a background thread that runs `repair_null_context_strings` once per
@@ -6570,29 +6586,8 @@ app.post('/api/login', handleLogin);
     #[test]
     fn test_change_before_the_watcher_starts_is_seen_by_the_first_call() {
         let project = TempDir::new().unwrap();
-        std::fs::write(project.path().join("a.py"), "def alpha():\n    return 1\n").unwrap();
-        let mut server = McpServer::new_test_with_project(project.path());
-        server.timing.watcher_backstop = std::time::Duration::from_secs(WATCHER_BACKSTOP_SECS);
-        server.spawn_startup_indexing(project.path().to_path_buf(), false, None);
-        {
-            let (lock, cvar) = &*server.indexing.startup_indexing_done;
-            let mut done = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !*done {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                assert!(!left.is_zero(), "the startup run never finished");
-                done = cvar.wait_timeout(done, left).unwrap().0;
-            }
-        }
-        assert!(
-            lock_or_recover(&server.watcher, "watcher").is_none(),
-            "precondition: no watcher before the first tool call"
-        );
-        std::fs::write(
-            project.path().join("late.py"),
-            "def late_fn():\n    return 2\n",
-        )
-        .unwrap();
+        let server = server_after_startup_index(project.path());
+        write_late_file(project.path());
 
         server.ensure_indexed().unwrap();
         // Without a watcher the no-watcher debounce would rescan anyway; this
@@ -6607,6 +6602,144 @@ app.post('/api/login', handleLogin);
                 .is_empty(),
             "a file created before the watcher started must be indexed by that call"
         );
+    }
+
+    /// A server whose background startup index of `project` (one file) has
+    /// finished, with the production backstop and no tool call made yet.
+    fn server_after_startup_index(project: &Path) -> McpServer {
+        std::fs::write(project.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project);
+        server.timing.watcher_backstop = std::time::Duration::from_secs(WATCHER_BACKSTOP_SECS);
+        server.spawn_startup_indexing(project.to_path_buf(), false, None);
+        {
+            let (lock, cvar) = &*server.indexing.startup_indexing_done;
+            let mut done = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !*done {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "the startup run never finished");
+                done = cvar.wait_timeout(done, left).unwrap().0;
+            }
+        }
+        assert!(
+            lock_or_recover(&server.watcher, "watcher").is_none(),
+            "precondition: no watcher before the first tool call"
+        );
+        server
+    }
+
+    fn write_late_file(project: &Path) {
+        std::fs::write(project.join("late.py"), "def late_fn():\n    return 2\n").unwrap();
+    }
+
+    fn late_fn_indexed(server: &McpServer) -> bool {
+        !queries::get_node_ids_by_name(server.db().conn(), "late_fn")
+            .unwrap()
+            .is_empty()
+    }
+
+    /// D#436(5) review: the startup thread runs the embedding backfill itself
+    /// (embed-model builds), so it is usually running when the first call
+    /// arrives, and an incremental must wait for it to yield — a batch of 32
+    /// took 6.8–10.3 s on the reviewer's machine. With nothing changed there is
+    /// nothing to catch up, and the first call must not wait at all.
+    #[test]
+    fn test_first_call_with_nothing_to_catch_up_does_not_wait_for_the_backfill() {
+        let project = TempDir::new().unwrap();
+        let server = server_after_startup_index(project.path());
+        // A backfill that never reaches a batch boundary.
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::Release);
+
+        let started = std::time::Instant::now();
+        server.ensure_indexed().unwrap();
+        let waited = started.elapsed();
+
+        assert!(lock_or_recover(&server.watcher, "watcher").is_some());
+        assert!(
+            waited < std::time::Duration::from_secs(EMBEDDING_YIELD_WAIT_SECS) / 2,
+            "the first call waited {waited:?} with no change to index"
+        );
+        assert!(!server.indexing.pending_incremental.load(Ordering::Acquire));
+    }
+
+    /// With a change to catch up and a backfill that will not yield, the first
+    /// call waits once, not once for the catch-up and again for the incremental
+    /// it left owed; the change stays owed and the next call indexes it.
+    #[test]
+    fn test_first_call_waits_for_the_backfill_at_most_once() {
+        let project = TempDir::new().unwrap();
+        let server = server_after_startup_index(project.path());
+        write_late_file(project.path());
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::Release);
+
+        let started = std::time::Instant::now();
+        server.ensure_indexed().unwrap();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(EMBEDDING_YIELD_WAIT_SECS * 3) / 2,
+            "the first call waited {waited:?}, more than one yield wait of {EMBEDDING_YIELD_WAIT_SECS} s"
+        );
+        assert!(!late_fn_indexed(&server));
+        assert!(
+            server.indexing.pending_incremental.load(Ordering::Acquire),
+            "the change stays owed"
+        );
+        server
+            .indexing
+            .embedding_in_progress
+            .store(false, Ordering::Release);
+        server.ensure_indexed().unwrap();
+        assert!(late_fn_indexed(&server));
+    }
+
+    /// A non-tool message can consume the startup result (`run_startup_tasks`
+    /// runs after every message). It must not block the stdio loop on an
+    /// incremental; the next tool call indexes the change.
+    #[test]
+    fn test_catch_up_after_a_non_tool_message_waits_for_the_next_call() {
+        let project = TempDir::new().unwrap();
+        let server = server_after_startup_index(project.path());
+        write_late_file(project.path());
+
+        server.run_startup_tasks();
+        assert!(lock_or_recover(&server.watcher, "watcher").is_some());
+        assert!(server.indexing.pending_incremental.load(Ordering::Acquire));
+
+        server.ensure_indexed().unwrap();
+        assert!(late_fn_indexed(&server));
+        assert!(!server.indexing.pending_incremental.load(Ordering::Acquire));
+    }
+
+    /// The other late start: a tool call that arrives before
+    /// `notifications/initialized` indexes synchronously and starts no
+    /// watcher; `initialized` then finds the index built and starts it. A
+    /// change made in between must be caught up as well.
+    #[test]
+    fn test_watcher_started_at_initialized_on_a_built_index_catches_up() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.timing.watcher_backstop = std::time::Duration::from_secs(WATCHER_BACKSTOP_SECS);
+        server.ensure_indexed().unwrap();
+        assert!(lock_or_recover(&server.watcher, "watcher").is_none());
+        write_late_file(project.path());
+
+        *lock_or_recover(
+            &server.indexing.startup_index_pending,
+            "startup_index_pending",
+        ) = true;
+        server.run_startup_tasks();
+        assert!(lock_or_recover(&server.watcher, "watcher").is_some());
+
+        server.ensure_indexed().unwrap();
+        assert!(late_fn_indexed(&server));
     }
 
     #[test]

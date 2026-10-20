@@ -2950,9 +2950,22 @@ fn test_cpp_field_type_change_re_resolves_untouched_callers() {
 /// `new Response()` (the global) was bound to the project's `interface
 /// Response`, 69 of the 82 such edges in its default tier. The edge is kept and
 /// labelled `ambiguous`; a reference to the type keeps its label.
+///
+/// Run twice: a run of at most `SCOPED_POST_PASS_MAX_FILES` files labels
+/// through the scoped post-pass driver, a larger one through the global one,
+/// and each driver carries its own copy of the rule's SQL.
 #[test]
 fn test_ts_call_into_an_interface_or_type_alias_is_ambiguous() {
-    let (_p, _d, db) = fresh_index_of(&[
+    let filler: Vec<(String, String)> = (0..65)
+        .map(|i| {
+            (
+                format!("fill/f{i}.ts"),
+                format!("export const v{i} = {i}\n"),
+            )
+        })
+        .collect();
+    assert!(filler.len() > super::index_files::SCOPED_POST_PASS_MAX_FILES);
+    let base: &[(&str, &str)] = &[
         (
             "src/types.ts",
             "export interface Response {\n  ok: boolean\n}\nexport type Make = { a: number }\n",
@@ -2979,7 +2992,20 @@ fn test_ts_call_into_an_interface_or_type_alias_is_ambiguous() {
             "go/b.go",
             "package p\n\nfunc wrap(f func()) HandlerFunc {\n\treturn HandlerFunc(f)\n}\n",
         ),
-    ]);
+    ];
+    for extra in [0, filler.len()] {
+        let mut files = base.to_vec();
+        files.extend(
+            filler[..extra]
+                .iter()
+                .map(|(p, b)| (p.as_str(), b.as_str())),
+        );
+        assert_ts_type_calls_are_ambiguous(&files);
+    }
+}
+
+fn assert_ts_type_calls_are_ambiguous(files: &[(&str, &str)]) {
+    let (_p, _d, db) = fresh_index_of(files);
     assert_eq!(
         call_edges_with_confidence(&db),
         [
@@ -2991,7 +3017,9 @@ fn test_ts_call_into_an_interface_or_type_alias_is_ambiguous() {
             "src/d.tsx.view -> src/props.tsx.Props - ambiguous",
             // Same file: was `extracted`.
             "src/s.ts.mk -> src/s.ts.User - ambiguous",
-        ]
+        ],
+        "{} files",
+        files.len()
     );
     let refs: Vec<(String, String)> = db
         .conn()
@@ -3011,7 +3039,8 @@ fn test_ts_call_into_an_interface_or_type_alias_is_ambiguous() {
             ("take -> Response".to_string(), "inferred".to_string()),
             ("wrap -> HandlerFunc".to_string(), "inferred".to_string()),
         ],
-        "a type in a signature is a reference, not a call"
+        "a type in a signature is a reference, not a call ({} files)",
+        files.len()
     );
 }
 
@@ -3071,6 +3100,47 @@ fn test_ts_type_call_label_converges_incrementally_to_a_rebuild() {
         &[("src/types.ts", IFACE), ("src/c.ts", CALL)],
         &[("src/f.ts", Some(FUNC))],
     );
+}
+
+/// D#436(5): the MCP server asks this before arming a catch-up incremental, so
+/// "no" must mean an incremental would index nothing. The `<external>`
+/// pseudo-file is in the index and never on disk; it is not a deletion.
+#[test]
+fn test_index_differs_from_disk_only_when_a_run_would_index_something() {
+    let (project, _d, db) = fresh_index_of(&[
+        (
+            "a.py",
+            "import os\n\ndef alpha():\n    return os.getcwd()\n",
+        ),
+        ("b.py", "def beta():\n    return 2\n"),
+    ]);
+    assert!(
+        get_all_file_hashes(db.conn())
+            .unwrap()
+            .contains_key(crate::domain::EXTERNAL_FILE_PATH),
+        "precondition: the index holds the <external> pseudo-file"
+    );
+    let (_, cache) = run_incremental_index_cached(&db, project.path(), None, None, None).unwrap();
+    let differs = |cache: Option<&crate::indexer::merkle::DirectoryCache>| {
+        index_differs_from_disk(&db, project.path(), cache).unwrap()
+    };
+    assert!(!differs(None));
+    assert!(!differs(Some(&cache)));
+
+    fs::write(project.path().join("c.py"), "def gamma():\n    return 3\n").unwrap();
+    assert!(differs(Some(&cache)), "a new file");
+    // Asking leaves the index alone: the run it leads to finds the file.
+    assert!(differs(Some(&cache)));
+    fs::remove_file(project.path().join("c.py")).unwrap();
+    assert!(!differs(Some(&cache)));
+
+    fs::write(project.path().join("b.py"), "def beta():\n    return 20\n").unwrap();
+    assert!(differs(Some(&cache)), "a changed file");
+    fs::write(project.path().join("b.py"), "def beta():\n    return 2\n").unwrap();
+    assert!(!differs(None));
+
+    fs::remove_file(project.path().join("b.py")).unwrap();
+    assert!(differs(Some(&cache)), "a deleted file");
 }
 
 /// A typed call its class did not decide (two same-named bases) is as much a

@@ -1554,8 +1554,9 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 ///   call is excluded by construction, instead of by a second predicate here
 ///   that would have to be kept in step with `conf_case`. The one other label
 ///   it reuses is a TypeScript call into an `interface` / `type` (D#370(d)),
-///   import-bound or not: re-extracting that caller when the name gains a
-///   definition lets it bind the new one, as a rebuild would.
+///   import-bound or not: such a caller is re-extracted when the name gains a
+///   definition and resolves as a rebuild does, which for an import-bound
+///   call is the same edge again — extra work, not a different answer.
 ///
 /// Drops its own temps: unlike the scope tables, nothing downstream reads these.
 pub(super) fn bare_name_callers_of_new_duplicates(
@@ -2249,8 +2250,9 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     // declaration exists only at compile time, so it is never the runtime
     // callee: on hono `new Response()`, the global, was bound to the project's
     // `interface Response` (69 of 82 such edges, 8.4% of its `inferred` calls),
-    // and a value sharing a type's name (`const User = …; type User = …`) has
-    // no node, so its calls bind the type even inside one file. Every such
+    // and when a value sharing a type's name has no node (`type User = …`
+    // beside a `const User` the index does not hold), its calls bind the
+    // type, even inside one file. Every such
     // edge, same-file or not, is `ambiguous` — kept, so an incremental run that
     // turns the type into a function finds the edge to re-point, but below the
     // default floor. References to a type keep their label.

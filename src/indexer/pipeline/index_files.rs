@@ -230,7 +230,7 @@ const STATS_REFRESH_MIN_FILES: usize = 50;
 /// refresh and every file-watcher flush. It stops paying when the changed set
 /// approaches the graph — and a full index MUST be `Global` regardless, since it
 /// is the base case every later incremental run's completeness argument assumes.
-const SCOPED_POST_PASS_MAX_FILES: usize = 64;
+pub(super) const SCOPED_POST_PASS_MAX_FILES: usize = 64;
 
 // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
 struct FilePreParsed {

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::merkle::{compute_diff, scan_directory_cached, DirectoryCache};
+use crate::indexer::merkle::{compute_diff, scan_directory_cached, DiffResult, DirectoryCache};
 use crate::storage::db::Database;
 use crate::storage::queries::{get_all_file_hashes, get_dirty_node_ids};
 
@@ -602,16 +602,15 @@ pub fn run_incremental_index(
     run_incremental_index_cached(db, project_root, model, None, progress).map(|(result, _)| result)
 }
 
-/// Incremental index with directory mtime cache for faster scanning.
-/// Files in unchanged directories are skipped entirely.
-pub fn run_incremental_index_cached(
+/// The tree on disk against the index, before anything is written: every file's
+/// current hash, the scan's new directory cache, and the diff against the
+/// stored hashes. The `<external>` pseudo-file is never on disk and is not a
+/// deletion.
+fn scan_against_index(
     db: &Database,
     project_root: &Path,
-    model: Option<&EmbeddingModel>,
     dir_cache: Option<&DirectoryCache>,
-    progress: Option<ProgressFn>,
-) -> Result<(IndexResult, DirectoryCache)> {
-    let start = std::time::Instant::now();
+) -> Result<(HashMap<String, String>, DirectoryCache, DiffResult)> {
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let (mut current_hashes, new_cache) = scan_directory_cached(project_root, dir_cache)?;
 
@@ -626,14 +625,38 @@ pub fn run_incremental_index_cached(
         }
     }
 
-    let diff = compute_diff(&stored_hashes, &current_hashes);
+    let mut diff = compute_diff(&stored_hashes, &current_hashes);
+    diff.deleted_files
+        .retain(|p| p != crate::domain::EXTERNAL_FILE_PATH);
+    Ok((current_hashes, new_cache, diff))
+}
 
-    // Preserve <external> pseudo-file across incremental indexes
-    let deleted_files: Vec<String> = diff
-        .deleted_files
-        .into_iter()
-        .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
-        .collect();
+/// Whether an incremental run would find a file new, changed or deleted on
+/// disk. Writes nothing, and takes the directory cache by reference so the run
+/// it may lead to still compares against the same cache and sees the change.
+pub fn index_differs_from_disk(
+    db: &Database,
+    project_root: &Path,
+    dir_cache: Option<&DirectoryCache>,
+) -> Result<bool> {
+    let (_, _, diff) = scan_against_index(db, project_root, dir_cache)?;
+    Ok(!(diff.new_files.is_empty()
+        && diff.changed_files.is_empty()
+        && diff.deleted_files.is_empty()))
+}
+
+/// Incremental index with directory mtime cache for faster scanning.
+/// Files in unchanged directories are skipped entirely.
+pub fn run_incremental_index_cached(
+    db: &Database,
+    project_root: &Path,
+    model: Option<&EmbeddingModel>,
+    dir_cache: Option<&DirectoryCache>,
+    progress: Option<ProgressFn>,
+) -> Result<(IndexResult, DirectoryCache)> {
+    let start = std::time::Instant::now();
+    let (current_hashes, new_cache, diff) = scan_against_index(db, project_root, dir_cache)?;
+    let deleted_files = diff.deleted_files;
     // Same interrupted-run escalation as `run_incremental_index`. `current_hashes`
     // is complete here too — the merge above carries forward the stored hash of
     // every file in a directory the cache let us skip walking.
