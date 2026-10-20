@@ -1588,7 +1588,7 @@ fn restore_does_not_fan_out_to_a_same_name_sibling() {
     // The sibling test above used to carry this guard and can no longer: there,
     // D#24's fan-out round writes the same row a wrong restore would, and
     // `idx_edges_unique` collapses them. Here the call is IMPORT-BOUND, so
-    // `CONF_CASE` labels it `inferred` rather than `ambiguous`, and the fan-out
+    // `conf_case` labels it `inferred` rather than `ambiguous`, and the fan-out
     // round — which selects `ambiguous` callers only — provably never opens
     // caller.ts. Anything that appears pointing at other.ts came from the
     // restore.
@@ -2942,6 +2942,134 @@ fn test_cpp_field_type_change_re_resolves_untouched_callers() {
     assert_incremental_matches_rebuild(
         &[("db_impl.hpp", &without), ("db_impl.cc", DB_IMPL_CC)],
         &[("db_impl.hpp", Some(DB_IMPL_HPP))],
+    );
+}
+
+/// D#370(d): a TypeScript `interface` or `type` alias exists only at compile
+/// time, so a call bound to one by name is never the runtime callee — on hono
+/// `new Response()` (the global) was bound to the project's `interface
+/// Response`, 69 of the 82 such edges in its default tier. The edge is kept and
+/// labelled `ambiguous`; a reference to the type keeps its label.
+#[test]
+fn test_ts_call_into_an_interface_or_type_alias_is_ambiguous() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "src/types.ts",
+            "export interface Response {\n  ok: boolean\n}\nexport type Make = { a: number }\n",
+        ),
+        ("src/props.tsx", "export interface Props {\n  n: number\n}\n"),
+        ("src/helper.ts", "export function helper() {\n  return 1\n}\n"),
+        (
+            "src/c.ts",
+            "export function run() {\n  helper()\n  Make()\n  return new Response()\n}\n",
+        ),
+        ("src/d.tsx", "export function view() {\n  return Props()\n}\n"),
+        (
+            "src/s.ts",
+            "export type User = { id: number }\nexport function mk() {\n  return User()\n}\n",
+        ),
+        (
+            "src/r.ts",
+            "import { Response } from './types'\nexport function take(r: Response) {\n  return r.ok\n}\n",
+        ),
+        // TypeScript only: a Go conversion names a type that does exist at
+        // run time (gin `HandlerFunc(f)`).
+        ("go/a.go", "package p\n\ntype HandlerFunc func()\n"),
+        (
+            "go/b.go",
+            "package p\n\nfunc wrap(f func()) HandlerFunc {\n\treturn HandlerFunc(f)\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        [
+            "go/b.go.wrap -> go/a.go.HandlerFunc - inferred",
+            // A function: untouched.
+            "src/c.ts.run -> src/helper.ts.helper - inferred",
+            "src/c.ts.run -> src/types.ts.Make - ambiguous",
+            "src/c.ts.run -> src/types.ts.Response - ambiguous",
+            "src/d.tsx.view -> src/props.tsx.Props - ambiguous",
+            // Same file: was `extracted`.
+            "src/s.ts.mk -> src/s.ts.User - ambiguous",
+        ]
+    );
+    let refs: Vec<(String, String)> = db
+        .conn()
+        .prepare(
+            "SELECT ns.name || ' -> ' || nt.name, e.confidence FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             WHERE e.relation = 'references' ORDER BY 1",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        refs,
+        [
+            ("take -> Response".to_string(), "inferred".to_string()),
+            ("wrap -> HandlerFunc".to_string(), "inferred".to_string()),
+        ],
+        "a type in a signature is a reference, not a call"
+    );
+}
+
+/// D#370(d): the label depends on the target's kind, so every way a name moves
+/// between a type and a value must leave an incremental run where a rebuild
+/// is. The shapes are the ones the 0.174.0 review used against the withdrawn
+/// edge-deleting version (F3), which a type-turned-function never re-bound.
+#[test]
+fn test_ts_type_call_label_converges_incrementally_to_a_rebuild() {
+    const IFACE: &str = "export interface Foo {\n  x: number\n}\n";
+    const FUNC: &str = "export function Foo() {\n  return 1\n}\n";
+    const CALL: &str = "export function run() {\n  return Foo()\n}\n";
+    const IMPORTED_CALL: &str =
+        "import { Foo } from './types'\nexport function run2() {\n  return Foo()\n}\n";
+    // The interface becomes a function, callers untouched.
+    assert_incremental_matches_rebuild(
+        &[
+            ("src/types.ts", IFACE),
+            ("src/caller.ts", CALL),
+            ("src/caller2.ts", IMPORTED_CALL),
+        ],
+        &[("src/types.ts", Some(FUNC))],
+    );
+    // An interface is added beside the function, then removed.
+    assert_incremental_matches_rebuild(
+        &[("src/a.ts", FUNC), ("src/c.ts", CALL)],
+        &[("src/b.ts", Some(IFACE))],
+    );
+    assert_incremental_matches_rebuild(
+        &[("src/a.ts", FUNC), ("src/b.ts", IFACE), ("src/c.ts", CALL)],
+        &[("src/b.ts", None)],
+    );
+    // A type alias becomes a value of the same name.
+    assert_incremental_matches_rebuild(
+        &[
+            (
+                "src/t.ts",
+                "export type Make = { a: number }\nexport function other() { return 2 }\n",
+            ),
+            ("src/c.ts", "export function run() {\n  return Make()\n}\n"),
+        ],
+        &[(
+            "src/t.ts",
+            Some("export const Make = () => ({ a: 1 })\nexport function other() { return 2 }\n"),
+        )],
+    );
+    // A function joins the interface in its own file (declaration merging).
+    assert_incremental_matches_rebuild(
+        &[("src/types.ts", IFACE), ("src/c.ts", IMPORTED_CALL)],
+        &[(
+            "src/types.ts",
+            Some("export interface Foo {\n  x: number\n}\nexport function Foo(): Foo {\n  return { x: 1 }\n}\n"),
+        )],
+    );
+    // A function of the same name appears in another file.
+    assert_incremental_matches_rebuild(
+        &[("src/types.ts", IFACE), ("src/c.ts", CALL)],
+        &[("src/f.ts", Some(FUNC))],
     );
 }
 
@@ -7977,8 +8105,8 @@ fn an_ordinary_edit_does_not_drag_callers_into_a_fanout_round() {
 fn a_new_same_name_definition_reaches_an_untouched_bare_reference() {
     // D#24's other half, found by pre-ship review of the first fix (2026-09-11).
     //
-    // `CONF_CASE` labels TWO relations `ambiguous`, not one: `classify_edge_confidence`
-    // binds `CONF_WHERE`'s parameters as `params![REL_CALLS, REL_REFERENCES, ...]`
+    // `conf_case` labels TWO relations `ambiguous`, not one: `classify_edge_confidence`
+    // binds `conf_where`'s parameters as `params![REL_CALLS, REL_REFERENCES, ...]`
     // (resolve.rs). A `references` edge therefore fans out to every same-name
     // candidate exactly as a `calls` edge does — and the first version of the
     // fan-out round filtered `e.relation = 'calls'` alone, so it repaired half

@@ -1546,13 +1546,16 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 ///   difference. A name that LOST a definition needs no new edge; the surviving
 ///   edges only need the relabel the post passes already do.
 /// * **Which callers.** Files outside the run holding a `calls` edge to that
-///   name that Phase 2e has just labelled `ambiguous`. `CONF_CASE` assigns that
+///   name that Phase 2e has just labelled `ambiguous`. `conf_case` assigns that
 ///   label exactly when the target name's count is >1 AND the caller's file does
 ///   not import that exact target AND the edge carries no type/path qualifier —
 ///   which is the definition of "resolved by a bare name among same-name
 ///   siblings". Reusing that verdict means an import-bound or type-qualified
 ///   call is excluded by construction, instead of by a second predicate here
-///   that would have to be kept in step with `CONF_CASE`.
+///   that would have to be kept in step with `conf_case`. The one other label
+///   it reuses is a TypeScript call into an `interface` / `type` (D#370(d)),
+///   import-bound or not: re-extracting that caller when the name gains a
+///   definition lets it bind the new one, as a rebuild would.
 ///
 /// Drops its own temps: unlike the scope tables, nothing downstream reads these.
 pub(super) fn bare_name_callers_of_new_duplicates(
@@ -1565,7 +1568,7 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     // unique — `cg_fanout_after` groups by both — so no DISTINCT is needed here,
     // and carrying the language is what keeps the round from firing across
     // languages: a rise in the JavaScript count of `render` says nothing about a
-    // Python caller of `render`, because `CONF_CASE` joins its name count as
+    // Python caller of `render`, because `conf_case` joins its name count as
     // `nc.lang IS tf.language` and so can never label that pair `ambiguous` in
     // the first place. The first version dropped the language here and joined on
     // name alone, which re-extracted callers in every language sharing a common
@@ -1590,13 +1593,13 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);",
     )?;
 
-    // BOTH relations `CONF_CASE` can label `ambiguous`, not just `calls`:
-    // `classify_edge_confidence` binds its `CONF_WHERE` parameters as
+    // BOTH relations `conf_case` can label `ambiguous`, not just `calls`:
+    // `classify_edge_confidence` binds its `conf_where` parameters as
     // `params![REL_CALLS, REL_REFERENCES, ...]`. A `references` edge — a type
     // mentioned in a signature, say — fans out to every same-name candidate
     // exactly as a call does, so leaving it out repaired one population and
     // silently left the other. Both constants come from `domain.rs` so this set
-    // cannot drift from `CONF_CASE`'s again; found by pre-ship review, which
+    // cannot drift from `conf_case`'s again; found by pre-ship review, which
     // measured 14 of 35 ambiguous edges in this repo's own index as
     // `references`.
     //
@@ -2214,13 +2217,15 @@ pub(super) fn prune_import_contradicted_call_edges(
 /// resolution + the structural relations imports/inherits/implements/routes_to/
 /// exports) is correct without touching its insert site. This pass only
 /// DOWNGRADES cross-file `calls`/`references` edges, and the same-file Rust
-/// method calls on an untyped receiver (D#162) and Python calls on an untyped
-/// receiver (D10B, see `CONF_WHERE`) — the by-name-resolved class:
+/// method calls on an untyped receiver (D#162), Python calls on an untyped
+/// receiver (D10B, see `conf_where`) and TypeScript calls into a type
+/// (D#370(d)) — the by-name-resolved class:
 ///   - `inferred`  when the target name is unique among same-language nodes;
 ///   - `ambiguous` when >1 same-language node shares the target name (the
 ///     by-name resolution could not pick uniquely — the known false-positive
 ///     class: bare_name_call_qualifier / method_call_edge_drops /
-///     value_reference_candidate_gen).
+///     value_reference_candidate_gen), and for every TypeScript call into an
+///     `interface` or `type` alias, which is never the runtime callee.
 ///
 /// Idempotent: re-running recomputes from current node state, so an `inferred`
 /// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
@@ -2240,13 +2245,27 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
            GROUP BY n.name, f.language;
          CREATE INDEX cg_namecount_k ON cg_namecount(nm, lang);",
     )?;
+    // A call bound to a TypeScript `interface` or `type` alias (D#370(d)). The
+    // declaration exists only at compile time, so it is never the runtime
+    // callee: on hono `new Response()`, the global, was bound to the project's
+    // `interface Response` (69 of 82 such edges, 8.4% of its `inferred` calls),
+    // and a value sharing a type's name (`const User = …; type User = …`) has
+    // no node, so its calls bind the type even inside one file. Every such
+    // edge, same-file or not, is `ambiguous` — kept, so an incremental run that
+    // turns the type into a function finds the edge to re-point, but below the
+    // default floor. References to a type keep their label.
+    const TS_TYPE_CALL: &str = "(e.relation = ?1
+                  AND tgt.type IN ('interface', 'type')
+                  AND tf.language IN ('typescript', 'tsx'))";
     // The classification itself — one expression, spent by every driver below.
     // `nc` is the same-name/same-language count; `e`, `src`, `tgt` are the edge
-    // and its two endpoints. Kept as one constant because a scoped copy that
+    // and its two endpoints. Kept as one string because a scoped copy that
     // drifted from the global one would label the same edge two ways depending
     // on how the index happened to be grown, which is the incremental-vs-rebuild
     // divergence class this pipeline has paid for twice already.
-    const CONF_CASE: &str = "CASE
+    let conf_case = format!(
+        "CASE
+                 WHEN {TS_TYPE_CALL} THEN ?3
                  WHEN nc.cnt > 1
                       -- ... UNLESS the caller's file explicitly imports THIS exact
                       -- target. An import binds the bare name to one node, so the
@@ -2278,7 +2297,8 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       AND (json_extract(e.metadata, '$.q') IS NULL
                            OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
-                 THEN ?3 ELSE ?4 END";
+                 THEN ?3 ELSE ?4 END"
+    );
     // Cross-file edges, plus one same-file class (D#162): a Rust method call
     // whose receiver the source leaves untyped (`q` member / chain with no
     // `rt`). `amb` would mark a typed one its type did not decide, but only
@@ -2302,7 +2322,11 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     // `self.x.f()` binds 14 right (6 of 24 where the name has another
     // definition), of 28 relative-import binds 4 credited and none right on
     // reading the code. A local receiver (`q` member) stays out: 63 of 80 right.
-    const CONF_WHERE: &str = "
+    //
+    // A same-file TypeScript call into a type is the third same-file class
+    // (`TS_TYPE_CALL` above).
+    let conf_where = format!(
+        "
              WHERE e.relation IN (?1, ?2)
                AND (src.file_id <> tgt.file_id
                     OR (tf.language = 'rust'
@@ -2310,50 +2334,52 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                         AND (json_extract(e.metadata, '$.rt') IS NULL
                              OR json_extract(e.metadata, '$.amb') IS NOT NULL))
                     OR (tf.language = 'python'
-                        AND json_extract(e.metadata, '$.ur') IS NOT NULL))";
+                        AND json_extract(e.metadata, '$.ur') IS NOT NULL)
+                    OR {TS_TYPE_CALL})"
+    );
     // Which edges to reconsider. The scoped form is three arms — the caller
     // moved, the callee moved, or the callee's NAME changed how many nodes
     // share it. Only the third needs `cg_scope_names`, and only this pass has
     // a globally-varying input that makes it necessary.
     let driver = if scope.is_global() {
         format!(
-            "SELECT e.id AS eid, {CONF_CASE} AS conf
+            "SELECT e.id AS eid, {conf_case} AS conf
              FROM edges e
              JOIN nodes src ON src.id = e.source_id
              JOIN nodes tgt ON tgt.id = e.target_id
              JOIN files tf ON tf.id = tgt.file_id
              JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
-             {CONF_WHERE}"
+             {conf_where}"
         )
     } else {
         format!(
             "SELECT eid, conf FROM (
-               SELECT e.id AS eid, {CONF_CASE} AS conf
+               SELECT e.id AS eid, {conf_case} AS conf
                FROM cg_scope_files s
                CROSS JOIN nodes src ON src.file_id = s.fid
                CROSS JOIN edges e ON e.source_id = src.id
                CROSS JOIN nodes tgt ON tgt.id = e.target_id
                CROSS JOIN files tf ON tf.id = tgt.file_id
                CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
-               {CONF_WHERE}
+               {conf_where}
                UNION
-               SELECT e.id AS eid, {CONF_CASE} AS conf
+               SELECT e.id AS eid, {conf_case} AS conf
                FROM cg_scope_files s
                CROSS JOIN nodes tgt ON tgt.file_id = s.fid
                CROSS JOIN edges e ON e.target_id = tgt.id
                CROSS JOIN nodes src ON src.id = e.source_id
                CROSS JOIN files tf ON tf.id = tgt.file_id
                CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
-               {CONF_WHERE}
+               {conf_where}
                UNION
-               SELECT e.id AS eid, {CONF_CASE} AS conf
+               SELECT e.id AS eid, {conf_case} AS conf
                FROM cg_scope_names sname
                CROSS JOIN nodes tgt ON tgt.name = sname.nm
                CROSS JOIN edges e ON e.target_id = tgt.id
                CROSS JOIN nodes src ON src.id = e.source_id
                CROSS JOIN files tf ON tf.id = tgt.file_id
                CROSS JOIN cg_namecount nc ON nc.nm = tgt.name AND nc.lang IS tf.language
-               {CONF_WHERE}
+               {conf_where}
              )"
         )
     };
