@@ -201,6 +201,103 @@ pub(super) fn resolve_python_module_targets(
     }
 }
 
+/// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from
+/// `pkg/sub/__init__.py`, which re-exports from `pkg/sub/impl.py`, is two.
+const REEXPORT_MAX_DEPTH: usize = 8;
+
+/// The nodes `module_files` re-export under `name` (D#370(a)): what `from
+/// <module> import name` binds when the module defines no `name` node but
+/// imports one itself — flask's `src/flask/__init__.py` holds only `from .app
+/// import Flask as Flask`, and the name chain bound `from flask import Flask`
+/// to a class local to a test function instead.
+///
+/// Read from the module's own `imports` edges, so it answers only once those
+/// exist; the deferred pass asks again until nothing moves. An edge counts only
+/// when it is verifiable: its target lies in the files its own `python_module`
+/// names, or is in turn one of their re-exports. An import the name chain bound
+/// is never followed, so the answer does not depend on whether that edge was
+/// written yet, which is what makes an incremental run agree with a rebuild.
+/// The name a module exports is its `as` when the import renamed it.
+pub(super) fn python_reexport_targets(
+    conn: &rusqlite::Connection,
+    module_files: &[String],
+    name: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> anyhow::Result<Vec<i64>> {
+    let mut on_path: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for file in module_files {
+        out.extend(reexports_of(
+            conn,
+            file,
+            name,
+            python_module_map,
+            &mut on_path,
+        )?);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// [`python_reexport_targets`] for one file. `on_path` holds the `(file, name)`
+/// pairs being answered further up, so a re-export cycle (`a` from `b`, `b`
+/// from `a`) verifies nothing; answers are not cached across branches, since
+/// one cut short by a cycle would be wrong where the cycle is not.
+fn reexports_of(
+    conn: &rusqlite::Connection,
+    file: &str,
+    name: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+    on_path: &mut HashSet<(String, String)>,
+) -> anyhow::Result<Vec<i64>> {
+    let key = (file.to_string(), name.to_string());
+    if on_path.len() > REEXPORT_MAX_DEPTH || !on_path.insert(key.clone()) {
+        return Ok(Vec::new());
+    }
+    let rows = conn
+        .prepare_cached(
+            "SELECT e.target_id, tn.name, tf.path, json_extract(e.metadata, '$.python_module')
+             FROM files f
+             JOIN nodes sn ON sn.file_id = f.id AND sn.name = '<module>'
+             JOIN edges e ON e.source_id = sn.id AND e.relation = 'imports'
+             JOIN nodes tn ON tn.id = e.target_id
+             JOIN files tf ON tf.id = tn.file_id
+             WHERE f.path = ?1
+               AND json_extract(e.metadata, '$.python_module') IS NOT NULL
+               AND json_extract(e.metadata, '$.is_module_import') IS NULL
+               AND COALESCE(json_extract(e.metadata, '$.as'), tn.name) = ?2",
+        )?
+        .query_map(rusqlite::params![file, name], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::new();
+    for (target, target_name, target_path, module) in rows {
+        let Some(files) = project_module_files_from(&module, file, python_module_map) else {
+            continue;
+        };
+        let mut verified = files.contains(&target_path);
+        for f in &files {
+            if verified {
+                break;
+            }
+            verified =
+                reexports_of(conn, f, &target_name, python_module_map, on_path)?.contains(&target);
+        }
+        if verified {
+            out.push(target);
+        }
+    }
+    on_path.remove(&key);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

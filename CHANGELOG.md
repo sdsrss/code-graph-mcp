@@ -2,10 +2,37 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 118
-because call edges into TypeScript types are labelled differently (below).
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 119
+because call edges into TypeScript types are labelled differently and a
+Python import of a name its package re-exports binds differently (below).
 The MCP server rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does.
+
+### A Python import of a name its package re-exports binds the re-exported definition
+
+`from flask import Flask` names flask's `src/flask/__init__.py`, which
+defines no `Flask` and imports one (`from .app import Flask as Flask`). The
+import was resolved by its name alone, and from a test file that picked the
+candidate whose path is closest to the caller: a `class Flask(flask.Flask)`
+defined inside a test function in `tests/test_config.py`. The import now binds
+what the package itself imports under that name, through a re-export of a
+re-export, a rename (`from .core import _Impl as Public`), and both branches
+of a `try`/`except` import, and a bare call of the name follows the import as
+before. A relative `from . import X` reads the package's re-export too. A
+re-export is followed only when its own target is in the module that import
+names, or is in turn re-exported there.
+
+Measured on the seven corpora of 0.174.0 with a fresh index from each build:
+six edge sets are identical, with no label moved. On flask, 31 calls and 15
+imports move from `tests/test_config.py`'s local `Flask` to
+`src/flask/app.py`'s, and the import edge of `src/flask/cli.py`'s `from . import
+Flask` moves from `__init__.py` to it as well; 16 edges into
+`src/flask/sansio/blueprints.py`'s `Blueprint` (9 calls, 7 imports) are gone,
+their callers keeping the ones into `src/flask/blueprints.py`'s; and 4
+`references` into the local `Flask` become `ambiguous`. Call edges into
+`src/flask/app.py`'s `Flask` go from 3 to 34; `callgraph Flask --direction
+callers --include-tests --depth 1` lists 28 callers where it listed 3, and
+`impact Flask` counts 27 tests affected where it counted 2.
 
 ### A TypeScript call into an interface or type alias is `ambiguous`
 
@@ -27,6 +54,16 @@ are counted as excluded `ambiguous` edges), and `callgraph
 createBunWebSocket --direction callees` no longer lists `Response`.
 `surprising` gives such an edge the reason "ambiguous: bare-name target not
 decided (several candidates, or a TypeScript type)".
+
+### Not covered
+
+- `import flask` and then `flask.Flask(...)` still resolves by the name: on
+  flask, 31 such calls stay `ambiguous` edges into `tests/test_config.py`'s
+  local `Flask`, and 16 inside `tests/test_config.py` stay bound to it.
+- A bare call of a name imported from two modules, as a `try`/`except`
+  import does, now gets no edge where it had the name's nearest definition:
+  the import binds both, and a call follows an import only when it has one
+  target.
 
 ## 0.174.0
 

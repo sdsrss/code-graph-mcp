@@ -1536,6 +1536,129 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// What a Python file of `cg_reexport_paths` exports through its imports
+/// (D#370(a)): one row per name its `<module>` imports other than as a module,
+/// `(file, exported name ␟ target file ␟ target name)`. The exported name is
+/// the import's `as` when it renamed.
+const PY_REEXPORT_SELECT: &str = "
+    SELECT f.path AS p,
+           COALESCE(json_extract(e.metadata, '$.as'), t.name) || char(31) || tf.path
+             || char(31) || t.name AS v
+    FROM cg_reexport_paths rp
+    JOIN files f ON f.path = rp.path
+    JOIN nodes s ON s.file_id = f.id AND s.name = '<module>'
+    JOIN edges e ON e.source_id = s.id AND e.relation = 'imports'
+    JOIN nodes t ON t.id = e.target_id
+    JOIN files tf ON tf.id = t.file_id
+    WHERE json_extract(e.metadata, '$.python_module') IS NOT NULL
+      AND json_extract(e.metadata, '$.is_module_import') IS NULL";
+
+/// Record what the Python files among `paths` re-export, before an
+/// `index_files` run rewrites them; [`importers_of_python_reexport_drift`]
+/// reads it after. `index_files` takes it itself, once its own Phase 0-pre has
+/// added the files whose dependencies appeared or vanished, so a re-exporter
+/// re-extracted for that reason is compared too.
+pub(super) fn snapshot_python_reexports<'a>(
+    conn: &rusqlite::Connection,
+    paths: impl Iterator<Item = &'a String>,
+) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_reexport_paths;
+         DROP TABLE IF EXISTS temp.cg_reexport_before;
+         CREATE TEMP TABLE cg_reexport_paths (path TEXT PRIMARY KEY);",
+    )?;
+    {
+        let mut stmt =
+            conn.prepare("INSERT OR IGNORE INTO cg_reexport_paths (path) VALUES (?1)")?;
+        for p in paths.filter(|p| p.ends_with(".py")) {
+            stmt.execute([p])?;
+        }
+    }
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE cg_reexport_before AS {PY_REEXPORT_SELECT};"
+    ))?;
+    Ok(())
+}
+
+/// The files that import a module whose re-exports the last `index_files` run
+/// moved (D#370(a)): a re-export retargeted, removed or added changes what
+/// `from <module> import name` binds in files the run never opened. Each
+/// importer is found by resolving the `python_module` of its own import edges,
+/// so a relative importer counts as well as an absolute one. The run's own
+/// files are left out: they were re-extracted against the new state. Drops the
+/// snapshot; empty when there is none.
+pub(super) fn importers_of_python_reexport_drift(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<String>> {
+    let has_snapshot: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_reexport_before')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_snapshot {
+        return Ok(Vec::new());
+    }
+    let rows = |sql: &str| -> Result<HashSet<(String, String)>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(rows)
+    };
+    let before = rows("SELECT p, v FROM cg_reexport_before")?;
+    let now = rows(PY_REEXPORT_SELECT)?;
+    let in_run: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM cg_reexport_paths")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<HashSet<String>>>()?;
+        rows
+    };
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_reexport_paths;
+         DROP TABLE IF EXISTS temp.cg_reexport_before;",
+    )?;
+    let drifted: HashSet<String> = before
+        .symmetric_difference(&now)
+        .map(|(p, _)| p.clone())
+        .collect();
+    if drifted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let python_paths: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM files WHERE path LIKE '%.py'")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<HashSet<String>>>()?;
+        rows
+    };
+    let module_map = super::python_modules::build_python_module_map(&python_paths);
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.python_module')
+         FROM edges e
+         JOIN nodes s ON s.id = e.source_id
+         JOIN files f ON f.id = s.file_id
+         WHERE e.relation = 'imports'
+           AND f.language = 'python'
+           AND json_extract(e.metadata, '$.python_module') IS NOT NULL",
+    )?;
+    let imports = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (importer, module) in imports {
+        if in_run.contains(&importer) || out.contains(&importer) {
+            continue;
+        }
+        if super::python_modules::project_module_files_from(&module, &importer, &module_map)
+            .is_some_and(|files| files.iter().any(|f| drifted.contains(f)))
+        {
+            out.insert(importer);
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 /// The files a second extraction round must cover: D#24's answer to "who needs
 /// to learn that this name now has another definition".
 ///

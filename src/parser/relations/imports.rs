@@ -832,13 +832,24 @@ pub(super) fn extract_python_from_import_names(
                     }
                 }
                 "aliased_import" => {
-                    // from X import Y as Z — extract Y (the original name)
+                    // from X import Y as Z — extract Y (the original name). A Z
+                    // other than Y is recorded as `as`: it is the name this
+                    // module now exports, which a `from <this module> import Z`
+                    // elsewhere follows (D#370(a)), and Y is not.
                     if let Some(original) = child.named_child(0) {
                         let name = node_text(&original, source).to_string();
                         if !name.is_empty() {
-                            let metadata = module_path
-                                .as_ref()
-                                .map(|m| serde_json::json!({"python_module": m}).to_string());
+                            let alias = child
+                                .child_by_field_name("alias")
+                                .map(|a| node_text(&a, source))
+                                .filter(|a| *a != name);
+                            let metadata = module_path.as_ref().map(|m| {
+                                match alias {
+                                    Some(a) => serde_json::json!({"python_module": m, "as": a}),
+                                    None => serde_json::json!({"python_module": m}),
+                                }
+                                .to_string()
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,

@@ -858,9 +858,12 @@ fn fan_out_to_new_duplicate_definitions(
         db.conn(),
         &resolve::collect_rust_crates(project_root),
     )?;
+    // Importers of a Python module whose re-exports the run moved (D#370(a)).
+    let reexported = resolve::importers_of_python_reexport_drift(db.conn())?;
     let callers: Vec<String> = typed
         .iter()
         .chain(bare.iter())
+        .chain(reexported.iter())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -870,10 +873,12 @@ fn fan_out_to_new_duplicate_definitions(
     }
     tracing::info!(
         "[index] fan-out round: re-extracting {} caller file(s): {} bare-name caller(s) reached \
-         by a new same-name definition, {} typed caller(s) of a changed class structure",
+         by a new same-name definition, {} typed caller(s) of a changed class structure, {} \
+         importer(s) of a moved Python re-export",
         callers.len(),
         bare.len(),
-        typed.len()
+        typed.len(),
+        reexported.len()
     );
     // Same reason round one captures it: re-indexing these files replaces their
     // node ids, so the context strings of nodes in OTHER files that point at
@@ -884,8 +889,35 @@ fn fan_out_to_new_duplicate_definitions(
     if !dirty.is_empty() {
         regenerate_context_strings(db, &dirty, model)?;
     }
-    Ok(callers.len())
+    // A re-export of a re-export: a file re-extracted above can move what it
+    // re-exports in turn, and then its own importers bind differently. One more
+    // round per link of the chain; the cap only stops a cycle that never
+    // settles, which leaves the rest to the next run, as the paragraph above
+    // describes for the bare-name half.
+    let mut pulled = callers.len();
+    for _ in 0..REEXPORT_FANOUT_ROUNDS {
+        let more = resolve::importers_of_python_reexport_drift(db.conn())?;
+        if more.is_empty() {
+            break;
+        }
+        tracing::info!(
+            "[index] fan-out round: re-extracting {} importer(s) of a moved Python re-export",
+            more.len()
+        );
+        let dirty = collect_dirty_node_ids(db, &more)?;
+        index_files(db, project_root, &more, hashes, model, &[], None)?;
+        if !dirty.is_empty() {
+            regenerate_context_strings(db, &dirty, model)?;
+        }
+        pulled += more.len();
+    }
+    Ok(pulled)
 }
+
+/// Fan-out rounds a chain of Python re-exports may take after the first: one
+/// per link (`pkg/__init__.py` re-exporting `pkg/sub/__init__.py`'s re-export
+/// is two). Eight is the depth `python_reexport_targets` follows.
+const REEXPORT_FANOUT_ROUNDS: usize = 8;
 
 /// True when an index run died (killed, or failed with an error) and left the
 /// index short of what it was writing: its token is still in the marker and no

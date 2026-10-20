@@ -52,7 +52,8 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_module_map, project_module_files_from, resolve_python_module_targets,
+    build_python_module_map, project_module_files_from, python_reexport_targets,
+    resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -2574,6 +2575,14 @@ Restart every code-graph server on this project so they run one version.",
     };
 
     let has_work = !files.is_empty() || !delete_paths.is_empty();
+    // What this run's Python files re-export, before it rewrites them: the
+    // caller's fan-out re-extracts the importers of any that moved (D#370(a)).
+    if has_work {
+        super::resolve::snapshot_python_reexports(
+            db.conn(),
+            files.iter().chain(delete_paths.iter()),
+        )?;
+    }
     // This run's token in the in-flight marker, held until its last graph phase
     // has run (`super::in_flight`; retired near the end of this function). An
     // error return drops it with the token left in place: the crash the marker
@@ -3592,6 +3601,46 @@ fn restore_inbound_edges(
     Ok(edges_created)
 }
 
+/// The Python imports the deferred pass parked because the module they name
+/// defines no node of their name (D#370(a)), bound to what that module
+/// re-exports under it ([`python_reexport_targets`]). Asked again until a round
+/// binds nothing: a re-export of a re-export answers only once the inner one is
+/// bound, in whichever order the pass met them, so a rebuild reaches the graph
+/// an incremental run starts from. What no round answers stays in `waiting`
+/// for the pass to bind as it did before.
+fn settle_python_reexports(
+    db: &Database,
+    waiting: &mut Vec<(&DeferredRelation, Vec<i64>, Vec<String>)>,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Result<usize> {
+    let mut edges_created = 0usize;
+    loop {
+        let mut bound = false;
+        let mut left = Vec::with_capacity(waiting.len());
+        for (d, source_ids, files) in waiting.drain(..) {
+            let targets =
+                python_reexport_targets(db.conn(), &files, &d.target_name, python_module_map)?;
+            if targets.is_empty() {
+                left.push((d, source_ids, files));
+                continue;
+            }
+            edges_created += insert_relation_edges(
+                db,
+                &source_ids,
+                &targets,
+                &d.relation,
+                d.metadata.as_deref(),
+                false,
+            )?;
+            bound = true;
+        }
+        *waiting = left;
+        if !bound || waiting.is_empty() {
+            return Ok(edges_created);
+        }
+    }
+}
+
 /// Phase 2b-final: post-loop resolution for `DeferredRelation`s (audit
 /// 2026-08-02 P0-1).
 ///
@@ -3687,18 +3736,40 @@ fn resolve_deferred_relations(
     let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
 
     // Calls last: a typed receiver's call also binds overrides, found through
-    // `inherits` edges that may themselves be among the deferred.
-    let ordered = deferred
+    // `inherits` edges that may themselves be among the deferred. Between the
+    // two, the Python imports that wait on a re-export (D#370(a)) are settled,
+    // and the ones none answered go round once more to bind as before.
+    let mut queue: Vec<&DeferredRelation> = deferred
         .iter()
         .filter(|d| d.relation != REL_CALLS)
-        .chain(deferred.iter().filter(|d| d.relation == REL_CALLS));
+        .collect();
+    let mut reexport_wait: Vec<(&DeferredRelation, Vec<i64>, Vec<String>)> = Vec::new();
+    let mut waited: HashSet<*const DeferredRelation> = HashSet::new();
+    let mut calls_queued = false;
+    let mut next = 0usize;
     // Loaded at the first C++ call through a field or a chain, which comes after
     // every other relation: the `inherits` edges its bases are read from may be
     // among this pass's own (a full index defers every cross-file one), and a
     // load before them typed differently from an incremental run.
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
-    for d in ordered {
+    loop {
+        if next == queue.len() {
+            if calls_queued {
+                break;
+            }
+            edges_created += settle_python_reexports(db, &mut reexport_wait, python_module_map)?;
+            for (d, _, _) in reexport_wait.drain(..) {
+                waited.insert(d);
+                queue.push(d);
+            }
+            queue.extend(deferred.iter().filter(|d| d.relation == REL_CALLS));
+            calls_queued = true;
+            continue;
+        }
+        let d = queue[next];
+        next += 1;
+        let queued = d;
         let d = if d.relation == REL_CALLS
             && d.metadata
                 .as_deref()
@@ -3870,6 +3941,16 @@ fn resolve_deferred_relations(
                             d.metadata.as_deref(),
                             false,
                         )?;
+                        continue;
+                    }
+                    // A name the module does not define may be one it imports,
+                    // and so exports (D#370(a)): `from flask import Flask` names
+                    // `__init__.py`'s `from .app import Flask as Flask`. That
+                    // import may be among this pass's own, so the miss waits
+                    // until every other relation is in, and binds as below only
+                    // when no re-export answers it then.
+                    if !is_module_import && !waited.contains(&(queued as *const DeferredRelation)) {
+                        reexport_wait.push((queued, source_ids, module_files));
                         continue;
                     }
                     // A relative import stays inside its package (D10): a name

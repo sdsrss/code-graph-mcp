@@ -11901,6 +11901,170 @@ fn a_python_from_import_bound_elsewhere_is_rebound_when_its_module_defines_it() 
     );
 }
 
+// D#370(a): `from flask import Flask` names `src/flask/__init__.py`, which only
+// re-exports it (`from .app import Flask as Flask`). The module held no `Flask`
+// node, so the import fell to the name chain, which picked the candidate with
+// the longest common path for a test caller: a class local to a test function
+// (`tests/test_config.py`), for 79 of flask's 82 call edges into a `Flask`. The
+// importer here sorts before the package, and its decoys share its directory,
+// so the name chain and the deferred order both point the wrong way.
+const REEXPORT_DECOYS: (&str, &str) = (
+    "aaa/decoys.py",
+    "def test_holder():\n    class Widget:\n        pass\n    class Gadget:\n        pass\n    \
+     def helper():\n        return 2\n    class Deep:\n        pass\n    class Speed:\n        \
+     pass\n    class Thing:\n        pass\n    return Widget, Gadget, helper, Deep, Speed, Thing\n",
+);
+
+#[test]
+fn a_python_from_import_follows_its_package_reexport() {
+    let files: &[(&str, &str)] = &[
+        REEXPORT_DECOYS,
+        (
+            "aaa/use.py",
+            "from pkg import Widget, Gadget, helper, Public, Deep, Speed, Thing\n\n\
+             def run():\n    Widget()\n    Gadget()\n    helper()\n    Deep()\n    Speed()\n",
+        ),
+        (
+            "pkg/__init__.py",
+            "from .core import Widget\nfrom .core import Gadget as Gadget\n\
+             from pkg.tools import helper\nfrom .core import _Hidden as Public\n\
+             from .core import Thing as Alias\nfrom .sub import Deep\n\
+             try:\n    from .fast import Speed\nexcept ImportError:\n    from .slow import Speed\n",
+        ),
+        (
+            "pkg/core.py",
+            "class Widget:\n    pass\n\nclass Gadget:\n    pass\n\nclass _Hidden:\n    pass\n\n\
+             class Thing:\n    pass\n",
+        ),
+        ("pkg/tools.py", "def helper():\n    return 1\n"),
+        ("pkg/sub/__init__.py", "from .impl import Deep\n"),
+        ("pkg/sub/impl.py", "class Deep:\n    pass\n"),
+        ("pkg/fast.py", "class Speed:\n    pass\n"),
+        ("pkg/slow.py", "class Speed:\n    pass\n"),
+        (
+            "pkg/user.py",
+            "from . import Widget\n\ndef make():\n    return Widget()\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let missing: Vec<&str> = [
+        // A1, A2, A3 (absolute), A4 (renamed into the export), A6 (a chain),
+        // A7 (both arms of a fallback import).
+        "aaa/use.py.<module> --imports--> pkg/core.py.Widget",
+        "aaa/use.py.<module> --imports--> pkg/core.py.Gadget",
+        "aaa/use.py.<module> --imports--> pkg/tools.py.helper",
+        "aaa/use.py.<module> --imports--> pkg/core.py._Hidden",
+        "aaa/use.py.<module> --imports--> pkg/sub/impl.py.Deep",
+        "aaa/use.py.<module> --imports--> pkg/fast.py.Speed",
+        "aaa/use.py.<module> --imports--> pkg/slow.py.Speed",
+        // The bare calls follow the import (bind + prune). Not `Speed()`: the
+        // bind pass follows a unique import only, so an import with two targets
+        // prunes the decoy and binds neither.
+        "aaa/use.py.run --calls--> pkg/core.py.Widget",
+        "aaa/use.py.run --calls--> pkg/core.py.Gadget",
+        "aaa/use.py.run --calls--> pkg/tools.py.helper",
+        "aaa/use.py.run --calls--> pkg/sub/impl.py.Deep",
+        // A14: a relative `from . import X` reads the package's re-export first.
+        "pkg/user.py.<module> --imports--> pkg/core.py.Widget",
+        "pkg/user.py.make --calls--> pkg/core.py.Widget",
+    ]
+    .into_iter()
+    .filter(|e| !edges.iter().any(|x| x == e))
+    .collect();
+    let wrong: Vec<&String> = edges
+        .iter()
+        .filter(|e| {
+            (e.starts_with("aaa/use.py.") || e.starts_with("pkg/user.py."))
+                && (e.contains("--> aaa/decoys.py.") && !e.ends_with(".Thing")
+                    // A5: `Thing as Alias` exports `Alias`, not `Thing`.
+                    || e.ends_with("--> pkg/core.py.Thing")
+                    || e.ends_with("--> pkg/__init__.py.<module>") && e.starts_with("pkg/user.py"))
+        })
+        .collect();
+    assert!(
+        missing.is_empty() && wrong.is_empty(),
+        "missing: {missing:#?}\nwrong: {wrong:#?}\n{edges:#?}"
+    );
+}
+
+// The re-export binding reads another file's import edges, so every way that
+// file or its target can change must leave the same graph as a rebuild: the
+// importer edited, the re-export retargeted, removed or added, its target
+// renamed or deleted, the middle of a chain retargeted or emptied, and a
+// re-export that itself fell to the name chain (A13), which a rebuild never
+// follows and an incremental run must not follow either.
+#[test]
+fn a_python_reexport_binding_converges_incrementally_to_a_rebuild() {
+    let base: Vec<(&str, &str)> = vec![
+        REEXPORT_DECOYS,
+        (
+            "aaa/use.py",
+            "from pkg import Widget, Deep, Lost\n\ndef run():\n    Widget()\n    Deep()\n    Lost()\n",
+        ),
+        (
+            "pkg/__init__.py",
+            "from .core import Widget\nfrom .sub import Deep\nfrom pkg.core import Lost\n",
+        ),
+        ("pkg/core.py", "class Widget:\n    pass\n"),
+        ("pkg/other.py", "class Widget:\n    pass\n"),
+        ("pkg/sub/__init__.py", "from .impl import Deep\n"),
+        ("pkg/sub/impl.py", "class Deep:\n    pass\n"),
+        ("pkg/sub/alt.py", "class Deep:\n    pass\n"),
+        ("zzz/lost.py", "class Lost:\n    pass\n"),
+        ("aaa/lost_decoy.py", "def holder():\n    class Lost:\n        pass\n    return Lost\n"),
+    ];
+    let without_widget: Vec<(&str, &str)> = base
+        .iter()
+        .map(|&(p, b)| {
+            if p == "pkg/__init__.py" {
+                (p, "from .sub import Deep\nfrom pkg.core import Lost\n")
+            } else {
+                (p, b)
+            }
+        })
+        .collect();
+    // (tree before, edits) per scenario.
+    type Scenario<'a> = (&'a [(&'a str, &'a str)], &'a [(&'a str, Option<&'a str>)]);
+    let edits: &[Scenario] = &[
+        (
+            &base,
+            &[(
+                "aaa/use.py",
+                Some("from pkg import Widget, Deep, Lost\n\ndef run():\n    Widget()\n    Deep()\n    Lost()\n\ndef more():\n    return 1\n"),
+            )],
+        ),
+        (
+            &base,
+            &[(
+                "pkg/__init__.py",
+                Some("from .other import Widget\nfrom .sub import Deep\nfrom pkg.core import Lost\n"),
+            )],
+        ),
+        (
+            &base,
+            &[(
+                "pkg/__init__.py",
+                Some("from .sub import Deep\nfrom pkg.core import Lost\n"),
+            )],
+        ),
+        (
+            &without_widget,
+            &[(
+                "pkg/__init__.py",
+                Some("from .core import Widget\nfrom .sub import Deep\nfrom pkg.core import Lost\n"),
+            )],
+        ),
+        (&base, &[("pkg/core.py", Some("class Widget2:\n    pass\n"))]),
+        (&base, &[("pkg/core.py", None)]),
+        (&base, &[("pkg/sub/__init__.py", Some("from .alt import Deep\n"))]),
+        (&base, &[("pkg/sub/__init__.py", Some("\n"))]),
+    ];
+    for (before, after) in edits {
+        assert_incremental_edges_match_rebuild(before, after);
+    }
+}
+
 // D9's fan-out arm re-extracts only the importers a rebuild binds differently:
 // not one that found its name in the module it names, not one in a language
 // the new definition cannot bind, and a D10A `<module>` fallback only when its
