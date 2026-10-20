@@ -154,23 +154,10 @@ pub(super) fn resolve_php_include_path(
 /// fallback, each an exact `file_set` membership check. System includes
 /// (`<stdio.h>`, already stripped of brackets) won't be in the set → None (the
 /// caller then falls back to `<external>` resolution).
-/// Indexed files by file name, for [`resolve_c_include_path`]'s include-root
-/// step: one lookup per include, where a scan of every path per include cost
-/// files × includes on a large C++ tree.
-pub(super) fn files_by_name(file_set: &HashSet<String>) -> HashMap<&str, Vec<&str>> {
-    let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
-    for path in file_set {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        by_name.entry(name).or_default().push(path);
-    }
-    by_name
-}
-
 pub(super) fn resolve_c_include_path(
     include_path: &str,
     importer_rel_path: &str,
     file_set: &HashSet<String>,
-    by_name: &HashMap<&str, Vec<&str>>,
 ) -> Option<String> {
     let rel = include_path.trim_start_matches("./");
     if rel.is_empty() {
@@ -193,23 +180,12 @@ pub(super) fn resolve_c_include_path(
     }
     // 2. Relative to the repo root (`#include "src/common/widget.h"` from an
     //    include root), for projects that pass `-I.`.
-    let base = normalize_rel_path(rel)?;
-    if file_set.contains(&base) {
-        return Some(base);
+    if let Some(base) = normalize_rel_path(rel) {
+        if file_set.contains(&base) {
+            return Some(base);
+        }
     }
-    // 3. Under another include root (`-Iinclude`): the one indexed file whose
-    //    path ends in the include. leveldb includes `include/leveldb/slice.h`
-    //    as "leveldb/slice.h" (D#370(f)). Two such files are no answer.
-    let suffix = format!("/{base}");
-    let name = base.rsplit('/').next().unwrap_or(&base);
-    let mut under_a_root = by_name
-        .get(name)?
-        .iter()
-        .filter(|path| path.ends_with(&suffix));
-    match (under_a_root.next(), under_a_root.next()) {
-        (Some(only), None) => Some((*only).to_string()),
-        _ => None,
-    }
+    None
 }
 
 /// Normalize a repo-relative path, collapsing `.` and `..` segments. Returns
