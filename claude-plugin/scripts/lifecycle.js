@@ -323,16 +323,30 @@ function readSettingsForWrite(pre) {
 // 2026-09-05 JS-01). Stat the original and restore its exact mode; when there
 // is no original, create owner-only rather than at whatever umask says.
 function writeJsonAtomic(filePath, data) {
-  const dir = path.dirname(filePath);
+  // A symlinked file (a dotfiles checkout's settings.json) is written where
+  // the link points: the rename landed on the link, replaced it with a plain
+  // file and left the checkout's copy stale (audit 2026-09-07 JS-19). A new
+  // file or a dangling link is written at the path itself, as before.
+  let target = filePath;
+  try {
+    if (fs.lstatSync(filePath).isSymbolicLink()) target = fs.realpathSync(filePath);
+  } catch { /* new file, or a dangling link */ }
+  const dir = path.dirname(target);
   fs.mkdirSync(dir, { recursive: true });
   let mode = null;
-  try { mode = fs.statSync(filePath).mode & 0o777; } catch { /* new file */ }
-  const tmp = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: mode ?? SECRET_FILE_MODE });
-  // umask can only have cleared bits the original had, so chmod is what makes
-  // this preservation rather than tightening.
-  restrictMode(tmp, mode ?? SECRET_FILE_MODE);
-  fs.renameSync(tmp, filePath);
+  try { mode = fs.statSync(target).mode & 0o777; } catch { /* new file */ }
+  const tmp = target + '.tmp.' + process.pid;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: mode ?? SECRET_FILE_MODE });
+    // umask can only have cleared bits the original had, so chmod is what makes
+    // this preservation rather than tightening.
+    restrictMode(tmp, mode ?? SECRET_FILE_MODE);
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    // The temp file holds the whole document, `env` secrets included (JS-28).
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 // A settings.json we can READ but not WRITE (read-only ~/.claude, EROFS, a

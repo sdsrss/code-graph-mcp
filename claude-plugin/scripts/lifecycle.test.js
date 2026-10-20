@@ -1721,6 +1721,49 @@ test('writeJsonAtomic preserves the mode of the file it replaces', (t) => {
   );
 });
 
+// Audit 2026-09-07 JS-19: a settings.json kept as a symlink into a dotfiles
+// checkout was replaced by a plain file on the first install or update that
+// changed it — the rename landed on the link — and the checkout's copy went
+// stale without a word.
+test('writeJsonAtomic writes through a symlinked file and keeps the link', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('symlinks need privileges on Windows');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { writeJsonAtomic } = require('./lifecycle');
+  const real = path.join(homeDir, 'dotfiles', 'settings.json');
+  writeJson(real, { env: { ANTHROPIC_API_KEY: 'sk-secret' } });
+  fs.chmodSync(real, 0o600);
+  const link = path.join(homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(real, link);
+
+  writeJsonAtomic(link, { env: { ANTHROPIC_API_KEY: 'sk-secret' }, hooks: {} });
+
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link must stay a link');
+  assert.deepEqual(JSON.parse(fs.readFileSync(real, 'utf8')).hooks, {}, 'the file it names gets the write');
+  assert.equal((fs.statSync(real).mode & 0o777).toString(8), '600');
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(real)).filter((f) => f.includes('.tmp.')),
+    [],
+  );
+});
+
+// JS-28: the temp file holds the whole document, `env` secrets included, and
+// a failed rename left it beside settings.json.
+test('writeJsonAtomic leaves no temp file behind when the write fails', (t) => {
+  const homeDir = mkHome(t);
+  const { writeJsonAtomic } = require('./lifecycle');
+  const dir = path.join(homeDir, '.claude');
+  // A directory where the file should be: the rename fails.
+  const target = path.join(dir, 'settings.json');
+  fs.mkdirSync(path.join(target, 'inner'), { recursive: true });
+
+  assert.throws(() => writeJsonAtomic(target, { env: { ANTHROPIC_API_KEY: 'sk-secret' } }));
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.includes('.tmp.')), []);
+});
+
 test('writeJsonAtomic creates a file the owner alone can read', (t) => {
   if (process.platform === 'win32') {
     t.skip('POSIX mode bits are not meaningful on Windows');
