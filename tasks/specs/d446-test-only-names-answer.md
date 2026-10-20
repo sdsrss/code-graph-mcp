@@ -82,7 +82,7 @@
 
 ## 先测
 
-BASE = `16f9bdf2`（0.172.0 源码，`git archive`，`cargo build --release` 默认特性），md5 `2c54890c…`。语料在 `/var/tmp/d446/corpora`：flask `d086db85`、leveldb `bb74ef7`、express `1faf228`（4.21.2）、hono `4eb101d`（v4.6.14）、gin `75ccf94`（v1.10.0）、gson `828a97be`（gson-parent-2.11.0）、cgm（本仓库 `16f9bdf2` 的 `src/`+`tests/`）。输入用 `gen.py`（seed 435）：45,723 个；每个版本 431,098 次运行（MCP 6 个面、CLI 4 个面）。BASE 跑两遍 431,098/431,098 逐字节相同。
+BASE = `16f9bdf2`（0.172.0 源码，`git archive`，`cargo build --release` 默认特性），md5 `2c54890c…`。语料在 `/var/tmp/d446/corpora`：flask `d086db85`、leveldb `bb74ef7`、express `1faf228`（4.21.2）、hono `4eb101d`（v4.6.14）、gin `75ccf94`（v1.10.0）、gson `828a97be`（gson-parent-2.11.0）、cgm（本仓库 `16f9bdf2` 的 `src/`+`tests/`）。输入用 `gen.py`（seed 435）：45,723 个；每个版本 431,098 次运行（MCP 6 个面、CLI 5 个面：`callgraph` 三个方向、`refs`、`impact` 788 次）。BASE 跑两遍 431,098/431,098 逐字节相同。
 
 BASE 上 `find_references` 的测试路径拒绝：flask 862、leveldb 70、express 196、hono 727、gin 664、gson 2,228、cgm 2,437。其中提示里把非测试路径说成测试路径的：cgm 427、leveldb 70、flask 9（`test_cli_runner` 在 `src/flask/app.py`）、gson 1。
 
@@ -91,7 +91,19 @@ BASE 上 `find_references` 的测试路径拒绝：flask 862、leveldb 70、expr
 - RED：`test_a_name_only_test_code_defines_is_answered` 在改动前的代码上失败：`get_ast_node make_client` → "Symbol 'make_client' not found in index"。`Job.test_step` 断言先加、先失败（歧义），再改 `get_ast_node`。
 - GREEN：同一测试和 `test_an_exact_definition_is_answered_not_a_near_name`、`test_mcp_selects_the_symbol_the_cli_selects`、`test_a_nested_type_typed_with_dots_is_that_type` 通过；集成测试 `mcp_caller_count_prod_only_and_test_symbol_is_answered` 通过（原名 `..._error_explains`，断言旧拒绝，按新契约改写）。
 - 变异（`mutate.py`，副本 `/var/tmp/d446/src-head2`，独立 target）：9 个变异 8 个被抓到；存活的"测试层也收生产定义"在现有调用点等价（只在没有生产定义时查测试层），加了一行直接断言 `test_code_definitions("ping")` 为空后被抓到，9/9。
-- 差分 BASE → HEAD2（md5 `d209eeba…`）：431,098 次里改变 19,070 次（9,248 个输入），全部是 `find_references` 测试路径拒绝 → 回答 6,844 / 歧义 340，`get_ast_node` not found → 回答 8,908 / 歧义 340，`include_impact` not found → 回答 2,597 / 歧义 41；`get_call_graph` 和 CLI 四个面 0 处改变；HEAD2 上测试路径拒绝 0 次；`get_ast_node` 回答的节点都是测试代码里叫这个名字的节点。
+- 差分 BASE → HEAD2（md5 `d209eeba…`）：431,098 次里改变 19,070 次（9,248 个输入），全部是 `find_references` 测试路径拒绝 → 回答 6,844 / 歧义 340，`get_ast_node` not found → 回答 8,908 / 歧义 340，`include_impact` not found → 回答 2,597 / 歧义 41；`get_call_graph` 和 CLI 五个面 0 处改变；HEAD2 上测试路径拒绝 0 次；`get_ast_node` 回答的节点都是测试代码里叫这个名字的节点。
 - 打分：每个改变的输入，`find_references(name)` 等于 `find_references(node_id=get_ast_node 回答的节点)` 8,908/8,908；歧义时两个工具候选 node_id 相同 340/340。
 - 被改变的输入在 BASE 上 `get_call_graph` 和 CLI `refs` 都回答（6,844 + 340），即本次之前只有这两个 MCP 工具拒绝。
 - clippy 两条特性腿通过（`-D warnings`）。
+
+## 发版前评审
+
+### 第 1 轮（新开子代理，`16f9bdf2..c59d0b56`）
+
+评审自己用 `git archive` 构建两个版本（md5 与上面相同），在自己的语料副本上重跑 431,098 次、用自己的统计脚本复算，CHANGELOG 的数字都对上（surface 个数除外）；另写夹具 575 次运行，改变的 132 次都是拒绝 / not found → 回答 / 歧义。0 个 HIGH。
+
+- MEDIUM F1（已复现，我在自己的夹具上也复现）：`<external>` 导入与测试定义同名（`import requests` + 测试里的 `def requests()`）：`find_references` 回答导入，`get_ast_node` 现在回答测试定义（多个时歧义），两个工具答的不是同一个节点。七个语料里导入与定义同名的 10 个名字都有生产定义（我用 SQL 数的：flask 3、express 5、hono 1、cgm 1）。
+- LOW F2：CLI 是 5 个面不是 4 个（`impact` 788 次）。F3：2,025 里列出的三个语料只合 1,985，另 40 个在其他四个语料。F4：`_AppCtxGlobalsProxy.test_no_routes` 是 flask 的例子，放在了 leveldb 后面。F5：提交说明把"精确限定名 `get_ast_node` 答 `find_references` 答的那个"写成了无条件的说法；生产层里 gtest `TEST(Foo, test_run)` 与方法 `Foo::test_run` 两个版本都不一致（`resolve.rs` 生产层按 `is_test_symbol`、`selectable_qualified_definitions` 按 `is_test`/路径），这次没改；提交说明的 6,844 + 8,908 + 340 + 340 漏了 `include_impact` 的 2,597 + 41。
+- LOW F6（已复现）：测试代码定义的名字，同名 Markdown 标题在非测试路径时，两个工具都答标题（两个版本相同），`get_call_graph` 跟函数走（`test_callers_filtered: 1`）。七个语料 0 个。
+
+处理（只改文档）：F1、F6 写进 Not covered（F1 与"只把拒绝改成回答"的决定一致，不改代码）；F2–F4 改 CHANGELOG 和本文件；F5 的说明错误在下一条提交说明里更正，行为本身记为延期项。

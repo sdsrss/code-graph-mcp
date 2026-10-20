@@ -34,24 +34,22 @@ functions in `src/`). When every definition of a name is test code:
   its `node_id`, as they do for production definitions. Among them a Markdown
   heading yields to code of the same name and a constructor (Java, C#, C++,
   Dart) to its class, as among production definitions.
-- A name an `<external>` import also binds: `find_references` still answers
-  with the import's references.
 
 Measured on seven corpora (flask, leveldb, express, hono, gin, gson, and this
 repository's `src/` and `tests/`) with every defined name, every qualified
 name, and generated dotted and misspelled names: 45,723 inputs, 431,098 runs
-per build over six MCP and four CLI surfaces.
+per build over six MCP and five CLI surfaces.
 
 - Defined names: `find_references` answers 6,290 it refused and calls 299
   ambiguous (flask 665 and 84, leveldb 33 and 0); `get_ast_node` answers
   6,311 it called not found and calls the same 299 ambiguous. Exact qualified
-  names: `get_ast_node` answers 2,025 more (flask 101, leveldb 28, gson
-  1,856).
+  names: `get_ast_node` answers 2,025 more (gson 1,856, flask 101, leveldb 28,
+  the other four corpora 40).
 - A dotted name answered for its last part (D#435) goes the way that part
   goes, with the `Resolved` note: of 0.172.0's generated `Class.member` names
   whose member only test code defines (Not covered there), flask 82 answered
-  and 7 ambiguous, leveldb 29 answered (`_AppCtxGlobalsProxy.test_no_routes`
-  → `test_no_routes`).
+  (`_AppCtxGlobalsProxy.test_no_routes` → `test_no_routes`) and 7 ambiguous,
+  leveldb 29 answered.
 - The other 412,028 runs give 0.172.0's answer byte for byte, every
   `get_call_graph` and CLI run among them. Each of the 19,070 that changed is
   a refusal or a "not found" that became an answer or an ambiguity.
@@ -65,6 +63,18 @@ per build over six MCP and four CLI surfaces.
   still merge them into one answer where the two tools above refuse: 299
   defined names on the seven corpora (flask 84, such as
   `test_template_filter`).
+- A name test code defines that an `<external>` import also binds (`import
+  requests` beside a test's `def requests()`): `find_references` answers with
+  the import's references, as 0.172.0 did, while `get_ast_node` now answers
+  with the test definition, or calls several ambiguous where
+  `find_references` still answers the import. Reproduced on a fixture; on the
+  seven corpora, each of the 10 names an import and a definition share also
+  has a production definition.
+- A name test code defines that a Markdown heading outside test code also
+  names: both tools answer with the heading, as 0.172.0 did, while
+  `get_call_graph` follows the function (its test caller is counted in
+  `test_callers_filtered`). Reproduced on a fixture; none on the seven
+  corpora.
 
 ## 0.172.0
 
