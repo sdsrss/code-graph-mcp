@@ -331,6 +331,12 @@ impl McpServer {
                 }
                 FuzzyResolution::NotFound => {
                     if !has_seed {
+                        if crate::resolve::external_only(self.db.conn(), function_name)? {
+                            return Err(anyhow!(crate::resolve::external_only_message(
+                                function_name,
+                                crate::resolve::Surface::Mcp
+                            )));
+                        }
                         return Err(anyhow!("Symbol '{}' not found in the index. Use semantic_code_search to find the correct symbol name, or check spelling.", typed));
                     }
                     // Function exists but has no callers/callees — fall through

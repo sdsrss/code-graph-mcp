@@ -3630,6 +3630,37 @@ fn test_cli_callgraph_nonexistent() {
     );
 }
 
+/// A name the project only imports has no call graph, and says so: `callgraph
+/// datetime` answered for the near name `TagDateTime`, and a name with no near
+/// one printed "No call graph results" with the stale-index hint.
+#[test]
+fn test_cli_callgraph_on_an_import_only_name_says_it_is_external() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        "import ssl\nimport datetime\nimport zlib\n\n\nclass TagDateTime:\n    pass\n\n\n\
+         class PassList:\n    pass\n\n\ndef use():\n    return zlib.crc32(b'')\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    for name in ["datetime", "ssl", "zlib"] {
+        let (stdout, stderr, code) = run_cli(&project, &["callgraph", name, "--json"]);
+        assert_ne!(code, 0, "{name}: {stdout}");
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let error = v["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("is defined outside this project"),
+            "{name}: {stdout} {stderr}"
+        );
+        assert!(!stderr.contains("Resolved"), "{name}: {stderr}");
+        assert!(!stderr.contains("index may be stale"), "{name}: {stderr}");
+    }
+}
+
 // Regression: `--direction` must be validated at the CLI layer (like cmd_deps does).
 // Without early validation a typo only surfaced after ambiguity resolution: user
 // got "Ambiguous symbol" first, retried with --file, then was told "invalid direction" —

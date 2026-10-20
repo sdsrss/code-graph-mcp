@@ -7504,6 +7504,44 @@ app.post('/api/login', handleLogin);
         assert!(!text.contains("candidates"), "{r}");
     }
 
+    /// A name the project only imports has no call graph, and says so:
+    /// `get_call_graph` answered flask `ssl` for `PassList` and `datetime` for
+    /// `TagDateTime` (near names, with a note), or "not found in the index" of
+    /// a name the index holds. `find_references` keeps answering the import.
+    #[test]
+    fn test_get_call_graph_on_an_import_only_name_says_it_is_external() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("app.py"),
+            "import ssl\nimport datetime\nimport zlib\n\n\nclass TagDateTime:\n    pass\n\n\n\
+             class PassList:\n    pass\n\n\ndef use():\n    return zlib.crc32(b'')\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let call = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            (result["isError"].as_bool().unwrap_or(false), text)
+        };
+        for name in ["datetime", "ssl", "zlib"] {
+            let (is_error, text) = call("get_call_graph", json!({"symbol_name": name}));
+            assert!(is_error, "{name}: {text}");
+            assert!(
+                text.contains("is defined outside this project"),
+                "{name}: {text}"
+            );
+            let (is_error, text) = call("find_references", json!({"symbol_name": name}));
+            assert!(!is_error, "{name}: {text}");
+            assert!(text.contains("imports"), "{name}: {text}");
+        }
+    }
+
     /// D#436(1): a C++ constructor defined out of line in the `.cc` beside its
     /// class's `.h` (leveldb's layout) counted as a second definition of the
     /// class name: `DBImpl`, `Status`, `VersionSet` and 26 more refused on every

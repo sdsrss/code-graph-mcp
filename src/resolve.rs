@@ -772,6 +772,31 @@ pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Va
     })
 }
 
+/// Whether the index holds `name` only as `<external>` rows: a name the
+/// project imports (or names as an external type) and does not define.
+pub fn external_only(conn: &Connection, name: &str) -> Result<bool> {
+    let rows = queries::get_node_ids_by_name(conn, name)?;
+    Ok(!rows.is_empty()
+        && rows
+            .iter()
+            .all(|(_, path)| path == crate::domain::EXTERNAL_FILE_PATH))
+}
+
+/// What a call-graph surface says of an [`external_only`] name. It answered
+/// a near name (flask `ssl` → `PassList`), listed near names, or said the
+/// name was not in the index, which holds it.
+pub fn external_only_message(name: &str, surface: Surface) -> String {
+    let refs = match surface {
+        Surface::Cli => format!("Run `code-graph-mcp refs {name}`"),
+        Surface::Mcp => "Use find_references".to_string(),
+    };
+    format!(
+        "Symbol '{name}' is defined outside this project (the index holds it only as an \
+         external name, such as an import), so it has no call graph. {refs} to list where \
+         it is referenced."
+    )
+}
+
 /// Outcome of fuzzy (substring-tolerant) name resolution.
 pub enum FuzzyResolution {
     /// The name to answer for: the one exact match outside test code, else
@@ -825,6 +850,11 @@ pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
     // `Unique(name)`, which `find_references` splits by the test rule alone,
     // calling a same-named `<external>` import a test path (pre-tag review).
     if test_code.iter().any(|c| c.name == name) {
+        return Ok(FuzzyResolution::NotFound);
+    }
+    // A name only an import binds is that import, not a near name either:
+    // flask `ssl` answered for `PassList`, `datetime` for `TagDateTime`.
+    if external_only(conn, name)? {
         return Ok(FuzzyResolution::NotFound);
     }
     match candidates.len() {

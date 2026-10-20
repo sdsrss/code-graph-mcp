@@ -282,6 +282,19 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     outcome.disclose();
 
     if result.nodes.is_empty() {
+        // A name only an import binds: say so, not "No call graph results"
+        // with the stale-index hint, which read as a missing symbol.
+        if !is_exact_qualified && crate::resolve::external_only(conn, symbol)? {
+            let msg = crate::resolve::external_only_message(symbol, crate::resolve::Surface::Cli);
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "results": [], "error": msg, "symbol": symbol })
+                );
+            }
+            eprintln!("[code-graph] {msg}");
+            std::process::exit(1);
+        }
         if json_mode {
             // In-band error (disclosure-gap class, roadmap 2026-07-18 §1.3):
             // a bare `{"results":[]}` under `2>/dev/null` is indistinguishable
