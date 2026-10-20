@@ -217,7 +217,11 @@ const REEXPORT_MAX_DEPTH: usize = 8;
 /// names, or is in turn one of their re-exports. An import the name chain bound
 /// is never followed, so the answer does not depend on whether that edge was
 /// written yet, which is what makes an incremental run agree with a rebuild.
-/// The name a module exports is its `as` when the import renamed it.
+/// A renamed import (`from .m import Y as X`, recorded `as`) is followed for
+/// neither name: it exports `X` and not `Y`, and binding `X` to the node named
+/// `Y` let an edit of `m` requeue the importer under `Y`, and its D10 fallback
+/// be followed or not by the order a run met it in (review of D#370(a), M2,
+/// M3). Its importers bind as they did before.
 pub(super) fn python_reexport_targets(
     conn: &rusqlite::Connection,
     edges: &mut ReexportEdges,
@@ -294,31 +298,51 @@ fn python_module_attribute_targets(
     let Some(files) = project_module_files(module, python_module_map) else {
         return Ok(None);
     };
-    let mut defined = Vec::new();
+    // A module's attribute is a definition at its top level, whose span lies in
+    // no class's (a method) and no function's (a nested def, whose qualified
+    // name has no dot to tell it by). And a definition does not hide a
+    // re-export, which may be the binding a later import makes of the same
+    // name (`def X` before `try: from ._fast import X`). Measured on the
+    // standard library by the SCIP oracle (review of D#370(a), M1): every one
+    // of 135 edges `os.close()`-style calls gained into methods was wrong.
+    let mut targets = Vec::new();
     {
         let mut stmt = conn.prepare_cached(
             "SELECT n.id FROM files f
              CROSS JOIN nodes n ON n.file_id = f.id AND n.name = ?2
-             WHERE f.path = ?1",
+             WHERE f.path = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM nodes o
+                   WHERE o.file_id = n.file_id AND o.id <> n.id
+                     AND o.type IN ('function', 'method', 'class')
+                     AND o.start_line < n.start_line AND o.end_line >= n.end_line
+               )",
         )?;
         for file in &files {
             for id in stmt.query_map(rusqlite::params![file, name], |r| r.get::<_, i64>(0))? {
-                defined.push(id?);
+                targets.push(id?);
             }
         }
     }
-    if !defined.is_empty() {
-        return Ok(Some(defined));
-    }
-    python_reexport_targets(conn, edges, &files, name, python_module_map).map(Some)
+    targets.extend(python_reexport_targets(
+        conn,
+        edges,
+        &files,
+        name,
+        python_module_map,
+    )?);
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(Some(targets))
 }
 
 /// One `imports` edge out of a Python file's `<module>` that names a symbol,
 /// not a module: what [`python_reexport_targets`] reads.
 struct ReexportEdge {
     target: i64,
-    /// The import's `as`, else the target's own name.
-    exported: String,
+    /// How many modules the file imports this name from, when more than one
+    /// (`"n"`, parser `count_python_import_sources`).
+    sources: Option<i64>,
     target_name: String,
     target_path: String,
     python_module: String,
@@ -347,8 +371,9 @@ impl ReexportEdges {
         if !self.by_file.contains_key(file) {
             let rows = conn
                 .prepare_cached(
-                    "SELECT e.target_id, COALESCE(json_extract(e.metadata, '$.as'), tn.name),
-                            tn.name, tf.path, json_extract(e.metadata, '$.python_module')
+                    "SELECT e.target_id, tn.name, tf.path,
+                            json_extract(e.metadata, '$.python_module'),
+                            json_extract(e.metadata, '$.n')
                      FROM files f
                      CROSS JOIN nodes sn ON sn.file_id = f.id AND sn.name = '<module>'
                      CROSS JOIN edges e ON e.source_id = sn.id AND e.relation = 'imports'
@@ -356,15 +381,16 @@ impl ReexportEdges {
                      CROSS JOIN files tf ON tf.id = tn.file_id
                      WHERE f.path = ?1
                        AND json_extract(e.metadata, '$.python_module') IS NOT NULL
-                       AND json_extract(e.metadata, '$.is_module_import') IS NULL",
+                       AND json_extract(e.metadata, '$.is_module_import') IS NULL
+                       AND json_extract(e.metadata, '$.as') IS NULL",
                 )?
                 .query_map([file], |r| {
                     Ok(ReexportEdge {
                         target: r.get(0)?,
-                        exported: r.get(1)?,
-                        target_name: r.get(2)?,
-                        target_path: r.get(3)?,
-                        python_module: r.get(4)?,
+                        sources: r.get(4)?,
+                        target_name: r.get(1)?,
+                        target_path: r.get(2)?,
+                        python_module: r.get(3)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -394,10 +420,23 @@ fn reexports_of(
     if on_path.len() > REEXPORT_MAX_DEPTH || !on_path.insert(key.clone()) {
         return Ok(Vec::new());
     }
-    let rows: Vec<(i64, String, String, String)> = edges
+    let matched: Vec<&ReexportEdge> = edges
         .of(conn, file)?
         .iter()
-        .filter(|e| e.exported == name)
+        .filter(|e| e.target_name == name)
+        .collect();
+    // The file imports the name from more modules than it has bound edges for:
+    // one it cannot see may be the binding that wins.
+    let seen: HashSet<&str> = matched.iter().map(|e| e.python_module.as_str()).collect();
+    if matched
+        .iter()
+        .any(|e| e.sources.is_some_and(|n| (seen.len() as i64) < n))
+    {
+        on_path.remove(&key);
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(i64, String, String, String)> = matched
+        .iter()
         .map(|e| {
             (
                 e.target,

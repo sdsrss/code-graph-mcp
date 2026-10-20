@@ -725,6 +725,56 @@ pub(super) fn extract_python_import_names(
     }
 }
 
+/// Mark each Python from-import of a name the file imports from more than one
+/// module with `"n"`, the number of modules (`from _py_warnings import warn`
+/// and, under `try`, `from _warnings import warn`). The resolver follows such
+/// a re-export only when it sees every one of them bound to a project node: a
+/// module it cannot see may be the binding Python keeps, and CPython keeps the
+/// compiled `_warnings.warn` (review of D#370(a): 111 `warnings.warn()` edges
+/// into `_py_warnings.warn` on the standard library, all wrong).
+pub(super) fn count_python_import_sources(relations: &mut [ParsedRelation]) {
+    let exported = |r: &ParsedRelation| -> Option<(String, String)> {
+        if r.relation != REL_IMPORTS || r.target_name == "*" {
+            return None;
+        }
+        let meta: serde_json::Value = serde_json::from_str(r.metadata.as_deref()?).ok()?;
+        if meta.get("is_module_import").is_some() {
+            return None;
+        }
+        let module = meta.get("python_module")?.as_str()?.to_string();
+        let name = meta
+            .get("as")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| r.target_name.clone());
+        Some((name, module))
+    };
+    let mut sources: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for r in relations.iter() {
+        if let Some((name, module)) = exported(r) {
+            sources.entry(name).or_default().insert(module);
+        }
+    }
+    for r in relations.iter_mut() {
+        let Some((name, _)) = exported(r) else {
+            continue;
+        };
+        let count = sources.get(&name).map_or(0, |m| m.len());
+        if count < 2 {
+            continue;
+        }
+        if let Some(serde_json::Value::Object(mut meta)) = r
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+        {
+            meta.insert("n".into(), serde_json::Value::from(count));
+            r.metadata = Some(serde_json::Value::Object(meta).to_string());
+        }
+    }
+}
+
 /// Extract imports from Python `from X import Y, Z` statements.
 /// AST: import_from_statement -> dotted_name ("collections"), dotted_name ("OrderedDict"), dotted_name ("defaultdict")
 /// The first dotted_name is the module; the rest are imported names.
@@ -833,9 +883,9 @@ pub(super) fn extract_python_from_import_names(
                 }
                 "aliased_import" => {
                     // from X import Y as Z — extract Y (the original name). A Z
-                    // other than Y is recorded as `as`: it is the name this
-                    // module now exports, which a `from <this module> import Z`
-                    // elsewhere follows (D#370(a)), and Y is not.
+                    // other than Y is recorded as `as`: this module then exports
+                    // Z and not Y, so a `from <this module> import Y` elsewhere
+                    // must not follow the edge as a re-export (D#370(a)).
                     if let Some(original) = child.named_child(0) {
                         let name = node_text(&original, source).to_string();
                         if !name.is_empty() {

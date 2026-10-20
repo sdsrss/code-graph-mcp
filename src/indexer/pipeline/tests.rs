@@ -11681,6 +11681,59 @@ fn a_python_relative_import_is_rebound_incrementally() {
 /// Index `before`, write `after` over it (None deletes), index incrementally,
 /// and require the WHOLE edge set of a fresh index of the result — imports and
 /// every other relation, not only calls.
+/// Every edge with its confidence and metadata, which [`edge_set`] leaves out:
+/// a call bound by its module and the same call guessed by name differ only
+/// there (review of D#370(a), H1).
+fn graph_rows(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT fs.path || '.' || ns.name || ' --' || e.relation || '[' || e.confidence \
+                 || ']' || COALESCE(e.metadata, '') || '--> ' || ft.path || '.' || nt.name \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// [`assert_incremental_edges_match_rebuild`] over [`graph_rows`].
+fn assert_incremental_graph_matches_rebuild(
+    before: &[(&str, &str)],
+    after: &[(&str, Option<&str>)],
+) -> Vec<String> {
+    let (project, _d, db) = fresh_index_of(before);
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    for (path, body) in after {
+        tree.retain(|(p, _)| p != path);
+        let abs = project.path().join(path);
+        match body {
+            Some(b) => {
+                fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                fs::write(&abs, b).unwrap();
+                tree.push((path.to_string(), b.to_string()));
+            }
+            None => fs::remove_file(&abs).unwrap(),
+        }
+    }
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    let rows = graph_rows(&db);
+    assert_eq!(
+        rows,
+        graph_rows(&control),
+        "incremental after {after:?} must equal a rebuild"
+    );
+    rows
+}
+
 fn assert_incremental_edges_match_rebuild(
     before: &[(&str, &str)],
     after: &[(&str, Option<&str>)],
@@ -11949,12 +12002,11 @@ fn a_python_from_import_follows_its_package_reexport() {
     let (_p, _d, db) = fresh_index_of(files);
     let edges = edge_set(&db);
     let missing: Vec<&str> = [
-        // A1, A2, A3 (absolute), A4 (renamed into the export), A6 (a chain),
-        // A7 (both arms of a fallback import).
+        // A1, A2, A3 (absolute), A6 (a chain), A7 (both arms of a fallback
+        // import).
         "aaa/use.py.<module> --imports--> pkg/core.py.Widget",
         "aaa/use.py.<module> --imports--> pkg/core.py.Gadget",
         "aaa/use.py.<module> --imports--> pkg/tools.py.helper",
-        "aaa/use.py.<module> --imports--> pkg/core.py._Hidden",
         "aaa/use.py.<module> --imports--> pkg/sub/impl.py.Deep",
         "aaa/use.py.<module> --imports--> pkg/fast.py.Speed",
         "aaa/use.py.<module> --imports--> pkg/slow.py.Speed",
@@ -11965,8 +12017,10 @@ fn a_python_from_import_follows_its_package_reexport() {
         "aaa/use.py.run --calls--> pkg/core.py.Gadget",
         "aaa/use.py.run --calls--> pkg/tools.py.helper",
         "aaa/use.py.run --calls--> pkg/sub/impl.py.Deep",
-        // A14: a relative `from . import X` reads the package's re-export first.
+        // A14: a relative `from . import X` reads the package's re-export first,
+        // and still depends on the package, whose `__init__.py` Python runs.
         "pkg/user.py.<module> --imports--> pkg/core.py.Widget",
+        "pkg/user.py.<module> --imports--> pkg/__init__.py.<module>",
         "pkg/user.py.make --calls--> pkg/core.py.Widget",
     ]
     .into_iter()
@@ -11979,7 +12033,10 @@ fn a_python_from_import_follows_its_package_reexport() {
                 && (e.contains("--> aaa/decoys.py.") && !e.ends_with(".Thing")
                     // A5: `Thing as Alias` exports `Alias`, not `Thing`.
                     || e.ends_with("--> pkg/core.py.Thing")
-                    || e.ends_with("--> pkg/__init__.py.<module>") && e.starts_with("pkg/user.py"))
+                    // A4 is not followed: a renamed re-export binds what the
+                    // importer's name names, which an edit can move apart from
+                    // the target (review of D#370(a), M2/M3).
+                    || e.ends_with("--> pkg/core.py._Hidden"))
         })
         .collect();
     assert!(
@@ -12061,7 +12118,7 @@ fn a_python_reexport_binding_converges_incrementally_to_a_rebuild() {
         (&base, &[("pkg/sub/__init__.py", Some("\n"))]),
     ];
     for (before, after) in edits {
-        assert_incremental_edges_match_rebuild(before, after);
+        assert_incremental_graph_matches_rebuild(before, after);
     }
 }
 
@@ -12118,7 +12175,7 @@ fn a_python_reexport_fanout_reaches_every_importer_shape() {
         )],
     ];
     for after in edits {
-        assert_incremental_edges_match_rebuild(&base, after);
+        assert_incremental_graph_matches_rebuild(&base, after);
     }
 }
 
@@ -12260,6 +12317,188 @@ fn a_buffered_module_attribute_call_is_swept_as_the_attribute() {
     );
 }
 
+// Review of D#370(a), round 1. What a `P.X()` call or a re-exported import is
+// bound to can vanish while the caller stays: a definition renamed (p22, p23),
+// a fallback `def` dropped (p01b), the end of a chain renamed (p03b). The call
+// is then resolved again as a rebuild resolves it (also when its file goes,
+// p08, or the def becomes a method, p27) — through the module, else
+// by name and marked as the guess that is — and never by name under the mark of
+// a decided binding, which labels a guess `inferred` (H1). A renamed re-export
+// (`from .m import Y as X`) is not followed: an edit of its target requeued the
+// importer under the target's name (p14, M2), and its D10 fallback edge was
+// followed or not by the order a run met it in (p24, M3).
+#[test]
+fn a_python_module_binding_survives_its_target_going_away() {
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [(&'a str, Option<&'a str>)]);
+    let decoys = |extra: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> {
+        let mut v = vec![
+            ("zzz/decoy.py", "def X():\n    pass\n"),
+            ("yyy/decoy2.py", "def X():\n    pass\n"),
+        ];
+        v.extend_from_slice(extra);
+        v
+    };
+    let p22 = decoys(&[
+        ("pkg/__init__.py", "def X():\n    pass\n"),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+    ]);
+    let p23: Vec<(&str, &str)> = vec![
+        ("util.py", "def helper():\n    pass\n"),
+        ("tests/helpers.py", "def helper():\n    pass\n"),
+        ("scripts/tool.py", "def helper():\n    pass\n"),
+        ("app.py", "import util\n\ndef main():\n    util.helper()\n"),
+    ];
+    let p01b = decoys(&[
+        (
+            "pkg/__init__.py",
+            "try:\n    from ._speed import X\nexcept ImportError:\n    def X():\n        pass\n",
+        ),
+        ("pkg/_speed.py", "def X():\n    pass\n"),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+    ]);
+    let p03b = decoys(&[
+        ("pkg/__init__.py", "from .sub import X\n"),
+        ("pkg/sub/__init__.py", "from .impl import X\n"),
+        ("pkg/sub/impl.py", "def X():\n    pass\n"),
+        (
+            "app.py",
+            "import pkg\nfrom pkg import X\n\ndef main():\n    pkg.X()\n\ndef main2():\n    X()\n",
+        ),
+    ]);
+    let p14: Vec<(&str, &str)> = vec![
+        ("pkg/__init__.py", "from .m import Y as X\n"),
+        ("pkg/m.py", "def Y():\n    pass\n"),
+        ("zzz/decoy.py", "def Y():\n    pass\n\ndef X():\n    pass\n"),
+        (
+            "yyy/decoy2.py",
+            "def Y():\n    pass\n\ndef X():\n    pass\n",
+        ),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+        ("app2.py", "from pkg import X\n\ndef main2():\n    X()\n"),
+    ];
+    let p24 = decoys(&[
+        ("pkg/__init__.py", "from .m import Y as X\n"),
+        ("pkg/m.py", "Y = 1\n\ndef other():\n    pass\n"),
+        ("app2.py", "from pkg import X\n\ndef main2():\n    X()\n"),
+    ]);
+    let p08 = decoys(&[
+        ("pkg/__init__.py", "from .core import X\n"),
+        ("pkg/core.py", "def X():\n    pass\n"),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+        ("app2.py", "from pkg import X\n\ndef main2():\n    X()\n"),
+    ]);
+    let p27: Vec<(&str, &str)> = vec![
+        ("util.py", "def helper():\n    pass\n"),
+        ("zzz/decoy.py", "def helper():\n    pass\n"),
+        ("yyy/decoy2.py", "def helper():\n    pass\n"),
+        ("app.py", "import util\n\ndef main():\n    util.helper()\n"),
+    ];
+    let cases: &[Case] = &[
+        (&p08, &[("pkg/core.py", None)]),
+        (
+            &p27,
+            &[(
+                "util.py",
+                Some("class Box:\n    def helper(self):\n        pass\n\nhelper = Box().helper\n"),
+            )],
+        ),
+        (&p22, &[("pkg/__init__.py", Some("def Y():\n    pass\n"))]),
+        (&p23, &[("util.py", Some("def helper2():\n    pass\n"))]),
+        (
+            &p01b,
+            &[("pkg/__init__.py", Some("from ._speed import X\n"))],
+        ),
+        (&p03b, &[("pkg/sub/impl.py", Some("def Y():\n    pass\n"))]),
+        (&p14, &[("pkg/m.py", Some("def Z():\n    pass\n"))]),
+        (
+            &p24,
+            &[(
+                "app2.py",
+                Some("from pkg import X\n\n\ndef main2():\n    X()\n"),
+            )],
+        ),
+    ];
+    for (before, after) in cases {
+        assert_incremental_graph_matches_rebuild(before, after);
+    }
+}
+
+// Review of D#370(a), round 1, M1: `P.X()` named every node `X` in P's files,
+// a method and a def nested in a function among them, and a definition there
+// hid the re-export a later import overrides it with. P's attribute is a
+// module-level definition (not a method, not nested), together with what P
+// re-exports.
+#[test]
+fn a_python_module_attribute_is_a_module_level_definition_or_a_reexport() {
+    let files: &[(&str, &str)] = &[
+        (
+            "pkg/__init__.py",
+            "from .core import run\nfrom .core import helper\n\nclass Runner:\n    def run(self):\n        pass\n\n\
+             def factory():\n    def helper():\n        pass\n    return helper\n\n\
+             def X():\n    pass\n\ntry:\n    from ._fast import X\nexcept ImportError:\n    pass\n",
+        ),
+        (
+            "pkg/core.py",
+            "def run():\n    pass\n\ndef helper():\n    pass\n",
+        ),
+        ("pkg/_fast.py", "def X():\n    pass\n"),
+        (
+            "app.py",
+            "import pkg\n\ndef main():\n    pkg.run()\n    pkg.helper()\n    pkg.X()\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let mut calls: Vec<String> = edge_set(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("app.py.main --calls--> "))
+        .collect();
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec![
+            "app.py.main --calls--> pkg/__init__.py.X".to_string(),
+            "app.py.main --calls--> pkg/_fast.py.X".to_string(),
+            "app.py.main --calls--> pkg/core.py.helper".to_string(),
+            "app.py.main --calls--> pkg/core.py.run".to_string(),
+        ]
+    );
+}
+
+// A module that imports a name from a module the index does not hold as well
+// as from one of its own (`warnings.py`: `from _py_warnings import warn`, then
+// under `try` the compiled `from _warnings import warn`) re-exports whichever
+// Python keeps, which on CPython is the compiled one: such a re-export is not
+// followed, by an import or by `P.X()`, which resolve as before. Two arms the
+// index holds both are (A7).
+#[test]
+fn a_python_reexport_with_an_unseen_alternative_is_not_followed() {
+    let files: &[(&str, &str)] = &[
+        (
+            "pkg/__init__.py",
+            "from ._pure import warn\ntry:\n    from _ext import warn\nexcept ImportError:\n    pass\n",
+        ),
+        ("pkg/_pure.py", "def warn():\n    pass\n"),
+        ("zzz/decoy.py", "def warn():\n    pass\n"),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.warn()\n"),
+        ("app2.py", "from pkg import warn\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let rows: Vec<String> = graph_rows(&db)
+        .into_iter()
+        .filter(|r| {
+            r.starts_with("app.py.main --calls") || r.starts_with("app2.py.<module> --imports")
+        })
+        .filter(|r| r.contains("warn"))
+        .collect();
+    let want = [
+        r#"app.py.main --calls[ambiguous]{"amb":1,"attr":1,"q":"module","v":"pkg"}--> pkg/_pure.py.warn"#,
+        r#"app.py.main --calls[ambiguous]{"amb":1,"attr":1,"q":"module","v":"pkg"}--> zzz/decoy.py.warn"#,
+        r#"app2.py.<module> --imports[extracted]{"python_module":"pkg"}--> pkg/_pure.py.warn"#,
+        r#"app2.py.<module> --imports[extracted]{"python_module":"pkg"}--> zzz/decoy.py.warn"#,
+    ];
+    assert_eq!(rows, want, "both resolve by the name, as before");
+}
+
 // What `pkg.X()` binds depends on what `pkg` defines and re-exports, so each
 // way that can change must leave a rebuild's graph: the package gains its own
 // `Widget`, retargets or drops the re-export, the target is renamed, the
@@ -12301,6 +12540,12 @@ fn a_python_module_attribute_call_converges_incrementally_to_a_rebuild() {
                 Some("from .core import Widget\nfrom .missing import Missing\n\ndef helper():\n    return 1\n"),
             ),
         ],
+        // The package gains a compiled alternative for `Widget`: no longer
+        // followed (`a_python_reexport_with_an_unseen_alternative_is_not_followed`).
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import Widget\ntry:\n    from _speedups import Widget\nexcept ImportError:\n    pass\n\ndef helper():\n    return 1\n"),
+        )],
         // Still buffered, the call meets two new `Missing`s in one run: the
         // package's own, which a rebuild binds, and a nearer one by path. No
         // fan-out reaches a buffered call, so the sweep decides it.
@@ -12316,8 +12561,137 @@ fn a_python_module_attribute_call_converges_incrementally_to_a_rebuild() {
         ],
     ];
     for after in edits {
-        assert_incremental_edges_match_rebuild(&base, after);
+        assert_incremental_graph_matches_rebuild(&base, after);
     }
+}
+
+// The two fan-out arms of D#370(a) pull a file only when it can bind
+// differently, since a pull is a re-extraction (review of D#370(a), L3). The
+// re-export arm: not a file of the run itself, not one whose only tie to the
+// package is its module row, not one importing the moved name from another
+// module. The new-definition arm's module-attribute half: not a call whose
+// name gains a definition outside the module it names (which changes no
+// attribute), and not one of another name.
+#[test]
+fn the_python_reexport_fanouts_pull_only_files_that_can_rebind() {
+    let base: &[(&str, &str)] = &[
+        (
+            "pkg/__init__.py",
+            "from .core import Widget\n\ndef helper():\n    return 1\n",
+        ),
+        (
+            "pkg/core.py",
+            "class Widget:\n    pass\n\nclass Gadget:\n    pass\n",
+        ),
+        ("pkg/other.py", "class Gadget:\n    pass\n"),
+        (
+            "pkg/self_call.py",
+            "import pkg\n\ndef helper():\n    return pkg.helper()\n",
+        ),
+        ("app/plain.py", "import pkg\n"),
+        (
+            "app/elsewhere.py",
+            "import pkg\nfrom pkg.other import Gadget\n\ndef e():\n    return Gadget()\n",
+        ),
+        (
+            "app/user.py",
+            "from pkg import Gadget\n\ndef u():\n    return Gadget()\n",
+        ),
+        (
+            "app/in_run.py",
+            "from pkg import Gadget\n\ndef r():\n    return Gadget()\n",
+        ),
+        (
+            "app/method.py",
+            "class C:\n    def m(self):\n        return self.x.helper()\n",
+        ),
+        (
+            "app/attr.py",
+            "import pkg\n\ndef a():\n    return pkg.helper()\n",
+        ),
+    ];
+    let rewrite = |project: &std::path::Path, edits: &[(&str, &str)]| -> Vec<String> {
+        for (path, body) in edits {
+            fs::write(project.join(path), body).unwrap();
+        }
+        edits.iter().map(|(p, _)| p.to_string()).collect()
+    };
+    // A re-export of `Gadget` appears in the package.
+    let (project, _d, db) = fresh_index_of(base);
+    let paths = rewrite(
+        project.path(),
+        &[
+            (
+                "pkg/__init__.py",
+                "from .core import Widget\nfrom .core import Gadget\n\ndef helper():\n    return 1\n",
+            ),
+            ("app/in_run.py", "from pkg import Gadget\n\ndef r():\n    return Gadget()\n\n"),
+        ],
+    );
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        super::resolve::importers_of_python_reexport_drift(db.conn()).unwrap(),
+        vec!["app/user.py".to_string()]
+    );
+    // `helper` gains a definition elsewhere.
+    let (project, _d, db) = fresh_index_of(base);
+    let paths = rewrite(
+        project.path(),
+        &[(
+            "pkg/other.py",
+            "class Gadget:\n    pass\n\ndef helper():\n    return 2\n",
+        )],
+    );
+    super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let pulled =
+        super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default())
+            .unwrap();
+    for not in ["app/attr.py", "pkg/self_call.py", "pkg/__init__.py"] {
+        assert!(!pulled.contains(&not.to_string()), "{not}: {pulled:?}");
+    }
+    // The package itself gains one: its attribute callers rebind.
+    let (project, _d, db) = fresh_index_of(base);
+    let paths = rewrite(
+        project.path(),
+        &[(
+            "pkg/__init__.py",
+            "from .core import Widget\n\ndef helper():\n    return 1\n\nclass Gadget:\n    pass\n",
+        )],
+    );
+    super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let pulled =
+        super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default())
+            .unwrap();
+    assert!(!pulled.contains(&"app/attr.py".to_string()), "{pulled:?}");
 }
 
 // D9's fan-out arm re-extracts only the importers a rebuild binds differently:

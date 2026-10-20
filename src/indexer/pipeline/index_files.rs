@@ -982,6 +982,15 @@ fn buffer_then_delete_files(
 /// aborts the whole run on the edges FK.
 ///
 /// Returns `(calls_buffered, other_relations_requeued)`.
+/// A Python call on an imported module bound by the module's attribute
+/// (`"attr":1`, D#370(a)), as the edge or the buffered call stores it.
+fn is_module_attr_call(metadata: &str) -> bool {
+    matches!(
+        super::resolve::parse_callee_metadata(Some(metadata)),
+        Some(super::resolve::CalleeMeta::Module { attr: true, .. })
+    )
+}
+
 fn buffer_inbound_before_node_purge(
     db: &Database,
     file_id: i64,
@@ -994,6 +1003,36 @@ fn buffer_inbound_before_node_purge(
 
     let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), file_id)?;
     for (source_id, target_name, source_language, metadata) in inbound {
+        // A call on an imported Python module goes back through the deferred
+        // pass, as on the edit path (`restore_inbound_edges`).
+        if metadata.as_deref().is_some_and(is_module_attr_call) {
+            let source_path: Option<String> = db
+                .conn()
+                .query_row(
+                    "SELECT f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id = ?1",
+                    [source_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(source_path) = source_path {
+                if !run_file_paths.contains(source_path.as_str())
+                    && !delete_set.contains(source_path.as_str())
+                {
+                    deferred.push(DeferredRelation {
+                        source_ids: vec![source_id],
+                        source_name: String::new(),
+                        target_name,
+                        relation: REL_CALLS.to_string(),
+                        metadata,
+                        rel_path: source_path,
+                        language: source_language,
+                        ns_file: None,
+                    });
+                    requeued += 1;
+                }
+            }
+            continue;
+        }
         crate::storage::queries::insert_pending_unresolved_call(
             db.conn(),
             source_id,
@@ -3474,8 +3513,18 @@ fn restore_inbound_edges(
             // receiver loses it on a rebuild. Re-resolved in the deferred pass
             // under the full rules, never restored by name (batch-1 review
             // round 2). Only the Rust parser writes `rt`.
+            //
+            // A call on an imported Python module (`flask.Flask()`, `attr`) is
+            // decided by what that module defines and re-exports, which an edit
+            // of the target's file can move while the name stays: re-resolved
+            // in the deferred pass too, so its target is the module's attribute
+            // or a guess marked `amb`, as in a rebuild — the pending buffer binds
+            // by name under the mark of the decided binding (review of
+            // D#370(a), H1).
             let receiver_typed = relation.as_str() == REL_CALLS
-                && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
+                && metadata
+                    .as_deref()
+                    .is_some_and(|m| m.contains(r#""rt":"#) || is_module_attr_call(m));
             let new_target_ids: Option<Vec<i64>> = (!renamed_import && !receiver_typed)
                 .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
                 .flatten()
@@ -3621,10 +3670,14 @@ fn restore_inbound_edges(
 /// binds nothing: a re-export of a re-export answers only once the inner one is
 /// bound, in whichever order the pass met them, so a rebuild reaches the graph
 /// an incremental run starts from. What no round answers stays in `waiting`
-/// for the pass to bind as it did before.
-fn settle_python_reexports(
+/// for the pass to bind as it did before. A relative import it answers goes to
+/// `relative_bound`, to take the package's `<module>` as well, as D10 binds it:
+/// Python runs that `__init__.py` for it, and without the edge the import left
+/// `cycles` and `deps` (review of D#370(a), L4).
+fn settle_python_reexports<'a>(
     db: &Database,
-    waiting: &mut Vec<(&DeferredRelation, Vec<i64>, Vec<String>)>,
+    waiting: &mut Vec<(&'a DeferredRelation, Vec<i64>, Vec<String>)>,
+    relative_bound: &mut Vec<&'a DeferredRelation>,
     python_module_map: &HashMap<String, Vec<String>>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
@@ -3658,6 +3711,15 @@ fn settle_python_reexports(
             )?;
             reexports.forget(&d.rel_path);
             bound = true;
+            let relative = d
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get("python_module")?.as_str().map(|m| m.starts_with('.')))
+                .unwrap_or(false);
+            if relative {
+                relative_bound.push(d);
+            }
         }
         *waiting = left;
         if !bound || waiting.is_empty() {
@@ -3796,8 +3858,18 @@ fn resolve_deferred_relations(
             if calls_queued {
                 break;
             }
-            edges_created += settle_python_reexports(db, &mut reexport_wait, python_module_map)?;
-            for (d, _, _) in reexport_wait.drain(..) {
+            let mut relative_bound = Vec::new();
+            edges_created += settle_python_reexports(
+                db,
+                &mut reexport_wait,
+                &mut relative_bound,
+                python_module_map,
+            )?;
+            for d in reexport_wait
+                .drain(..)
+                .map(|(d, _, _)| d)
+                .chain(relative_bound)
+            {
                 waited.insert(d);
                 queue.push(d);
             }

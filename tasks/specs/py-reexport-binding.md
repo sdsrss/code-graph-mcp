@@ -1,6 +1,6 @@
 # Python 包的再导出绑定（D#370(a)，2026-10-20，0.174.0 之后）
 
-状态：(a1) 已提交 `b7424176` + `d523c852`（INDEX_VERSION 119）；(a2) 完成待提交（INDEX_VERSION 120）。
+状态：(a1) `b7424176` + `d523c852`，(a2) `d44798b1`；评审第 1 轮修复待提交（INDEX_VERSION 121），之后评审第 2 轮（只审修复）。
 
 ## 背景与目标
 
@@ -113,3 +113,32 @@ SCIP oracle 只统计指向函数/方法的调用，`Flask(...)` 是类构造，
 - networkx（base vs a2f）：只有 1 条边改目标（`test_threshold.py` 的 `nxt.triangles()`，从 `test_cycles.py` 的内嵌函数到 `threshold.py:triangles`，对）；10,744 条只改元数据（10,715 条 `attr` 调用 + 29 条导入的 `as`）；5 条调用 `ambiguous → inferred`。10,715 条 `attr` 调用里 67 条经模块属性绑定，10,648 条回落（星号再导出）。
 - SCIP oracle（flask，a1c 与 a2）：精确率/召回完全相同，且与 base 相同（extracted 195/205、inferred 89/107、ambiguous 19/60；R@inferred 258/300）——变动的调用都不在金标里（scip-python 没解析测试里的 `import flask`）。
 - 性能（a2f md5 `e0be3389`）：networkx 全量 CPU 3.84–4.07 s（中位 3.87），base 3.72–3.90（中位 3.83），各 7 次交替；普通编辑 83–137 ms（中位 104），base 89–121（中位 105），不触发扇出。
+
+## 评审第 1 轮（新开子代理，盲审 `752afb86..d44798b1`）
+
+1 HIGH、3 MEDIUM、6 LOW；我用评审的 `parity.py` 和自己的二进制逐条复现后才动手。评审工具和场景在 `/var/tmp/d370a-review/`。
+
+- H1（成立）：`P.X()` 的目标消失（定义改名、回退 `def` 删掉、链尾改名、目标文件删除）时，`restore_inbound_edges` / `buffer_inbound_before_node_purge` 把调用放进待定缓冲，扫描按名绑定却带着"已决定"的元数据，被豁免成 `inferred`（重建是 `ambiguous`），有时还多出诱饵边。我此前删掉扫描的属性查找，理由是"没有测试能杀死它"——是场景集没覆盖"模块里的定义消失"这条路径。修复：这类调用像 receiver-typed 调用一样回到延迟阶段重新解析（编辑路径与删除路径都改）。
+- M1（成立）：属性查找绑定模块文件里所有同名节点（方法、嵌套 def），且"已定义"挡住再导出。标准库上 135 条指向方法的新 `inferred` 边全错。修复：只认跨度不在任何类/函数里的顶层定义，并与再导出取并集。
+- M2、M3、L5（成立）：改名再导出（`Y as X`）的目标改名后按 `Y` 重新入队；D10 回落边带 `as` 时是否被跟随取决于顺序。修复：改名再导出两个名字都不跟随（窄化，回到 BASE）。
+- L1（成立，并在标准库上看到实害）：模块名被参数/赋值遮蔽（`pdb.py` 的 `pdb = Pdb._last_pdb_instance`），以及 `os.py` 两个分支把 `posixpath`、`ntpath` 都绑成 `path`。修复：文件里任何其他方式绑定过的名字不算模块名。
+- L2（成立）：仓库的增量断言只比边，不比标签和元数据。新增 `assert_incremental_graph_matches_rebuild`，本任务的增量测试都改用它（换上它以后，原有的 `attr` 守卫在"目标改名"场景就失败了）。
+- L3（成立）：扇出的成本条件没被测试钉住。新增 `the_python_reexport_fanouts_pull_only_files_that_can_rebind`；写它时发现 D9 的 `attr` 臂过宽（新定义在别的模块也拉调用者），收窄为"调用所指模块的文件在本次运行里新增了这个名字"。
+- L4（成立）：相对导入经再导出绑定后丢了对包 `<module>` 的边（flask `cycles` 20 → 19 个文件）。修复：已绑定的相对导入再走一次 D10。
+- L6（成立）：networkx `__init__.py` 加一行 `Graph` 再导出要重新提取 255 个文件（1.9–2.3 s，base 122–183 ms）。为了与重建一致必须付，写进 CHANGELOG 的 Cost。
+- 新增（修复时自己在标准库上测到）：`warnings.py` 先 `from _py_warnings import warn`、再在 `try` 里 `from _warnings import warn`（编译模块）；跟随前者把 111 条 `warnings.warn()` 提进 `inferred`，oracle 判全错。修复：解析器给"同一文件里从多个模块导入的名字"记 `"n"`，解析时看得见的绑定少于 `n` 就不跟随。
+
+决策：
+- 改名再导出整体不跟随，而不是修重新入队的名字：入队记录没有导入者那边的名字，修它要改边的元数据，面更大；flask、networkx 上改名再导出的导入者都没有因此变化。
+- 删除路径的重新入队保留，尽管目前的场景里它被 Phase 0-pre（结构依赖重提取）和漂移扇出遮住（变异 R1b 存活）：它和编辑路径是同一条原则的两处，删掉它要靠别的机制碰巧覆盖——H1 正是这样出的错。
+- 属性查找的方法过滤和点号过滤都与跨度检查重复（flask 上 429 个方法全带点、全在类跨度里），只留跨度检查。
+
+### 修复验证（r3，md5 `97420cf5`）
+
+- 新测试：`a_python_module_binding_survives_its_target_going_away`（p08、p27、p22、p23、p01b、p03b、p14、p24）、`a_python_module_attribute_is_a_module_level_definition_or_a_reexport`、`a_python_reexport_with_an_unseen_alternative_is_not_followed`、`the_python_reexport_fanouts_pull_only_files_that_can_rebind`、解析器 `test_python_module_attribute_mark_needs_a_name_bound_only_by_its_import`、`test_python_import_of_a_name_from_several_modules_is_counted`；形状测试改为 A4 不跟随、A14 保留包边。RED：在修复前代码上，新场景测试在 p22 失败，M1 形状失败，原 `attr` 守卫换成带标签的断言后在"目标改名"失败。
+- 变异（都能编译、都跑到）：编辑路径改回待定 → 2 个测试失败；属性查找"定义挡住再导出" → M1 测试失败；跟随改名行 → 2 个失败；相对导入不补 D10 → 形状测试失败；D9 `attr` 臂不查模块 → 成本测试失败；跨度检查去掉 → M1 测试失败；解析器遮蔽过滤 / 第二个模块 / 参数各自去掉 → 解析器测试失败；看不见的来源仍跟随 → 新测试失败；漂移快照不含 `n` → 增量守卫失败。存活：删除路径改回待定（见上）、方法过滤与点号过滤（重复，已删）。
+- 评审的 31 个增量场景（`parity.py`，比边、元数据、标签）：r3 28 个与重建一致；p15、p28、p29 在 BASE 上也不一致（既有）。
+- 七个语料（base vs r3，各自全量建索引，14 个库 `integrity_check` 都 ok）：六个边集合相同、无标签变化；flask 11,941 → 11,845，变化同 a2 外加 `cli.py` 保留指向 `__init__.py` 的导入边；`Flask` 81 条全 `inferred`，callgraph 75 行，impact 74 个测试，`cycles` 恢复 20 个文件。
+- 标准库（569 个文件，SCIP oracle，base vs r3）：`inferred` 正确 1235 → 1489（+254）、错误 872 → 873（+1，`operator.index`），精确率 58.6% → 63.0%；`extracted` 正确不变、错误 −7；`ambiguous` 错误 −743；没有正确边丢失；R@inferred 10530 → 10784。
+- networkx（base vs r3）：1 条边改目标（`nxt.triangles()`，对）；`attr` 调用 10,637 条，60 条经属性绑定；2 条 `ambiguous → inferred`。全量 CPU 14 次中位 3.83 s vs 3.73 s（+2.7%）；普通编辑中位 136 vs 149 ms；L6 见上。
+- 一次原因不明的库损坏：第一次跑七语料差分时 r3 的 hono 库 `database disk image is malformed`（`integrity_check`：页 806 字节重复使用、`idx_edges_source` 缺行）。随后 base/r2/r3 在 hono 上 39 次全部正常、库完整；同时间没有别的进程写 `/var/tmp`。记为遗留。

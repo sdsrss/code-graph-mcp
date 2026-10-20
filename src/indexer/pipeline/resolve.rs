@@ -1543,14 +1543,15 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 }
 
 /// What a Python file of `cg_reexport_paths` exports through its imports
-/// (D#370(a)): one row per name its `<module>` imports other than as a module,
-/// `(file, exported name ␟ target file ␟ target name)`. The exported name is
-/// the import's `as` when it renamed. Join order fixed for the reason
+/// (D#370(a)): one row per name its `<module>` imports other than as a module
+/// and without renaming it (a renamed import is no re-export the resolver
+/// follows), `(file, name ␟ target file ␟ number of modules it is imported
+/// from)`. Join order fixed for the reason
 /// `python_modules::ReexportEdges` gives.
 const PY_REEXPORT_SELECT: &str = "
     SELECT f.path AS p,
-           COALESCE(json_extract(e.metadata, '$.as'), t.name) || char(31) || tf.path
-             || char(31) || t.name AS v
+           t.name || char(31) || tf.path || char(31) || COALESCE(json_extract(e.metadata, '$.n'), '')
+             AS v
     FROM cg_reexport_paths rp
     CROSS JOIN files f ON f.path = rp.path
     CROSS JOIN nodes s ON s.file_id = f.id AND s.name = '<module>'
@@ -1558,7 +1559,8 @@ const PY_REEXPORT_SELECT: &str = "
     CROSS JOIN nodes t ON t.id = e.target_id
     CROSS JOIN files tf ON tf.id = t.file_id
     WHERE json_extract(e.metadata, '$.python_module') IS NOT NULL
-      AND json_extract(e.metadata, '$.is_module_import') IS NULL";
+      AND json_extract(e.metadata, '$.is_module_import') IS NULL
+      AND json_extract(e.metadata, '$.as') IS NULL";
 
 /// Record what the Python files among `paths` re-export, before an
 /// `index_files` run rewrites them; [`importers_of_python_reexport_drift`]
@@ -1593,8 +1595,8 @@ pub(super) fn snapshot_python_reexports<'a>(
 /// importer is a file with an import edge whose `python_module` resolves to a
 /// moved module (so a relative importer counts as well as an absolute one), and
 /// it is pulled only when it could bind differently: it holds an import edge
-/// to a node of a moved name (the name chain's target, an `<external>`
-/// sentinel, or a renamed re-export's own target), or a relative import that
+/// to a node of a moved name (the name chain's target or an `<external>`
+/// sentinel), or a relative import that
 /// fell back to a `<module>` (D10: the package's own, or a submodule's, which a
 /// new re-export of that name now shadows, as it does in Python), or it calls
 /// the module's attribute of a moved name (`flask.Flask()`). Pulling every
@@ -1634,18 +1636,10 @@ pub(super) fn importers_of_python_reexport_drift(
          DROP TABLE IF EXISTS temp.cg_reexport_before;",
     )?;
     let mut drifted: HashSet<String> = HashSet::new();
-    // The exported names, and the target's own name where the re-export
-    // renamed it: that importer's edge is to the target's name.
     let mut names: HashSet<String> = HashSet::new();
     for (path, row) in before.symmetric_difference(&now) {
         drifted.insert(path.clone());
-        let mut parts = row.split('\u{1f}');
-        let exported = parts.next().unwrap_or_default();
-        let target = parts.nth(1).unwrap_or_default();
-        names.insert(exported.to_string());
-        if target != exported {
-            names.insert(target.to_string());
-        }
+        names.extend(row.split('\u{1f}').next().map(str::to_string));
     }
     if drifted.is_empty() {
         return Ok(Vec::new());
@@ -1901,11 +1895,15 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     );
     // A Python call on an imported module bound to the module's attribute
     // (`flask.Flask()`, D#370(a)) is not `ambiguous`, so the first half misses
-    // it: when its name gains a definition — in the module itself, which a
-    // rebuild binds before a re-export — re-extract the caller. `"attr":1`, not
-    // `"attr"`, which D10B's `{"ur":"attr"}` also holds.
+    // it: when the module itself gains a definition of its name, which a
+    // rebuild binds too, re-extract the caller — a call that fell back to the
+    // name (`amb`) as well, since the sweep can bind it by name in the same run.
+    // Kept below only when the module is a file of this run that now defines
+    // the name: a definition anywhere else changes no attribute, and moves a
+    // guess's name count, which the first half reads (`"attr":1`, not
+    // `"attr"`, which D10B's `{"ur":"attr"}` also holds).
     let module_attr_sql = format!(
-        "SELECT DISTINCT f.path
+        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.v'), u.nm
          FROM cg_fanout_up u
          CROSS JOIN nodes tgt ON tgt.name = u.nm
          CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
@@ -2050,12 +2048,34 @@ pub(super) fn bare_name_callers_of_new_duplicates(
             paths.sort_unstable();
             paths.dedup();
         }
-        let attr_callers: Vec<String> = conn
+        let attr_calls: Vec<(String, String, String)> = conn
             .prepare(&module_attr_sql)?
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if !attr_callers.is_empty() {
-            paths.extend(attr_callers);
+        if !attr_calls.is_empty() {
+            let python_paths: HashSet<String> = conn
+                .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            let module_map = super::python_modules::build_python_module_map(&python_paths);
+            let mut defines = conn.prepare(
+                "SELECT 1 FROM cg_fanout_paths p
+                 CROSS JOIN files f ON f.path = p.path
+                 CROSS JOIN nodes n ON n.file_id = f.id AND n.name = ?2
+                 WHERE p.path = ?1 LIMIT 1",
+            )?;
+            for (caller, module, name) in attr_calls {
+                let Some(files) = super::python_modules::project_module_files(&module, &module_map)
+                else {
+                    continue;
+                };
+                for file in files {
+                    if defines.exists(rusqlite::params![file, name])? {
+                        paths.push(caller);
+                        break;
+                    }
+                }
+            }
             paths.sort_unstable();
             paths.dedup();
         }

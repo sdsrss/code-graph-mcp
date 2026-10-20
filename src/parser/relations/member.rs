@@ -50,9 +50,9 @@ thread_local! {
     static PACKAGE_MEMBER: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
     /// Python names that hold the very module [`IMPORT_BOUND`] gives for them:
     /// `import a` and `import a.b as m`, but not `import a.b` (it binds `a`,
-    /// while the import names `a.b`) and no name a from-import also binds. A
-    /// call `m.f()` on one is the module's attribute `f` (D#370(a)). Per file:
-    /// reset by `reset_import_bound`.
+    /// while the import names `a.b`) and no name the file binds any other way
+    /// ([`collect_py_module_names`]). A call `m.f()` on one is the module's
+    /// attribute `f` (D#370(a)). Per file: reset by `reset_import_bound`.
     static PY_MODULE_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
@@ -68,9 +68,13 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     }
     let mut module_names = HashSet::new();
     if family == "python" {
-        let mut from_bound = HashSet::new();
-        collect_py_module_names(root, source, &mut module_names, &mut from_bound, 0);
-        module_names.retain(|n| !from_bound.contains(n));
+        let mut modules = HashMap::new();
+        let mut rebound = HashSet::new();
+        collect_py_module_names(root, source, &mut modules, &mut rebound, 0);
+        module_names = modules
+            .into_keys()
+            .filter(|n| !rebound.contains(n))
+            .collect();
     }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
@@ -79,13 +83,19 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     PACKAGE_MEMBER.with(|m| m.borrow_mut().clear());
 }
 
-/// [`PY_MODULE_NAMES`] for one tree: the names plain imports bind to their
-/// own module, and every name a from-import binds, which disqualifies it.
+/// [`PY_MODULE_NAMES`] for one tree: the names plain imports bind to their own
+/// module, less every name the file binds any other way — a from-import, a
+/// plain import of another module (`import posixpath as path` beside `import
+/// ntpath as path`), or anything else that rebinds it somewhere in the file
+/// (an assignment, a parameter, a loop or `with`/`except` target, a `def` or
+/// `class`): `pdb = Pdb(); pdb.set_trace()` in `pdb.py` is the local's method,
+/// not the module's function (review of D#370(a), L1; both lost a correct edge
+/// on the standard library).
 fn collect_py_module_names(
     node: tree_sitter::Node,
     source: &str,
-    modules: &mut HashSet<String>,
-    from_bound: &mut HashSet<String>,
+    modules: &mut HashMap<String, String>,
+    rebound: &mut HashSet<String>,
     depth: usize,
 ) {
     if depth > 256 {
@@ -103,26 +113,91 @@ fn collect_py_module_names(
                 if Some(c.id()) == module {
                     continue;
                 }
+                // (bound name, the module it holds when that is its own)
                 let bound = match c.kind() {
                     "dotted_name" => c
                         .named_child(0)
-                        .map(|first| (text(first), c.named_child_count() == 1)),
-                    "aliased_import" => c.child_by_field_name("alias").map(|a| (text(a), true)),
+                        .map(|first| (text(first), (c.named_child_count() == 1).then(|| text(c)))),
+                    "aliased_import" => c
+                        .child_by_field_name("alias")
+                        .map(|a| (text(a), c.child_by_field_name("name").map(text))),
                     _ => None,
                 };
-                if let Some((name, own_module)) = bound {
-                    if is_from {
-                        from_bound.insert(name);
-                    } else if own_module {
-                        modules.insert(name);
+                let Some((name, own)) = bound else {
+                    continue;
+                };
+                match own.filter(|_| !is_from) {
+                    Some(m) if modules.get(&name).is_none_or(|known| *known == m) => {
+                        modules.insert(name, m);
+                    }
+                    _ => {
+                        rebound.insert(name);
                     }
                 }
             }
+            return;
         }
+        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                pattern_names(left, source, rebound, depth + 1);
+            }
+        }
+        "named_expression"
+        | "function_definition"
+        | "class_definition"
+        | "default_parameter"
+        | "typed_default_parameter" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                pattern_names(name, source, rebound, depth + 1);
+            }
+        }
+        "as_pattern" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                pattern_names(alias, source, rebound, depth + 1);
+            }
+        }
+        "parameters" | "lambda_parameters" => {
+            for i in 0..node.named_child_count() {
+                let Some(p) = node.named_child(i) else {
+                    continue;
+                };
+                match p.kind() {
+                    "identifier" => {
+                        rebound.insert(text(p));
+                    }
+                    "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+                        if let Some(first) = p.named_child(0) {
+                            pattern_names(first, source, rebound, depth + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            collect_py_module_names(c, source, modules, rebound, depth + 1);
+        }
+    }
+}
+
+/// The names a binding target binds: `a`, `a, b`, `(a, *b)`, `as_pattern_target`;
+/// none for `x.a` or `x[i]`, which bind no name.
+fn pattern_names(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>, depth: usize) {
+    if depth > 256 {
+        return;
+    }
+    match node.kind() {
+        "identifier" => {
+            out.insert(node_text(&node, source).to_string());
+        }
+        "attribute" | "subscript" => {}
         _ => {
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {
-                    collect_py_module_names(c, source, modules, from_bound, depth + 1);
+                    pattern_names(c, source, out, depth + 1);
                 }
             }
         }

@@ -778,6 +778,92 @@ fn test_member_call_on_an_object_is_marked_member() {
     assert_eq!(meta_of(&c, "read"), None);
 }
 
+// Review of D#370(a), L1 and the standard library: a name that holds a module
+// only where the file binds it no other way. A parameter, a local assignment
+// or loop target, a `with` / `except` alias, a `def` of that name, or a second
+// plain import of another module under it (`os.py` imports `posixpath` and
+// `ntpath` as `path` in two branches) leave the call unmarked: it resolves as
+// a call through an import did before.
+// Review of D#370(a): a name a file imports from more than one module carries
+// how many (`"n"`), so the resolver can tell a re-export with an arm it cannot
+// see from one it sees whole. Counted over the exported name (an `as`), not
+// the original; one module imported twice is one.
+#[test]
+fn test_python_import_of_a_name_from_several_modules_is_counted() {
+    let rels = extract_relations(
+        "from ._py import warn\ntry:\n    from _c import warn\nexcept ImportError:\n    pass\n\
+         from .a import X\nfrom .a import X\nfrom .b import Y as Z\nfrom .c import Z\nfrom .d import W\n",
+        "python",
+    )
+    .unwrap();
+    let meta = |name: &str, module: &str| -> Option<String> {
+        rels.iter()
+            .find(|r| {
+                r.relation == REL_IMPORTS
+                    && r.target_name == name
+                    && r.metadata
+                        .as_deref()
+                        .is_some_and(|m| m.contains(&format!("\"{module}\"")))
+            })
+            .and_then(|r| r.metadata.clone())
+    };
+    assert_eq!(
+        meta("warn", "._py").as_deref(),
+        Some(r#"{"n":2,"python_module":"._py"}"#)
+    );
+    assert_eq!(
+        meta("warn", "_c").as_deref(),
+        Some(r#"{"n":2,"python_module":"_c"}"#)
+    );
+    assert_eq!(
+        meta("X", ".a").as_deref(),
+        Some(r#"{"python_module":".a"}"#)
+    );
+    assert_eq!(
+        meta("Y", ".b").as_deref(),
+        Some(r#"{"as":"Z","n":2,"python_module":".b"}"#)
+    );
+    assert_eq!(
+        meta("Z", ".c").as_deref(),
+        Some(r#"{"n":2,"python_module":".c"}"#)
+    );
+    assert_eq!(
+        meta("W", ".d").as_deref(),
+        Some(r#"{"python_module":".d"}"#)
+    );
+}
+
+#[test]
+fn test_python_module_attribute_mark_needs_a_name_bound_only_by_its_import() {
+    let py = call_meta(
+        "import keep\nimport config\nimport pdb\nimport loop\nimport ctx\nimport err\nimport defined\n\
+         import posixpath as path\nimport ntpath as path\n\
+         def f(config):\n    config.get()\n\
+         def g():\n    pdb = Pdb.last\n    pdb.set_trace()\n\
+         def h():\n    for loop in []:\n        loop.step()\n    with open() as ctx:\n        ctx.read()\n\
+         \x20   try:\n        pass\n    except E as err:\n        err.why()\n    path.split()\n    keep.run()\n\
+         def defined():\n    pass\n\ndefined.attr_call()\n",
+        "python",
+    );
+    assert_eq!(
+        meta_of(&py, "run"),
+        Some(r#"{"attr":1,"q":"module","v":"keep"}"#),
+        "{py:?}"
+    );
+    for (t, module) in [
+        ("get", "config"),
+        ("set_trace", "pdb"),
+        ("step", "loop"),
+        ("read", "ctx"),
+        ("why", "err"),
+        ("split", "ntpath"),
+        ("attr_call", "defined"),
+    ] {
+        let want = format!(r#"{{"q":"module","v":"{module}"}}"#);
+        assert_eq!(meta_of(&py, t), Some(want.as_str()), "{t}: {py:?}");
+    }
+}
+
 #[test]
 fn test_python_call_on_an_untyped_receiver_is_marked() {
     // D10B: `self.serializer.tag()` is not a call on the instance, and

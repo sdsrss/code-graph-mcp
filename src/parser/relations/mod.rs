@@ -194,6 +194,9 @@ pub fn extract_relations_from_tree(
     if config.name == "ruby" {
         ruby_bare_calls::extract(tree.root_node(), source, "<module>", &mut relations);
     }
+    if config.name == "python" {
+        imports::count_python_import_sources(&mut relations);
+    }
     // Stamp source_language on every relation. walk_for_relations constructs
     // ParsedRelation with source_language: String::new(), and we fill it in
     // here so every call site inside walk doesn't need to propagate language.
