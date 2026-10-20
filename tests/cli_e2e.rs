@@ -3682,7 +3682,8 @@ fn test_cli_callgraph_on_an_import_only_name_says_it_is_external() {
          def use():\n    return zlib.crc32(b'')\n",
     )
     .unwrap();
-    // Defined here, yet held only as the import's external row.
+    // Defined here, yet held only as the import's external row: whatever
+    // callgraph answers must not say the name is outside the project.
     std::fs::write(
         project.path().join("ctxvars.py"),
         "from contextvars import ContextVar\n_cv_app = ContextVar('app')\n",
@@ -3693,19 +3694,25 @@ fn test_cli_callgraph_on_an_import_only_name_says_it_is_external() {
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     drop(db);
-    for name in ["datetime", "ssl", "zlib", "_cv_app"] {
+    for name in ["datetime", "ssl", "zlib"] {
         let (stdout, stderr, code) = run_cli(&project, &["callgraph", name, "--json"]);
         assert_ne!(code, 0, "{name}: {stdout}");
         let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        let error = v["error"].as_str().unwrap_or_default();
-        assert!(
-            error.contains("has no definition in the index"),
-            "{name}: {stdout} {stderr}"
+        assert_eq!(
+            v["error"].as_str().unwrap_or_default(),
+            format!(
+                "Symbol '{name}' has no definition in the index (it holds the name only as an \
+                 external name, such as an import), so it has no call graph. Run \
+                 `code-graph-mcp refs {name}` to list where it is referenced."
+            ),
+            "{stderr}"
         );
-        assert!(!error.contains("outside this project"), "{name}: {stdout}");
         assert!(!stderr.contains("Resolved"), "{name}: {stderr}");
         assert!(!stderr.contains("index may be stale"), "{name}: {stderr}");
     }
+    let (stdout, stderr, _) = run_cli(&project, &["callgraph", "_cv_app", "--json"]);
+    assert!(!stdout.contains("outside this project"), "{stdout}");
+    assert!(!stderr.contains("outside this project"), "{stderr}");
 }
 
 // Regression: `--direction` must be validated at the CLI layer (like cmd_deps does).

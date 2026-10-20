@@ -5,16 +5,15 @@
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Some answers
 change (below): C++ class names whose constructor another file defines are
 answered where they were ambiguous; `get_call_graph` and CLI `callgraph` say
-that a name the index holds only as an import has no call graph; CLI `refs`
-and `impact` leave out test-code namesakes of a production name, as the MCP
-tools do. A `~/.claude/settings.json` kept as a symlink now stays a link; when
-the directory holding the linked file cannot be written, install refuses
-instead of replacing the link (below). To keep
-0.173.0's answers: `npm i -g @sdsrs/code-graph@0.173.0` (or, from source,
-`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
-v0.173.0 --features embed-model`), then delete
-`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
-as described under 0.171.0.
+that a name the index holds only as an external name has no call graph; CLI
+`refs` and `impact` leave out test-code namesakes of a production name, as the
+MCP tools do. A `~/.claude/settings.json` kept as a symlink to a file now
+stays a link; when the directory holding the linked file cannot be written,
+install refuses instead of replacing the link (below). To keep 0.173.0's
+answers: `npm i -g @sdsrs/code-graph@0.173.0` (or, from source, `cargo
+install --locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.173.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
 
 Measured on the seven corpora of 0.173.0 (flask, leveldb, express, hono, gin,
 gson, and this repository's `src/` and `tests/`) with the same 45,723 inputs:
@@ -47,14 +46,17 @@ class in `db/log_writer.h` and the constructor of the struct
 `DBImpl::Writer` in `db/db_impl.cc`, which the index names `DBImpl::Writer`
 rather than `Writer` (4 → 2). The six other corpora answer as before.
 
-### A name the index holds only as an import says it has no call graph
+### A name the index holds only as an external name says it has no call graph
 
-A name the index holds only as an external name has no node of its own: the
-project imports it (flask `ssl`), or defines it in a form the indexer makes
-no node for (flask's module-level `_cv_app` and `current_app`, gson's
-`@interface Expose`, hono's `export type Endpoint`, this repository's `pub
-type EdgeInfo`). MCP `get_call_graph` and CLI `callgraph` never answered for
-such a name. They said the index did not have a name it holds
+A name the index holds only as an external name has no node of its own.
+Among them are names the project imports (flask `ssl`), names it imports one
+of its own files by (express `application` for `lib/application.js`, which
+the index holds as a file), external types it implements (gson
+`Appendable`), and names it defines in a form the indexer makes no node for
+(flask's module-level `_cv_app` and `current_app`, gson's `@interface
+Expose`, hono's `export type Endpoint`, this repository's `pub type
+EdgeInfo`). MCP `get_call_graph` and CLI `callgraph` never answered for such
+a name. They said the index did not have a name it holds
 (MCP `Symbol '_cv_app' not found in the index`, CLI `No call graph results
 for: _cv_app` with a hint that the index may be stale), listed near names
 (`No exact match … Did you mean`), or answered for another symbol with a note
@@ -66,15 +68,18 @@ external name, such as an import), so it has no call graph. Use
 find_references to list where it is referenced.
 ```
 
-The CLI says `` Run `code-graph-mcp refs ssl` `` where MCP says `Use
-find_references`, without the stale-index hint, and exits 1, as it did for a
-name it called not found; where it answered another symbol it exited 0. MCP
-returns it with `isError: true`, as it did for a name it called not found;
-near names and another symbol's answer came with `isError: false`. On the
-seven corpora, 735 inputs (732 names) that the index holds only as external
-names changed on each of the six call-graph surfaces (three directions, MCP
-and CLI; 4,410 runs): 461 had been not found, 210 a list of near names and
-64 another symbol's answer. No run that answered the name asked for changed.
+MCP's text starts with `Error: ` and comes with `isError: true`, as it did
+for a name it called not found; near names and another symbol's answer came
+with `isError: false`. The CLI says `` Run `code-graph-mcp refs ssl` `` where
+MCP says `Use find_references`, without the stale-index hint, and exits 1, as
+it did for a name it called not found or for near names; where it answered
+another symbol it exited 0. On the seven corpora, 735 inputs changed on each
+of the six call-graph surfaces (three directions, MCP and CLI; 4,410 runs):
+725 inputs naming 722 names the index holds only as external names (461 had
+been not found, 200 a list of near names, 64 another symbol's answer), and
+10 dotted or path-like inputs the index holds in no form, whose last part is
+such a name (hono `db/db_impl.h` → `h`; near names before; Not covered). No
+run that answered the name asked for changed.
 
 ### CLI `refs` and `impact` leave out test namesakes of a production name
 
@@ -141,8 +146,15 @@ of 40 with the change.
 
 - CLI `impact` and MCP `get_ast_node` (with or without `include_impact`)
   still say a name the index holds only as an external name is not found, as
-  0.173.0 did: 724 such names on the seven corpora, every one of which
-  `find_references` answers.
+  0.173.0 did: 724 such names on the seven corpora. `find_references`
+  answers 722 of them and calls the other two (`std::fmt::Display`,
+  `std::ops::Deref`) ambiguous.
+- For a dotted or path-like input the index holds in no form, the message
+  names the input's last part without the note other answers for a last part
+  carry (MCP `Resolved 'X' → 'Y'.`, CLI `No definition is named 'X';
+  answering for 'Y'.`): hono `db/db_impl.h` gets `Symbol 'h' has no
+  definition in the index …` on both (10 inputs on the seven corpora);
+  0.173.0 listed near names for the input.
 - An out-of-line C/C++ constructor whose own class the index does not hold
   now gives way to a type of that name in another namespace: `Foo::Foo()` in
   `src/foo.cc` beside `namespace other { struct Foo … }` makes `refs Foo`

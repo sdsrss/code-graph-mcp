@@ -7519,7 +7519,8 @@ app.post('/api/login', handleLogin);
         )
         .unwrap();
         // Defined here, as flask's globals.py does, yet held only as the
-        // import's external row: the message must not say "outside".
+        // import's external row: whatever the tool answers must not say the
+        // name is outside the project (a node for it later is no regression).
         std::fs::write(
             project.path().join("ctxvars.py"),
             "from contextvars import ContextVar\n_cv_app = ContextVar('app')\n",
@@ -7537,18 +7538,23 @@ app.post('/api/login', handleLogin);
             let text = result["content"][0]["text"].as_str().unwrap().to_string();
             (result["isError"].as_bool().unwrap_or(false), text)
         };
-        for name in ["datetime", "ssl", "zlib", "_cv_app"] {
+        for name in ["datetime", "ssl", "zlib"] {
             let (is_error, text) = call("get_call_graph", json!({"symbol_name": name}));
             assert!(is_error, "{name}: {text}");
-            assert!(
-                text.contains("has no definition in the index"),
-                "{name}: {text}"
+            assert_eq!(
+                text,
+                format!(
+                    "Error: Symbol '{name}' has no definition in the index (it holds the name \
+                     only as an external name, such as an import), so it has no call graph. \
+                     Use find_references to list where it is referenced."
+                )
             );
-            assert!(!text.contains("outside this project"), "{name}: {text}");
             let (is_error, text) = call("find_references", json!({"symbol_name": name}));
             assert!(!is_error, "{name}: {text}");
             assert!(text.contains("imports"), "{name}: {text}");
         }
+        let (_, text) = call("get_call_graph", json!({"symbol_name": "_cv_app"}));
+        assert!(!text.contains("outside this project"), "{text}");
     }
 
     /// D#436(1): a C++ constructor defined out of line in the `.cc` beside its
