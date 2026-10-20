@@ -67,13 +67,7 @@ pub(super) enum CalleeMeta {
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
-    /// `attr` when `m` holds module `v` itself (`import flask; flask.Flask()`,
-    /// metadata `"attr"`): the call names `v`'s attribute, bound to what `v`
-    /// defines or re-exports under that name before anything else (D#370(a)).
-    Module {
-        module: String,
-        attr: bool,
-    },
+    Module(String),
 }
 
 /// Parse a `{"q":"...", "v":"..."}` JSON metadata blob. Returns None for
@@ -92,10 +86,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             arrow: v.get("a").is_some(),
         }),
         "member" => Some(CalleeMeta::Member),
-        "module" => v.get("v")?.as_str().map(|m| CalleeMeta::Module {
-            module: m.to_string(),
-            attr: v.get("attr").is_some(),
-        }),
+        "module" => v
+            .get("v")?
+            .as_str()
+            .map(|m| CalleeMeta::Module(m.to_string())),
         "path" => {
             let payload = v.get("v")?.as_str()?;
             let segments: Vec<String> = payload.split("::").map(String::from).collect();
@@ -1598,8 +1592,7 @@ pub(super) fn snapshot_python_reexports<'a>(
 /// to a node of a moved name (the name chain's target or an `<external>`
 /// sentinel), or a relative import that
 /// fell back to a `<module>` (D10: the package's own, or a submodule's, which a
-/// new re-export of that name now shadows, as it does in Python), or it calls
-/// the module's attribute of a moved name (`flask.Flask()`). Pulling every
+/// new re-export of that name now shadows, as it does in Python). Pulling every
 /// importer re-extracted all 52 of flask's `__init__.py` for a line that
 /// re-exported a new name, 330 ms more than the edit itself. The run's own
 /// files are left out: they were re-extracted against the new state. Drops the
@@ -1708,32 +1701,6 @@ pub(super) fn importers_of_python_reexport_drift(
             || (target_path == crate::domain::EXTERNAL_FILE_PATH && names.contains(target_name))
         {
             could_rebind.insert(importer);
-        }
-    }
-    // A call on the module (`flask.Flask()`, `attr`) binds its re-export too:
-    // bound to a node of a moved name, or still buffered under one.
-    let attr_calls: Vec<(String, String, String)> = conn
-        .prepare(
-            "SELECT DISTINCT f.path, t.name, json_extract(e.metadata, '$.v')
-             FROM edges e
-             JOIN nodes s ON s.id = e.source_id
-             JOIN files f ON f.id = s.file_id
-             JOIN nodes t ON t.id = e.target_id
-             WHERE e.relation = 'calls'
-               AND f.language = 'python'
-               AND json_extract(e.metadata, '$.attr') IS NOT NULL
-             UNION
-             SELECT f.path, p.target_name, json_extract(p.metadata, '$.v')
-             FROM pending_unresolved_calls p
-             JOIN nodes s ON s.id = p.source_id
-             JOIN files f ON f.id = s.file_id
-             WHERE json_extract(p.metadata, '$.attr') IS NOT NULL",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (caller, name, module) in &attr_calls {
-        if names.contains(name) && moved(module, caller) {
-            could_rebind.insert(caller);
         }
     }
     let mut out: Vec<String> = importers
@@ -1893,27 +1860,6 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          WHERE u.nm <> '<module>'
            AND f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
-    // A Python call on an imported module bound to the module's attribute
-    // (`flask.Flask()`, D#370(a)) is not `ambiguous`, so the first half misses
-    // it: when the module itself gains a definition of its name, which a
-    // rebuild binds too, re-extract the caller — a call that fell back to the
-    // name (`amb`) as well, since the sweep can bind it by name in the same run.
-    // Kept below only when the module is a file of this run that now defines
-    // the name: a definition anywhere else changes no attribute, and moves a
-    // guess's name count, which the first half reads (`"attr":1`, not
-    // `"attr"`, which D10B's `{"ur":"attr"}` also holds).
-    let module_attr_sql = format!(
-        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.v'), u.nm
-         FROM cg_fanout_up u
-         CROSS JOIN nodes tgt ON tgt.name = u.nm
-         CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
-         CROSS JOIN edges e ON e.target_id = tgt.id AND e.relation = '{REL_CALLS}'
-                           AND e.metadata LIKE '%\"attr\":1%'
-         CROSS JOIN nodes src ON src.id = e.source_id
-         CROSS JOIN files f ON f.id = src.file_id
-         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
-           AND src.file_id <> tgt.file_id"
-    );
     // D10A's fallback: `from .helpers import url_for` binds `helpers.py`'s
     // `<module>` while that file defines no `url_for`, and the edge keeps no
     // name to look for. Re-extract such importers of a file of this run that
@@ -2045,37 +1991,6 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         if !imports.is_empty() || !fallbacks.is_empty() {
             paths.extend(module_importers_to_refresh(conn, &imports)?);
             paths.extend(fallbacks);
-            paths.sort_unstable();
-            paths.dedup();
-        }
-        let attr_calls: Vec<(String, String, String)> = conn
-            .prepare(&module_attr_sql)?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if !attr_calls.is_empty() {
-            let python_paths: HashSet<String> = conn
-                .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<_, _>>()?;
-            let module_map = super::python_modules::build_python_module_map(&python_paths);
-            let mut defines = conn.prepare(
-                "SELECT 1 FROM cg_fanout_paths p
-                 CROSS JOIN files f ON f.path = p.path
-                 CROSS JOIN nodes n ON n.file_id = f.id AND n.name = ?2
-                 WHERE p.path = ?1 LIMIT 1",
-            )?;
-            for (caller, module, name) in attr_calls {
-                let Some(files) = super::python_modules::project_module_files(&module, &module_map)
-                else {
-                    continue;
-                };
-                for file in files {
-                    if defines.exists(rusqlite::params![file, name])? {
-                        paths.push(caller);
-                        break;
-                    }
-                }
-            }
             paths.sort_unstable();
             paths.dedup();
         }
@@ -2559,13 +2474,6 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       AND (json_extract(e.metadata, '$.q') IS NULL
                            OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
-                      -- ... and UNLESS it is a Python call on an imported module
-                      -- bound to that module's own attribute (`flask.Flask()`,
-                      -- `attr`, D#370(a)): the module named the target. One that
-                      -- fell back to the name carries `amb`.
-                      AND NOT (json_extract(e.metadata, '$.q') = 'module'
-                               AND json_extract(e.metadata, '$.attr') IS NOT NULL
-                               AND json_extract(e.metadata, '$.amb') IS NULL)
                  THEN ?3 ELSE ?4 END"
     );
     // Cross-file edges, plus one same-file class (D#162): a Rust method call
@@ -4423,7 +4331,7 @@ impl CppFieldTypes {
 }
 
 /// `metadata` without the [`ambiguous_meta`] mark.
-pub(super) fn decided_meta(metadata: &str) -> String {
+fn decided_meta(metadata: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(metadata) {
         Ok(serde_json::Value::Object(mut map)) if map.contains_key("amb") => {
             map.remove("amb");

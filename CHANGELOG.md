@@ -2,10 +2,9 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 121
-because call edges into TypeScript types are labelled differently, and a
-Python import of a name its package re-exports, and a call on an imported
-Python module, bind differently (below).
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 122
+because call edges into TypeScript types are labelled differently and a
+Python import of a name its package re-exports binds differently (below).
 The MCP server rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does.
 
@@ -17,15 +16,15 @@ import was resolved by its name alone, and from a test file that picked the
 candidate whose path is closest to the caller: a `class Flask(flask.Flask)`
 defined inside a test function in `tests/test_config.py`. The import now binds
 what the package itself imports under that name, through a re-export of a
-re-export and both branches of a `try`/`except` import, and a bare call of the
-name follows the import as before. A relative `from . import X` reads the
-package's re-export too, and keeps its edge to the package. A re-export is
+re-export, and a bare call of the name follows the import as before. A
+relative `from . import X` reads the package's re-export too, and keeps its
+edge to the package. A re-export is
 followed only when its own target is in the module that import names, or is
 in turn re-exported there. Two shapes are not followed, and their importers
 bind as before: a renamed one (`from .core import _Impl as Public`), and a
-name the package also imports from a module the index does not hold, such as
-a compiled accelerator under `try` (`warnings.py` re-exports
-`_py_warnings.warn`, and CPython keeps `_warnings.warn`).
+name the package imports from more than one module, since Python keeps
+whichever binding runs last (`warnings.py` re-exports `_py_warnings.warn`,
+and on CPython the compiled `_warnings.warn` imported under `try` wins).
 
 Measured on the seven corpora of 0.174.0, a fresh index from each build,
 against the build before these changes (`main` at `30017f46`): six edge sets
@@ -35,61 +34,25 @@ from `tests/test_config.py`'s local `Flask` to `src/flask/app.py`'s,
 to `__init__.py`, 16 edges into `src/flask/sansio/blueprints.py`'s `Blueprint`
 (9 calls, 7 imports) are gone, their callers keeping the ones into
 `src/flask/blueprints.py`'s, and 4 `references` into the local `Flask` become
-`ambiguous`.
-
-### A call on an imported Python module binds the module's attribute
-
-`import flask` and then `flask.Flask(...)` was resolved by the name alone, so
-inside `tests/test_config.py` it bound that file's own test-local `Flask`, and
-elsewhere the `Flask` nearest by path. A call made straight on a name that a
-plain `import P` (or `import a.b as P`) binds now goes to the definitions of
-the name at `P`'s top level (not a method, not a def nested in a function),
-and to what `P` re-exports under it (as above), never to the caller's own
-definition; such an edge is not relabelled `ambiguous` because other files
-define the same name. When `P` has neither (an assignment, a submodule,
-`__getattr__`, a `from … import *`), the call resolves by its name as before.
-So does a call on a name the file binds any other way too: a parameter, an
-assignment, a loop, `with` or `except` target, a `def`, or a second plain
-import of another module (`os.py` imports both `posixpath` and `ntpath` as
-`path`). `a.b.f()`, `import a.b` and then `a.f()`, and a call on a name a
-from-import binds are unchanged.
-
-Measured on the same seven corpora against the same build: six edge sets
-identical, with no label moved. On flask, 47 more calls move from the
-test-local `Flask` to `src/flask/app.py`'s (31 cross-file, 16 inside
-`tests/test_config.py`), 5 `flask.redirect()` calls move from a function
-nested in a test to `src/flask/helpers.py`'s, and 83 second edges are gone (48
-into `src/flask/sansio/blueprints.py`'s `Blueprint`, 32 into the method
-`Flask.url_for`, 3 into `Flask.make_response`), each caller keeping its edge
-into the definition `flask` re-exports, now `inferred` where it was
-`ambiguous`. With both changes, call edges into `src/flask/app.py`'s `Flask`
-go from 3 to 81, all `inferred`; `callgraph Flask --direction callers
---include-tests --depth 1` lists 75 callers where it listed 3; and `impact
-Flask` counts 74 tests affected where it counted 2. On networkx (693 files),
-whose packages re-export with `import *`, 60 of 10,637 such calls bind through
-the module, one call changes target (`nxt.triangles()` in
-`networkx/algorithms/tests/test_threshold.py`, from a function nested in a test
-to `networkx/algorithms/threshold.py`'s), and 2 call edges go from `ambiguous`
-to `inferred`. On 569 files of the Python 3.14 standard library, the SCIP
-oracle counts, against the same build, 254 more correct and 1 more wrong edge
-at the `inferred` tier (precision 58.6% → 63.0%), 743 fewer wrong `ambiguous`
-edges, and no correct edge lost. Its flask scores are unchanged (scip-python
-does not resolve the tests' `import flask`, so none of these calls is judged).
+`ambiguous`. Call edges into `src/flask/app.py`'s `Flask` go from 3 to 34, all
+`inferred`; `callgraph Flask --direction callers --include-tests --depth 1`
+lists 28 callers where it listed 3, and `impact Flask` counts 27 tests
+affected where it counted 2. On networkx (693 files), which re-exports with
+`import *`, no edge moves (29 import edges gain an `as` key in their
+metadata).
 
 ### Cost
 
 An edit that changes what a Python module re-exports also re-extracts the
-files that import or call a moved name through it, since what they bind
-depends on it. On flask's `src/flask/__init__.py`, one new line re-exporting a
-name under its own name re-extracts 1 file (113–155 ms), retargeting
-`redirect` 7 (127–165 ms), and one re-exporting `abort` as `abort2` none
-(39–69 ms); each of these edits took 25–30 ms before. On networkx, adding
-`from networkx.classes.graph import Graph` to `networkx/__init__.py`
-re-extracts 255 files that call or import `Graph` through `networkx`: 1.9–2.3
-s where the edit took 122–183 ms. An edit that leaves a module's imports
-alone costs what it did: on networkx, 104–209 ms over 15 edits (114–190 ms
-before; medians 136 and 149). A full index of networkx takes 3.73–4.10 CPU
-seconds over 14 runs, 3.65–3.94 before (medians 3.83 and 3.73).
+files that import a moved name from it, since what they bind depends on it.
+On flask's `src/flask/__init__.py`, one new line re-exporting a name
+re-extracts 1 file (63–64 ms), retargeting `redirect` 3 (69–72 ms), and
+retargeting `Flask` 19 (94–96 ms), where those edits took 24–29 ms before. On
+networkx, adding `from networkx.classes.graph import Graph` to
+`networkx/__init__.py` re-extracts 4 files (175–190 ms, 94–97 ms before). An
+edit that leaves a module's imports alone costs what it did (networkx: medians
+102 and 100 ms over 15 edits), and so does a full index (networkx: medians
+3.64 and 3.64 CPU seconds over 9 runs).
 
 ### A TypeScript call into an interface or type alias is `ambiguous`
 
@@ -114,14 +77,14 @@ decided (several candidates, or a TypeScript type)".
 
 ### Not covered
 
-- A bare call of a name imported from two modules, as a `try`/`except`
-  import does, now gets no edge where it had the name's nearest definition:
-  the import binds both, and a call follows an import only when it has one
-  target.
-- A module that defines a name and then replaces it with `from <compiled
-  module> import *` (`operator.py` with `_operator`) is taken at its
-  definition: on the standard library, one `operator.index()` call is the one
-  wrong edge the oracle counts above.
+- `import flask` and then `flask.Flask(...)` still resolves by the name: on
+  flask, 31 such calls stay `ambiguous` edges into `tests/test_config.py`'s
+  local `Flask`, and 16 inside `tests/test_config.py` stay bound to it. A
+  change binding such calls to the module's attribute was reviewed twice and
+  withdrawn: its answer read definitions in other files that an incremental
+  run did not re-examine.
+- On 569 files of the Python 3.14 standard library the SCIP oracle's scores
+  are unchanged by this release (`inferred` 1235/2107 before and after).
 
 ## 0.174.0
 

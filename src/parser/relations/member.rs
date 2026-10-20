@@ -48,12 +48,6 @@ thread_local! {
     /// [`js_package_binding`]'s program-level answer per name: the package a
     /// top-level `var resolve = path.resolve` stands for. Per file, as above.
     static PACKAGE_MEMBER: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
-    /// Python names that hold the very module [`IMPORT_BOUND`] gives for them:
-    /// `import a` and `import a.b as m`, but not `import a.b` (it binds `a`,
-    /// while the import names `a.b`) and no name the file binds any other way
-    /// ([`collect_py_module_names`]). A call `m.f()` on one is the module's
-    /// attribute `f` (D#370(a)). Per file: reset by `reset_import_bound`.
-    static PY_MODULE_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
@@ -66,142 +60,10 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     if matches!(family, "javascript" | "typescript" | "tsx") {
         collect_renamed(root, source, &mut renamed, 0);
     }
-    let mut module_names = HashSet::new();
-    if family == "python" {
-        let mut modules = HashMap::new();
-        let mut rebound = HashSet::new();
-        collect_py_module_names(root, source, &mut modules, &mut rebound, 0);
-        module_names = modules
-            .into_keys()
-            .filter(|n| !rebound.contains(n))
-            .collect();
-    }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
-    PY_MODULE_NAMES.with(|m| *m.borrow_mut() = module_names);
     SCOPE_BINDING.with(|m| m.borrow_mut().clear());
     PACKAGE_MEMBER.with(|m| m.borrow_mut().clear());
-}
-
-/// [`PY_MODULE_NAMES`] for one tree: the names plain imports bind to their own
-/// module, less every name the file binds any other way — a from-import, a
-/// plain import of another module (`import posixpath as path` beside `import
-/// ntpath as path`), or anything else that rebinds it somewhere in the file
-/// (an assignment, a parameter, a loop or `with`/`except` target, a `def` or
-/// `class`): `pdb = Pdb(); pdb.set_trace()` in `pdb.py` is the local's method,
-/// not the module's function (review of D#370(a), L1; both lost a correct edge
-/// on the standard library).
-fn collect_py_module_names(
-    node: tree_sitter::Node,
-    source: &str,
-    modules: &mut HashMap<String, String>,
-    rebound: &mut HashSet<String>,
-    depth: usize,
-) {
-    if depth > 256 {
-        return;
-    }
-    let text = |n: tree_sitter::Node| node_text(&n, source).to_string();
-    let module = node.child_by_field_name("module_name").map(|m| m.id());
-    match node.kind() {
-        "import_statement" | "import_from_statement" => {
-            let is_from = node.kind() == "import_from_statement";
-            for i in 0..node.named_child_count() {
-                let Some(c) = node.named_child(i) else {
-                    continue;
-                };
-                if Some(c.id()) == module {
-                    continue;
-                }
-                // (bound name, the module it holds when that is its own)
-                let bound = match c.kind() {
-                    "dotted_name" => c
-                        .named_child(0)
-                        .map(|first| (text(first), (c.named_child_count() == 1).then(|| text(c)))),
-                    "aliased_import" => c
-                        .child_by_field_name("alias")
-                        .map(|a| (text(a), c.child_by_field_name("name").map(text))),
-                    _ => None,
-                };
-                let Some((name, own)) = bound else {
-                    continue;
-                };
-                match own.filter(|_| !is_from) {
-                    Some(m) if modules.get(&name).is_none_or(|known| *known == m) => {
-                        modules.insert(name, m);
-                    }
-                    _ => {
-                        rebound.insert(name);
-                    }
-                }
-            }
-            return;
-        }
-        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                pattern_names(left, source, rebound, depth + 1);
-            }
-        }
-        "named_expression"
-        | "function_definition"
-        | "class_definition"
-        | "default_parameter"
-        | "typed_default_parameter" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                pattern_names(name, source, rebound, depth + 1);
-            }
-        }
-        "as_pattern" => {
-            if let Some(alias) = node.child_by_field_name("alias") {
-                pattern_names(alias, source, rebound, depth + 1);
-            }
-        }
-        "parameters" | "lambda_parameters" => {
-            for i in 0..node.named_child_count() {
-                let Some(p) = node.named_child(i) else {
-                    continue;
-                };
-                match p.kind() {
-                    "identifier" => {
-                        rebound.insert(text(p));
-                    }
-                    "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
-                        if let Some(first) = p.named_child(0) {
-                            pattern_names(first, source, rebound, depth + 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    for i in 0..node.named_child_count() {
-        if let Some(c) = node.named_child(i) {
-            collect_py_module_names(c, source, modules, rebound, depth + 1);
-        }
-    }
-}
-
-/// The names a binding target binds: `a`, `a, b`, `(a, *b)`, `as_pattern_target`;
-/// none for `x.a` or `x[i]`, which bind no name.
-fn pattern_names(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>, depth: usize) {
-    if depth > 256 {
-        return;
-    }
-    match node.kind() {
-        "identifier" => {
-            out.insert(node_text(&node, source).to_string());
-        }
-        "attribute" | "subscript" => {}
-        _ => {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    pattern_names(c, source, out, depth + 1);
-                }
-            }
-        }
-    }
 }
 
 fn collect(
@@ -1133,27 +995,19 @@ pub(super) fn python_untyped_receiver_meta(
 
 /// Metadata of a Python call through a name an absolute import binds
 /// (`click.echo()` → `{"q":"module","v":"click"}`): the resolver drops it when
-/// that module is not the project's, since no project code can run then. A
-/// call straight on a name that holds that module (`import flask` and then
-/// `flask.Flask()`, [`PY_MODULE_NAMES`]) is marked `"attr":1`: it names the
-/// module's attribute, which the resolver looks up in that module (D#370(a)).
+/// that module is not the project's, since no project code can run then.
 pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
         return None;
     }
-    let object = function.child_by_field_name("object")?;
-    let mut root = object;
+    let mut root = function.child_by_field_name("object")?;
     while root.kind() == "attribute" {
         root = root.child_by_field_name("object")?;
     }
     if root.kind() != "identifier" {
         return None;
     }
-    let name = node_text(&root, source);
-    let module = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned())??;
-    if object.id() == root.id() && PY_MODULE_NAMES.with(|m| m.borrow().contains(name)) {
-        return Some(serde_json::json!({ "q": "module", "v": module, "attr": 1 }).to_string());
-    }
+    let module = IMPORT_BOUND.with(|b| b.borrow().get(node_text(&root, source)).cloned())??;
     Some(serde_json::json!({ "q": "module", "v": module }).to_string())
 }

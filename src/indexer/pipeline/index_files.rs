@@ -982,15 +982,6 @@ fn buffer_then_delete_files(
 /// aborts the whole run on the edges FK.
 ///
 /// Returns `(calls_buffered, other_relations_requeued)`.
-/// A Python call on an imported module bound by the module's attribute
-/// (`"attr":1`, D#370(a)), as the edge or the buffered call stores it.
-fn is_module_attr_call(metadata: &str) -> bool {
-    matches!(
-        super::resolve::parse_callee_metadata(Some(metadata)),
-        Some(super::resolve::CalleeMeta::Module { attr: true, .. })
-    )
-}
-
 fn buffer_inbound_before_node_purge(
     db: &Database,
     file_id: i64,
@@ -1003,36 +994,6 @@ fn buffer_inbound_before_node_purge(
 
     let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), file_id)?;
     for (source_id, target_name, source_language, metadata) in inbound {
-        // A call on an imported Python module goes back through the deferred
-        // pass, as on the edit path (`restore_inbound_edges`).
-        if metadata.as_deref().is_some_and(is_module_attr_call) {
-            let source_path: Option<String> = db
-                .conn()
-                .query_row(
-                    "SELECT f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id = ?1",
-                    [source_id],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(source_path) = source_path {
-                if !run_file_paths.contains(source_path.as_str())
-                    && !delete_set.contains(source_path.as_str())
-                {
-                    deferred.push(DeferredRelation {
-                        source_ids: vec![source_id],
-                        source_name: String::new(),
-                        target_name,
-                        relation: REL_CALLS.to_string(),
-                        metadata,
-                        rel_path: source_path,
-                        language: source_language,
-                        ns_file: None,
-                    });
-                    requeued += 1;
-                }
-            }
-            continue;
-        }
         crate::storage::queries::insert_pending_unresolved_call(
             db.conn(),
             source_id,
@@ -2023,21 +1984,7 @@ fn resolve_batch_relations(
                 match parse_callee_metadata(rel.metadata.as_deref()) {
                     // `click.echo()` through an import of a library module: no
                     // project code can run. A project module resolves as bare.
-                    Some(CalleeMeta::Module { module, .. }) if !py_modules.contains(&module) => {
-                        continue;
-                    }
-                    // `flask.Flask()`: the attribute of a project module, which a
-                    // later batch may define, and whose re-export edges are only
-                    // all in after the batches (D#370(a)). Decided in the
-                    // deferred pass, which also marks the by-name fallback of
-                    // one it cannot look up (a namespace package).
-                    Some(CalleeMeta::Module { attr: true, .. }) => {
-                        deferred.push(DeferredRelation::of(
-                            &source_ids,
-                            rel,
-                            &pf.rel_path,
-                            &pf.language,
-                        ));
+                    Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
                         continue;
                     }
                     // `b()` through a renamed import (D#120) binds by the
@@ -3513,18 +3460,8 @@ fn restore_inbound_edges(
             // receiver loses it on a rebuild. Re-resolved in the deferred pass
             // under the full rules, never restored by name (batch-1 review
             // round 2). Only the Rust parser writes `rt`.
-            //
-            // A call on an imported Python module (`flask.Flask()`, `attr`) is
-            // decided by what that module defines and re-exports, which an edit
-            // of the target's file can move while the name stays: re-resolved
-            // in the deferred pass too, so its target is the module's attribute
-            // or a guess marked `amb`, as in a rebuild — the pending buffer binds
-            // by name under the mark of the decided binding (review of
-            // D#370(a), H1).
             let receiver_typed = relation.as_str() == REL_CALLS
-                && metadata
-                    .as_deref()
-                    .is_some_and(|m| m.contains(r#""rt":"#) || is_module_attr_call(m));
+                && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
             let new_target_ids: Option<Vec<i64>> = (!renamed_import && !receiver_typed)
                 .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
                 .flatten()
@@ -3851,8 +3788,6 @@ fn resolve_deferred_relations(
     // load before them typed differently from an incremental run.
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
-    // Read by calls on an imported Python module, after every import is in.
-    let mut module_attributes = super::python_modules::ModuleAttributes::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -4288,32 +4223,9 @@ fn resolve_deferred_relations(
                 .filter(|m| m.contains(r#""rtype""#) || m.contains(r#""super""#))
                 .map(super::resolve::ambiguous_meta);
             match parse_callee_metadata(d.metadata.as_deref()) {
-                Some(CalleeMeta::Module { module, attr }) => {
+                Some(CalleeMeta::Module(module)) => {
                     if !py_modules.contains(&module) {
                         continue; // a library module's function, as at batch time
-                    }
-                    if attr {
-                        // `flask.Flask()`: what the module defines or re-exports
-                        // under that name, never the caller's own (D#370(a)).
-                        let targets = module_attributes
-                            .targets(db.conn(), &module, &d.target_name, python_module_map)?
-                            .to_vec();
-                        if !targets.is_empty() {
-                            let decided = call_meta.map(super::resolve::decided_meta);
-                            edges_created += insert_relation_edges(
-                                db,
-                                &source_ids,
-                                &targets,
-                                &d.relation,
-                                decided.as_deref(),
-                                false,
-                            )?;
-                            continue;
-                        }
-                        // Neither (a variable, a submodule, a `__getattr__`):
-                        // by name, as before, marked as the guess it is.
-                        opaque_meta = call_meta.map(super::resolve::ambiguous_meta);
-                        call_meta = opaque_meta.as_deref();
                     }
                     handled = false;
                 }
