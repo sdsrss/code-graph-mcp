@@ -1,6 +1,6 @@
 # D#446：MCP 回答只在测试代码里定义的名字
 
-状态：进行中。级别 L3（LLM 看到的默认回答改变：约 800 个名字由拒绝变为回答，次版本号）。用户 2026-10-20 授权方案 (a)，范围 `src/mcp/server/tools/refs.rs`、`src/mcp/server/tools/ast_node.rs`、`src/resolve.rs`。
+状态：发版中（0.173.0）。级别 L3（LLM 看到的默认回答改变：约 800 个名字由拒绝变为回答，次版本号）。用户 2026-10-20 授权方案 (a)，范围 `src/mcp/server/tools/refs.rs`、`src/mcp/server/tools/ast_node.rs`、`src/resolve.rs`。
 
 ## 背景与目标
 
@@ -61,8 +61,8 @@
 - [x] AC1：夹具上每个形态的 HEAD 回答如上表 — 验证：`cargo test test_a_name_only_test_code_defines_is_answered`（先在 BASE 代码上失败）
 - [x] AC2：语料差分：BASE → HEAD 改变的输入都在"BASE 测试路径拒绝 / not found 且有测试定义"里；其余逐字节相同 — 验证：`tasks/d435-harness/d446.py base head2 --root /var/tmp/d446`
 - [x] AC3：按输入所指节点打分：回答的节点就是那个名字的测试定义 — 验证：`tasks/d435-harness/d446_score.py base head2 <head2 binary>`
-- [ ] AC4：全量 pre-commit（cargo test、fmt、clippy 两条腿）通过
-- [ ] AC5：发版前评审（新开子代理）无未处理的 HIGH
+- [x] AC4：全量 pre-commit（cargo test、fmt、clippy 两条腿）通过
+- [x] AC5：发版前评审（新开子代理）无未处理的 HIGH
 
 ## 计划
 
@@ -70,7 +70,7 @@
 - [x] S2：RED 测试 — 主会话
 - [x] S3：实现 + 改写编码了旧拒绝的测试 — 主会话
 - [x] S4：差分 + 打分 + 变异 — 主会话
-- [ ] S5：CHANGELOG（实测每条说法）、发版前评审 — 评审用新开子代理
+- [x] S5：CHANGELOG（实测每条说法）、发版前评审 — 评审用新开子代理
 - [ ] S6：发版 0.173.0 — 主会话
 
 ## 决策与进展
@@ -107,3 +107,7 @@ BASE 上 `find_references` 的测试路径拒绝：flask 862、leveldb 70、expr
 - LOW F6（已复现）：测试代码定义的名字，同名 Markdown 标题在非测试路径时，两个工具都答标题（两个版本相同），`get_call_graph` 跟函数走（`test_callers_filtered: 1`）。七个语料 0 个。
 
 处理（只改文档）：F1、F6 写进 Not covered（F1 与"只把拒绝改成回答"的决定一致，不改代码）；F2–F4 改 CHANGELOG 和本文件；F5 的说明错误在下一条提交说明里更正，行为本身记为延期项。
+
+### 第 2 轮（差量，新开子代理，`c59d0b56..e4e8d419`）
+
+评审用同一对二进制（md5 核对）在自己的语料副本上把 431,098 次各重跑一遍，与已存结果逐字节相同；CHANGELOG 的数字、两条新 Not covered（自建夹具 + 语料计数：导入与定义同名 10 个都有生产定义；生产标题只与测试代码同名 0 个，语料里标题有 6/61/388/57/167/149/0 个）都复现。0 HIGH、0 MEDIUM；1 个 LOW：`e4e8d419` 的提交说明漏了 c59d0b56 说明的第三处过头说法（`<external>` 同名时 `find_references` 答导入），另有标题措辞不准。处理：改提交说明（`41cc5b17`，未推送时 amend）。评审到此结束，没有第 3 轮。

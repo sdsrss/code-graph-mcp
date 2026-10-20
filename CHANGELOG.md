@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.173.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). MCP
 `find_references` and `get_ast_node` now answer names only test code defines,
