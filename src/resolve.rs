@@ -403,8 +403,13 @@ fn definitions_in_tier(
                 Some("c" | "cpp")
             ) && nf.node.qualified_name.as_deref()
                 == Some(format!("{0}.{0}", nf.node.name).as_str());
+            // Its class, not a Python or Java one that shares the name.
             type_bodies.iter().any(|&(file, start, end)| {
-                out_of_line
+                (out_of_line
+                    && matches!(
+                        crate::utils::config::detect_language(file),
+                        Some("c" | "cpp")
+                    ))
                     || (file == nf.file_path
                         && start <= nf.node.start_line
                         && nf.node.start_line <= end)

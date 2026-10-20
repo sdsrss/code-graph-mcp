@@ -53,16 +53,6 @@ pub(crate) fn print_refs_notfound_json(symbol: &str) {
     );
 }
 
-/// How to find the reference targets AGAIN once a refresh has renumbered the
-/// index (SURF-16, audit 2026-09-07).
-///
-/// `nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
-/// AUTOINCREMENT — so the incremental re-index `refs` runs on its own result set
-/// deletes the file's rows and the re-insert REUSES the freed ids. Any id
-/// resolved before `refresh_files_if_stale` can therefore name a DIFFERENT
-/// symbol after it, and re-running the rollup with those ids answers about that
-/// other symbol under the name resolution settled on first. `show --node-id`
-/// already re-resolves by identity (CON-10); this is the same rule for `refs`.
 /// The rows a bare name targets: every row named it, less test code's
 /// namesakes when production code defines the name, as MCP `find_references`
 /// takes them. With them, flask `invoke` counted 22 references to MCP's 2:
@@ -77,6 +67,16 @@ fn name_target_ids(conn: &rusqlite::Connection, symbol: &str) -> Result<Vec<i64>
         .collect())
 }
 
+/// How to find the reference targets AGAIN once a refresh has renumbered the
+/// index (SURF-16, audit 2026-09-07).
+///
+/// `nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
+/// AUTOINCREMENT — so the incremental re-index `refs` runs on its own result set
+/// deletes the file's rows and the re-insert REUSES the freed ids. Any id
+/// resolved before `refresh_files_if_stale` can therefore name a DIFFERENT
+/// symbol after it, and re-running the rollup with those ids answers about that
+/// other symbol under the name resolution settled on first. `show --node-id`
+/// already re-resolves by identity (CON-10); this is the same rule for `refs`.
 enum RefsTarget {
     /// `--node-id`. Identity is (file_path, name, qualified_name, type) — the
     /// key [`crate::resolve::reresolve_node_by_identity`] uses, shared with

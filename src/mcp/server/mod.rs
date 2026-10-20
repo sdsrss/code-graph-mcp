@@ -7575,6 +7575,10 @@ app.post('/api/login', handleLogin);
             "b/state.h",
             "namespace b {\nclass State {\n public:\n  int n;\n};\n}\n",
         );
+        // A `T::T` whose class is not indexed does not yield to a class of
+        // another language that happens to share the name (review round 1).
+        write("src/config.cc", "Config::Config() {}\n");
+        write("tools/config_tool.py", "class Config:\n    pass\n");
         let server = McpServer::new_test_with_project(project.path());
         server.ensure_indexed().unwrap();
         let answer = |tool: &str, args: serde_json::Value| {
@@ -7598,13 +7602,19 @@ app.post('/api/login', handleLogin);
             let out = answer(tool, json!({"symbol_name": "DBImpl"}));
             assert!(out.get("error").is_none(), "{tool}: {out}");
         }
-        for tool in ["get_ast_node", "find_references", "get_call_graph"] {
-            let out = answer(tool, json!({"symbol_name": "State"}));
+        for (tool, name) in [
+            ("get_ast_node", "State"),
+            ("find_references", "State"),
+            ("get_call_graph", "State"),
+            ("get_ast_node", "Config"),
+            ("find_references", "Config"),
+            ("get_call_graph", "Config"),
+        ] {
+            let out = answer(tool, json!({"symbol_name": name}));
+            let error = out["error"].as_str().unwrap_or_default();
             assert!(
-                out["error"]
-                    .as_str()
-                    .is_some_and(|e| e.starts_with("Ambiguous symbol 'State': 2 matches")),
-                "{tool}: {out}"
+                error.starts_with(&format!("Ambiguous symbol '{name}': 2 matches")),
+                "{tool} {name}: {out}"
             );
         }
     }

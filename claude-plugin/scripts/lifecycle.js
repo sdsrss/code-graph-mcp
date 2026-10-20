@@ -326,10 +326,14 @@ function writeJsonAtomic(filePath, data) {
   // A symlinked file (a dotfiles checkout's settings.json) is written where
   // the link points: the rename landed on the link, replaced it with a plain
   // file and left the checkout's copy stale (audit 2026-09-07 JS-19). A new
-  // file or a dangling link is written at the path itself, as before.
+  // file, a dangling link or a link to anything but a file (a directory took
+  // the whole document beside it, then failed) is written at the path itself,
+  // as before.
   let target = filePath;
   try {
-    if (fs.lstatSync(filePath).isSymbolicLink()) target = fs.realpathSync(filePath);
+    if (fs.lstatSync(filePath).isSymbolicLink() && fs.statSync(filePath).isFile()) {
+      target = fs.realpathSync(filePath);
+    }
   } catch { /* new file, or a dangling link */ }
   const dir = path.dirname(target);
   fs.mkdirSync(dir, { recursive: true });

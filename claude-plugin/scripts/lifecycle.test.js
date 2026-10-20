@@ -1750,6 +1750,29 @@ test('writeJsonAtomic writes through a symlinked file and keeps the link', (t) =
   );
 });
 
+// Only a link to a file is followed. A link to a directory wrote the whole
+// document, secrets included, beside that directory before failing with
+// EISDIR (review round 1); it is replaced, as before JS-19.
+test('writeJsonAtomic does not follow a link to a directory', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('symlinks need privileges on Windows');
+    return;
+  }
+  const homeDir = mkHome(t);
+  const { writeJsonAtomic } = require('./lifecycle');
+  const dir = path.join(homeDir, 'elsewhere', 'adir');
+  fs.mkdirSync(dir, { recursive: true });
+  const link = path.join(homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(dir, link);
+
+  writeJsonAtomic(link, { env: { ANTHROPIC_API_KEY: 'sk-secret' } });
+
+  assert.ok(fs.lstatSync(link).isFile(), 'the link is replaced by the file');
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.deepEqual(fs.readdirSync(path.dirname(dir)), ['adir']);
+});
+
 // JS-28: the temp file holds the whole document, `env` secrets included, and
 // a failed rename left it beside settings.json.
 test('writeJsonAtomic leaves no temp file behind when the write fails', (t) => {

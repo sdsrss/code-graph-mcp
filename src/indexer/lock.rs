@@ -277,8 +277,9 @@ impl HeldFlock {
         Self(file)
     }
 
-    /// The open file, for a test that needs a second descriptor on it.
-    #[cfg(test)]
+    /// The open file, for a test that needs a second descriptor on it. Unix
+    /// only, as those tests are: unused on Windows it fails the build there.
+    #[cfg(all(test, unix))]
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.0
     }
