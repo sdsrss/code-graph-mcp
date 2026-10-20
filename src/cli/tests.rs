@@ -2503,7 +2503,7 @@ fn grep_flaglike_pattern_hint_fires_only_on_the_confusing_pairing() {
 /// HELD `index.lock`. The guard file is returned: flock is released when it
 /// drops, so the caller must keep it alive for the length of the assertion.
 #[cfg(unix)]
-fn locked_project() -> (tempfile::TempDir, std::fs::File) {
+fn locked_project() -> (tempfile::TempDir, crate::indexer::lock::HeldFlock) {
     use std::os::unix::io::AsRawFd;
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(project.path().join("src")).unwrap();
@@ -2539,7 +2539,9 @@ fn locked_project() -> (tempfile::TempDir, std::fs::File) {
         "fixture precondition: the probe must SEE the held lock, else every \
              assertion below passes vacuously"
     );
-    (project, lock)
+    // Released by `LOCK_UN` on drop: a plain close left it held while a child
+    // another test thread forked still had the descriptor (D#459).
+    (project, crate::indexer::lock::HeldFlock::new(lock))
 }
 
 /// The P1-3 defect: `rebuild-index` warned and then renamed a fresh index

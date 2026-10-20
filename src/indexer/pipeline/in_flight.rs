@@ -24,6 +24,7 @@
 //! lock file that cannot be opened — a run holds nothing and a probe reads
 //! every token as dead: the behaviour before this module.
 
+use crate::indexer::lock::HeldFlock;
 use crate::storage::db::Database;
 use crate::storage::schema::META_KEY_INDEX_RUN_IN_FLIGHT;
 use anyhow::Result;
@@ -40,7 +41,7 @@ const RUN_LOCK: &str = "index-run.lock";
 /// stays and the hold goes, which is exactly a crash as the next probe sees it.
 pub(super) struct RunMark {
     token: String,
-    _hold: Option<std::fs::File>,
+    _hold: Option<HeldFlock>,
 }
 
 /// Start a run: take the shared hold, then add this run's token. In that order,
@@ -146,14 +147,14 @@ fn run_lock_path(db: &Database) -> Option<std::path::PathBuf> {
 /// moment, which is brief, for at most two seconds; past that, or on any
 /// error, the run goes unheld.
 #[cfg(unix)]
-fn hold_shared(db: &Database) -> Option<std::fs::File> {
+fn hold_shared(db: &Database) -> Option<HeldFlock> {
     use std::os::unix::io::AsRawFd;
     let file = crate::utils::owned::share_owned(&run_lock_path(db)?).ok()?;
     for _ in 0..200 {
         // SAFETY: `file` is an open File owned by this scope, so its fd is valid
         // for the call; flock has no other precondition.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-            return Some(file);
+            return Some(HeldFlock::new(file));
         }
         let err = std::io::Error::last_os_error();
         if !crate::indexer::lock::is_flock_conflict(err.raw_os_error())
@@ -167,7 +168,7 @@ fn hold_shared(db: &Database) -> Option<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn hold_shared(_db: &Database) -> Option<std::fs::File> {
+fn hold_shared(_db: &Database) -> Option<HeldFlock> {
     None
 }
 
@@ -178,7 +179,7 @@ enum Probe {
     InFlight,
     /// Taken, by this probe: no run is in flight while the handle lives.
     #[cfg_attr(not(unix), allow(dead_code))]
-    Held(std::fs::File),
+    Held(HeldFlock),
     /// No answer — no lock file, an open that fails, any other error — which
     /// reads every token as dead: the behaviour without this lock.
     NoLock,
@@ -194,10 +195,10 @@ fn probe_exclusive(db: &Database) -> Probe {
         return Probe::NoLock;
     };
     for _ in 0..5 {
-        // SAFETY: as in `hold_shared`. The lock is released when `file` is
-        // dropped, which closes the only descriptor of its open file.
+        // SAFETY: as in `hold_shared`. The lock is released when the
+        // `HeldFlock` drops, also where a forked child holds a copy of `file`.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Probe::Held(file);
+            return Probe::Held(HeldFlock::new(file));
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {
@@ -371,5 +372,52 @@ mod tests {
         let token = crashed.token.clone();
         drop(crashed);
         assert_eq!(dead_runs(&db).unwrap(), Some(vec![token]));
+    }
+
+    /// D#457: a child another thread forks holds a copy of every descriptor
+    /// until it execs, and that copy kept a finished run's hold: a CLI query
+    /// probing then read the run as in flight and skipped its refresh
+    /// (`cli_e2e`, 1 in 30 under load). `try_clone` stands in for the copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_run_leaves_no_hold_in_a_copy_of_its_descriptor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        let run = begin(&db).unwrap();
+        let copy = run
+            ._hold
+            .as_ref()
+            .expect("the hold must be taken")
+            .file()
+            .try_clone()
+            .unwrap();
+        finish(&db, run).unwrap();
+        assert!(
+            !a_run_is_in_flight(&db),
+            "a finished run must release its hold, not only close its descriptor"
+        );
+        drop(copy);
+    }
+
+    /// The probe's exclusive hold, likewise: kept by a copy, it held a run
+    /// that starts after the probe out of its hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_probe_leaves_no_hold_in_a_copy_of_its_descriptor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Database::open(&dir.path().join("index.db")).unwrap();
+        std::fs::write(dir.path().join(RUN_LOCK), b"").unwrap();
+        let Probe::Held(held) = probe_exclusive(&db) else {
+            panic!("a free run lock must be taken by the probe");
+        };
+        let copy = held.file().try_clone().unwrap();
+        drop(held);
+        let run = begin(&db).unwrap();
+        assert!(
+            run._hold.is_some(),
+            "a dropped probe must not keep a run from its hold"
+        );
+        finish(&db, run).unwrap();
+        drop(copy);
     }
 }

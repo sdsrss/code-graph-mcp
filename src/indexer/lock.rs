@@ -262,18 +262,50 @@ pub(crate) fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::F
 /// than a `cfg` at each call site — is what stops the delete from growing back.
 pub(crate) fn release_index_lock(_code_graph_dir: &Path) {}
 
+/// A lock file whose flock is released when it drops, not when its last
+/// descriptor closes. Unix flock lives on the open file description, and a
+/// child that another thread forks holds a copy of every descriptor until it
+/// execs: closing the holder left the lock held by that copy, so a finished
+/// run read as in flight to a CLI probe, which skipped its refresh (D#457),
+/// and a dropped guard read as held (D#459). `LOCK_UN` releases the
+/// description, copies included. The Windows lock is the exclusive open, which
+/// a child does not inherit.
+pub(crate) struct HeldFlock(std::fs::File);
+
+impl HeldFlock {
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        Self(file)
+    }
+
+    /// The open file, for a test that needs a second descriptor on it.
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl Drop for HeldFlock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `self.0` is open until this drop returns, so its fd is
+            // valid for the call; flock has no other precondition.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// A held index lock for callers that take it for a bounded operation rather
 /// than for a whole process lifetime — the CLI's wholesale-replace commands
 /// (`rebuild-index`, `reindex --from-snapshot`).
 ///
-/// Dropping the handle IS the release, on both platforms: Unix flock lives on
-/// the open file description, and the Windows lock is the exclusive open itself.
-/// There is deliberately no `Drop` impl beyond that — in particular the lock
+/// Dropping it IS the release, on both platforms ([`HeldFlock`]). The lock
 /// FILE is left in place. It used to be removed on the non-Unix leg, back when
 /// the lock was the file's existence plus a PID; see [`release_index_lock`] for
 /// why unlinking it breaks mutual exclusion on both platforms now.
 pub(crate) struct IndexLockGuard {
-    _file: std::fs::File,
+    _file: HeldFlock,
 }
 
 /// Take the index lock for a bounded operation. `None` means somebody else holds
@@ -281,7 +313,9 @@ pub(crate) struct IndexLockGuard {
 /// (see `lock_index_for_replace` in the CLI, which re-probes to tell them apart).
 pub(crate) fn acquire_index_lock_guard(code_graph_dir: &Path) -> Option<IndexLockGuard> {
     let file = try_acquire_index_lock(code_graph_dir)?;
-    Some(IndexLockGuard { _file: file })
+    Some(IndexLockGuard {
+        _file: HeldFlock::new(file),
+    })
 }
 
 /// Non-destructively check whether ANOTHER process currently holds the index lock
@@ -397,7 +431,7 @@ pub(crate) fn acquire_build_lock(
     code_graph_dir: &Path,
     wait: std::time::Duration,
     on_wait: &mut dyn FnMut(),
-) -> Option<std::fs::File> {
+) -> Option<HeldFlock> {
     use std::os::unix::io::AsRawFd;
     let path = code_graph_dir.join(BUILD_LOCK);
     let file = crate::utils::owned::share_owned(&path).ok()?;
@@ -407,7 +441,7 @@ pub(crate) fn acquire_build_lock(
         // SAFETY: `file` is an open File owned by this scope, so its fd is valid
         // for the call; flock has no other precondition.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Some(file);
+            return Some(HeldFlock::new(file));
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
@@ -441,7 +475,7 @@ pub(crate) fn acquire_build_lock(
     _code_graph_dir: &Path,
     _wait: std::time::Duration,
     _on_wait: &mut dyn FnMut(),
-) -> Option<std::fs::File> {
+) -> Option<HeldFlock> {
     None
 }
 
@@ -782,14 +816,52 @@ mod tests {
             "the guard's drop must not unlink either"
         );
 
-        // Deliberately NOT asserting `!other_process_holds_index_lock(cg)` here.
-        // That probe has its own test above, and asserting it a second time from
-        // this one failed twice in ~18 full-suite runs and then refused to
-        // reproduce across 16 more — an unexplained flake, not a diagnosis. A
-        // guard that is red 1 run in 9 for reasons nobody has pinned down teaches
-        // people to re-run rather than to read, which costs more than the extra
-        // coverage was worth. The two assertions above are what the fix is about
-        // and both are mutation-verified.
+        // This assertion failed twice in ~18 full-suite runs and was dropped as
+        // an unexplained flake. The cause was a child another test thread forked
+        // holding a copy of the guard's descriptor; the guard now unlocks on
+        // drop (D#459).
+        assert!(
+            !other_process_holds_index_lock(cg),
+            "the guard's drop must release the lock"
+        );
+    }
+
+    /// D#459: a flock lives on the open file description, and a child another
+    /// thread forks holds a copy of every descriptor until it execs. A guard
+    /// that only closed its descriptor left the lock held by that copy, and the
+    /// next probe read a finished rebuild as a holder. `try_clone` stands in
+    /// for the child's copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_guard_frees_the_lock_a_copy_of_its_descriptor_names() {
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path().join(".code-graph");
+        std::fs::create_dir(&cg).unwrap();
+        let guard = acquire_index_lock_guard(&cg).expect("a free lock must be acquirable");
+        let copy = guard._file.file().try_clone().unwrap();
+        drop(guard);
+        assert!(
+            !other_process_holds_index_lock(&cg),
+            "the guard's drop must release the lock, not only close its descriptor"
+        );
+        drop(copy);
+    }
+
+    /// The build lock, likewise: a server's startup build or a CLI build
+    /// that finished kept the next build waiting on a copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_build_lock_frees_the_lock_a_copy_of_its_descriptor_names() {
+        let dir = TempDir::new().unwrap();
+        let held = acquire_build_lock(dir.path(), std::time::Duration::ZERO, &mut || {})
+            .expect("a free build lock must be acquirable");
+        let copy = held.file().try_clone().unwrap();
+        drop(held);
+        assert!(
+            acquire_build_lock(dir.path(), std::time::Duration::ZERO, &mut || {}).is_some(),
+            "a dropped build lock must be free for the next build"
+        );
+        drop(copy);
     }
 
     /// Regression guard for the `9b4821c` → this-commit fix. `9b4821c` applied the
