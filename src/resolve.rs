@@ -324,11 +324,28 @@ pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<Name
 /// then answered with flask's README `# Flask`, the lowest id (E2E 2026-10-16
 /// round 2).
 pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCandidate>> {
+    definitions_in_tier(conn, name, false)
+}
+
+/// The definitions test code has of a bare `name`, chosen by the rules of
+/// [`preferred_definitions`]: for a name with no preferred definition, where
+/// they are all there is. `find_references` refused such a name ("all N
+/// match(es) are in test/bench paths") and `get_ast_node` called it not
+/// found, while `get_call_graph` and CLI `refs` answered it (D#446).
+pub fn test_code_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCandidate>> {
+    definitions_in_tier(conn, name, true)
+}
+
+fn definitions_in_tier(
+    conn: &Connection,
+    name: &str,
+    test_code: bool,
+) -> Result<Vec<NameCandidate>> {
     let with_files = queries::get_nodes_with_files_by_symbol(conn, name)?;
-    let non_test: Vec<NameCandidate> = with_files
+    let in_tier: Vec<NameCandidate> = with_files
         .iter()
         .filter(|nf| is_selectable_definition(&nf.file_path))
-        .filter(|nf| !crate::domain::is_test_symbol(&nf.node.name, &nf.file_path))
+        .filter(|nf| crate::domain::is_test_symbol(&nf.node.name, &nf.file_path) == test_code)
         .map(|nf| NameCandidate {
             name: nf.node.name.clone(),
             file_path: nf.file_path.clone(),
@@ -347,10 +364,10 @@ pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCa
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
         )
     };
-    let non_test: Vec<NameCandidate> = if non_test.iter().any(|c| !is_heading(c)) {
-        non_test.into_iter().filter(|c| !is_heading(c)).collect()
+    let in_tier: Vec<NameCandidate> = if in_tier.iter().any(|c| !is_heading(c)) {
+        in_tier.into_iter().filter(|c| !is_heading(c)).collect()
     } else {
-        non_test
+        in_tier
     };
     // A function inside the body of a same-named type is that type's
     // constructor (Java, C#, C++): every class with an explicit constructor
@@ -390,11 +407,11 @@ pub fn preferred_definitions(conn: &Connection, name: &str) -> Result<Vec<NameCa
         })
         .map(|nf| nf.node.id)
         .collect();
-    let non_test: Vec<NameCandidate> = non_test
+    let in_tier: Vec<NameCandidate> = in_tier
         .into_iter()
         .filter(|c| !constructors.contains(&c.node_id))
         .collect();
-    Ok(non_test)
+    Ok(in_tier)
 }
 
 /// [`detect_ambiguity`] under a file selector: the definitions of bare `name`

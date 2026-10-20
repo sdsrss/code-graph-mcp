@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). MCP
+`find_references` and `get_ast_node` now answer names only test code defines,
+where they refused them or said not found (below). To keep 0.172.0's answers:
+`npm i -g @sdsrs/code-graph@0.172.0` (or, from source, `cargo install --locked
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.172.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### Names only test code defines are answered (MCP)
+
+Test code here is what the tools already set apart as test code: a definition
+in a test path, or one named `test_…`, `…Test` or `…Tests` wherever it is
+(leveldb's `AutoCompactTest` in `db/autocompact_test.cc`, Rust `test_…`
+functions in `src/`). When every definition of a name is test code:
+
+- `find_references` refused it: `Symbol 'after' exists but all 1 match(es) are
+  in test/bench paths (tests/test_async.py). Pass node_id … or file_path …`,
+  naming as test paths files that are not (flask's `test_cli_runner` method
+  in `src/flask/app.py`, leveldb's `db/version_set_test.cc`). It now answers
+  for that definition, as `get_call_graph` and CLI `refs` did. Its
+  `include_tests` defaults to true so that a rename audit sees the tests, and
+  renaming a test helper was what it refused.
+- `get_ast_node` said `Symbol 'after' not found in index.`, of a name the
+  index has, also when given an exact qualified name only test code defines
+  (gson `AbstractClass.AbstractClass`). It now answers with that definition;
+  for an exact qualified name, with the one `find_references` answers, chosen
+  by location (a `Job.test_step` method in `src/` over a test file's twin).
+- Several test-code definitions of one name: both tools say `Ambiguous symbol
+  'test_template_filter': 2 matches in different files` and list each with
+  its `node_id`, as they do for production definitions. Among them a Markdown
+  heading yields to code of the same name and a constructor (Java, C#, C++,
+  Dart) to its class, as among production definitions.
+- A name an `<external>` import also binds: `find_references` still answers
+  with the import's references.
+
+Measured on seven corpora (flask, leveldb, express, hono, gin, gson, and this
+repository's `src/` and `tests/`) with every defined name, every qualified
+name, and generated dotted and misspelled names: 45,723 inputs, 431,098 runs
+per build over six MCP and four CLI surfaces.
+
+- Defined names: `find_references` answers 6,290 it refused and calls 299
+  ambiguous (flask 665 and 84, leveldb 33 and 0); `get_ast_node` answers
+  6,311 it called not found and calls the same 299 ambiguous. Exact qualified
+  names: `get_ast_node` answers 2,025 more (flask 101, leveldb 28, gson
+  1,856).
+- A dotted name answered for its last part (D#435) goes the way that part
+  goes, with the `Resolved` note: of 0.172.0's generated `Class.member` names
+  whose member only test code defines (Not covered there), flask 82 answered
+  and 7 ambiguous, leveldb 29 answered (`_AppCtxGlobalsProxy.test_no_routes`
+  → `test_no_routes`).
+- The other 412,028 runs give 0.172.0's answer byte for byte, every
+  `get_call_graph` and CLI run among them. Each of the 19,070 that changed is
+  a refusal or a "not found" that became an answer or an ambiguity.
+- For every changed input, `find_references` by name answers as it does for
+  the `node_id` `get_ast_node` returns (8,908 of 8,908), and when ambiguous
+  both tools list the same candidates (340 of 340).
+
+### Not covered
+
+- Several test-code definitions of one name: `get_call_graph` and CLI `refs`
+  still merge them into one answer where the two tools above refuse: 299
+  defined names on the seven corpora (flask 84, such as
+  `test_template_filter`).
+
 ## 0.172.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). The MCP tools now

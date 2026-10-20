@@ -7961,15 +7961,10 @@ end
             }
         }
         // find_references gives the answer it gives any name only test files
-        // define, whatever else is named like it.
-        let (is_error, text) = call("find_references", json!({"symbol_name": "after"}));
-        assert!(is_error, "{text}");
-        assert!(
-            text.starts_with(
-                "Error: Symbol 'after' exists but all 1 match(es) are in test/bench paths"
-            ),
-            "{text}"
-        );
+        // define, whatever else is named like it: that definition (D#446).
+        let out = answer("find_references", json!({"symbol_name": "after"}));
+        assert_eq!(out["symbol"], "after", "{out}");
+        assert!(out.get("note").is_none(), "{out}");
         // Beside an `<external>` import of the same name, that answer is the
         // import's references, as 0.171.3 gave: the test-path refusal named
         // `<external>` a test path (pre-tag review).
@@ -8270,6 +8265,150 @@ end
                 .is_some_and(|e| e.starts_with("Ambiguous symbol 'CacheTest.Erase'")),
             "{out}"
         );
+    }
+
+    /// D#446: a name only test code defines is answered by `find_references`
+    /// and `get_ast_node`, as `get_call_graph` and CLI `refs` answer it.
+    /// `find_references` refused it ("all N match(es) are in test/bench
+    /// paths", also for a `test_`-named function in `src/`) and
+    /// `get_ast_node` said not found. Several test definitions are ambiguous,
+    /// not merged as CLI `refs` merges them.
+    #[test]
+    fn test_a_name_only_test_code_defines_is_answered() {
+        let project = TempDir::new().unwrap();
+        let write = |path: &str, src: &str| {
+            let full = project.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, src).unwrap();
+        };
+        write(
+            "app.py",
+            "import test_support\n\n\ndef ping():\n    return test_connection()\n",
+        );
+        write(
+            "src/util.py",
+            "def test_connection():\n    return 1\n\n\n\
+             class Job:\n    def test_step(self):\n        return 1\n",
+        );
+        write(
+            "tests/test_job.py",
+            "class Job:\n    def test_step(self):\n        return 2\n",
+        );
+        write(
+            "tests/test_app.py",
+            "def make_client():\n    return 1\n\n\ndef make_fixture():\n    return 2\n\n\n\
+             def test_one():\n    return make_client()\n",
+        );
+        write("tests/test_a.py", "def shared_helper():\n    return 1\n");
+        write("tests/test_b.py", "def shared_helper():\n    return 2\n");
+        write(
+            "tests/test_views.py",
+            "class IndexView:\n    def fetch_page(self):\n        return 1\n\n\n\
+             class ListView:\n    def fetch_page(self):\n        return 2\n",
+        );
+        write("tests/conftest.py", "def test_support():\n    return 1\n");
+        // A heading yields to code it names, as among production definitions;
+        // a heading alone is the answer.
+        write(
+            "tests/README.md",
+            "# Tests\n\n## make_fixture\n\nText.\n\n## Fixture setup\n\nText.\n",
+        );
+        // A test class's constructor yields to the class.
+        write(
+            "tests/FooTest.java",
+            "class FooTest {\n    FooTest() {}\n    void check() {}\n}\n",
+        );
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        // The test tier holds test code only, whatever its callers check first.
+        assert!(
+            crate::resolve::test_code_definitions(server.db.conn(), "ping")
+                .unwrap()
+                .is_empty()
+        );
+        let answer = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args.clone()))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            assert!(
+                !result["isError"].as_bool().unwrap_or(false),
+                "{tool} {args}: {text}"
+            );
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+
+        // One definition: that definition, with every reference to it.
+        for (typed, file, calls) in [
+            ("make_client", "tests/test_app.py", 1),
+            (" make_client ", "tests/test_app.py", 1),
+            ("test_connection", "src/util.py", 1),
+            ("make_fixture", "tests/test_app.py", 0),
+            ("FooTest", "tests/FooTest.java", 0),
+        ] {
+            let out = answer("get_ast_node", json!({"symbol_name": typed}));
+            assert_eq!(out["name"], typed.trim(), "{typed}: {out}");
+            assert_eq!(out["file_path"], file, "{typed}: {out}");
+            assert!(
+                matches!(out["type"].as_str(), Some("function" | "class")),
+                "{typed}: {out}"
+            );
+            assert!(out.get("note").is_none(), "{typed}: {out}");
+            let out = answer("find_references", json!({"symbol_name": typed}));
+            assert_eq!(out["symbol"], typed.trim(), "{typed}: {out}");
+            assert_eq!(out["total_references"], calls, "{typed}: {out}");
+            assert!(out.get("note").is_none(), "{typed}: {out}");
+        }
+        let out = answer("get_ast_node", json!({"symbol_name": "Fixture setup"}));
+        assert_eq!(out["file_path"], "tests/README.md", "{out}");
+        // An exact qualified name is the definition `find_references`
+        // answers it with: by location, the production one beside a test
+        // file's twin, though its name reads as a test.
+        let out = answer("get_ast_node", json!({"symbol_name": "Job.test_step"}));
+        assert_eq!(out["file_path"], "src/util.py", "{out}");
+        let out = answer("find_references", json!({"symbol_name": "Job.test_step"}));
+        assert_eq!(out["by_relation"], json!({}), "{out}");
+        // Production callers only: the answer stands, the test caller is
+        // counted as filtered.
+        let out = answer(
+            "find_references",
+            json!({"symbol_name": "make_client", "include_tests": false}),
+        );
+        assert_eq!(out["total_references"], 0, "{out}");
+        assert_eq!(out["test_references_filtered"], 1, "{out}");
+        // Reached as a dotted name's last part, it says so.
+        let note = "Resolved 'Harness.make_client' → 'make_client'.";
+        for (tool, key) in [("get_ast_node", "name"), ("find_references", "symbol")] {
+            let out = answer(tool, json!({"symbol_name": "Harness.make_client"}));
+            assert_eq!(out[key], "make_client", "{tool}: {out}");
+            assert_eq!(out["note"], note, "{tool}: {out}");
+        }
+
+        // Several test definitions are several symbols.
+        for (typed, wording) in [
+            ("shared_helper", "2 matches in different files"),
+            ("fetch_page", "2 definitions in the same file"),
+        ] {
+            for tool in ["get_ast_node", "find_references"] {
+                let out = answer(tool, json!({"symbol_name": typed}));
+                let error = out["error"].as_str().unwrap_or_default();
+                assert!(
+                    error.starts_with(&format!("Ambiguous symbol '{typed}': {wording}")),
+                    "{tool} {typed}: {out}"
+                );
+                assert_eq!(out["suggestions"].as_array().map(Vec::len), Some(2));
+            }
+        }
+
+        // Beside an `<external>` import, `find_references` still answers the
+        // import; `get_ast_node` shows the definition.
+        let out = answer("find_references", json!({"symbol_name": "test_support"}));
+        assert_eq!(out["by_relation"], json!({"imports": 1}), "{out}");
+        let out = answer("get_ast_node", json!({"symbol_name": "test_support"}));
+        assert_eq!(out["file_path"], "tests/conftest.py", "{out}");
     }
 
     /// D#228: an absolute path under the project root, and a `./` spelling, name

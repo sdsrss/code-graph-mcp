@@ -539,10 +539,10 @@ fn mcp_find_references_default_prod_first() {
     );
 }
 
-/// R4/R5 fix + A fix: caller_count is prod-only and find_references on a
-/// test-only symbol returns an explanatory error (not "not found").
+/// R4/R5 fix + D#446: caller_count is prod-only and find_references answers a
+/// test-only symbol.
 #[test]
-fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
+fn mcp_caller_count_prod_only_and_test_symbol_is_answered() {
     let project = setup_fixture_project();
     let mut client = McpClient::spawn(project.path());
 
@@ -569,33 +569,19 @@ fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
         caller_count
     );
 
-    // A fix: find_references on a test-only symbol should error with
-    // "exists but all matches are in test/bench paths" rather than the old
-    // misleading "not found".
+    // find_references on a test-only symbol answers it (D#446). It used to
+    // error "exists but all matches are in test/bench paths" (which beat the
+    // older misleading "not found"), while CLI `refs` and `get_call_graph`
+    // answered.
     let resp = client.call_tool(
         "find_references",
         json!({
             "symbol_name": "test_inline_00_calls_target",
         }),
     );
-    // Tool errors come back either as JSON-RPC error or as result.isError=true with text.
-    let err_text = resp
-        .get("error")
-        .and_then(|e| e["message"].as_str())
-        .or_else(|| {
-            if resp["result"]["isError"].as_bool() == Some(true) {
-                resp["result"]["content"][0]["text"].as_str()
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| panic!("expected error response, got: {}", resp));
-
-    assert!(
-        err_text.contains("test/bench paths") || err_text.contains("bypass the test filter"),
-        "error must explain the test filter; got: {}",
-        err_text
-    );
+    let body = extract_tool_payload(&resp);
+    assert_eq!(body["symbol"], "test_inline_00_calls_target", "{}", body);
+    assert_eq!(body["total_references"], 0, "{}", body);
 }
 
 /// Regression: enum-valued direction/deps_direction args must be validated at the

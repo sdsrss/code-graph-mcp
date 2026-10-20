@@ -10,7 +10,7 @@ definitions and none in production (is_test flag or test path).
 """
 import argparse, collections, json, os, re
 
-CORPORA = ("flask", "leveldb", "md", "fx2")
+CORPORA = ("flask", "leveldb", "md", "fx2", "express", "hono", "gin", "gson", "cgm")
 DIRS = ("callers", "callees", "both")
 
 def load(path):

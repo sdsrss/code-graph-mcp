@@ -234,14 +234,20 @@ impl McpServer {
             // two definitions of one qualified name are ambiguous, and a dotted
             // name nothing is qualified-named is its last part, where this said
             // "not found" (D#435).
-            let sym = match crate::resolve::select_symbol(self.db.conn(), typed, None)? {
-                Ok(selection) => selection.lookup_name,
-                Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {
-                    return Ok(crate::resolve::ambiguity_response(typed, &cands));
-                }
-                // Only with a file_path (see `select_symbol`).
-                Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => typed.to_string(),
-            };
+            let (sym, exact_qualified) =
+                match crate::resolve::select_symbol(self.db.conn(), typed, None)? {
+                    Ok(selection) => (
+                        selection.lookup_name,
+                        selection.lookup == crate::resolve::SymbolLookup::ExactQualified,
+                    ),
+                    Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {
+                        return Ok(crate::resolve::ambiguity_response(typed, &cands));
+                    }
+                    // Only with a file_path (see `select_symbol`).
+                    Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => {
+                        (typed.to_string(), false)
+                    }
+                };
             let note = super::super::fuzzy_switch_note(typed, &sym);
             let sym = sym.as_str();
             // Ambiguity verdict + response from the shared resolver (2026-08-16
@@ -258,7 +264,32 @@ impl McpServer {
                 return Ok(crate::resolve::ambiguity_response(sym, &cands));
             }
             // The same candidates `detect_ambiguity` counted, so 0 or 1 here.
-            let preferred = crate::resolve::preferred_definitions(self.db.conn(), sym)?;
+            // None: test code's definitions, where this said "not found" of a
+            // name the index has (D#446).
+            let mut preferred = crate::resolve::preferred_definitions(self.db.conn(), sym)?;
+            if preferred.is_empty() {
+                preferred = if exact_qualified {
+                    // The one definition `select_symbol` found, which
+                    // `find_references` and `get_call_graph` answer: chosen
+                    // by location, where the test rule above goes by name too
+                    // (`Job.test_step` in `src/` beside a test file's twin).
+                    crate::resolve::selectable_qualified_definitions(self.db.conn(), sym, None)?
+                        .into_iter()
+                        .map(|c| crate::storage::queries::NameCandidate {
+                            name: c.node.name,
+                            file_path: c.file_path,
+                            node_type: c.node.node_type,
+                            node_id: c.node.id,
+                            start_line: c.node.start_line,
+                        })
+                        .collect()
+                } else {
+                    crate::resolve::test_code_definitions(self.db.conn(), sym)?
+                };
+                if preferred.len() > 1 {
+                    return Ok(crate::resolve::ambiguity_response(sym, &preferred));
+                }
+            }
             return match preferred.first() {
                 None => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", typed)),
                 Some(nf) => {

@@ -193,7 +193,7 @@ impl McpServer {
             {
                 FuzzyResolution::Unique(symbol_name.to_string())
             } else if !queries::get_node_ids_by_name(self.db.conn(), symbol_name)?.is_empty() {
-                // Test code or `<external>` alone: the `NotFound` arm.
+                // Test code or `<external>` alone: the `NotFound` arm answers.
                 FuzzyResolution::NotFound
             } else {
                 self.resolve_fuzzy_name(symbol_name)?
@@ -231,11 +231,9 @@ impl McpServer {
                     return Ok(crate::resolve::ambiguity_response(symbol_name, &cands));
                 }
                 FuzzyResolution::NotFound => {
-                    // No definition outside test code. Distinguish "truly
-                    // absent" from "found-but-filtered" by querying without the
-                    // test filter — the latter means the user is on a dead-code
-                    // → find_references reverse-trace and needs to know they
-                    // can bypass with node_id/file_path.
+                    // No definition outside test code. Querying without the
+                    // test filter tells "truly absent" from an import's name
+                    // and from a name test code defines.
                     let unfiltered = queries::get_node_ids_by_name(self.db.conn(), symbol_name)?;
                     // `<external>` sentinels are no definition (that is
                     // deliberate — symbol *resolution* must keep preferring a
@@ -250,12 +248,27 @@ impl McpServer {
                     let (external, testish): (Vec<_>, Vec<_>) = unfiltered
                         .into_iter()
                         .partition(|(_, fp)| fp == crate::domain::EXTERNAL_FILE_PATH);
+                    let test_defs = if external.is_empty() && !testish.is_empty() {
+                        crate::resolve::test_code_definitions(self.db.conn(), symbol_name)?
+                    } else {
+                        Vec::new()
+                    };
                     if !external.is_empty() {
                         (
                             external.into_iter().map(|(id, _)| id).collect(),
                             symbol_name.to_string(),
                         )
+                    } else if test_defs.len() > 1 {
+                        return Ok(crate::resolve::ambiguity_response(symbol_name, &test_defs));
+                    } else if let Some(def) = test_defs.first() {
+                        // Test code's one definition is the name's: a rename
+                        // audit of a test helper is what `include_tests`
+                        // (default true) is for, and `get_call_graph` and CLI
+                        // `refs` answered it while this refused (D#446).
+                        (vec![def.node_id], symbol_name.to_string())
                     } else if !testish.is_empty() {
+                        // Rows no definition query returns, such as a node
+                        // without its `files` row.
                         let example_paths: Vec<String> =
                             testish.iter().take(3).map(|(_, fp)| fp.clone()).collect();
                         return Err(anyhow!(

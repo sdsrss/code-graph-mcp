@@ -191,7 +191,7 @@ def main():
             cls_file.setdefault(r[1], r[4])
     d1 = []
     seen = set()
-    while len(d1) < 400:
+    while classes and methods and len(d1) < 400:
         c, m = rnd.choice(classes), rnd.choice(methods)
         s = f"{c}.{m}"
         if s in quals or s in names or s in seen:
@@ -255,12 +255,12 @@ def main():
         suite = r[1].split(".")[0]
         emit("D3", f"{suite}.NoSuchCase{len(out)}", shape="gtest_suite_missing_case")
     pads = [(" ", ""), ("", " "), ("\t", "\n"), ("", " ")]
-    for c, m, s in rnd.sample(d1, 20):
+    for c, m, s in rnd.sample(d1, min(20, len(d1))):
         for pre, post in pads:
             emit("D3", pre + s + post, shape="pad", base=s)
 
     # DF: D1 with the class's own file.
-    for c, m, s in rnd.sample(d1, 100):
+    for c, m, s in rnd.sample(d1, min(100, len(d1))):
         emit("DF", s, file=cls_file[c], bare=m)
 
     # X: bare typos and prefixes.
