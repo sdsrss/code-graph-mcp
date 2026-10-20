@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.174.0
+
+**Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Some answers
+change (below): C++ class names whose constructor another file defines are
+answered where they were ambiguous; `get_call_graph` and CLI `callgraph` say
+that a name only an import binds is defined outside the project; CLI `refs`
+and `impact` leave out test-code namesakes of a production name, as the MCP
+tools do. A `~/.claude/settings.json` kept as a symlink now stays a link, and
+one that links to a read-only file is left alone instead of replaced. To keep
+0.173.0's answers: `npm i -g @sdsrs/code-graph@0.173.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.173.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0.
+
+Measured on the seven corpora of 0.173.0 (flask, leveldb, express, hono, gin,
+gson, and this repository's `src/` and `tests/`) with the same 45,723 inputs:
+of 431,098 runs per build over six MCP and five CLI surfaces, 4,771 changed,
+each in one of the three ways below, and the other 426,327 give 0.173.0's
+answer byte for byte; of 45,723 CLI `impact` runs (one per input), 108
+changed, in the first and third ways.
+
+### A C++ class whose constructor another file defines is answered
+
+An out-of-line constructor `T::T` gave way to its class `T` only when the
+class body was in the same file. A class declared in a header with its
+constructor defined in the `.cc` was `Ambiguous symbol 'DBImpl': 2 matches in
+different files` on `find_references`, `get_ast_node`, `get_call_graph` and
+CLI `refs`, `callgraph` and `impact`. A C/C++ `T::T` now gives way to a C/C++
+type named `T` wherever that is defined.
+
+On leveldb, 24 inputs that were ambiguous are answered with the class (or
+struct) in its header on each of those surfaces: 17 class names (`Arena`,
+`Block`, `BlockBuilder`, `Compaction`, `DBImpl`, `Env`, `FilterBlockBuilder`,
+`FilterBlockReader`, `LookupKey`, `MemTable`, `Options`, `Reader`, `Status`,
+`TableBuilder`, `TableCache`, `VersionSet`, `WriteBatch`) and 7 dotted names
+answered for one of them (`WriteBatch.DBImpl` → `DBImpl`). Two names stay
+ambiguous with fewer candidates: `Iterator` between its two classes
+(`db/skiplist.h`, `include/leveldb/iterator.h`; the constructor in
+`table/iterator.cc` is no longer listed, 3 → 2), and `Writer` between the
+class in `db/log_writer.h` and the constructor of `DBImpl::Writer`, a struct
+`db/db_impl.cc` defines that the index holds no node for (4 → 2). The six
+other corpora answer as before.
+
+### A name only an import binds says it has no call graph
+
+MCP `get_call_graph` and CLI `callgraph` never answered for a name the project
+imports and does not define. They said the index did not have a name it holds
+(MCP `Symbol '_cv_app' not found in the index`, CLI `No call graph results
+for: _cv_app` with a hint that the index may be stale), listed near names
+(`No exact match … Did you mean`), or answered for another symbol with a note
+(flask `ssl` → `PassList`, `datetime` → `TagDateTime`). They now say:
+
+```
+Symbol 'ssl' is defined outside this project (the index holds it only as an
+external name, such as an import), so it has no call graph. Use
+find_references to list where it is referenced.
+```
+
+The CLI says `` Run `code-graph-mcp refs ssl` `` where MCP says `Use
+find_references`, without the stale-index hint, and exits 1, as it did for a
+name it called not found; where it answered another symbol it exited 0. On
+the seven corpora, 735 names that only an import binds changed on each of the
+six call-graph surfaces (three directions, MCP and CLI; 4,410 runs): 461 had
+been not found, 210 a list of near names and 64 another symbol's answer. No
+run that answered the name asked for changed.
+
+### CLI `refs` and `impact` leave out test namesakes of a production name
+
+For a bare name with one production definition and test-code definitions of
+the same name, the MCP tools answered for the production definition and the
+CLI for all of them. CLI `refs invoke` (flask) counted 22 calls where
+`find_references` counts 2, and CLI `impact post` read `Risk: LOW` with 7
+tests affected (in `tests/test_async.py` and `tests/test_views.py`), where
+`get_ast_node` with `include_impact` says UNKNOWN. `refs` now leaves out test
+code's definitions when production defines the name, also when it resolves
+the name again after a refresh, and `impact` starts from the one production
+definition, as the MCP tools do (flask `impact post`: UNKNOWN, 0 tests).
+
+CLI `refs` changed for 100 inputs (flask 30, hono 22, gin 17, gson 16, this
+repository 9, express 6). Each now lists what `find_references` lists: 90 the
+same references, 10 the same total, with `find_references` listing part of
+them. CLI `impact`, run on every input, changed for 108 inputs (28 of them the
+leveldb names of the first section). Each now gives the risk level that
+`get_ast_node` gives with `include_impact` (108 of 108); 16 went from LOW to
+UNKNOWN.
+
+### A symlinked `settings.json` stays a link (plugin)
+
+Installing or updating the plugin wrote `~/.claude/settings.json` by renaming
+a temporary file onto the path, so a `settings.json` kept as a symlink into a
+dotfiles checkout became a plain file the first time the plugin changed it,
+and the checkout's copy went stale. A link to a file is now written through:
+the file it names gets the change and the link stays (`lifecycle.js install`
+on a link to a writable file: 0.173.0 left a plain file and the linked file
+without the statusline; now the link is kept and the linked file has it). A
+new file, a dangling link or a link to something other than a file is
+written at the path, as before; a file that replaces such a link now gets
+mode 0600, where it took the mode of what the link pointed to (a link to
+`/dev/null` became a 0666 `settings.json`). When a write or rename fails, the
+temporary file, which holds the whole document with its `env` values, is
+removed; it stayed beside `settings.json`.
+
+If the link names a file that cannot be written (a read-only file, as in a
+Nix home-manager setup), the plugin now leaves it alone: `lifecycle.js
+install` prints `cannot write … (EACCES …)` and `Not installed: … is not
+writable … Nothing was changed.`, exits 1, and the statusline is not set.
+0.173.0 replaced the link with a plain read-only copy and set the statusline.
+
+### Index locks are released when their holder lets go
+
+A lock on `.code-graph/` (the index lock, the build lock, an index run's
+marker) is a `flock`, which lives on the open file description. A child
+process that another thread starts holds a copy of every descriptor until it
+runs its program, so a lock its holder had closed could stay held for that
+long. A finished index run then still read as running, so a CLI query
+skipped the refresh it skips while a run is going, and a released rebuild
+guard read as held. These locks are now unlocked when dropped, which releases
+the copies too. In a test run that starts processes from four threads, the
+four lock tests this concerns failed in 13 of 40 rounds on 0.173.0 and in 0
+of 40 with the change.
+
+### Not covered
+
+- CLI `impact` and MCP `get_ast_node` (with or without `include_impact`)
+  still say a name only an import binds is not found, as 0.173.0 did: 724
+  such names on the seven corpora, every one of which `find_references`
+  answers.
+- A `::`-qualified external path can still get a list of near names from
+  `get_call_graph` and CLI `callgraph`: `std::fmt::Display` (`display_name`,
+  `display_node_name`, …) and `std::ops::Deref` (`deref`, `may_deref`, …) on
+  this repository.
+- An MCP server that takes the index lock and then gives it back (it could
+  not open the index for writing, or a newer version built the index) still
+  only closes the lock file, so a child process another thread has just
+  started can hold the lock until it runs its program.
+
 ## 0.173.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). MCP
