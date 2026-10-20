@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 118
+because call edges into TypeScript types are labelled differently (below).
+The MCP server rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does.
+
+### A TypeScript call into an interface or type alias is `ambiguous`
+
+An `interface` or a `type` alias exists only at compile time, yet a call was
+bound to one by name: hono's `new Response(...)`, the global, went to its own
+`export interface Response` in `src/client/types.ts`. Such an edge is now
+labelled `ambiguous`, whether the caller is in the same file or another one,
+so `callgraph` and `impact` leave it out unless asked for
+`--min-confidence ambiguous`. The edge itself stays, and a reference to a
+type (a parameter or return annotation) keeps its label. Only TypeScript
+(`.ts`, `.tsx`) changes.
+
+Measured on the seven corpora of 0.174.0 with a fresh index from each build:
+the edge sets are identical, and the only labels that move are 82 hono
+`calls` edges, `inferred` → `ambiguous`: 80 into interfaces (`Response` 69,
+`Set` 10, `Router` 1) and 2 into type aliases. On hono, `impact Response`
+was Risk HIGH with 51 callers and is now Risk UNKNOWN with 0 (the 69 calls
+are counted as excluded `ambiguous` edges), and `callgraph
+createBunWebSocket --direction callees` no longer lists `Response`.
+`surprising` gives such an edge the reason "ambiguous: bare-name target not
+decided (several candidates, or a TypeScript type)".
+
 ## 0.174.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Some answers
