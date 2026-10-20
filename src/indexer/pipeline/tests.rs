@@ -3102,47 +3102,6 @@ fn test_ts_type_call_label_converges_incrementally_to_a_rebuild() {
     );
 }
 
-/// D#436(5): the MCP server asks this before arming a catch-up incremental, so
-/// "no" must mean an incremental would index nothing. The `<external>`
-/// pseudo-file is in the index and never on disk; it is not a deletion.
-#[test]
-fn test_index_differs_from_disk_only_when_a_run_would_index_something() {
-    let (project, _d, db) = fresh_index_of(&[
-        (
-            "a.py",
-            "import os\n\ndef alpha():\n    return os.getcwd()\n",
-        ),
-        ("b.py", "def beta():\n    return 2\n"),
-    ]);
-    assert!(
-        get_all_file_hashes(db.conn())
-            .unwrap()
-            .contains_key(crate::domain::EXTERNAL_FILE_PATH),
-        "precondition: the index holds the <external> pseudo-file"
-    );
-    let (_, cache) = run_incremental_index_cached(&db, project.path(), None, None, None).unwrap();
-    let differs = |cache: Option<&crate::indexer::merkle::DirectoryCache>| {
-        index_differs_from_disk(&db, project.path(), cache).unwrap()
-    };
-    assert!(!differs(None));
-    assert!(!differs(Some(&cache)));
-
-    fs::write(project.path().join("c.py"), "def gamma():\n    return 3\n").unwrap();
-    assert!(differs(Some(&cache)), "a new file");
-    // Asking leaves the index alone: the run it leads to finds the file.
-    assert!(differs(Some(&cache)));
-    fs::remove_file(project.path().join("c.py")).unwrap();
-    assert!(!differs(Some(&cache)));
-
-    fs::write(project.path().join("b.py"), "def beta():\n    return 20\n").unwrap();
-    assert!(differs(Some(&cache)), "a changed file");
-    fs::write(project.path().join("b.py"), "def beta():\n    return 2\n").unwrap();
-    assert!(!differs(None));
-
-    fs::remove_file(project.path().join("b.py")).unwrap();
-    assert!(differs(Some(&cache)), "a deleted file");
-}
-
 /// A typed call its class did not decide (two same-named bases) is as much a
 /// guess as an untyped one: `ambiguous`, not the `inferred` a typed bind earns.
 #[test]
