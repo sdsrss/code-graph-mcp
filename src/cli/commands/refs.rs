@@ -63,6 +63,20 @@ pub(crate) fn print_refs_notfound_json(symbol: &str) {
 /// symbol after it, and re-running the rollup with those ids answers about that
 /// other symbol under the name resolution settled on first. `show --node-id`
 /// already re-resolves by identity (CON-10); this is the same rule for `refs`.
+/// The rows a bare name targets: every row named it, less test code's
+/// namesakes when production code defines the name, as MCP `find_references`
+/// takes them. With them, flask `invoke` counted 22 references to MCP's 2:
+/// mostly click's `runner.invoke` bound to a test method (D#458).
+fn name_target_ids(conn: &rusqlite::Connection, symbol: &str) -> Result<Vec<i64>> {
+    let rows = queries::get_node_ids_by_name(conn, symbol)?;
+    let production = !crate::resolve::preferred_definitions(conn, symbol)?.is_empty();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, fp)| !production || !crate::domain::is_test_symbol(symbol, fp))
+        .map(|(id, _)| id)
+        .collect())
+}
+
 enum RefsTarget {
     /// `--node-id`. Identity is (file_path, name, qualified_name, type) — the
     /// key [`crate::resolve::reresolve_node_by_identity`] uses, shared with
@@ -124,10 +138,7 @@ impl RefsTarget {
                 .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .map(|n| n.id)
                 .collect(),
-            RefsTarget::Name { file_path: None } => queries::get_node_ids_by_name(conn, symbol)?
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect(),
+            RefsTarget::Name { file_path: None } => name_target_ids(conn, symbol)?,
         })
     }
 
@@ -365,9 +376,8 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                             if resolved != base {
                                 eprintln!("[code-graph] Resolved '{}' → '{}'", base, resolved);
                             }
-                            let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
                             (
-                                resolved_ids.into_iter().map(|(id, _)| id).collect(),
+                                name_target_ids(conn, &resolved)?,
                                 resolved,
                                 RefsTarget::Name { file_path: None },
                             )
@@ -403,7 +413,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                     }
                 } else {
                     (
-                        ids.into_iter().map(|(id, _)| id).collect(),
+                        name_target_ids(conn, base)?,
                         base.to_string(),
                         RefsTarget::Name { file_path: None },
                     )

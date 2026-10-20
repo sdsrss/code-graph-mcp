@@ -3630,6 +3630,45 @@ fn test_cli_callgraph_nonexistent() {
     );
 }
 
+/// A name with one production definition and test-code namesakes is that
+/// definition on `refs` and `impact`, as on MCP `find_references` and
+/// `get_ast_node`'s impact: CLI `impact post` on flask said Risk LOW with 7
+/// tests affected (the callers of 7 test-file `post` methods) where MCP said
+/// UNKNOWN, and `refs invoke` counted 22 references where MCP counted 2.
+#[test]
+fn test_cli_refs_and_impact_leave_out_test_namesakes_of_a_production_name() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("src/scaffold.py"),
+        "class Scaffold:\n    def post(self):\n        return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_views.py"),
+        "class Index:\n    def post(self):\n        return 2\n\n\n\
+         def test_index():\n    return Index().post()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, stderr, code) = run_cli(&project, &["refs", "post", "--json"]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["total_references"], 0, "{stdout}");
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "post", "--json"]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["tests_affected"], 0, "{stdout}");
+    assert_ne!(v["risk"], "LOW", "{stdout}");
+}
+
 /// A name the project only imports has no call graph, and says so: `callgraph
 /// datetime` answered for the near name `TagDateTime`, and a name with no near
 /// one printed "No call graph results" with the stale-index hint.

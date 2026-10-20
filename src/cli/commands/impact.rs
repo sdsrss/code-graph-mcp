@@ -229,11 +229,25 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
+    // One production definition beside test code's namesakes: seed it in its
+    // own file, as MCP `get_ast_node`'s impact does. By name alone the callers
+    // of every namesake counted: flask `post` said Risk LOW with 7 tests
+    // affected, all callers of test-file `post` methods, where MCP said
+    // UNKNOWN (D#458).
+    let seed_file: Option<String> = match (file_filter, &node_target, is_exact_qualified) {
+        (None, None, false) => {
+            match crate::resolve::preferred_definitions(conn, symbol)?.as_slice() {
+                [only] => Some(only.file_path.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let seed_of = |target: &Option<CliNodeTarget>| match target {
         Some(target) => crate::graph::query::CallGraphSeed::Node(target.id),
         None => crate::graph::query::CallGraphSeed::Name {
             name: symbol,
-            file_path: file_filter,
+            file_path: file_filter.or(seed_file.as_deref()),
         },
     };
     let mut caller_set = crate::graph::routes::get_callers_with_route_info_seeded(

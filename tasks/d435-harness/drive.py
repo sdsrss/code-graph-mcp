@@ -16,6 +16,7 @@ CLASSES = set()
 SURFACES = set()
 # CLI impact runs only for these classes and for every input of the fx2 corpus.
 IMPACT_CLI_CLASSES = {"HD", "HDF", "E", "EF", "FH"}
+IMPACT_ALL = False  # --impact-all: CLI impact for every input
 
 def load_inputs(root, corpus, sample):
     recs = [json.loads(l) for l in open(f"{root}/results/inputs-{corpus}.jsonl", encoding="utf-8")]
@@ -72,7 +73,7 @@ def cli_jobs(recs):
         for d in DIRS:
             jobs.append(("cli_cg_" + d, r["id"], ["callgraph", r["sym"], "--direction", d, "--json"] + fileargs))
         jobs.append(("cli_refs", r["id"], ["refs", r["sym"], "--json"] + fileargs))
-        if r["class"] in IMPACT_CLI_CLASSES or r["id"].startswith("fx2:"):
+        if IMPACT_ALL or r["class"] in IMPACT_CLI_CLASSES or r["id"].startswith("fx2:"):
             jobs.append(("cli_impact", r["id"], ["impact", r["sym"], "--json"] + fileargs))
     return [j for j in jobs if not SURFACES or j[0] in SURFACES]
 
@@ -108,8 +109,10 @@ def main():
     ap.add_argument("--root", default="/var/tmp/d435")
     ap.add_argument("--classes", default="")
     ap.add_argument("--surfaces", default="")
+    ap.add_argument("--impact-all", action="store_true")
     a = ap.parse_args()
-    global CLASSES, SURFACES
+    global CLASSES, SURFACES, IMPACT_ALL
+    IMPACT_ALL = a.impact_all
     CLASSES = set(filter(None, a.classes.split(",")))
     SURFACES = set(filter(None, a.surfaces.split(",")))
     for corpus in a.corpora.split(","):
