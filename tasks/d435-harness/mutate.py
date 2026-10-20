@@ -7,7 +7,7 @@ A mutation whose `old` text is not found exactly once is reported, not run.
 """
 import json, os, subprocess, sys
 tree, test, muts = sys.argv[1], sys.argv[2], json.load(open(sys.argv[3]))
-env = dict(os.environ, CARGO_TARGET_DIR="/var/tmp/d446/target-mut")
+env = dict(os.environ, CARGO_TARGET_DIR="/var/tmp/backlog/b4/target-mut")
 def run():
     r = subprocess.run(["cargo", "test", "--lib", test], cwd=tree, env=env,
                        capture_output=True, text=True)

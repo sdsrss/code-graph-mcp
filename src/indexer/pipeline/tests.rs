@@ -2456,6 +2456,72 @@ fn callees_of(db: &Database, caller: &str) -> Vec<String> {
     rows.filter_map(Result::ok).collect()
 }
 
+/// `(target name, target file)` of each `imports` edge out of `file`.
+fn import_targets_of(db: &Database, file: &str) -> Vec<(String, String)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT t.name, COALESCE(tf.path, '') FROM edges e \
+             JOIN nodes s ON s.id = e.source_id JOIN files sf ON sf.id = s.file_id \
+             JOIN nodes t ON t.id = e.target_id LEFT JOIN files tf ON tf.id = t.file_id \
+             WHERE sf.path = ?1 AND e.relation = 'imports' ORDER BY 2, 1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+const INCLUDE_ROOT_HEADER: (&str, &str) = ("include/lib/slice.h", "struct Slice {\n  int n;\n};\n");
+const INCLUDE_ROOT_FILES: [(&str, &str); 2] = [
+    (
+        "db/keybuf.h",
+        "class KeyBuffer {\n public:\n  int slice() { return 0; }\n  int nothere() { return 0; }\n};\n",
+    ),
+    (
+        "util/env.cc",
+        "#include \"lib/slice.h\"\n#include \"missing/nothere.h\"\nint f() { return 1; }\n",
+    ),
+];
+
+/// D#370(f): a header under an include root (`include/leveldb/slice.h`,
+/// included as "leveldb/slice.h") resolved neither beside its includer nor
+/// from the repo root, and the include then bound by its bare name to any
+/// project symbol named like the header: leveldb `env_posix.cc` imported
+/// `KeyBuffer.slice`, 270 such edges, and `cycles` reported a 32-file loop
+/// that is not there. An include no file answers is an external one.
+#[test]
+fn test_cpp_include_under_an_include_root_names_its_header() {
+    let mut files = INCLUDE_ROOT_FILES.to_vec();
+    files.push(INCLUDE_ROOT_HEADER);
+    let (_p, _d, db) = fresh_index_of(&files);
+    let targets = import_targets_of(&db, "util/env.cc");
+    assert!(
+        targets.iter().any(|(_, f)| f == "include/lib/slice.h"),
+        "the include must name its header: {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|(_, f)| f == "db/keybuf.h"),
+        "an include binds no method named like the header: {targets:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|(_, f)| f == crate::domain::EXTERNAL_FILE_PATH),
+        "an include no file answers is external: {targets:?}"
+    );
+    // The header added after its includer: as a rebuild has it.
+    let (project, _d2, incremental) = fresh_index_of(&INCLUDE_ROOT_FILES);
+    let header = project.path().join(INCLUDE_ROOT_HEADER.0);
+    fs::create_dir_all(header.parent().unwrap()).unwrap();
+    fs::write(&header, INCLUDE_ROOT_HEADER.1).unwrap();
+    run_incremental_index(&incremental, project.path(), None, None).unwrap();
+    assert_eq!(import_targets_of(&incremental, "util/env.cc"), targets);
+}
+
 const DB_IMPL_HPP: &str = "#include <string>\n\
     class SnapshotList {\n public:\n  void Delete(int s) {}\n  void clear() {}\n};\n\
     class DBImpl {\n public:\n  void Delete(int k) {}\n  void Release(int s);\n\

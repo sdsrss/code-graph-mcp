@@ -48,7 +48,7 @@ use crate::utils::tokenizer::split_identifier;
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::js_modules::{
-    resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path,
+    files_by_name, resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path,
     resolve_php_include_path,
 };
 use super::python_modules::{
@@ -1461,6 +1461,8 @@ fn resolve_batch_relations(
     all_file_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<BatchRelations> {
+    // Built on the first `#include` that needs it (`resolve_c_include_path`).
+    let c_files_by_name = std::cell::OnceCell::new();
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut edges_created = 0usize;
     // --- Phase 2: Extract relations + insert edges ---
@@ -1900,7 +1902,10 @@ fn resolve_batch_relations(
             // through to default (`<external>`) resolution (M6).
             if let Some(meta) = import_meta.as_ref() {
                 if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
-                    if let Some(file) = resolve_c_include_path(inc, &pf.rel_path, all_file_paths) {
+                    let by_name = c_files_by_name.get_or_init(|| files_by_name(all_file_paths));
+                    if let Some(file) =
+                        resolve_c_include_path(inc, &pf.rel_path, all_file_paths, by_name)
+                    {
                         let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
                         if !module_targets.is_empty() {
                             edges_created += insert_relation_edges(
@@ -1923,7 +1928,19 @@ fn resolve_batch_relations(
                         ));
                         continue;
                     }
-                    // Unindexed include → fall through to default.
+                    // An include no indexed file answers (`<vector>`, a header
+                    // outside the tree) is external. By its bare stem it bound to
+                    // any project symbol named like the header: leveldb
+                    // `env_posix.cc` imported `KeyBuffer.slice` (D#370(f)).
+                    for &src_id in &source_ids {
+                        unresolved_externals.push((
+                            src_id,
+                            rel.target_name.clone(),
+                            rel.relation.clone(),
+                            None,
+                        ));
+                    }
+                    continue;
                 }
             }
 
@@ -3613,6 +3630,8 @@ fn resolve_deferred_relations(
     python_module_map: &HashMap<String, Vec<String>>,
     crate_roots: &super::resolve::RustCrates,
 ) -> Result<(usize, usize)> {
+    // Built on the first `#include` that needs it (`resolve_c_include_path`).
+    let c_files_by_name = std::cell::OnceCell::new();
     use super::resolve::{
         method_candidates, parse_callee_metadata, path_filter_candidates, recv_type_targets,
         self_filter_candidates, CalleeMeta, ProjectClassNames, RecvTypeTargets,
@@ -3941,7 +3960,11 @@ fn resolve_deferred_relations(
                 .or_else(|| {
                     meta.get("c_include")
                         .and_then(|v| v.as_str())
-                        .and_then(|inc| resolve_c_include_path(inc, &d.rel_path, all_file_paths))
+                        .and_then(|inc| {
+                            let by_name =
+                                c_files_by_name.get_or_init(|| files_by_name(all_file_paths));
+                            resolve_c_include_path(inc, &d.rel_path, all_file_paths, by_name)
+                        })
                 });
             if let Some(file) = inc_file {
                 let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
@@ -3956,6 +3979,18 @@ fn resolve_deferred_relations(
                     )?;
                     continue;
                 }
+            }
+            // As at batch time: an include no file answers is external.
+            if meta.get("c_include").is_some() {
+                for &src_id in &source_ids {
+                    unresolved_externals.push((
+                        src_id,
+                        d.target_name.clone(),
+                        d.relation.clone(),
+                        None,
+                    ));
+                }
+                continue;
             }
         }
 
