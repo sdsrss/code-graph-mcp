@@ -1217,30 +1217,54 @@ impl McpServer {
 
         // Start watcher + embedding
         if let Some(ref root) = self.project_root {
+            // The watcher starts only now, at the first message after the
+            // startup index (D#436(5)), so a change made since that index
+            // scanned raised no event, and with a watcher live the next rescan
+            // is the backstop's: a file created there was "not found" 130 s
+            // later on flask. Catch up here, before the embedding backfill
+            // below is spawned and this incremental would have to wait for it.
+            if self.start_watcher(root) && self.may_write_index() {
+                match self.run_incremental_with_cache_restore(root, None) {
+                    Ok(()) => {
+                        *lock_or_recover(&self.last_incremental_check, "last_incremental_check") =
+                            std::time::Instant::now();
+                    }
+                    Err(e) => tracing::warn!(
+                        "Catch-up index after the file watcher started failed (still owed): {e}"
+                    ),
+                }
+            }
             self.start_post_index_services(root);
+        }
+    }
+
+    /// Start the file watcher unless one is running. True when this call
+    /// started it.
+    fn start_watcher(&self, project_root: &Path) -> bool {
+        let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
+        if watcher_guard.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        match FileWatcher::start(project_root, tx) {
+            Ok(fw) => {
+                *watcher_guard = Some(WatcherState {
+                    _watcher: fw,
+                    receiver: rx,
+                });
+                self.send_log("info", "File watcher started automatically.");
+                true
+            }
+            Err(e) => {
+                self.send_log("warning", &format!("Could not start file watcher: {}", e));
+                false
+            }
         }
     }
 
     /// Start file watcher and background embedding (called after indexing completes).
     fn start_post_index_services(&self, project_root: &Path) {
-        // Auto-start file watcher
-        let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
-        if watcher_guard.is_none() {
-            let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
-            match FileWatcher::start(project_root, tx) {
-                Ok(fw) => {
-                    *watcher_guard = Some(WatcherState {
-                        _watcher: fw,
-                        receiver: rx,
-                    });
-                    self.send_log("info", "File watcher started automatically.");
-                }
-                Err(e) => {
-                    self.send_log("warning", &format!("Could not start file watcher: {}", e));
-                }
-            }
-        }
-        drop(watcher_guard);
+        self.start_watcher(project_root);
 
         // Repair Phase-3 casualties (NULL context_string from prior-session crashes)
         // BEFORE spawning embedding, so rebuilt context strings get vectorized in the
@@ -6535,6 +6559,54 @@ app.post('/api/login', handleLogin);
             _watcher: fw,
             receiver: quiet_rx,
         });
+    }
+
+    /// D#436(5): the watcher starts when the first tool call consumes the
+    /// startup index, so a change made after the startup scan and before that
+    /// call raised no event, and with the watcher then live only the backstop
+    /// rescanned — about 240 s into the process, since `last_incremental_check`
+    /// starts 60 s back. A file created in that window was "not found" 130 s
+    /// later on flask. The call that starts the watcher must catch up.
+    #[test]
+    fn test_change_before_the_watcher_starts_is_seen_by_the_first_call() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.timing.watcher_backstop = std::time::Duration::from_secs(WATCHER_BACKSTOP_SECS);
+        server.spawn_startup_indexing(project.path().to_path_buf(), false, None);
+        {
+            let (lock, cvar) = &*server.indexing.startup_indexing_done;
+            let mut done = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !*done {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "the startup run never finished");
+                done = cvar.wait_timeout(done, left).unwrap().0;
+            }
+        }
+        assert!(
+            lock_or_recover(&server.watcher, "watcher").is_none(),
+            "precondition: no watcher before the first tool call"
+        );
+        std::fs::write(
+            project.path().join("late.py"),
+            "def late_fn():\n    return 2\n",
+        )
+        .unwrap();
+
+        server.ensure_indexed().unwrap();
+        // Without a watcher the no-watcher debounce would rescan anyway; this
+        // test is about the call that starts one.
+        assert!(
+            lock_or_recover(&server.watcher, "watcher").is_some(),
+            "precondition: the first call starts the watcher"
+        );
+        assert!(
+            !queries::get_node_ids_by_name(server.db().conn(), "late_fn")
+                .unwrap()
+                .is_empty(),
+            "a file created before the watcher started must be indexed by that call"
+        );
     }
 
     #[test]
