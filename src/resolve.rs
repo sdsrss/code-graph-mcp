@@ -778,7 +778,9 @@ pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Va
 }
 
 /// Whether the index holds `name` only as `<external>` rows: a name the
-/// project imports (or names as an external type) and does not define.
+/// project imports or names as an external type, with no node of its own.
+/// The project can still define it in a form the indexer makes no node for
+/// (flask's module-level `_cv_app`, a Rust `pub type`, a TS `export type`).
 pub fn external_only(conn: &Connection, name: &str) -> Result<bool> {
     let rows = queries::get_node_ids_by_name(conn, name)?;
     Ok(!rows.is_empty()
@@ -789,14 +791,15 @@ pub fn external_only(conn: &Connection, name: &str) -> Result<bool> {
 
 /// What a call-graph surface says of an [`external_only`] name. It answered
 /// a near name (flask `ssl` → `PassList`), listed near names, or said the
-/// name was not in the index, which holds it.
+/// name was not in the index, which holds it. It says what the index holds,
+/// not where the name is defined, which the index cannot tell.
 pub fn external_only_message(name: &str, surface: Surface) -> String {
     let refs = match surface {
         Surface::Cli => format!("Run `code-graph-mcp refs {name}`"),
         Surface::Mcp => "Use find_references".to_string(),
     };
     format!(
-        "Symbol '{name}' is defined outside this project (the index holds it only as an \
+        "Symbol '{name}' has no definition in the index (it holds the name only as an \
          external name, such as an import), so it has no call graph. {refs} to list where \
          it is referenced."
     )

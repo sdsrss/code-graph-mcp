@@ -7513,8 +7513,16 @@ app.post('/api/login', handleLogin);
         let project = TempDir::new().unwrap();
         std::fs::write(
             project.path().join("app.py"),
-            "import ssl\nimport datetime\nimport zlib\n\n\nclass TagDateTime:\n    pass\n\n\n\
-             class PassList:\n    pass\n\n\ndef use():\n    return zlib.crc32(b'')\n",
+            "import ssl\nimport datetime\nimport zlib\nfrom ctxvars import _cv_app\n\n\n\
+             class TagDateTime:\n    pass\n\n\nclass PassList:\n    pass\n\n\n\
+             def use():\n    return zlib.crc32(b'')\n",
+        )
+        .unwrap();
+        // Defined here, as flask's globals.py does, yet held only as the
+        // import's external row: the message must not say "outside".
+        std::fs::write(
+            project.path().join("ctxvars.py"),
+            "from contextvars import ContextVar\n_cv_app = ContextVar('app')\n",
         )
         .unwrap();
         let server = McpServer::new_test_with_project(project.path());
@@ -7529,13 +7537,14 @@ app.post('/api/login', handleLogin);
             let text = result["content"][0]["text"].as_str().unwrap().to_string();
             (result["isError"].as_bool().unwrap_or(false), text)
         };
-        for name in ["datetime", "ssl", "zlib"] {
+        for name in ["datetime", "ssl", "zlib", "_cv_app"] {
             let (is_error, text) = call("get_call_graph", json!({"symbol_name": name}));
             assert!(is_error, "{name}: {text}");
             assert!(
-                text.contains("is defined outside this project"),
+                text.contains("has no definition in the index"),
                 "{name}: {text}"
             );
+            assert!(!text.contains("outside this project"), "{name}: {text}");
             let (is_error, text) = call("find_references", json!({"symbol_name": name}));
             assert!(!is_error, "{name}: {text}");
             assert!(text.contains("imports"), "{name}: {text}");

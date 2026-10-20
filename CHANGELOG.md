@@ -5,10 +5,11 @@
 **Upgrading: nothing to do** (`INDEX_VERSION` is unchanged). Some answers
 change (below): C++ class names whose constructor another file defines are
 answered where they were ambiguous; `get_call_graph` and CLI `callgraph` say
-that a name only an import binds is defined outside the project; CLI `refs`
+that a name the index holds only as an import has no call graph; CLI `refs`
 and `impact` leave out test-code namesakes of a production name, as the MCP
-tools do. A `~/.claude/settings.json` kept as a symlink now stays a link, and
-one that links to a read-only file is left alone instead of replaced. To keep
+tools do. A `~/.claude/settings.json` kept as a symlink now stays a link; when
+the directory holding the linked file cannot be written, install refuses
+instead of replacing the link (below). To keep
 0.173.0's answers: `npm i -g @sdsrs/code-graph@0.173.0` (or, from source,
 `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
 v0.173.0 --features embed-model`), then delete
@@ -28,7 +29,9 @@ An out-of-line constructor `T::T` gave way to its class `T` only when the
 class body was in the same file. A class declared in a header with its
 constructor defined in the `.cc` was `Ambiguous symbol 'DBImpl': 2 matches in
 different files` on `find_references`, `get_ast_node`, `get_call_graph` and
-CLI `refs`, `callgraph` and `impact`. A C/C++ `T::T` now gives way to a C/C++
+CLI `refs`, `callgraph` and `impact`, and on CLI `similar` and MCP
+`find_similar_code`, which the measurements below do not run (leveldb
+`DBImpl` there now picks the class). A C/C++ `T::T` now gives way to a C/C++
 type named `T` wherever that is defined.
 
 On leveldb, 24 inputs that were ambiguous are answered with the class (or
@@ -40,32 +43,38 @@ answered for one of them (`WriteBatch.DBImpl` → `DBImpl`). Two names stay
 ambiguous with fewer candidates: `Iterator` between its two classes
 (`db/skiplist.h`, `include/leveldb/iterator.h`; the constructor in
 `table/iterator.cc` is no longer listed, 3 → 2), and `Writer` between the
-class in `db/log_writer.h` and the constructor of `DBImpl::Writer`, a struct
-`db/db_impl.cc` defines that the index holds no node for (4 → 2). The six
-other corpora answer as before.
+class in `db/log_writer.h` and the constructor of the struct
+`DBImpl::Writer` in `db/db_impl.cc`, which the index names `DBImpl::Writer`
+rather than `Writer` (4 → 2). The six other corpora answer as before.
 
-### A name only an import binds says it has no call graph
+### A name the index holds only as an import says it has no call graph
 
-MCP `get_call_graph` and CLI `callgraph` never answered for a name the project
-imports and does not define. They said the index did not have a name it holds
+A name the index holds only as an external name has no node of its own: the
+project imports it (flask `ssl`), or defines it in a form the indexer makes
+no node for (flask's module-level `_cv_app` and `current_app`, gson's
+`@interface Expose`, hono's `export type Endpoint`, this repository's `pub
+type EdgeInfo`). MCP `get_call_graph` and CLI `callgraph` never answered for
+such a name. They said the index did not have a name it holds
 (MCP `Symbol '_cv_app' not found in the index`, CLI `No call graph results
 for: _cv_app` with a hint that the index may be stale), listed near names
 (`No exact match … Did you mean`), or answered for another symbol with a note
 (flask `ssl` → `PassList`, `datetime` → `TagDateTime`). They now say:
 
 ```
-Symbol 'ssl' is defined outside this project (the index holds it only as an
+Symbol 'ssl' has no definition in the index (it holds the name only as an
 external name, such as an import), so it has no call graph. Use
 find_references to list where it is referenced.
 ```
 
 The CLI says `` Run `code-graph-mcp refs ssl` `` where MCP says `Use
 find_references`, without the stale-index hint, and exits 1, as it did for a
-name it called not found; where it answered another symbol it exited 0. On
-the seven corpora, 735 names that only an import binds changed on each of the
-six call-graph surfaces (three directions, MCP and CLI; 4,410 runs): 461 had
-been not found, 210 a list of near names and 64 another symbol's answer. No
-run that answered the name asked for changed.
+name it called not found; where it answered another symbol it exited 0. MCP
+returns it with `isError: true`, as it did for a name it called not found;
+near names and another symbol's answer came with `isError: false`. On the
+seven corpora, 735 inputs (732 names) that the index holds only as external
+names changed on each of the six call-graph surfaces (three directions, MCP
+and CLI; 4,410 runs): 461 had been not found, 210 a list of near names and
+64 another symbol's answer. No run that answered the name asked for changed.
 
 ### CLI `refs` and `impact` leave out test namesakes of a production name
 
@@ -101,13 +110,19 @@ written at the path, as before; a file that replaces such a link now gets
 mode 0600, where it took the mode of what the link pointed to (a link to
 `/dev/null` became a 0666 `settings.json`). When a write or rename fails, the
 temporary file, which holds the whole document with its `env` values, is
-removed; it stayed beside `settings.json`.
+removed; 0.173.0 left it behind.
 
-If the link names a file that cannot be written (a read-only file, as in a
-Nix home-manager setup), the plugin now leaves it alone: `lifecycle.js
-install` prints `cannot write … (EACCES …)` and `Not installed: … is not
-writable … Nothing was changed.`, exits 1, and the statusline is not set.
-0.173.0 replaced the link with a plain read-only copy and set the statusline.
+The write goes to a temporary file beside the linked file, so it needs the
+linked file's directory to be writable. When that directory cannot be
+written (a store directory a Nix home-manager link points into is one), the
+plugin now leaves the link and the file alone: `lifecycle.js install`
+prints `cannot write …` with the error (`EACCES` in a 0555 directory) and
+`Not installed: … is not writable`, exits 1, and the statusline is not set.
+This holds when the file itself is writable, although the message asks for
+the file to be made writable. 0.173.0 replaced the link with a plain copy and
+set the statusline. A read-only linked file in a writable directory is
+rewritten and keeps its mode, as a plain read-only `settings.json` is and
+was.
 
 ### Index locks are released when their holder lets go
 
@@ -125,9 +140,14 @@ of 40 with the change.
 ### Not covered
 
 - CLI `impact` and MCP `get_ast_node` (with or without `include_impact`)
-  still say a name only an import binds is not found, as 0.173.0 did: 724
-  such names on the seven corpora, every one of which `find_references`
-  answers.
+  still say a name the index holds only as an external name is not found, as
+  0.173.0 did: 724 such names on the seven corpora, every one of which
+  `find_references` answers.
+- An out-of-line C/C++ constructor whose own class the index does not hold
+  now gives way to a type of that name in another namespace: `Foo::Foo()` in
+  `src/foo.cc` beside `namespace other { struct Foo … }` makes `refs Foo`
+  answer for `other::Foo` (`No references found`), where 0.173.0 said
+  `2 matches`. Reproduced on a two-file project; none on the seven corpora.
 - A `::`-qualified external path can still get a list of near names from
   `get_call_graph` and CLI `callgraph`: `std::fmt::Display` (`display_name`,
   `display_node_name`, …) and `std::ops::Deref` (`deref`, `may_deref`, …) on

@@ -3677,8 +3677,15 @@ fn test_cli_callgraph_on_an_import_only_name_says_it_is_external() {
     let project = TempDir::new().unwrap();
     std::fs::write(
         project.path().join("app.py"),
-        "import ssl\nimport datetime\nimport zlib\n\n\nclass TagDateTime:\n    pass\n\n\n\
-         class PassList:\n    pass\n\n\ndef use():\n    return zlib.crc32(b'')\n",
+        "import ssl\nimport datetime\nimport zlib\nfrom ctxvars import _cv_app\n\n\n\
+         class TagDateTime:\n    pass\n\n\nclass PassList:\n    pass\n\n\n\
+         def use():\n    return zlib.crc32(b'')\n",
+    )
+    .unwrap();
+    // Defined here, yet held only as the import's external row.
+    std::fs::write(
+        project.path().join("ctxvars.py"),
+        "from contextvars import ContextVar\n_cv_app = ContextVar('app')\n",
     )
     .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -3686,15 +3693,16 @@ fn test_cli_callgraph_on_an_import_only_name_says_it_is_external() {
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     drop(db);
-    for name in ["datetime", "ssl", "zlib"] {
+    for name in ["datetime", "ssl", "zlib", "_cv_app"] {
         let (stdout, stderr, code) = run_cli(&project, &["callgraph", name, "--json"]);
         assert_ne!(code, 0, "{name}: {stdout}");
         let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         let error = v["error"].as_str().unwrap_or_default();
         assert!(
-            error.contains("is defined outside this project"),
+            error.contains("has no definition in the index"),
             "{name}: {stdout} {stderr}"
         );
+        assert!(!error.contains("outside this project"), "{name}: {stdout}");
         assert!(!stderr.contains("Resolved"), "{name}: {stderr}");
         assert!(!stderr.contains("index may be stale"), "{name}: {stderr}");
     }
