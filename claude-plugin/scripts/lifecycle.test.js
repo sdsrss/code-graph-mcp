@@ -1769,6 +1769,11 @@ test('writeJsonAtomic does not follow a link to a directory', (t) => {
   writeJsonAtomic(link, { env: { ANTHROPIC_API_KEY: 'sk-secret' } });
 
   assert.ok(fs.lstatSync(link).isFile(), 'the link is replaced by the file');
+  assert.equal(
+    (fs.statSync(link).mode & 0o777).toString(8),
+    '600',
+    'a new file takes the secret-file mode, not the directory\'s',
+  );
   assert.deepEqual(fs.readdirSync(dir), []);
   assert.deepEqual(fs.readdirSync(path.dirname(dir)), ['adir']);
 });

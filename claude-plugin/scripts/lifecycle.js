@@ -337,8 +337,13 @@ function writeJsonAtomic(filePath, data) {
   } catch { /* new file, or a dangling link */ }
   const dir = path.dirname(target);
   fs.mkdirSync(dir, { recursive: true });
+  // A file's own bits only: through a link to a directory the new file took
+  // the directory's 0755 for a document that holds secrets.
   let mode = null;
-  try { mode = fs.statSync(target).mode & 0o777; } catch { /* new file */ }
+  try {
+    const st = fs.statSync(target);
+    if (st.isFile()) mode = st.mode & 0o777;
+  } catch { /* new file */ }
   const tmp = target + '.tmp.' + process.pid;
   try {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: mode ?? SECRET_FILE_MODE });

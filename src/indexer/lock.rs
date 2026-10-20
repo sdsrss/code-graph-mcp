@@ -270,18 +270,23 @@ pub(crate) fn release_index_lock(_code_graph_dir: &Path) {}
 /// and a dropped guard read as held (D#459). `LOCK_UN` releases the
 /// description, copies included. The Windows lock is the exclusive open, which
 /// a child does not inherit.
-pub(crate) struct HeldFlock(std::fs::File);
+///
+/// `_file`: read only by the Unix unlock (and Unix tests), so on Windows it
+/// is the open file the lock is, kept alive and never read.
+pub(crate) struct HeldFlock {
+    _file: std::fs::File,
+}
 
 impl HeldFlock {
     pub(crate) fn new(file: std::fs::File) -> Self {
-        Self(file)
+        Self { _file: file }
     }
 
     /// The open file, for a test that needs a second descriptor on it. Unix
     /// only, as those tests are: unused on Windows it fails the build there.
     #[cfg(all(test, unix))]
     pub(crate) fn file(&self) -> &std::fs::File {
-        &self.0
+        &self._file
     }
 }
 
@@ -290,9 +295,9 @@ impl Drop for HeldFlock {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            // SAFETY: `self.0` is open until this drop returns, so its fd is
+            // SAFETY: `self._file` is open until this drop returns, so its fd is
             // valid for the call; flock has no other precondition.
-            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+            unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
         }
     }
 }
