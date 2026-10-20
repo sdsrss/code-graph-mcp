@@ -7504,6 +7504,73 @@ app.post('/api/login', handleLogin);
         assert!(!text.contains("candidates"), "{r}");
     }
 
+    /// D#436(1): a C++ constructor defined out of line in the `.cc` beside its
+    /// class's `.h` (leveldb's layout) counted as a second definition of the
+    /// class name: `DBImpl`, `Status`, `VersionSet` and 26 more refused on every
+    /// surface, `--file` included. Two classes of one name stay ambiguous.
+    #[test]
+    fn test_a_cpp_class_with_its_constructor_in_another_file_is_the_class() {
+        let project = TempDir::new().unwrap();
+        let write = |path: &str, src: &str| {
+            let full = project.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, src).unwrap();
+        };
+        write(
+            "db/db_impl.h",
+            "class DBImpl {\n public:\n  DBImpl();\n  void Write();\n};\n",
+        );
+        write(
+            "db/db_impl.cc",
+            "#include \"db/db_impl.h\"\nDBImpl::DBImpl() {}\nvoid DBImpl::Write() {}\n",
+        );
+        write(
+            "db/open.cc",
+            "#include \"db/db_impl.h\"\nvoid Open() {\n  DBImpl* d = new DBImpl();\n  d->Write();\n}\n",
+        );
+        write(
+            "a/state.h",
+            "namespace a {\nclass State {\n public:\n  State();\n};\n}\n",
+        );
+        write("a/state.cc", "namespace a {\nState::State() {}\n}\n");
+        write(
+            "b/state.h",
+            "namespace b {\nclass State {\n public:\n  int n;\n};\n}\n",
+        );
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        let answer = |tool: &str, args: serde_json::Value| {
+            let resp = server
+                .handle_message(&tool_call_json(tool, args.clone()))
+                .unwrap()
+                .unwrap();
+            let result =
+                serde_json::from_str::<serde_json::Value>(&resp).unwrap()["result"].clone();
+            let text = result["content"][0]["text"].as_str().unwrap().to_string();
+            assert!(
+                !result["isError"].as_bool().unwrap_or(false),
+                "{tool} {args}: {text}"
+            );
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        let out = answer("get_ast_node", json!({"symbol_name": "DBImpl"}));
+        assert_eq!(out["type"], "class", "{out}");
+        assert_eq!(out["file_path"], "db/db_impl.h", "{out}");
+        for tool in ["find_references", "get_call_graph"] {
+            let out = answer(tool, json!({"symbol_name": "DBImpl"}));
+            assert!(out.get("error").is_none(), "{tool}: {out}");
+        }
+        for tool in ["get_ast_node", "find_references", "get_call_graph"] {
+            let out = answer(tool, json!({"symbol_name": "State"}));
+            assert!(
+                out["error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("Ambiguous symbol 'State': 2 matches")),
+                "{tool}: {out}"
+            );
+        }
+    }
+
     /// E2E 2026-10-16 round 2: get_ast_node's impact counted pruned edges into
     /// its deepest (third) layer of callers, whose callers lie past the depth at
     /// any floor — same overcount as `cmd_impact`.

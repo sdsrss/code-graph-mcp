@@ -379,6 +379,9 @@ fn definitions_in_tier(
     // struct` and `Context.Negotiate`), and that is two definitions (round 3).
     // And only where the language names a constructor after its class: a TS,
     // Python or Ruby method named like its class is a method (round 4).
+    // `T::T` names its class wherever that class is declared: leveldb defines
+    // the constructor in the `.cc` beside the class's `.h`, and `DBImpl`,
+    // `Status` and 27 more refused as "2 matches in different files" (D#436).
     let names_constructors = |path: &str| {
         matches!(
             crate::utils::config::detect_language(path),
@@ -401,8 +404,10 @@ fn definitions_in_tier(
             ) && nf.node.qualified_name.as_deref()
                 == Some(format!("{0}.{0}", nf.node.name).as_str());
             type_bodies.iter().any(|&(file, start, end)| {
-                file == nf.file_path
-                    && (out_of_line || (start <= nf.node.start_line && nf.node.start_line <= end))
+                out_of_line
+                    || (file == nf.file_path
+                        && start <= nf.node.start_line
+                        && nf.node.start_line <= end)
             })
         })
         .map(|nf| nf.node.id)
