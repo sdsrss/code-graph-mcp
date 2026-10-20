@@ -2104,6 +2104,51 @@ pub(super) fn bind_calls_to_imported_targets(
     Ok(inserted)
 }
 
+/// Drop `calls` edges into a TypeScript interface or type alias. Those declare
+/// a type only, so no call names them: `new Response(…)` calls the runtime's
+/// global `Response`, yet hono bound 69 calls to the `Response` interface in
+/// `src/client/types.ts`, and `impact Set` called an interface Risk HIGH
+/// (D#370(d)). Scoped like [`prune_import_contradicted_call_edges`]: an
+/// incremental run reconsiders edges out of and into the files it touched.
+///
+/// Returns the number of edges removed.
+pub(super) fn prune_calls_into_ts_types(db: &Database, scope: &PostPassScope) -> Result<usize> {
+    const PREDICATE: &str = "
+            WHERE e.relation = ?1
+              AND tn.type IN ('interface', 'type')
+              AND tf.language IN ('typescript', 'tsx')";
+    let sql = if scope.is_global() {
+        format!(
+            "DELETE FROM edges WHERE id IN (
+            SELECT e.id FROM edges e
+            JOIN nodes tn ON tn.id = e.target_id
+            JOIN files tf ON tf.id = tn.file_id
+            {PREDICATE}
+        )"
+        )
+    } else {
+        format!(
+            "DELETE FROM edges WHERE id IN (
+            SELECT e.id
+            FROM cg_scope_files s
+            CROSS JOIN nodes sn ON sn.file_id = s.fid
+            CROSS JOIN edges e ON e.source_id = sn.id
+            CROSS JOIN nodes tn ON tn.id = e.target_id
+            JOIN files tf ON tf.id = tn.file_id
+            {PREDICATE}
+            UNION
+            SELECT e.id
+            FROM cg_scope_files s
+            CROSS JOIN nodes tn ON tn.file_id = s.fid
+            CROSS JOIN edges e ON e.target_id = tn.id
+            JOIN files tf ON tf.id = tn.file_id
+            {PREDICATE}
+        )"
+        )
+    };
+    Ok(db.conn().execute(&sql, [crate::domain::REL_CALLS])?)
+}
+
 /// Remove bare-name `calls` edges that an explicit import in the caller's file
 /// contradicts. Runs once after all call edges exist (post Phase-2 + pending
 /// sweep).

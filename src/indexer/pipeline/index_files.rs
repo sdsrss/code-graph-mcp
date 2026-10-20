@@ -4762,6 +4762,13 @@ fn run_global_edge_post_passes(
             pruned
         );
     }
+    let pruned = super::resolve::prune_calls_into_ts_types(db, scope)?;
+    if pruned > 0 {
+        tracing::info!(
+            "[index] Phase 2d: pruned {} call edges into TypeScript types",
+            pruned
+        );
+    }
 
     // Phase 2e: classify edge confidence. Downgrades cross-file by-name
     // `calls`/`references` edges to inferred/ambiguous; every precise edge keeps

@@ -2522,6 +2522,49 @@ fn test_cpp_include_under_an_include_root_names_its_header() {
     assert_eq!(import_targets_of(&incremental, "util/env.cc"), targets);
 }
 
+const TS_TYPES: (&str, &str) = (
+    "src/types.ts",
+    "export interface Response {\n  ok: boolean;\n}\nexport type Handler = (n: number) => number;\n",
+);
+const TS_CALLER: (&str, &str) = (
+    "src/app.ts",
+    "export function make(): number {\n  return 1;\n}\n\
+     export function run(): void {\n  const r = new Response('x');\n  const h = Handler(1);\n  make();\n}\n",
+);
+
+/// D#370(d): a TypeScript interface or type alias is a type only, so no call
+/// names it, yet `new Response(…)` bound hono's 69 calls to the `Response`
+/// interface in `src/client/types.ts`, and `impact Set` reported Risk HIGH
+/// for an interface. 92 call edges on hono pointed at type nodes.
+#[test]
+fn test_a_call_never_binds_a_typescript_interface_or_type_alias() {
+    let (_p, _d, db) = fresh_index_of(&[TS_TYPES, TS_CALLER]);
+    assert_eq!(callees_of(&db, "run"), vec!["src/app.ts.make".to_string()]);
+    // The types added after their caller: as a rebuild has it.
+    let (project, _d2, incremental) = fresh_index_of(&[TS_CALLER]);
+    fs::write(project.path().join(TS_TYPES.0), TS_TYPES.1).unwrap();
+    run_incremental_index(&incremental, project.path(), None, None).unwrap();
+    assert_eq!(callees_of(&incremental, "run"), callees_of(&db, "run"));
+    // A function that becomes an interface: the untouched caller's edge into
+    // it is dropped, as a rebuild has it.
+    let (project, _d3, changed) = fresh_index_of(&[
+        (
+            TS_TYPES.0,
+            "export function Response(s: string): number {\n  return 1;\n}\n\
+             export function Handler(n: number): number {\n  return n;\n}\n",
+        ),
+        TS_CALLER,
+    ]);
+    assert_eq!(
+        callees_of(&changed, "run").len(),
+        3,
+        "precondition: functions are called"
+    );
+    fs::write(project.path().join(TS_TYPES.0), TS_TYPES.1).unwrap();
+    run_incremental_index(&changed, project.path(), None, None).unwrap();
+    assert_eq!(callees_of(&changed, "run"), callees_of(&db, "run"));
+}
+
 const DB_IMPL_HPP: &str = "#include <string>\n\
     class SnapshotList {\n public:\n  void Delete(int s) {}\n  void clear() {}\n};\n\
     class DBImpl {\n public:\n  void Delete(int k) {}\n  void Release(int s);\n\
