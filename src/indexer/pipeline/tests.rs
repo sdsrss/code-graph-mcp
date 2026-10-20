@@ -12065,6 +12065,58 @@ fn a_python_reexport_binding_converges_incrementally_to_a_rebuild() {
     }
 }
 
+// The fan-out pulls only the importers a moved re-export can rebind (an edge
+// to a node of a moved name, or a relative import that fell back to a
+// `<module>`), so each way an importer holds the name is a scenario: a
+// relative `from . import X` on the package's `<module>` (D10) and on a
+// submodule's that a new re-export shadows, an `<external>` sentinel for a name
+// nothing defined, and a renamed re-export's own target. `Gadget2` is a
+// re-export no file imports.
+#[test]
+fn a_python_reexport_fanout_reaches_every_importer_shape() {
+    let base: Vec<(&str, &str)> = vec![
+        ("pkg/__init__.py", "from .core import _Hidden as Public\n"),
+        (
+            "pkg/core.py",
+            "class Widget:\n    pass\n\nclass Gadget:\n    pass\n\nclass _Hidden:\n    pass\n",
+        ),
+        ("pkg/tools.py", "def helper():\n    return 1\n"),
+        (
+            "pkg/user.py",
+            "from . import Widget\nfrom . import tools\n\ndef make():\n    return Widget()\n",
+        ),
+        (
+            "app/use.py",
+            "from pkg import Ghost, Public\n\ndef run():\n    Ghost()\n    Public()\n",
+        ),
+    ];
+    let edits: &[&[(&str, Option<&str>)]] = &[
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import _Hidden as Public\nfrom .core import Widget\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import _Hidden as Public\nfrom .core import Widget as tools\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import _Hidden as Public\nfrom .core import Widget as Ghost\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import Widget as Public\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import _Hidden as Public\nfrom .core import Gadget as Gadget2\n"),
+        )],
+    ];
+    for after in edits {
+        assert_incremental_edges_match_rebuild(&base, after);
+    }
+}
+
 // D9's fan-out arm re-extracts only the importers a rebuild binds differently:
 // not one that found its name in the module it names, not one in a language
 // the new definition cannot bind, and a D10A `<module>` fallback only when its

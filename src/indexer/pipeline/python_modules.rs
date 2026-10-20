@@ -220,6 +220,7 @@ const REEXPORT_MAX_DEPTH: usize = 8;
 /// The name a module exports is its `as` when the import renamed it.
 pub(super) fn python_reexport_targets(
     conn: &rusqlite::Connection,
+    edges: &mut ReexportEdges,
     module_files: &[String],
     name: &str,
     python_module_map: &HashMap<String, Vec<String>>,
@@ -229,6 +230,7 @@ pub(super) fn python_reexport_targets(
     for file in module_files {
         out.extend(reexports_of(
             conn,
+            edges,
             file,
             name,
             python_module_map,
@@ -240,12 +242,78 @@ pub(super) fn python_reexport_targets(
     Ok(out)
 }
 
+/// One `imports` edge out of a Python file's `<module>` that names a symbol,
+/// not a module: what [`python_reexport_targets`] reads.
+struct ReexportEdge {
+    target: i64,
+    /// The import's `as`, else the target's own name.
+    exported: String,
+    target_name: String,
+    target_path: String,
+    python_module: String,
+}
+
+/// The [`ReexportEdge`]s of each file asked about, read from the database once
+/// per file: networkx's 840 waiting imports asked 1,680 times about 275 files
+/// (593 ms of a 2.3 s index when each asked the database). Whoever writes an
+/// `imports` edge out of a file must [`Self::forget`] it.
+///
+/// The read's join order is fixed (`CROSS JOIN`): a build has no statistics
+/// yet, and the planner then drove it from every `imports` edge in the index
+/// (`idx_edges_relation`), 0.34 ms a file instead of 6 µs.
+#[derive(Default)]
+pub(super) struct ReexportEdges {
+    by_file: HashMap<String, Vec<ReexportEdge>>,
+}
+
+impl ReexportEdges {
+    /// Drop what is held for `file`, whose `<module>` just gained an edge.
+    pub(super) fn forget(&mut self, file: &str) {
+        self.by_file.remove(file);
+    }
+
+    fn of(&mut self, conn: &rusqlite::Connection, file: &str) -> anyhow::Result<&[ReexportEdge]> {
+        if !self.by_file.contains_key(file) {
+            let rows = conn
+                .prepare_cached(
+                    "SELECT e.target_id, COALESCE(json_extract(e.metadata, '$.as'), tn.name),
+                            tn.name, tf.path, json_extract(e.metadata, '$.python_module')
+                     FROM files f
+                     CROSS JOIN nodes sn ON sn.file_id = f.id AND sn.name = '<module>'
+                     CROSS JOIN edges e ON e.source_id = sn.id AND e.relation = 'imports'
+                     CROSS JOIN nodes tn ON tn.id = e.target_id
+                     CROSS JOIN files tf ON tf.id = tn.file_id
+                     WHERE f.path = ?1
+                       AND json_extract(e.metadata, '$.python_module') IS NOT NULL
+                       AND json_extract(e.metadata, '$.is_module_import') IS NULL",
+                )?
+                .query_map([file], |r| {
+                    Ok(ReexportEdge {
+                        target: r.get(0)?,
+                        exported: r.get(1)?,
+                        target_name: r.get(2)?,
+                        target_path: r.get(3)?,
+                        python_module: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.by_file.insert(file.to_string(), rows);
+        }
+        Ok(self
+            .by_file
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or_default())
+    }
+}
+
 /// [`python_reexport_targets`] for one file. `on_path` holds the `(file, name)`
 /// pairs being answered further up, so a re-export cycle (`a` from `b`, `b`
 /// from `a`) verifies nothing; answers are not cached across branches, since
 /// one cut short by a cycle would be wrong where the cycle is not.
 fn reexports_of(
     conn: &rusqlite::Connection,
+    edges: &mut ReexportEdges,
     file: &str,
     name: &str,
     python_module_map: &HashMap<String, Vec<String>>,
@@ -255,28 +323,19 @@ fn reexports_of(
     if on_path.len() > REEXPORT_MAX_DEPTH || !on_path.insert(key.clone()) {
         return Ok(Vec::new());
     }
-    let rows = conn
-        .prepare_cached(
-            "SELECT e.target_id, tn.name, tf.path, json_extract(e.metadata, '$.python_module')
-             FROM files f
-             JOIN nodes sn ON sn.file_id = f.id AND sn.name = '<module>'
-             JOIN edges e ON e.source_id = sn.id AND e.relation = 'imports'
-             JOIN nodes tn ON tn.id = e.target_id
-             JOIN files tf ON tf.id = tn.file_id
-             WHERE f.path = ?1
-               AND json_extract(e.metadata, '$.python_module') IS NOT NULL
-               AND json_extract(e.metadata, '$.is_module_import') IS NULL
-               AND COALESCE(json_extract(e.metadata, '$.as'), tn.name) = ?2",
-        )?
-        .query_map(rusqlite::params![file, name], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows: Vec<(i64, String, String, String)> = edges
+        .of(conn, file)?
+        .iter()
+        .filter(|e| e.exported == name)
+        .map(|e| {
+            (
+                e.target,
+                e.target_name.clone(),
+                e.target_path.clone(),
+                e.python_module.clone(),
+            )
+        })
+        .collect();
     let mut out = Vec::new();
     for (target, target_name, target_path, module) in rows {
         let Some(files) = project_module_files_from(&module, file, python_module_map) else {
@@ -287,8 +346,8 @@ fn reexports_of(
             if verified {
                 break;
             }
-            verified =
-                reexports_of(conn, f, &target_name, python_module_map, on_path)?.contains(&target);
+            verified = reexports_of(conn, edges, f, &target_name, python_module_map, on_path)?
+                .contains(&target);
         }
         if verified {
             out.push(target);

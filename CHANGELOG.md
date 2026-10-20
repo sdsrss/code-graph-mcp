@@ -34,6 +34,14 @@ their callers keeping the ones into `src/flask/blueprints.py`'s; and 4
 callers --include-tests --depth 1` lists 28 callers where it listed 3, and
 `impact Flask` counts 27 tests affected where it counted 2.
 
+An edit that changes what a Python module re-exports also re-extracts the
+files that import a moved name, since what they bind depends on it: on flask,
+adding or retargeting one import line of `src/flask/__init__.py` re-extracts 7
+to 9 files, and that edit's incremental run takes 128–144 ms where it took
+25–27 ms. On networkx (693 files) an edit that leaves a module's imports alone
+takes 83–122 ms (81–121 ms before, 15 edits each), and a full index
+1,649–1,773 ms (1,642–1,728 ms before).
+
 ### A TypeScript call into an interface or type alias is `ambiguous`
 
 An `interface` or a `type` alias exists only at compile time, yet a call was

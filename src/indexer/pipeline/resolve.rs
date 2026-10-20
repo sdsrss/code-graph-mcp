@@ -1539,17 +1539,18 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
 /// What a Python file of `cg_reexport_paths` exports through its imports
 /// (D#370(a)): one row per name its `<module>` imports other than as a module,
 /// `(file, exported name ␟ target file ␟ target name)`. The exported name is
-/// the import's `as` when it renamed.
+/// the import's `as` when it renamed. Join order fixed for the reason
+/// `python_modules::ReexportEdges` gives.
 const PY_REEXPORT_SELECT: &str = "
     SELECT f.path AS p,
            COALESCE(json_extract(e.metadata, '$.as'), t.name) || char(31) || tf.path
              || char(31) || t.name AS v
     FROM cg_reexport_paths rp
-    JOIN files f ON f.path = rp.path
-    JOIN nodes s ON s.file_id = f.id AND s.name = '<module>'
-    JOIN edges e ON e.source_id = s.id AND e.relation = 'imports'
-    JOIN nodes t ON t.id = e.target_id
-    JOIN files tf ON tf.id = t.file_id
+    CROSS JOIN files f ON f.path = rp.path
+    CROSS JOIN nodes s ON s.file_id = f.id AND s.name = '<module>'
+    CROSS JOIN edges e ON e.source_id = s.id AND e.relation = 'imports'
+    CROSS JOIN nodes t ON t.id = e.target_id
+    CROSS JOIN files tf ON tf.id = t.file_id
     WHERE json_extract(e.metadata, '$.python_module') IS NOT NULL
       AND json_extract(e.metadata, '$.is_module_import') IS NULL";
 
@@ -1582,11 +1583,18 @@ pub(super) fn snapshot_python_reexports<'a>(
 
 /// The files that import a module whose re-exports the last `index_files` run
 /// moved (D#370(a)): a re-export retargeted, removed or added changes what
-/// `from <module> import name` binds in files the run never opened. Each
-/// importer is found by resolving the `python_module` of its own import edges,
-/// so a relative importer counts as well as an absolute one. The run's own
-/// files are left out: they were re-extracted against the new state. Drops the
-/// snapshot; empty when there is none.
+/// `from <module> import name` binds in files the run never opened. An
+/// importer is a file with an import edge whose `python_module` resolves to a
+/// moved module (so a relative importer counts as well as an absolute one), and
+/// it is pulled only when it could bind differently: it holds an import edge
+/// to a node of a moved name (the name chain's target, an `<external>`
+/// sentinel, or a renamed re-export's own target), or a relative import that
+/// fell back to a `<module>` (D10: the package's own, or a submodule's, which a
+/// new re-export of that name now shadows, as it does in Python). Pulling every importer
+/// re-extracted all 52 of flask's `__init__.py` for a line that re-exported a
+/// new name, 330 ms more than the edit itself. The run's own files are left
+/// out: they were re-extracted against the new state. Drops the snapshot;
+/// empty when there is none.
 pub(super) fn importers_of_python_reexport_drift(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<String>> {
@@ -1618,10 +1626,16 @@ pub(super) fn importers_of_python_reexport_drift(
         "DROP TABLE IF EXISTS temp.cg_reexport_paths;
          DROP TABLE IF EXISTS temp.cg_reexport_before;",
     )?;
-    let drifted: HashSet<String> = before
-        .symmetric_difference(&now)
-        .map(|(p, _)| p.clone())
-        .collect();
+    let mut drifted: HashSet<String> = HashSet::new();
+    // Exported and target names alike: a renamed re-export's importer holds an
+    // edge to the target's own name.
+    let mut names: HashSet<String> = HashSet::new();
+    for (path, row) in before.symmetric_difference(&now) {
+        drifted.insert(path.clone());
+        let mut parts = row.split('\u{1f}');
+        names.extend(parts.next().map(str::to_string));
+        names.extend(parts.nth(1).map(str::to_string));
+    }
     if drifted.is_empty() {
         return Ok(Vec::new());
     }
@@ -1634,29 +1648,49 @@ pub(super) fn importers_of_python_reexport_drift(
     };
     let module_map = super::python_modules::build_python_module_map(&python_paths);
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.python_module')
+        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.python_module'),
+                json_extract(e.metadata, '$.is_module_import') IS NOT NULL, t.name
          FROM edges e
          JOIN nodes s ON s.id = e.source_id
          JOIN files f ON f.id = s.file_id
+         JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'imports'
-           AND f.language = 'python'
-           AND json_extract(e.metadata, '$.python_module') IS NOT NULL",
+           AND f.language = 'python'",
     )?;
     let imports = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (importer, module) in imports {
-        if in_run.contains(&importer) || out.contains(&importer) {
+    let mut importers: HashSet<&str> = HashSet::new();
+    let mut could_rebind: HashSet<&str> = HashSet::new();
+    for (importer, module, module_row, target_name) in &imports {
+        if in_run.contains(importer) {
             continue;
         }
-        if super::python_modules::project_module_files_from(&module, &importer, &module_map)
-            .is_some_and(|files| files.iter().any(|f| drifted.contains(f)))
+        let names_moved = module.as_deref().is_some_and(|m| {
+            super::python_modules::project_module_files_from(m, importer, &module_map)
+                .is_some_and(|files| files.iter().any(|f| drifted.contains(f)))
+        });
+        if names_moved {
+            importers.insert(importer);
+        }
+        if names.contains(target_name) || (names_moved && !module_row && target_name == "<module>")
         {
-            out.insert(importer);
+            could_rebind.insert(importer);
         }
     }
-    Ok(out.into_iter().collect())
+    let mut out: Vec<String> = importers
+        .intersection(&could_rebind)
+        .map(|s| s.to_string())
+        .collect();
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// The files a second extraction round must cover: D#24's answer to "who needs

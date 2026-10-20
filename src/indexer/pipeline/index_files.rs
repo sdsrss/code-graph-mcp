@@ -3614,12 +3614,22 @@ fn settle_python_reexports(
     python_module_map: &HashMap<String, Vec<String>>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
+    let mut reexports = super::python_modules::ReexportEdges::default();
+    let started = std::time::Instant::now();
+    let parked = waiting.len();
+    let mut rounds = 0usize;
     loop {
+        rounds += 1;
         let mut bound = false;
         let mut left = Vec::with_capacity(waiting.len());
         for (d, source_ids, files) in waiting.drain(..) {
-            let targets =
-                python_reexport_targets(db.conn(), &files, &d.target_name, python_module_map)?;
+            let targets = python_reexport_targets(
+                db.conn(),
+                &mut reexports,
+                &files,
+                &d.target_name,
+                python_module_map,
+            )?;
             if targets.is_empty() {
                 left.push((d, source_ids, files));
                 continue;
@@ -3632,10 +3642,22 @@ fn settle_python_reexports(
                 d.metadata.as_deref(),
                 false,
             )?;
+            reexports.forget(&d.rel_path);
             bound = true;
         }
         *waiting = left;
         if !bound || waiting.is_empty() {
+            if parked > 0 {
+                tracing::info!(
+                    "[index] Phase 2b-final: {} Python import(s) waited on a re-export, {} bound \
+                     ({} edge(s)) in {} round(s), {} ms",
+                    parked,
+                    parked - waiting.len(),
+                    edges_created,
+                    rounds,
+                    started.elapsed().as_millis()
+                );
+            }
             return Ok(edges_created);
         }
     }

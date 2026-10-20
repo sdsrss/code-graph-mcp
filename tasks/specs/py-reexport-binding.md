@@ -1,6 +1,6 @@
 # Python 包的再导出绑定（D#370(a)，2026-10-20，0.174.0 之后）
 
-状态：(a1) 完成待提交（INDEX_VERSION 119）；(a2) 未开始。
+状态：(a1) 已提交 `b7424176`（INDEX_VERSION 119），性能与扇出收窄另一提交；(a2) 未开始。
 
 ## 背景与目标
 
@@ -80,6 +80,8 @@ SCIP oracle 只统计指向函数/方法的调用，`Flask(...)` 是类构造，
 - 选再导出跟随而不是"排除函数内嵌节点"：前者是正向绑定，同时修好 `Blueprint`（绑到两个类）、`flask.redirect()`（绑到测试里的内嵌函数）；后者只换掉错误候选，`Blueprint` 这类两个都是模块级的仍错。内嵌作用域另记。
 - (a1) 实现：挂起的导入在非调用关系之后、调用之前结算（`settle_python_reexports`），剩下的回到同一个循环体照旧绑定（指针集合 `waited` 标记，循环体不复制）。快照在 `index_files` 里 Phase 0-pre 之后取（这样因依赖出现/消失而被拉进来的重导出者也比较），扇出在 `fan_out_to_new_duplicate_definitions` 里读；导入者用自己导入边的 `python_module` 解析，相对导入者也算。链：之后每轮重读漂移，上限 8 轮。
 - 查找不缓存跨分支的结果：被循环截断的答案在不成环的分支上是错的；链深 ≤ 8、分支数通常为 1，代价可忽略。
+- 性能（networkx 693 个文件实测后改）：结算里每次查找各查一次库，840 个挂起导入 × 2 轮，593 ms（全量 2.3 s 里）；建索引时还没有统计信息，规划器从 `idx_edges_relation` 扫全部导入边（每个文件 0.34 ms）。改为每文件读一次的缓存（`ReexportEdges`，绑定后对该文件 `forget`）+ 固定连接顺序（`CROSS JOIN`），结算 1 ms。
+- 扇出收窄：原来拉进模块的全部导入者（flask `__init__.py` 加一行再导出 → 52 个文件，352–368 ms）。改为只拉"可能改绑"的：有一条导入边指向被移动名字（导出名或目标名）的节点，或相对导入回落到某个 `<module>`（D10，包自己的或子模块的——新的再导出会遮住子模块，Python 也如此）。7–9 个文件，128–144 ms。三个条件各有一个变异测试。
 - A7（try/except）：导入两个都绑；裸调用的 bind 只跟随唯一导入，于是 prune 去掉错误的邻近候选、不绑任何一个。不扩 bind（范围外），CHANGELOG 记入 Not covered。
 
 ## 验证记录
@@ -91,4 +93,6 @@ SCIP oracle 只统计指向函数/方法的调用，`Flask(...)` 是类构造，
 - 变异（每个都能编译、都实际跑到）：去掉验证 → A13 场景失败；去掉扇出 → S2 失败；结算只跑一轮 → 两个测试都失败；忽略 `as` → 形状测试失败。第一次写的"去掉验证"因 `deny(warnings)`（未用变量）编译不过，改写后重跑。
 - clippy（默认、embed-model，`-D warnings`）通过；指纹重新生成，`index_version_guard` 7/7。
 - 语料全边差分（`edgediff.py`，base `737a1bfb` vs a1 `325d7063`，两臂都是源码 release 构建 + embed-model，各自全量建索引）：cgm/express/gin/gson/hono/leveldb 边集合相同、无标签变化、建索引耗时相同（0.1 s 精度）。flask：11,941 → 11,927 条边。去掉元数据后 −63 / +49：31 条调用 + 15 条导入从 `tests/test_config.py` 的局部 `Flask` 改到 `src/flask/app.py`；`cli.py` 的 `from . import Flask` 从 `__init__.py` 的 `<module>` 改到 `app.py:Flask`（A14）；16 条指向 `sansio/blueprints.py:Blueprint` 的边（9 调用 + 7 导入）去掉，16 个调用者都保留指向 `src/flask/blueprints.py` 的边；2 条导入因 `as` 不同成为同一目标的第二条边（`app.py` 函数内的 `from .testing import FlaskClient as cls`）；8 条只是元数据加了 `as`。4 条指向局部 `Flask` 的 `references` 从 `inferred` 变 `ambiguous`（文件的导入不再指向它）。
+- 性能与收窄（`a1c` md5 `263c3b3a`）：七个语料与 a1 的边集合、标签完全相同。networkx 全量 5 次交替：a1c 1,649–1,773 ms（中位 1,668），base 1,642–1,728（中位 1,680）；普通文件编辑（3 个文件 × 5 次）a1c 83–122 ms、base 81–121 ms，不触发扇出。flask 改 `__init__.py` 再导出：base 25–27 ms，收窄前 352–368 ms（52 个文件），收窄后 128–144 ms（7–9 个文件）。
+- 新测试 `a_python_reexport_fanout_reaches_every_importer_shape`（相对导入回落到包、被新再导出遮住的子模块、`<external>` 哨兵、改名再导出的目标名、没人导入的新再导出）；变异：去掉"名字"条件 → 哨兵与改指向场景失败；去掉 `<module>` 条件 → 相对导入场景失败；只用导出名 → 改名场景失败。
 - 指向 `src/flask/app.py:Flask` 的调用边 3 → 34（全部 `inferred`）；`callgraph Flask --direction callers --include-tests --depth 1` 3 行 → 28 行；`impact Flask` 受影响测试 2 → 27。剩下的 31 条 `ambiguous` + 16 条同文件是形状 B（a2）。
