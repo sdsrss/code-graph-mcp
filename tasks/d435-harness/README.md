@@ -11,3 +11,4 @@
 - `d446.py <armA> <armB> [--root R]`（D#446，0.173.0）：两个版本间每个改变的运行按（面、前裁决、后裁决）分类，列出不在预期集合里的改变、仍是测试路径拒绝的输入、`get_ast_node` 回答的节点是否为测试代码里叫这个名字的节点；改变的输入写到 `results/d446-changed-<A>-<B>-<corpus>.json`。
 - `d446_score.py <armA> <armB> <binary>`：对上面改变的输入，`find_references(name)` 与 `find_references(node_id=get_ast_node 回答的节点)` 比较，歧义时比较两个工具的候选 node_id。
 - D#446 加了五个语料（express、hono、gin v1.10.0、gson gson-parent-2.11.0、本仓库 `src/`+`tests/` 的 `git archive`，后者要 `git init` 并提交一次）；`gen.py` 对没有 class/method 的语料跳过 D1/DF。
+- `rel174.py <armA> <armB> [--root R]`（0.174.0）：两臂间每个改变的运行归入三类——调用图面变成只有外部行时的新提示且名字只有 `<external>` 行、改变前不是回答这个名字本身（外部名）；leveldb 由 ambiguous_exact 变为回答或候选更少的 ambiguous_exact（构造函数）；CLI `refs` 回答→回答，并与同一臂的 MCP `find_references` 比较列表/总数（refs）。其余打印为 UNEXPECTED。
