@@ -1,6 +1,6 @@
 # D#446：MCP 回答只在测试代码里定义的名字
 
-状态：发版中（0.173.0）。级别 L3（LLM 看到的默认回答改变：约 800 个名字由拒绝变为回答，次版本号）。用户 2026-10-20 授权方案 (a)，范围 `src/mcp/server/tools/refs.rs`、`src/mcp/server/tools/ast_node.rs`、`src/resolve.rs`。
+状态：已发布 0.173.0（2026-10-20，tag `v0.173.0` 在 `a2f10fbe`）。级别 L3（LLM 看到的默认回答改变：约 800 个名字由拒绝变为回答，次版本号）。用户 2026-10-20 授权方案 (a)，范围 `src/mcp/server/tools/refs.rs`、`src/mcp/server/tools/ast_node.rs`、`src/resolve.rs`。
 
 ## 背景与目标
 
@@ -71,7 +71,7 @@
 - [x] S3：实现 + 改写编码了旧拒绝的测试 — 主会话
 - [x] S4：差分 + 打分 + 变异 — 主会话
 - [x] S5：CHANGELOG（实测每条说法）、发版前评审 — 评审用新开子代理
-- [ ] S6：发版 0.173.0 — 主会话
+- [x] S6：发版 0.173.0 — 主会话
 
 ## 决策与进展
 
@@ -111,3 +111,9 @@ BASE 上 `find_references` 的测试路径拒绝：flask 862、leveldb 70、expr
 ### 第 2 轮（差量，新开子代理，`c59d0b56..e4e8d419`）
 
 评审用同一对二进制（md5 核对）在自己的语料副本上把 431,098 次各重跑一遍，与已存结果逐字节相同；CHANGELOG 的数字、两条新 Not covered（自建夹具 + 语料计数：导入与定义同名 10 个都有生产定义；生产标题只与测试代码同名 0 个，语料里标题有 6/61/388/57/167/149/0 个）都复现。0 HIGH、0 MEDIUM；1 个 LOW：`e4e8d419` 的提交说明漏了 c59d0b56 说明的第三处过头说法（`<external>` 同名时 `find_references` 答导入），另有标题措辞不准。处理：改提交说明（`41cc5b17`，未推送时 amend）。评审到此结束，没有第 3 轮。
+
+## 发布
+
+- `v0.173.0`（`a2f10fbe`）：发版提交的 pre-commit 2,296 通过 / 0 失败 / 7 忽略；main 推送后 CI 7/7 通过（macOS、Windows 日志里 3 个新增或改写的测试都是 ok），再打 tag；Release 11/11 通过（门禁、5 个平台构建、发布、3 个发布后冒烟）；Routing Bench 通过；6 个 npm 包都是 0.173.0；GitHub Release 14 个附件，说明由自动的 88 字符换成 CHANGELOG 这一节（4,479 字符）。打 tag 前从干净克隆装插件：Skills 2 · Agents 1 · Hooks 6 · MCP 1。
+- 发布后的 linux-x64 二进制（npm `@sdsrs/code-graph-linux-x64@0.173.0`，44,385,912 B，`-rwxr-xr-x`，md5 `fbe95d31…`，带 embed-model）在七个语料上跑同一批 431,098 次：与 HEAD2 源码构建（默认特性）逐字节相同 431,098/431,098。
+- 延期：D#460（生产层里 gtest `TEST` 与同名方法，`get_ast_node` 和 `find_references` 选的节点不同，两个版本相同）。
