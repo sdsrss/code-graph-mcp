@@ -12068,8 +12068,9 @@ fn a_python_reexport_binding_converges_incrementally_to_a_rebuild() {
 // The fan-out pulls only the importers a moved re-export can rebind (an edge
 // to a node of a moved name, or a relative import that fell back to a
 // `<module>`), so each way an importer holds the name is a scenario: a
-// relative `from . import X` on the package's `<module>` (D10) and on a
-// submodule's that a new re-export shadows, an `<external>` sentinel for a name
+// relative `from . import X` on the package's `<module>` (D10) and, in a
+// file of its own, on a submodule's that a new re-export shadows (a fallback
+// to the package pulls a file whatever the name), an `<external>` sentinel for a name
 // nothing defined, and a renamed re-export's own target. `Gadget2` is a
 // re-export no file imports.
 #[test]
@@ -12083,7 +12084,11 @@ fn a_python_reexport_fanout_reaches_every_importer_shape() {
         ("pkg/tools.py", "def helper():\n    return 1\n"),
         (
             "pkg/user.py",
-            "from . import Widget\nfrom . import tools\n\ndef make():\n    return Widget()\n",
+            "from . import Widget\n\ndef make():\n    return Widget()\n",
+        ),
+        (
+            "pkg/tools_user.py",
+            "from . import tools\n\ndef use():\n    return tools.helper()\n",
         ),
         (
             "app/use.py",
@@ -12111,6 +12116,204 @@ fn a_python_reexport_fanout_reaches_every_importer_shape() {
             "pkg/__init__.py",
             Some("from .core import _Hidden as Public\nfrom .core import Gadget as Gadget2\n"),
         )],
+    ];
+    for after in edits {
+        assert_incremental_edges_match_rebuild(&base, after);
+    }
+}
+
+// D#370(a), the second shape: `import flask` and then `flask.Flask(...)`. The
+// call resolved like a bare name, so the same-file tier took a class local to a
+// test in `tests/test_config.py` (16 edges) and the cross-file pool the one
+// nearest by path (31). `P.X()` on a name a plain `import P` (or `import a.b as
+// P`) binds is P's attribute: what P defines, else what it re-exports, never
+// the caller's own `X`. Bound so, it is not a by-name guess, so a name defined
+// in several files does not make it `ambiguous`.
+const MODULE_ATTR_PKG: [(&str, &str); 4] = [
+    (
+        "pkg/__init__.py",
+        "from .core import Widget\n\ndef helper():\n    return 1\n",
+    ),
+    (
+        "pkg/core.py",
+        "class Widget:\n    pass\n\ndef build():\n    return 1\n",
+    ),
+    ("pkg/other.py", "class Widget:\n    pass\n"),
+    (
+        "aaa/decoys.py",
+        "def holder():\n    class Widget:\n        pass\n    def helper():\n        return 2\n    \
+         def build():\n        return 3\n    return Widget, helper, build\n",
+    ),
+];
+const MODULE_ATTR_CALLER: (&str, &str) = (
+    "aaa/calls.py",
+    "import pkg\nimport pkg.core as core\n\ndef go():\n    pkg.Widget()\n    pkg.helper()\n    \
+     core.build()\n",
+);
+const MODULE_ATTR_SELF: (&str, &str) = (
+    "aaa/self_def.py",
+    "import pkg\n\nclass Widget:\n    pass\n\ndef f():\n    return pkg.Widget()\n",
+);
+
+#[test]
+fn a_python_call_on_an_imported_module_binds_the_module_attribute() {
+    let mut files: Vec<(&str, &str)> = MODULE_ATTR_PKG.to_vec();
+    files.extend([MODULE_ATTR_CALLER, MODULE_ATTR_SELF]);
+    let (_p, _d, db) = fresh_index_of(&files);
+    let edges = edge_set(&db);
+    let missing: Vec<&str> = [
+        // B2: re-exported; B1: defined in the package; B3: `import a.b as m`.
+        "aaa/calls.py.go --calls--> pkg/core.py.Widget",
+        "aaa/calls.py.go --calls--> pkg/__init__.py.helper",
+        "aaa/calls.py.go --calls--> pkg/core.py.build",
+        // B8: the caller's own `Widget` is not `pkg.Widget`.
+        "aaa/self_def.py.f --calls--> pkg/core.py.Widget",
+    ]
+    .into_iter()
+    .filter(|e| !edges.iter().any(|x| x == e))
+    .collect();
+    let wrong: Vec<&String> = edges
+        .iter()
+        .filter(|e| {
+            (e.starts_with("aaa/calls.py.go --calls--> ")
+                || e.starts_with("aaa/self_def.py.f --calls--> "))
+                && (e.contains("--> aaa/") || e.ends_with("--> pkg/other.py.Widget"))
+        })
+        .collect();
+    let labels: Vec<(String, String)> = db
+        .conn()
+        .prepare(
+            "SELECT fs.path || '.' || ns.name || ' -> ' || ft.path || '.' || nt.name, e.confidence
+             FROM edges e
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id
+             WHERE e.relation = 'calls' AND fs.path LIKE 'aaa/%' AND ft.path LIKE 'pkg/%'
+               AND e.confidence = 'ambiguous'",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        missing.is_empty() && wrong.is_empty() && labels.is_empty(),
+        "missing: {missing:#?}\nwrong: {wrong:#?}\nambiguous: {labels:#?}\n{edges:#?}"
+    );
+}
+
+// A `pkg.Missing()` with nothing of that name anywhere waits in the pending
+// buffer, marked `amb` by the deferred pass's fallback. When the package alone
+// gains it, the sweep binds it by name with that mark; the fan-out round then
+// re-extracts the caller (an `attr` call into a name that gained a
+// definition), and the edge ends as a rebuild's: the attribute, without the
+// mark, which would otherwise make it `ambiguous` once a second `Missing`
+// appears.
+#[test]
+fn a_buffered_module_attribute_call_is_swept_as_the_attribute() {
+    let mut base: Vec<(&str, &str)> = MODULE_ATTR_PKG.to_vec();
+    base.push((
+        "aaa/later.py",
+        "import pkg\n\ndef g():\n    return pkg.Missing()\n",
+    ));
+    let init =
+        "from .core import Widget\n\ndef helper():\n    return 1\n\nclass Missing:\n    pass\n";
+    let call_edge = |db: &Database| -> Vec<(String, Option<String>)> {
+        db.conn()
+            .prepare(
+                "SELECT ft.path || '.' || nt.name, e.metadata FROM edges e
+                 JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id
+                 JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id
+                 WHERE e.relation = 'calls' AND fs.path = 'aaa/later.py'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let (project, _d, db) = fresh_index_of(&base);
+    assert!(
+        call_edge(&db).is_empty(),
+        "precondition: {:?}",
+        call_edge(&db)
+    );
+    fs::write(project.path().join("pkg/__init__.py"), init).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let rebuilt: Vec<(&str, &str)> = base
+        .iter()
+        .map(|&(p, b)| {
+            if p == "pkg/__init__.py" {
+                (p, init)
+            } else {
+                (p, b)
+            }
+        })
+        .collect();
+    let (_p2, _d2, control) = fresh_index_of(&rebuilt);
+    assert_eq!(call_edge(&db), call_edge(&control));
+    assert_eq!(
+        call_edge(&control),
+        vec![(
+            "pkg/__init__.py.Missing".to_string(),
+            Some(r#"{"attr":1,"q":"module","v":"pkg"}"#.to_string())
+        )]
+    );
+}
+
+// What `pkg.X()` binds depends on what `pkg` defines and re-exports, so each
+// way that can change must leave a rebuild's graph: the package gains its own
+// `Widget`, retargets or drops the re-export, the target is renamed, the
+// package's own `helper` goes away, and a name nothing defined appears.
+#[test]
+fn a_python_module_attribute_call_converges_incrementally_to_a_rebuild() {
+    let mut base: Vec<(&str, &str)> = MODULE_ATTR_PKG.to_vec();
+    base.extend([
+        MODULE_ATTR_CALLER,
+        MODULE_ATTR_SELF,
+        (
+            "aaa/later.py",
+            "import pkg\n\ndef g():\n    return pkg.Missing()\n",
+        ),
+    ]);
+    let edits: &[&[(&str, Option<&str>)]] = &[
+        &[(
+            "aaa/calls.py",
+            Some("import pkg\nimport pkg.core as core\n\ndef go():\n    pkg.Widget()\n    pkg.helper()\n    core.build()\n\ndef more():\n    return 1\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .core import Widget\n\ndef helper():\n    return 1\n\nclass Widget:\n    pass\n"),
+        )],
+        &[(
+            "pkg/__init__.py",
+            Some("from .other import Widget\n\ndef helper():\n    return 1\n"),
+        )],
+        &[("pkg/__init__.py", Some("def helper():\n    return 1\n"))],
+        &[(
+            "pkg/core.py",
+            Some("class Widget2:\n    pass\n\ndef build():\n    return 1\n"),
+        )],
+        &[("pkg/__init__.py", Some("from .core import Widget\n"))],
+        &[
+            ("pkg/missing.py", Some("class Missing:\n    pass\n")),
+            (
+                "pkg/__init__.py",
+                Some("from .core import Widget\nfrom .missing import Missing\n\ndef helper():\n    return 1\n"),
+            ),
+        ],
+        // Still buffered, the call meets two new `Missing`s in one run: the
+        // package's own, which a rebuild binds, and a nearer one by path. No
+        // fan-out reaches a buffered call, so the sweep decides it.
+        &[
+            (
+                "pkg/__init__.py",
+                Some("from .core import Widget\n\ndef helper():\n    return 1\n\nclass Missing:\n    pass\n"),
+            ),
+            (
+                "aaa/decoys2.py",
+                Some("def holder():\n    class Missing:\n        pass\n    return Missing\n"),
+            ),
+        ],
     ];
     for after in edits {
         assert_incremental_edges_match_rebuild(&base, after);

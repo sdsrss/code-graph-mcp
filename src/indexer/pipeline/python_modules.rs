@@ -242,6 +242,77 @@ pub(super) fn python_reexport_targets(
     Ok(out)
 }
 
+/// [`python_module_attribute_targets`] for the calls of one deferred pass,
+/// answered once per `(module, name)`: networkx makes 10,700 such calls, on a
+/// few hundred names, and a query each cost 6% of its full index. The calls
+/// come after every import and node of the pass, so an answer cannot move.
+#[derive(Default)]
+pub(super) struct ModuleAttributes {
+    reexports: ReexportEdges,
+    answers: HashMap<(String, String), Vec<i64>>,
+}
+
+impl ModuleAttributes {
+    pub(super) fn targets(
+        &mut self,
+        conn: &rusqlite::Connection,
+        module: &str,
+        name: &str,
+        python_module_map: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<&[i64]> {
+        let key = (module.to_string(), name.to_string());
+        if !self.answers.contains_key(&key) {
+            let found = python_module_attribute_targets(
+                conn,
+                &mut self.reexports,
+                module,
+                name,
+                python_module_map,
+            )?
+            .unwrap_or_default();
+            self.answers.insert(key.clone(), found);
+        }
+        Ok(self
+            .answers
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or_default())
+    }
+}
+
+/// What `m.name()` binds when `m` holds the project module `module`
+/// (`import flask; flask.Flask()`, D#370(a)): the nodes of that name its files
+/// define, else what they re-export under it ([`python_reexport_targets`]).
+/// `None` when `module` has no file of its own (a namespace package).
+fn python_module_attribute_targets(
+    conn: &rusqlite::Connection,
+    edges: &mut ReexportEdges,
+    module: &str,
+    name: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    let Some(files) = project_module_files(module, python_module_map) else {
+        return Ok(None);
+    };
+    let mut defined = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT n.id FROM files f
+             CROSS JOIN nodes n ON n.file_id = f.id AND n.name = ?2
+             WHERE f.path = ?1",
+        )?;
+        for file in &files {
+            for id in stmt.query_map(rusqlite::params![file, name], |r| r.get::<_, i64>(0))? {
+                defined.push(id?);
+            }
+        }
+    }
+    if !defined.is_empty() {
+        return Ok(Some(defined));
+    }
+    python_reexport_targets(conn, edges, &files, name, python_module_map).map(Some)
+}
+
 /// One `imports` edge out of a Python file's `<module>` that names a symbol,
 /// not a module: what [`python_reexport_targets`] reads.
 struct ReexportEdge {

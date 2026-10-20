@@ -1984,7 +1984,21 @@ fn resolve_batch_relations(
                 match parse_callee_metadata(rel.metadata.as_deref()) {
                     // `click.echo()` through an import of a library module: no
                     // project code can run. A project module resolves as bare.
-                    Some(CalleeMeta::Module(module)) if !py_modules.contains(&module) => {
+                    Some(CalleeMeta::Module { module, .. }) if !py_modules.contains(&module) => {
+                        continue;
+                    }
+                    // `flask.Flask()`: the attribute of a project module, which a
+                    // later batch may define, and whose re-export edges are only
+                    // all in after the batches (D#370(a)). Decided in the
+                    // deferred pass, which also marks the by-name fallback of
+                    // one it cannot look up (a namespace package).
+                    Some(CalleeMeta::Module { attr: true, .. }) => {
+                        deferred.push(DeferredRelation::of(
+                            &source_ids,
+                            rel,
+                            &pf.rel_path,
+                            &pf.language,
+                        ));
                         continue;
                     }
                     // `b()` through a renamed import (D#120) binds by the
@@ -3775,6 +3789,8 @@ fn resolve_deferred_relations(
     // load before them typed differently from an incremental run.
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
+    // Read by calls on an imported Python module, after every import is in.
+    let mut module_attributes = super::python_modules::ModuleAttributes::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -4200,9 +4216,32 @@ fn resolve_deferred_relations(
                 .filter(|m| m.contains(r#""rtype""#) || m.contains(r#""super""#))
                 .map(super::resolve::ambiguous_meta);
             match parse_callee_metadata(d.metadata.as_deref()) {
-                Some(CalleeMeta::Module(module)) => {
+                Some(CalleeMeta::Module { module, attr }) => {
                     if !py_modules.contains(&module) {
                         continue; // a library module's function, as at batch time
+                    }
+                    if attr {
+                        // `flask.Flask()`: what the module defines or re-exports
+                        // under that name, never the caller's own (D#370(a)).
+                        let targets = module_attributes
+                            .targets(db.conn(), &module, &d.target_name, python_module_map)?
+                            .to_vec();
+                        if !targets.is_empty() {
+                            let decided = call_meta.map(super::resolve::decided_meta);
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &targets,
+                                &d.relation,
+                                decided.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                        // Neither (a variable, a submodule, a `__getattr__`):
+                        // by name, as before, marked as the guess it is.
+                        opaque_meta = call_meta.map(super::resolve::ambiguous_meta);
+                        call_meta = opaque_meta.as_deref();
                     }
                     handled = false;
                 }

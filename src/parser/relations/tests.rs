@@ -733,11 +733,18 @@ fn test_member_call_on_an_object_is_marked_member() {
         assert_eq!(meta_of(&py, t), None, "{t} must resolve as before: {py:?}");
     }
     // A call through an absolute import names its module (dropped when that
-    // module is not the project's).
-    for (t, module) in [("run", "helpers"), ("go", "pkg.mod"), ("parse", "x")] {
-        let want = format!(r#"{{"q":"module","v":"{module}"}}"#);
+    // module is not the project's). One straight on the module a plain import
+    // binds is that module's attribute (`attr`, D#370(a)); a from-import binds
+    // a name inside its module, which is not.
+    for (t, module) in [("run", "helpers"), ("go", "pkg.mod")] {
+        let want = format!(r#"{{"attr":1,"q":"module","v":"{module}"}}"#);
         assert_eq!(meta_of(&py, t), Some(want.as_str()), "{t}: {py:?}");
     }
+    assert_eq!(
+        meta_of(&py, "parse"),
+        Some(r#"{"q":"module","v":"x"}"#),
+        "{py:?}"
+    );
 
     let js = call_meta(
         "import * as ns from './ns';\nimport def, { named as alias } from './d';\n\
@@ -794,7 +801,10 @@ fn test_python_call_on_an_untyped_receiver_is_marked() {
     }
     // Receivers that already say what they are keep their qualifier.
     assert_eq!(meta_of(&py, "own"), Some(r#"{"q":"rtype","v":"C"}"#));
-    assert_eq!(meta_of(&py, "getcwd"), Some(r#"{"q":"module","v":"os"}"#));
+    assert_eq!(
+        meta_of(&py, "getcwd"),
+        Some(r#"{"attr":1,"q":"module","v":"os"}"#)
+    );
     assert_eq!(meta_of(&py, "push"), Some(MEMBER));
     assert_eq!(meta_of(&py, "local"), None);
 

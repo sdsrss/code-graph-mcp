@@ -48,6 +48,12 @@ thread_local! {
     /// [`js_package_binding`]'s program-level answer per name: the package a
     /// top-level `var resolve = path.resolve` stands for. Per file, as above.
     static PACKAGE_MEMBER: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    /// Python names that hold the very module [`IMPORT_BOUND`] gives for them:
+    /// `import a` and `import a.b as m`, but not `import a.b` (it binds `a`,
+    /// while the import names `a.b`) and no name a from-import also binds. A
+    /// call `m.f()` on one is the module's attribute `f` (D#370(a)). Per file:
+    /// reset by `reset_import_bound`.
+    static PY_MODULE_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
@@ -60,10 +66,67 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     if matches!(family, "javascript" | "typescript" | "tsx") {
         collect_renamed(root, source, &mut renamed, 0);
     }
+    let mut module_names = HashSet::new();
+    if family == "python" {
+        let mut from_bound = HashSet::new();
+        collect_py_module_names(root, source, &mut module_names, &mut from_bound, 0);
+        module_names.retain(|n| !from_bound.contains(n));
+    }
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
+    PY_MODULE_NAMES.with(|m| *m.borrow_mut() = module_names);
     SCOPE_BINDING.with(|m| m.borrow_mut().clear());
     PACKAGE_MEMBER.with(|m| m.borrow_mut().clear());
+}
+
+/// [`PY_MODULE_NAMES`] for one tree: the names plain imports bind to their
+/// own module, and every name a from-import binds, which disqualifies it.
+fn collect_py_module_names(
+    node: tree_sitter::Node,
+    source: &str,
+    modules: &mut HashSet<String>,
+    from_bound: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > 256 {
+        return;
+    }
+    let text = |n: tree_sitter::Node| node_text(&n, source).to_string();
+    let module = node.child_by_field_name("module_name").map(|m| m.id());
+    match node.kind() {
+        "import_statement" | "import_from_statement" => {
+            let is_from = node.kind() == "import_from_statement";
+            for i in 0..node.named_child_count() {
+                let Some(c) = node.named_child(i) else {
+                    continue;
+                };
+                if Some(c.id()) == module {
+                    continue;
+                }
+                let bound = match c.kind() {
+                    "dotted_name" => c
+                        .named_child(0)
+                        .map(|first| (text(first), c.named_child_count() == 1)),
+                    "aliased_import" => c.child_by_field_name("alias").map(|a| (text(a), true)),
+                    _ => None,
+                };
+                if let Some((name, own_module)) = bound {
+                    if is_from {
+                        from_bound.insert(name);
+                    } else if own_module {
+                        modules.insert(name);
+                    }
+                }
+            }
+        }
+        _ => {
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    collect_py_module_names(c, source, modules, from_bound, depth + 1);
+                }
+            }
+        }
+    }
 }
 
 fn collect(
@@ -995,19 +1058,27 @@ pub(super) fn python_untyped_receiver_meta(
 
 /// Metadata of a Python call through a name an absolute import binds
 /// (`click.echo()` → `{"q":"module","v":"click"}`): the resolver drops it when
-/// that module is not the project's, since no project code can run then.
+/// that module is not the project's, since no project code can run then. A
+/// call straight on a name that holds that module (`import flask` and then
+/// `flask.Flask()`, [`PY_MODULE_NAMES`]) is marked `"attr":1`: it names the
+/// module's attribute, which the resolver looks up in that module (D#370(a)).
 pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
         return None;
     }
-    let mut root = function.child_by_field_name("object")?;
+    let object = function.child_by_field_name("object")?;
+    let mut root = object;
     while root.kind() == "attribute" {
         root = root.child_by_field_name("object")?;
     }
     if root.kind() != "identifier" {
         return None;
     }
-    let module = IMPORT_BOUND.with(|b| b.borrow().get(node_text(&root, source)).cloned())??;
+    let name = node_text(&root, source);
+    let module = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned())??;
+    if object.id() == root.id() && PY_MODULE_NAMES.with(|m| m.borrow().contains(name)) {
+        return Some(serde_json::json!({ "q": "module", "v": module, "attr": 1 }).to_string());
+    }
     Some(serde_json::json!({ "q": "module", "v": module }).to_string())
 }
