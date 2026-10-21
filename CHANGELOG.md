@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.176.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 123 → 124
 because a Python call on an imported module binds differently (below). The
