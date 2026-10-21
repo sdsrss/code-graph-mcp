@@ -1,6 +1,6 @@
 # Python `import P` + `P.X()` 经导入边绑定（D#518，接 D#515，2026-10-21）
 
-状态：已实现（INDEX_VERSION 123 → 124），待评审。
+状态：已实现（INDEX_VERSION 123 → 124，`33fbf845`）；第 1 轮评审（1 MEDIUM、7 LOW）已修，待修复提交的复审。
 
 ## 背景
 
@@ -55,6 +55,16 @@
 - 去掉的代码：外部模块的合成导入特判（与 `import M` 的哨兵边去重，变异等价）、删除路径按属性名重排（不可达：导入者总是被删文件的结构依赖）、删除路径的 `P.X()` 调用绕过 pending（同理不可达）。
 - 保留但变异存活：deferred 里"模块不再是项目模块就丢弃"（只在重排队路径可达，场景里未触发）、绑到 `X` 的合成导入按名回填而非重排（结果相同，只省开销）、漂移快照排除合成导入（只少拉文件）。
 
+- 第 1 轮评审（新子代理，盲审 `2f070d5a..33fbf845`，报告 HIGH 0 · MEDIUM 1 · LOW 7），逐条复核后的处理：
+  - MEDIUM-1 成立（复现：`/var/tmp/d520-review/tools/par.py scn/twofile.py`、`scn/attr2.py d02`）。模块路径同时指两个文件（`tests/helpers.py` 与根的 `helpers.py`、`pkg.py` 与 `pkg/__init__.py`）时，重建在每个定义了名字的文件都绑；增量里第二个文件新增名字不会重读导入者（`module_importers_to_refresh` 只在当前目标落在模块文件之外时重读），from-import 在 0.175.0 就有这个缺口，`P.X()` 继承了它。另一半：两个文件都没有名字时合成导入回落到两个 `<module>`，其中一个新增名字，回填只重排进入该文件的那条边，另一个文件的 `<module>` 边残留。修：(a) 行带上名字，模块路径指的其他文件在本次运行里定义了它就重读导入者；(b) 重排回落的合成导入时先删掉同一导入（同源、同关系、同元数据）的其余边，deferred 重新解析整个目标集。两半各自变异都让新测试失败。
+  - LOW-1 成立，根源是 pending 唯一索引（LOW 7），需改表结构，并入 LOW 7 的授权请求；写进 Not covered。
+  - LOW-2 成立：运行摘要的边数含合成导入、没算 Phase 2d-attr。修：`insert_relation_edges` 和回填不计合成导入（`domain::is_synthetic_import`），`GlobalPostPassCounts` 加上 2d-attr 的绑定与剪枝。三项各自变异都让新测试失败；回填那处没有测试钉住（增量运行的"新建边数"没有可断言的等式）。
+  - LOW-3 部分成立：fixture 里嵌套类、函数内的类会被 `m.X()` 绑为 `inferred`；但在 flask、networkx、标准库上新变成 `inferred` 的这类边是 0（标准库 21 条进 `os.fsencode/fsdecode` 的在 0.175.0 已是 `inferred`）。不改代码（排除函数内定义会丢掉 `os.fsencode` 这种在模块层赋值的正确边），改 Not covered 的文字。
+  - LOW-4 成立：改 CHANGELOG（本仓库当前树 17,320 → 17,290；flask 683 条）。
+  - LOW-5 部分成立：开销确实存在，但不在 `cg_attr_imports`：直接计时全局版在 networkx 上 2 ms（32 行），范围版 0.2 ms。仍把有范围的运行改为只取范围内文件和调用了范围内节点的文件（全局版随仓库里 `imports` 边数增长）。新的第二臂（调用了范围内节点的文件）变异存活，与 R3 同因：合成导入一旦重新解析，调用方就作为 deferred 来源进了范围。
+  - LOW-6 成立：surprising 测试加 `type` 别名的调用和对 interface 的 `references`，T1、T2 变异都被杀死。
+  - LOW-7：embedding 回填排序按入边数，合成导入让 `pkg.X` 多算一次，与 `from pkg import X` + `X()` 的计法相同，回填完成后向量集合不变；不改。测试专用的 CTE oracle 不改。
+
 ## 验证记录
 
 - RED：解析器测试 `a_call_on_a_python_module_name_names_the_module_attribute` 在实现前失败（没有 `attr`）。管线测试在实现过程中逐个写、逐个失败后修（s18 的 pending 合并、大运行早批次、`<module>` 回落的回填）。
@@ -64,3 +74,10 @@
 - SCIP oracle（标准库）：`inferred` 1,235/2,107 → 1,469/2,342，+234 对、+1 错（`gettext` 的 `operator.index`），被判对的边一条没丢；195 条由 `ambiguous` 升为 `inferred` 且正确。
 - 用户面（flask，16 个 CLI 面）：callgraph Flask 不再隐藏 31 条 ambiguous、测试调用者 50 → 81；impact Flask 受影响测试 27 → 74；health 边数 11,928 → 11,845；deps/affected/map/refs Flask 随调用边变化；cycles、dead-code、surprising、refs/impact/callgraph url_for、callgraph make_response 不变。
 - 开销（7 次交替中位数，对 `cgm-A`）：全量 CPU networkx 3.73 → 3.96 s、标准库 5.47 → 5.67 s（解析器多一遍游标遍历约占一半：只遍历不写合成导入的变体 3.91 s）；networkx 编辑 `cycles.py` 124 → 141 ms、`__init__.py` 120 → 149 ms（回填前 342 ms，改为"有同名节点才重排"）、`classes/graph.py` 504 → 510 ms（`P.X()` 调用改为按名回填前 620 ms）；flask 普通编辑 58 vs 51 ms。
+- 第 1 轮评审的修复（release `cgm-c2` md5 `05470130…`）：
+  - RED：`a_module_path_naming_two_files_rebinds_its_importers_when_either_changes`（修前增量只绑 `tests/helpers.py.h`）、`a_full_run_counts_the_edges_a_health_check_reports`（修前 6 ≠ 4）；surprising 测试加的两条在 T1、T2 变异下失败。
+  - 全量：c2 与 `33fbf845`（评审的 `cgm-head`）在 flask、networkx、标准库、hono、本仓库当前树上边逐行相同（0 差异）。flask 运行摘要 11,845 条边 = health-check 11,845（修前 11,981）。
+  - 场景：D#370(a) 66 个，b5 与 c2 都是 65 一致（p15）；1,789 步，两者都是同样的 262 步不一致；评审的 994 个场景 1,205 步，0.175.0 362 步、c2 276 步不一致，只有 c2 不一致的 3 步都是 LOW-1 的形状（a11 第 2、3 步，d05 第 3 步）。twofile 6 个场景 c2 全部一致（0.175.0 的 from-import 3 个不一致）。
+  - 开销（15 次交替中位数；另一个会话在跑 vitest，负载 3–10）：c2 对 `33fbf845` 不更慢（标准库 `json/__init__.py` 125 vs 122 ms，networkx 四种编辑持平或更快）。D#518 整体（`cgm-A` → c2）：networkx `cycles.py` 107 → 114、`__init__.py` 101 → 127、`classes/graph.py` 425 → 444、新增模块 78 → 83 ms；标准库新增模块 98 → 106 ms。
+  - 本仓库当前树：用户边 17,320 → 17,290（ambiguous −32、inferred +2，全在 `scripts/test_plugin_usage.py`），合成导入 20。flask `surprising --include-tests --limit 100000`：883 → 683 条 ambiguous，都是 several candidates；默认 15 条除原因文字外相同。
+  - `cargo test --no-fail-fast`：2,327 通过、1 失败（抽取指纹守卫：源文件变了，全量索引不变 → 不升版本，重录指纹后 7/7 通过）。

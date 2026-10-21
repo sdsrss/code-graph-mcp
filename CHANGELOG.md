@@ -31,11 +31,13 @@ also assigned, passed as an argument, used as a parameter, or bound by a
 `a.X()`, and `P.a.X()`. To keep incremental runs in step, each such call is
 recorded as an internal import of `X` from `P` that no command shows: not
 `refs`, `deps`, `affected`, `cycles`, `map`, `dead-code`, the context text
-search reads, nor the edge counts.
+search reads, nor the edge counts of `health-check` and of an index run.
 
 Measured with a fresh index from this build and from the one before this
 change, on the seven corpora of 0.174.0, networkx and the Python standard
-library: express, hono, gin, gson, leveldb and this repository are unchanged.
+library: express, hono, gin, gson, leveldb and this repository as of 0.174.0
+are unchanged (this repository as it is now loses 32 `ambiguous` calls and
+gains 2 `inferred`, all in `scripts/test_plugin_usage.py`).
 flask loses 218 call edges (200 `ambiguous`, 18 into test-local
 definitions) and gains 135 `inferred`; networkx moves 5 calls from
 `ambiguous` to `inferred`; the standard library loses 1,695 (1,683
@@ -46,17 +48,36 @@ and no edge the oracle judges right is lost. On flask, `callgraph Flask
 --direction callers` no longer hides 31 `ambiguous` edges and counts 81 test
 callers instead of 50; `impact Flask` counts 74 affected tests instead of 27;
 `health-check` reports 11,845 edges instead of 11,928; `deps
-tests/test_config.py` lists `src/flask/app.py`. `cycles`, `dead-code` and
-`surprising` answer as before there.
+tests/test_config.py` lists `src/flask/app.py`. `cycles` and `dead-code`
+answer as before there, and `surprising` lists the same 15 connections (with
+the reason text below); with `--include-tests` and no limit it lists 683
+`ambiguous` ones instead of 883.
 
 An incremental index agrees with a fresh one wherever the build before this
-change did: the 65 incremental scenarios of D#370(a)'s two reviews (64
-agree; p15, a renamed re-export, disagrees as before) and the 1,789 steps of
-0.175.0's reviews (262 disagree with either build, the same steps). Cost: a
-full index takes more CPU (medians over 7 alternating runs: networkx 3.73 →
-3.96 s, the standard library 5.47 → 5.67 s); an edit of one networkx file
-takes 141 ms instead of 124 ms, of `networkx/__init__.py` 149 ms instead of
-120 ms, of `networkx/classes/graph.py` 510 ms instead of 504 ms.
+change did, except for a function calling both `m.X()` and a bare `X()`
+(under Not covered): over the 65 incremental scenarios of D#370(a)'s two
+reviews, 64 agree with either build (p15, a renamed re-export, disagrees as
+before); over the 1,789 steps of 0.175.0's reviews, 262 disagree with either
+build, the same steps; over the 1,205 steps of this change's review, 362
+disagree with 0.175.0 and 276 with this build, and the 3 where only this
+build disagrees are that function's.
+Cost: a full index takes more CPU (medians over 7 alternating runs: networkx
+3.73 → 3.96 s, the standard library 5.47 → 5.67 s). An incremental run
+takes longer, medians over 15 alternating runs: an edit of
+`networkx/algorithms/cycles.py` 107 → 114 ms, of `networkx/__init__.py` 101
+→ 127 ms, of `networkx/classes/graph.py` 425 → 444 ms; adding a module 78 →
+83 ms on networkx and 98 → 106 ms on the standard library.
+
+### Python: an import whose module path names two files follows both
+
+`import helpers` and `from helpers import h` in `tests/test_a.py` name both
+`tests/helpers.py` and a top-level `helpers.py` when both exist, as `import
+pkg` names both `pkg.py` and `pkg/__init__.py`; a fresh index binds `h` in
+each that defines it. When the second file gained `h`, an incremental index
+kept only the first until the importing file was edited. The importer is now
+re-read. A full index is unchanged. Over 12 incremental steps of that shape
+from this change's review, 0.175.0 disagreed with a fresh index after 3 and
+this build after none.
 
 ### Python: two more edits an incremental index now follows
 
@@ -108,7 +129,7 @@ TypeScript `interface` or `type` alias now reads "a call into a TypeScript
 type, which exists only at compile time", and every other `ambiguous` edge
 "bare-name target not decided (several candidates)". On hono 73 of the 1,748
 `ambiguous` connections `surprising --include-tests` lists are such calls; on
-flask none of 883 are.
+flask none of 683 are (883 before the change above).
 
 ### Not covered
 
@@ -119,8 +140,19 @@ flask none of 883 are.
 - A module that imports its own module path (`import typing` in
   `src/flask/typing.py`) keeps that binding when an `__init__.py` above it is
   added back.
-- A function nested in a module is a candidate for `from m import name`, as
-  in 0.175.0, and for `m.name()` now.
+- A function or class defined inside another one (a nested class
+  `Outer.Inner`, a class or function local to a function) is a candidate for
+  `from m import name`, as in 0.175.0, and for `m.name()` now, where the edge
+  is `inferred` and so shows at the default floor. On flask, networkx and the
+  standard library no call binds such a definition anew; the standard
+  library's 21 calls into `os.fsencode` and `os.fsdecode`, which `os.py`
+  defines inside `_fscodec()` and assigns at module level, were `inferred`
+  before.
+- A function that calls both `m.X()` and a bare `X()` before any file
+  defines `X`: once `m.py` defines it, an incremental index binds the `m.X()`
+  call and not the bare one, as 0.175.0 did. 0.175.0 then caught up when a
+  second `X` appeared in another file, by re-checking `ambiguous` calls; the
+  `m.X()` call is now `inferred`, so this index does not.
 - `P.X()` binds nothing new when the name resolution never binds `X` across
   files (a short list of very common names: `get`, `close`, `read`, `write`,
   `join`, `map`, `filter`, …); it stays without an edge.
