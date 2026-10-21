@@ -1,12 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.175.0
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 122
-because call edges into TypeScript types are labelled differently and a
-Python import of a name its package re-exports binds differently (below).
-The MCP server rebuilds the index when it starts; from the command line,
-`code-graph-mcp reindex` does.
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 123
+because call edges into TypeScript types are labelled differently and some
+Python imports bind differently (below). The MCP server rebuilds the index
+when it starts; from the command line, `code-graph-mcp reindex` does. To go
+back to 0.174.0: `npm i -g @sdsrs/code-graph@0.174.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.174.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0. 0.174.0 answers from an index this release built
+but does not write to it; `code-graph-mcp rebuild-index --confirm` in each
+project rebuilds it at the older version.
 
 ### A Python import of a name its package re-exports binds the re-exported definition
 
@@ -75,6 +81,50 @@ createBunWebSocket --direction callees` no longer lists `Response`.
 `surprising` gives such an edge the reason "ambiguous: bare-name target not
 decided (several candidates, or a TypeScript type)".
 
+### Python: an `__init__.py` that appears or vanishes, and a method beside a module-level name
+
+Two Python shapes where an incremental index kept an answer that a fresh
+index of the same tree does not give:
+
+- A directory that gains an `__init__.py` becomes a package, and a module
+  inside it is no longer importable by its bare name: once `tests/__init__.py`
+  exists, `import helpers` in `tests/test_a.py` no longer names
+  `tests/helpers.py`, and once `src/__init__.py` exists, `import pkg` no
+  longer names `src/pkg/`. Removing the file does the reverse. The importing
+  file had not changed, so nothing re-read it, and it kept its old binding
+  until it was edited. An index run that sees an `__init__.py` appear or
+  vanish now also re-extracts the Python files whose absolute imports name a
+  module path that resolves to other files after the change.
+- `from m import Y`, where `m` defines a function `Y` and a class with a
+  method `Y`, bound both, and an incremental run that had indexed `m` before
+  the method appeared bound only the function. It now binds the function
+  alone. An import whose only candidates in `m` are methods binds them as
+  before.
+
+Measured with a fresh index from each build, against the build before this
+change (`main` at `b41ee796`): the seven corpora of 0.174.0 and networkx keep
+identical edge sets, with no label moved. On 569 files of the Python 3.14
+standard library, 19 edges are gone, 14 imports and 5 calls, each into a
+method (`gettext.NullTranslations.gettext` for `argparse.py`'s `from gettext
+import gettext as _`, `statistics.NormalDist.stdev` for `random.py`,
+`inspect.BoundArguments.signature` for `xmlrpc/server.py`, and others), and
+each of their importers and callers keeps its edge to the module-level
+function of the same name. The SCIP oracle judges 3 of the 19 calls and
+imports, all 3 wrong: its `inferred` tier goes from 1235/2107 correct to
+1235/2104, and no other edge it judges moves.
+
+Adding `tests/__init__.py` to flask now re-extracts 5 files
+(`tests/test_blueprints.py`, `tests/test_cli.py`, `tests/test_templating.py`
+and two files under `tests/test_apps/`), 91–160 ms where the edit took
+37–45 ms; the incremental index then equals a fresh one, where before it
+held 152 edges a fresh index does not have and lacked 6 it has. Deleting
+`networkx/utils/__init__.py` re-extracts the same 186 files as before
+(1.27–1.32 s, 1.27–1.39 s before). Other edits cost what they did (flask
+`src/flask/helpers.py`: median 54 ms over 5 edits, 57 ms before; networkx
+`networkx/algorithms/cycles.py`: 128 ms, 125 ms before), and so does a full
+index (networkx: median 3.99 CPU seconds over 7 runs, 4.22 before; standard
+library: 5.55 over 15, 5.59 before).
+
 ### Not covered
 
 - `import flask` and then `flask.Flask(...)` still resolves by the name: on
@@ -83,8 +133,8 @@ decided (several candidates, or a TypeScript type)".
   change binding such calls to the module's attribute was reviewed twice and
   withdrawn: its answer read definitions in other files that an incremental
   run did not re-examine.
-- On 569 files of the Python 3.14 standard library the SCIP oracle's scores
-  are unchanged by this release (`inferred` 1235/2107 before and after).
+- On 569 files of the Python 3.14 standard library, the re-export binding
+  above moves no edge the SCIP oracle judges.
 
 ## 0.174.0
 
