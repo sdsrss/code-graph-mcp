@@ -12680,6 +12680,60 @@ fn a_python_from_import_binds_the_module_level_name_not_a_method() {
     );
 }
 
+// Only an import names a module attribute (pre-tag review of 0.175.0): a call
+// or reference into a method keeps it when the method's file, holding a
+// function of the same name too, is re-indexed — `self.store.fetch_rows()`,
+// `m.fetch_rows()`, a bare `fetch_rows()`, and a closure named like a method.
+#[test]
+fn an_edit_keeps_the_calls_into_a_method_beside_a_namesake_function() {
+    let m = "def fetch_rows():\n    return 1\n\nclass Store:\n    def fetch_rows(self):\n        return 2\n";
+    let edited = format!("# edit\n{m}");
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/m.py", m),
+            (
+                "pkg/b.py",
+                "from . import m\n\nclass User:\n    def run(self):\n        return self.store.fetch_rows()\n\n    def run2(self):\n        return m.fetch_rows()\n\n\ndef bare():\n    return fetch_rows()\n",
+            ),
+        ],
+        &[("pkg/m.py", Some(edited.as_str()))],
+    );
+    // The function and the method, both as before the edit.
+    let run = rows
+        .iter()
+        .filter(|r| r.starts_with("pkg/b.py.run --calls"))
+        .count();
+    assert_eq!(run, 2, "{rows:#?}");
+    let lib = "def factory():\n    def handle():\n        pass\n    return handle\n\nclass H:\n    def handle(self):\n        pass\n";
+    let edited = format!("# edit\n{lib}");
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("lib.py", lib),
+            (
+                "app.py",
+                "def run(x):\n    x.h.handle()\n\ndef run2(x):\n    return handle()\n",
+            ),
+        ],
+        &[("lib.py", Some(edited.as_str()))],
+    );
+    // Python only: a TypeScript import binds the method beside the function,
+    // and keeps it.
+    let ts =
+        "export function Y() {\n  return 1\n}\nexport class C {\n  Y() {\n    return 2\n  }\n}\n";
+    let edited = format!("// edit\n{ts}");
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("m.ts", ts),
+            (
+                "app.ts",
+                "import { Y } from './m'\nexport function main() {\n  return Y()\n}\n",
+            ),
+        ],
+        &[("m.ts", Some(edited.as_str()))],
+    );
+}
+
 // D6 (2026-09-29 usage evaluation): a route whose handler lives in another
 // file — the canonical `import { getUser } from './ctrl'; app.get('/users',
 // getUser)` — is stored as the handler's self-edge, inside the HANDLER's file,

@@ -3573,12 +3573,14 @@ fn restore_inbound_edges(
                         .collect::<Vec<_>>()
                 })
                 .map(|found| {
-                    // A Python name that is a module attribute is not the
+                    // An imported name is a module attribute, not the
                     // namesake method beside it, as at resolution (D#517):
                     // `from m import Y` that bound `C.Y` binds the `def Y` that
-                    // `m` gains.
-                    let module_level =
-                        src_lang == "python" && found.iter().any(|(_, _, ty)| *ty != "method");
+                    // `m` gains. Only an import: a call or reference into the
+                    // method keeps it (pre-tag review of 0.175.0).
+                    let module_level = src_lang == "python"
+                        && relation.as_str() == REL_IMPORTS
+                        && found.iter().any(|(_, _, ty)| *ty != "method");
                     found
                         .into_iter()
                         .filter(|(_, _, ty)| !module_level || *ty != "method")
