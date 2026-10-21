@@ -47,6 +47,16 @@ affected where it counted 2. On networkx (693 files), which re-exports with
 `import *`, no edge moves (29 import edges gain an `as` key in their
 metadata).
 
+Import edges carry two metadata keys 0.174.0 did not write: `as`, the name a
+renamed import binds (`from .testing import FlaskClient as cls`), and `n`, the
+number of modules a file imports that name from. Flask has 10 import edges
+with `as` and 3 with `n`, the standard library 51 and 18, networkx 29 and 0.
+Imports that differ only in `as` now keep an edge each: on flask,
+`src/flask/app.py` imports `FlaskClient` and `FlaskCliRunner` once plain and
+once `as cls`; on the standard library, `importlib/machinery.py` has 3 edges
+to `_bootstrap_external`'s module where 0.174.0 had 1 (two of its imports
+rename names that make no node).
+
 ### Cost
 
 An edit that changes what a Python module re-exports also re-extracts the
@@ -55,10 +65,14 @@ On flask's `src/flask/__init__.py`, one new line re-exporting a name
 re-extracts 1 file (63–64 ms), retargeting `redirect` 3 (69–72 ms), and
 retargeting `Flask` 19 (94–96 ms), where those edits took 24–29 ms before. On
 networkx, adding `from networkx.classes.graph import Graph` to
-`networkx/__init__.py` re-extracts 4 files (175–190 ms, 94–97 ms before). An
-edit that leaves a module's imports alone costs what it did (networkx: medians
-102 and 100 ms over 15 edits), and so does a full index (networkx: medians
-3.64 and 3.64 CPU seconds over 9 runs).
+`networkx/__init__.py` re-extracts 4 files (175–190 ms, 94–97 ms before).
+Deleting `networkx/utils/__init__.py` re-extracts, beside the 186 files that
+depended on it, the 23 files that import a name it re-exported: median 1249 ms
+over 3 deletions, 1018 ms with 0.174.0. An edit that leaves a module's imports
+alone costs what it did (networkx: medians 102 and 100 ms over 15 edits). A
+full index takes about 2% more CPU: on networkx, median 3.68 s against 3.61 s
+with 0.174.0 over 9 alternating runs, more in each of the 9 pairs; on the
+Python standard library, 5.40 s against 5.32 s.
 
 ### A TypeScript call into an interface or type alias is `ambiguous`
 
@@ -115,15 +129,12 @@ imports, all 3 wrong: its `inferred` tier goes from 1235/2107 correct to
 
 Adding `tests/__init__.py` to flask now re-extracts 5 files
 (`tests/test_blueprints.py`, `tests/test_cli.py`, `tests/test_templating.py`
-and two files under `tests/test_apps/`), 91–160 ms where the edit took
-37–45 ms; the incremental index then equals a fresh one, where before it
-held 152 edges a fresh index does not have and lacked 6 it has. Deleting
-`networkx/utils/__init__.py` re-extracts the same 186 files as before
-(1.27–1.32 s, 1.27–1.39 s before). Other edits cost what they did (flask
-`src/flask/helpers.py`: median 54 ms over 5 edits, 57 ms before; networkx
-`networkx/algorithms/cycles.py`: 128 ms, 125 ms before), and so does a full
-index (networkx: median 3.99 CPU seconds over 7 runs, 4.22 before; standard
-library: 5.55 over 15, 5.59 before).
+and two files under `tests/test_apps/`), 88–109 ms where 0.174.0 takes 34 ms;
+the incremental index then equals a fresh one, where 0.174.0's held 152 edges
+a fresh index does not have and lacked 6 it has. Other edits cost what they
+did with 0.174.0 (flask `src/flask/helpers.py`: median 52 ms over 5 edits,
+49 ms; networkx `networkx/algorithms/cycles.py`: 113 ms, 117 ms). Deleting
+an `__init__.py` and a full index are under Cost above.
 
 ### Not covered
 
@@ -135,6 +146,30 @@ library: 5.55 over 15, 5.59 before).
   run did not re-examine.
 - On 569 files of the Python 3.14 standard library, the re-export binding
   above moves no edge the SCIP oracle judges.
+- A function nested in another function counts as module-level when `from m
+  import Y` chooses between it and a method named `Y`: with `class Registry:
+  def register`, `register = _default.register` (which makes no node) and
+  `def make(): def register(x)`, `from m import register` binds only the
+  nested function.
+- A re-export inside a function of `__init__.py` (`def lazy(): from .heavy
+  import X`) is followed as if the package exported `X`.
+- An incremental run still differs from a fresh index in these shapes, as it
+  did with 0.174.0: a relative `from .. import X` after the package's
+  `__init__.py` is deleted and added back; a new top-level module that shares
+  a module path with an existing one (`helpers.py` beside an importable
+  `tests/helpers.py`).
+
+### Known issue (also in 0.174.0)
+
+Rarely, a full index stops with `Invalid column type Blob at index: N, name:
+<column>`: one value of one symbol was stored with the wrong SQLite type. In
+this release's testing it happened 5 times in about 18,000 full indexes of
+hono and networkx, with development builds of this release and with 0.174.0,
+and one more run crashed instead. One of the 5 also broke a table index, and
+the two later runs of that index we tried stopped with `database disk image
+is malformed`. For the two we re-ran, `code-graph-mcp rebuild-index --confirm`
+built a clean index; running the index again repaired the one whose table
+index was intact and not the other. The cause is not found yet.
 
 ## 0.174.0
 

@@ -46,3 +46,26 @@
 - SCIP oracle（标准库，两臂都重跑）：w1 `inferred` 1235/2107（与记录的基线相同），a 1235/2104；判定边的差别只有 3 条 `inferred` 错边被去掉（`pydoc.html_error`、`random._test_generator`、`xmlrpc/server.docroutine`）。
 - 语料增量一致性（`corpus_parity.py`：索引 → 改动 → 增量，对比同一棵树的全新索引）：flask 新增 `tests/__init__.py`，w1 增量多 152 条、少 6 条，a 完全一致（重新提取 5 个文件）；networkx 删除 `networkx/utils/__init__.py`，两臂都一致（186 个文件，由已有的删除依赖覆盖）。
 - 开销（D#516 循环暂停时测）：flask 新增 `tests/__init__.py` 91–160 ms（中位 105），w1 37–45 ms；networkx 删除 `utils/__init__.py` 两臂 1.27–1.39 s；普通编辑 flask 54 vs 57 ms、networkx 128 vs 125 ms（各 5 次）；全量 CPU networkx 中位 3.99 vs 4.22 s（7 次交替），标准库 5.55 vs 5.59 s（15 次交替）。
+
+## 发版前评审第 1 轮（0.175.0，新开子代理，盲审 `v0.174.0..9f834cc3`）
+
+1 HIGH、1 MEDIUM、9 LOW；场景与工具在 `/var/tmp/d175-review/harness/`。
+
+- HIGH（成立，我用 `parity.py` 复现）：`restore_inbound_edges` 的方法过滤对所有 Python 关系生效，方法所在文件同时有同名函数（或嵌套闭包）时，指向方法的调用和引用（`self.store.fetch_rows()`、`m.fetch_rows()`、裸调用）在该文件重新索引后不回填；标准库 10 个文件各加一行注释缺 624 条，flask 改 `__init__.py` 的再导出缺 1 条（`View.as_view → AppGroup.decorator`）。修复 `d45dad19`：只对 `imports` 生效。RED：新测试 `an_edit_keeps_the_calls_into_a_method_beside_a_namesake_function` 在修复前失败；GREEN 后，标准库 10 文件实验 0/0、flask 场景一致。变异：去掉语言条件（M19）、恢复成所有关系（即本 HIGH）都被新测试杀死（加了一个 TypeScript 场景钉住语言条件）。全量索引不变（9 个语料 a vs b 边集合相同），INDEX_VERSION 不升（123 未发版），只更新指纹。
+- MEDIUM：CI 红是三条 2026-10-19/20 的 RustSec 公告（rustls-webpki、webpki-roots、webpki-root-certs），与代码无关；升级生产依赖需要用户授权，已提问。
+- LOW 3（嵌套函数算作模块级）、8（`__init__.py` 函数内的导入被当作再导出）、5/6（既有的增量缺口）：写入 CHANGELOG 的 Not covered，不修（LOW 的修复是发版里风险最高的代码）。
+- LOW 4（删 `__init__.py` 时再导出扇出多 23 个文件，说明里没写）、9（元数据新增 `as`/`n` 没写）：按实测补进说明。基准改用 v0.174.0 源码构建（评审的 `aef147c7`），networkx 改用干净副本（`/var/tmp/d370a/nx/A` 的 `__init__.py` 有一行未提交的再导出，评审指出）。
+- LOW 10（`query_row` 对已删除的 id 会中止运行，评审找不到触发方式）、11（`surprising` 的原因文字对所有语言都写了 TypeScript）：记入遗留。
+
+### 修复后的测量（最终构建 `925c1488`，`d45dad19`）
+
+- 全量：七个语料 + 干净 networkx + 标准库，与 `abb76729`（`bcba08f9`）边集合完全相同。
+- 对 0.174.0（`aef147c7`）：flask 新增 `tests/__init__.py` 88–109 ms vs 34 ms；删 `networkx/utils/__init__.py` 中位 1249 vs 1018 ms（186 + 23 个文件 vs 186 个）；普通编辑 flask 52 vs 49 ms、networkx 113 vs 117 ms；全量 CPU networkx 3.68 vs 3.61 s（9 次交替，每组都更高），标准库 5.40 vs 5.32 s。
+- 元数据：0.174.0 不写 `as`/`n`；最终版 flask 10/3、标准库 51/18、networkx 29/0。
+
+## D#516（同一会话）
+
+- hono 全量循环约 17,910 次：4 次 `Invalid column type Blob`（其中 1 次 `integrity_check` 报索引缺行）+ 1 次段错误，全部在 04:53–05:35；同时段内核有 virtio-gpu vblank 超时（vCPU 停顿）。此后各臂（w1、0.174.0、`RAYON_NUM_THREADS=1`、glibc `malloc.check=3`、`malloc.perturb`）约 15,500 次 0 失败。
+- networkx：0.174.0 源码构建全量一次失败（07:3x，`code_content` 成 BLOB）——问题在已发布版本里就有。
+- 特征：一个节点行的一列被存成 BLOB，字节或与原文本相同（只有类型变了），或是残留 C 字符串 `"typescript\0"`、零字节、含堆指针的垃圾；与 `Mem` 标志被改写一致。插入走缓存的 `INSERT … RETURNING id`，表上有 FTS5 AFTER INSERT 触发器。
+- 补救（同版本实测）：值损坏、索引结构完好 → 再跑索引或 `rebuild-index --confirm` 都能修好；表索引也坏了 → 再跑两次都报 malformed，`rebuild-index --confirm` 能修好。写入 CHANGELOG 的 Known issue。
