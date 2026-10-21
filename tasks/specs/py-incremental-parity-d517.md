@@ -87,3 +87,11 @@
 - LOW 6 在 w1 上同样出现（多 1 少 8），来自 D#370(a1) 的再导出绑定，不是方法规则；0.174.0 缺 5 条。写入 Not covered。
 - 测试：删去钉住方法规则的测试；回填测试加上引用（`cb = Y`、`f(Y)`、导入名）和嵌套函数、类两种同名形状。pre-commit 全量通过（lib 1497/1497）。
 - 开销（对 0.174.0 源码构建 `aef147c7`）：flask 新增 `tests/__init__.py` 82–102 ms vs 34–37 ms；删 `networkx/utils/__init__.py` 中位 1230 vs 1046 ms；普通编辑 flask 51 vs 53 ms、networkx 118 vs 118 ms；全量 CPU networkx 3.64 vs 3.67 s（9 次交替，最终版更高 3 组），标准库 5.27 vs 5.25 s（9 组中 0.174.0 失败 1 组——D#516，又一个数据点）。
+
+## 发版（v0.175.0，2026-10-21）
+
+- 依赖（用户授权）：rustls-webpki 0.103.15 → 0.103.16、webpki-roots 1.0.6 → 1.0.10、webpki-root-certs 1.0.4 → 1.0.10（只改 `Cargo.lock`，`af1bec74`）。Cargo Audit 由红（run 39554249862、39583727683）转绿（39590778067）。webpki-root-certs 不进 5 个发布目标里的任何一个（`cargo tree --target <t> -i`）。CHANGELOG 加 Dependencies 一节（`85ab3f99`）。
+- 依赖升级前后的全量索引：c-rel（`693c7f42`）与最终构建（`33723f9c`）在 9 个语料上边集合相同、标签不变（标准库 116,373，networkx 36,776）。
+- tag `v0.175.0` 打在 `85ab3f99`；main CI 7/7（`af1bec74` 和 `85ab3f99` 两次），13 个新测试在 macOS、Windows 日志里都是 `ok`；Release 10/10（11:38 → 12:10）；Routing Bench 通过。
+- 发布后：npm 6 个包都是 0.175.0；Release 非草稿、14 个资产；真实安装 `added 2 packages`，linux-x64 二进制 44,438,424 B，`--version` 0.175.0；与源码构建在 9 个语料上边集合相同；flask 新增 `tests/__init__.py`：重新抽取 5 个文件，增量 = 重建（0.174.0 多 152 少 6）。
+- 未做（转入延期项）：D#515/D#518（`P.X()` 走导入边）、D#519（D#516 的损坏，坏库留在 `/var/tmp/d516`）、D#520（第 1、2 轮评审的 LOW）。
