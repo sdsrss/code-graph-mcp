@@ -119,6 +119,16 @@ cost what they did with 0.174.0 (flask `src/flask/helpers.py`: median 51 ms
 over 5 edits, 53 ms; networkx `networkx/algorithms/cycles.py`: 118 ms,
 118 ms). Deleting an `__init__.py` is under Cost above.
 
+### Dependencies: rustls-webpki 0.103.16, webpki-roots 1.0.10
+
+rustls-webpki goes 0.103.15 → 0.103.16 for RUSTSEC-2026-0382 and
+webpki-roots 1.0.6 → 1.0.10 for RUSTSEC-2026-0381, which `cargo audit`
+reported from 2026-10-21; both are built into each of the five release
+binaries. The lockfile's webpki-root-certs goes 1.0.4 → 1.0.10 for
+RUSTSEC-2026-0383; it is built into none of them. A full index writes the
+same edges with and without the update on the seven corpora of 0.174.0,
+networkx and the stdlib.
+
 ### Not covered
 
 - `import flask` and then `flask.Flask(...)` still resolves by the name: on
