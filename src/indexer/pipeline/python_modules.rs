@@ -188,29 +188,22 @@ pub(super) fn project_module_files_from(
 /// Resolve Python import targets within the files [`project_module_files`]
 /// resolved the module to.
 /// For `import X` (is_module_import): finds `<module>` nodes in those files.
-/// For `from X import Y`: finds nodes named Y only in those files, leaving out
-/// a method named Y beside a module-level one: `from m import Y` binds an
-/// attribute of `m`, which a method is not (D#517). An import whose only
-/// candidates are methods binds them as before, rather than fall through to
-/// the name chain.
+/// For `from X import Y`: finds nodes named Y only in those files.
 /// Returns None if no matching node exists yet.
 pub(super) fn resolve_python_module_targets(
-    conn: &rusqlite::Connection,
     module_files: &[String],
     is_module_import: bool,
     target_name: &str,
     node_id_to_path: &HashMap<i64, String>,
     name_to_ids: &HashMap<String, Vec<i64>>,
-) -> anyhow::Result<Option<Vec<i64>>> {
+) -> Option<Vec<i64>> {
     let lookup_name = if is_module_import {
         "<module>"
     } else {
         target_name
     };
-    let Some(all_ids) = name_to_ids.get(lookup_name) else {
-        return Ok(None);
-    };
-    let mut targets: Vec<i64> = all_ids
+    let all_ids = name_to_ids.get(lookup_name)?;
+    let targets: Vec<i64> = all_ids
         .iter()
         .filter(|nid| {
             node_id_to_path
@@ -220,20 +213,11 @@ pub(super) fn resolve_python_module_targets(
         })
         .copied()
         .collect();
-    if !is_module_import && targets.len() > 1 {
-        let mut is_method =
-            conn.prepare_cached("SELECT type = 'method' FROM nodes WHERE id = ?1")?;
-        let mut methods: HashSet<i64> = HashSet::new();
-        for &id in &targets {
-            if is_method.query_row([id], |r| r.get::<_, bool>(0))? {
-                methods.insert(id);
-            }
-        }
-        if methods.len() < targets.len() {
-            targets.retain(|id| !methods.contains(id));
-        }
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
     }
-    Ok((!targets.is_empty()).then_some(targets))
 }
 
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from

@@ -1842,13 +1842,12 @@ fn resolve_batch_relations(
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
-                            db.conn(),
                             &module_files,
                             is_module_import,
                             &rel.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        )? {
+                        ) {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,
@@ -3570,20 +3569,6 @@ fn restore_inbound_edges(
                                     )
                                 })
                         })
-                        .collect::<Vec<_>>()
-                })
-                .map(|found| {
-                    // An imported name is a module attribute, not the
-                    // namesake method beside it, as at resolution (D#517):
-                    // `from m import Y` that bound `C.Y` binds the `def Y` that
-                    // `m` gains. Only an import: a call or reference into the
-                    // method keeps it (pre-tag review of 0.175.0).
-                    let module_level = src_lang == "python"
-                        && relation.as_str() == REL_IMPORTS
-                        && found.iter().any(|(_, _, ty)| *ty != "method");
-                    found
-                        .into_iter()
-                        .filter(|(_, _, ty)| !module_level || *ty != "method")
                         .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })
@@ -4063,13 +4048,12 @@ fn resolve_deferred_relations(
                     project_module_files_from(python_module, &d.rel_path, python_module_map)
                 {
                     if let Some(module_targets) = resolve_python_module_targets(
-                        db.conn(),
                         &module_files,
                         is_module_import,
                         &d.target_name,
                         &node_id_to_path,
                         &name_to_ids,
-                    )? {
+                    ) {
                         edges_created += insert_relation_edges(
                             db,
                             &source_ids,
@@ -4105,13 +4089,12 @@ fn resolve_deferred_relations(
                             project_module_files_from(&submodule, &d.rel_path, python_module_map)
                                 .unwrap_or(module_files);
                         if let Some(module_nodes) = resolve_python_module_targets(
-                            db.conn(),
                             &files,
                             true,
                             &d.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        )? {
+                        ) {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,

@@ -12605,85 +12605,11 @@ fn a_python_package_change_pulls_only_the_importers_it_reroots() {
     assert!(pulled(&[], &["lib/__init__.py"]).is_empty());
 }
 
-// D#517 (p15): `from m import Y` binds an attribute of module `m`, and a method
-// of a class in `m` that is also named `Y` is not one. A rebuild bound both,
-// an incremental run the one it had. With no module-level `Y` the import binds
-// the method as before, rather than fall through to the name chain.
-#[test]
-fn a_python_from_import_binds_the_module_level_name_not_a_method() {
-    let both = "def Y():\n    return 1\n\nclass C:\n    def Y(self):\n        pass\n";
-    // Two methods, so the lookup has more than one candidate to choose from.
-    let method_only =
-        "class C:\n    def Y(self):\n        pass\n\nclass D:\n    def Y(self):\n        pass\n";
-    let importer = ("app2.py", "from pkg.m import Y\n\ndef main2():\n    Y()\n");
-    let decoy = ("zzz/decoy.py", "def Y():\n    pass\n");
-    let targets = |db: &Database| -> Vec<(String, String)> {
-        let mut stmt = db
-            .conn()
-            .prepare(
-                "SELECT e.relation, nt.type FROM edges e \
-                 JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
-                 JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
-                 WHERE fs.path = 'app2.py' AND ft.path = 'pkg/m.py' ORDER BY 1, 2",
-            )
-            .unwrap();
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        rows.filter_map(Result::ok).collect()
-    };
-    let pair = |rel: &str, ty: &str| (rel.to_string(), ty.to_string());
-    let (_p, _d, db) = fresh_index_of(&[("pkg/m.py", both), importer, decoy]);
-    assert_eq!(
-        targets(&db),
-        vec![
-            pair("calls", "function"),
-            pair("imports", "function"),
-            pair("imports", "module")
-        ]
-    );
-    let (_p, _d, db) = fresh_index_of(&[("pkg/m.py", method_only), importer, decoy]);
-    assert_eq!(
-        targets(&db),
-        vec![
-            pair("calls", "method"),
-            pair("calls", "method"),
-            pair("imports", "method"),
-            pair("imports", "method"),
-            pair("imports", "module")
-        ]
-    );
-
-    let plain = "def Y():\n    return 1\n";
-    for (before, after) in [
-        (plain, both),
-        (both, plain),
-        (method_only, both),
-        (both, method_only),
-    ] {
-        assert_incremental_graph_matches_rebuild(
-            &[("pkg/m.py", before), importer, decoy],
-            &[("pkg/m.py", Some(after))],
-        );
-    }
-    // The same through a renamed re-export (review scenario p15).
-    assert_incremental_graph_matches_rebuild(
-        &[
-            ("pkg/__init__.py", "from .m import Y as X\n"),
-            ("pkg/m.py", "def Y():\n    pass\n"),
-            ("zzz/decoy.py", "def Y():\n    pass\n\ndef X():\n    pass\n"),
-            ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
-            ("app2.py", "from pkg import X\n\ndef main2():\n    X()\n"),
-        ],
-        &[(
-            "pkg/m.py",
-            Some("def Y():\n    return 1\n\nclass C:\n    def Y(self):\n        pass\n"),
-        )],
-    );
-}
-
-// Only an import names a module attribute (pre-tag review of 0.175.0): a call
-// or reference into a method keeps it when the method's file, holding a
-// function of the same name too, is re-indexed — `self.store.fetch_rows()`,
-// `m.fetch_rows()`, a bare `fetch_rows()`, and a closure named like a method.
+// A call or reference into a method keeps it when the method's file, holding a
+// function, a nested function or a class of the same name too, is re-indexed
+// (pre-tag review of 0.175.0: a restore filter of D#517 dropped them until the
+// caller's own file changed) — `self.store.fetch_rows()`, `m.fetch_rows()`, a
+// bare `fetch_rows()`, `cb = Y`, `f(Y)`, an imported name.
 #[test]
 fn an_edit_keeps_the_calls_into_a_method_beside_a_namesake_function() {
     let m = "def fetch_rows():\n    return 1\n\nclass Store:\n    def fetch_rows(self):\n        return 2\n";
@@ -12705,6 +12631,30 @@ fn an_edit_keeps_the_calls_into_a_method_beside_a_namesake_function() {
         .filter(|r| r.starts_with("pkg/b.py.run --calls"))
         .count();
     assert_eq!(run, 2, "{rows:#?}");
+    let caller = "import pkg.m\nfrom pkg import m\n\ndef member(x):\n    return x.store.Y()\n\ndef via_mod():\n    return m.Y()\n\ndef via_dotted():\n    return pkg.m.Y()\n\ndef bare():\n    return Y()\n\ndef cls_call():\n    return pkg.m.C.Y(None)\n\ndef val_ref():\n    cb = Y\n    return cb\n\ndef arg_ref(f):\n    return f(Y)\n";
+    let importer =
+        "from pkg.m import Y\n\ndef imp_call():\n    return Y()\n\ndef imp_ref():\n    return Y\n";
+    for m in [
+        "def Y():\n    return 1\n\nclass C:\n    def Y(self):\n        return 2\n",
+        "def make():\n    def Y():\n        return 1\n    return Y\n\nclass C:\n    def Y(self):\n        return 2\n",
+        "class Y:\n    pass\n\nclass C:\n    def Y(self):\n        return 2\n",
+    ] {
+        let edited = format!("# edit\n{m}");
+        let rows = assert_incremental_graph_matches_rebuild(
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/m.py", m),
+                ("app.py", caller),
+                ("app_imp.py", importer),
+            ],
+            &[("pkg/m.py", Some(edited.as_str()))],
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("app.py.val_ref --references") && r.ends_with("pkg/m.py.Y")),
+            "{rows:#?}"
+        );
+    }
     let lib = "def factory():\n    def handle():\n        pass\n    return handle\n\nclass H:\n    def handle(self):\n        pass\n";
     let edited = format!("# edit\n{lib}");
     assert_incremental_graph_matches_rebuild(
