@@ -158,23 +158,10 @@ pub(super) fn project_module_files_from(
     importer: &str,
     python_module_map: &HashMap<String, Vec<String>>,
 ) -> Option<Vec<String>> {
-    let Some(mut rest) = python_module.strip_prefix('.') else {
+    if !python_module.starts_with('.') {
         return project_module_files(python_module, python_module_map);
-    };
-    let mut dir = importer.rsplit_once('/').map_or("", |(d, _)| d);
-    while let Some(r) = rest.strip_prefix('.') {
-        if dir.is_empty() {
-            return None;
-        }
-        dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
-        rest = r;
     }
-    let path = match (dir, rest) {
-        ("", "") => return None,
-        ("", r) => r.replace('.', "/"),
-        (d, "") => d.to_string(),
-        (d, r) => format!("{d}/{}", r.replace('.', "/")),
-    };
+    let path = relative_module_path(python_module, importer)?;
     let wanted = [format!("{path}.py"), format!("{path}/__init__.py")];
     let files: Vec<String> = python_module_map
         .get(&path.replace('/', "."))?
@@ -183,6 +170,27 @@ pub(super) fn project_module_files_from(
         .cloned()
         .collect();
     (!files.is_empty()).then_some(files)
+}
+
+/// The path, without `.py` or `/__init__.py`, that a relative module path
+/// names from `importer`: one dot is its directory, each further dot one level
+/// up (PEP 328). `None` for an absolute module path, or above the project root.
+pub(super) fn relative_module_path(python_module: &str, importer: &str) -> Option<String> {
+    let mut rest = python_module.strip_prefix('.')?;
+    let mut dir = importer.rsplit_once('/').map_or("", |(d, _)| d);
+    while let Some(r) = rest.strip_prefix('.') {
+        if dir.is_empty() {
+            return None;
+        }
+        dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        rest = r;
+    }
+    Some(match (dir, rest) {
+        ("", "") => return None,
+        ("", r) => r.replace('.', "/"),
+        (d, "") => d.to_string(),
+        (d, r) => format!("{d}/{}", r.replace('.', "/")),
+    })
 }
 
 /// Resolve Python import targets within the files [`project_module_files`]

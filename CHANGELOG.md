@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Python: two more edits an incremental index now follows
+
+An incremental index re-reads the files an edit changed, plus the files whose
+imports the edit can move. Two edits moved imports without either kind of
+file being re-read, and the index kept the old binding until the importing
+file itself was edited (both listed under 0.175.0's Not covered):
+
+- A new module that shares a module path with an existing one: a top-level
+  `helpers.py` added beside an importable `tests/helpers.py` is also what
+  `import helpers` in `tests/test_a.py` names. The importers of that path are
+  now re-read.
+- An `__init__.py` that appears or vanishes decides whether a relative import
+  of its package resolves: `from .. import X` in `pkg/sub/m.py`, `from .
+  import tasks` in `pkg/views.py`. Those importers are now re-read too.
+
+A full index is unchanged: the seven corpora of 0.174.0, networkx and the
+standard library give the same edges, labels and metadata as 0.175.0. Over
+the 1,781 incremental steps of 0.175.0's two reviews, an incremental index
+differed from a fresh one after 335 with 0.175.0 and 330 with this build, and
+after no step where 0.175.0 did not; the 330 are 0.175.0's Not covered shapes
+of a method `Y` beside a function `Y`, and of a renamed class. On flask, 90 random edits (renames, deletions,
+restores, `__init__.py` added or removed) left the incremental index
+different after 6 with 0.175.0 and 3 with this build (below). Cost: adding a
+module now also compares the module paths before and after, medians over 7
+alternating runs 113 → 117 ms on the standard library and 85 → 91 ms on
+networkx.
+
 ### `surprising` names a TypeScript type only for a call into one
 
 0.175.0 gave every `ambiguous` edge the reason "bare-name target not decided
@@ -11,6 +38,18 @@ type, which exists only at compile time", and every other `ambiguous` edge
 "bare-name target not decided (several candidates)". On hono 73 of the 1,748
 `ambiguous` connections `surprising --include-tests` lists are such calls; on
 flask none of 883 are.
+
+### Not covered
+
+- When one function calls two methods of the same name through different
+  receivers (flask's `bp.register_blueprint(...)` and
+  `app.register_blueprint(...)`), and the file defining one of them is
+  renamed, an incremental index keeps only one of the two calls into it.
+- A module that imports its own module path (`import typing` in
+  `src/flask/typing.py`) keeps that binding when an `__init__.py` above it is
+  added back.
+- A function nested in a module is a candidate for `from m import name`, as
+  in 0.175.0.
 
 ## 0.175.0
 

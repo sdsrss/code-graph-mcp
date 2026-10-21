@@ -12603,6 +12603,95 @@ fn a_python_package_change_pulls_only_the_importers_it_reroots() {
     // `lib/` stops being a package: `core` becomes a root-level name, which
     // nothing imports, and `lib.core` keeps its file.
     assert!(pulled(&[], &["lib/__init__.py"]).is_empty());
+    // A new root-level `helpers.py` joins the module path `helpers` (D#520).
+    assert_eq!(
+        pulled(&["helpers.py"], &[]),
+        vec!["tests/test_a.py".to_string(), "tests/test_b.py".to_string()]
+    );
+}
+
+// D#520 (review of 0.175.0, LOW 6): a new module that joins a module path
+// other files already answer to. `import helpers` beside `tests/helpers.py`
+// names a root-level `helpers.py` as well once it exists, and its importer's
+// text did not change.
+#[test]
+fn a_new_python_module_on_a_module_path_rebinds_its_importers() {
+    let tree: &[(&str, &str)] = &[
+        ("tests/helpers.py", "def h():\n    pass\n"),
+        (
+            "tests/test_a.py",
+            "import helpers\nfrom helpers import h\n\ndef test_x():\n    h()\n",
+        ),
+    ];
+    let rows = assert_incremental_graph_matches_rebuild(
+        tree,
+        &[("helpers.py", Some("def h():\n    pass\n"))],
+    );
+    let root = r#"tests/test_a.py.<module> --imports[extracted]{"python_module":"helpers"}--> helpers.py.h"#;
+    assert!(rows.iter().any(|r| r == root), "{rows:#?}");
+}
+
+// D#520 (review of 0.175.0, LOW 5, and a flask edit): a relative import names
+// its package from its own path, so it does not move with the import roots, but
+// it does resolve only while that package has its `__init__.py`. `from .. import
+// X` in `pkg/sub/m.py` and `from . import tasks` in `pkg/views.py` change when
+// `pkg/__init__.py` appears or vanishes.
+#[test]
+fn a_package_init_that_appears_or_vanishes_rebinds_the_relative_imports_of_it() {
+    let tree: &[(&str, &str)] = &[
+        ("pkg/__init__.py", "from .core import X\n"),
+        ("pkg/core.py", "def X():\n    pass\n"),
+        ("pkg/tasks.py", "def run():\n    pass\n"),
+        (
+            "pkg/views.py",
+            "from . import tasks\n\ndef view():\n    tasks.run()\n",
+        ),
+        ("pkg/sub/__init__.py", ""),
+        ("pkg/sub/m.py", "from .. import X\n\ndef f():\n    X()\n"),
+        ("user.py", "from pkg import X\n\ndef go():\n    X()\n"),
+    ];
+    let rows = assert_incremental_graph_matches_rebuild(tree, &[("pkg/__init__.py", None)]);
+    assert!(
+        rows.iter()
+            .any(|r| r == "pkg/views.py.<module> --imports[extracted]--> <external>.."),
+        "{rows:#?}"
+    );
+    let without: Vec<(&str, &str)> = tree
+        .iter()
+        .filter(|(p, _)| *p != "pkg/__init__.py")
+        .copied()
+        .collect();
+    let rows = assert_incremental_graph_matches_rebuild(
+        &without,
+        &[("pkg/__init__.py", Some("from .core import X\n"))],
+    );
+    let bound =
+        r#"pkg/sub/m.py.<module> --imports[extracted]{"python_module":".."}--> pkg/core.py.X"#;
+    assert!(rows.iter().any(|r| r == bound), "{rows:#?}");
+
+    // A package inside a package is no import root, so its `__init__.py`
+    // moves no root; its relative importers still change.
+    let nested: &[(&str, &str)] = &[
+        ("app/__init__.py", ""),
+        ("app/pkg/__init__.py", "from .core import X\n"),
+        ("app/pkg/core.py", "def X():\n    pass\n"),
+        ("app/pkg/sub/__init__.py", ""),
+        (
+            "app/pkg/sub/m.py",
+            "from .. import X\n\ndef f():\n    X()\n",
+        ),
+    ];
+    let without: Vec<(&str, &str)> = nested
+        .iter()
+        .filter(|(p, _)| *p != "app/pkg/__init__.py")
+        .copied()
+        .collect();
+    let rows = assert_incremental_graph_matches_rebuild(
+        &without,
+        &[("app/pkg/__init__.py", Some("from .core import X\n"))],
+    );
+    let bound = r#"app/pkg/sub/m.py.<module> --imports[extracted]{"python_module":".."}--> app/pkg/core.py.X"#;
+    assert!(rows.iter().any(|r| r == bound), "{rows:#?}");
 }
 
 // A call or reference into a method keeps it when the method's file, holding a

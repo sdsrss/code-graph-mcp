@@ -1281,13 +1281,23 @@ fn existence_change_dependents(
     Ok(extra.into_iter().collect())
 }
 
-/// The Python files whose absolute imports name other files once this run's
-/// `__init__.py` files appear or vanish (D#517): `tests/test_a.py`'s `import
-/// helpers` named `tests/helpers.py` until `tests/__init__.py` appeared, and
-/// `import pkg` stopped naming `src/pkg/` when `src/__init__.py` did. The
-/// importer's text did not change, so nothing else re-extracts it. Read from
-/// both the import edges a module path bound and the `<external>` sentinels
-/// it did not, which are named by the module path.
+/// The Python files whose imports name other files once this run's modules
+/// appear or vanish, though their own text did not change, so nothing else
+/// re-extracts them. Read from both the import edges a module path bound and
+/// the `<external>` sentinels it did not, which are named by the module path.
+///
+/// - An `__init__.py` that appears or vanishes moves the import roots below it
+///   (D#517): `tests/test_a.py`'s `import helpers` named `tests/helpers.py`
+///   until `tests/__init__.py` appeared, and `import pkg` stopped naming
+///   `src/pkg/` when `src/__init__.py` did.
+/// - It also decides whether a relative import of its package resolves (D#520):
+///   `from .. import X` in `pkg/sub/m.py` and `from . import tasks` in
+///   `pkg/views.py` name `pkg/` only while `pkg/__init__.py` exists.
+/// - A new module adds its file to the module paths it is reachable by
+///   (D#520): a root-level `helpers.py` beside `tests/helpers.py`. Only its own
+///   paths change — a new import root above it holds no other module, or it
+///   was a root already — and an importer it takes away from a deleted file
+///   is that file's dependent anyway.
 pub(super) fn python_root_change_importers(
     db: &Database,
     files: &[String],
@@ -1297,16 +1307,29 @@ pub(super) fn python_root_change_importers(
     let mut known = db
         .conn()
         .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
-    let mut package_changed = delete_paths.iter().any(|p| is_init(p));
-    for f in files.iter().filter(|f| is_init(f)) {
-        if package_changed {
-            break;
-        }
-        package_changed = !known.exists([f.as_str()])?;
+    // The directories whose `__init__.py` appears or vanishes.
+    let mut packages: HashSet<&str> = HashSet::new();
+    let mut new_module = false;
+    for f in delete_paths.iter().filter(|p| is_init(p)) {
+        packages.insert(f.rsplit_once('/').map_or("", |(d, _)| d));
     }
-    if !package_changed {
+    for f in files.iter().filter(|f| f.ends_with(".py")) {
+        if known.exists([f.as_str()])? {
+            continue;
+        }
+        if is_init(f) {
+            packages.insert(f.rsplit_once('/').map_or("", |(d, _)| d));
+        } else {
+            new_module = true;
+        }
+    }
+    if packages.is_empty() && !new_module {
         return Ok(Vec::new());
     }
+    let names_package = |module: &str, importer: &str| {
+        super::python_modules::relative_module_path(module, importer)
+            .is_some_and(|p| packages.contains(p.as_str()))
+    };
     let before: HashSet<String> = db
         .conn()
         .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?
@@ -1337,12 +1360,14 @@ pub(super) fn python_root_change_importers(
     let bound = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     for row in bound {
         let (importer, module) = row?;
-        if changed.contains(&module) {
+        if changed.contains(&module) || names_package(&module, &importer) {
             out.insert(importer);
         }
     }
     for (module, importer) in crate::storage::queries::get_external_sentinel_importers(db.conn())? {
-        if importer.ends_with(".py") && changed.contains(&module) {
+        if importer.ends_with(".py")
+            && (changed.contains(&module) || names_package(&module, &importer))
+        {
             out.insert(importer);
         }
     }
