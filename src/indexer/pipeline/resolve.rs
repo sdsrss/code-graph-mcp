@@ -2330,48 +2330,20 @@ pub(super) fn bind_module_attr_calls(
     use crate::domain::{REL_CALLS, REL_IMPORTS};
     let conn = db.conn();
     conn.execute_batch("DROP TABLE IF EXISTS temp.cg_attr_imports;")?;
-    const COLUMNS: &str = "mn.file_id AS fid,
+    conn.execute(
+        "CREATE TEMP TABLE cg_attr_imports AS
+         SELECT mn.file_id AS fid,
                 json_extract(ie.metadata, '$.python_module') AS module,
                 json_extract(ie.metadata, '$.attr') AS attr,
-                ie.target_id AS tid";
-    const SYNTHETIC: &str = "ie.metadata LIKE '%\"attr\":%' AND itn.name <> '<module>'";
-    if scope.is_global() {
-        conn.execute(
-            &format!(
-                "CREATE TEMP TABLE cg_attr_imports AS
-                 SELECT {COLUMNS}
-                 FROM edges ie
-                 JOIN nodes mn  ON mn.id  = ie.source_id
-                 JOIN nodes itn ON itn.id = ie.target_id
-                 WHERE ie.relation = ?1 AND {SYNTHETIC}"
-            ),
-            rusqlite::params![REL_IMPORTS],
-        )?;
-    } else {
-        // Only the files whose calls the statements below read: those in
-        // scope, and the callers of a scope file's node. The whole table is a
-        // scan of every `imports` edge on every run, which grows with the
-        // repository (review of D#518, LOW-5; networkx 2 ms, this 0.2 ms).
-        conn.execute(
-            &format!(
-                "CREATE TEMP TABLE cg_attr_imports AS
-                 SELECT {COLUMNS}
-                 FROM (SELECT s.fid FROM cg_scope_files s
-                       UNION
-                       SELECT sn.file_id
-                       FROM cg_scope_files s
-                       CROSS JOIN nodes tn ON tn.file_id = s.fid
-                       CROSS JOIN edges e ON e.target_id = tn.id
-                       CROSS JOIN nodes sn ON sn.id = e.source_id
-                       WHERE e.relation = ?2 AND e.metadata LIKE '%\"attr\":%') f
-                 CROSS JOIN nodes mn  ON mn.file_id = f.fid
-                 CROSS JOIN edges ie  ON ie.source_id = mn.id AND ie.relation = ?1
-                 CROSS JOIN nodes itn ON itn.id = ie.target_id
-                 WHERE {SYNTHETIC}"
-            ),
-            rusqlite::params![REL_IMPORTS, REL_CALLS],
-        )?;
-    }
+                ie.target_id AS tid
+         FROM edges ie
+         JOIN nodes mn  ON mn.id  = ie.source_id
+         JOIN nodes itn ON itn.id = ie.target_id
+         WHERE ie.relation = ?1
+           AND ie.metadata LIKE '%\"attr\":%'
+           AND itn.name <> '<module>'",
+        rusqlite::params![REL_IMPORTS],
+    )?;
     conn.execute_batch(
         "CREATE INDEX cg_attr_imports_k ON cg_attr_imports(fid, module, attr, tid);",
     )?;
