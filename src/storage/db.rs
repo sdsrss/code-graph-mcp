@@ -368,9 +368,13 @@ impl Database {
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
-        // Only an indexer writes pending rows, so only its open converts their
-        // key: a reader's file can be read-only, or another process can hold the
-        // write lock, and the reader then failed to open an index it can read.
+        // Only an indexer's open converts the pending key: a reader's file can be
+        // read-only, or another process can hold the write lock, and the reader
+        // then failed to open an index it can read. A reader that re-indexes
+        // stale files does write pending rows, and on an unconverted index they
+        // keep one row per caller and name. Such an index is one built before
+        // INDEX_VERSION 124 (development builds aside), and the next indexer
+        // open wipes it and converts the key, so no row it dropped outlives it.
         if revalidate {
             schema::widen_pending_unique_index(&conn)?;
         }

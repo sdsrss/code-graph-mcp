@@ -10594,8 +10594,9 @@ fn test_rust_blanket_impl_binds_without_a_scope_test() {
 }
 
 /// Batch-1 review round 2: re-resolving a receiver-typed call whose target's
-/// file was re-indexed must not go through the pending buffer, which keeps one
-/// row per caller and name: tokio's `localset_future_drives_all_local_futs`
+/// file was re-indexed must not go through the pending buffer, which then kept
+/// one row per caller and name (its key has the metadata since 0.176.0, and
+/// the route is unchanged): tokio's `localset_future_drives_all_local_futs`
 /// has a `task::spawn_local(..)` waiting there, and its `local.spawn_local(..)`
 /// lost its `LocalSet.spawn_local` edge when an unrelated edit re-indexed
 /// `task/local.rs`.

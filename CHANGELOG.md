@@ -141,16 +141,16 @@ bare `X()` before any file defines `X`; or, on flask, when
 `Blueprint.register_blueprint` from six test functions in
 `tests/test_blueprints.py` that call `register_blueprint` both on a blueprint
 and on the app. Both calls are now kept. An index built by an earlier version
-is converted the first time this version indexes it; a command that only
-reads the index leaves it as it was, so a read-only index, or one another
-process is writing, still answers. 0.175.0 still opens a converted index.
+is converted the first time this version indexes it. A query command does
+not convert it, so a read-only index, or one another process is writing,
+answers as it did before. 0.175.0 still opens a converted index.
 
 A full index gives the same edges as before on the seven corpora of 0.174.0,
 networkx, the standard library and this repository as it is now, and keeps
-more calls for later: this repository 12,181 → 13,320 (8,828 → 9,917 as of
+more calls for later: this repository 12,183 → 13,322 (8,828 → 9,917 as of
 0.174.0), leveldb 1,854 → 1,911, hono 3,005 → 3,026, networkx 8,834 → 8,848,
 the standard library 8,556 → 8,560, flask 921 → 923; express, gin and gson
-the same. An incremental run reads all of them; an edit of
+the same. An incremental run that re-reads a file reads all of them; an edit of
 `src/storage/db.rs` in this repository took 306 → 307 ms and 300 → 308 ms
 (medians over 15 and over 41 alternating runs). Over the 1,205 incremental
 steps of the `P.X()` change's first review, an incremental index differed

@@ -66,3 +66,14 @@
 - F8 LOW 成立：三处注释改为历史原因。
 - F9 LOW：M6b 成立，加 `a_fresh_db_buffers_a_call_without_metadata_once`（M6b 下 2 ≠ 1）。M13（编辑路径重排按调用者和名字去重）是否有可达形状未验证：登记待办。
 - 范围外：本仓库 Rust 随机编辑 30 次里 16 次增量与重建不一致（f31bbf5e 与本版相同；恢复删除的文件后带路径的 calls/references 缺失，如恢复 `src/indexer/pipeline/mod.rs` 后少 96 条）：登记待办，不在本版修。
+
+## 第 2 轮评审（新子代理，盲审 `d7a18c5d..aed40873`：HIGH 0 · MEDIUM 0 · LOW 6，范围外 1）
+
+- F1 LOW 成立：CLI 查询命令刷新过期文件时会经读者连接写 pending 行（`cli/freshness.rs` → `apply_file_refreshes` → `index_files` Phase 0），读者不转换，旧键下一个调用者同名只留一行。评审复现只在 INDEX_VERSION 124 + 旧键的库上留下（只有未发布的 33fbf845..f31bbf5e 会写出）；0.175.0 的库（123）下一次索引器打开即清空并转换，结果 = 重建。不改代码（LOW 的修复风险最高，已到第 2 轮止损线），`db.rs` 注释改为写明这一点。
+- F2 LOW：变异 M1（`create_tables_sql` 用旧键）在 lib 全套存活：每次索引器打开都会转换新库，运行时等价。不改。
+- F3 LOW：M10（吞掉转换错误）存活，没有转换失败的测试。不改，记在这里。
+- F4 LOW 成立：本仓库 pending 行数改为发版树（aed40873）上的 12,183 → 13,322（自己复现，边数两臂都是 17,335）。
+- F5 LOW 成立：只有重读了文件的增量运行才扫 pending（`index_files.rs` `all_indexed.is_empty()` 时为 0）；措辞改正。
+- F6 LOW 成立：tests.rs 一处注释改为历史原因。
+- 范围外 F7（0.175.0 起就有）：pending 扫描绑定的边不进上下文文本（Phase 3 在 Phase 2c 之前），登记 D#545。
+- R1、R2 评审复现成立；R3 除 F4、F5 外成立，开销数评审在负载 5–14 下测不出稳定差别（自己的测量在负载 1.1–1.4 下）。
