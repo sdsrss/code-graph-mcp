@@ -1,6 +1,6 @@
 # 0.175.0 两轮评审剩下的 LOW（D#520，2026-10-21）
 
-状态：LOW 5、6、11 已实现（全量索引不变，INDEX_VERSION 不升）；LOW 7 已授权（2026-10-21），已实现，随 0.176.0 发布。
+状态：已完成。LOW 5、6、11、7 随 v0.176.0 发布（2026-10-21，tag 在 113262d3）；LOW 3、8 与两轮评审余下的 LOW 写在 CHANGELOG 的 Not covered 或登记待办（D#542–D#545）。
 
 ## 背景
 
@@ -77,3 +77,8 @@
 - F6 LOW 成立：tests.rs 一处注释改为历史原因。
 - 范围外 F7（0.175.0 起就有）：pending 扫描绑定的边不进上下文文本（Phase 3 在 Phase 2c 之前），登记 D#545。
 - R1、R2 评审复现成立；R3 除 F4、F5 外成立，开销数评审在负载 5–14 下测不出稳定差别（自己的测量在负载 1.1–1.4 下）。
+
+## 发布
+
+- v0.176.0：main CI 7/7（三个新测试在 macOS、Windows 日志里 `ok`），Release 10/10 一次通过，npm 六个包都是 0.176.0，GitHub Release 14 个资产、说明 13,195 字符。npm 装出的 linux-x64 二进制（md5 `016b7f5d…`）：a11 与 flask 改名 `blueprints.py` 增量 = 重建，flask 全量边与源码构建逐字节相同；0.175.0 建的只读索引上 `health-check`、`callgraph`、`show` 退出码 0。
+- 测量脚本（原在 `/var/tmp/d521`，已删除）留在 `tasks/d520-review-lows/`：`build.sh`、`runall.sh`、`runall2.sh`、`tally.py`、`inc_cost.py`、`signal3.sh`；两轮评审的 README 也在那里。
