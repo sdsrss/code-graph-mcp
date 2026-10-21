@@ -442,6 +442,8 @@ mod tests {
             (5, "method", "call"),
             (6, "interface", "Svc"),
             (4, "function", "build"),
+            (4, "type", "Props"),
+            (4, "interface", "Shape"),
         ] {
             conn.execute(
                 "INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (?1,?2,?3,1,2,'',0)",
@@ -449,10 +451,17 @@ mod tests {
             )
             .unwrap();
         }
-        for (s, t) in [(1, 2), (3, 4), (5, 6), (3, 7)] {
+        for (s, t, rel) in [
+            (1, 2, "calls"),
+            (3, 4, "calls"),
+            (5, 6, "calls"),
+            (3, 7, "calls"),
+            (3, 8, "calls"),
+            (3, 9, "references"),
+        ] {
             conn.execute(
-                "INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (?1,?2,'calls','ambiguous')",
-                [s, t],
+                "INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (?1,?2,?3,'ambiguous')",
+                rusqlite::params![s, t, rel],
             )
             .unwrap();
         }
@@ -478,6 +487,15 @@ mod tests {
         assert_eq!(
             reason("Response"),
             "ambiguous: a call into a TypeScript type, which exists only at compile time"
+        );
+        assert_eq!(
+            reason("Props"),
+            "ambiguous: a call into a TypeScript type, which exists only at compile time"
+        );
+        // A type mentioned, not called (review of D#520's commits, LOW-6).
+        assert_eq!(
+            reason("Shape"),
+            "ambiguous: bare-name target not decided (several candidates)"
         );
     }
 
