@@ -29,6 +29,21 @@ module now also compares the module paths before and after, medians over 7
 alternating runs 113 → 117 ms on the standard library and 85 → 91 ms on
 networkx.
 
+### Python: an incremental run of more than one batch keeps the imports of a name it removes
+
+An index run handles files in batches of 500. When one run changed both an
+importer and the module it imports from, and the importer's batch came first,
+its `from pkg.m import Y` was resolved against `pkg/m.py`'s old symbols; if
+`m.py`'s later batch no longer defined `Y`, the import was dropped instead of
+resolved again, and stayed missing until the importer was edited again. It
+is now resolved again, as a fresh index resolves it.
+
+A full index is unchanged (flask and networkx: same edges as 0.175.0). Over
+the 1,781 incremental steps of 0.175.0's reviews (and 8 more steps of renames
+added here), an incremental index differed from a fresh one after 330 with
+the build before this change and 262 with it, and after no step where it did
+not before; the 68 it repairs are runs of more than 500 changed files.
+
 ### `surprising` names a TypeScript type only for a call into one
 
 0.175.0 gave every `ambiguous` edge the reason "bare-name target not decided

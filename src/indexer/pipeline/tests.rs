@@ -13364,3 +13364,46 @@ fn a_cfg_test_file_s_module_node_is_test_code() {
     assert!(module_is_test("src/mocks.rs"));
     assert!(!module_is_test("src/lib.rs"));
 }
+
+// A run of more than one batch: an importer in an earlier batch resolved
+// `from pkg.m import Y` against `m.py`'s old nodes, and `m.py`'s later batch
+// drops `Y`. The import is requeued, as a rebuild re-resolves it, instead of
+// skipped as if the importer's batch were still to come (review of 0.175.0,
+// round 2, MEDIUM 2).
+#[test]
+fn a_big_run_requeues_an_earlier_batch_import_of_a_vanished_name() {
+    let filler: Vec<(String, String)> = (0..super::index_files::BATCH_SIZE)
+        .map(|i| {
+            (
+                format!("f/{i:04}.py"),
+                format!("def filler_{i}():\n    return {i}\n"),
+            )
+        })
+        .collect();
+    let caller = "from pkg.m import Y\n\ndef imp_call():\n    return Y()\n";
+    let mut before: Vec<(&str, &str)> = vec![
+        ("pkg/__init__.py", ""),
+        ("pkg/m.py", "def Y():\n    return 1\n"),
+        ("app_imp.py", caller),
+    ];
+    before.extend(filler.iter().map(|(p, b)| (p.as_str(), b.as_str())));
+    let touched: Vec<(String, String)> = filler
+        .iter()
+        .map(|(p, b)| (p.clone(), format!("# e\n{b}")))
+        .collect();
+    let caller_touched = format!("# e\n{caller}");
+    let mut after: Vec<(&str, Option<&str>)> = vec![
+        ("pkg/m.py", Some("def other():\n    return 0\n")),
+        ("app_imp.py", Some(caller_touched.as_str())),
+    ];
+    after.extend(touched.iter().map(|(p, b)| (p.as_str(), Some(b.as_str()))));
+    let rows = assert_incremental_graph_matches_rebuild(&before, &after);
+    assert!(
+        rows.iter()
+            .any(|r| r == "app_imp.py.<module> --imports[extracted]--> <external>.Y"),
+        "{:#?}",
+        rows.iter()
+            .filter(|r| r.starts_with("app_imp"))
+            .collect::<Vec<_>>()
+    );
+}

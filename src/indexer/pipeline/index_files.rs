@@ -2768,6 +2768,8 @@ Restart every code-graph server on this project so they run one version.",
     let plan = plan_batches(&files, root, BATCH_SIZE, BATCH_MAX_BYTES);
     let multi_batch = plan.len() > 1;
     let mut batch_start = 0usize;
+    // The run's files whose batch is done: their node ids are final.
+    let mut done_paths: HashSet<String> = HashSet::new();
     for batch_len in plan {
         let batch = &files[batch_start..batch_start + batch_len];
         batch_start += batch_len;
@@ -2894,8 +2896,10 @@ Restart every code-graph server on this project so they run one version.",
             &batch_file_ids,
             &saved_inbound_edges,
             &run_file_paths,
+            &done_paths,
             &mut deferred,
         )?;
+        done_paths.extend(batch_file_paths.iter().map(|p| p.to_string()));
 
         tx.commit()?;
 
@@ -3459,6 +3463,7 @@ fn restore_inbound_edges(
         Option<String>,
     )],
     run_file_paths: &HashSet<&str>,
+    done_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
@@ -3626,17 +3631,19 @@ fn restore_inbound_edges(
                 if src_path.is_empty() {
                     continue; // source file row gone — nothing to requeue for
                 }
-                if run_file_paths.contains(src_path.as_str()) {
-                    // The source file is in THIS RUN's changed set (an earlier
-                    // OR a later batch): its own batch (re)extracts every
-                    // relation with fresh node ids, so there is nothing to
-                    // requeue — and requeuing would capture a source_id that a
-                    // LATER batch's cascade-delete turns dangling, aborting the
-                    // whole run on the edges FK when the deferred pass inserts
-                    // (pre-tag review Critical-1: >500 changed files + a
-                    // rename reproduced `FOREIGN KEY constraint failed`, with
-                    // the index left missing every deferred edge and no
-                    // self-heal).
+                if run_file_paths.contains(src_path.as_str()) && !done_paths.contains(&src_path) {
+                    // The source file is in a LATER batch of this run: its own
+                    // batch (re)extracts every relation with fresh node ids, so
+                    // there is nothing to requeue — and requeuing would capture
+                    // a source_id that batch's cascade-delete turns dangling,
+                    // aborting the whole run on the edges FK when the deferred
+                    // pass inserts (pre-tag review Critical-1: >500 changed
+                    // files + a rename reproduced `FOREIGN KEY constraint
+                    // failed`, with the index left missing every deferred edge
+                    // and no self-heal). One in an EARLIER batch is requeued:
+                    // its ids are final, and the relation it resolved against
+                    // this file's old nodes is gone with them (D#518; review of
+                    // 0.175.0, round 2, MEDIUM 2).
                     skipped_intra_batch += 1;
                     continue;
                 }
