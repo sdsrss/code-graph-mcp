@@ -54,8 +54,9 @@ the reason text below); with `--include-tests` and no limit it lists 683
 `ambiguous` ones instead of 883.
 
 An incremental index agrees with a fresh one wherever the build before this
-change did, except for a function calling both `m.X()` and a bare `X()`
-(under Not covered): over the 65 incremental scenarios of D#370(a)'s two
+change did, except for a function calling both `m.X()` and a bare `X()`,
+and for a run that moves a name into the second file of a module path
+naming two (both under Not covered): over the 65 incremental scenarios of D#370(a)'s two
 reviews, 64 agree with either build (p15, a renamed re-export, disagrees as
 before); over the 1,789 steps of 0.175.0's reviews, 262 disagree with either
 build, the same steps; over the 1,205 steps of this change's review, 362
@@ -63,10 +64,12 @@ disagree with 0.175.0 and 276 with this build, and the 3 where only this
 build disagrees are that function's.
 Cost: a full index takes more CPU (medians over 7 alternating runs: networkx
 3.73 → 3.96 s, the standard library 5.47 → 5.67 s). An incremental run
-takes longer, medians over 15 alternating runs: an edit of
-`networkx/algorithms/cycles.py` 107 → 114 ms, of `networkx/__init__.py` 101
-→ 127 ms, of `networkx/classes/graph.py` 425 → 444 ms; adding a module 78 →
-83 ms on networkx and 98 → 106 ms on the standard library.
+takes longer; medians over 15 and over 41 alternating runs, in two sessions
+on a shared machine: an edit of `networkx/algorithms/cycles.py` 107 → 114
+and 124 → 133 ms, of `networkx/__init__.py` 101 → 127 and 110 → 139 ms, of
+`networkx/classes/graph.py` 425 → 444 and 438 → 461 ms; adding a module 78
+→ 83 and 63 → 73 ms on networkx, 98 → 106 and 113 → 114 ms on the standard
+library.
 
 ### Python: an import whose module path names two files follows both
 
@@ -75,7 +78,8 @@ takes longer, medians over 15 alternating runs: an edit of
 pkg` names both `pkg.py` and `pkg/__init__.py`; a fresh index binds `h` in
 each that defines it. When the second file gained `h`, an incremental index
 kept only the first until the importing file was edited. The importer is now
-re-read. A full index is unchanged. Over 12 incremental steps of that shape
+re-read, unless the same run removed `h` from another file (under Not
+covered). A full index is unchanged. Over 12 incremental steps of that shape
 from this change's review, 0.175.0 disagreed with a fresh index after 3 and
 this build after none.
 
@@ -148,6 +152,13 @@ flask none of 683 are (883 before the change above).
   library's 21 calls into `os.fsencode` and `os.fsdecode`, which `os.py`
   defines inside `_fscodec()` and assigns at module level, were `inferred`
   before.
+- A run that moves `h` into the second file a module path names, out of a
+  third file (`lib/z.py` loses `h`, `helpers.py` gains it, `tests/helpers.py`
+  has it already), does not re-read the importer: `import helpers;
+  helpers.h()` keeps only `tests/helpers.py`'s `h`, which 0.175.0, resolving
+  the call by name, had right; `from helpers import h` keeps it in 0.175.0
+  too. flask, networkx and the standard library import no module path that
+  names two files.
 - A function that calls both `m.X()` and a bare `X()` before any file
   defines `X`: once `m.py` defines it, an incremental index binds the `m.X()`
   call and not the bare one, as 0.175.0 did. 0.175.0 then caught up when a

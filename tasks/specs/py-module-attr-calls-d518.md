@@ -1,6 +1,6 @@
 # Python `import P` + `P.X()` 经导入边绑定（D#518，接 D#515，2026-10-21）
 
-状态：已实现（INDEX_VERSION 123 → 124，`33fbf845`）；第 1 轮评审（1 MEDIUM、7 LOW）已修，待修复提交的复审。
+状态：已实现（INDEX_VERSION 123 → 124，`33fbf845`）；第 1 轮评审（1 MEDIUM、7 LOW）已修（`e699bdec`、`ebfea33e`、`91085214`、`f6e8c932`）；修复的复审（第 2 轮，1 MEDIUM、4 LOW）已处理：撤回 `d99f628b`（`cd0be77c`），其余写进 Not covered 或登记待办。到评审止损线，不再打补丁。
 
 ## 背景
 
@@ -65,6 +65,13 @@
   - LOW-6 成立：surprising 测试加 `type` 别名的调用和对 interface 的 `references`，T1、T2 变异都被杀死。
   - LOW-7：embedding 回填排序按入边数，合成导入让 `pkg.X` 多算一次，与 `from pkg import X` + `X()` 的计法相同，回填完成后向量集合不变；不改。测试专用的 CTE oracle 不改。
 
+- 第 2 轮评审（新子代理，盲审 `33fbf845..f6e8c932`，HIGH 0 · MEDIUM 1 · LOW 4）：
+  - MEDIUM-1 成立（复现：`/var/tmp/d518r2/tools/par.py scn/twofile3.py r11_`，attr 形式 0.175.0 一致、c2 不一致；from 形式三个构建都不一致）。二文件重读由 `cg_fanout_up`（本次运行里名字的总数上升）触发，一次运行把 `h` 从第三个文件挪进第二个文件时总数不变。修需要按文件的前后快照，会让每次运行都建模块表，且已到第 3 轮评审的止损线：写进 Not covered，登记待办。flask、networkx、标准库没有导入指两个文件的模块路径（近似模块表：flask 2 个多文件路径 `conftest`/`tests.conftest`，导入 0 次；networkx、标准库 0 个；索引里绑到两个文件的 `import M` 三个语料都是 0）。
+  - LOW-2 成立（同批次里获得名字的文件排在另一个文件之前时，另一个文件的 `<module>` 合成导入在 DELETE 之后被按名回填，残留）。只差一条合成导入，所有回答都过滤它，调用边不受影响：登记待办（修法：回填 `<module>` 合成导入前查 `requeued_typed`）。
+  - LOW-3 不成立：1,789 步里 262 步不一致是对的。评审按（场景名, 步号）去重得 191，但 256 个重名场景内容都不同（cases1–6 与 s1–s8 同名不同内容），是不同的场景。
+  - LOW-4 成立：范围版 `cg_attr_imports` 对热点文件比全局版慢（`classes/graph.py` 3.1 vs 1.07 ms），端到端无差别（41 次，464 vs 459 ms）。撤回 `d99f628b`；撤回后的状态即评审的 `cgm-headG`，与范围版在 1,023 个场景每一步结果相同。
+  - LOW-5：回填路径的计数（M4）、DELETE 的 `attr_import.is_some()` 守卫（M13）没有测试钉住；M13 去掉守卫后 DELETE 也会对重排的调用执行，deferred 会重建它们的目标集，危害未验证。不改。
+
 ## 验证记录
 
 - RED：解析器测试 `a_call_on_a_python_module_name_names_the_module_attribute` 在实现前失败（没有 `attr`）。管线测试在实现过程中逐个写、逐个失败后修（s18 的 pending 合并、大运行早批次、`<module>` 回落的回填）。
@@ -81,3 +88,4 @@
   - 开销（15 次交替中位数；另一个会话在跑 vitest，负载 3–10）：c2 对 `33fbf845` 不更慢（标准库 `json/__init__.py` 125 vs 122 ms，networkx 四种编辑持平或更快）。D#518 整体（`cgm-A` → c2）：networkx `cycles.py` 107 → 114、`__init__.py` 101 → 127、`classes/graph.py` 425 → 444、新增模块 78 → 83 ms；标准库新增模块 98 → 106 ms。
   - 本仓库当前树：用户边 17,320 → 17,290（ambiguous −32、inferred +2，全在 `scripts/test_plugin_usage.py`），合成导入 20。flask `surprising --include-tests --limit 100000`：883 → 683 条 ambiguous，都是 several candidates；默认 15 条除原因文字外相同。
   - `cargo test --no-fail-fast`：2,327 通过、1 失败（抽取指纹守卫：源文件变了，全量索引不变 → 不升版本，重录指纹后 7/7 通过）。
+- 第 2 轮评审之后：撤回提交 `cd0be77c` 过 pre-commit（cargo check、全量 test、clippy 两条腿）。评审在 f6e8c932 上 `cargo test --no-fail-fast` 2,328 通过；十个语料全量 f6e8c932 与 33fbf845 逐边相同；运行摘要边数 = health-check（十个语料）。CHANGELOG 开销数改为两次会话各自的中位数（本会话 15 次、评审 41 次）。
