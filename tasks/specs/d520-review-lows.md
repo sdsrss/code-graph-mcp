@@ -52,3 +52,17 @@
   - 0.175.0 两轮 1,789 步：两臂都是 262 步，逐步裁决相同。D#370(a) 65 个 + big_run_attr：两臂都是 65/66（p15）。第 2 轮 twofile2–4：两臂相同（D#542 的形状）。
   - flask 随机编辑 3×30：pre176 2/0/1，low7 1/0/1；seed 1 op6 改名 `sansio/blueprints.py` 少 6 条（`tests/test_blueprints.py` 六个测试函数进 `Blueprint.register_blueprint`）修好；剩下 2 次是 `typing.py` 自导入（7'）。
   - 降级：low7 建的 flask 索引，0.175.0 `health-check`、`callgraph` 退出码 0（照旧打印"newer index"警告），`rebuild-index --confirm` 建出旧定义的索引；low7 再打开（health-check，读者路径）即改为新定义，增量运行后 INDEX_VERSION 124、pending 923。
+
+## 0.176.0 发版前评审（第 1 轮，新子代理，盲审 `f6e8c932..d7a18c5d`：HIGH 0 · MEDIUM 3 · LOW 6）
+
+逐条复核后的处理：
+- F1 MEDIUM 成立（复现：0.175.0 建的 flask 索引 `chmod 444` 后 low7 的 `health-check`/`callgraph`/`show` 退出码 1，`attempt to write a readonly database`；另一连接持 `BEGIN IMMEDIATE` 8 秒时 low7 `health-check` 退出码 1，`database is locked`；f31bbf5e 都是 0）。修：只在索引器打开（`revalidate`）时转换；读者打开不写。RED：db 测试加"读者打开后 schema_version 不变"（修前 33 ≠ 31）。`03b01c4f` 构建（`cgm-fix2` md5 `36e0f6c2…`）上同样的复现全部退出码 0，读者不改定义，`incremental-index` 后转换，0.175.0 仍能读、能 `rebuild-index --confirm`。
+- F2 MEDIUM 成立：改名那条腿在改名前对 `q.py` 没有边，什么也没钉住。改为 `q.py` 里的方法 `K.X`（`m.X()` 与 `o.X()` 两条边都进它，即 flask 的形状）；单独跑这条腿，旧键下失败（缺 `{"q":"member"}` 那条）。
+- F3 MEDIUM 成立：flask 随机编辑的数字是"引入新差异的编辑数"（0.175.0 6、f31bbf5e 3、本版 2），差异会延续，"之后不一致的编辑数"是 33 / 32 / 20（自己从日志重算，与评审一致）。两处 CHANGELOG 都写明两种数。
+- F4 LOW 成立：pending 行数补全十个语料（本仓库 12,181 → 13,320 最多），并写开销：本仓库编辑 `src/storage/db.rs` 中位数 306 → 307 ms（15 次）、300 → 308 ms（41 次），自己测。
+- F5 LOW 成立：第 2 轮 101 步里本版在 0.175.0 一致的 6 步不一致（q03、r11 = Not covered 的形状；q20、q23、q24、r06 = 多留一条合成导入，D#542 (2)，f31bbf5e 起就有）。q20 自己复现：增量 2 条合成导入、重建 1 条，7 个命令输出逐字节相同。CHANGELOG 句子改为写明这两个例外，Not covered 加一条。
+- F6 LOW 成立：1,789 行里 863 行是第 0 步（与自身比较），比较步是 926（不含改名 922）；CHANGELOG 分母改为 926 / 922 / 改名 4。
+- F7 LOW 成立（并发首次打开各自重建，结果相同）：只改文档措辞，不改代码。
+- F8 LOW 成立：三处注释改为历史原因。
+- F9 LOW：M6b 成立，加 `a_fresh_db_buffers_a_call_without_metadata_once`（M6b 下 2 ≠ 1）。M13（编辑路径重排按调用者和名字去重）是否有可达形状未验证：登记待办。
+- 范围外：本仓库 Rust 随机编辑 30 次里 16 次增量与重建不一致（f31bbf5e 与本版相同；恢复删除的文件后带路径的 calls/references 缺失，如恢复 `src/indexer/pipeline/mod.rs` 后少 96 条）：登记待办，不在本版修。

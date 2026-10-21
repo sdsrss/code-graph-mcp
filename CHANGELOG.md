@@ -54,13 +54,16 @@ the reason text below); with `--include-tests` and no limit it lists 683
 `ambiguous` ones instead of 883.
 
 An incremental index agrees with a fresh one wherever the build before this
-change did, except for a run that moves a name into the second file of a
-module path naming two (under Not covered): over the 65 incremental
-scenarios of D#370(a)'s two reviews, 64 agree with either build (p15, a
-renamed re-export, disagrees as before); over the 1,789 steps of 0.175.0's
+change did, apart from a run that moves a name into the second file of a
+module path naming two, and from the internal imports, of which it can keep
+one more (both under Not covered): over the 65 incremental scenarios of
+D#370(a)'s two reviews, 64 agree with either build (p15, a renamed
+re-export, disagrees as before); over the 926 incremental steps of 0.175.0's
 reviews, 262 disagree with either build, the same steps; over the 1,205
-steps of this change's review, 362 disagree with 0.175.0 and 270 with this
-release, none of them a step where 0.175.0 agreed.
+steps of this change's first review, 362 disagree with 0.175.0 and 270 with
+this release, none of them a step where 0.175.0 agreed; over the 101 steps
+of its second review, this release disagrees after 6 where 0.175.0 agreed,
+2 of them that run and 4 the extra internal import.
 Cost: a full index takes more CPU (medians over 7 alternating runs: networkx
 3.73 → 3.96 s, the standard library 5.47 → 5.67 s). An incremental run
 takes longer; medians over 15 and over 41 alternating runs, in two sessions
@@ -99,13 +102,16 @@ file itself was edited (both listed under 0.175.0's Not covered):
 
 A full index is unchanged: the seven corpora of 0.174.0, networkx and the
 standard library give the same edges, labels and metadata as 0.175.0. Over
-the 1,781 incremental steps of 0.175.0's two reviews, an incremental index
+the 922 incremental steps of 0.175.0's two reviews, an incremental index
 differed from a fresh one after 335 with 0.175.0 and 330 with this build, and
 after no step where 0.175.0 did not; the 330 are 0.175.0's Not covered shapes
-of a method `Y` beside a function `Y`, and of a renamed class. On flask, 90 random edits (renames, deletions,
-restores, `__init__.py` added or removed) left the incremental index
-different after 6 with 0.175.0 and 2 with this release (both under Not
-covered; a rename among the 6 is the change two sections below). Cost: adding a
+of a method `Y` beside a function `Y`, and of a renamed class. On flask, in
+90 random edits (renames, deletions, restores, `__init__.py` added or
+removed; three runs of 30), 6 edits made the incremental index differ from a
+fresh one with 0.175.0 and 2 with this release (both under Not covered; a
+rename among the 6 is the change two sections below). A difference stays
+until a later edit repairs it, so the index differed after 33 of the 90
+edits with 0.175.0 and after 20 with this release. Cost: adding a
 module now also compares the module paths before and after, medians over 7
 alternating runs 113 → 117 ms on the standard library and 85 → 91 ms on
 networkx.
@@ -120,8 +126,8 @@ resolved again, and stayed missing until the importer was edited again. It
 is now resolved again, as a fresh index resolves it.
 
 A full index is unchanged (flask and networkx: same edges as 0.175.0). Over
-the 1,781 incremental steps of 0.175.0's reviews (and 8 more steps of renames
-added here), an incremental index differed from a fresh one after 330 with
+the 922 incremental steps of 0.175.0's reviews (and 4 more of renames added
+here), an incremental index differed from a fresh one after 330 with
 the build before this change and 262 with it, and after no step where it did
 not before; the 68 it repairs are runs of more than 500 changed files.
 
@@ -135,19 +141,25 @@ bare `X()` before any file defines `X`; or, on flask, when
 `Blueprint.register_blueprint` from six test functions in
 `tests/test_blueprints.py` that call `register_blueprint` both on a blueprint
 and on the app. Both calls are now kept. An index built by an earlier version
-is converted the first time this version opens it; 0.175.0 still opens a
-converted index.
+is converted the first time this version indexes it; a command that only
+reads the index leaves it as it was, so a read-only index, or one another
+process is writing, still answers. 0.175.0 still opens a converted index.
 
 A full index gives the same edges as before on the seven corpora of 0.174.0,
-networkx, the standard library and this repository as it is now, and keeps a
-few more calls for later (flask 921 → 923, hono 3,005 → 3,026, networkx 8,834
-→ 8,848, the standard library 8,556 → 8,560). Over the 1,205 incremental steps
-of the `P.X()` change's review, an incremental index differed from a fresh one
-after 276 steps before this change and 270 with it, and after no step where
-it agreed before; over the 1,789 steps of 0.175.0's reviews and the 66
-scenarios of D#370(a)'s reviews and the `P.X()` change, it differs after the
-same ones as before. On flask, the 90 random edits above differ after 3
-before this change and 2 with it.
+networkx, the standard library and this repository as it is now, and keeps
+more calls for later: this repository 12,181 → 13,320 (8,828 → 9,917 as of
+0.174.0), leveldb 1,854 → 1,911, hono 3,005 → 3,026, networkx 8,834 → 8,848,
+the standard library 8,556 → 8,560, flask 921 → 923; express, gin and gson
+the same. An incremental run reads all of them; an edit of
+`src/storage/db.rs` in this repository took 306 → 307 ms and 300 → 308 ms
+(medians over 15 and over 41 alternating runs). Over the 1,205 incremental
+steps of the `P.X()` change's first review, an incremental index differed
+from a fresh one after 276 steps before this change and 270 with it, and
+after no step where it agreed before; over the 926 steps of 0.175.0's
+reviews, the 101 of the `P.X()` change's second review and the 66 scenarios
+of D#370(a)'s reviews and the `P.X()` change, it differs after the same ones
+as before. On flask, of the 90 random edits above, 3 made the index differ
+before this change and 2 with it, and it differed after 32 and 20 of them.
 
 ### `surprising` names a TypeScript type only for a call into one
 
@@ -179,6 +191,13 @@ flask none of 683 are (883 before the change above).
   the call by name, had right; `from helpers import h` keeps it in 0.175.0
   too. flask, networkx and the standard library import no module path that
   names two files.
+- The internal import a `P.X()` call records can outlive a run that edits two
+  files of one module path where neither defined `X`: when `scripts/utils.py`
+  gains `run` and `tools/utils.py` is edited in the same run, an incremental
+  index keeps the import of `utils.run()` into `tools/utils.py` that a fresh
+  index drops. No command shows these imports; there, `deps`, `affected`,
+  `refs`, `callgraph`, `impact`, `map` and `dead-code` answer as for a fresh
+  index.
 - `P.X()` binds nothing new when the name resolution never binds `X` across
   files (a short list of very common names: `get`, `close`, `read`, `write`,
   `join`, `map`, `filter`, …); it stays without an edge.
