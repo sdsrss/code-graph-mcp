@@ -879,13 +879,16 @@ fn insert_relation_edges(
     metadata: Option<&str>,
     allow_self: bool,
 ) -> Result<usize> {
+    // A `P.X()` call's synthetic import (D#518) is no edge of the graph a user
+    // is told about.
+    let counted = usize::from(!crate::domain::is_synthetic_import(relation, metadata));
     let mut created = 0usize;
     for &src_id in sources {
         for &tgt_id in targets {
             if (src_id != tgt_id || allow_self)
                 && insert_edge_cached(db.conn(), src_id, tgt_id, relation, metadata)?
             {
-                created += 1;
+                created += counted;
             }
         }
     }
@@ -3635,7 +3638,10 @@ fn restore_inbound_edges(
                             metadata.as_deref(),
                         )?
                     {
-                        edges_created += 1;
+                        edges_created += usize::from(!crate::domain::is_synthetic_import(
+                            relation.as_str(),
+                            metadata.as_deref(),
+                        ));
                         restored += 1;
                     }
                 }
@@ -4981,9 +4987,10 @@ fn build_context_strings_and_embed(
 
 /// Result of the three global edge post-passes, in the caller's accounting terms.
 struct GlobalPostPassCounts {
-    /// Bare calls newly bound to the target an explicit import names.
+    /// Calls newly bound to the target an explicit import names: bare calls,
+    /// and `P.X()` calls through their synthetic import (D#518).
     bound: usize,
-    /// Proximity-picked call edges dropped as contradicted by that import.
+    /// The other edges of those calls, dropped as contradicted by the import.
     pruned: usize,
 }
 
@@ -5053,7 +5060,10 @@ fn run_global_edge_post_passes(
         );
     }
 
-    Ok(GlobalPostPassCounts { bound, pruned })
+    Ok(GlobalPostPassCounts {
+        bound: bound + attr_bound,
+        pruned: pruned + attr_pruned,
+    })
 }
 
 #[cfg(test)]

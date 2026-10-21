@@ -13800,6 +13800,35 @@ fn a_module_path_naming_two_files_rebinds_its_importers_when_either_changes() {
     );
 }
 
+// A run reports the edges of the graph it leaves: a `P.X()` call's synthetic
+// import is none of them, and the pass that binds the call through it adds and
+// removes some (review of D#518, LOW-2).
+#[test]
+fn a_full_run_counts_the_edges_a_health_check_reports() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    for (name, body) in [
+        ("pkg/__init__.py", "def X():\n    pass\n"),
+        ("zzz/decoy.py", "def X():\n    pass\n"),
+        ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+        (
+            "app2.py",
+            "import pkg\n\ndef X():\n    pass\n\ndef g():\n    pkg.X()\n",
+        ),
+    ] {
+        fs::create_dir_all(project_dir.path().join(name).parent().unwrap()).unwrap();
+        fs::write(project_dir.path().join(name), body).unwrap();
+    }
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        result.edges_created as i64,
+        crate::storage::queries::count_user_edges(db.conn()).unwrap(),
+        "{:#?}",
+        graph_rows(&db)
+    );
+}
+
 // A run of more than one batch: an importer in an earlier batch resolved
 // `from pkg.m import Y` against `m.py`'s old nodes, and `m.py`'s later batch
 // drops `Y`. The import is requeued, as a rebuild re-resolves it, instead of

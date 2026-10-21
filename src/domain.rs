@@ -103,6 +103,11 @@ pub fn synthetic_import_sql(alias: &str) -> String {
     };
     format!("({p}relation = 'imports' AND COALESCE({p}metadata, '') LIKE '%\"attr\":%')")
 }
+
+/// [`synthetic_import_sql`] for one edge in hand.
+pub fn is_synthetic_import(relation: &str, metadata: Option<&str>) -> bool {
+    relation == REL_IMPORTS && metadata.is_some_and(|m| m.contains(r#""attr":"#))
+}
 pub const REL_ROUTES_TO: &str = "routes_to";
 pub const REL_IMPLEMENTS: &str = "implements";
 pub const REL_EXPORTS: &str = "exports";
