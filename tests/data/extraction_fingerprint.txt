@@ -8,5 +8,5 @@
 extraction_fingerprint = 97613d803888622963ab2e19323327f19de49b36e5bce7ea6f00a05d3bc352ac
 extraction_recorded_at_index_version = 124
 
-schema_fingerprint = a41b7f64d024fabc545dfd2f193df03581b00a12b8ef668b3d19ff59bb3f2272
+schema_fingerprint = 0e9515eb0fa3298d6e0ed71eb37f8a870d2429206217dc5217218387902aec2d
 schema_recorded_at_schema_version = 10

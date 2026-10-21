@@ -198,7 +198,9 @@ CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
 CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
+-- `metadata` is part of the key: one caller's `m.X()` and `X()` are two calls of
+-- `X`, and each must be buffered (see widen_pending_unique_index).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language, COALESCE(metadata, ''));
 
 -- C++ class fields and the class a call through each names (`dot` for `x.f()`,
 -- `arrow` for `x->f()`), recorded from the class body's own file. A member
@@ -474,6 +476,40 @@ pub fn migrate_v9_to_v10(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         )?;
     }
     tracing::info!("[schema] Migration v9->v10 complete.");
+    Ok(())
+}
+
+/// Rebuild `idx_pending_unique` with `metadata` in its key when the stored
+/// definition is the one from before 0.176.0, `(source_id, target_name,
+/// source_language)`. Under it one caller's `m.X()` and `X()` (or `m.X()` and
+/// `o.X()`) kept one pending row between them, and the sweep bound one of the
+/// two calls a rebuild binds (review of 0.175.0, LOW 7). Runs after
+/// `create_tables_sql`, whose `IF NOT EXISTS` leaves an existing index of that
+/// name as it is, and writes only when the definition is the old one.
+///
+/// No SCHEMA_VERSION bump: the wider index accepts every set of rows the old one
+/// did, so an older binary keeps working on a rebuilt index, and its own
+/// `CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique` finds the name and
+/// does nothing.
+pub fn widen_pending_unique_index(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_pending_unique'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if sql.is_some_and(|s| s.contains("metadata")) {
+        return Ok(());
+    }
+    tracing::info!("[schema] Rebuilding idx_pending_unique with metadata in its key");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_pending_unique;
+         CREATE UNIQUE INDEX idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language, COALESCE(metadata, ''));",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

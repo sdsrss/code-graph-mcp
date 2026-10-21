@@ -87,7 +87,7 @@ pub fn insert_edge_cached(
 /// Buffer a REL_CALLS edge that Phase 2 couldn't resolve against same-file
 /// or same-language candidates so a later resolution sweep can claim it once
 /// the callee is added. Idempotent via the unique index on
-/// (source_id, target_name, source_language).
+/// (source_id, target_name, source_language, metadata).
 pub fn insert_pending_unresolved_call(
     conn: &Connection,
     source_id: i64,

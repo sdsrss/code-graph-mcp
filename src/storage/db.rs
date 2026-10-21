@@ -368,6 +368,7 @@ impl Database {
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
+        schema::widen_pending_unique_index(&conn)?;
 
         if enable_vec {
             conn.execute_batch(&schema::create_vec_tables_sql())?;
@@ -1833,6 +1834,79 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
+    }
+
+    /// An index from before 0.176.0 keys `idx_pending_unique` without
+    /// `metadata`. Opening it rebuilds the index with it, keeps the rows, writes
+    /// the schema only that once, and leaves an index an older binary still
+    /// opens: no SCHEMA_VERSION bump, for the reasons given on
+    /// [`test_open_adds_composite_file_name_index_to_an_older_db`].
+    #[test]
+    fn opening_an_older_db_puts_metadata_in_the_pending_unique_key() {
+        use crate::storage::queries::{
+            count_pending_unresolved_calls, insert_pending_unresolved_call,
+        };
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(&schema::create_tables_sql()).unwrap();
+            c.execute_batch(
+                "DROP INDEX idx_pending_unique;
+                 CREATE UNIQUE INDEX idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
+                 INSERT INTO files (id, path, blake3_hash, last_modified, language, indexed_at)
+                     VALUES (1, 'app.py', 'h', 0, 'python', 0);
+                 INSERT INTO nodes (id, file_id, type, name, start_line, end_line, code_content)
+                     VALUES (1, 1, 'function', 'f', 3, 5, 'def f(): ...');",
+            )
+            .unwrap();
+            insert_pending_unresolved_call(&c, 1, "X", "python", None).unwrap();
+            c.pragma_update(None, "user_version", schema::SCHEMA_VERSION)
+                .unwrap();
+            c.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)
+                .unwrap();
+        }
+        let module = Some(r#"{"q":"module","v":"m"}"#);
+        // Precondition: the old key drops the second call of `X`.
+        {
+            let c = Connection::open(&db_path).unwrap();
+            insert_pending_unresolved_call(&c, 1, "X", "python", module).unwrap();
+            assert_eq!(count_pending_unresolved_calls(&c).unwrap(), 1);
+        }
+
+        drop(Database::open(&db_path).unwrap());
+        let c = Connection::open(&db_path).unwrap();
+        let schema_cookie = |c: &Connection| -> i64 {
+            c.pragma_query_value(None, "schema_version", |r| r.get(0))
+                .unwrap()
+        };
+        let after_first_open = schema_cookie(&c);
+        assert_eq!(
+            count_pending_unresolved_calls(&c).unwrap(),
+            1,
+            "rows survive"
+        );
+        insert_pending_unresolved_call(&c, 1, "X", "python", module).unwrap();
+        insert_pending_unresolved_call(&c, 1, "X", "python", module).unwrap();
+        insert_pending_unresolved_call(&c, 1, "X", "python", None).unwrap();
+        assert_eq!(
+            count_pending_unresolved_calls(&c).unwrap(),
+            2,
+            "one row per (caller, name, language, metadata)"
+        );
+        // An older binary's open runs its own definition, which finds the name.
+        c.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);",
+        )
+        .unwrap();
+
+        drop(Database::open(&db_path).unwrap());
+        assert_eq!(
+            schema_cookie(&c),
+            after_first_open,
+            "a second open must not rewrite the index"
+        );
     }
 
     /// The composite `nodes(file_id, name)` index the three global edge

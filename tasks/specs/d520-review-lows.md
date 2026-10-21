@@ -1,6 +1,6 @@
 # 0.175.0 两轮评审剩下的 LOW（D#520，2026-10-21）
 
-状态：LOW 5、6、11 已实现（全量索引不变，INDEX_VERSION 不升）；LOW 7 待授权。
+状态：LOW 5、6、11 已实现（全量索引不变，INDEX_VERSION 不升）；LOW 7 已授权（2026-10-21），已实现，随 0.176.0 发布。
 
 ## 背景
 
@@ -27,12 +27,14 @@
 2. LOW 5/5'：本次出现或消失的 `D/__init__.py`（`D` 非空），拉取相对导入解析到 `D` 的 Python 文件，包括已绑定的边（`python_module` 以 `.` 开头）和 `<external>` 哨兵（名字以 `.` 开头）。解析与 `project_module_files_from` 共用一个函数，只算路径。
    实现时去掉了"`changed` 为空但有包变化"的分支：`__init__.py` 出现或消失时它自己的模块路径就变了，`changed` 不会为空（变异 M5 存活，是等价变异）。
 3. LOW 11：原因文字按边判断：调用、目标是 `interface`/`type`、目标文件是 TypeScript 时写 TypeScript 类型，其余写"several candidates"。判断与 `classify_edge_confidence` 的 `TS_TYPE_CALL` 一致。
-4. LOW 7（待授权）：`pending_unresolved_calls` 唯一索引是 `(source_id, target_name, source_language)`，同一调用者两个同名、元数据不同的调用（flask `test_blueprint_renaming` 里 `bp.register_blueprint` 是 `{"q":"member"}`，`app.register_blueprint` 是 `{"q":"module","v":"blueprintapp"}`）缓冲时只留第一条。改成 `(source_id, target_name, source_language, COALESCE(metadata, ''))` 需要迁移旧库的索引。
+4. LOW 7（2026-10-21 授权）：`pending_unresolved_calls` 唯一索引是 `(source_id, target_name, source_language)`，同一调用者两个同名、元数据不同的调用（flask `test_blueprint_renaming` 里 `bp.register_blueprint` 是 `{"q":"member"}`，`app.register_blueprint` 是 `{"q":"module","v":"blueprintapp"}`）缓冲时只留第一条。改成 `(source_id, target_name, source_language, COALESCE(metadata, ''))` 需要迁移旧库的索引。
+   实现：`create_tables_sql` 的定义改为带 `COALESCE(metadata, '')`（与 `idx_edges_unique` 同形）；打开数据库时 `schema::widen_pending_unique_index` 读 `sqlite_master` 里的定义，没有 `metadata` 才在一个事务里 DROP + CREATE，所以只写一次。不升 SCHEMA_VERSION：新索引接受旧索引接受的每一组行，0.175.0 打开迁移后的库时自己的 `CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique` 按名字不做事，照常工作；升 SCHEMA_VERSION 会让旧版本拒绝打开、health-check 报 UNHEALTHY（`test_open_adds_composite_file_name_index_to_an_older_db` 的同一理由）。同时覆盖 D#518 第 1 轮的 LOW-1（同一函数里 `m.X()` 与裸 `X()`）。
 
 ## 决策
 
 - 2026-10-21：分级 L2（恢复增量 = 重建；改动在 `src/indexer/` 一个模块内，加上 `src/graph/surprising.rs` 的文字）。全量索引不变，INDEX_VERSION 不升。
 - LOW 3、8 不做，理由见上表；写进 CHANGELOG 的 Not covered。
+- 2026-10-21：LOW 7 获授权，分级 L3（索引结构迁移）。D#519 按方案 (a) 结案：保留已知问题（用户回复"把后面的做了"，按报告里的推荐理解）。
 
 ## 验证记录
 
@@ -43,3 +45,4 @@
 - flask 随机编辑（`fuzz.py` seed 1–3，各 30 次）：0.175.0 不一致 6 次，新版 3 次（改名 1 次 = LOW 7；`typing.py` 自导入 2 次 = 7'）。
 - 开销（7 次交替的中位数）：新增模块 标准库 113 → 117 ms、networkx 85 → 91 ms；删 `networkx/utils/__init__.py` 1340 vs 1302 ms（5 次，都重抽 186 个文件）；flask 删 `task_app/__init__.py` 36 vs 33 ms（2 → 3 个文件）；flask 普通编辑 48 vs 51 ms。
 - `surprising --include-tests`：hono 1,748 条 `ambiguous` 中 73 条改为 TypeScript 类型的文字，其余 1,675 条为 several candidates；flask 883 条都是 several candidates。
+- LOW 7：RED `two_unresolved_calls_of_one_name_are_buffered_apart`（修前增量缺 `app.py.f --calls[inferred]--> m.py.X`，即裸 `X()`）；`opening_an_older_db_puts_metadata_in_the_pending_unique_key`。变异：去掉打开时的调用 → 行数 1 ≠ 2；去掉"已是新定义就返回" → 第二次打开 schema_version 35 ≠ 33。两个都被杀死。

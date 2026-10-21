@@ -13800,6 +13800,43 @@ fn a_module_path_naming_two_files_rebinds_its_importers_when_either_changes() {
     );
 }
 
+// One caller, two unresolved calls of one name that differ only in how they
+// name it (`m.X()` and `X()`, `m.X()` and `o.X()`): both are buffered, and the
+// sweep binds each as a rebuild does (review of 0.175.0, LOW 7; review of
+// D#518, LOW-1).
+#[test]
+fn two_unresolved_calls_of_one_name_are_buffered_apart() {
+    let unresolved: &[(&str, &str)] = &[
+        ("m.py", "def other():\n    pass\n"),
+        ("app.py", "import m\n\ndef f():\n    m.X()\n    X()\n"),
+    ];
+    for gains in ["m.py", "q.py"] {
+        let rows = assert_incremental_graph_matches_rebuild(
+            unresolved,
+            &[(
+                gains,
+                Some("def other():\n    pass\n\ndef X():\n    pass\n"),
+            )],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.starts_with("app.py.f --calls"))
+                .count(),
+            2,
+            "{rows:#?}"
+        );
+    }
+    // The callee's file is renamed: both inbound calls are requeued.
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("m.py", "def other():\n    pass\n"),
+            ("q.py", "def X():\n    pass\n"),
+            ("app.py", "import m\n\ndef f(o):\n    m.X()\n    o.X()\n"),
+        ],
+        &[("q.py", None), ("r.py", Some("def X():\n    pass\n"))],
+    );
+}
+
 // A run reports the edges of the graph it leaves: a `P.X()` call's synthetic
 // import is none of them, and the pass that binds the call through it adds and
 // removes some (review of D#518, LOW-2).
