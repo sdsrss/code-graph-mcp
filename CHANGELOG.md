@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### `surprising` names a TypeScript type only for a call into one
+
+0.175.0 gave every `ambiguous` edge the reason "bare-name target not decided
+(several candidates, or a TypeScript type)", in every language. A call into a
+TypeScript `interface` or `type` alias now reads "a call into a TypeScript
+type, which exists only at compile time", and every other `ambiguous` edge
+"bare-name target not decided (several candidates)". On hono 73 of the 1,748
+`ambiguous` connections `surprising --include-tests` lists are such calls; on
+flask none of 883 are.
+
 ## 0.175.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 123

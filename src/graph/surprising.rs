@@ -32,6 +32,10 @@ pub struct SurpriseInput {
     pub relation: String,
     /// `edges.confidence`: extracted | inferred | ambiguous.
     pub confidence: String,
+    /// A call into a TypeScript `interface` or `type` alias, which the
+    /// resolver labels `ambiguous` whatever the candidates
+    /// (`classify_edge_confidence`).
+    pub type_call: bool,
 }
 
 /// A scored surprising connection with a human explanation of the score.
@@ -77,7 +81,7 @@ pub fn find_surprising(edges: &[SurpriseInput], top_n: usize) -> Vec<SurprisingC
         .map(|e| {
             let (ds, dt) = (dir_of(&e.source_file), dir_of(&e.target_file));
             let mut score = confidence_surprise(&e.confidence);
-            let mut reasons = vec![confidence_reason(&e.confidence)];
+            let mut reasons = vec![confidence_reason(&e.confidence, e.type_call)];
 
             if ds != dt {
                 score += CROSS_DIR_BONUS;
@@ -132,10 +136,11 @@ fn confidence_surprise(c: &str) -> i32 {
     }
 }
 
-fn confidence_reason(c: &str) -> String {
-    if c == CONF_AMBIGUOUS {
-        "ambiguous: bare-name target not decided (several candidates, or a TypeScript type)"
-            .to_string()
+fn confidence_reason(c: &str, type_call: bool) -> String {
+    if c == CONF_AMBIGUOUS && type_call {
+        "ambiguous: a call into a TypeScript type, which exists only at compile time".to_string()
+    } else if c == CONF_AMBIGUOUS {
+        "ambiguous: bare-name target not decided (several candidates)".to_string()
     } else if c == CONF_INFERRED {
         "inferred: cross-file bare-name resolution".to_string()
     } else {
@@ -168,7 +173,9 @@ pub fn surprising_connections(
         )
     };
     let sql = format!(
-        "SELECT ns.name, sf.path, nt.name, tf.path, e.relation, e.confidence \
+        "SELECT ns.name, sf.path, nt.name, tf.path, e.relation, e.confidence, \
+                e.relation = ?1 AND nt.type IN ('interface', 'type') \
+                AND tf.language IN ('typescript', 'tsx') \
          FROM edges e \
          JOIN nodes ns ON ns.id = e.source_id \
          JOIN files sf ON sf.id = ns.file_id \
@@ -188,6 +195,7 @@ pub fn surprising_connections(
             target_file: row.get(3)?,
             relation: row.get(4)?,
             confidence: row.get(5)?,
+            type_call: row.get(6)?,
         })
     })?;
     let mut inputs = Vec::new();
@@ -320,6 +328,7 @@ mod tests {
             target_file: tf.into(),
             relation: "calls".into(),
             confidence: conf.into(),
+            type_call: false,
         }
     }
 
@@ -401,6 +410,74 @@ mod tests {
         assert!(
             reasons.contains("sole"),
             "explains sole bridge; got: {reasons}"
+        );
+    }
+
+    // D#520 (review of 0.175.0, LOW 11): only a call into a TypeScript
+    // `interface` or `type` alias is said to be one; a Python call with several
+    // candidates, or a call into a Java interface, is not.
+    #[test]
+    fn the_ambiguous_reason_names_a_typescript_type_only_for_a_call_into_one() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        for (path, lang) in [
+            ("src/a.py", "python"),
+            ("lib/b.py", "python"),
+            ("src/c.ts", "typescript"),
+            ("lib/types.ts", "typescript"),
+            ("src/D.java", "java"),
+            ("lib/Svc.java", "java"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1,'h',0,?2,0)",
+                [path, lang],
+            )
+            .unwrap();
+        }
+        for (file, ty, name) in [
+            (1, "function", "go"),
+            (2, "function", "run"),
+            (3, "function", "make"),
+            (4, "interface", "Response"),
+            (5, "method", "call"),
+            (6, "interface", "Svc"),
+            (4, "function", "build"),
+        ] {
+            conn.execute(
+                "INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (?1,?2,?3,1,2,'',0)",
+                rusqlite::params![file, ty, name],
+            )
+            .unwrap();
+        }
+        for (s, t) in [(1, 2), (3, 4), (5, 6), (3, 7)] {
+            conn.execute(
+                "INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (?1,?2,'calls','ambiguous')",
+                [s, t],
+            )
+            .unwrap();
+        }
+        let r = surprising_connections(conn, false, 10).unwrap();
+        let reason = |target: &str| {
+            r.iter()
+                .find(|c| c.target == target)
+                .map(|c| c.reasons[0].clone())
+                .unwrap()
+        };
+        assert_eq!(
+            reason("run"),
+            "ambiguous: bare-name target not decided (several candidates)"
+        );
+        assert_eq!(
+            reason("Svc"),
+            "ambiguous: bare-name target not decided (several candidates)"
+        );
+        assert_eq!(
+            reason("build"),
+            "ambiguous: bare-name target not decided (several candidates)"
+        );
+        assert_eq!(
+            reason("Response"),
+            "ambiguous: a call into a TypeScript type, which exists only at compile time"
         );
     }
 
