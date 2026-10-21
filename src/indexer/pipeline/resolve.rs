@@ -226,6 +226,17 @@ pub(super) fn refine_ambiguous_targets(
     }
 }
 
+/// A `P.X()` call on a module name (`"attr"` beside `"q":"module"`, D#518).
+pub(super) fn is_module_attr_call(metadata: Option<&str>) -> bool {
+    metadata.is_some_and(|m| m.contains(r#""attr":"#) && m.contains(r#""q":"module""#))
+}
+
+/// The attribute a `P.X()` call's synthetic import names (`"attr"`, D#518).
+pub(super) fn python_attr_of(metadata: Option<&str>) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(metadata?).ok()?;
+    meta.get("attr")?.as_str().map(str::to_string)
+}
+
 /// The `pending_unresolved_calls.target_name` of a buffered call through a
 /// renamed import (D#120). The table is unique on (caller, target name,
 /// language), so the export's name alone let one caller's `m()` from './x' and
@@ -918,7 +929,9 @@ fn build_imports_temp(conn: &rusqlite::Connection, with_name: bool) -> Result<()
     conn.execute_batch("DROP TABLE IF EXISTS temp.cg_imports;")?;
     conn.execute(
         "CREATE TEMP TABLE cg_imports AS
-         SELECT mn.file_id AS fid, itn.name AS nm, ie.target_id AS tid
+         SELECT mn.file_id AS fid, itn.name AS nm, ie.target_id AS tid,
+                json_extract(ie.metadata, '$.attr') AS attr,
+                json_extract(ie.metadata, '$.python_module') AS module
          FROM edges ie
          JOIN nodes mn  ON mn.id  = ie.source_id
          JOIN nodes itn ON itn.id = ie.target_id
@@ -1554,7 +1567,8 @@ const PY_REEXPORT_SELECT: &str = "
     CROSS JOIN files tf ON tf.id = t.file_id
     WHERE json_extract(e.metadata, '$.python_module') IS NOT NULL
       AND json_extract(e.metadata, '$.is_module_import') IS NULL
-      AND json_extract(e.metadata, '$.as') IS NULL";
+      AND json_extract(e.metadata, '$.as') IS NULL
+      AND json_extract(e.metadata, '$.attr') IS NULL";
 
 /// Record what the Python files among `paths` re-export, before an
 /// `index_files` run rewrites them; [`importers_of_python_reexport_drift`]
@@ -2214,6 +2228,8 @@ pub(super) fn bind_calls_to_imported_targets(
          JOIN files itf ON itf.id = itn.file_id
          WHERE ie.relation = ?1
            AND itf.path <> '<external>'
+           -- a `P.X()` call's synthetic import binds no bare `X()` (D#518)
+           AND json_extract(ie.metadata, '$.attr') IS NULL
          GROUP BY mn.file_id, itn.name
          HAVING COUNT(DISTINCT itn.id) = 1",
         rusqlite::params![REL_IMPORTS],
@@ -2283,6 +2299,119 @@ pub(super) fn bind_calls_to_imported_targets(
     Ok(inserted)
 }
 
+/// Phase 2d-attr (D#518): a `P.X()` call on a module name binds what its
+/// file's synthetic import of `X` from that module binds, and nothing else,
+/// once the import found a definition rather than the module's `<module>` (its
+/// fallback). The call was first resolved by name like any other; this adds
+/// the import's targets under the call's own metadata, then removes the call's
+/// other edges. A same-file `X` does not shadow `P.X`, unlike in the bare bind.
+/// Returns `(bound, pruned)`.
+pub(super) fn bind_module_attr_calls(
+    db: &Database,
+    scope: &PostPassScope,
+) -> Result<(usize, usize)> {
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
+    let conn = db.conn();
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_attr_imports;")?;
+    conn.execute(
+        "CREATE TEMP TABLE cg_attr_imports AS
+         SELECT mn.file_id AS fid,
+                json_extract(ie.metadata, '$.python_module') AS module,
+                json_extract(ie.metadata, '$.attr') AS attr,
+                ie.target_id AS tid
+         FROM edges ie
+         JOIN nodes mn  ON mn.id  = ie.source_id
+         JOIN nodes itn ON itn.id = ie.target_id
+         WHERE ie.relation = ?1
+           AND ie.metadata LIKE '%\"attr\":%'
+           AND itn.name <> '<module>'",
+        rusqlite::params![REL_IMPORTS],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX cg_attr_imports_k ON cg_attr_imports(fid, module, attr, tid);",
+    )?;
+    // The call's own (file, module, attribute), shared by every statement.
+    const CALL: &str = "a.fid = sn.file_id
+                    AND a.module = json_extract(e.metadata, '$.v')
+                    AND a.attr = json_extract(e.metadata, '$.attr')";
+    const IS_ATTR_CALL: &str = "e.relation = ?1 AND e.metadata LIKE '%\"attr\":%'";
+    let (bind, prune) = if scope.is_global() {
+        (
+            format!(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+                 SELECT DISTINCT e.source_id, a.tid, ?1, e.metadata
+                 FROM edges e
+                 JOIN nodes sn ON sn.id = e.source_id
+                 JOIN cg_attr_imports a ON {CALL}
+                 WHERE {IS_ATTR_CALL} AND e.source_id <> a.tid"
+            ),
+            format!(
+                "DELETE FROM edges WHERE id IN (
+                   SELECT e.id FROM edges e
+                   JOIN nodes sn ON sn.id = e.source_id
+                   WHERE {IS_ATTR_CALL}
+                     AND EXISTS (SELECT 1 FROM cg_attr_imports a WHERE {CALL})
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cg_attr_imports a WHERE {CALL} AND a.tid = e.target_id
+                     )
+                 )"
+            ),
+        )
+    } else {
+        // The caller's file in scope, or the callee's; CROSS JOIN order is
+        // load-bearing (see PostPassScope::is_global).
+        (
+            format!(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+                 SELECT DISTINCT src_id, tgt_id, ?1, meta FROM (
+                   SELECT e.source_id AS src_id, a.tid AS tgt_id, e.metadata AS meta
+                   FROM cg_scope_files s
+                   CROSS JOIN nodes sn ON sn.file_id = s.fid
+                   CROSS JOIN edges e ON e.source_id = sn.id
+                   CROSS JOIN cg_attr_imports a ON {CALL}
+                   WHERE {IS_ATTR_CALL} AND e.source_id <> a.tid
+                   UNION
+                   SELECT e.source_id, a.tid, e.metadata
+                   FROM cg_scope_files s
+                   CROSS JOIN nodes tn ON tn.file_id = s.fid
+                   CROSS JOIN edges e ON e.target_id = tn.id
+                   CROSS JOIN nodes sn ON sn.id = e.source_id
+                   CROSS JOIN cg_attr_imports a ON {CALL}
+                   WHERE {IS_ATTR_CALL} AND e.source_id <> a.tid
+                 )"
+            ),
+            format!(
+                "DELETE FROM edges WHERE id IN (
+                   SELECT e.id
+                   FROM cg_scope_files s
+                   CROSS JOIN nodes sn ON sn.file_id = s.fid
+                   CROSS JOIN edges e ON e.source_id = sn.id
+                   WHERE {IS_ATTR_CALL}
+                     AND EXISTS (SELECT 1 FROM cg_attr_imports a WHERE {CALL})
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cg_attr_imports a WHERE {CALL} AND a.tid = e.target_id
+                     )
+                   UNION
+                   SELECT e.id
+                   FROM cg_scope_files s
+                   CROSS JOIN nodes tn ON tn.file_id = s.fid
+                   CROSS JOIN edges e ON e.target_id = tn.id
+                   CROSS JOIN nodes sn ON sn.id = e.source_id
+                   WHERE {IS_ATTR_CALL}
+                     AND EXISTS (SELECT 1 FROM cg_attr_imports a WHERE {CALL})
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cg_attr_imports a WHERE {CALL} AND a.tid = e.target_id
+                     )
+                 )"
+            ),
+        )
+    };
+    let bound = conn.execute(&bind, rusqlite::params![REL_CALLS])?;
+    let pruned = conn.execute(&prune, rusqlite::params![REL_CALLS])?;
+    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_attr_imports;")?;
+    Ok((bound, pruned))
+}
+
 /// Remove bare-name `calls` edges that an explicit import in the caller's file
 /// contradicts. Runs once after all call edges exist (post Phase-2 + pending
 /// sweep).
@@ -2340,17 +2469,21 @@ pub(super) fn prune_import_contradicted_call_edges(
               -- the edge (safe direction, same bias as the guard above). L12.
               AND sn.code_content NOT LIKE '%...'
               -- caller's file imports the SAME name bound to a DIFFERENT node
+              -- (a `P.X()` call's synthetic import says nothing of a bare
+              -- call, D#518)
               AND EXISTS (
                   SELECT 1 FROM cg_imports i
                   WHERE i.fid = sn.file_id
                     AND i.nm = tn.name
                     AND i.tid <> e.target_id
+                    AND i.attr IS NULL
               )
               -- ... and does NOT import THIS target (so it is contradicted)
               AND NOT EXISTS (
                   SELECT 1 FROM cg_imports i2
                   WHERE i2.fid = sn.file_id
                     AND i2.tid = e.target_id
+                    AND i2.attr IS NULL
               )";
     let sql = if scope.is_global() {
         format!(
@@ -2457,6 +2590,11 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                           SELECT 1 FROM cg_imports i
                           WHERE i.fid = src.file_id
                             AND i.tid = tgt.id
+                            -- a `P.X()` call's synthetic import vouches only
+                            -- for that call (D#518)
+                            AND (i.attr IS NULL
+                                 OR (i.attr = json_extract(e.metadata, '$.attr')
+                                     AND i.module = json_extract(e.metadata, '$.v')))
                       )
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
                       -- qualifier (self / stype / rtype / super / path), or through a

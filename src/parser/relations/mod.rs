@@ -195,6 +195,20 @@ pub fn extract_relations_from_tree(
         ruby_bare_calls::extract(tree.root_node(), source, "<module>", &mut relations);
     }
     if config.name == "python" {
+        // D#518: one synthetic `from M import X` per `P.X()` call target,
+        // marked `attr`, which `count_python_import_sources` does not count.
+        for (module, attr) in member::take_python_attr_imports() {
+            relations.push(ParsedRelation {
+                source_name: "<module>".to_string(),
+                target_name: attr.clone(),
+                relation: crate::domain::REL_IMPORTS.into(),
+                metadata: Some(
+                    serde_json::json!({ "python_module": module, "attr": attr }).to_string(),
+                ),
+                source_language: String::new(),
+                source_line: None,
+            });
+        }
         imports::count_python_import_sources(&mut relations);
     }
     // Stamp source_language on every relation. walk_for_relations constructs

@@ -225,16 +225,19 @@ pub fn get_project_map(
         // packages must not surface as an internal `→ <root>` dependency (they
         // otherwise dominate the Dependencies section and collide with the real
         // root source module).
-        let sql = "SELECT sf.path, tf.path, COUNT(*) \
+        let sql = format!(
+            "SELECT sf.path, tf.path, COUNT(*) \
              FROM edges e \
              JOIN nodes sn ON sn.id = e.source_id \
              JOIN nodes tn ON tn.id = e.target_id \
              JOIN files sf ON sf.id = sn.file_id \
              JOIN files tf ON tf.id = tn.file_id \
-             WHERE e.relation = ?1 AND sf.path != tf.path \
+             WHERE e.relation = ?1 AND sf.path != tf.path AND NOT {} \
                AND sf.path != '<external>' AND tf.path != '<external>' \
-             GROUP BY sf.path, tf.path";
-        let mut stmt = conn.prepare(sql)?;
+             GROUP BY sf.path, tf.path",
+            crate::domain::synthetic_import_sql("e")
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([REL_IMPORTS], |row| {
             Ok((
                 row.get::<_, String>(0)?,

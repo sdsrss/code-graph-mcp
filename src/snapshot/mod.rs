@@ -356,9 +356,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     let node_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
         .unwrap_or(0);
-    let edge_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
-        .unwrap_or(0);
+    let edge_count: i64 = crate::storage::queries::count_user_edges(conn).unwrap_or(0);
 
     Ok(SnapshotMeta {
         source_commit,

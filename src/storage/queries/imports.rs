@@ -52,6 +52,7 @@ fn file_closure(
         .map(|r| format!("'{r}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    let synthetic = crate::domain::synthetic_import_sql("e");
     // `n_from` is the node on the frontier side of the edge, `n_to` the node on
     // the side we are expanding towards; the edge column each binds to is what
     // makes the hop outgoing or incoming.
@@ -86,6 +87,7 @@ fn file_closure(
                 "SELECT DISTINCT f_to.id, f_to.path
                  FROM nodes n_from
                  JOIN edges e ON e.{from_col} = n_from.id AND e.relation IN ({in_list})
+                   AND NOT {synthetic}
                  JOIN nodes n_to ON n_to.id = e.{to_col}
                  JOIN files f_to ON f_to.id = n_to.file_id
                  WHERE n_from.file_id IN ({placeholders})"
@@ -143,6 +145,7 @@ fn cross_file_symbol_counts(
         .map(|r| format!("'{r}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    let synthetic = crate::domain::synthetic_import_sql("ea");
     // The counted symbol is always the edge TARGET (`nb`), as in the CTE's
     // `COUNT(DISTINCT nb.id)`; only which end is pinned to the root changes.
     let (pinned, grouped) = match hop {
@@ -154,6 +157,7 @@ fn cross_file_symbol_counts(
          FROM nodes na
          JOIN files fa ON fa.id = na.file_id
          JOIN edges ea ON ea.source_id = na.id AND ea.relation IN ({in_list})
+           AND NOT {synthetic}
          JOIN nodes nb ON nb.id = ea.target_id
          JOIN files fb ON fb.id = nb.file_id
          WHERE {pinned}.path = ?1
@@ -288,7 +292,7 @@ pub fn get_reverse_dependents(
 /// excluded: a call cycle is mutual recursion, not a circular *import*.
 pub fn all_file_import_edges(conn: &Connection) -> Result<Vec<(String, String)>> {
     use crate::domain::REL_IMPORTS;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT sf.path, tf.path \
          FROM edges e \
          JOIN nodes ns ON ns.id = e.source_id \
@@ -296,9 +300,11 @@ pub fn all_file_import_edges(conn: &Connection) -> Result<Vec<(String, String)>>
          JOIN nodes nt ON nt.id = e.target_id \
          JOIN files tf ON tf.id = nt.file_id \
          WHERE e.relation = ?1 \
+           AND NOT {} \
            AND sf.id != tf.id \
            AND sf.path != '<external>' AND tf.path != '<external>'",
-    )?;
+        crate::domain::synthetic_import_sql("e")
+    ))?;
     let rows = stmt.query_map(rusqlite::params![REL_IMPORTS], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;

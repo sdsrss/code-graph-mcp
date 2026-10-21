@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 123 → 124
+because a Python call on an imported module binds differently (below). The
+MCP server rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does. To go back to 0.175.0: `npm i -g
+@sdsrs/code-graph@0.175.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.175.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0; `code-graph-mcp
+rebuild-index --confirm` in each project rebuilds the index at the older
+version.
+
+### Python: `import flask` and then `flask.Flask()` binds what the module exports
+
+A call on a module the file imports, `P.X()`, was resolved by the name `X`
+alone. On flask, `flask.url_for(...)` in the tests went to both
+`helpers.url_for` and the method `Flask.url_for`, as `ambiguous`, and
+`flask.Flask(...)` inside `tests/test_config.py` went to a `class Flask`
+defined in that file's test function. Such a call now binds what `from P
+import X` binds: what the module itself defines as `X` (not a method of one
+of its classes), else what the module re-exports under that name, followed
+as for `from P import X`; the edge is `inferred`. A module that
+neither defines nor re-exports `X` leaves the call resolved by name, as
+before. It applies when `P` holds the module everywhere in the file: every
+use of the name is `import P` / `import a.b as P` or `P.something`. A name
+also assigned, passed as an argument, used as a parameter, or bound by a
+`from` import keeps the old resolution, and so do `import a.b` followed by
+`a.X()`, and `P.a.X()`. To keep incremental runs in step, each such call is
+recorded as an internal import of `X` from `P` that no command shows: not
+`refs`, `deps`, `affected`, `cycles`, `map`, `dead-code`, the context text
+search reads, nor the edge counts.
+
+Measured with a fresh index from this build and from the one before this
+change, on the seven corpora of 0.174.0, networkx and the Python standard
+library: express, hono, gin, gson, leveldb and this repository are unchanged.
+flask loses 218 call edges (200 `ambiguous`, 18 into test-local
+definitions) and gains 135 `inferred`; networkx moves 5 calls from
+`ambiguous` to `inferred`; the standard library loses 1,695 (1,683
+`ambiguous`) and gains 478. Against the SCIP oracle on the standard library,
+`inferred` edges are right 1,469 of 2,342 times instead of 1,235 of 2,107
+(+234 right, +1 wrong), recall at the default floor goes from 85.1% to 87.0%,
+and no edge the oracle judges right is lost. On flask, `callgraph Flask
+--direction callers` no longer hides 31 `ambiguous` edges and counts 81 test
+callers instead of 50; `impact Flask` counts 74 affected tests instead of 27;
+`health-check` reports 11,845 edges instead of 11,928; `deps
+tests/test_config.py` lists `src/flask/app.py`. `cycles`, `dead-code` and
+`surprising` answer as before there.
+
+An incremental index agrees with a fresh one wherever the build before this
+change did: the 65 incremental scenarios of D#370(a)'s two reviews (64
+agree; p15, a renamed re-export, disagrees as before) and the 1,789 steps of
+0.175.0's reviews (262 disagree with either build, the same steps). Cost: a
+full index takes more CPU (medians over 7 alternating runs: networkx 3.73 →
+3.96 s, the standard library 5.47 → 5.67 s); an edit of one networkx file
+takes 141 ms instead of 124 ms, of `networkx/__init__.py` 149 ms instead of
+120 ms, of `networkx/classes/graph.py` 510 ms instead of 504 ms.
+
 ### Python: two more edits an incremental index now follows
 
 An incremental index re-reads the files an edit changed, plus the files whose
@@ -64,7 +120,13 @@ flask none of 883 are.
   `src/flask/typing.py`) keeps that binding when an `__init__.py` above it is
   added back.
 - A function nested in a module is a candidate for `from m import name`, as
-  in 0.175.0.
+  in 0.175.0, and for `m.name()` now.
+- `P.X()` binds nothing new when the name resolution never binds `X` across
+  files (a short list of very common names: `get`, `close`, `read`, `write`,
+  `join`, `map`, `filter`, …); it stays without an edge.
+- Through a re-export, `P.X()` binds a method as `from P import X` does, and
+  shares that import's incremental gap from 0.175.0 (a module that gains a
+  method `X` beside its function `X`).
 
 ## 0.175.0
 

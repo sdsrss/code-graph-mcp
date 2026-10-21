@@ -24,7 +24,7 @@ pub use dead_code::{
     DeadCodeItem, DeadCodeReport, DeadCodeResult, DEAD_CODE_SCAN_LIMIT,
 };
 pub use edges::{
-    age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls,
+    age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls, count_user_edges,
     delete_pending_unresolved_call, get_edge_source_names, get_edge_sources_with_files,
     get_edge_target_names, get_edge_target_names_batch, get_edge_targets_with_files,
     get_edges_batch, get_edges_from, get_incoming_references, insert_edge, insert_edge_cached,

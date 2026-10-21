@@ -738,7 +738,7 @@ pub(super) fn count_python_import_sources(relations: &mut [ParsedRelation]) {
             return None;
         }
         let meta: serde_json::Value = serde_json::from_str(r.metadata.as_deref()?).ok()?;
-        if meta.get("is_module_import").is_some() {
+        if meta.get("is_module_import").is_some() || meta.get("attr").is_some() {
             return None;
         }
         let module = meta.get("python_module")?.as_str()?.to_string();

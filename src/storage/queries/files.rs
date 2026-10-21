@@ -31,7 +31,7 @@ pub fn get_index_status(conn: &Connection, is_watching: bool) -> Result<IndexSta
         |r| r.get(0),
     )?;
     let nodes_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-    let edges_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+    let edges_count: i64 = crate::storage::queries::count_user_edges(conn)?;
     let last_indexed_at: Option<i64> = conn
         .query_row("SELECT MAX(indexed_at) FROM files", [], |r| r.get(0))
         .ok()

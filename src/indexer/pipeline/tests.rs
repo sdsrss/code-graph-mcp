@@ -12343,8 +12343,8 @@ fn a_python_reexport_with_an_unseen_alternative_is_not_followed() {
         .filter(|r| r.contains("warn"))
         .collect();
     let want = [
-        r#"app.py.main --calls[ambiguous]{"q":"module","v":"pkg"}--> pkg/_pure.py.warn"#,
-        r#"app.py.main --calls[ambiguous]{"q":"module","v":"pkg"}--> zzz/decoy.py.warn"#,
+        r#"app.py.main --calls[ambiguous]{"attr":"warn","q":"module","v":"pkg"}--> pkg/_pure.py.warn"#,
+        r#"app.py.main --calls[ambiguous]{"attr":"warn","q":"module","v":"pkg"}--> zzz/decoy.py.warn"#,
         r#"app2.py.<module> --imports[extracted]{"python_module":"pkg"}--> pkg/_pure.py.warn"#,
         r#"app2.py.<module> --imports[extracted]{"python_module":"pkg"}--> zzz/decoy.py.warn"#,
     ];
@@ -13365,6 +13365,384 @@ fn a_cfg_test_file_s_module_node_is_test_code() {
     assert!(!module_is_test("src/lib.rs"));
 }
 
+// D#518: a call `P.X()` on a module name binds what `from M import X` binds —
+// the module's own `X`, else its re-export — and only that, labelled
+// `inferred`; a shape the parser declines, or a module with no `X`, resolves
+// by name as before. Shape table: tasks/specs/py-module-attr-calls-d518.md.
+#[test]
+fn a_call_on_a_python_module_binds_the_module_attribute() {
+    let calls_of = |files: &[(&str, &str)], caller: &str| -> Vec<String> {
+        let (_p, _d, db) = fresh_index_of(files);
+        graph_rows(&db)
+            .into_iter()
+            .filter(|r| r.contains(&format!(".{caller} --calls[")))
+            .map(|r| {
+                let (head, target) = r.split_once("--> ").unwrap();
+                let label = head
+                    .split("--calls[")
+                    .nth(1)
+                    .unwrap()
+                    .split(']')
+                    .next()
+                    .unwrap();
+                format!("{label} {target}")
+            })
+            .collect()
+    };
+    let decoy = ("zzz/decoy.py", "def X():\n    pass\n");
+    let main = |body: &str| format!("import pkg\n\n{body}def main():\n    pkg.X()\n");
+    // A1 (+A5: the decoy loses its edge)
+    assert_eq!(
+        calls_of(
+            &[
+                ("pkg/__init__.py", "def X():\n    pass\n"),
+                decoy,
+                ("app.py", &main(""))
+            ],
+            "main"
+        ),
+        ["inferred pkg/__init__.py.X"]
+    );
+    // A2: through the package's re-export
+    assert_eq!(
+        calls_of(
+            &[
+                ("pkg/__init__.py", "from .core import X\n"),
+                ("pkg/core.py", "def X():\n    pass\n"),
+                decoy,
+                ("app.py", &main("")),
+            ],
+            "main"
+        ),
+        ["inferred pkg/core.py.X"]
+    );
+    // A3: `import a.b as m`
+    assert_eq!(
+        calls_of(
+            &[
+                ("a/b.py", "def f():\n    pass\n"),
+                ("zzz/f.py", "def f():\n    pass\n"),
+                ("app.py", "import a.b as m\n\ndef main():\n    m.f()\n"),
+            ],
+            "main"
+        ),
+        ["inferred a/b.py.f"]
+    );
+    // A4: the caller's own `X` does not shadow `pkg.X`
+    assert_eq!(
+        calls_of(
+            &[
+                ("pkg/__init__.py", "def X():\n    pass\n"),
+                ("app.py", &main("def X():\n    pass\n\n")),
+            ],
+            "main"
+        ),
+        ["inferred pkg/__init__.py.X"]
+    );
+    // A6: flask's `tests/test_config.py`, whose test-local `class Flask`
+    // took `flask.Flask(...)` by name.
+    let rows = calls_of(
+        &[
+            ("src/flask/__init__.py", "from .app import Flask as Flask\n"),
+            ("src/flask/app.py", "class Flask:\n    pass\n"),
+            (
+                "tests/test_config.py",
+                "import flask\n\ndef test_a():\n    class Flask(flask.Flask):\n        pass\n    \
+                 return flask.Flask(__name__), Flask\n",
+            ),
+        ],
+        "test_a",
+    );
+    assert_eq!(rows, ["inferred src/flask/app.py.Flask"]);
+
+    // A7: among the module's own nodes a method is no attribute of it; one
+    // reached through a re-export binds as `from M import X` binds it.
+    assert_eq!(
+        calls_of(
+            &[
+                (
+                    "pkg/__init__.py",
+                    "def X():\n    pass\n\nclass C:\n    def X(self):\n        pass\n",
+                ),
+                ("app.py", &main("")),
+            ],
+            "main"
+        ),
+        ["inferred pkg/__init__.py.X"]
+    );
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "pkg/__init__.py",
+            "class C:\n    def X(self):\n        pass\n",
+        ),
+        ("app.py", &main("")),
+    ]);
+    let rows = graph_rows(&db);
+    assert!(
+        rows.iter().any(|r| r
+            == r#"app.py.<module> --imports[extracted]{"attr":"X","python_module":"pkg"}--> pkg/__init__.py.<module>"#),
+        "{rows:#?}"
+    );
+
+    // The synthetic import says nothing of the file's other calls: a bare `X()`
+    // binds by name as before, keeps its edges and its label, and a package
+    // whose own code calls `core.X()` does not export `X` by it.
+    let rows = |files: &[(&str, &str)]| {
+        let (_p, _d, db) = fresh_index_of(files);
+        graph_rows(&db)
+    };
+    let bare = |r: &&String| {
+        r.starts_with("app/main.py.other --calls") || r.starts_with("app.py.other --calls")
+    };
+    let near = rows(&[
+        ("pkg/__init__.py", "def X():\n    pass\n"),
+        ("app/helpers.py", "def X():\n    pass\n"),
+        (
+            "app/main.py",
+            "import pkg\n\ndef main():\n    pkg.X()\n\ndef other():\n    X()\n",
+        ),
+    ]);
+    let near: Vec<&String> = near.iter().filter(bare).collect();
+    assert_eq!(near.len(), 1, "{near:#?}");
+    assert!(near[0].ends_with("--> app/helpers.py.X"), "{near:#?}");
+    let tied = rows(&[
+        ("pkg/__init__.py", "def X():\n    pass\n"),
+        decoy,
+        (
+            "app.py",
+            "import pkg\n\ndef main():\n    pkg.X()\n\ndef other():\n    X()\n",
+        ),
+    ]);
+    let tied: Vec<&String> = tied.iter().filter(bare).collect();
+    assert_eq!(
+        tied,
+        [
+            "app.py.other --calls[ambiguous]--> pkg/__init__.py.X",
+            "app.py.other --calls[ambiguous]--> zzz/decoy.py.X"
+        ],
+        "{tied:#?}"
+    );
+    let reexport = rows(&[
+        (
+            "pkg/__init__.py",
+            "import pkg.core as core\n\ndef f():\n    core.X()\n",
+        ),
+        ("pkg/core.py", "def X():\n    pass\n"),
+        ("zzz/x.py", "def X():\n    pass\n"),
+        ("zzz/app.py", "from pkg import X\n"),
+    ]);
+    let imports: Vec<&String> = reexport
+        .iter()
+        .filter(|r| r.starts_with("zzz/app.py.<module> --imports") && r.contains(".X"))
+        .collect();
+    assert_eq!(
+        imports,
+        [r#"zzz/app.py.<module> --imports[extracted]{"python_module":"pkg"}--> zzz/x.py.X"#],
+        "{reexport:#?}"
+    );
+
+    // A bare `X()` that a `from` import binds keeps binding only that, beside
+    // a `pkg.X()` elsewhere in the file; and a call on another module with no
+    // `X` is not vouched for by the first one's import.
+    let pruned = rows(&[
+        ("pkg/__init__.py", "def X():\n    pass\n"),
+        ("other.py", "def X():\n    pass\n"),
+        (
+            "app.py",
+            "import pkg\nfrom other import X\n\ndef main():\n    pkg.X()\n\ndef plain():\n    X()\n",
+        ),
+    ]);
+    let plain: Vec<&String> = pruned
+        .iter()
+        .filter(|r| r.starts_with("app.py.plain --calls"))
+        .collect();
+    assert_eq!(
+        plain,
+        ["app.py.plain --calls[inferred]--> other.py.X"],
+        "{pruned:#?}"
+    );
+    let two = rows(&[
+        ("a/__init__.py", "def X():\n    pass\n"),
+        ("b/__init__.py", "Y = 1\n"),
+        decoy,
+        (
+            "app.py",
+            "import a\nimport b\n\ndef f():\n    a.X()\n\ndef g():\n    b.X()\n",
+        ),
+    ]);
+    let g: Vec<&String> = two
+        .iter()
+        .filter(|r| r.starts_with("app.py.g --calls"))
+        .collect();
+    assert_eq!(
+        g,
+        [r#"app.py.g --calls[ambiguous]{"attr":"X","q":"module","v":"b"}--> a/__init__.py.X"#],
+        "{two:#?}"
+    );
+
+    // Declined (D1) and a module with no `X` (D8): by name, as before.
+    assert_eq!(
+        calls_of(
+            &[
+                ("pkg/__init__.py", "def X():\n    pass\n"),
+                decoy,
+                ("app.py", "import pkg\n\ndef main(pkg):\n    pkg.X()\n"),
+            ],
+            "main"
+        ),
+        ["ambiguous pkg/__init__.py.X", "ambiguous zzz/decoy.py.X"]
+    );
+    let (_p, _d, db) =
+        fresh_index_of(&[("pkg/__init__.py", "Y = 1\n"), decoy, ("app.py", &main(""))]);
+    let rows = graph_rows(&db);
+    assert!(
+        rows.iter().any(|r| r
+            == r#"app.py.<module> --imports[extracted]{"attr":"X","python_module":"pkg"}--> pkg/__init__.py.<module>"#),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("app.py.main --calls[") && r.ends_with("--> zzz/decoy.py.X")),
+        "{rows:#?}"
+    );
+    // D7: a library module's attribute: no edge, no import of it.
+    let (_p, _d, db) = fresh_index_of(&[
+        decoy,
+        ("app.py", "import click\n\ndef main():\n    click.X()\n"),
+    ]);
+    let rows = graph_rows(&db);
+    assert!(
+        !rows.iter().any(|r| r.contains("main --calls")),
+        "{rows:#?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("\"attr\"")), "{rows:#?}");
+}
+
+// D#518: what the module or its re-export defines can change while the caller
+// does not, and an incremental run must bind the call as a rebuild does.
+#[test]
+fn a_call_on_a_python_module_follows_edits_of_the_module() {
+    let app = ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n");
+    let decoy = ("zzz/decoy.py", "def X():\n    pass\n");
+    let with_x = ("pkg/__init__.py", "def X():\n    pass\n");
+    let without_x = ("pkg/__init__.py", "Y = 1\n");
+    let bound = "app.py.main --calls[inferred]{\"attr\":\"X\",\"q\":\"module\",\"v\":\"pkg\"}--> ";
+    // The module gains `X`, and loses it.
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[without_x, decoy, app],
+        &[(with_x.0, Some(with_x.1))],
+    );
+    assert!(
+        rows.iter()
+            .any(|r| *r == format!("{bound}pkg/__init__.py.X")),
+        "{rows:#?}"
+    );
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[with_x, decoy, app],
+        &[(without_x.0, Some(without_x.1))],
+    );
+    assert!(
+        rows.iter().any(|r| r.ends_with("--> zzz/decoy.py.X")),
+        "{rows:#?}"
+    );
+    // With no `X` anywhere else either, the call has no edge to requeue it.
+    assert_incremental_graph_matches_rebuild(&[without_x, app], &[(with_x.0, Some(with_x.1))]);
+    // A call through the module and a bare call of the imported name in one
+    // function, while the package's re-export chain moves: the two are buffered
+    // apart (review of D#370(a), round 2, s18).
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("pkg/__init__.py", "from .sub import X\n"),
+            ("pkg/sub/__init__.py", "from .impl import X\n"),
+            ("pkg/sub/impl.py", "def X():\n    pass\n"),
+            ("pkg/sub/other.py", "def W():\n    pass\n"),
+            (
+                "app/user.py",
+                "import pkg\nfrom pkg import X\n\ndef run():\n    pkg.X()\n    X()\n",
+            ),
+            ("app/decoy.py", "def X():\n    pass\n"),
+        ],
+        &[
+            ("pkg/sub/impl.py", Some("def V():\n    pass\n")),
+            ("pkg/sub/other.py", Some("def X():\n    pass\n")),
+            ("pkg/sub/__init__.py", Some("from .other import X\n")),
+        ],
+    );
+    // The module gains a method of the same name, or keeps only that.
+    let with_method = (
+        "pkg/__init__.py",
+        "def X():\n    pass\n\nclass C:\n    def X(self):\n        pass\n",
+    );
+    let only_method = (
+        "pkg/__init__.py",
+        "class C:\n    def X(self):\n        pass\n",
+    );
+    for (from, to) in [
+        (with_x, with_method),
+        (with_method, only_method),
+        (only_method, with_method),
+    ] {
+        assert_incremental_graph_matches_rebuild(&[from, decoy, app], &[(to.0, Some(to.1))]);
+    }
+    // An edit of the module that keeps `X`.
+    assert_incremental_graph_matches_rebuild(
+        &[with_x, decoy, app],
+        &[("pkg/__init__.py", Some("# c\ndef X():\n    pass\n"))],
+    );
+    // The re-export moves, its target file is edited, deleted, or renamed.
+    let reexport: &[(&str, &str)] = &[
+        ("pkg/__init__.py", "from .core import X\n"),
+        ("pkg/core.py", "def X():\n    pass\n"),
+        ("pkg/alt.py", "def X():\n    pass\n"),
+        decoy,
+        app,
+    ];
+    let rows = assert_incremental_graph_matches_rebuild(
+        reexport,
+        &[("pkg/__init__.py", Some("from .alt import X\n"))],
+    );
+    assert!(
+        rows.iter().any(|r| *r == format!("{bound}pkg/alt.py.X")),
+        "{rows:#?}"
+    );
+    assert_incremental_graph_matches_rebuild(
+        reexport,
+        &[("pkg/core.py", Some("# c\ndef X():\n    pass\n"))],
+    );
+    assert_incremental_graph_matches_rebuild(reexport, &[("pkg/core.py", None)]);
+    assert_incremental_graph_matches_rebuild(
+        reexport,
+        &[
+            ("pkg/core.py", None),
+            ("pkg/core2.py", Some("def X():\n    pass\n")),
+            ("pkg/__init__.py", Some("from .core2 import X\n")),
+        ],
+    );
+    // The package's `__init__.py` vanishes and comes back.
+    assert_incremental_graph_matches_rebuild(reexport, &[("pkg/__init__.py", None)]);
+    let no_init: Vec<(&str, &str)> = reexport[1..].to_vec();
+    assert_incremental_graph_matches_rebuild(
+        &no_init,
+        &[("pkg/__init__.py", Some("from .core import X\n"))],
+    );
+    // The caller stops calling through the module, or starts.
+    assert_incremental_graph_matches_rebuild(
+        &[with_x, decoy, app],
+        &[(
+            "app.py",
+            Some("import pkg\n\ndef main(pkg):\n    pkg.X()\n"),
+        )],
+    );
+    assert_incremental_graph_matches_rebuild(
+        &[
+            with_x,
+            decoy,
+            ("app.py", "import pkg\n\ndef main(pkg):\n    pkg.X()\n"),
+        ],
+        &[(app.0, Some(app.1))],
+    );
+}
+
 // A run of more than one batch: an importer in an earlier batch resolved
 // `from pkg.m import Y` against `m.py`'s old nodes, and `m.py`'s later batch
 // drops `Y`. The import is requeued, as a rebuild re-resolves it, instead of
@@ -13406,4 +13784,164 @@ fn a_big_run_requeues_an_earlier_batch_import_of_a_vanished_name() {
             .filter(|r| r.starts_with("app_imp"))
             .collect::<Vec<_>>()
     );
+}
+
+// D#518: the synthetic imports exist for the resolver only. Every user-facing
+// query answers as if they were not there: deleting them from the index moves
+// no answer.
+#[test]
+fn the_synthetic_imports_of_module_attribute_calls_reach_no_answer() {
+    use crate::storage::queries as q;
+    // `get` and `read` are names the by-name resolution never binds across
+    // files, so `pkg.get()` and `pkg.read()` have their synthetic import and
+    // no call edge: `get` is used by nothing else, and `extra.py` is reached
+    // from `app2.py` by nothing else.
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "pkg/__init__.py",
+            "from .core import X\nfrom .extra import read\n\ndef Y():\n    pass\n\ndef get():\n    pass\n",
+        ),
+        (
+            "pkg/core.py",
+            "def X():\n    pass\n\ndef unused():\n    pass\n",
+        ),
+        ("pkg/extra.py", "def read():\n    pass\n"),
+        ("pkg/sub.py", "import pkg\n\ndef s():\n    pkg.X()\n"),
+        (
+            "app.py",
+            "import pkg\n\ndef main():\n    pkg.X()\n    pkg.Y()\n    pkg.Z()\n    pkg.get()\n",
+        ),
+        ("app2.py", "import pkg\n\ndef h():\n    pkg.read()\n"),
+    ]);
+    let conn = db.conn();
+    let synthetic: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM edges WHERE {}",
+                crate::domain::synthetic_import_sql("")
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        synthetic >= 4,
+        "precondition: synthetic imports exist ({synthetic})"
+    );
+    let answers = || -> Vec<String> {
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM nodes ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        for &id in &ids {
+            for filter in [None, Some("imports")] {
+                let refs: Vec<String> = q::get_incoming_references(conn, id, filter)
+                    .unwrap()
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{} {} {}:{} {} {}",
+                            r.node_id, r.name, r.file_path, r.start_line, r.relation, r.confidence
+                        )
+                    })
+                    .collect();
+                out.push(format!("refs {id} {filter:?} {refs:?}"));
+            }
+        }
+        let mut batch: Vec<_> = q::get_edges_batch(conn, &ids)
+            .unwrap()
+            .into_iter()
+            .collect();
+        batch.sort_by_key(|(id, _)| *id);
+        out.push(format!("context {batch:?}"));
+        out.push(format!("count {}", q::count_user_edges(conn).unwrap()));
+        out.push(format!("stats {:?}", q::resolution_stats(conn).unwrap()));
+        out.push(format!(
+            "cycles {:?}",
+            q::all_file_import_edges(conn).unwrap()
+        ));
+        for f in [
+            "app.py",
+            "app2.py",
+            "pkg/sub.py",
+            "pkg/core.py",
+            "pkg/extra.py",
+            "pkg/__init__.py",
+        ] {
+            for depth in [1, 3] {
+                for dir in ["outgoing", "incoming"] {
+                    let tree = q::get_import_tree(conn, f, dir, depth).unwrap();
+                    out.push(format!("deps {f} {dir} {depth} {tree:?}"));
+                }
+                let affected = q::get_reverse_dependents(conn, f, depth).unwrap();
+                out.push(format!("affected {f} {depth} {affected:?}"));
+            }
+        }
+        let (_, deps, _, _) = q::get_project_map(conn).unwrap();
+        let deps: Vec<String> = deps
+            .iter()
+            .map(|d| format!("{} {} {}", d.from, d.to, d.import_count))
+            .collect();
+        out.push(format!("map {deps:?}"));
+        out.push(format!(
+            "dead {:?}",
+            q::find_dead_code(conn, None, None, true, 0, 1000).unwrap()
+        ));
+        out
+    };
+    let with = answers();
+    conn.execute(
+        &format!(
+            "DELETE FROM edges WHERE {}",
+            crate::domain::synthetic_import_sql("")
+        ),
+        [],
+    )
+    .unwrap();
+    let without = answers();
+    for (a, b) in with.iter().zip(without.iter()) {
+        assert_eq!(a, b);
+    }
+    assert_eq!(with.len(), without.len());
+}
+
+// D#518: the importer of a `P.X()` call in an earlier batch of a big run, and
+// the module's batch later in the same run.
+#[test]
+fn a_big_run_rebinds_a_module_attribute_call_of_an_earlier_batch() {
+    let filler: Vec<(String, String)> = (0..super::index_files::BATCH_SIZE)
+        .map(|i| {
+            (
+                format!("f/{i:04}.py"),
+                format!("def filler_{i}():\n    return {i}\n"),
+            )
+        })
+        .collect();
+    let caller = "import pkg.m as mm\n\ndef via_alias():\n    return mm.Y()\n";
+    let caller_touched = format!("# e\n{caller}");
+    let touched: Vec<(String, String)> = filler
+        .iter()
+        .map(|(p, b)| (p.clone(), format!("# e\n{b}")))
+        .collect();
+    for after_m in [
+        "# e\ndef Y():\n    return 1\n",
+        "def other():\n    return 0\n",
+    ] {
+        let mut before: Vec<(&str, &str)> = vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/m.py", "def Y():\n    return 1\n"),
+            ("app.py", caller),
+        ];
+        before.extend(filler.iter().map(|(p, b)| (p.as_str(), b.as_str())));
+        let mut after: Vec<(&str, Option<&str>)> = vec![
+            ("pkg/m.py", Some(after_m)),
+            ("app.py", Some(caller_touched.as_str())),
+        ];
+        after.extend(touched.iter().map(|(p, b)| (p.as_str(), Some(b.as_str()))));
+        assert_incremental_graph_matches_rebuild(&before, &after);
+    }
 }

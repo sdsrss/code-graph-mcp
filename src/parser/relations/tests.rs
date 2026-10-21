@@ -733,11 +733,13 @@ fn test_member_call_on_an_object_is_marked_member() {
         assert_eq!(meta_of(&py, t), None, "{t} must resolve as before: {py:?}");
     }
     // A call through an absolute import names its module (dropped when that
-    // module is not the project's).
-    for (t, module) in [("run", "helpers"), ("go", "pkg.mod"), ("parse", "x")] {
-        let want = format!(r#"{{"q":"module","v":"{module}"}}"#);
+    // module is not the project's), and through a plain import the module's
+    // attribute too (D#518).
+    for (t, module) in [("run", "helpers"), ("go", "pkg.mod")] {
+        let want = format!(r#"{{"attr":"{t}","q":"module","v":"{module}"}}"#);
         assert_eq!(meta_of(&py, t), Some(want.as_str()), "{t}: {py:?}");
     }
+    assert_eq!(meta_of(&py, "parse"), Some(r#"{"q":"module","v":"x"}"#));
 
     let js = call_meta(
         "import * as ns from './ns';\nimport def, { named as alias } from './d';\n\
@@ -843,7 +845,10 @@ fn test_python_call_on_an_untyped_receiver_is_marked() {
     }
     // Receivers that already say what they are keep their qualifier.
     assert_eq!(meta_of(&py, "own"), Some(r#"{"q":"rtype","v":"C"}"#));
-    assert_eq!(meta_of(&py, "getcwd"), Some(r#"{"q":"module","v":"os"}"#));
+    assert_eq!(
+        meta_of(&py, "getcwd"),
+        Some(r#"{"attr":"getcwd","q":"module","v":"os"}"#)
+    );
     assert_eq!(meta_of(&py, "push"), Some(MEMBER));
     assert_eq!(meta_of(&py, "local"), None);
 
@@ -7940,4 +7945,153 @@ fn a_python_decorator_named_bare_is_a_reference() {
     let mut sources = refs.clone();
     sources.sort_unstable();
     assert_eq!(sources, ["Scaffold.add_url_rule", "top"], "{all:?}");
+}
+
+// D#518: a direct call `P.X()` on a name that holds one module everywhere in
+// the file — every occurrence is a plain `import M` / `import M as P` binding
+// or the object of an attribute — names the module's attribute `X`: the call
+// says so (`"attr"`), and the file gets one synthetic import of `X` from `M`
+// per (M, X), resolved like `from M import X`. Every other shape keeps its
+// metadata and adds no import (shape table in
+// tasks/specs/py-module-attr-calls-d518.md).
+#[test]
+fn a_call_on_a_python_module_name_names_the_module_attribute() {
+    let attr_imports = |code: &str| -> Vec<(String, String)> {
+        extract_relations(code, "python")
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.relation == REL_IMPORTS
+                    && r.metadata
+                        .as_deref()
+                        .is_some_and(|m| m.contains("\"attr\""))
+            })
+            .map(|r| (r.target_name, r.metadata.unwrap()))
+            .collect()
+    };
+    // A1, A3; a type annotation and a second call of the same name.
+    let src = "import helpers\nimport pkg.mod as m\n\n\
+               def f(x: helpers.Kind):\n    helpers.run()\n    helpers.run()\n    m.go()\n";
+    let calls = call_meta(src, "python");
+    assert_eq!(
+        meta_of(&calls, "run"),
+        Some(r#"{"attr":"run","q":"module","v":"helpers"}"#)
+    );
+    assert_eq!(
+        meta_of(&calls, "go"),
+        Some(r#"{"attr":"go","q":"module","v":"pkg.mod"}"#)
+    );
+    assert_eq!(
+        attr_imports(src),
+        vec![
+            (
+                "run".to_string(),
+                r#"{"attr":"run","python_module":"helpers"}"#.to_string()
+            ),
+            (
+                "go".to_string(),
+                r#"{"attr":"go","python_module":"pkg.mod"}"#.to_string()
+            ),
+        ]
+    );
+    // `from P import …` names P's module without binding the name P, and an
+    // attribute or keyword named P is no occurrence of it.
+    let neutral = "import flask\nfrom flask import json\n\n\
+                   def f(o):\n    o.flask(flask=1)\n    flask.Flask()\n";
+    assert_eq!(
+        meta_of(&call_meta(neutral, "python"), "Flask"),
+        Some(r#"{"attr":"Flask","q":"module","v":"flask"}"#)
+    );
+
+    // Declined: the call keeps the plain module qualifier and adds no import.
+    for (shape, src, callee) in [
+        (
+            "D1 assignment",
+            "import pdb\n\ndef f():\n    pdb = Pdb()\n    pdb.set_trace()\n",
+            "set_trace",
+        ),
+        (
+            "D1 parameter",
+            "import flask\n\ndef f(flask):\n    flask.Flask()\n",
+            "Flask",
+        ),
+        (
+            "D1 for target",
+            "import m\n\nfor m in xs:\n    m.go()\n",
+            "go",
+        ),
+        (
+            "D1 with target",
+            "import m\n\nwith open() as m:\n    m.go()\n",
+            "go",
+        ),
+        (
+            "D1 except target",
+            "import m\n\ntry:\n    m.go()\nexcept E as m:\n    pass\n",
+            "go",
+        ),
+        (
+            "D1 def name",
+            "import m\n\ndef m():\n    pass\n\nm.go()\n",
+            "go",
+        ),
+        (
+            "D1 global",
+            "import m\n\ndef f():\n    global m\n    m.go()\n",
+            "go",
+        ),
+        (
+            "D2 value",
+            "import m\n\ndef f():\n    g(m)\n    m.go()\n",
+            "go",
+        ),
+        (
+            "D3 from-import",
+            "from x import m\n\ndef f():\n    m.go()\n",
+            "go",
+        ),
+        (
+            "D4 dotted import",
+            "import a.b\n\ndef f():\n    a.go()\n",
+            "go",
+        ),
+        (
+            "D4 dotted beside plain",
+            "import a\nimport a.b\n\ndef f():\n    a.go()\n",
+            "go",
+        ),
+        (
+            "D5 two modules",
+            "import posixpath as path\nimport ntpath as path\n\npath.join()\n",
+            "join",
+        ),
+    ] {
+        let meta = meta_of(&call_meta(src, "python"), callee).map(str::to_string);
+        assert!(
+            !meta.as_deref().unwrap_or("").contains("\"attr\""),
+            "{shape}: {meta:?}"
+        );
+        assert!(
+            attr_imports(src).is_empty(),
+            "{shape}: {:?}",
+            attr_imports(src)
+        );
+    }
+    // D6: only a direct call.
+    let deep = "import m\n\ndef f():\n    m.sub.go()\n";
+    assert_eq!(
+        meta_of(&call_meta(deep, "python"), "go"),
+        Some(r#"{"q":"module","v":"m"}"#)
+    );
+    assert!(attr_imports(deep).is_empty());
+
+    // The synthetic import is no source of a from-import's name ("n").
+    let mixed = "from a import X\nimport m\n\ndef f():\n    m.X()\n";
+    let from_import = extract_relations(mixed, "python")
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            r.relation == REL_IMPORTS && r.metadata.as_deref() == Some(r#"{"python_module":"a"}"#)
+        });
+    assert!(from_import.is_some(), "{:?}", call_meta(mixed, "python"));
 }

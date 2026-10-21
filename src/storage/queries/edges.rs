@@ -316,24 +316,29 @@ pub fn get_incoming_references(
     target_id: i64,
     relation_filter: Option<&str>,
 ) -> Result<Vec<IncomingReference>> {
+    let synthetic = crate::domain::synthetic_import_sql("e");
     let sql = if relation_filter.is_some() {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
+        format!(
+            "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
                 n.qualified_name
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
-         WHERE e.target_id = ?1 AND e.relation = ?2
+         WHERE e.target_id = ?1 AND e.relation = ?2 AND NOT {synthetic}
          ORDER BY f.path, n.start_line"
+        )
     } else {
-        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
+        format!(
+            "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
                 n.qualified_name
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
-         WHERE e.target_id = ?1
+         WHERE e.target_id = ?1 AND NOT {synthetic}
          ORDER BY e.relation, f.path, n.start_line"
+        )
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(rel) = relation_filter {
         stmt.query_map(rusqlite::params![target_id, rel], map_incoming_ref)?
     } else {
@@ -381,8 +386,9 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
         // is a literal per query — so two rows that still tie are byte-identical
         // in the output.
         let sql_out = format!(
-            "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({}) ORDER BY e.relation, n.name, e.metadata",
-            placeholders
+            "SELECT e.source_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.target_id WHERE e.source_id IN ({}) AND NOT {} ORDER BY e.relation, n.name, e.metadata",
+            placeholders,
+            crate::domain::synthetic_import_sql("e")
         );
         let mut stmt = conn.prepare(&sql_out)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
@@ -403,8 +409,9 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
 
         // Incoming edges: node is target
         let sql_in = format!(
-            "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({}) ORDER BY e.relation, n.name, e.metadata",
-            placeholders
+            "SELECT e.target_id, e.relation, n.name, e.metadata FROM edges e JOIN nodes n ON n.id = e.source_id WHERE e.target_id IN ({}) AND NOT {} ORDER BY e.relation, n.name, e.metadata",
+            placeholders,
+            crate::domain::synthetic_import_sql("e")
         );
         let mut stmt = conn.prepare(&sql_in)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
@@ -438,6 +445,22 @@ pub struct ResolutionStats {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
 }
 
+/// The edges a user is told about: all but the synthetic imports of
+/// [`crate::domain::synthetic_import_sql`] (D#518), which the second count
+/// reaches through the relation index.
+pub fn count_user_edges(conn: &Connection) -> Result<i64> {
+    let all: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+    let synthetic: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM edges WHERE {}",
+            crate::domain::synthetic_import_sql("")
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(all - synthetic)
+}
+
 /// Aggregate resolved edges per (language, relation) plus the pending-call backlog.
 /// Pure read over existing `edges`/`nodes`/`files` rows — no extraction, no schema change.
 pub fn resolution_stats(conn: &Connection) -> Result<ResolutionStats> {
@@ -445,13 +468,15 @@ pub fn resolution_stats(conn: &Connection) -> Result<ResolutionStats> {
 
     let pending = count_pending_unresolved_calls(conn)?;
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT COALESCE(f.language, 'unknown') AS lang, e.relation, COUNT(*) AS cnt
          FROM edges e
          JOIN nodes n ON n.id = e.source_id
          JOIN files f ON f.id = n.file_id
+         WHERE NOT {}
          GROUP BY lang, e.relation",
-    )?;
+        crate::domain::synthetic_import_sql("e")
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,

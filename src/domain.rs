@@ -89,6 +89,20 @@ pub const NON_LISTED_MCP_TOOLS: &[&str] = &[
 pub const REL_CALLS: &str = "calls";
 pub const REL_INHERITS: &str = "inherits";
 pub const REL_IMPORTS: &str = "imports";
+
+/// SQL true for an edge (table alias `alias`, or none) that is a Python
+/// `P.X()` call's synthetic import (D#518): an `imports` edge whose metadata
+/// carries `"attr"`. Only the indexer reads these, to bind the call; every
+/// answer a user sees (references, dependencies, cycles, maps, dead code,
+/// context strings, counts) leaves them out with `AND NOT` this.
+pub fn synthetic_import_sql(alias: &str) -> String {
+    let p = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    format!("({p}relation = 'imports' AND COALESCE({p}metadata, '') LIKE '%\"attr\":%')")
+}
 pub const REL_ROUTES_TO: &str = "routes_to";
 pub const REL_IMPLEMENTS: &str = "implements";
 pub const REL_EXPORTS: &str = "exports";
@@ -397,7 +411,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 123; // v123 (2026-10-21, D#517): an `__init__.py` that appears or vanishes re-extracts the files whose absolute imports it re-roots (`import helpers` beside `tests/helpers.py` once `tests/` is a package, `import pkg` of `src/pkg/` once `src/` is one), as a rebuild resolves them; a full index writes what v122 wrote (a rule binding `from m import Y` to a module-level `Y` beside a method `Y` was withdrawn after two review rounds). // v122 (2026-10-20, review round 2 of D#370(a)): the `P.X()` module-attribute binding of v120/v121 is withdrawn (its answer read definitions in other files that no fan-out round tracked), so a call on an imported module resolves as it did at v119; and a name a module imports from more than one module is not followed as a re-export, decided from the module's own `"n"` rather than from which of the others are bound. // Older entries (v121 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 124; // v124 (2026-10-21, D#518): a call `P.X()` on a name that holds one plain-imported module everywhere in a Python file binds what `from M import X` binds (the module's own non-method `X`, else its re-export), through a synthetic `imports` edge marked `"attr"` that every user-facing query leaves out; a module with neither keeps the call resolved by name. // v123 (2026-10-21, D#517): an `__init__.py` that appears or vanishes re-extracts the files whose absolute imports it re-roots (`import helpers` beside `tests/helpers.py` once `tests/` is a package, `import pkg` of `src/pkg/` once `src/` is one), as a rebuild resolves them; a full index writes what v122 wrote (a rule binding `from m import Y` to a module-level `Y` beside a method `Y` was withdrawn after two review rounds). // Older entries (v122 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

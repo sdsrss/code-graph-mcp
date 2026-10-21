@@ -85,8 +85,10 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     // Edge-confidence breakdown.
     let mut conf: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT confidence, COUNT(*) FROM edges GROUP BY confidence")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT confidence, COUNT(*) FROM edges WHERE NOT {} GROUP BY confidence",
+            crate::domain::synthetic_import_sql("")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (c, n) = row?;

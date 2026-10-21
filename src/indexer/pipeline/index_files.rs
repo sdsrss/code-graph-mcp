@@ -1866,13 +1866,21 @@ fn resolve_batch_relations(
                         project_module_files_from(python_module, &pf.rel_path, python_module_map)
                     {
                         // Internal module — try constrained resolution
-                        if let Some(module_targets) = resolve_python_module_targets(
+                        let found = resolve_python_module_targets(
                             &module_files,
                             is_module_import,
                             &rel.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        ) {
+                        );
+                        let found = match found {
+                            Some(ids) if meta.get("attr").is_some() => {
+                                Some(super::python_modules::module_attribute_ids(db.conn(), ids)?)
+                                    .filter(|ids| !ids.is_empty())
+                            }
+                            found => found,
+                        };
+                        if let Some(module_targets) = found {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,
@@ -3508,7 +3516,7 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
-        let mut requeued_typed: HashSet<(i64, &str, Option<&str>)> = HashSet::new();
+        let mut requeued_typed: HashSet<(i64, String, Option<&str>)> = HashSet::new();
         for (
             source_id,
             source_file_id,
@@ -3568,41 +3576,54 @@ fn restore_inbound_edges(
             // round 2). Only the Rust parser writes `rt`.
             let receiver_typed = relation.as_str() == REL_CALLS
                 && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
-            let new_target_ids: Option<Vec<i64>> = (!renamed_import && !receiver_typed)
-                .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
+            // A `P.X()` call (D#518) whose target is gone is requeued the same
+            // way, not buffered: the pending buffer keeps one row per (caller,
+            // name), which a bare `X()` of the same caller would take.
+            let attr_call = relation.as_str() == REL_CALLS
+                && super::resolve::is_module_attr_call(metadata.as_deref());
+            // A `P.X()` call's synthetic import (D#518) that fell back to the
+            // module's `<module>` is re-resolved, not rebound by name, when the
+            // module now has a node named `X`: it may have gained the
+            // attribute. Otherwise, and when bound to `X`, it is restored like
+            // any other import (a re-export the module gained is the drift
+            // fan-out's).
+            let attr_import = (relation.as_str() == REL_IMPORTS && target_name == "<module>")
+                .then(|| super::resolve::python_attr_of(metadata.as_deref()))
                 .flatten()
-                .map(|found| {
-                    found
-                        .iter()
-                        .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
-                        // A Python edge moves onto a method only if it pointed
-                        // at that same method: a `def helper` that became
-                        // `Box.helper` is another symbol, and whether the name
-                        // still reaches it (a module-level alias such as
-                        // `helper = _box.helper` can) is the resolver's call,
-                        // so the edge is re-resolved, not restored (D#192).
-                        .filter(|(_, q, ty)| {
-                            src_lang != "python"
-                                || *ty != "method"
-                                || *q == target_qualified.as_deref()
-                        })
-                        .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
-                        .filter(|(id, _, _)| {
-                            relation.as_str() != REL_CALLS
-                                || rust_fn_shapes.get(id).is_none_or(|shape| {
-                                    super::resolve::rust_call_shape_admits(
-                                        metadata.as_deref(),
-                                        shape,
-                                    ) && super::resolve::rust_crate_admits(
+                .filter(|attr| batch_name_to_ids.contains_key(&(*target_file_id, attr.as_str())));
+            let new_target_ids: Option<Vec<i64>> = (!renamed_import
+                && !receiver_typed
+                && attr_import.is_none())
+            .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
+            .flatten()
+            .map(|found| {
+                found
+                    .iter()
+                    .filter(|(_, q, _)| !typed || *q == target_qualified.as_deref())
+                    // A Python edge moves onto a method only if it pointed
+                    // at that same method: a `def helper` that became
+                    // `Box.helper` is another symbol, and whether the name
+                    // still reaches it (a module-level alias such as
+                    // `helper = _box.helper` can) is the resolver's call,
+                    // so the edge is re-resolved, not restored (D#192).
+                    .filter(|(_, q, ty)| {
+                        src_lang != "python" || *ty != "method" || *q == target_qualified.as_deref()
+                    })
+                    .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
+                    .filter(|(id, _, _)| {
+                        relation.as_str() != REL_CALLS
+                            || rust_fn_shapes.get(id).is_none_or(|shape| {
+                                super::resolve::rust_call_shape_admits(metadata.as_deref(), shape)
+                                    && super::resolve::rust_crate_admits(
                                         Some(src_path.as_str()).filter(|p| !p.is_empty()),
                                         shape,
                                     )
-                                })
-                        })
-                        .map(|(id, _, _)| *id)
-                        .collect::<Vec<i64>>()
-                })
-                .filter(|ids| !ids.is_empty());
+                            })
+                    })
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<i64>>()
+            })
+            .filter(|ids| !ids.is_empty());
             if let Some(new_target_ids) = new_target_ids {
                 for &new_tgt_id in &new_target_ids {
                     if *source_id != new_tgt_id
@@ -3653,16 +3674,17 @@ fn restore_inbound_edges(
                 // displaced by) the same caller's other `spawn_local` call, and
                 // tokio's `local.spawn_local(..)` lost its edge. One entry per
                 // call, though it was bound to several targets.
-                if receiver_typed {
+                if receiver_typed || attr_call || attr_import.is_some() {
+                    let target_name = attr_import.as_deref().unwrap_or(target_name.as_str());
                     if requeued_typed.insert((
                         *source_id,
-                        target_name.as_str(),
+                        target_name.to_string(),
                         metadata.as_deref(),
                     )) {
                         deferred.push(DeferredRelation {
                             source_ids: vec![*source_id],
                             source_name: String::new(),
-                            target_name: target_name.clone(),
+                            target_name: target_name.to_string(),
                             relation: relation.clone(),
                             metadata: metadata.clone(),
                             rel_path: src_path,
@@ -4076,16 +4098,27 @@ fn resolve_deferred_relations(
                     .get("is_module_import")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Some(module_files) =
-                    project_module_files_from(python_module, &d.rel_path, python_module_map)
-                {
-                    if let Some(module_targets) = resolve_python_module_targets(
+                let module_files =
+                    project_module_files_from(python_module, &d.rel_path, python_module_map);
+                if module_files.is_none() && meta.get("attr").is_some() {
+                    continue; // D#518: `import P` keeps the sentinel; nothing to bind
+                }
+                if let Some(module_files) = module_files {
+                    let found = resolve_python_module_targets(
                         &module_files,
                         is_module_import,
                         &d.target_name,
                         &node_id_to_path,
                         &name_to_ids,
-                    ) {
+                    );
+                    let found = match found {
+                        Some(ids) if meta.get("attr").is_some() => {
+                            Some(super::python_modules::module_attribute_ids(db.conn(), ids)?)
+                                .filter(|ids| !ids.is_empty())
+                        }
+                        found => found,
+                    };
+                    if let Some(module_targets) = found {
                         edges_created += insert_relation_edges(
                             db,
                             &source_ids,
@@ -4104,6 +4137,31 @@ fn resolve_deferred_relations(
                     // when no re-export answers it then.
                     if !is_module_import && !waited.contains(&(queued as *const DeferredRelation)) {
                         reexport_wait.push((queued, source_ids, module_files));
+                        continue;
+                    }
+                    // A `P.X()` call's synthetic import (D#518) of a name the
+                    // module neither defines nor re-exports binds the module
+                    // itself, never a same-named node elsewhere: its calls then
+                    // resolve by name as before, and an edit of the module
+                    // requeues it (`restore_inbound_edges` never rebinds it by
+                    // name).
+                    if meta.get("attr").is_some() {
+                        if let Some(module_nodes) = resolve_python_module_targets(
+                            &module_files,
+                            true,
+                            &d.target_name,
+                            &node_id_to_path,
+                            &name_to_ids,
+                        ) {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &module_nodes,
+                                &d.relation,
+                                d.metadata.as_deref(),
+                                false,
+                            )?;
+                        }
                         continue;
                     }
                     // A relative import stays inside its package (D10): a name
@@ -4959,6 +5017,16 @@ fn run_global_edge_post_passes(
         tracing::info!(
             "[index] Phase 2d: pruned {} import-contradicted call edges",
             pruned
+        );
+    }
+
+    // Phase 2d-attr (D#518): a `P.X()` call binds its synthetic import's target.
+    let (attr_bound, attr_pruned) = super::resolve::bind_module_attr_calls(db, scope)?;
+    if attr_bound + attr_pruned > 0 {
+        tracing::info!(
+            "[index] Phase 2d-attr: bound {} module-attribute call(s), pruned {} other edge(s)",
+            attr_bound,
+            attr_pruned
         );
     }
 

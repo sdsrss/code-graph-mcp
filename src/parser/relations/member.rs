@@ -48,6 +48,13 @@ thread_local! {
     /// [`js_package_binding`]'s program-level answer per name: the package a
     /// top-level `var resolve = path.resolve` stands for. Per file, as above.
     static PACKAGE_MEMBER: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    /// Python names that hold one module everywhere in the file, and that
+    /// module ([`py_module_names`]). Per file: reset by `reset_import_bound`.
+    static PY_MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// The (module, attribute) of each `P.X()` call [`python_module_call_meta`]
+    /// marked, in the order met: one synthetic import each
+    /// ([`take_python_attr_imports`]).
+    static PY_ATTR_IMPORTS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
@@ -60,6 +67,13 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     if matches!(family, "javascript" | "typescript" | "tsx") {
         collect_renamed(root, source, &mut renamed, 0);
     }
+    let modules = if family == "python" && names.values().any(Option::is_some) {
+        py_module_names(root, source, &names)
+    } else {
+        HashMap::new()
+    };
+    PY_MODULE_NAMES.with(|m| *m.borrow_mut() = modules);
+    PY_ATTR_IMPORTS.with(|a| a.borrow_mut().clear());
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
     SCOPE_BINDING.with(|m| m.borrow_mut().clear());
@@ -996,18 +1010,165 @@ pub(super) fn python_untyped_receiver_meta(
 /// Metadata of a Python call through a name an absolute import binds
 /// (`click.echo()` → `{"q":"module","v":"click"}`): the resolver drops it when
 /// that module is not the project's, since no project code can run then.
+///
+/// A direct call `P.X()` on a name that holds one module everywhere in the
+/// file ([`PY_MODULE_NAMES`]) also names the attribute (`"attr":"X"`), and is
+/// recorded for a synthetic import of `X` from that module (D#518): the call
+/// then binds what `from M import X` would, through the same import machinery.
 pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
         return None;
     }
-    let mut root = function.child_by_field_name("object")?;
+    let object = function.child_by_field_name("object")?;
+    let mut root = object;
     while root.kind() == "attribute" {
         root = root.child_by_field_name("object")?;
     }
     if root.kind() != "identifier" {
         return None;
     }
-    let module = IMPORT_BOUND.with(|b| b.borrow().get(node_text(&root, source)).cloned())??;
-    Some(serde_json::json!({ "q": "module", "v": module }).to_string())
+    let name = node_text(&root, source);
+    let module = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned())??;
+    let attr = function
+        .child_by_field_name("attribute")
+        .filter(|a| object.kind() == "identifier" && a.kind() == "identifier")
+        .map(|a| node_text(&a, source).to_string())
+        .filter(|_| PY_MODULE_NAMES.with(|m| m.borrow().get(name) == Some(&module)));
+    let Some(attr) = attr else {
+        return Some(serde_json::json!({ "q": "module", "v": module }).to_string());
+    };
+    PY_ATTR_IMPORTS.with(|a| {
+        let mut a = a.borrow_mut();
+        let key = (module.clone(), attr.clone());
+        if !a.contains(&key) {
+            a.push(key);
+        }
+    });
+    Some(serde_json::json!({ "q": "module", "v": module, "attr": attr }).to_string())
+}
+
+/// The (module, attribute) pairs of the file's `P.X()` calls, for the
+/// synthetic imports `extract_relations_from_tree` adds (D#518).
+pub(super) fn take_python_attr_imports() -> Vec<(String, String)> {
+    PY_ATTR_IMPORTS.with(|a| std::mem::take(&mut *a.borrow_mut()))
+}
+
+/// The names of `bound` (the file's import bindings) that hold one module
+/// everywhere in the file (D#518): every occurrence of the name is a plain
+/// `import M` / `import a.b as P` binding of that one module, or the object
+/// of an attribute (`P.X`). Anything else — an assignment, a parameter, a
+/// loop, `with` or `except` target, a `def`, `global`, a from-import, `import
+/// a.b` (which binds `a` while importing `a.b`), the name passed as a value —
+/// leaves it out, so `pdb = Pdb(); pdb.set_trace()` stays the local's call.
+/// Only identifiers are occurrences: an attribute name (`o.P`), a keyword
+/// (`f(P=1)`) and a module path segment (`from P import x`) are not.
+///
+/// One cursor walk, no recursion: a deep expression cannot overflow it.
+fn py_module_names(
+    root: tree_sitter::Node,
+    source: &str,
+    bound: &HashMap<String, Option<String>>,
+) -> HashMap<String, String> {
+    let mut modules: HashMap<String, String> = HashMap::new();
+    let mut rejected: HashSet<String> = HashSet::new();
+    let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier" {
+            let name = node_text(&node, source);
+            if bound.contains_key(name) && !rejected.contains(name) {
+                match py_name_occurrence(node, &ancestors, source) {
+                    Occurrence::Binding(m) => match modules.get(name) {
+                        Some(known) if *known != m => {
+                            rejected.insert(name.to_string());
+                        }
+                        _ => {
+                            modules.insert(name.to_string(), m);
+                        }
+                    },
+                    Occurrence::Neutral => {}
+                    Occurrence::Other => {
+                        rejected.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            ancestors.push(node);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                modules.retain(|n, _| !rejected.contains(n));
+                return modules;
+            }
+            ancestors.pop();
+        }
+    }
+}
+
+/// What one identifier occurrence does to its name, for [`py_module_names`].
+enum Occurrence {
+    /// A plain import binds the name to this module.
+    Binding(String),
+    /// Not an occurrence of the variable, or the object of an attribute.
+    Neutral,
+    /// Anything else: the name is no module name.
+    Other,
+}
+
+fn py_name_occurrence(
+    node: tree_sitter::Node,
+    ancestors: &[tree_sitter::Node],
+    source: &str,
+) -> Occurrence {
+    let is = |field: Option<tree_sitter::Node>| field.is_some_and(|f| f.id() == node.id());
+    let Some(&parent) = ancestors.last() else {
+        return Occurrence::Other;
+    };
+    let grandparent = ancestors.len().checked_sub(2).map(|i| ancestors[i]);
+    match parent.kind() {
+        "attribute" if is(parent.child_by_field_name("object")) => Occurrence::Neutral,
+        "attribute" if is(parent.child_by_field_name("attribute")) => Occurrence::Neutral,
+        "keyword_argument" if is(parent.child_by_field_name("name")) => Occurrence::Neutral,
+        "dotted_name" => {
+            let first = is(parent.named_child(0));
+            match grandparent.map(|g| g.kind()) {
+                Some("import_statement") if first && parent.named_child_count() == 1 => {
+                    Occurrence::Binding(node_text(&node, source).to_string())
+                }
+                Some("import_statement") if first => Occurrence::Other,
+                Some("import_statement" | "aliased_import" | "relative_import") => {
+                    Occurrence::Neutral
+                }
+                Some("import_from_statement")
+                    if !first
+                        || grandparent.is_some_and(|g| {
+                            is_node(g.child_by_field_name("module_name"), parent)
+                        }) =>
+                {
+                    Occurrence::Neutral
+                }
+                _ => Occurrence::Other,
+            }
+        }
+        "aliased_import" if is(parent.child_by_field_name("alias")) => {
+            match (
+                grandparent.map(|g| g.kind()),
+                parent.child_by_field_name("name"),
+            ) {
+                (Some("import_statement"), Some(path)) => {
+                    Occurrence::Binding(node_text(&path, source).to_string())
+                }
+                _ => Occurrence::Other,
+            }
+        }
+        _ => Occurrence::Other,
+    }
+}
+
+fn is_node(field: Option<tree_sitter::Node>, node: tree_sitter::Node) -> bool {
+    field.is_some_and(|f| f.id() == node.id())
 }

@@ -228,6 +228,27 @@ pub(super) fn resolve_python_module_targets(
     }
 }
 
+/// `ids` less the methods (D#518): what a `P.X()` call's synthetic import may
+/// bind among the module's own nodes, since a module's attribute is never a
+/// method. A re-export is followed as `from M import X` follows it, and a
+/// `from M import X` keeps binding methods, as before. An id the index no
+/// longer holds is dropped.
+pub(super) fn module_attribute_ids(
+    conn: &rusqlite::Connection,
+    ids: Vec<i64>,
+) -> anyhow::Result<Vec<i64>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare_cached("SELECT type = 'method' FROM nodes WHERE id = ?1")?;
+    let mut kept = Vec::with_capacity(ids.len());
+    for id in ids {
+        let method: Option<bool> = stmt.query_row([id], |r| r.get(0)).optional()?;
+        if method == Some(false) {
+            kept.push(id);
+        }
+    }
+    Ok(kept)
+}
+
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from
 /// `pkg/sub/__init__.py`, which re-exports from `pkg/sub/impl.py`, is two.
 const REEXPORT_MAX_DEPTH: usize = 8;
@@ -319,7 +340,8 @@ impl ReexportEdges {
                      WHERE f.path = ?1
                        AND json_extract(e.metadata, '$.python_module') IS NOT NULL
                        AND json_extract(e.metadata, '$.is_module_import') IS NULL
-                       AND json_extract(e.metadata, '$.as') IS NULL",
+                       AND json_extract(e.metadata, '$.as') IS NULL
+                       AND json_extract(e.metadata, '$.attr') IS NULL",
                 )?
                 .query_map([file], |r| {
                     Ok(ReexportEdge {

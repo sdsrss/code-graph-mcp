@@ -163,6 +163,7 @@ pub fn find_dead_code(
     }
 
     let where_clause = conditions.join(" AND ");
+    let synthetic = crate::domain::synthetic_import_sql("");
 
     let sql = format!(
         "SELECT n.id, n.name, n.type, n.start_line, n.end_line, f.path, n.code_content,
@@ -174,6 +175,7 @@ pub fn find_dead_code(
                SELECT 1 FROM edges
                WHERE target_id = n.id
                  AND relation IN (:rel_calls, :rel_imports, :rel_inherits, :rel_implements, :rel_references)
+                 AND NOT {synthetic}
            )
            AND NOT EXISTS (
                SELECT 1 FROM edges
