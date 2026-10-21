@@ -3,8 +3,8 @@
 ## 0.175.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 117 → 123
-because call edges into TypeScript types are labelled differently and some
-Python imports bind differently (below). The MCP server rebuilds the index
+because call edges into TypeScript types are labelled differently and a
+Python import of a name its package re-exports binds differently (below). The MCP server rebuilds the index
 when it starts; from the command line, `code-graph-mcp reindex` does. To go
 back to 0.174.0: `npm i -g @sdsrs/code-graph@0.174.0` (or, from source,
 `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
@@ -67,12 +67,11 @@ retargeting `Flask` 19 (94–96 ms), where those edits took 24–29 ms before. O
 networkx, adding `from networkx.classes.graph import Graph` to
 `networkx/__init__.py` re-extracts 4 files (175–190 ms, 94–97 ms before).
 Deleting `networkx/utils/__init__.py` re-extracts, beside the 186 files that
-depended on it, the 23 files that import a name it re-exported: median 1249 ms
-over 3 deletions, 1018 ms with 0.174.0. An edit that leaves a module's imports
-alone costs what it did (networkx: medians 102 and 100 ms over 15 edits). A
-full index takes about 2% more CPU: on networkx, median 3.68 s against 3.61 s
-with 0.174.0 over 9 alternating runs, more in each of the 9 pairs; on the
-Python standard library, 5.40 s against 5.32 s.
+depended on it, the 23 files that import a name it re-exported: median 1230 ms
+over 3 deletions, 1046 ms with 0.174.0. An edit that leaves a module's imports
+alone costs what it did (networkx: medians 102 and 100 ms over 15 edits), and
+so does a full index (networkx: median 3.64 CPU seconds over 9 alternating
+runs, 3.67 with 0.174.0; the Python standard library: 5.27 and 5.25).
 
 ### A TypeScript call into an interface or type alias is `ambiguous`
 
@@ -95,46 +94,30 @@ createBunWebSocket --direction callees` no longer lists `Response`.
 `surprising` gives such an edge the reason "ambiguous: bare-name target not
 decided (several candidates, or a TypeScript type)".
 
-### Python: an `__init__.py` that appears or vanishes, and a method beside a module-level name
+### Python: an `__init__.py` that appears or vanishes re-roots its importers
 
-Two Python shapes where an incremental index kept an answer that a fresh
-index of the same tree does not give:
+A directory that gains an `__init__.py` becomes a package, and a module
+inside it is no longer importable by its bare name: once `tests/__init__.py`
+exists, `import helpers` in `tests/test_a.py` no longer names
+`tests/helpers.py`, and once `src/__init__.py` exists, `import pkg` no longer
+names `src/pkg/`. Removing the file does the reverse. A fresh index resolved
+these as Python does, but an incremental one kept the old binding: the
+importing file had not changed, so nothing re-read it until it was edited.
+An index run that sees an `__init__.py` appear or vanish now also re-extracts
+the Python files whose absolute imports name a module path that resolves to
+other files after the change.
 
-- A directory that gains an `__init__.py` becomes a package, and a module
-  inside it is no longer importable by its bare name: once `tests/__init__.py`
-  exists, `import helpers` in `tests/test_a.py` no longer names
-  `tests/helpers.py`, and once `src/__init__.py` exists, `import pkg` no
-  longer names `src/pkg/`. Removing the file does the reverse. The importing
-  file had not changed, so nothing re-read it, and it kept its old binding
-  until it was edited. An index run that sees an `__init__.py` appear or
-  vanish now also re-extracts the Python files whose absolute imports name a
-  module path that resolves to other files after the change.
-- `from m import Y`, where `m` defines a function `Y` and a class with a
-  method `Y`, bound both, and an incremental run that had indexed `m` before
-  the method appeared bound only the function. It now binds the function
-  alone. An import whose only candidates in `m` are methods binds them as
-  before.
-
-Measured with a fresh index from each build, against the build before this
-change (`main` at `b41ee796`): the seven corpora of 0.174.0 and networkx keep
-identical edge sets, with no label moved. On 569 files of the Python 3.14
-standard library, 19 edges are gone, 14 imports and 5 calls, each into a
-method (`gettext.NullTranslations.gettext` for `argparse.py`'s `from gettext
-import gettext as _`, `statistics.NormalDist.stdev` for `random.py`,
-`inspect.BoundArguments.signature` for `xmlrpc/server.py`, and others), and
-each of their importers and callers keeps its edge to the module-level
-function of the same name. The SCIP oracle judges 3 of the 19 calls and
-imports, all 3 wrong: its `inferred` tier goes from 1235/2107 correct to
-1235/2104, and no other edge it judges moves.
-
-Adding `tests/__init__.py` to flask now re-extracts 5 files
+A full index is unchanged by this: the seven corpora of 0.174.0, networkx and
+569 files of the Python 3.14 standard library give identical edge sets, with
+no label moved, against the build before it (`main` at `b41ee796`). Adding
+`tests/__init__.py` to flask now re-extracts 5 files
 (`tests/test_blueprints.py`, `tests/test_cli.py`, `tests/test_templating.py`
-and two files under `tests/test_apps/`), 88–109 ms where 0.174.0 takes 34 ms;
-the incremental index then equals a fresh one, where 0.174.0's held 152 edges
-a fresh index does not have and lacked 6 it has. Other edits cost what they
-did with 0.174.0 (flask `src/flask/helpers.py`: median 52 ms over 5 edits,
-49 ms; networkx `networkx/algorithms/cycles.py`: 113 ms, 117 ms). Deleting
-an `__init__.py` and a full index are under Cost above.
+and two files under `tests/test_apps/`), 82–102 ms where 0.174.0 takes
+34–37 ms; the incremental index then equals a fresh one, where 0.174.0's
+held 152 edges a fresh index does not have and lacked 6 it has. Other edits
+cost what they did with 0.174.0 (flask `src/flask/helpers.py`: median 51 ms
+over 5 edits, 53 ms; networkx `networkx/algorithms/cycles.py`: 118 ms,
+118 ms). Deleting an `__init__.py` is under Cost above.
 
 ### Not covered
 
@@ -146,28 +129,30 @@ an `__init__.py` and a full index are under Cost above.
   run did not re-examine.
 - On 569 files of the Python 3.14 standard library, the re-export binding
   above moves no edge the SCIP oracle judges.
-- A function nested in another function counts as module-level when `from m
-  import Y` chooses between it and a method named `Y`: with `class Registry:
-  def register`, `register = _default.register` (which makes no node) and
-  `def make(): def register(x)`, `from m import register` binds only the
-  nested function.
 - A re-export inside a function of `__init__.py` (`def lazy(): from .heavy
   import X`) is followed as if the package exported `X`.
 - An incremental run still differs from a fresh index in these shapes, as it
   did with 0.174.0: a relative `from .. import X` after the package's
   `__init__.py` is deleted and added back; a new top-level module that shares
   a module path with an existing one (`helpers.py` beside an importable
-  `tests/helpers.py`).
+  `tests/helpers.py`); `from m import Y` where `m` gains a method `Y` beside
+  its function `Y` (a fresh index binds both, the incremental one keeps the
+  function); a class renamed in a file that also defines a function of its
+  method's name (calls and references into the renamed class's method are
+  missing). When a module whose only `Y` is a method gains a second method
+  `Y`, importers through a package re-export (`from pkg import Y`) now miss
+  the new method too.
 
 ### Known issue (also in 0.174.0)
 
 Rarely, a full index stops with `Invalid column type Blob at index: N, name:
 <column>`: one value of one symbol was stored with the wrong SQLite type. In
-this release's testing it happened 5 times in about 18,000 full indexes of
-hono and networkx, with development builds of this release and with 0.174.0,
-and one more run crashed instead. One of the 5 also broke a table index, and
-the two later runs of that index we tried stopped with `database disk image
-is malformed`. For the two we re-ran, `code-graph-mcp rebuild-index --confirm`
+this release's testing, with development builds of this release and with
+0.174.0, it stopped 4 of about 17,900 full indexes of hono (and one more
+crashed), 1 of about 100 of networkx, and 3 of about 430 of the Python
+standard library (one of them with `database disk image is malformed`). One
+hono index also had a broken table index, and the two later runs of it we
+tried stopped with `database disk image is malformed`. For the two we re-ran, `code-graph-mcp rebuild-index --confirm`
 built a clean index; running the index again repaired the one whose table
 index was intact and not the other. The cause is not found yet.
 
