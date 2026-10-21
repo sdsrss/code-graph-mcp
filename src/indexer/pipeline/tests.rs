@@ -12506,6 +12506,180 @@ fn the_module_import_fanout_pulls_only_importers_a_rebuild_rebinds() {
     );
 }
 
+// D#517: an `__init__.py` that appears or vanishes makes its directory a
+// package or a plain directory again, which removes or adds the import roots
+// below it. An importer whose text did not change then names another file, or
+// none: `import helpers` beside `tests/helpers.py` stops naming it once
+// `tests/` is a package, and `import pkg` stops naming `src/pkg/` once `src/`
+// is one.
+#[test]
+fn a_python_package_change_rebinds_the_imports_it_reroots() {
+    let tests_dir: &[(&str, &str)] = &[
+        ("tests/helpers.py", "def make():\n    pass\n"),
+        (
+            "tests/test_a.py",
+            "import helpers\nfrom helpers import make\n\ndef test_a():\n    helpers.make()\n    make()\n",
+        ),
+        ("zzz/decoy.py", "def make():\n    pass\n"),
+    ];
+    let bound = r#"tests/test_a.py.<module> --imports[extracted]{"python_module":"helpers"}--> tests/helpers.py.make"#;
+    let external = "tests/test_a.py.<module> --imports[extracted]--> <external>.helpers";
+    let rows =
+        assert_incremental_graph_matches_rebuild(tests_dir, &[("tests/__init__.py", Some(""))]);
+    assert!(rows.iter().any(|r| r == external), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r == bound), "{rows:#?}");
+    let mut package = tests_dir.to_vec();
+    package.push(("tests/__init__.py", ""));
+    let rows = assert_incremental_graph_matches_rebuild(&package, &[("tests/__init__.py", None)]);
+    assert!(rows.iter().any(|r| r == bound), "{rows:#?}");
+
+    let src_layout: &[(&str, &str)] = &[
+        ("src/pkg/__init__.py", "from .core import X\n"),
+        ("src/pkg/core.py", "def X():\n    pass\n"),
+        ("zzz/decoy.py", "def X():\n    pass\n"),
+        (
+            "app.py",
+            "import pkg\nfrom pkg.core import X\n\ndef main():\n    pkg.X()\n    X()\n",
+        ),
+    ];
+    let bound =
+        r#"app.py.<module> --imports[extracted]{"python_module":"pkg.core"}--> src/pkg/core.py.X"#;
+    let external = "app.py.<module> --imports[extracted]--> <external>.pkg";
+    let rows =
+        assert_incremental_graph_matches_rebuild(src_layout, &[("src/__init__.py", Some(""))]);
+    assert!(rows.iter().any(|r| r == external), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r == bound), "{rows:#?}");
+    let mut package = src_layout.to_vec();
+    package.push(("src/__init__.py", ""));
+    let rows = assert_incremental_graph_matches_rebuild(&package, &[("src/__init__.py", None)]);
+    assert!(rows.iter().any(|r| r == bound), "{rows:#?}");
+
+    // Inside a package a plain directory is no root either, so it changes
+    // nothing (and pulls nothing, below).
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/x.py", "def f():\n    pass\n"),
+            (
+                "app.py",
+                "from pkg.sub.x import f\nimport x\n\ndef main():\n    f()\n",
+            ),
+        ],
+        &[("pkg/sub/__init__.py", None)],
+    );
+}
+
+// The D#517 pull re-extracts only importers of a module path whose files
+// changed: not one importing a module the change leaves alone, not a relative
+// import (it names its file from its own path), not a non-Python file, and
+// nothing at all when no `__init__.py` appears or vanishes.
+#[test]
+fn a_python_package_change_pulls_only_the_importers_it_reroots() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("tests/helpers.py", "def make():\n    pass\n"),
+        ("tests/test_a.py", "import helpers\n"),
+        ("tests/test_b.py", "from helpers import make\n"),
+        ("tests/test_rel.py", "from .helpers import make\n"),
+        ("tests/conftest.py", "import json\n"),
+        ("lib/__init__.py", ""),
+        ("lib/core.py", "def run():\n    pass\n"),
+        ("app.py", "import lib.core\nimport absent\n"),
+        ("web.js", "const helpers = require('helpers')\n"),
+    ]);
+    let pulled = |files: &[&str], deleted: &[&str]| -> Vec<String> {
+        let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+        let deleted: Vec<String> = deleted.iter().map(|s| s.to_string()).collect();
+        super::index_files::python_root_change_importers(&db, &files, &deleted).unwrap()
+    };
+    assert_eq!(
+        pulled(&["tests/__init__.py"], &[]),
+        vec!["tests/test_a.py".to_string(), "tests/test_b.py".to_string()]
+    );
+    // An edit of a module, or a new module that is no `__init__.py`.
+    assert!(pulled(&["tests/helpers.py", "tests/new.py"], &[]).is_empty());
+    // An `__init__.py` the index already holds is no change of package.
+    assert!(pulled(&["lib/__init__.py"], &[]).is_empty());
+    // `lib/` stops being a package: `core` becomes a root-level name, which
+    // nothing imports, and `lib.core` keeps its file.
+    assert!(pulled(&[], &["lib/__init__.py"]).is_empty());
+}
+
+// D#517 (p15): `from m import Y` binds an attribute of module `m`, and a method
+// of a class in `m` that is also named `Y` is not one. A rebuild bound both,
+// an incremental run the one it had. With no module-level `Y` the import binds
+// the method as before, rather than fall through to the name chain.
+#[test]
+fn a_python_from_import_binds_the_module_level_name_not_a_method() {
+    let both = "def Y():\n    return 1\n\nclass C:\n    def Y(self):\n        pass\n";
+    // Two methods, so the lookup has more than one candidate to choose from.
+    let method_only =
+        "class C:\n    def Y(self):\n        pass\n\nclass D:\n    def Y(self):\n        pass\n";
+    let importer = ("app2.py", "from pkg.m import Y\n\ndef main2():\n    Y()\n");
+    let decoy = ("zzz/decoy.py", "def Y():\n    pass\n");
+    let targets = |db: &Database| -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT e.relation, nt.type FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+                 JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+                 WHERE fs.path = 'app2.py' AND ft.path = 'pkg/m.py' ORDER BY 1, 2",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+    let pair = |rel: &str, ty: &str| (rel.to_string(), ty.to_string());
+    let (_p, _d, db) = fresh_index_of(&[("pkg/m.py", both), importer, decoy]);
+    assert_eq!(
+        targets(&db),
+        vec![
+            pair("calls", "function"),
+            pair("imports", "function"),
+            pair("imports", "module")
+        ]
+    );
+    let (_p, _d, db) = fresh_index_of(&[("pkg/m.py", method_only), importer, decoy]);
+    assert_eq!(
+        targets(&db),
+        vec![
+            pair("calls", "method"),
+            pair("calls", "method"),
+            pair("imports", "method"),
+            pair("imports", "method"),
+            pair("imports", "module")
+        ]
+    );
+
+    let plain = "def Y():\n    return 1\n";
+    for (before, after) in [
+        (plain, both),
+        (both, plain),
+        (method_only, both),
+        (both, method_only),
+    ] {
+        assert_incremental_graph_matches_rebuild(
+            &[("pkg/m.py", before), importer, decoy],
+            &[("pkg/m.py", Some(after))],
+        );
+    }
+    // The same through a renamed re-export (review scenario p15).
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("pkg/__init__.py", "from .m import Y as X\n"),
+            ("pkg/m.py", "def Y():\n    pass\n"),
+            ("zzz/decoy.py", "def Y():\n    pass\n\ndef X():\n    pass\n"),
+            ("app.py", "import pkg\n\ndef main():\n    pkg.X()\n"),
+            ("app2.py", "from pkg import X\n\ndef main2():\n    X()\n"),
+        ],
+        &[(
+            "pkg/m.py",
+            Some("def Y():\n    return 1\n\nclass C:\n    def Y(self):\n        pass\n"),
+        )],
+    );
+}
+
 // D6 (2026-09-29 usage evaluation): a route whose handler lives in another
 // file — the canonical `import { getUser } from './ctrl'; app.get('/users',
 // getUser)` — is stored as the handler's self-edge, inside the HANDLER's file,

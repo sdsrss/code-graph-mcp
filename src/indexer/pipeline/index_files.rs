@@ -1208,6 +1208,8 @@ fn settle_foreign_routes(
 /// - APPEARED: a file NEW to the index may satisfy a specifier that failed to
 ///   resolve earlier, and the record of that failure is an `<external>` sentinel.
 ///   Candidates are its importers whose specifier could name the new file's stem.
+/// - A Python `__init__.py` appearing or vanishing moves import roots:
+///   [`python_root_change_importers`].
 ///
 /// Files already in this run's set (they are being re-extracted anyway) and files
 /// being deleted (their nodes are going away) are never added.
@@ -1270,7 +1272,81 @@ fn existence_change_dependents(
         }
     }
 
+    for importer in python_root_change_importers(db, files, delete_paths)? {
+        if !in_run.contains(importer.as_str()) && !deleting.contains(importer.as_str()) {
+            extra.insert(importer);
+        }
+    }
+
     Ok(extra.into_iter().collect())
+}
+
+/// The Python files whose absolute imports name other files once this run's
+/// `__init__.py` files appear or vanish (D#517): `tests/test_a.py`'s `import
+/// helpers` named `tests/helpers.py` until `tests/__init__.py` appeared, and
+/// `import pkg` stopped naming `src/pkg/` when `src/__init__.py` did. The
+/// importer's text did not change, so nothing else re-extracts it. Read from
+/// both the import edges a module path bound and the `<external>` sentinels
+/// it did not, which are named by the module path.
+pub(super) fn python_root_change_importers(
+    db: &Database,
+    files: &[String],
+    delete_paths: &[String],
+) -> Result<Vec<String>> {
+    let is_init = |p: &str| p == "__init__.py" || p.ends_with("/__init__.py");
+    let mut known = db
+        .conn()
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut package_changed = delete_paths.iter().any(|p| is_init(p));
+    for f in files.iter().filter(|f| is_init(f)) {
+        if package_changed {
+            break;
+        }
+        package_changed = !known.exists([f.as_str()])?;
+    }
+    if !package_changed {
+        return Ok(Vec::new());
+    }
+    let before: HashSet<String> = db
+        .conn()
+        .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if before.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut after = before.clone();
+    for p in delete_paths {
+        after.remove(p);
+    }
+    after.extend(files.iter().filter(|f| f.ends_with(".py")).cloned());
+    let changed = super::python_modules::changed_module_paths(&before, &after);
+    if changed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut stmt = db.conn().prepare(
+        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.python_module')
+         FROM edges e
+         JOIN nodes s ON s.id = e.source_id
+         JOIN files f ON f.id = s.file_id
+         WHERE e.relation = 'imports'
+           AND f.language = 'python'
+           AND json_extract(e.metadata, '$.python_module') IS NOT NULL",
+    )?;
+    let bound = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in bound {
+        let (importer, module) = row?;
+        if changed.contains(&module) {
+            out.insert(importer);
+        }
+    }
+    for (module, importer) in crate::storage::queries::get_external_sentinel_importers(db.conn())? {
+        if importer.ends_with(".py") && changed.contains(&module) {
+            out.insert(importer);
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// The `__init__.py` of each package a Python module NEW to the index joins:
@@ -1766,12 +1842,13 @@ fn resolve_batch_relations(
                     {
                         // Internal module — try constrained resolution
                         if let Some(module_targets) = resolve_python_module_targets(
+                            db.conn(),
                             &module_files,
                             is_module_import,
                             &rel.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        ) {
+                        )? {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,
@@ -3493,6 +3570,18 @@ fn restore_inbound_edges(
                                     )
                                 })
                         })
+                        .collect::<Vec<_>>()
+                })
+                .map(|found| {
+                    // A Python name that is a module attribute is not the
+                    // namesake method beside it, as at resolution (D#517):
+                    // `from m import Y` that bound `C.Y` binds the `def Y` that
+                    // `m` gains.
+                    let module_level =
+                        src_lang == "python" && found.iter().any(|(_, _, ty)| *ty != "method");
+                    found
+                        .into_iter()
+                        .filter(|(_, _, ty)| !module_level || *ty != "method")
                         .map(|(id, _, _)| *id)
                         .collect::<Vec<i64>>()
                 })
@@ -3972,12 +4061,13 @@ fn resolve_deferred_relations(
                     project_module_files_from(python_module, &d.rel_path, python_module_map)
                 {
                     if let Some(module_targets) = resolve_python_module_targets(
+                        db.conn(),
                         &module_files,
                         is_module_import,
                         &d.target_name,
                         &node_id_to_path,
                         &name_to_ids,
-                    ) {
+                    )? {
                         edges_created += insert_relation_edges(
                             db,
                             &source_ids,
@@ -4013,12 +4103,13 @@ fn resolve_deferred_relations(
                             project_module_files_from(&submodule, &d.rel_path, python_module_map)
                                 .unwrap_or(module_files);
                         if let Some(module_nodes) = resolve_python_module_targets(
+                            db.conn(),
                             &files,
                             true,
                             &d.target_name,
                             &node_id_to_path,
                             &name_to_ids,
-                        ) {
+                        )? {
                             edges_created += insert_relation_edges(
                                 db,
                                 &source_ids,

@@ -111,6 +111,25 @@ pub(super) fn build_python_module_map(
     map
 }
 
+/// The dotted module paths that name other files in `after` than in `before`
+/// (D#517). An `__init__.py` that appears or vanishes turns its directory into
+/// a package or back, which removes or adds the import roots below it, so the
+/// same tree of modules answers `import helpers` differently.
+pub(super) fn changed_module_paths(
+    before: &HashSet<String>,
+    after: &HashSet<String>,
+) -> HashSet<String> {
+    let (old, new) = (
+        build_python_module_map(before),
+        build_python_module_map(after),
+    );
+    old.keys()
+        .chain(new.keys())
+        .filter(|k| old.get(*k) != new.get(*k))
+        .cloned()
+        .collect()
+}
+
 /// The project files a dotted Python module path may legitimately name, or
 /// `None` when the path is not a project module at all (so the caller binds it
 /// to the `<external>` sentinel).
@@ -169,22 +188,29 @@ pub(super) fn project_module_files_from(
 /// Resolve Python import targets within the files [`project_module_files`]
 /// resolved the module to.
 /// For `import X` (is_module_import): finds `<module>` nodes in those files.
-/// For `from X import Y`: finds nodes named Y only in those files.
+/// For `from X import Y`: finds nodes named Y only in those files, leaving out
+/// a method named Y beside a module-level one: `from m import Y` binds an
+/// attribute of `m`, which a method is not (D#517). An import whose only
+/// candidates are methods binds them as before, rather than fall through to
+/// the name chain.
 /// Returns None if no matching node exists yet.
 pub(super) fn resolve_python_module_targets(
+    conn: &rusqlite::Connection,
     module_files: &[String],
     is_module_import: bool,
     target_name: &str,
     node_id_to_path: &HashMap<i64, String>,
     name_to_ids: &HashMap<String, Vec<i64>>,
-) -> Option<Vec<i64>> {
+) -> anyhow::Result<Option<Vec<i64>>> {
     let lookup_name = if is_module_import {
         "<module>"
     } else {
         target_name
     };
-    let all_ids = name_to_ids.get(lookup_name)?;
-    let targets: Vec<i64> = all_ids
+    let Some(all_ids) = name_to_ids.get(lookup_name) else {
+        return Ok(None);
+    };
+    let mut targets: Vec<i64> = all_ids
         .iter()
         .filter(|nid| {
             node_id_to_path
@@ -194,11 +220,20 @@ pub(super) fn resolve_python_module_targets(
         })
         .copied()
         .collect();
-    if targets.is_empty() {
-        None
-    } else {
-        Some(targets)
+    if !is_module_import && targets.len() > 1 {
+        let mut is_method =
+            conn.prepare_cached("SELECT type = 'method' FROM nodes WHERE id = ?1")?;
+        let mut methods: HashSet<i64> = HashSet::new();
+        for &id in &targets {
+            if is_method.query_row([id], |r| r.get::<_, bool>(0))? {
+                methods.insert(id);
+            }
+        }
+        if methods.len() < targets.len() {
+            targets.retain(|id| !methods.contains(id));
+        }
     }
+    Ok((!targets.is_empty()).then_some(targets))
 }
 
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from
@@ -489,6 +524,32 @@ mod tests {
         let m = map_of(&["a/utils.py", "b/utils.py"]);
         let got = project_module_files("utils", &m).unwrap();
         assert_eq!(got.len(), 2, "got {got:?}");
+    }
+
+    #[test]
+    fn a_package_change_changes_the_module_paths_below_it() {
+        let set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect();
+        let plain = set(&[
+            "tests/helpers.py",
+            "tests/test_a.py",
+            "lib/__init__.py",
+            "lib/a.py",
+        ]);
+        let package = set(&[
+            "tests/__init__.py",
+            "tests/helpers.py",
+            "tests/test_a.py",
+            "lib/__init__.py",
+            "lib/a.py",
+        ]);
+        let mut got: Vec<String> = changed_module_paths(&plain, &package).into_iter().collect();
+        got.sort();
+        // `tests` gains its `__init__.py`; `tests.helpers` and `lib.a` keep
+        // their files.
+        assert_eq!(got, ["helpers", "test_a", "tests"]);
+        let mut back: Vec<String> = changed_module_paths(&package, &plain).into_iter().collect();
+        back.sort();
+        assert_eq!(back, got);
     }
 
     #[test]
