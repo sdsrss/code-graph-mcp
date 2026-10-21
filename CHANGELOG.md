@@ -54,14 +54,13 @@ the reason text below); with `--include-tests` and no limit it lists 683
 `ambiguous` ones instead of 883.
 
 An incremental index agrees with a fresh one wherever the build before this
-change did, except for a function calling both `m.X()` and a bare `X()`,
-and for a run that moves a name into the second file of a module path
-naming two (both under Not covered): over the 65 incremental scenarios of D#370(a)'s two
-reviews, 64 agree with either build (p15, a renamed re-export, disagrees as
-before); over the 1,789 steps of 0.175.0's reviews, 262 disagree with either
-build, the same steps; over the 1,205 steps of this change's review, 362
-disagree with 0.175.0 and 276 with this build, and the 3 where only this
-build disagrees are that function's.
+change did, except for a run that moves a name into the second file of a
+module path naming two (under Not covered): over the 65 incremental
+scenarios of D#370(a)'s two reviews, 64 agree with either build (p15, a
+renamed re-export, disagrees as before); over the 1,789 steps of 0.175.0's
+reviews, 262 disagree with either build, the same steps; over the 1,205
+steps of this change's review, 362 disagree with 0.175.0 and 270 with this
+release, none of them a step where 0.175.0 agreed.
 Cost: a full index takes more CPU (medians over 7 alternating runs: networkx
 3.73 → 3.96 s, the standard library 5.47 → 5.67 s). An incremental run
 takes longer; medians over 15 and over 41 alternating runs, in two sessions
@@ -105,7 +104,8 @@ differed from a fresh one after 335 with 0.175.0 and 330 with this build, and
 after no step where 0.175.0 did not; the 330 are 0.175.0's Not covered shapes
 of a method `Y` beside a function `Y`, and of a renamed class. On flask, 90 random edits (renames, deletions,
 restores, `__init__.py` added or removed) left the incremental index
-different after 6 with 0.175.0 and 3 with this build (below). Cost: adding a
+different after 6 with 0.175.0 and 2 with this release (both under Not
+covered; a rename among the 6 is the change two sections below). Cost: adding a
 module now also compares the module paths before and after, medians over 7
 alternating runs 113 → 117 ms on the standard library and 85 → 91 ms on
 networkx.
@@ -125,6 +125,30 @@ added here), an incremental index differed from a fresh one after 330 with
 the build before this change and 262 with it, and after no step where it did
 not before; the 68 it repairs are runs of more than 500 changed files.
 
+### An incremental index keeps both calls when one function calls a name two ways
+
+A call an incremental index cannot bind yet is kept and bound once a
+definition appears. It kept one such call per function and name, so a
+function that names one callee two ways lost one of its calls: `m.X()` and a
+bare `X()` before any file defines `X`; or, on flask, when
+`src/flask/sansio/blueprints.py` was renamed, the calls into
+`Blueprint.register_blueprint` from six test functions in
+`tests/test_blueprints.py` that call `register_blueprint` both on a blueprint
+and on the app. Both calls are now kept. An index built by an earlier version
+is converted the first time this version opens it; 0.175.0 still opens a
+converted index.
+
+A full index gives the same edges as before on the seven corpora of 0.174.0,
+networkx, the standard library and this repository as it is now, and keeps a
+few more calls for later (flask 921 → 923, hono 3,005 → 3,026, networkx 8,834
+→ 8,848, the standard library 8,556 → 8,560). Over the 1,205 incremental steps
+of the `P.X()` change's review, an incremental index differed from a fresh one
+after 276 steps before this change and 270 with it, and after no step where
+it agreed before; over the 1,789 steps of 0.175.0's reviews and the 66
+scenarios of D#370(a)'s reviews and the `P.X()` change, it differs after the
+same ones as before. On flask, the 90 random edits above differ after 3
+before this change and 2 with it.
+
 ### `surprising` names a TypeScript type only for a call into one
 
 0.175.0 gave every `ambiguous` edge the reason "bare-name target not decided
@@ -137,10 +161,6 @@ flask none of 683 are (883 before the change above).
 
 ### Not covered
 
-- When one function calls two methods of the same name through different
-  receivers (flask's `bp.register_blueprint(...)` and
-  `app.register_blueprint(...)`), and the file defining one of them is
-  renamed, an incremental index keeps only one of the two calls into it.
 - A module that imports its own module path (`import typing` in
   `src/flask/typing.py`) keeps that binding when an `__init__.py` above it is
   added back.
@@ -159,17 +179,22 @@ flask none of 683 are (883 before the change above).
   the call by name, had right; `from helpers import h` keeps it in 0.175.0
   too. flask, networkx and the standard library import no module path that
   names two files.
-- A function that calls both `m.X()` and a bare `X()` before any file
-  defines `X`: once `m.py` defines it, an incremental index binds the `m.X()`
-  call and not the bare one, as 0.175.0 did. 0.175.0 then caught up when a
-  second `X` appeared in another file, by re-checking `ambiguous` calls; the
-  `m.X()` call is now `inferred`, so this index does not.
 - `P.X()` binds nothing new when the name resolution never binds `X` across
   files (a short list of very common names: `get`, `close`, `read`, `write`,
   `join`, `map`, `filter`, …); it stays without an edge.
 - Through a re-export, `P.X()` binds a method as `from P import X` does, and
   shares that import's incremental gap from 0.175.0 (a module that gains a
   method `X` beside its function `X`).
+
+### Known issue (also in 0.174.0 and 0.175.0)
+
+The rare full-index stop that 0.175.0 describes (`Invalid column type Blob
+at index: N, name: <column>`, once with `database disk image is malformed`)
+is not fixed, and its cause is not found. In 1,000 more full indexes with
+builds made while developing this release (networkx 300 and the standard
+library 300, both under AddressSanitizer, and the standard library 400
+without it), it did not occur. 0.175.0's notes say what repaired the indexes
+it stopped.
 
 ## 0.175.0
 

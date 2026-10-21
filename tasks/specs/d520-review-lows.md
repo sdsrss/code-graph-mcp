@@ -46,3 +46,9 @@
 - 开销（7 次交替的中位数）：新增模块 标准库 113 → 117 ms、networkx 85 → 91 ms；删 `networkx/utils/__init__.py` 1340 vs 1302 ms（5 次，都重抽 186 个文件）；flask 删 `task_app/__init__.py` 36 vs 33 ms（2 → 3 个文件）；flask 普通编辑 48 vs 51 ms。
 - `surprising --include-tests`：hono 1,748 条 `ambiguous` 中 73 条改为 TypeScript 类型的文字，其余 1,675 条为 several candidates；flask 883 条都是 several candidates。
 - LOW 7：RED `two_unresolved_calls_of_one_name_are_buffered_apart`（修前增量缺 `app.py.f --calls[inferred]--> m.py.X`，即裸 `X()`）；`opening_an_older_db_puts_metadata_in_the_pending_unique_key`。变异：去掉打开时的调用 → 行数 1 ≠ 2；去掉"已是新定义就返回" → 第二次打开 schema_version 35 ≠ 33。两个都被杀死。
+- LOW 7 差分（`/var/tmp/d521`，release 构建 `cgm-pre176` = f31bbf5e md5 `e3c2482c…`，`cgm-low7` = 8f3f1670 md5 `b17a79c3…`；第一次构建 low7 因 `git archive` 的 mtime 被 cargo 复用、md5 相同，touch 后重建）：
+  - 全量：十个语料（d446 的七个、networkx、标准库、本仓库 8f3f1670 树）两臂边逐行相同。pending 行数 flask 921 → 923、hono 3,005 → 3,026、networkx 8,834 → 8,848、标准库 8,556 → 8,560。
+  - D#518 第 1 轮 994 个场景 1,205 步：0.175.0 362 步、pre176 276 步、low7 270 步不一致；low7 没有一步是 pre176 或 0.175.0 一致的；修好 a11 第 1–3 步、d05 第 3、4 步、d370a-review2 s23 第 1 步。剩下与本项相关的 d05 第 2 步只差一条 pending 行（边相同），a09 第 2 步 0.175.0 起就有。
+  - 0.175.0 两轮 1,789 步：两臂都是 262 步，逐步裁决相同。D#370(a) 65 个 + big_run_attr：两臂都是 65/66（p15）。第 2 轮 twofile2–4：两臂相同（D#542 的形状）。
+  - flask 随机编辑 3×30：pre176 2/0/1，low7 1/0/1；seed 1 op6 改名 `sansio/blueprints.py` 少 6 条（`tests/test_blueprints.py` 六个测试函数进 `Blueprint.register_blueprint`）修好；剩下 2 次是 `typing.py` 自导入（7'）。
+  - 降级：low7 建的 flask 索引，0.175.0 `health-check`、`callgraph` 退出码 0（照旧打印"newer index"警告），`rebuild-index --confirm` 建出旧定义的索引；low7 再打开（health-check，读者路径）即改为新定义，增量运行后 INDEX_VERSION 124、pending 923。
