@@ -3580,8 +3580,10 @@ fn restore_inbound_edges(
             let receiver_typed = relation.as_str() == REL_CALLS
                 && metadata.as_deref().is_some_and(|m| m.contains(r#""rt":"#));
             // A `P.X()` call (D#518) whose target is gone is requeued the same
-            // way, not buffered: the pending buffer keeps one row per (caller,
-            // name), which a bare `X()` of the same caller would take.
+            // way, not buffered. It was routed here while the pending buffer
+            // kept one row per (caller, name), which a bare `X()` of the same
+            // caller would take; the buffer's key has the metadata too since
+            // 0.176.0, and the route is unchanged.
             let attr_call = relation.as_str() == REL_CALLS
                 && super::resolve::is_module_attr_call(metadata.as_deref());
             // A `P.X()` call's synthetic import (D#518) that fell back to the
@@ -3675,11 +3677,12 @@ fn restore_inbound_edges(
                     continue;
                 }
                 // A receiver-typed call goes through the deferred pass, as its
-                // first resolution did: the pending buffer keeps one row per
-                // caller and name, so requeued there it displaced (or was
-                // displaced by) the same caller's other `spawn_local` call, and
-                // tokio's `local.spawn_local(..)` lost its edge. One entry per
-                // call, though it was bound to several targets.
+                // first resolution did. It was routed here while the pending
+                // buffer kept one row per caller and name: requeued there it
+                // displaced (or was displaced by) the same caller's other
+                // `spawn_local` call, and tokio's `local.spawn_local(..)` lost
+                // its edge. One entry per call, though it was bound to several
+                // targets.
                 if receiver_typed || attr_call || attr_import.is_some() {
                     let target_name = attr_import.as_deref().unwrap_or(target_name.as_str());
                     if requeued_typed.insert((

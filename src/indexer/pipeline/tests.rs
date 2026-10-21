@@ -13826,14 +13826,24 @@ fn two_unresolved_calls_of_one_name_are_buffered_apart() {
             "{rows:#?}"
         );
     }
-    // The callee's file is renamed: both inbound calls are requeued.
-    assert_incremental_graph_matches_rebuild(
+    // The file both calls bind into is renamed (flask's `sansio/blueprints.py`
+    // and `register_blueprint`): both inbound calls are requeued and bound again
+    // (review of 0.176.0, F2).
+    let method = "class K:\n    def X(self):\n        pass\n";
+    let rows = assert_incremental_graph_matches_rebuild(
         &[
             ("m.py", "def other():\n    pass\n"),
-            ("q.py", "def X():\n    pass\n"),
+            ("q.py", method),
             ("app.py", "import m\n\ndef f(o):\n    m.X()\n    o.X()\n"),
         ],
-        &[("q.py", None), ("r.py", Some("def X():\n    pass\n"))],
+        &[("q.py", None), ("r.py", Some(method))],
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.starts_with("app.py.f --calls") && r.ends_with("--> r.py.X"))
+            .count(),
+        2,
+        "{rows:#?}"
     );
 }
 

@@ -483,9 +483,11 @@ pub fn migrate_v9_to_v10(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 /// definition is the one from before 0.176.0, `(source_id, target_name,
 /// source_language)`. Under it one caller's `m.X()` and `X()` (or `m.X()` and
 /// `o.X()`) kept one pending row between them, and the sweep bound one of the
-/// two calls a rebuild binds (review of 0.175.0, LOW 7). Runs after
-/// `create_tables_sql`, whose `IF NOT EXISTS` leaves an existing index of that
-/// name as it is, and writes only when the definition is the old one.
+/// two calls a rebuild binds (review of 0.175.0, LOW 7). Runs on an indexer's
+/// open, after `create_tables_sql`, whose `IF NOT EXISTS` leaves an existing
+/// index of that name as it is, and writes only when the definition is the old
+/// one. The check is outside the transaction, so indexers that open one old
+/// database at the same moment can each rebuild it; the result is the same.
 ///
 /// No SCHEMA_VERSION bump: the wider index accepts every set of rows the old one
 /// did, so an older binary keeps working on a rebuilt index, and its own

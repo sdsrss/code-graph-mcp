@@ -368,7 +368,12 @@ impl Database {
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
-        schema::widen_pending_unique_index(&conn)?;
+        // Only an indexer writes pending rows, so only its open converts their
+        // key: a reader's file can be read-only, or another process can hold the
+        // write lock, and the reader then failed to open an index it can read.
+        if revalidate {
+            schema::widen_pending_unique_index(&conn)?;
+        }
 
         if enable_vec {
             conn.execute_batch(&schema::create_vec_tables_sql())?;
@@ -1641,7 +1646,7 @@ mod tests {
             "fresh migration must leave pending_unresolved_calls empty"
         );
 
-        // (b) The unique index (source_id, target_name, source_language) exists —
+        // (b) The unique index idx_pending_unique exists —
         // without it, repeated Phase 2 invocations on the same file would
         // grow the table unbounded.
         let unique_idx_exists: bool = db
@@ -1837,9 +1842,11 @@ mod tests {
     }
 
     /// An index from before 0.176.0 keys `idx_pending_unique` without
-    /// `metadata`. Opening it rebuilds the index with it, keeps the rows, writes
-    /// the schema only that once, and leaves an index an older binary still
-    /// opens: no SCHEMA_VERSION bump, for the reasons given on
+    /// `metadata`. An indexer's open rebuilds the index with it and keeps the
+    /// rows; a reader's open writes nothing, since the file can be read-only or
+    /// another process can hold the write lock (review of 0.176.0, F1); a later
+    /// open writes nothing either; an older binary still opens the result. No
+    /// SCHEMA_VERSION bump, for the reasons given on
     /// [`test_open_adds_composite_file_name_index_to_an_older_db`].
     #[test]
     fn opening_an_older_db_puts_metadata_in_the_pending_unique_key() {
@@ -1868,19 +1875,27 @@ mod tests {
                 .unwrap();
         }
         let module = Some(r#"{"q":"module","v":"m"}"#);
-        // Precondition: the old key drops the second call of `X`.
-        {
-            let c = Connection::open(&db_path).unwrap();
-            insert_pending_unresolved_call(&c, 1, "X", "python", module).unwrap();
-            assert_eq!(count_pending_unresolved_calls(&c).unwrap(), 1);
-        }
-
-        drop(Database::open(&db_path).unwrap());
-        let c = Connection::open(&db_path).unwrap();
         let schema_cookie = |c: &Connection| -> i64 {
             c.pragma_query_value(None, "schema_version", |r| r.get(0))
                 .unwrap()
         };
+        // Precondition: the old key drops the second call of `X`.
+        let before = {
+            let c = Connection::open(&db_path).unwrap();
+            insert_pending_unresolved_call(&c, 1, "X", "python", module).unwrap();
+            assert_eq!(count_pending_unresolved_calls(&c).unwrap(), 1);
+            schema_cookie(&c)
+        };
+
+        drop(Database::open_nondestructive(&db_path).unwrap());
+        assert_eq!(
+            schema_cookie(&Connection::open(&db_path).unwrap()),
+            before,
+            "a reader's open must not write the schema"
+        );
+
+        drop(Database::open(&db_path).unwrap());
+        let c = Connection::open(&db_path).unwrap();
         let after_first_open = schema_cookie(&c);
         assert_eq!(
             count_pending_unresolved_calls(&c).unwrap(),
@@ -1907,6 +1922,30 @@ mod tests {
             after_first_open,
             "a second open must not rewrite the index"
         );
+    }
+
+    /// The key of a fresh database treats a call without metadata as one value:
+    /// buffering it twice keeps one row. A bare `metadata` column in the key
+    /// would keep both, since a unique index holds NULLs as distinct.
+    #[test]
+    fn a_fresh_db_buffers_a_call_without_metadata_once() {
+        use crate::storage::queries::{
+            count_pending_unresolved_calls, insert_pending_unresolved_call,
+        };
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(&tmp.path().join("index.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO files (id, path, blake3_hash, last_modified, language, indexed_at)
+                     VALUES (1, 'app.py', 'h', 0, 'python', 0);
+                 INSERT INTO nodes (id, file_id, type, name, start_line, end_line, code_content)
+                     VALUES (1, 1, 'function', 'f', 3, 5, 'def f(): ...');",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            insert_pending_unresolved_call(db.conn(), 1, "X", "python", None).unwrap();
+        }
+        assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
     }
 
     /// The composite `nodes(file_id, name)` index the three global edge
