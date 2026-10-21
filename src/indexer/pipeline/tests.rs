@@ -13743,6 +13743,63 @@ fn a_call_on_a_python_module_follows_edits_of_the_module() {
     );
 }
 
+// A module path can name two files at once (`tests/helpers.py` beside the
+// root's `helpers.py`, `pkg.py` beside `pkg/__init__.py`), and a rebuild binds
+// the name in each that defines it: the second file gaining it must rebind an
+// importer whose edge points only at the first (review of D#518, MEDIUM-1).
+#[test]
+fn a_module_path_naming_two_files_rebinds_its_importers_when_either_changes() {
+    let gains = |importer: (&'static str, &'static str), first: &'static str, second| {
+        let rows = assert_incremental_graph_matches_rebuild(
+            &[
+                (first, "def h():\n    pass\n"),
+                (second, "def other():\n    pass\n"),
+                ("z.py", "def h():\n    pass\n"),
+                importer,
+            ],
+            &[(second, Some("def h():\n    pass\n"))],
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("--imports") && r.ends_with(&format!("--> {second}.h"))),
+            "{rows:#?}"
+        );
+    };
+    let attr = (
+        "tests/test_a.py",
+        "import helpers\n\ndef test_x():\n    helpers.h()\n",
+    );
+    let from = (
+        "tests/test_a.py",
+        "from helpers import h\n\ndef test_x():\n    h()\n",
+    );
+    for importer in [attr, from] {
+        gains(importer, "tests/helpers.py", "helpers.py");
+    }
+    let attr = ("app.py", "import pkg\n\ndef f():\n    pkg.h()\n");
+    let from = ("app.py", "from pkg import h\n\ndef f():\n    h()\n");
+    for importer in [attr, from] {
+        gains(importer, "pkg/__init__.py", "pkg.py");
+    }
+    // Neither file defines the name, so the import binds both modules; then one
+    // gains it, and the other module is no target of a rebuild.
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("scripts/utils.py", "def other2():\n    pass\n"),
+            ("tools/utils.py", "def other():\n    pass\n"),
+            (
+                "scripts/go.py",
+                "import utils\n\ndef main():\n    utils.run()\n",
+            ),
+        ],
+        &[("scripts/utils.py", Some("def run():\n    pass\n"))],
+    );
+    assert!(
+        rows.iter().any(|r| r.ends_with("--> scripts/utils.py.run")),
+        "{rows:#?}"
+    );
+}
+
 // A run of more than one batch: an importer in an earlier batch resolved
 // `from pkg.m import Y` against `m.py`'s old nodes, and `m.py`'s later batch
 // drops `Y`. The import is requeued, as a rebuild re-resolves it, instead of

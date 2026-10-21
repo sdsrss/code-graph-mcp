@@ -1863,7 +1863,7 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     // below, in Rust, where the module paths can be resolved. Rust `use` paths
     // follow the stricter rules of the arms above.
     let module_import_sql = format!(
-        "SELECT DISTINCT f.path, f.language, e.metadata, tf.path, u.lang
+        "SELECT DISTINCT f.path, f.language, e.metadata, tf.path, u.nm, u.lang
          FROM cg_fanout_up u
          CROSS JOIN nodes tgt ON tgt.name = u.nm AND tgt.type <> 'external_module'
          CROSS JOIN files tf ON tf.id = tgt.file_id
@@ -1994,7 +1994,8 @@ pub(super) fn bare_name_callers_of_new_duplicates(
                     language: row.get(1)?,
                     metadata: row.get(2)?,
                     target_path: row.get(3)?,
-                    added_language: row.get(4)?,
+                    name: row.get(4)?,
+                    added_language: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2021,6 +2022,7 @@ struct ModuleImportRow {
     language: Option<String>,
     metadata: Option<String>,
     target_path: String,
+    name: String,
     added_language: Option<String>,
 }
 
@@ -2028,7 +2030,9 @@ struct ModuleImportRow {
 /// took the name pool — the `<external>` sentinel, or a definition outside the
 /// file its module names — in a language the added definition can bind. An
 /// import that found its name in its own module keeps it, whatever else defines
-/// that name.
+/// that name, unless its module names another file this run gave the name: a
+/// rebuild binds both `tests/helpers.py` and the root's `helpers.py` for
+/// `import helpers` (review of D#518, MEDIUM-1).
 fn module_importers_to_refresh(
     conn: &rusqlite::Connection,
     rows: &[ModuleImportRow],
@@ -2043,6 +2047,12 @@ fn module_importers_to_refresh(
         .cloned()
         .collect();
     let python_module_map = super::python_modules::build_python_module_map(&python_paths);
+    let mut defines_in_run = conn.prepare(
+        "SELECT 1 FROM cg_fanout_paths p
+         CROSS JOIN files f ON f.path = p.path
+         CROSS JOIN nodes n ON n.file_id = f.id
+         WHERE p.path = ?1 AND n.name = ?2 LIMIT 1",
+    )?;
     let mut out = Vec::new();
     for row in rows {
         let (Some(lang), Some(added)) = (row.language.as_deref(), row.added_language.as_deref())
@@ -2079,8 +2089,15 @@ fn module_importers_to_refresh(
             } else {
                 continue;
             };
-        if !named.is_some_and(|files| files.contains(&row.target_path)) {
+        let Some(files) = named.filter(|files| files.contains(&row.target_path)) else {
             out.push(row.importer.clone());
+            continue;
+        };
+        for file in files.iter().filter(|f| **f != row.target_path) {
+            if defines_in_run.exists(rusqlite::params![file, row.name])? {
+                out.push(row.importer.clone());
+                break;
+            }
         }
     }
     Ok(out)

@@ -3681,6 +3681,17 @@ fn restore_inbound_edges(
                         target_name.to_string(),
                         metadata.as_deref(),
                     )) {
+                        // The import's `<module>` edges into the other files its
+                        // module names: the deferred pass binds its whole target
+                        // set again, which may be the attribute alone (review of
+                        // D#518, MEDIUM-1).
+                        if attr_import.is_some() {
+                            db.conn().execute(
+                                "DELETE FROM edges
+                                 WHERE source_id = ?1 AND relation = ?2 AND metadata = ?3",
+                                rusqlite::params![*source_id, relation, metadata],
+                            )?;
+                        }
                         deferred.push(DeferredRelation {
                             source_ids: vec![*source_id],
                             source_name: String::new(),
