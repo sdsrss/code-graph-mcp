@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.177.0
+
+**Upgrading: no rebuild.** `INDEX_VERSION` stays at 124. A full index is
+the same as 0.176.0's: on the seven corpora of 0.174.0 and on this repository
+as it is now, the same symbols, edges, context text and buffered calls. The
+changes are to incremental runs. Where an earlier version already left an
+incremental index out of step, it stays so until the files involved are
+edited, or until `code-graph-mcp rebuild-index --confirm` indexes the project
+from scratch. To go back to 0.176.0: `npm i -g @sdsrs/code-graph@0.176.0`
+(or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.176.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### A deleted file that comes back brings back what its dependents lost
+
+Deleting a file re-reads the files that import it or refer to it other than
+by a call, against the tree without it. What only that file could answer is
+then dropped there, with nothing left to say it was: a path-qualified call
+such as `code_graph_mcp::indexer::pipeline::run_full_index()`, a type named
+in a signature, a `use` through a module that re-exports the file with `pub
+use e::*`. Restoring the file did not re-read them, so those edges stayed
+missing until each of those files was edited. In this repository, deleting
+and restoring `src/indexer/pipeline/mod.rs` left 96 edges missing: 90 calls
+from `tests/cli_e2e.rs`, 89 of them to `run_full_index` by its full path, and
+6 references. A deletion now records the files whose edges into the deleted
+file would otherwise be lost, and the run in which the file comes back
+re-reads them. A file that calls into it only by a name without a path is not
+recorded: its calls are kept and bound again as before.
+
+Measured with builds of this release and of 0.176.0's code: the restore above
+leaves no edge missing. In 90 random edits of this repository (three runs of
+30: appending to a file, deleting, restoring, renaming), 7 of the 12 restores
+left the incremental index with edges a fresh index of the same files does not
+have, or without edges it has, with 0.176.0's code, and none with this
+release; no other edit did so with either. In 30 random edits each of flask,
+hono and gin, the two builds differ from a fresh index after the same edits:
+flask after one (an `__init__.py` restored, the first item under 0.176.0's Not
+covered), hono and gin after none.
+
+Cost: only a run in which a recorded file comes back does more. Restoring
+`src/indexer/pipeline/mod.rs` re-reads 34 files instead of 1 and takes 1,014
+ms instead of 684 (1,623 ms of CPU instead of 845; medians of 7 alternating
+runs); a full index of this repository takes 1.8 s. Every other run that
+indexes or deletes a file reads the record, one row: an edit of that file
+with 2,000 deleted paths recorded took 190 ms, against 191 ms with the build
+before this change (medians of 7).
+
+### Context text names the calls an incremental run adds
+
+Each symbol's context text lists its calls and callers (`calls: …`,
+`called_by: …`); `search` ranks by it and semantic search embeds it. An
+incremental run rewrote the text of symbols in other files only when they had
+an edge into the re-indexed files before the run, so the callee of a call it
+added into a file it did not open never listed the new caller: adding `run()`
+to `b.py` left `run` in `a.py` without `called_by: main`, which a fresh index
+writes. The
+same happened to a call written before the function it calls, bound in the
+run that adds the function: neither `main` nor `run` named it. Those texts
+are now rewritten, and their embeddings recomputed (at once when the run has
+a model loaded, else by the background embedder).
+
+Measured with builds of this release and of 0.176.0's code: in six small
+projects (a call added into another file's function, in Python and in Rust; a
+function added after its caller, in an existing file, in a new file and in
+Rust; a module path naming two files) the text differed from a fresh index's
+with 0.176.0's code and matches it with this release. After the 90 random
+edits of this repository above, the symbols whose context text differs from
+a fresh index's went from 123, 71 and 15 to 3, 7 and 4. After 30 random
+edits each: gin 15 to 0, flask 31 to 27, hono 72 to 71 (what is left is
+under Not covered).
+
+Cost: one more query in each run that re-indexes something, and the symbols
+it finds rendered again. One-file edits, medians of 15 alternating runs of
+the two builds: on this repository `src/indexer/pipeline/mod.rs` 176 → 172
+ms, `src/storage/queries/meta.rs` 100 → 100 ms, `src/cli/commands/callgraph.rs`
+114 → 117 ms; on flask `src/flask/app.py` 69 → 70 ms, `src/flask/helpers.py`
+47 → 46 ms, `tests/test_basic.py` 150 → 154 ms.
+
+### Not covered
+
+- A file the index has never held, added while other files already name it
+  by path or by type, is not re-read into them: with `src/b.rs` calling
+  `crate::a::run_full()` and taking a `crate::a::Phase` before `src/a.rs`
+  exists, adding `src/a.rs` leaves both edges missing, as in 0.176.0. Only a
+  deletion records the files to re-read.
+- The record keeps 2,000 deleted paths and drops the oldest. A file restored
+  after its entry was dropped comes back as it did in 0.176.0.
+- Context text can still list calls its own index no longer has, or miss
+  ones it has: it is written before the steps that bind calls through imports
+  and drop calls an import contradicts, in a full index as in an incremental
+  one. Of the 71 symbols left on hono above, the incremental index's text
+  matches its own edges for 70 and the fresh index's does not. One traced in
+  this repository: a fresh index's text lists three `test_db` calls where its
+  edges keep one.
+- 0.176.0's Not covered items still hold.
+
+### Known issue (also in 0.174.0, 0.175.0 and 0.176.0)
+
+The rare full-index stop that 0.175.0 describes (`Invalid column type Blob
+at index: N, name: <column>`) is not fixed and its cause is not found.
+
 ## 0.176.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 123 → 124
