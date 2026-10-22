@@ -4203,6 +4203,137 @@ fn test_newly_added_file_revives_its_importers_stale_sentinel() {
     );
 }
 
+/// D#543: deleting a file re-extracts its dependents against the tree without
+/// it, and what only that file could answer drops with no record left: an
+/// inline `crate::a::f()` (an empty path filter is a drop, not a buffer), a type
+/// reference (references never buffer), a `use` through a glob re-export (its
+/// sentinel names the re-exporting module, not the file that comes back).
+/// A file that only calls `demo::a::run_full()` is not re-extracted, but its
+/// buffered row is drained once the path filter finds nothing against
+/// `z::run_full`. Restoring the file must bring all of them back, as a rebuild
+/// of the same tree does.
+#[test]
+fn a_restored_rust_file_brings_back_what_its_dependents_lost() {
+    let tree: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod a;\npub mod b;\npub mod c;\npub mod q;\npub mod z;\n",
+        ),
+        ("src/z.rs", "pub fn run_full() {}\n"),
+        ("tests/t.rs", "fn t() {\n    demo::a::run_full();\n}\n"),
+        ("src/a.rs", "pub struct Phase;\npub fn run_full() {}\n"),
+        (
+            "src/b.rs",
+            "pub fn caller(p: crate::a::Phase) {\n    crate::a::run_full();\n}\n",
+        ),
+        ("src/q/mod.rs", "mod e;\npub use e::*;\n"),
+        ("src/q/e.rs", "pub fn insert_row() {}\n"),
+        (
+            "src/c.rs",
+            "use crate::q::insert_row;\n\npub fn store() {\n    insert_row();\n}\n",
+        ),
+    ];
+    for gone in ["src/a.rs", "src/q/e.rs"] {
+        let (project, _d, db) = fresh_index_of(tree);
+        let full = edge_set(&db);
+        for edge in [
+            "src/b.rs.caller --calls--> src/a.rs.run_full",
+            "src/b.rs.caller --references--> src/a.rs.Phase",
+            "src/c.rs.store --calls--> src/q/e.rs.insert_row",
+            "tests/t.rs.t --calls--> src/a.rs.run_full",
+        ] {
+            assert!(full.contains(&edge.to_string()), "control: {full:#?}");
+        }
+
+        let body = tree.iter().find(|(p, _)| *p == gone).unwrap().1;
+        fs::remove_file(project.path().join(gone)).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let without: Vec<(&str, &str)> = tree.iter().copied().filter(|(p, _)| *p != gone).collect();
+        let (_p, _d2, control) = fresh_index_of(&without);
+        assert_eq!(edge_set(&db), edge_set(&control), "{gone} deleted");
+
+        assert!(
+            vanished_record(&db).iter().any(|(p, _)| p == gone),
+            "{gone} recorded"
+        );
+
+        fs::write(project.path().join(gone), body).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        assert_eq!(edge_set(&db), full, "{gone} restored");
+        assert!(
+            !vanished_record(&db).iter().any(|(p, _)| p == gone),
+            "{gone}'s entry is spent once it is back"
+        );
+    }
+}
+
+fn vanished_record(db: &Database) -> Vec<(String, Vec<String>)> {
+    crate::storage::queries::get_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_VANISHED_DEPENDENTS,
+    )
+    .unwrap()
+    .map(|v| serde_json::from_str(&v).unwrap())
+    .unwrap_or_default()
+}
+
+fn set_vanished_record(db: &Database, record: &[(String, Vec<String>)]) {
+    crate::storage::queries::set_meta(
+        db.conn(),
+        crate::storage::schema::META_KEY_VANISHED_DEPENDENTS,
+        &serde_json::to_string(record).unwrap(),
+    )
+    .unwrap();
+}
+
+const VANISHED_A_PY: &str = "def f():\n    pass\n";
+const VANISHED_B_PY: &str = "from a import f\n\ndef g():\n    f()\n";
+
+/// The record keeps at most 2,000 deleted paths and drops the oldest first: a
+/// file deleted for good must not keep its entry forever.
+#[test]
+fn the_vanished_file_record_keeps_the_newest_two_thousand_paths() {
+    let (project, _d, db) = fresh_index_of(&[("a.py", VANISHED_A_PY), ("b.py", VANISHED_B_PY)]);
+    let old: Vec<(String, Vec<String>)> = (0..2_000)
+        .map(|i| (format!("gone/{i}.py"), vec!["b.py".to_string()]))
+        .collect();
+    set_vanished_record(&db, &old);
+
+    fs::remove_file(project.path().join("a.py")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+
+    let record = vanished_record(&db);
+    assert_eq!(record.len(), 2_000);
+    assert_eq!(record[0].0, "gone/1.py", "the oldest entry went");
+    assert_eq!(
+        record.last().unwrap(),
+        &("a.py".to_string(), vec!["b.py".to_string()])
+    );
+}
+
+/// An entry for a path the index already holds is left over from a run that
+/// died: indexing the path drops it and re-extracts nobody.
+#[test]
+fn a_leftover_vanished_entry_re_extracts_nothing() {
+    let (project, _d, db) = fresh_index_of(&[("a.py", VANISHED_A_PY), ("b.py", VANISHED_B_PY)]);
+    set_vanished_record(&db, &[("a.py".to_string(), vec!["b.py".to_string()])]);
+    let g_before = crate::storage::queries::get_node_ids_by_name(db.conn(), "g").unwrap();
+
+    fs::write(project.path().join("a.py"), "def f():\n    return 1\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+
+    assert!(vanished_record(&db).is_empty());
+    assert_eq!(
+        crate::storage::queries::get_node_ids_by_name(db.conn(), "g").unwrap(),
+        g_before,
+        "b.py was not re-extracted"
+    );
+}
+
 #[test]
 fn test_sentinel_name_matches_stem_spellings() {
     // Every spelling a specifier reaches a file stem by must match...

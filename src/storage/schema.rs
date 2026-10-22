@@ -66,6 +66,18 @@ pub const META_KEY_PARSE_ERROR_FILES_VERIFIED: &str = "parse_error_files_verifie
 /// so the next incremental re-extracts every file of each such package once.
 pub const META_KEY_RUST_ROOT_MODS: &str = "rust_root_mods";
 
+/// JSON array of `[deleted path, [files that had an edge into it]]`, oldest
+/// first: what a deletion took from files nobody edited (D#543). Deleting a file
+/// re-extracts its dependents against the tree without it, and what only that
+/// file could answer then drops with no other record — an inline
+/// `crate::a::f()`, a type reference, a `use` through a glob re-export. When the
+/// path comes back, the run re-extracts the files listed for it and drops the
+/// entry (`index_files::vanished_file_dependents`).
+///
+/// No SCHEMA_VERSION bump: absent or unreadable reads as "nothing recorded",
+/// which is what every index built before this key holds.
+pub const META_KEY_VANISHED_DEPENDENTS: &str = "vanished_file_dependents";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "

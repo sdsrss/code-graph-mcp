@@ -233,6 +233,14 @@ const STATS_REFRESH_MIN_FILES: usize = 50;
 /// is the base case every later incremental run's completeness argument assumes.
 pub(super) const SCOPED_POST_PASS_MAX_FILES: usize = 64;
 
+/// Deleted paths the vanished-file record keeps (`vanished_file_dependents`);
+/// past it the oldest entry goes. A file that comes back usually does so within
+/// a few runs (an undo, a branch switch and back), and a file deleted for good
+/// would otherwise keep its entry forever. An evicted entry costs what the index
+/// cost before the record existed: that file's dependents stay as the deletion
+/// left them until they are edited or the index is rebuilt.
+const VANISHED_RECORD_MAX_PATHS: usize = 2_000;
+
 // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
 struct FilePreParsed {
     rel_path: String,
@@ -1213,6 +1221,9 @@ fn settle_foreign_routes(
 ///   Candidates are its importers whose specifier could name the new file's stem.
 /// - A Python `__init__.py` appearing or vanishing moves import roots:
 ///   [`python_root_change_importers`].
+/// - RETURNED: a deleted path coming back re-extracts the files that pointed into
+///   it when it went ([`vanished_file_dependents`]). The second value is the
+///   record to store when this run changed it.
 ///
 /// Files already in this run's set (they are being re-extracted anyway) and files
 /// being deleted (their nodes are going away) are never added.
@@ -1220,10 +1231,13 @@ fn existence_change_dependents(
     db: &Database,
     files: &[String],
     delete_paths: &[String],
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Option<VanishedRecord>)> {
     let in_run: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
     let deleting: HashSet<&str> = delete_paths.iter().map(|s| s.as_str()).collect();
     let mut extra: BTreeSet<String> = BTreeSet::new();
+
+    let (returned, record) = vanished_file_dependents(db, &in_run, &deleting, delete_paths)?;
+    extra.extend(returned);
 
     for path in delete_paths {
         for dep in crate::storage::queries::get_structural_dependent_files(db.conn(), path)? {
@@ -1281,7 +1295,82 @@ fn existence_change_dependents(
         }
     }
 
-    Ok(extra.into_iter().collect())
+    Ok((extra.into_iter().collect(), record))
+}
+
+/// [`META_KEY_VANISHED_DEPENDENTS`](crate::storage::schema::META_KEY_VANISHED_DEPENDENTS):
+/// `(deleted path, files that had an edge into it)`, oldest first.
+type VanishedRecord = Vec<(String, Vec<String>)>;
+
+/// D#543. The VANISHED direction above re-extracts a deleted file's dependents
+/// against the tree without it, and what only that file could answer drops there
+/// with no record an APPEARED lookup could read: an inline `crate::a::f()` (an
+/// empty path filter drops), a type reference (references never buffer), a
+/// `use` through a glob re-export (the sentinel names the re-exporting module).
+/// So the deletion records itself: the files with an edge into the path, kept
+/// until the path is indexed again. A run in which it comes back re-extracts
+/// them; a run that indexes it while the index still holds it (an entry left by
+/// a run that died) only drops the entry.
+///
+/// Returns the files to re-extract, and the record to store when it changed.
+fn vanished_file_dependents(
+    db: &Database,
+    in_run: &HashSet<&str>,
+    deleting: &HashSet<&str>,
+    delete_paths: &[String],
+) -> Result<(Vec<String>, Option<VanishedRecord>)> {
+    use crate::storage::schema::META_KEY_VANISHED_DEPENDENTS;
+    let stored: VanishedRecord =
+        crate::storage::queries::get_meta(db.conn(), META_KEY_VANISHED_DEPENDENTS)?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+    if stored.is_empty() && delete_paths.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let mut indexed = db
+        .conn()
+        .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut changed = false;
+    let mut returned: Vec<String> = Vec::new();
+    let mut record: VanishedRecord = Vec::with_capacity(stored.len() + delete_paths.len());
+    for (path, dependents) in stored {
+        if !in_run.contains(path.as_str()) {
+            record.push((path, dependents));
+            continue;
+        }
+        changed = true;
+        if indexed.exists([path.as_str()])? {
+            continue;
+        }
+        for dep in dependents {
+            if !in_run.contains(dep.as_str())
+                && !deleting.contains(dep.as_str())
+                && indexed.exists([dep.as_str()])?
+            {
+                returned.push(dep);
+            }
+        }
+    }
+
+    for path in delete_paths {
+        let dependents: Vec<String> =
+            crate::storage::queries::get_unbuffered_dependent_files(db.conn(), path)?
+                .into_iter()
+                .filter(|dep| !deleting.contains(dep.as_str()))
+                .collect();
+        if dependents.is_empty() {
+            continue;
+        }
+        changed = true;
+        record.retain(|(p, _)| p != path);
+        record.push((path.clone(), dependents));
+    }
+    if record.len() > VANISHED_RECORD_MAX_PATHS {
+        record.drain(..record.len() - VANISHED_RECORD_MAX_PATHS);
+    }
+
+    Ok((returned, changed.then_some(record)))
 }
 
 /// The Python files whose imports name other files once this run's modules
@@ -2602,9 +2691,11 @@ Restart every code-graph server on this project so they run one version.",
     //
     // Re-extraction is the only mechanism that reproduces extraction's own shape,
     // and it is correct in BOTH directions (the vanished state and the restored
-    // one) because it is the same code path a full rebuild runs.
+    // one) because it is the same code path a full rebuild runs. The restored
+    // direction needs to know which files to re-extract, and only the deletion
+    // knew that for sure: it records them (D#543, `vanished_file_dependents`).
+    let (extra, vanished_record) = existence_change_dependents(db, &files, delete_paths)?;
     let files: Vec<String> = {
-        let extra = existence_change_dependents(db, &files, delete_paths)?;
         if extra.is_empty() {
             files
         } else {
@@ -2720,6 +2811,17 @@ Restart every code-graph server on this project so they run one version.",
     // the ones this run's files wrote elsewhere, before any purge takes them.
     if has_work {
         settle_foreign_routes(db, &files, delete_paths, &mut deferred)?;
+    }
+
+    // After the in-flight marker, like every other write of the run: a run that
+    // dies past here is re-indexed in full, which needs no record.
+    if let Some(record) = &vanished_record {
+        let key = crate::storage::schema::META_KEY_VANISHED_DEPENDENTS;
+        if record.is_empty() {
+            crate::storage::queries::delete_meta(db.conn(), key)?;
+        } else {
+            crate::storage::queries::set_meta(db.conn(), key, &serde_json::to_string(record)?)?;
+        }
     }
 
     // Phase 0: Delete removed files in own transaction.

@@ -401,6 +401,30 @@ pub fn get_structural_dependent_files(conn: &Connection, path: &str) -> Result<V
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// The other files whose relations into `path` no buffer carries back when it
+/// returns (D#543): [`get_structural_dependent_files`], which deleting `path`
+/// re-extracts against a tree without it, and the sources of path-qualified
+/// calls (`crate::a::f()`), whose pending row the sweep drains once the path
+/// filter comes up empty against another same-named item. Every other call has
+/// its pending row.
+pub fn get_unbuffered_dependent_files(conn: &Connection, path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT fs.path
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files ft ON ft.id = nt.file_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE ft.path = ?1
+           AND fs.path <> ?1
+           AND (e.relation <> 'calls' OR e.metadata LIKE '%\"q\":\"path\"%')
+           AND fs.language IS NOT NULL
+         ORDER BY fs.path",
+    )?;
+    let rows = stmt.query_map([path], |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
 /// Every `(sentinel name, importing file)` pair currently bound to an
 /// `<external>` sentinel by a non-`calls` relation.
 ///
