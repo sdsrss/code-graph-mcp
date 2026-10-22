@@ -8,7 +8,8 @@ as it is now, the same symbols, edges, context text and buffered calls. The
 changes are to incremental runs. Where an earlier version already left an
 incremental index out of step, it stays so until the files involved are
 edited, or until `code-graph-mcp rebuild-index --confirm` indexes the project
-from scratch. To go back to 0.176.0: `npm i -g @sdsrs/code-graph@0.176.0`
+from scratch; the context text 0.176.0 wrote for `<external>` symbols (below)
+stays until that rebuild. To go back to 0.176.0: `npm i -g @sdsrs/code-graph@0.176.0`
 (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.176.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -35,18 +36,19 @@ A deletion now records those files: the ones that import or refer to the
 deleted file, and the ones that call into it with a qualifier, including
 files deleted in the same run. The run in which the file comes back re-reads
 the ones that still exist, except a file edited since it was last indexed,
-which the next incremental run indexes as any edit. A file that calls into it
-only by a plain name is not recorded: its calls are kept and bound again as
-before.
+which is left to the next incremental run (under Not covered when that edit is
+undone first). A file that calls into it only by a plain name is not recorded:
+its calls stay in the buffer as before, which two shapes slip through (under
+Not covered).
 
 Measured with builds of this release and of 0.176.0's code: the restore above
 leaves no edge missing. In 150 random edits of this repository as of
 59b2fc73 (five runs of 30: appending to a file, deleting, restoring,
-renaming), 13 of the 19 restores left the incremental index with edges a
+renaming; seeds 1 to 5 of `tasks/d543-kit/harness/fuzz.py`), 13 of the 19 restores left the incremental index with edges a
 fresh index of the same files does not have, or without edges it has, with
 0.176.0's code, and none with this release; no other edit of those runs did
 so with either build. In one run of 30 random edits each of flask, hono and
-gin, both builds differ from a fresh index after the same edits: flask after
+gin (seed 1), both builds differ from a fresh index after the same edits: flask after
 one (`src/flask/__init__.py` restored, the first item under 0.176.0's Not
 covered), hono and gin after none. Other runs can differ elsewhere: the
 pre-tag review's own random edits found a hono rename after which both builds
@@ -57,10 +59,16 @@ Restoring `src/indexer/pipeline/mod.rs` re-reads 34 other files, where 0.176.0's
 code re-read 16 (1 before and 15 in its fan-out round), and takes 952 ms
 instead of 662 (1,543 ms of CPU instead of 797; medians of 7 alternating
 runs). Restoring `src/storage/db.rs`, which 935 calls from 731 functions in other
-files reach, re-reads 102 (85, then 17 in the fan-out round) where 0.176.0's code re-read
-33, and takes 2,046 ms instead of 1,064 (3,457 ms of CPU instead of 1,514;
-medians of 5): longer than a full index of this repository, 1.8 s. Every run
-that indexes or deletes a file reads the record, one row.
+files reach, re-reads 85 other files, 17 of them twice (again in the fan-out
+round), where 0.176.0's code re-read 33, and takes 2,046 ms instead of 1,064
+(3,457 ms of CPU instead of 1,514; medians of 5): longer than a full index of
+this repository, 1.8 s. The pre-tag review measured other languages
+(medians of 5 on a loaded machine): restoring express `lib/response.js`
+re-reads the 110 files recorded for it and takes 358 ms instead of 210, hono
+`src/request.ts` 76 files and 663 ms instead of 384, leveldb `slice.h` 57
+files and 768 ms instead of 502. Go and Java calls between files carry no qualifier, so on
+gin and gson only files that import or refer to the deleted one are recorded.
+Every run that indexes or deletes a file reads the record, one row.
 
 ### Context text names the calls an incremental run adds
 
@@ -109,22 +117,43 @@ ms, `src/storage/queries/meta.rs` 96 → 100 ms, `src/cli/commands/callgraph.rs`
   others resolved against it, and when it comes back they are not re-read, as
   in 0.176.0. A deleted file that comes back set aside spends its record.
 - The record keeps 2,000 deleted paths and drops the oldest. A file restored
-  after its entry was dropped comes back as it did in 0.176.0.
+  after its entry was dropped comes back as it did in 0.176.0. Files deleted
+  together are each recorded, so a run that deletes more than 2,000 files
+  that refer to one another (a branch switch that removes a package) can drop
+  every older entry.
+- A recorded file edited after the deletion, when a query names the restored
+  file before an incremental run (a CLI command or an MCP argument with that
+  path), is left to the next incremental run; if the edit is undone before
+  that run, the file is not re-read, as in 0.176.0.
+- A plain call is not recorded, and two of its shapes stay missing after a
+  restore, as in 0.176.0. One that bound to another function of that name
+  while the file was gone, labelled `inferred`, stays there: deleting and
+  restoring `src/mcp/server/mod.rs` in this repository leaves
+  `betweenness_centrality_capped` → `is_test_symbol` missing (0.176.0's code
+  left 26 edges missing there, that one among them). And a buffered call is
+  dropped after 50 indexing runs that parse something, so a file restored
+  later loses it.
 - Context text can still list calls its own index no longer has, or miss
   ones it has: it is written before the steps that bind calls through imports
   and drop calls an import contradicts, in a full index as in an incremental
   one. Of the 71 project symbols left on hono above, the incremental index's
   text matches its own edges for 70 and the fresh index's does not. Since an
   incremental run now rewrites more texts after those steps, it can also
-  differ where 0.176.0's code matched a fresh index: the pre-tag review found
-  7 such symbols on hono and one in a Python project (`calls: helper` where a
-  fresh index writes `calls: helper, helper`, with the same edges).
+  differ where 0.176.0's code matched a fresh index: deleting and restoring
+  each of 25 hono files, the pre-tag review counted 1,247 project symbols
+  whose text differs from a fresh index's with this release and 1,084 with
+  0.176.0's code (in the one checked, the fresh index's text lists `Hono` four
+  times over one edge); in a Python project, `calls: helper` where a fresh
+  index writes `calls: helper, helper`, with the same edges.
 - 0.176.0's Not covered items still hold.
 
 ### Known issue (also in 0.174.0, 0.175.0 and 0.176.0)
 
 The rare full-index stop that 0.175.0 describes (`Invalid column type Blob
-at index: N, name: <column>`) is not fixed and its cause is not found.
+at index: N, name: <column>`) is not fixed and its cause is not found. During
+the pre-tag review a full index built with 0.176.0's code stopped once with
+`database disk image is malformed`; 8 retries (4 with each build) did not
+reproduce it, and the database it left passed `integrity_check`.
 
 ## 0.176.0
 

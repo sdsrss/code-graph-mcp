@@ -4422,12 +4422,13 @@ fn a_query_time_restore_leaves_an_edited_dependent_to_the_next_run() {
 /// them out, or an incremental index differs from a fresh one.
 #[test]
 fn an_incremental_run_renders_no_sentinel_context_string() {
+    let b_rs = "use std::collections::HashMap;\n\npub fn b() -> HashMap<u8, u8> {\n    HashMap::new()\n}\n";
     let (project, _d, db) = fresh_index_of(&[("src/a.rs", "pub fn a() {}\n")]);
-    fs::write(
-        project.path().join("src/b.rs"),
-        "use std::collections::HashMap;\n\npub fn b() -> HashMap<u8, u8> {\n    HashMap::new()\n}\n",
-    )
-    .unwrap();
+    // Added (the sentinel is next to the run's file after the run), then edited
+    // (next to it before the run as well).
+    fs::write(project.path().join("src/b.rs"), b_rs).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    fs::write(project.path().join("src/b.rs"), format!("{b_rs}\n")).unwrap();
     run_incremental_index(&db, project.path(), None, None).unwrap();
     let rendered: Vec<String> = db
         .conn()

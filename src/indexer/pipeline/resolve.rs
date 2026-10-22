@@ -630,10 +630,12 @@ pub(super) fn resolve_pending_calls_touching(
         //     (index_files.rs SelfRecv/SelfType/Path arms all drop on empty). A
         //     bare fallback here would wire the very false same-name-sibling edges
         //     the qualifier exists to exclude.
-        // Every shape reaches the buffer: Phase 0 and the edit-path requeue buffer
-        // whatever inbound call they find, and a `use`-anchored path buffers here
-        // (D#132). A deletion records the files whose qualified rows this drains
-        // (D#543), so the run that restores the file re-reads them.
+        // Every shape reaches the buffer: Phase 0 buffers whatever inbound call it
+        // finds, the edit-path requeue whatever it does not hand to the deferred
+        // pass (typed receivers and module-attribute calls go there), and a
+        // `use`-anchored path buffers here (D#132). A deletion records the files
+        // whose qualified rows this drains (D#543), so the run that restores the
+        // file re-reads them.
         let mut guessed: Option<String> = None;
         // A typed receiver's own-class binding is final, as in the deferred pass:
         // no proximity refinement may drop its overrides.

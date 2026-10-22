@@ -408,9 +408,10 @@ pub fn get_structural_dependent_files(conn: &Connection, path: &str) -> Result<V
 /// parses something before `path` returns sweeps the buffer, and the sweep
 /// drains a qualified row with no edge once its qualifier rules out every
 /// other same-named item (pre-tag review). A plain call is left to the
-/// channels any edit relies on: its row binds by name when the definition
-/// returns, or, bound meanwhile to a namesake, the fan-out of the returning
-/// definition reaches it.
+/// channels any edit relies on, which miss two shapes (second review): a call
+/// bound meanwhile to a namesake as `inferred` (the fan-out of the returning
+/// definition follows `ambiguous` edges only), and a row evicted after
+/// `PENDING_CALL_MAX_ATTEMPTS` sweeps.
 pub fn get_unbuffered_dependent_files(conn: &Connection, path: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT fs.path
@@ -798,7 +799,8 @@ pub fn get_node_with_file_by_id(conn: &Connection, node_id: i64) -> Result<Optio
 /// (incoming edges from changed files) to ensure context strings stay consistent.
 /// Used for dirty-node propagation during incremental indexing. `<external>`
 /// sentinels are left out: no index run renders a context string for one, so
-/// re-rendering them made an incremental index differ from a fresh one.
+/// re-rendering them made an incremental index differ from a fresh one. Only
+/// the callee side needs the filter: no edge starts at a sentinel.
 pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result<Vec<i64>> {
     if changed_file_ids.is_empty() {
         return Ok(vec![]);
@@ -813,13 +815,9 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
         let sql_callers = format!(
             "SELECT DISTINCT e.source_id FROM edges e
              JOIN nodes n ON n.id = e.target_id
-             JOIN nodes far ON far.id = e.source_id
-             JOIN files ff ON ff.id = far.file_id AND ff.path <> '{}'
              WHERE n.file_id IN ({})
              AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-            crate::domain::EXTERNAL_FILE_PATH,
-            changed_ph,
-            exclude_ph
+            changed_ph, exclude_ph
         );
         let sql_callees = format!(
             "SELECT DISTINCT e.target_id FROM edges e
