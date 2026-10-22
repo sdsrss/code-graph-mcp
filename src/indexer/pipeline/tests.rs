@@ -4367,6 +4367,52 @@ fn a_call_the_pending_sweep_binds_is_in_both_context_strings() {
     }
 }
 
+/// D#544: one caller, three calls of one name told apart only by their metadata
+/// (a typed receiver, a path, a bare name). Renaming the callees buffers each
+/// call on its own pending row; a buffer keyed by caller and name alone kept one
+/// of the three, and renaming back bound one edge where a rebuild binds three.
+#[test]
+fn every_call_of_one_name_survives_a_rename_and_back() {
+    let a = |name: &str| {
+        format!(
+            "pub fn {name}() {{}}\npub struct C;\nimpl C {{\n    pub fn {name}(&self) {{}}\n}}\n"
+        )
+    };
+    let tree = |a_rs: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "Cargo.toml".into(),
+                "[package]\nname = \"d\"\nversion = \"0.1.0\"\n".into(),
+            ),
+            ("src/lib.rs".into(), "pub mod a;\npub mod b;\n".into()),
+            ("src/a.rs".into(), a_rs.into()),
+            (
+                "src/b.rs".into(),
+                "use crate::a::C;\npub fn f(o: &C) {\n    o.run();\n    crate::a::run();\n    run();\n}\n"
+                    .into(),
+            ),
+        ]
+    };
+    fn borrow(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect()
+    }
+    let (project, _d, db) = fresh_index_of(&borrow(&tree(&a("run"))));
+    let full = edge_set(&db);
+    let into_run = |edges: &[String]| {
+        edges
+            .iter()
+            .filter(|e| e.starts_with("src/b.rs.f --calls--> src/a.rs.run"))
+            .count()
+    };
+    assert_eq!(into_run(&full), 3, "control: {full:#?}");
+
+    fs::write(project.path().join("src/a.rs"), a("walk")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    fs::write(project.path().join("src/a.rs"), a("run")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(edge_set(&db), full);
+}
+
 #[test]
 fn test_sentinel_name_matches_stem_spellings() {
     // Every spelling a specifier reaches a file stem by must match...
