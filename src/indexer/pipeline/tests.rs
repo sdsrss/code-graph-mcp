@@ -4593,50 +4593,84 @@ fn a_new_call_into_an_untouched_file_is_in_the_callee_context_string() {
     );
 }
 
-/// D#544: one caller, three calls of one name told apart only by their metadata
-/// (a typed receiver, a path, a bare name). Renaming the callees buffers each
-/// call on its own pending row; a buffer keyed by caller and name alone kept one
-/// of the three, and renaming back bound one edge where a rebuild binds three.
+/// D#544: one caller, several calls of one name told apart only by their
+/// metadata (Rust: a typed receiver, a path, a bare name; Python: a member call
+/// and a bare one). Renaming the callees away must leave buffered what a fresh
+/// index of the renamed tree buffers, and renaming them back must bind what a
+/// rebuild binds. A buffer keyed by caller and name alone kept one call where a
+/// fresh index keeps two.
 #[test]
 fn every_call_of_one_name_survives_a_rename_and_back() {
-    let a = |name: &str| {
+    let rust = |name: &str| {
         format!(
             "pub fn {name}() {{}}\npub struct C;\nimpl C {{\n    pub fn {name}(&self) {{}}\n}}\n"
         )
     };
-    let tree = |a_rs: &str| -> Vec<(String, String)> {
-        vec![
-            (
-                "Cargo.toml".into(),
-                "[package]\nname = \"d\"\nversion = \"0.1.0\"\n".into(),
-            ),
-            ("src/lib.rs".into(), "pub mod a;\npub mod b;\n".into()),
-            ("src/a.rs".into(), a_rs.into()),
-            (
-                "src/b.rs".into(),
-                "use crate::a::C;\npub fn f(o: &C) {\n    o.run();\n    crate::a::run();\n    run();\n}\n"
-                    .into(),
-            ),
-        ]
+    let python = |name: &str| {
+        format!("def {name}():\n    pass\n\nclass C:\n    def {name}(self):\n        pass\n")
     };
-    fn borrow(v: &[(String, String)]) -> Vec<(&str, &str)> {
-        v.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect()
-    }
-    let (project, _d, db) = fresh_index_of(&borrow(&tree(&a("run"))));
-    let full = edge_set(&db);
-    let into_run = |edges: &[String]| {
-        edges
+    let rust_tree: Vec<(&str, String)> = vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"d\"\nversion = \"0.1.0\"\n".into(),
+        ),
+        ("src/lib.rs", "pub mod a;\npub mod b;\n".into()),
+        (
+            "src/b.rs",
+            "use crate::a::C;\npub fn f(o: &C) {\n    o.run();\n    crate::a::run();\n    run();\n}\n"
+                .into(),
+        ),
+    ];
+    let python_tree: Vec<(&str, String)> =
+        vec![("go.py", "def f(o):\n    o.run()\n    run()\n".into())];
+    for (others, callee, body, calls) in [
+        (rust_tree, "src/a.rs", &rust as &dyn Fn(&str) -> String, 3),
+        (python_tree, "lib.py", &python as &dyn Fn(&str) -> String, 3),
+    ] {
+        let tree = |name: &str| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = others
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.clone()))
+                .collect();
+            v.push((callee.to_string(), body(name)));
+            v
+        };
+        fn borrow(v: &[(String, String)]) -> Vec<(&str, &str)> {
+            v.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect()
+        }
+        let (project, _d, db) = fresh_index_of(&borrow(&tree("run")));
+        let full = edge_set(&db);
+        let into_run = full
             .iter()
-            .filter(|e| e.starts_with("src/b.rs.f --calls--> src/a.rs.run"))
-            .count()
-    };
-    assert_eq!(into_run(&full), 3, "control: {full:#?}");
+            .filter(|e| e.contains(".f --calls--> ") && e.ends_with(".run"))
+            .count();
+        assert_eq!(into_run, calls, "control: {full:#?}");
 
-    fs::write(project.path().join("src/a.rs"), a("walk")).unwrap();
-    run_incremental_index(&db, project.path(), None, None).unwrap();
-    fs::write(project.path().join("src/a.rs"), a("run")).unwrap();
-    run_incremental_index(&db, project.path(), None, None).unwrap();
-    assert_eq!(edge_set(&db), full);
+        fs::write(project.path().join(callee), body("walk")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let (_p, _d2, renamed) = fresh_index_of(&borrow(&tree("walk")));
+        assert_eq!(pending_set(&db), pending_set(&renamed), "{callee} renamed");
+
+        fs::write(project.path().join(callee), body("run")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        assert_eq!(edge_set(&db), full, "{callee} renamed back");
+    }
+}
+
+/// Every buffered call, spelled `path.caller -> name metadata`, sorted.
+fn pending_set(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT f.path || '.' || n.name || ' -> ' || p.target_name || ' ' \
+                 || COALESCE(p.metadata, '') \
+             FROM pending_unresolved_calls p \
+             JOIN nodes n ON n.id = p.source_id JOIN files f ON f.id = n.file_id \
+             ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
 }
 
 #[test]
