@@ -21,32 +21,46 @@ by a call, against the tree without it. What only that file could answer is
 then dropped there, with nothing left to say it was: a path-qualified call
 such as `code_graph_mcp::indexer::pipeline::run_full_index()`, a type named
 in a signature, a `use` through a module that re-exports the file with `pub
-use e::*`. Restoring the file did not re-read them, so those edges stayed
-missing until each of those files was edited. In this repository, deleting
-and restoring `src/indexer/pipeline/mod.rs` left 96 edges missing: 90 calls
-from `tests/cli_e2e.rs`, 89 of them to `run_full_index` by its full path, and
-6 references. A deletion now records the files whose edges into the deleted
-file would otherwise be lost, and the run in which the file comes back
-re-reads them. A file that calls into it only by a name without a path is not
-recorded: its calls are kept and bound again as before.
+use e::*`. A file that only calls into it keeps each call in a buffer, but a
+call with a qualifier (`self.helper()`, `Self::helper()`, `auth.login()`, a
+path) was dropped from it by any run that parsed something before the file
+came back, once the qualifier ruled out every other item of that name.
+Restoring the file did not re-read any of them, so those edges stayed missing
+until each of those files was edited. In this repository, deleting and
+restoring `src/indexer/pipeline/mod.rs` left 96 edges missing: 90 calls from
+`tests/cli_e2e.rs`, 89 of them to `run_full_index` by its full path, and 6
+references.
+
+A deletion now records those files: the ones that import or refer to the
+deleted file, and the ones that call into it with a qualifier, including
+files deleted in the same run. The run in which the file comes back re-reads
+the ones that still exist, except a file edited since it was last indexed,
+which the next incremental run indexes as any edit. A file that calls into it
+only by a plain name is not recorded: its calls are kept and bound again as
+before.
 
 Measured with builds of this release and of 0.176.0's code: the restore above
-leaves no edge missing. In 90 random edits of this repository (three runs of
-30: appending to a file, deleting, restoring, renaming), 7 of the 12 restores
-left the incremental index with edges a fresh index of the same files does not
-have, or without edges it has, with 0.176.0's code, and none with this
-release; no other edit did so with either. In 30 random edits each of flask,
-hono and gin, the two builds differ from a fresh index after the same edits:
-flask after one (an `__init__.py` restored, the first item under 0.176.0's Not
-covered), hono and gin after none.
+leaves no edge missing. In 150 random edits of this repository as of
+59b2fc73 (five runs of 30: appending to a file, deleting, restoring,
+renaming), 13 of the 19 restores left the incremental index with edges a
+fresh index of the same files does not have, or without edges it has, with
+0.176.0's code, and none with this release; no other edit of those runs did
+so with either build. In one run of 30 random edits each of flask, hono and
+gin, both builds differ from a fresh index after the same edits: flask after
+one (`src/flask/__init__.py` restored, the first item under 0.176.0's Not
+covered), hono and gin after none. Other runs can differ elsewhere: the
+pre-tag review's own random edits found a hono rename after which both builds
+differ.
 
-Cost: only a run in which a recorded file comes back does more. Restoring
-`src/indexer/pipeline/mod.rs` re-reads 34 files instead of 1 and takes 1,014
-ms instead of 684 (1,623 ms of CPU instead of 845; medians of 7 alternating
-runs); a full index of this repository takes 1.8 s. Every other run that
-indexes or deletes a file reads the record, one row: an edit of that file
-with 2,000 deleted paths recorded took 190 ms, against 191 ms with the build
-before this change (medians of 7).
+Cost: a run in which a recorded file comes back re-reads its recorded files.
+Restoring `src/indexer/pipeline/mod.rs` re-reads 34 other files, where 0.176.0's
+code re-read 16 (1 before and 15 in its fan-out round), and takes 952 ms
+instead of 662 (1,543 ms of CPU instead of 797; medians of 7 alternating
+runs). Restoring `src/storage/db.rs`, which 935 calls from 731 functions in other
+files reach, re-reads 102 (85, then 17 in the fan-out round) where 0.176.0's code re-read
+33, and takes 2,046 ms instead of 1,064 (3,457 ms of CPU instead of 1,514;
+medians of 5): longer than a full index of this repository, 1.8 s. Every run
+that indexes or deletes a file reads the record, one row.
 
 ### Context text names the calls an incremental run adds
 
@@ -56,45 +70,55 @@ incremental run rewrote the text of symbols in other files only when they had
 an edge into the re-indexed files before the run, so the callee of a call it
 added into a file it did not open never listed the new caller: adding `run()`
 to `b.py` left `run` in `a.py` without `called_by: main`, which a fresh index
-writes. The
-same happened to a call written before the function it calls, bound in the
-run that adds the function: neither `main` nor `run` named it. Those texts
-are now rewritten, and their embeddings recomputed (at once when the run has
-a model loaded, else by the background embedder).
+writes. The same happened to a call written before the function it calls,
+bound in the run that adds the function: neither `main` nor `run` named it.
+Those texts are now rewritten, and their embeddings recomputed (at once when
+the run has a model loaded, else by the background embedder). Rewriting the
+text of symbols next to a re-indexed file also gave `<external>` symbols
+(what a file imports from outside the project) a context text, which no full
+index writes, as 0.176.0 already did; it now leaves them out.
 
 Measured with builds of this release and of 0.176.0's code: in six small
 projects (a call added into another file's function, in Python and in Rust; a
 function added after its caller, in an existing file, in a new file and in
 Rust; a module path naming two files) the text differed from a fresh index's
-with 0.176.0's code and matches it with this release. After the 90 random
-edits of this repository above, the symbols whose context text differs from
-a fresh index's went from 123, 71 and 15 to 3, 7 and 4. After 30 random
-edits each: gin 15 to 0, flask 31 to 27, hono 72 to 71 (what is left is
-under Not covered).
+with 0.176.0's code and matches it with this release. After the 150 random
+edits of this repository above, the project symbols whose context text
+differs from a fresh index's went from 123, 71, 15, 51 and 4 to 3, 7, 4, 0
+and 1, and the `<external>` ones from 104, 102, 50, 96 and 98 to none. After
+30 random edits each: gin 15 to 0, flask 31 to 27, hono 72 to 71 (project
+symbols; `<external>` ones 52, 88 and 22 to none).
 
 Cost: one more query in each run that re-indexes something, and the symbols
 it finds rendered again. One-file edits, medians of 15 alternating runs of
-the two builds: on this repository `src/indexer/pipeline/mod.rs` 176 → 172
-ms, `src/storage/queries/meta.rs` 100 → 100 ms, `src/cli/commands/callgraph.rs`
-114 → 117 ms; on flask `src/flask/app.py` 69 → 70 ms, `src/flask/helpers.py`
-47 → 46 ms, `tests/test_basic.py` 150 → 154 ms.
+the two builds: on this repository `src/indexer/pipeline/mod.rs` 173 → 172
+ms, `src/storage/queries/meta.rs` 96 → 100 ms, `src/cli/commands/callgraph.rs`
+115 → 110 ms; on flask `src/flask/app.py` 69 → 68 ms, `src/flask/helpers.py`
+47 → 48 ms, `tests/test_basic.py` 152 → 149 ms.
 
 ### Not covered
 
-- A file the index has never held, added while other files already name it
-  by path or by type, is not re-read into them: with `src/b.rs` calling
-  `crate::a::run_full()` and taking a `crate::a::Phase` before `src/a.rs`
-  exists, adding `src/a.rs` leaves both edges missing, as in 0.176.0. Only a
-  deletion records the files to re-read.
+- A file that names a deleted file's items only after the deletion has no
+  edge into it to record, so it is not re-read when the file returns: a file
+  the index has never held, added while `src/b.rs` already calls
+  `crate::a::run_full()` and takes a `crate::a::Phase`, leaves both edges
+  missing, as in 0.176.0; so does an edit to `src/b.rs` that starts naming
+  them while `src/a.rs` is deleted, or restoring `src/b.rs` in the run that
+  deletes `src/a.rs`.
+- A file set aside (larger than the size limit, or not UTF-8) loses what
+  others resolved against it, and when it comes back they are not re-read, as
+  in 0.176.0. A deleted file that comes back set aside spends its record.
 - The record keeps 2,000 deleted paths and drops the oldest. A file restored
   after its entry was dropped comes back as it did in 0.176.0.
 - Context text can still list calls its own index no longer has, or miss
   ones it has: it is written before the steps that bind calls through imports
   and drop calls an import contradicts, in a full index as in an incremental
-  one. Of the 71 symbols left on hono above, the incremental index's text
-  matches its own edges for 70 and the fresh index's does not. One traced in
-  this repository: a fresh index's text lists three `test_db` calls where its
-  edges keep one.
+  one. Of the 71 project symbols left on hono above, the incremental index's
+  text matches its own edges for 70 and the fresh index's does not. Since an
+  incremental run now rewrites more texts after those steps, it can also
+  differ where 0.176.0's code matched a fresh index: the pre-tag review found
+  7 such symbols on hono and one in a Python project (`calls: helper` where a
+  fresh index writes `calls: helper, helper`, with the same edges).
 - 0.176.0's Not covered items still hold.
 
 ### Known issue (also in 0.174.0, 0.175.0 and 0.176.0)
