@@ -4271,6 +4271,188 @@ fn a_restored_rust_file_brings_back_what_its_dependents_lost() {
     }
 }
 
+/// D#543, pre-tag review: a qualified call's pending row is not a safe channel
+/// either. Between the deletion and the restore, any run that parses something
+/// sweeps the buffer, and a `self.helper()` (`T`'s impls split over two files,
+/// a free `helper` elsewhere) or a Python `auth.login()` (a free `login`
+/// elsewhere) is drained there with no edge. Its file must be recorded, as a path call's is.
+#[test]
+fn a_restored_file_brings_back_qualified_calls_swept_in_between() {
+    let rust: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod a;\npub mod b;\npub mod t;\npub mod w;\npub mod z;\n",
+        ),
+        ("src/t.rs", "pub struct T;\n"),
+        (
+            "src/b.rs",
+            "impl crate::t::T {\n    pub fn helper(&self) {}\n}\n",
+        ),
+        (
+            "src/a.rs",
+            "impl crate::t::T {\n    pub fn user(&self) {\n        self.helper();\n    }\n}\n",
+        ),
+        ("src/z.rs", "pub fn helper() {}\n"),
+        ("src/w.rs", "pub fn idle() {}\n"),
+    ];
+    let python: &[(&str, &str)] = &[
+        (
+            "conftest.py",
+            "class AuthActions:\n    def login(self):\n        pass\n",
+        ),
+        ("test_auth.py", "def test_login(auth):\n    auth.login()\n"),
+        ("views.py", "def login():\n    pass\n"),
+        ("w.py", "def idle():\n    pass\n"),
+    ];
+    for (tree, gone, edit, edge) in [
+        (
+            rust,
+            "src/b.rs",
+            "src/w.rs",
+            "src/a.rs.user --calls--> src/b.rs.helper",
+        ),
+        (
+            python,
+            "conftest.py",
+            "w.py",
+            "test_auth.py.test_login --calls--> conftest.py.login",
+        ),
+    ] {
+        let (project, _d, db) = fresh_index_of(tree);
+        let full = edge_set(&db);
+        assert!(full.contains(&edge.to_string()), "control: {full:#?}");
+        let body = tree.iter().find(|(p, _)| *p == gone).unwrap().1;
+        fs::remove_file(project.path().join(gone)).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        fs::write(project.path().join(edit), "\n").unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let idle = tree.iter().find(|(p, _)| *p == edit).unwrap().1;
+        fs::write(project.path().join(edit), idle).unwrap();
+        fs::write(project.path().join(gone), body).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        assert_eq!(edge_set(&db), full, "{gone} restored");
+    }
+}
+
+/// D#543, pre-tag review: a dependent deleted in the same run as the file it
+/// depends on is recorded too. Restored first, it is read against a tree without
+/// that file; when the file comes back, the dependent must be read again.
+#[test]
+fn a_dependent_deleted_with_its_file_is_read_again_when_the_file_returns() {
+    let tree: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        ("src/a.rs", "pub struct Phase;\npub fn run_full() {}\n"),
+        (
+            "src/b.rs",
+            "pub fn caller(p: crate::a::Phase) {\n    crate::a::run_full();\n}\n",
+        ),
+    ];
+    let (project, _d, db) = fresh_index_of(tree);
+    let full = edge_set(&db);
+    let body = |p: &str| tree.iter().find(|(q, _)| *q == p).unwrap().1;
+    for gone in ["src/a.rs", "src/b.rs"] {
+        fs::remove_file(project.path().join(gone)).unwrap();
+    }
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    for back in ["src/b.rs", "src/a.rs"] {
+        fs::write(project.path().join(back), body(back)).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+    }
+    assert_eq!(edge_set(&db), full);
+}
+
+/// D#543, pre-tag review: a query-time refresh that brings a deleted file back
+/// must not re-read a recorded dependent the user has edited since. That edit
+/// (`b.rs` gains `work`) belongs to the next incremental run, whose fan-out
+/// re-reads `c.rs`, which imports `work`; read by the refresh, `b.rs` looked
+/// unchanged to that run and `c.rs` kept its `<external>` import.
+#[test]
+fn a_query_time_restore_leaves_an_edited_dependent_to_the_next_run() {
+    let tree = |b: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "Cargo.toml".into(),
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n".into(),
+            ),
+            (
+                "src/lib.rs".into(),
+                "pub mod a;\npub mod b;\npub mod c;\n".into(),
+            ),
+            ("src/a.rs".into(), "pub struct Phase;\n".into()),
+            ("src/b.rs".into(), b.into()),
+            (
+                "src/c.rs".into(),
+                "use crate::b::work;\n\npub fn user() {\n    work();\n}\n".into(),
+            ),
+        ]
+    };
+    fn borrow(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect()
+    }
+    let before = "pub fn caller(p: crate::a::Phase) {}\n";
+    let after = "pub fn caller(p: crate::a::Phase) {}\n\npub fn work() {}\n";
+    let (project, _d, db) = fresh_index_of(&borrow(&tree(before)));
+    fs::remove_file(project.path().join("src/a.rs")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+
+    fs::write(project.path().join("src/a.rs"), "pub struct Phase;\n").unwrap();
+    fs::write(project.path().join("src/b.rs"), after).unwrap();
+    ensure_file_indexed(&db, project.path(), "src/a.rs", None).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+
+    let (_p, _d2, fresh) = fresh_index_of(&borrow(&tree(after)));
+    let want = edge_set(&fresh);
+    assert!(
+        want.contains(&"src/c.rs.user --calls--> src/b.rs.work".to_string()),
+        "control: {want:#?}"
+    );
+    assert_eq!(edge_set(&db), want);
+}
+
+/// Pre-tag review: no index run renders a context string for an `<external>`
+/// sentinel, so re-rendering the nodes next to a re-indexed file must leave
+/// them out, or an incremental index differs from a fresh one.
+#[test]
+fn an_incremental_run_renders_no_sentinel_context_string() {
+    let (project, _d, db) = fresh_index_of(&[("src/a.rs", "pub fn a() {}\n")]);
+    fs::write(
+        project.path().join("src/b.rs"),
+        "use std::collections::HashMap;\n\npub fn b() -> HashMap<u8, u8> {\n    HashMap::new()\n}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let rendered: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT n.name FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE f.path = '<external>' AND n.context_string IS NOT NULL",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let sentinels: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
+             WHERE f.path = '<external>'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sentinels > 0, "control: the import mints a sentinel");
+    assert!(rendered.is_empty(), "{rendered:?}");
+}
+
 fn vanished_record(db: &Database) -> Vec<(String, Vec<String>)> {
     crate::storage::queries::get_meta(
         db.conn(),

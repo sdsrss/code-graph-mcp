@@ -403,10 +403,14 @@ pub fn get_structural_dependent_files(conn: &Connection, path: &str) -> Result<V
 
 /// The other files whose relations into `path` no buffer carries back when it
 /// returns (D#543): [`get_structural_dependent_files`], which deleting `path`
-/// re-extracts against a tree without it, and the sources of path-qualified
-/// calls (`crate::a::f()`), whose pending row the sweep drains once the path
-/// filter comes up empty against another same-named item. Every other call has
-/// its pending row.
+/// re-extracts against a tree without it, and the sources of qualified calls
+/// (`crate::a::f()`, `self.f()`, `obj.f()`: metadata with a `q`). Any run that
+/// parses something before `path` returns sweeps the buffer, and the sweep
+/// drains a qualified row with no edge once its qualifier rules out every
+/// other same-named item (pre-tag review). A plain call is left to the
+/// channels any edit relies on: its row binds by name when the definition
+/// returns, or, bound meanwhile to a namesake, the fan-out of the returning
+/// definition reaches it.
 pub fn get_unbuffered_dependent_files(conn: &Connection, path: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT fs.path
@@ -417,7 +421,7 @@ pub fn get_unbuffered_dependent_files(conn: &Connection, path: &str) -> Result<V
          JOIN files fs ON fs.id = ns.file_id
          WHERE ft.path = ?1
            AND fs.path <> ?1
-           AND (e.relation <> 'calls' OR e.metadata LIKE '%\"q\":\"path\"%')
+           AND (e.relation <> 'calls' OR e.metadata LIKE '%\"q\":%')
            AND fs.language IS NOT NULL
          ORDER BY fs.path",
     )?;
@@ -792,7 +796,9 @@ pub fn get_node_with_file_by_id(conn: &Connection, node_id: i64) -> Result<Optio
 /// Find node IDs in other files that have edges pointing to/from nodes in the given file IDs.
 /// Bidirectional: finds both callers (outgoing edges into changed files) and callees
 /// (incoming edges from changed files) to ensure context strings stay consistent.
-/// Used for dirty-node propagation during incremental indexing.
+/// Used for dirty-node propagation during incremental indexing. `<external>`
+/// sentinels are left out: no index run renders a context string for one, so
+/// re-rendering them made an incremental index differ from a fresh one.
 pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result<Vec<i64>> {
     if changed_file_ids.is_empty() {
         return Ok(vec![]);
@@ -807,16 +813,24 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
         let sql_callers = format!(
             "SELECT DISTINCT e.source_id FROM edges e
              JOIN nodes n ON n.id = e.target_id
+             JOIN nodes far ON far.id = e.source_id
+             JOIN files ff ON ff.id = far.file_id AND ff.path <> '{}'
              WHERE n.file_id IN ({})
              AND e.source_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-            changed_ph, exclude_ph
+            crate::domain::EXTERNAL_FILE_PATH,
+            changed_ph,
+            exclude_ph
         );
         let sql_callees = format!(
             "SELECT DISTINCT e.target_id FROM edges e
              JOIN nodes n ON n.id = e.source_id
+             JOIN nodes far ON far.id = e.target_id
+             JOIN files ff ON ff.id = far.file_id AND ff.path <> '{}'
              WHERE n.file_id IN ({})
              AND e.target_id NOT IN (SELECT id FROM nodes WHERE file_id IN ({}))",
-            changed_ph, exclude_ph
+            crate::domain::EXTERNAL_FILE_PATH,
+            changed_ph,
+            exclude_ph
         );
 
         let doubled: Vec<i64> = chunk.iter().chain(chunk.iter()).copied().collect();
