@@ -1,0 +1,20 @@
+=== pkg/__init__.py
+from pkg import X
+import pkg
+
+def f():
+    pkg.X()
+=== pkg/a.py
+from .b import X
+=== pkg/b.py
+from .a import X
+=== zzz/decoy.py
+def X():
+    pass
+=== app.py
+import pkg
+from pkg.a import X
+
+def main():
+    pkg.X()
+    X()

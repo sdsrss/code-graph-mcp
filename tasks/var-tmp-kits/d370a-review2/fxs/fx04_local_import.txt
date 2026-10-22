@@ -1,0 +1,17 @@
+=== pkg/__init__.py
+def G():
+    pass
+
+
+def helper():
+    from .impl import G
+    return G()
+=== pkg/impl.py
+def G():
+    pass
+=== app/c.py
+import pkg
+
+
+def run():
+    pkg.G()

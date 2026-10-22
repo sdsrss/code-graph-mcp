@@ -1,0 +1,19 @@
+=== src/markup/__init__.py
+try:
+    from ._speedups import escape
+except ImportError:
+    from ._native import escape
+=== src/markup/_speedups.py
+def escape(s):
+    return s
+=== src/markup/_native.py
+def escape(s):
+    return s
+=== src/markup/util.py
+def escape(s):
+    return s
+=== app/views.py
+from markup import escape
+
+def render():
+    return escape("x")

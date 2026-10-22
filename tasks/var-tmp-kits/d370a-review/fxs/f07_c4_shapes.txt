@@ -1,0 +1,49 @@
+=== a/__init__.py
+from .impl import X
+from . import b
+
+def Z():
+    pass
+=== a/impl.py
+def X():
+    pass
+=== a/b.py
+def f():
+    pass
+
+def X():
+    pass
+=== zzz/decoy.py
+def X():
+    pass
+
+def f():
+    pass
+
+def Z():
+    pass
+=== c1.py
+from a import b
+
+def m1():
+    b.f()
+    b.X()
+=== c2.py
+import a.b
+
+def m2():
+    a.b.f()
+    a.X()
+    a.Z()
+=== c3.py
+import a
+import a.b
+
+def m3():
+    a.X()
+    a.b.f()
+=== c4.py
+from a import impl as b
+
+def m4():
+    b.X()

@@ -1,0 +1,15 @@
+=== pkg/__init__.py
+def X():
+    pass
+
+
+from .impl import *
+=== pkg/impl.py
+def X():
+    pass
+=== app/c.py
+import pkg
+
+
+def run():
+    pkg.X()

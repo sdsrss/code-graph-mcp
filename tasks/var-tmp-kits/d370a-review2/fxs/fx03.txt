@@ -1,0 +1,78 @@
+=== pkg/__init__.py
+def deco(f):
+    return f
+
+
+class K:
+    def X(self):
+        pass
+
+    class V:
+        pass
+
+
+def outer():
+    def X():
+        pass
+
+    class V:
+        pass
+    return X
+
+
+if True:
+    def Y():
+        pass
+else:
+    def Y():
+        pass
+
+
+@deco
+def Z():
+    pass
+
+
+@deco
+class Q:
+    pass
+
+def one(): return 1
+def W(): return 2
+
+try:
+    from ._fast import F
+except ImportError:
+    def F():
+        pass
+
+def G():
+    pass
+
+def helper():
+    from .impl import G
+    return G
+=== pkg/_fast.py
+def F():
+    pass
+=== pkg/impl.py
+def G():
+    pass
+=== app/c.py
+import pkg
+
+def run():
+    pkg.X()
+    pkg.Y()
+    pkg.Z()
+    pkg.Q()
+    pkg.V()
+    pkg.W()
+    pkg.F()
+    pkg.G()
+=== app/other.py
+def X():
+    pass
+
+def V():
+    pass

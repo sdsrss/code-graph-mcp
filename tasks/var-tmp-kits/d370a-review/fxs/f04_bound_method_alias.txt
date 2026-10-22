@@ -1,0 +1,29 @@
+=== pkg/__init__.py
+from .registry import Registry
+_default = Registry()
+register = _default.register
+=== pkg/registry.py
+class Registry:
+    def register(self, f):
+        return f
+=== other.py
+def register(f):
+    return f
+=== app.py
+import pkg
+
+@pkg.register
+def handler():
+    pass
+
+def main():
+    pkg.register(handler)
+=== app2.py
+from pkg import register
+
+@register
+def h2():
+    pass
+
+def main2():
+    register(h2)

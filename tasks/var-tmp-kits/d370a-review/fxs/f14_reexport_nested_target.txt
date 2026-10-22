@@ -1,0 +1,17 @@
+=== pkg/__init__.py
+from .m import helper
+=== pkg/m.py
+def factory():
+    def helper():
+        pass
+    return helper
+
+helper = factory()
+=== zzz/decoy.py
+def helper():
+    pass
+=== app.py
+from pkg import helper
+
+def main():
+    helper()

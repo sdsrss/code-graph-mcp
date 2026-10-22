@@ -1,0 +1,13 @@
+=== pkg/__init__.py
+from .m import Y as X
+=== pkg/m.py
+def Y():
+    pass
+=== zzz/decoy.py
+def X():
+    pass
+=== app.py
+from pkg import X
+
+def main():
+    X()

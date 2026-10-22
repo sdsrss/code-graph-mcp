@@ -1,0 +1,15 @@
+=== pkg/__init__.py
+from .core import helper
+
+def factory():
+    def helper():
+        pass
+    return helper
+=== pkg/core.py
+def helper():
+    pass
+=== app.py
+import pkg
+
+def main():
+    pkg.helper()

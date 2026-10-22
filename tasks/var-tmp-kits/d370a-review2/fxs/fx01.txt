@@ -1,0 +1,50 @@
+=== pkg/__init__.py
+from .m import Y as X
+try:
+    from _cext import helper
+except ImportError:
+    from .slow import helper
+from .a import thing
+from .b import thing2 as thing
+=== pkg/m.py
+def X():
+    pass
+
+def Y():
+    pass
+=== pkg/slow.py
+def helper():
+    pass
+=== pkg/a.py
+def thing():
+    pass
+=== pkg/b.py
+def thing2():
+    pass
+=== app/c.py
+from pkg import X, Y, helper, thing
+import pkg
+
+def run():
+    X()
+    Y()
+    helper()
+    thing()
+
+def run2():
+    pkg.X()
+    pkg.Y()
+    pkg.helper()
+    pkg.thing()
+=== app/other.py
+def X():
+    pass
+
+def Y():
+    pass
+
+def helper():
+    pass
+
+def thing():
+    pass

@@ -1,0 +1,14 @@
+=== mylog.py
+class Logger:
+    def info(self, msg):
+        pass
+
+_root = Logger()
+
+def info(msg):
+    _root.info(msg)
+=== app.py
+import mylog
+
+def main():
+    mylog.info("x")

@@ -1,0 +1,27 @@
+=== pkg/__init__.py
+from .routing import route
+from .routing import register as reg
+=== pkg/routing.py
+def route(path):
+    def deco(f):
+        return f
+    return deco
+
+def register(f):
+    return f
+=== zzz/decoy.py
+def route(path):
+    pass
+
+def reg(f):
+    pass
+=== app.py
+import pkg
+
+@pkg.route("/")
+def index():
+    pass
+
+@pkg.reg
+def other():
+    pass

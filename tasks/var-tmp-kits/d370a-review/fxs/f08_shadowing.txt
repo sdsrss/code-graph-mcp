@@ -1,0 +1,30 @@
+=== config.py
+def get(key):
+    pass
+
+def load():
+    pass
+=== other/settings.py
+class Settings:
+    def get(self, key):
+        pass
+=== app.py
+import config
+
+def handler(config):
+    return config.get("x")
+
+def main():
+    config.load()
+=== app2.py
+import config
+config = config.load()
+
+def use():
+    return config.get("y")
+=== app3.py
+import config
+
+def f():
+    for config in []:
+        config.get("z")

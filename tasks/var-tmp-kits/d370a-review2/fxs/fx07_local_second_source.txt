@@ -1,0 +1,21 @@
+=== pkg/__init__.py
+from .a import X
+
+
+def reload():
+    from .b import X
+    return X
+=== pkg/a.py
+def X():
+    pass
+=== pkg/b.py
+def X():
+    pass
+=== app/c.py
+import pkg
+from pkg import X
+
+
+def run():
+    pkg.X()
+    X()

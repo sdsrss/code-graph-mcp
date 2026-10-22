@@ -1,0 +1,21 @@
+=== pkg/__init__.py
+try:
+    from ._speedups import escape
+except ImportError:
+    from ._native import escape
+=== pkg/_speedups.py
+def escape(s):
+    return s
+=== pkg/_native.py
+def escape(s):
+    return s
+=== app.py
+from pkg import escape
+
+def main():
+    return escape("x")
+=== app2.py
+import pkg
+
+def main2():
+    return pkg.escape("x")

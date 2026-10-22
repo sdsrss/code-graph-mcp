@@ -1,0 +1,198 @@
+=== pkg/__init__.py
+def X():
+    pass
+
+=== pkg/sub.py
+
+=== other.py
+def X():
+    pass
+
+=== app/c01_except_as.py
+import pkg
+
+def f():
+    try:
+        pass
+    except Exception as pkg:
+        pkg.X()
+
+=== app/c02_match_capture.py
+import pkg
+
+def f(v):
+    match v:
+        case pkg:
+            pkg.X()
+
+=== app/c03_global_assign.py
+import pkg
+
+def g():
+    global pkg
+    pkg = object()
+
+def f():
+    pkg.X()
+
+=== app/c04_type_param.py
+import pkg
+
+def f[pkg](v: pkg):
+    pkg.X()
+
+=== app/c05_with_as.py
+import pkg
+
+def f():
+    with open('x') as pkg:
+        pkg.X()
+
+=== app/c06_comprehension.py
+import pkg
+
+def f(xs):
+    return [pkg.X() for pkg in xs]
+
+=== app/c07_class_attr.py
+import pkg
+
+class K:
+    pkg = None
+
+def f():
+    pkg.X()
+
+=== app/c08_lambda.py
+import pkg
+
+f = lambda pkg: pkg.X()
+
+=== app/c09_except_star.py
+import pkg
+
+def f():
+    try:
+        pass
+    except* Exception as pkg:
+        pkg.X()
+
+=== app/c10_kwonly.py
+import pkg
+
+def f(*, pkg):
+    pkg.X()
+
+=== app/c11_posonly_default.py
+import pkg
+
+def f(pkg=1, /):
+    pkg.X()
+
+=== app/c12_attr_target.py
+import pkg
+
+def f(xs):
+    for pkg.y in xs:
+        pass
+    pkg.X()
+
+=== app/c13_plain_ok.py
+import pkg
+
+def f():
+    pkg.X()
+
+=== app/c14_import_in_func_param_other.py
+def g(pkg):
+    return pkg
+
+def f():
+    import pkg
+    pkg.X()
+
+=== app/c15_del.py
+import pkg
+
+def f():
+    pkg.X()
+
+=== app/c16_import_star.py
+import pkg
+from other_mod import *
+
+def f():
+    pkg.X()
+
+=== app/c17_walrus.py
+import pkg
+
+def f(v):
+    if (pkg := v):
+        pkg.X()
+
+=== app/c18_typed_default.py
+import pkg
+
+def f(pkg: int = 1):
+    pkg.X()
+
+=== app/c19_nonlocal.py
+import pkg
+
+def f():
+    pkg = 1
+    def g():
+        nonlocal pkg
+        pkg.X()
+
+=== app/c20_tuple_for.py
+import pkg
+
+def f(xs):
+    for a, (b, pkg) in xs:
+        pkg.X()
+
+=== app/c21_starred_assign.py
+import pkg
+
+def f(xs):
+    a, *pkg = xs
+    pkg.X()
+
+=== app/c22_type_alias.py
+import pkg
+
+type pkg = int
+
+def f():
+    pkg.X()
+
+=== app/c23_case_as.py
+import pkg
+
+def f(v):
+    match v:
+        case [1, 2] as pkg:
+            pkg.X()
+
+=== app/c24_case_class_kw.py
+import pkg
+
+def f(v):
+    match v:
+        case Point(x=pkg):
+            pkg.X()
+
+=== app/c25_import_as_same.py
+import pkg as pkg
+
+def f():
+    pkg.X()
+
+=== app/c26_import_dotted_and_plain.py
+import pkg
+import pkg.sub
+
+def f():
+    pkg.X()

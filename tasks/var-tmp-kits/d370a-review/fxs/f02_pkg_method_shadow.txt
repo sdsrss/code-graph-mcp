@@ -1,0 +1,14 @@
+=== pkg/__init__.py
+from .core import run
+
+class Runner:
+    def run(self):
+        pass
+=== pkg/core.py
+def run():
+    pass
+=== app.py
+import pkg
+
+def main():
+    pkg.run()

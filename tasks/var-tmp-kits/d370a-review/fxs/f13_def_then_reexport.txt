@@ -1,0 +1,20 @@
+=== pkg/__init__.py
+def X():
+    pass
+
+try:
+    from ._fast import X
+except ImportError:
+    pass
+=== pkg/_fast.py
+def X():
+    pass
+=== app.py
+import pkg
+from pkg import X
+
+def main():
+    pkg.X()
+
+def main2():
+    X()
