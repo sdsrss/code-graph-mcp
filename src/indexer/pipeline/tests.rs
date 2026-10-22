@@ -4367,6 +4367,50 @@ fn a_call_the_pending_sweep_binds_is_in_both_context_strings() {
     }
 }
 
+/// D#545's commoner half: an edit that adds a call into a function in a file
+/// the run does not touch. The callee's context text was re-rendered only when
+/// it had an edge into the edited file BEFORE the run, so its `called_by` never
+/// learned of a new caller. Every refresh path is checked: the incremental run,
+/// a query-time refresh of the one file, and the fan-out round that re-binds a
+/// caller to a second definition the run added.
+#[test]
+fn a_new_call_into_an_untouched_file_is_in_the_callee_context_string() {
+    let callee = ("a.py", "def run():\n    pass\n");
+    let before = "def main():\n    pass\n";
+    let after = "from a import run\n\ndef main():\n    run()\n";
+    let (_p, _d0, fresh) = fresh_index_of(&[callee, ("b.py", after)]);
+    let want = context_string_of(&fresh, "a.py", "run").unwrap();
+    assert!(want.contains("called_by: main"), "control: {want}");
+
+    for refresh in ["incremental", "ensure_file_indexed"] {
+        let (project, _d, db) = fresh_index_of(&[callee, ("b.py", before)]);
+        fs::write(project.path().join("b.py"), after).unwrap();
+        if refresh == "incremental" {
+            run_incremental_index(&db, project.path(), None, None).unwrap();
+        } else {
+            ensure_file_indexed(&db, project.path(), "b.py", None).unwrap();
+        }
+        assert_eq!(
+            context_string_of(&db, "a.py", "run").unwrap(),
+            want,
+            "{refresh}"
+        );
+    }
+
+    let caller = ("c.py", "def main():\n    run()\n");
+    let (project, _d, db) = fresh_index_of(&[callee, caller]);
+    fs::write(project.path().join("b.py"), callee.1).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    let (_p2, _d2, fresh) = fresh_index_of(&[callee, ("b.py", callee.1), caller]);
+    let want = context_string_of(&fresh, "b.py", "run").unwrap();
+    assert!(want.contains("called_by: main"), "control: {want}");
+    assert_eq!(
+        context_string_of(&db, "b.py", "run").unwrap(),
+        want,
+        "fan-out"
+    );
+}
+
 /// D#544: one caller, three calls of one name told apart only by their metadata
 /// (a typed receiver, a path, a bare name). Renaming the callees buffers each
 /// call on its own pending row; a buffer keyed by caller and name alone kept one

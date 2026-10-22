@@ -568,9 +568,7 @@ pub fn apply_file_refreshes(
         )?;
     }
 
-    if !dirty_node_ids.is_empty() {
-        regenerate_context_strings(db, &dirty_node_ids, model)?;
-    }
+    regenerate_dirty_context(db, &dirty_seed, dirty_node_ids, model)?;
     Ok(())
 }
 
@@ -715,13 +713,13 @@ pub fn run_incremental_index_cached(
         )?;
     }
 
-    if !dirty_node_ids.is_empty() {
+    if !dirty_seed.is_empty() {
         // Heartbeat: context-string regeneration for dirty dependents runs after
         // index_files' own finalize ticks and can take a while on wide fan-in.
         if let Some(cb) = progress {
             cb(IndexPhase::Finalizing, result.files_indexed, to_index.len());
         }
-        regenerate_context_strings(db, &dirty_node_ids, model)?;
+        regenerate_dirty_context(db, &dirty_seed, dirty_node_ids, model)?;
     }
 
     if result.files_indexed > 0 || !deleted_files.is_empty() {
@@ -886,9 +884,7 @@ fn fan_out_to_new_duplicate_definitions(
     // `index_files` cascades them away (CORE-12).
     let dirty = collect_dirty_node_ids(db, &callers)?;
     index_files(db, project_root, &callers, hashes, model, &[], None)?;
-    if !dirty.is_empty() {
-        regenerate_context_strings(db, &dirty, model)?;
-    }
+    regenerate_dirty_context(db, &callers, dirty, model)?;
     // A re-export of a re-export: a file re-extracted above can move what it
     // re-exports in turn, and then its own importers bind differently. One more
     // round per link of the chain; the cap only stops a cycle that never
@@ -906,9 +902,7 @@ fn fan_out_to_new_duplicate_definitions(
         );
         let dirty = collect_dirty_node_ids(db, &more)?;
         index_files(db, project_root, &more, hashes, model, &[], None)?;
-        if !dirty.is_empty() {
-            regenerate_context_strings(db, &dirty, model)?;
-        }
+        regenerate_dirty_context(db, &more, dirty, model)?;
         pulled += more.len();
     }
     Ok(pulled)
@@ -990,8 +984,9 @@ fn to_index_after_interrupt_check(
     Ok(current_hashes.keys().cloned().collect())
 }
 
-/// Collect node IDs in OTHER files that have edges pointing to nodes in the changed files.
-/// Must be called BEFORE re-indexing (cascade delete removes old edges).
+/// Collect node IDs in OTHER files that have edges into or out of the changed files.
+/// Called BEFORE re-indexing for the edges the run removes (cascade delete takes
+/// them), and again after it for the ones it made ([`regenerate_dirty_context`]).
 fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<HashSet<i64>> {
     let mut changed_file_ids = Vec::new();
     for path in changed_paths {
@@ -1007,4 +1002,23 @@ fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<Has
     }
     let ids = get_dirty_node_ids(db.conn(), &changed_file_ids)?;
     Ok(ids.into_iter().collect())
+}
+
+/// Re-render the context strings of `before` — the nodes elsewhere that had an
+/// edge into or out of `paths` before `index_files` re-indexed them, taken then
+/// because the run removes those edges — and of the nodes elsewhere that have
+/// one now. The second set holds the edges the run made: a new call into a
+/// function in a file the run never opened, whose `called_by` the first set
+/// cannot know about (D#545).
+fn regenerate_dirty_context(
+    db: &Database,
+    paths: &[String],
+    mut before: HashSet<i64>,
+    model: Option<&EmbeddingModel>,
+) -> Result<()> {
+    before.extend(collect_dirty_node_ids(db, paths)?);
+    if !before.is_empty() {
+        regenerate_context_strings(db, &before, model)?;
+    }
+    Ok(())
 }
