@@ -4334,6 +4334,39 @@ fn a_leftover_vanished_entry_re_extracts_nothing() {
     );
 }
 
+/// D#545: a call written before its callee is buffered, and the run that adds
+/// the callee binds it in the pending sweep, after Phase 3 rendered the run's
+/// context strings — and the caller's file is not in the run at all. Both ends
+/// must name the call, as a rebuild of the same tree renders them.
+#[test]
+fn a_call_the_pending_sweep_binds_is_in_both_context_strings() {
+    let caller = ("go.py", "def main():\n    run()\n");
+    let callee = "def other():\n    pass\n\ndef run():\n    pass\n";
+    // The callee added to a file the index holds, and in a file of its own.
+    for (path, before) in [
+        ("utils.py", Some("def other():\n    pass\n")),
+        ("run.py", None),
+    ] {
+        let mut start = vec![caller];
+        start.extend(before.map(|b| (path, b)));
+        let (project, _d, db) = fresh_index_of(&start);
+        fs::write(project.path().join(path), callee).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+
+        let (_p, _d2, fresh) = fresh_index_of(&[caller, (path, callee)]);
+        let main = context_string_of(&fresh, "go.py", "main").unwrap();
+        let run = context_string_of(&fresh, path, "run").unwrap();
+        assert!(main.contains("calls: run"), "control: {main}");
+        assert!(run.contains("called_by: main"), "control: {run}");
+        assert_eq!(
+            context_string_of(&db, "go.py", "main").unwrap(),
+            main,
+            "{path}"
+        );
+        assert_eq!(context_string_of(&db, path, "run").unwrap(), run, "{path}");
+    }
+}
+
 #[test]
 fn test_sentinel_name_matches_stem_spellings() {
     // Every spelling a specifier reaches a file stem by must match...

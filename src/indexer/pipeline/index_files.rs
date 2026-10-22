@@ -3165,10 +3165,16 @@ Restart every code-graph server on this project so they run one version.",
     //
     // Deletions do not qualify: removing nodes can only shrink the candidate set.
     let mut pending_sources = std::collections::BTreeSet::new();
+    let mut swept_ends = HashSet::new();
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        super::resolve::resolve_pending_calls_touching(db, &crate_roots, &mut pending_sources)?
+        super::resolve::resolve_pending_calls_touching(
+            db,
+            &crate_roots,
+            &mut pending_sources,
+            &mut swept_ends,
+        )?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
@@ -3176,6 +3182,13 @@ Restart every code-graph server on this project so they run one version.",
             "[index] Phase 2c: resolved {} pending unresolved calls",
             pending_resolved
         );
+    }
+    // Phase 3 rendered this run's nodes before the sweep bound anything, and the
+    // callers it binds sit in files this run may not have opened: both ends of a
+    // swept edge are re-rendered, as a run that bound the call in Phase 2 renders
+    // them (D#545).
+    if !swept_ends.is_empty() {
+        super::context::regenerate_context_strings(db, &swept_ends, model)?;
     }
 
     // Phases 2d-bind, 2d-prune, and 2e are full-graph set-based passes (a JOIN over

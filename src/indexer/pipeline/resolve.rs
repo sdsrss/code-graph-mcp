@@ -417,16 +417,24 @@ pub(super) fn js_export_map_sql() -> String {
 /// Returns the number of edges inserted by this sweep.
 #[cfg(test)]
 pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &RustCrates) -> Result<usize> {
-    resolve_pending_calls_touching(db, crate_roots, &mut std::collections::BTreeSet::new())
+    resolve_pending_calls_touching(
+        db,
+        crate_roots,
+        &mut std::collections::BTreeSet::new(),
+        &mut HashSet::new(),
+    )
 }
 
 /// [`resolve_pending_calls`], adding to `touched` the file of every caller it
 /// bound an edge from: those edges are cross-file by-name binds the post-pass
 /// scope must classify, and their caller may be a file this run never opened.
+/// Both nodes of every edge it binds go into `ends`: their context strings were
+/// rendered without it (D#545).
 pub(super) fn resolve_pending_calls_touching(
     db: &Database,
     crate_roots: &RustCrates,
     touched: &mut std::collections::BTreeSet<String>,
+    ends: &mut HashSet<i64>,
 ) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
     if pending.is_empty() {
@@ -527,6 +535,7 @@ pub(super) fn resolve_pending_calls_touching(
                         )? {
                             edges_added += 1;
                             touched.insert(caller_path.to_string());
+                            ends.extend([row.source_id, *tgt_id]);
                         }
                     }
                 }
@@ -861,6 +870,7 @@ pub(super) fn resolve_pending_calls_touching(
             if insert_edge_cached(db.conn(), row.source_id, *tgt_id, REL_CALLS, metadata)? {
                 edges_added += 1;
                 touched.insert(caller_path.to_string());
+                ends.extend([row.source_id, *tgt_id]);
             }
         }
         to_delete.push(row.id);
