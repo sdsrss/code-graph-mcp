@@ -1,5 +1,5 @@
 # 无索引目录里的查询不再静默返回空（P0-b）
-状态：草稿（等用户授权进入实现）
+状态：进行中（已实现，待评审）
 
 ## 背景与目标
 
@@ -32,10 +32,10 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 
 ## 验收标准
 
-- [ ] AC1：在未建索引的 git 仓库里，对每个经过 `CliContext::open` 的查询命令执行 `code-graph-mcp <cmd> <arg> 2>/dev/null`，stdout 恰好一行，包含 `No index` 和 `incremental-index`，退出码 1。验证：新增 `tests/cli_e2e.rs` 用例，逐个命令检查。
-- [ ] AC2：`--json` 的 stdout 仍然只有那一个 JSON 对象，不多出一行文本。验证：同一用例里加断言。
-- [ ] AC3：有索引时，所有命令的输出不变。验证：`cargo test --no-default-features` 全部通过。
-- [ ] AC4：stderr 原有那一行不变，`--json` 的错误对象不变。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
+- [x] AC1：在未建索引的 git 仓库里，对每个经过 `CliContext::open` 的查询命令执行 `code-graph-mcp <cmd> <arg> 2>/dev/null`，stdout 恰好一行，包含 `No index` 和 `incremental-index`，退出码 1。验证：新增 `tests/cli_e2e.rs` 用例，逐个命令检查。
+- [x] AC2：`--json` 的 stdout 仍然只有那一个 JSON 对象，不多出一行文本。验证：同一用例里加断言。
+- [x] AC3：有索引时，所有命令的输出不变。验证：`cargo test --no-default-features` 全部通过。
+- [x] AC4：stderr 原有那一行不变，`--json` 的错误对象不变。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
 - [ ] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列里，副本目录中的调用不再是空输出。
 
 ## 方案
@@ -47,16 +47,22 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 
 ## 计划
 
-- [ ] S1：先写测试（`tests/cli_e2e.rs`，逐个命令，包括 `--json` 不变）——覆盖 AC1、AC2——依赖：无——执行：主会话
-- [ ] S2：`NoIndexError` 加上 main 出口的改动——覆盖 AC1、AC3、AC4——依赖：S1
-- [ ] S3：CHANGELOG 的 Unreleased 写明 stdout 多一行——依赖：S2
+- [x] S1：先写测试（`tests/cli_e2e.rs`，逐个命令，包括 `--json` 不变）——覆盖 AC1、AC2——依赖：无——执行：主会话
+- [x] S2：`NoIndexError` 加上 main 出口的改动——覆盖 AC1、AC3、AC4——依赖：S1
+- [x] S3：CHANGELOG 的 Unreleased 写明 stdout 多一行——依赖：S2
 - [ ] S4：发版前评审，用一个新的子代理（`review.md`）——依赖：S3
 
 ## 决策与进展
 
 - 2026-10-23：草稿。这一项改变已发布 CLI 的用户可见默认行为，按规范属于 L3，需要用户授权后才能实现。
+- 2026-10-23：用户授权，在分支 `fix/no-index-visible` 上实现。实测范围：19 个命令（18 个查询命令加 `health-check`）都经过 `CliContext::open_inner`，无索引时原来都是 stdout 为空。
+- 设计收窄：最初在 main 里还加了一段"`--format json` 时不打这一行"的判断，后来删掉了。只有 `health-check` 有 `--format`，而它的 JSON 分支自己生成 `no_index` 报告，不会产生 `NoIndexError`；删掉之后测试照样通过。
 - 2026-10-23：同一轮审计里的 P1（把 SubagentStart 扩到所有代理类型）已撤回，不在本 spec 范围内。核实发现自定义代理会加载 CLAUDE.md（release-reviewer 45/45、executor 24/24、reviewer 30/30），而 daagu、gsd-lite、claudemd 的 CLAUDE.md 里都有 code-graph 的引导段落。所以 release-reviewer 31 个会话一次没用 code-graph，原因不是缺少上下文。
 
 ## 验证记录
 
-- （尚未实现）
+- `cargo test --no-default-features --test cli_e2e test_cli_no_index_says_so_on_stdout`：改动前失败（`["show", "foo"]: one line on stdout, got ""`），改动后通过。
+- `cargo test --no-default-features`：通过，2342 个通过、0 失败、7 个忽略。
+- `cargo clippy --no-default-features --all-targets -- -D warnings`：通过。
+- `cargo fmt --all -- --check`：第一次失败（两处换行），`cargo fmt` 之后通过，相关测试重跑通过（3/3）。
+- 手动核对（debug 构建，未建索引的 git 仓库）：`show foo 2>/dev/null` 的 stdout 是 `[code-graph] No index found at …/.code-graph/index.db. Run: code-graph-mcp incremental-index`，退出码 1；stderr 是 `Error: No index found at …`；`health-check --format json` 的 stdout 仍然是 JSON。

@@ -211,6 +211,27 @@ pub fn serve_non_project_stub<R: BufRead, W: Write>(
     Ok(())
 }
 
+/// No index where a query looked. A type rather than a message, so `main` can
+/// tell it from every other failure and also say it on stdout: agents query a
+/// scratch clone as `code-graph-mcp show X 2>/dev/null | head`, where a
+/// stderr-only error left nothing at all (tasks/specs/no-index-visible.md).
+#[derive(Debug)]
+pub struct NoIndexError {
+    pub db_path: PathBuf,
+}
+
+impl std::fmt::Display for NoIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No index found at {}. Run: code-graph-mcp incremental-index",
+            self.db_path.display()
+        )
+    }
+}
+
+impl std::error::Error for NoIndexError {}
+
 /// Lightweight CLI context for subcommands called by hooks.
 /// Does NOT load the embedding model (too slow for 5-10s hook timeouts).
 pub struct CliContext {
@@ -265,10 +286,7 @@ impl CliContext {
         crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
-            anyhow::bail!(
-                "No index found at {}. Run: code-graph-mcp incremental-index",
-                db_path.display()
-            );
+            return Err(NoIndexError { db_path }.into());
         }
         cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
         // CLI commands behind CliContext are READERS (grep, show, callgraph,

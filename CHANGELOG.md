@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### A query with no index says so on stdout
+
+In a directory with no index, `show`, `callgraph`, `impact`, `refs`,
+`overview`, `search` and the other commands that read the index (19 with
+`health-check`) wrote their error to stderr only, and stdout was empty. Agents
+reviewing a scratch clone of a repository run `code-graph-mcp show X
+2>/dev/null | head -40 || grep …`: the error went to `/dev/null`, `|| grep`
+did not run because the pipeline's exit code is `head`'s, and the call came
+back with nothing. From 2026-10-16 to 2026-10-23, 3 of the 9 code-graph calls
+that subagents in three projects on the maintainer's machine made in such
+clones did.
+
+The same line, `[code-graph] No index found at <path>. Run: code-graph-mcp
+incremental-index`, now also goes to stdout. The exit code (1), the stderr line
+and `--json` output are unchanged; `health-check --format json` still answers
+with its own `no_index` report. A script that reads stdout gets this one line
+where it got nothing before. `grep` already searched without an index and is
+unchanged.
+
 ### Edits in a linked worktree get their impact summary and Stop check
 
 An agent isolated in a worktree, and a session in Claude Code's

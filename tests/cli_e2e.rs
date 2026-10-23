@@ -9699,6 +9699,64 @@ fn test_cli_json_error_no_index_emits_error_object() {
     }
 }
 
+/// tasks/specs/no-index-visible.md: in an unindexed directory a text-mode query
+/// wrote its error to stderr only, so `code-graph-mcp show X 2>/dev/null | head`
+/// — the shape agents use in a scratch clone of a repository — returned nothing
+/// at all, and a `|| grep …` after it never ran (3 of 9 subagent calls in clones,
+/// 2026-10-16..23). The line now reaches stdout too. Stderr, the exit code and
+/// machine-readable output are as before.
+#[test]
+fn test_cli_no_index_says_so_on_stdout() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src").join("a.rs"), "fn a() {}\n").unwrap();
+    for cmd in [
+        vec!["show", "foo"],
+        vec!["overview", "src"],
+        vec!["callgraph", "x"],
+        vec!["refs", "y"],
+        vec!["map"],
+        vec!["dead-code"],
+        vec!["cycles"],
+        vec!["impact", "z"],
+        vec!["search", "q"],
+        vec!["trace", "a"],
+        vec!["deps", "src/a.rs"],
+        vec!["affected", "src/a.rs"],
+        vec!["ast-search", "--type", "fn"],
+        vec!["centrality"],
+        vec!["report"],
+        vec!["surprising"],
+        vec!["tour"],
+        vec!["similar", "a"],
+        vec!["health-check"],
+    ] {
+        let (out, err, code) = run_cli(&project, &cmd);
+        assert_eq!(code, 1, "{cmd:?} must still exit 1 without an index");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 1, "{cmd:?}: one line on stdout, got {out:?}");
+        assert!(
+            lines[0].contains("No index found")
+                && lines[0].contains("code-graph-mcp incremental-index"),
+            "{cmd:?}: the stdout line names the missing index and the remedy, got {out:?}"
+        );
+        assert!(
+            err.contains("Error: No index found at"),
+            "{cmd:?}: stderr keeps its line (doctor.js reads it), got {err:?}"
+        );
+    }
+    for args in [
+        vec!["show", "foo", "--json"],
+        vec!["health-check", "--json"],
+        vec!["health-check", "--format", "json"],
+    ] {
+        let (out, _err, _code) = run_cli(&project, &args);
+        serde_json::from_str::<serde_json::Value>(out.trim())
+            .unwrap_or_else(|_| panic!("{args:?}: stdout must stay one JSON value, got {out:?}"));
+    }
+}
+
 #[test]
 fn test_cli_json_error_path_outside_root_emits_error_object() {
     // Same tier-3 contract, out-of-root leg (the 8 path-taking commands used

@@ -528,6 +528,15 @@ fn main() -> Result<()> {
             && args.get(2).map(|s| s.as_str()) == Some("inspect");
         if always_json_stdout || args.iter().skip(2).any(|a| a == "--json") {
             println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+        } else if e
+            .downcast_ref::<code_graph_mcp::cli::NoIndexError>()
+            .is_some()
+        {
+            // Text mode: the line also goes to stdout, where a query run as
+            // `… 2>/dev/null | head` still shows it (tasks/specs/no-index-visible.md).
+            // `health-check --format json` answers a missing index with its own
+            // report and never reaches here.
+            println!("[code-graph] {e}");
         }
     }
     result
