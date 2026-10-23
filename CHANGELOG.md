@@ -38,8 +38,8 @@ indexer skips hidden directories, so that index holds no file under
 there the impact summary before an Edit that changes a definition's header
 said nothing, the Stop check of changed signatures found no callers, and five
 reads into one directory never brought its overview. From 2026-10-16 to
-2026-10-23, 725 of the ~1,694 edits in three projects on the maintainer's
-machine were made there.
+2026-10-23, 295 of the ~1,694 edits in three projects on the maintainer's
+machine were of files in such worktrees, all of them in one project.
 
 The hooks now ask the index for a file in a worktree under a hidden directory
 by its path from the worktree. When the file defines the edited name more
