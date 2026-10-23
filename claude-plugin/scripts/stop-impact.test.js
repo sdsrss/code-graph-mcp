@@ -277,6 +277,22 @@ test('D#560: a worktree file is reported by its path, and the command asks for i
   assert.match(r.lines[0], /and 3 more \(code-graph-mcp refs compute --file src\/a\.rs\)$/);
 });
 
+// A session whose own cwd is the worktree (EnterWorktree) reads the report
+// from there, where `.claude/worktrees/wt/src/b.rs` does not exist (review of
+// D#560). Names are shown from the session's tree; the log keeps its keys.
+test('D#560: a session working in the worktree is shown paths from the worktree', () => {
+  const wtA = '.claude/worktrees/wt/src/a.rs';
+  const r = computeStopReport({
+    edits: EDIT_A.map((e) => ({ ...e, file: wtA })), state: EMPTY, now: 9000,
+    workText: (f) => (f === wtA ? SIG_A : null),
+    callers: () => [{ file: '.claude/worktrees/wt/src/b.rs', line: 6, name: 'caller_b' }],
+    mtimeMs: () => 1000,
+    displayOf: (f) => (f.startsWith('.claude/worktrees/wt/') ? f.slice('.claude/worktrees/wt/'.length) : f),
+  });
+  assert.equal(r.lines[0], '  compute() in src/a.rs: src/b.rs:6 (caller_b)');
+  assert.deepEqual(r.files, ['.claude/worktrees/wt/src/b.rs'], 'the follow-up keeps the log\'s keys');
+});
+
 test('stop: one caller line per file:line; a module-level caller has no name', () => {
   const refs = [
     { file: 'src/b.rs', line: 5, name: 'caller_b' },
@@ -520,6 +536,36 @@ test('e2e D#560: a signature change in a linked worktree is checked against the 
   assert.match(ctx, /compute\(\) in \.claude\/worktrees\/wt\/src\/a\.rs: \.claude\/worktrees\/wt\/src\/b\.rs:6 \(caller_b\)/, ctx);
   assert.doesNotMatch(ctx, /c0\.rs/, 'a caller the agent edited this turn is not listed');
   assert.match(ctx, /and 1 more \(code-graph-mcp refs compute --file src\/a\.rs\)/, ctx);
+});
+
+// The session itself works in the worktree (EnterWorktree): its Stop runs with
+// the worktree as cwd, so the report names files from there.
+test('e2e D#560: a session working in a linked worktree is shown paths from the worktree', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t);
+  execFileSync('git', ['worktree', 'add', '-q', '.claude/worktrees/wt', '-b', 'wt'],
+    { cwd: sb.repo, env: sb.env, stdio: 'pipe' });
+  const wt = path.join(sb.repo, '.claude', 'worktrees', 'wt');
+  const aWt = path.join(wt, 'src', 'a.rs');
+  const oldString = 'pub fn compute(x: i32) -> i32 {';
+  const newString = 'pub fn compute(x: i32, y: i32) -> i32 {';
+  const pre = spawnSync(process.execPath, [path.join(__dirname, 'pre-edit-guide.js')], {
+    input: JSON.stringify({
+      session_id: 'sess-in-wt', hook_event_name: 'PreToolUse', tool_name: 'Edit', cwd: wt,
+      tool_input: { file_path: aWt, old_string: oldString, new_string: newString },
+    }),
+    cwd: wt, env: sb.env, encoding: 'utf8', timeout: 20000,
+  });
+  assert.equal(pre.status, 0, pre.stderr);
+  fs.writeFileSync(aWt, fs.readFileSync(aWt, 'utf8').replace(oldString, newString));
+
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'stop-impact.js')], {
+    input: JSON.stringify({ session_id: 'sess-in-wt', hook_event_name: 'Stop', cwd: wt, stop_hook_active: false }),
+    cwd: wt, env: sb.env, encoding: 'utf8', timeout: 20000,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout, 'expected a Stop envelope');
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.match(ctx, /^ {2}compute\(\) in src\/a\.rs: src\/b\.rs:5 \(caller_b\)$/m, ctx);
 });
 
 // D#163: the roadmap's Stop metric ("reported, and adopted") needs both halves

@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { indexBuildInProgress, INDEXING_STALE_MS, indexKey } = require('./project-root');
+const { indexBuildInProgress, INDEXING_STALE_MS, indexKey, worktreePrefix } = require('./project-root');
 
 function project(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-project-root-'));
@@ -100,6 +100,36 @@ test('indexKey: a submodule, a worktree of another repo, and a key leaving the r
   assert.equal(indexKey(root, 'vendor/lib/x.js'), 'vendor/lib/x.js');
   assert.equal(indexKey(root, 'nested/wt/x.js'), 'nested/wt/x.js');
   assert.equal(indexKey(root, '../wt/src/a.js'), '../wt/src/a.js');
+});
+
+// The indexer skips hidden directories, so a worktree under one is never in
+// the index; a worktree elsewhere in the project is indexed under its own path
+// unless ignored, and stripping its prefix asked for main's copy instead
+// (review of D#560: 13 callers became 12).
+test('indexKey: a worktree outside hidden directories keeps its prefix', (t) => {
+  const root = project(t);
+  linkedDir(root, 'wt2', path.join(root, '.git', 'worktrees', 'wt2'));
+  linkedDir(root, '.wt/x', path.join(root, '.git', 'worktrees', 'x'));
+  assert.equal(indexKey(root, 'wt2/src/a.js'), 'wt2/src/a.js');
+  assert.equal(indexKey(root, '.wt/x/src/a.js'), 'src/a.js');
+});
+
+test('indexKey: a root reached through a symlink still matches its worktrees', (t) => {
+  const real = project(t);
+  linkedDir(real, '.claude/worktrees/wt', path.join(fs.realpathSync(real), '.git', 'worktrees', 'wt'));
+  const link = path.join(os.tmpdir(), `cg-project-root-link-${process.pid}`);
+  fs.symlinkSync(real, link);
+  t.after(() => fs.rmSync(link, { force: true }));
+  assert.equal(indexKey(link, '.claude/worktrees/wt/src/a.js'), 'src/a.js');
+});
+
+test('worktreePrefix: the worktree a session directory sits in, or none', (t) => {
+  const root = project(t);
+  linkedDir(root, '.claude/worktrees/wt', path.join(root, '.git', 'worktrees', 'wt'));
+  assert.equal(worktreePrefix(root, '.claude/worktrees/wt'), '.claude/worktrees/wt/');
+  assert.equal(worktreePrefix(root, '.claude/worktrees/wt/src'), '.claude/worktrees/wt/');
+  assert.equal(worktreePrefix(root, 'src'), '');
+  assert.equal(worktreePrefix(root, ''), '');
 });
 
 test('indexKey: the key keeps its own separators', { skip: path.sep !== '\\' && 'Windows separators' }, (t) => {

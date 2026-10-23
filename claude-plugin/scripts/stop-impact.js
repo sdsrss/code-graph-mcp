@@ -415,8 +415,12 @@ function findCallSiteLine(text, symbol, startLine) {
  * @param {(file:string)=>number|null} a.mtimeMs
  * @param {(file:string)=>string} [a.indexKeyOf]  the key the index knows a
  *   file by: a linked worktree's copy drops the worktree's prefix (D#560)
+ * @param {(file:string)=>string} [a.displayOf]  a file as the reader names it:
+ *   a session working in a worktree reads paths from there (D#560 review)
  */
-function computeStopReport({ edits, state, now, workText, callers, mtimeMs, indexKeyOf = (f) => f }) {
+function computeStopReport({
+  edits, state, now, workText, callers, mtimeMs, indexKeyOf = (f) => f, displayOf = (f) => f,
+}) {
   const lastStopAt = state.lastStopAt;
   const turn = edits.filter((e) => lastStopAt === null || e.ts > lastStopAt);
   const next = { lastStopAt: now, reported: [...state.reported] };
@@ -473,9 +477,9 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs, inde
     // text from the repository, and the model may paste it into a command.
     const shown = untouched.slice(0, MAX_CALLERS_LISTED).map((r) => {
       const name = r.name && r.name !== '<module>' ? ' (' + shellQuoteArg(r.name) + ')' : '';
-      return shellQuoteArg(r.file) + ':' + r.line + name;
+      return shellQuoteArg(displayOf(r.file)) + ':' + r.line + name;
     });
-    let line = '  ' + shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file) + ': ' + shown.join(', ');
+    let line = '  ' + shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(displayOf(c.file)) + ': ' + shown.join(', ');
     if (untouched.length > MAX_CALLERS_LISTED) {
       line += ', and ' + (untouched.length - MAX_CALLERS_LISTED) + ' more (' +
         formatCgCommand(['refs', c.symbol, '--file', indexKeyOf(c.file)]) + ')';
@@ -490,7 +494,7 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs, inde
   const unchecked = changed.slice(MAX_SYMBOLS_CHECKED);
   if (unchecked.length > 0) {
     lines.push('  ' + unchecked.length + ' more changed, callers not checked: ' +
-      unchecked.map((c) => shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file)).join(', '));
+      unchecked.map((c) => shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(displayOf(c.file))).join(', '));
   }
   // `symbols` / `files`: what the report names, for its telemetry and its
   // follow-up (D#163). Not part of `state`.
@@ -564,9 +568,13 @@ function runMain() {
   const input = readStdinJson();
   if (!input || !input.session_id) return;
 
-  const { resolveProjectRoot, indexKey } = require('./project-root');
-  const root = resolveProjectRoot(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd());
+  const { resolveProjectRoot, indexKey, worktreePrefix } = require('./project-root');
+  const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
+  const root = resolveProjectRoot(cwd);
   if (root === null) return;
+  // A session working in a linked worktree (EnterWorktree) reads the report
+  // from there; files in that worktree are named from its top.
+  const shownFrom = worktreePrefix(root, path.relative(root, cwd).split(path.sep).join('/'));
 
   const sessionEdits = require('./session-edits');
   const { recordRecommendation } = require('./recommendation-log');
@@ -645,6 +653,7 @@ function runMain() {
       },
       mtimeMs,
       indexKeyOf: (file) => indexKey(root, file),
+      displayOf: (file) => (shownFrom && file.startsWith(shownFrom) ? file.slice(shownFrom.length) : file),
     });
   }
   const rec = reportRecords(report);

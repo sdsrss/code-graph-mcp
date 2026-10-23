@@ -236,16 +236,18 @@ function runImpact(args) {
 // the old_string is not in the file (the Edit will fail) or no candidate fits.
 // The CLI lists at most five, in source order, and says how many exist in
 // `total`: past the last listed one an unlisted definition may start, so an
-// edit there is not guessed at (pre-tag review 2026-09-29). The text is the
-// edited file's own (`fileKey`, a worktree's copy included); the candidates
-// name it by its index key.
+// edit there is not guessed at (pre-tag review 2026-09-29). The line is
+// counted in the copy the index describes, whose start lines the candidates
+// carry: in a worktree, the main checkout's. Counted in the worktree's copy, a
+// header whose lines had moved named another same-named definition's callers
+// (review of D#560). A copy without the edited text gets no guess.
 function editedNodeId(suggestions, fileKey, total) {
+  const indexedKey = indexKey(cwd, fileKey);
   let text;
-  try { text = fs.readFileSync(path.join(cwd, fileKey), 'utf8'); } catch { return null; }
+  try { text = fs.readFileSync(path.join(cwd, indexedKey), 'utf8'); } catch { return null; }
   const at = text.indexOf(oldStr);
   if (at === -1) return null;
   const line = text.slice(0, at + symbolAt).split('\n').length;
-  const indexedKey = indexKey(cwd, fileKey);
   let best = null;
   for (const c of suggestions) {
     if (!c || c.file_path !== indexedKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;

@@ -708,16 +708,35 @@ test('D#560: a changed signature in a linked worktree injects the impact summary
     `got: ${res.stdout}`);
 });
 
-test('D#560: a same-file same-name edit in a worktree is placed in the worktree\'s copy', (t) => {
-  // Only the worktree holds the file: a read from the main checkout finds
-  // nothing, and a candidate compared with the worktree-prefixed key never fits.
+// The candidates' start lines are the main checkout's (the index describes its
+// copy), so the edited line is counted there too. Counted in the worktree's
+// copy, whose lines had moved, it named A.fetch's callers for an edit of
+// B.fetch (review of D#560: before the fix the hook was silent here; a wrong
+// answer is worse).
+const TWO_GETS_SHIFTED = 'class A:\n    def fetch(self, k):\n        return k\nclass B:\n    def fetch(self, k):\n        return k\n';
+
+test('D#560: a same-file same-name edit in a worktree is counted in the copy the index describes', (t) => {
+  const { res } = runPreEditHook(t, {
+    worktree: 'wt', relPath: 'src/app.py', stubExec: STUB_SAME_FILE,
+    setup: (proj, workDir) => {
+      writeTwoGets(proj);
+      require('node:fs').mkdirSync(require('node:path').join(workDir, 'src'), { recursive: true });
+      require('node:fs').writeFileSync(require('node:path').join(workDir, 'src', 'app.py'), TWO_GETS_SHIFTED);
+    },
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_22/, `B.fetch is at line 7 in the indexed copy (5 in the worktree's); got: ${res.stdout}`);
+});
+
+test('D#560: a same-file same-name edit whose text the main checkout lacks gets no guess', (t) => {
   const { res } = runPreEditHook(t, {
     worktree: 'wt', relPath: 'src/app.py', stubExec: STUB_SAME_FILE,
     setup: (proj, workDir) => writeTwoGets(workDir),
     oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
   });
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /caller_of_22/, `B.fetch starts at line 7; got: ${res.stdout}`);
+  assert.equal(res.stdout.trim(), '', `got: ${res.stdout}`);
 });
 
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`

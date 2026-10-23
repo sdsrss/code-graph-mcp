@@ -31,26 +31,42 @@ indexes the directory as it is; with a `.git` it is unchanged.
 
 An agent isolated in a worktree, and a session in Claude Code's
 `.claude/worktrees/<slug>`, works in a linked worktree inside the project
-with no index of its own, so the hooks read the main checkout's index. That
-index stores files by their path in the main checkout, and the hooks asked it
-for `.claude/worktrees/<slug>/src/a.js`, which it refuses. So for every edit
+with no index of its own, so the hooks read the main checkout's index. The
+indexer skips hidden directories, so that index holds no file under
+`.claude/worktrees/`, and the hooks asked it for
+`.claude/worktrees/<slug>/src/a.js`, which it refuses. So for every edit
 there the impact summary before an Edit that changes a definition's header
 said nothing, the Stop check of changed signatures found no callers, and five
 reads into one directory never brought its overview. From 2026-10-16 to
 2026-10-23, 725 of the ~1,694 edits in three projects on the maintainer's
 machine were made there.
 
-The hooks now ask the index for such a file by its path from the worktree.
-The Stop check, which runs in the parent session, names the callers by their
-path through the worktree and reads the worktree's copies, so a caller the
-agent already edited is left out as in the main checkout, and the line it
-names is the copy's. Greps in a worktree run as typed, as before: the index
-holds the main checkout's text, not the worktree's.
+The hooks now ask the index for a file in a worktree under a hidden directory
+by its path from the worktree. When the file defines the edited name more
+than once, the edited definition is placed by the main checkout's copy, which
+the index describes; an edit whose text that copy lacks gets no summary
+rather than a guess. The Stop check names callers by their path through the
+worktree when it runs in the parent session, and from the worktree's top when
+the session itself works in the worktree. It reads the worktree's copies, so
+a caller already edited there is left out as in the main checkout, and a
+caller's line is looked for in the copy, from where the main checkout has it.
+Greps in a worktree run as typed, as before: the index holds the main
+checkout's text, not the worktree's.
 
-Not covered: a worktree outside the project (`git worktree add ../wt`); edits
-there are outside the project to the hooks, as before. The answers come from
-the main checkout's index, so a caller the worktree added, or a definition it
-moved, is not in them until the work reaches the main checkout.
+Not covered, and as before:
+- a worktree outside the project (`git worktree add ../wt`): its edits are
+  outside the project to the hooks;
+- a worktree inside the project but not under a hidden directory: the index
+  holds its files under their own path unless they are ignored, and the hooks
+  ask by that path;
+- a project that is itself a linked worktree, and a worktree inside a
+  worktree.
+
+The answers come from the main checkout's index: a caller the worktree added,
+removed or moved is as the main checkout has it until the work reaches it.
+The two-minute pause between summaries for one name and the count of reads
+per directory are shared by the main checkout's session and its worktrees'
+agents.
 
 ## 0.177.0
 

@@ -129,25 +129,37 @@ function samePath(a, b) {
   try { return fs.realpathSync(a) === fs.realpathSync(b); } catch { return false; }
 }
 
-// The key the index knows a file by, given its key from `root` (a path relative
-// to it). A worktree with no index of its own resolves to its main checkout
-// (above), whose index stores the main checkout's layout; a key that runs
-// through a linked worktree of `root` names the worktree's copy, which the index
-// knows by its path from the worktree's top. Built from `root`, every such key
-// carried the worktree's prefix: `impact --file .claude/worktrees/x/src/a.js`
-// was refused, and the pre-edit impact went silent for every edit in an
-// isolated agent's worktree (D#560). Any other key comes back unchanged, its
-// separators included. Only worktrees inside `root` are seen: a key leaving it
-// (`../wt/…`) is outside the project to the hooks.
-function indexKey(root, key) {
-  if (!root || !key || key.startsWith('..') || path.isAbsolute(key)) return key;
+// The part of `key` (a path from `root`) that leads to the top of a linked
+// worktree of `root` the key is in, separator included; '' when there is none.
+// Only a worktree under a hidden directory counts (Claude Code's
+// `.claude/worktrees/<slug>`): the indexer skips hidden directories, so the
+// index holds none of its files under their path from `root`. A worktree
+// elsewhere in the project is indexed under that path unless ignored, and
+// stripping it asked for the main checkout's copy instead (review of D#560).
+// Only worktrees inside `root` are seen: a key leaving it (`../wt/…`) is
+// outside the project to the hooks.
+function worktreePrefix(root, key) {
+  if (!root || !key || key.startsWith('..') || path.isAbsolute(key)) return '';
   const sep = path.sep === '\\' ? /[\\/]/g : /\//g;
-  let m;
-  while ((m = sep.exec(key)) !== null) {
-    const main = worktreeMainRoot(path.join(root, key.slice(0, m.index)));
-    if (main && samePath(main, root)) return key.slice(m.index + 1);
+  const ends = [...key.matchAll(sep)].map((m) => m.index).concat(key.length);
+  for (const end of ends) {
+    const dir = key.slice(0, end);
+    if (!dir.split(sep).some((part) => part.startsWith('.'))) continue;
+    const main = worktreeMainRoot(path.join(root, dir));
+    if (main && samePath(main, root)) return end < key.length ? key.slice(0, end + 1) : `${key}/`;
   }
-  return key;
+  return '';
+}
+
+// The key the index knows a file by, given its key from `root`. A worktree
+// with no index of its own resolves to its main checkout (above), whose index
+// stores the main checkout's layout, so a worktree's copy is known by its path
+// from the worktree's top. Built from `root`, every such key carried the
+// worktree's prefix: `impact --file .claude/worktrees/x/src/a.js` was refused,
+// and the pre-edit impact went silent for every edit in an isolated agent's
+// worktree (D#560). Any other key comes back unchanged, separators included.
+function indexKey(root, key) {
+  return key ? key.slice(worktreePrefix(root, key).length) : key;
 }
 
 // True while the MCP server's startup index is still being written for `root`.
@@ -189,4 +201,4 @@ function writerAlive(p) {
   }
 }
 
-module.exports = { resolveProjectRoot, indexKey, indexBuildInProgress, writerAlive, INDEXING_STALE_MS };
+module.exports = { resolveProjectRoot, indexKey, worktreePrefix, indexBuildInProgress, writerAlive, INDEXING_STALE_MS };
