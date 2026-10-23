@@ -290,6 +290,38 @@ starts, and two were already running when the sixth crossed it ($0.81).
   dropped from `find_references`), which a steering file would amplify, not
   fix: measure after that changes.
 
+### Rerun after D#228/D#229 (2026-10-23, 0.177.0)
+
+Same command, variant `none`, two runs per case, `-j 1` per model with a
+$2.50 cap each; the binary was a fixed copy of 0.177.0's release build. The
+suite now has eight cases (the six above and two controls); the table is the
+six. Results: `evals/results/2026-10-23T20-30-58Z-steering-ab` (Sonnet) and
+`…T20-37-07Z-steering-ab` (Haiku), $3.81 plus a $0.06 delivery probe.
+
+| Model | Sessions | Mean recall | Used code-graph | 10-06 recall |
+|---|---|---|---|---|
+| `claude-sonnet-5-5` | 12 | 0.958 | 0/12 | 0.951 (12) |
+| `claude-haiku-4-5` | 11 | 0.904 | 9/11 | 0.733 (8) |
+
+- Sonnet is unchanged and used code-graph in none of its sessions. Its one
+  miss is `spawn-blocking`'s `sys::run` re-export again (1 run of 2).
+- Haiku's difference is one case: `linked-list-remove` went from 0.583 and
+  0.0 to 0.667 and 1.0. In both new sessions `find_references` still answered
+  0 references, now with D#229's `unresolved_calls` (same-named calls in 23
+  files) and a `next` grep, and Haiku went on searching; on 10-06 it got a
+  bare 0. The other five cases moved by at most 0.06 (the 10-06 Haiku run
+  had one session each on three of them). Over the six cases, 0.733 → 0.904
+  has a two-sided permutation p of 0.18: not a measured gain.
+- Turn counts cannot be compared across the two dates: this run's
+  `linked-list-remove` sessions reported 62 and 76 turns under the same
+  `max_turns: 50` that stopped a 10-06 session at 51.
+- Haiku stopped at 15 of 16 sessions on the cap (spawn-blocking r2 not run).
+- What this cannot say: whether the plugin helps at all. Every session had
+  it; `ab.py` has no arm without it. Haiku's per-session SD here, 0.155 over
+  its 15 sessions and 0.176 over the six cases, puts a 0.1 difference at
+  2 × (1.96 + 0.84)² × SD² / 0.1² ≈ 38 to 48 sessions per arm (α 0.05, power
+  0.8).
+
 ## What an eval run cannot measure: use in real sessions
 
 An eval case says whether the plugin helps on a task; it does not say whether

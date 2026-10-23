@@ -1,5 +1,5 @@
 # 无索引目录里的查询不再静默返回空（P0-b）
-状态：进行中（已实现，待评审）
+状态：已完成（只剩发版后的 AC5 监测）
 
 ## 背景与目标
 
@@ -50,7 +50,7 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 - [x] S1：先写测试（`tests/cli_e2e.rs`，逐个命令，包括 `--json` 不变）——覆盖 AC1、AC2——依赖：无——执行：主会话
 - [x] S2：`NoIndexError` 加上 main 出口的改动——覆盖 AC1、AC3、AC4——依赖：S1
 - [x] S3：CHANGELOG 的 Unreleased 写明 stdout 多一行——依赖：S2
-- [ ] S4：发版前评审，用一个新的子代理（`review.md`）——依赖：S3
+- [x] S4：发版前评审，用一个新的子代理（`review.md`）——依赖：S3
 
 ## 决策与进展
 
@@ -65,6 +65,8 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
   - F3 读端提前关闭时 `println!` 触发 panic 钩子，退出码变 0、stderr 那行丢失。改为 `writeln!` 并忽略写入错误。测试先失败后通过。
   - F4 措辞、F6（首次建索引期间仍只写 stderr）写进 CHANGELOG；F5 加了反向对照（被拒绝的 `.code-graph` 不进 stdout），评审员给的变异 `.is_some() || true` 现在会被测出；F7 把 `plugin_usage.py` 的空输出和"无索引"拆开计数，AC5 改成可测的写法；F8 补跑了 `doctor.test.js`；F9 修正注释；F10 `plugin_usage.py` 不再把含 "No index found" 的错误结果算成 deny。
   - 变异：三处修复各有测试抓住。第一次对 `println!` 的变异因为留下了未使用的 `use` 而编译失败，被脚本误报成"存活"；把 `use` 一起替换后重做，确认被杀死。
+
+- 2026-10-23：合入 main（快进到 133b3de7，之后是 D#560 的评审修复 2b12f713 和数字更正 732c6bff）。未发版。
 
 ## 验证记录
 
