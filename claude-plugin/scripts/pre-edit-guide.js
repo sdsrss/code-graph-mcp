@@ -240,9 +240,11 @@ function runImpact(args) {
 // counted in the copy the index describes, whose start lines the candidates
 // carry: in a worktree, the main checkout's. Counted in the worktree's copy, a
 // header whose lines had moved named another same-named definition's callers
-// (review of D#560). A copy without the edited text gets no guess, and nor
-// does one that holds it twice: the Edit found it once in the worktree's copy,
-// so which occurrence is the edited one cannot be told (review of 0.178.0).
+// (review of D#560). A copy without the edited text gets no guess, and in a
+// worktree nor does one that holds it twice: the main checkout's copy is not
+// the edited one, so which occurrence matches the edited definition cannot be
+// told (review of 0.178.0). In the main checkout that is a `replace_all` Edit,
+// and the first occurrence is one of the definitions it changes.
 function editedNodeId(suggestions, fileKey, total) {
   const indexedKey = indexKey(cwd, fileKey);
   let text;

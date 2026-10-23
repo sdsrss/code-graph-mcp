@@ -778,6 +778,19 @@ test('D#560: a same-file same-name edit whose text the main checkout holds twice
   assert.equal(res.stdout.trim(), '', `got: ${res.stdout}`);
 });
 
+// The rule is the worktree's only. In the main checkout a text the file holds
+// twice is a `replace_all` Edit (Claude Code checks uniqueness only without
+// it), which picks the first occurrence's definition as 0.177.0 did: one of
+// the definitions the edit changes (review of 0.178.0).
+test('Q4: a main-checkout edit whose text the file holds twice (replace_all) keeps its pick', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: '    def fetch(self, k):\n        return k', newString: '    def fetch(self, key):\n        return key',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_11/, `A.fetch, the first occurrence; got: ${res.stdout}`);
+});
+
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`
 // reported 7 direct callers AND `ambiguous_callers_excluded: 32`; the CLI's text
 // prints the ⚠ line, the hook printed "7 direct callers" alone — an undercount

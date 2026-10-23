@@ -74,6 +74,12 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
   - L-1：`--json` 在读端关闭时退出码为 0、stderr 为空，0.177.0 也是如此，CHANGELOG 已写明。L-2：建索引期间 `health-check` 不拒绝请求，CHANGELOG 已写明。
   - L-4：`plugin_usage.py` 把所有含 "No index found" 的结果都记为 `cg_no_index`，包括 0.178 之前把 stderr 一并收进来的结果。所以 AC5 的基线要用新脚本对发版前的时段重新计算，不能沿用审计报告里的数字。
 - dead-end: 在无 `.git` 的目录里让提示直接给出 `rebuild-index --confirm` —— 判断条件只看有没有 `.git`，区分不了项目副本和 `$HOME` —— 本任务不再尝试
+- 2026-10-23：第三轮评审（新的子代理，只审 f3a6345c）没有 HIGH。处理如下：
+  - F2（MEDIUM）：新用例拿 `project.path()` 拼期望的路径，而 CLI 给的是物理路径。macOS 的临时目录经过 `/var` → `/private/var` 符号链接，这个用例会在 CI 的 macOS 那一路失败。改为从 stderr 读回原文再比对。旧写法在符号链接的 TMPDIR 下复现失败；修复后 cli_e2e 全量 401/401 通过。
+  - F1、F3、F6–F9：commit 说明、代码注释和 CHANGELOG 里共有几句不准确的话，已改正：`replace_all` 时主 checkout 的文本不唯一；Stop 检查的那条说法不该是全称；建索引期间带 `--json` 时，stdout 上是 JSON 错误对象；`incremental-index` 的跳过提示在 `$HOME` 里也会给出 `rebuild-index`（0.177.0 起就如此）；`health-check` 有竞态窗口；worktree 副本走样后，可能报出另一个同名定义的调用方。
+  - F4：只在 worktree 下生效的那个条件原先没有测试钉住，补了主 checkout 的 `replace_all` 用例，变异 JM2 现在会被测出。
+  - F5（LOW，未修）：钩子数文本出现次数时允许重叠，Claude Code 的 Edit 不允许重叠，结果是 `old_string = X+X` 落在 `X+X+X` 里时，worktree 中静默。这是罕见形态，记入待办。
+  - 不再开第四轮评审：这一轮的修复只改了一个测试的断言、一处注释和若干措辞，产品行为没有变化。F2 的真正检验是 CI 的 macOS 那一路。
 
 ## 验证记录
 

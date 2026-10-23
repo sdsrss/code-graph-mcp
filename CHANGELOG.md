@@ -37,10 +37,12 @@ code, stderr and stdout are byte-equal to 0.177.0's once that line is taken
 out. In text mode the exit code and the stderr line hold also when the reader
 of stdout has already gone; with `--json` and the reader gone the command
 exits 0 with nothing on stderr, as it did. `health-check --format json` still
-answers with its own `no_index` report. A script that reads stdout gets this
-one line where it got nothing before. `grep` already searched without an index
-and is unchanged. While the first index is still being built the 18 query
-commands refuse with a different error, which stays on stderr only;
+answers with its own `no_index` report, unless the index file vanishes between
+its check and its open, when it gets the line. A script that reads stdout
+gets this one line where it got nothing before. `grep` already searched
+without an index and is unchanged. While the first index is still being
+built the 18 query commands refuse with a different error, which stays off
+stdout in text mode (with `--json` it is the JSON error object, as before);
 `health-check` is not refused then.
 
 In a directory with no `.git` (a `git archive` copy) the line names
@@ -49,6 +51,8 @@ message, on stderr, names `git init`, a git repository, or `code-graph-mcp
 rebuild-index --confirm`, which indexes the directory as it is. The line does
 not name `rebuild-index` itself: a directory with no `.git` is also `$HOME`, or
 a directory holding many repositories, where it indexes the whole tree.
+`incremental-index`'s message offers it there too, beside the other two ways,
+as before.
 
 ### Edits in a linked worktree get their impact summary and Stop check
 
@@ -88,16 +92,17 @@ Not covered, and as before:
 - for the Stop check, a worktree checked out after the turn began (the
   previous Stop, or the session's first edit): the check counts a caller as
   edited this turn when its file changed since then, and checking out wrote
-  every file of the worktree, so it names none of their callers. An isolated
-  agent's worktree is checked out when the agent starts, so its edits are in
-  this case in every turn after the session's first Stop, and in a first turn
-  whose session logged an edit before the agent started.
+  every file of the worktree, so it names none of their callers. The edits an
+  isolated agent makes in the turn it started in are in this case, unless that
+  turn is the session's first and nothing was edited before the agent started.
 
 The answers come from the main checkout's index: a caller the worktree added,
 removed or moved is as the main checkout has it until the work reaches it.
-The two-minute pause between summaries for one name and the count of reads
-per directory are shared by the main checkout's session and its worktrees'
-agents.
+When the worktree's copy has diverged so that an edit's text is found once in
+the main checkout's copy but at another definition of the same name, the
+summary names that definition's callers. The two-minute pause between
+summaries for one name and the count of reads per directory are shared by the
+main checkout's session and its worktrees' agents.
 
 ## 0.177.0
 

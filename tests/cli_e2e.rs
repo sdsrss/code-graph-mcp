@@ -9767,15 +9767,23 @@ fn test_cli_no_index_without_git_says_what_a_repository_gets() {
     let project = TempDir::new().unwrap();
     std::fs::create_dir(project.path().join("src")).unwrap();
     std::fs::write(project.path().join("src").join("a.rs"), "fn foo() {}\n").unwrap();
-    let db = project.path().join(".code-graph").join("index.db");
-    let line = format!(
-        "No index found at {}. Run: code-graph-mcp incremental-index",
-        db.display()
-    );
+    // The text is read back from stderr, not rebuilt from `project.path()`:
+    // the CLI names the directory by its physical path, and on macOS the temp
+    // dir is reached through `/var` → `/private/var` (review of 0.178.0).
     let (out, err, code) = run_cli(&project, &["show", "foo"]);
     assert_eq!(code, 1);
+    let line = err
+        .lines()
+        .find_map(|l| l.strip_prefix("Error: "))
+        .unwrap_or_else(|| panic!("stderr: {err:?}"))
+        .to_string();
+    assert!(
+        line.starts_with("No index found at ")
+            && line.contains(".code-graph")
+            && line.ends_with("index.db. Run: code-graph-mcp incremental-index"),
+        "the line a repository gets, got {line:?}"
+    );
     assert_eq!(out, format!("[code-graph] {line}\n"), "stdout");
-    assert!(err.contains(&format!("Error: {line}")), "stderr: {err:?}");
     let (out, _err, code) = run_cli(&project, &["show", "foo", "--json"]);
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
