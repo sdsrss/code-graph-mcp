@@ -207,6 +207,114 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(s["pointer_kinds"], {"PostToolUse:Bash callgraph": 2})
 
 
+def indexed_project(names):
+    """A project dir whose .code-graph/index.db defines NAMES (and a heading)."""
+    import sqlite3
+    d = tempfile.TemporaryDirectory()
+    os.makedirs(os.path.join(d.name, ".code-graph"))
+    c = sqlite3.connect(os.path.join(d.name, ".code-graph", "index.db"))
+    c.execute("CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT, qualified_name TEXT, type TEXT)")
+    c.executemany("INSERT INTO nodes (name, qualified_name, type) VALUES (?, ?, ?)",
+                  [(n, None, "function") for n in names] + [("Overview", None, "h2")])
+    c.commit()
+    c.close()
+    return d
+
+
+def answered(call, text, is_error=False):
+    return {"type": "user", "message": {"content": [{
+        "type": "tool_result", "tool_use_id": call["message"]["content"][0]["id"],
+        "is_error": is_error, "content": text}]}}
+
+
+class AuditCountersTest(unittest.TestCase):
+    """2026-10-23 audit: lookups the index could answer, code-graph calls that
+    came back empty, and edits in linked worktrees (docs/plugin-usage-audit-2026-10-23.md)."""
+
+    def setUp(self):
+        self.t = Tree()
+        self.p = indexed_project(["fetch_rows", "Store", "load_all"])
+
+    def tearDown(self):
+        self.t.close()
+        self.p.cleanup()
+
+    def scan(self, records):
+        return pu.scan_transcript(self.t.write("p/s.jsonl", records))
+
+    def test_symbol_greps(self):
+        cwd = self.p.name
+        s = self.scan([
+            header("2026-10-20T00:00:00Z", cwd=cwd),
+            tool("Grep", pattern="def fetch_rows", path="src"),          # a definition lookup
+            bash('grep -rn "fetch_rows(\\|Store" src/'),                  # references, alternation
+            bash("rg -n '\\bload_all\\b'"),                               # rg searches the cwd
+            bash("git grep -n fetch_rows -- src"),
+            bash('grep -rn "TODO: fix" src/'),                            # text
+            bash("grep -rn unknown_name src/"),                           # not a name the index defines
+            bash("grep -rn Overview docs/"),                              # a markdown heading is no symbol
+            bash("grep -rni fetch_rows src/"),                            # case-insensitive: a text search
+            bash("cargo test 2>&1 | grep fetch_rows"),                    # filters piped output
+            bash("grep -n fetch_rows notes.md"),                          # a non-code file
+            tool("Grep", pattern="fetch_rows", glob="*.md"),
+            bash("grep -rn fetch_rows ~/.claude/"),                       # outside the project
+            bash("grep fetch_rows"),                                      # reads stdin
+        ])
+        self.assertEqual(s["symbol_greps"], 4)
+
+    def test_symbol_greps_need_an_index(self):
+        s = self.scan([header("2026-10-20T00:00:00Z", cwd="/w/app"), bash("grep -rn fetch_rows src/")])
+        self.assertEqual(s["symbol_greps"], 0)
+
+    def test_symbol_greps_from_a_subdirectory_and_a_worktree(self):
+        wt = os.path.join(self.p.name, ".claude", "worktrees", "wt", "src")
+        os.makedirs(wt)
+        s = self.scan([header("2026-10-20T00:00:00Z", cwd=wt), bash("grep -rn fetch_rows .")])
+        self.assertEqual(s["symbol_greps"], 1)
+
+    def test_empty_code_graph_answers(self):
+        a, b, c, d = (bash("code-graph-mcp show f 2>/dev/null | head -40"), bash("code-graph-mcp callgraph f"),
+                      bash("code-graph-mcp show g"), bash("grep -rn x src/"))
+        s = self.scan([
+            header("2026-10-20T00:00:00Z"),
+            a, answered(a, "(Bash completed with no output)"),
+            b, answered(b, "Error: No index found at /tmp/r/.code-graph/index.db. "
+                           "Run: code-graph-mcp incremental-index", True),
+            c, answered(c, "fn g  src/g.rs:1-3  ()\n  fn g() {}"),
+            d, answered(d, ""),                                           # not a code-graph call
+        ])
+        self.assertEqual((s["cg_explicit"], s["cg_empty"]), ({"bash": 3}, 2))
+
+    def test_worktree_edits_and_their_impact(self):
+        wt = "/w/app/.claude/worktrees/agent-1"
+        s = self.scan([
+            header("2026-10-20T00:00:00Z", cwd=wt),
+            tool("Edit", file_path=wt + "/a.py"),
+            ctx("PreToolUse:Edit", "[code-graph:impact] f() — Risk: LOW"),
+            tool("Edit", file_path=wt + "/b.py"),
+            tool("Write", file_path=wt + "/c.py"),
+        ])
+        self.assertEqual((s["worktree"], s["edits"], s["cg_inject"]), (True, 3, {"PreToolUse:Edit": 1}))
+        root = self.scan([header("2026-10-20T00:00:00Z"), tool("Edit", file_path="/w/app/a.py")])
+        self.assertEqual((root["worktree"], root["edits"]), (False, 1))
+
+    def test_aggregate(self):
+        cwd = self.p.name
+        self.t.write("-w-app/a.jsonl", [header("2026-10-20T00:00:00Z", cwd=cwd), bash("grep -rn fetch_rows src/"),
+                                        bash("grep -rn Store src/"), bash("code-graph-mcp callgraph load_all")])
+        wt = cwd + "/.claude/worktrees/wt"
+        self.t.write("-w-app/b.jsonl", [header("2026-10-20T00:01:00Z", cwd=wt),
+                                        tool("Edit", file_path=wt + "/a.py"),
+                                        ctx("PreToolUse:Edit", "[code-graph:impact] f() — Risk: LOW"),
+                                        tool("Edit", file_path=wt + "/b.py")])
+        rows = pu.aggregate(pu.collect(self.t.root, projects=[cwd]))
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["symbol_greps"], r["cg_explicit"], r["structural_coverage"]), (2, 1, 0.333))
+        self.assertEqual((r["tools"], r["edits"], r["worktree_edits"], r["worktree_edit_impact"]), (5, 2, 2, 1))
+        self.assertEqual(r["symbol_greps_per_1k"], 400.0)
+
+
 class CollectTest(unittest.TestCase):
     def setUp(self):
         self.t = Tree()

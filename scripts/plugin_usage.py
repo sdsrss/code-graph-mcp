@@ -24,6 +24,14 @@ session this counts:
               MCP tool (the SubagentStart facts among them), and how many were
               followed by a code-graph call within the next --window tool calls
 
+  symG        greps for nothing but names the project's index defines, over code
+              inside the project, case-sensitive: lookups the index could have
+              answered (by hand, 38 of 50 were). cover = cg / (cg + symG)
+  empty       code-graph calls that returned no output or "No index found" (an
+              unindexed scratch clone under `2>/dev/null`)
+  wt          in sessions whose cwd is a linked worktree (.claude/worktrees/),
+              edits that got a pre-edit impact summary / all edits (D#560)
+
 and the same explicit / inject counts for claude-mem-lite as a reference arm.
 Counts are not outcomes: a session can use code-graph more and finish no
 better. Pair a change in these numbers with an outcome eval (evals/).
@@ -60,6 +68,18 @@ MEM_CLI_SCRIPTS = {"cli.mjs", "mem-cli.mjs"}
 PLAIN_STDOUT_EVENTS = {"UserPromptSubmit", "SessionStart"}
 MCP_TOOL_NAMES = ("semantic_code_search", "module_overview", "get_call_graph", "find_references",
                   "get_ast_node", "project_map", "ast_search")
+# 2026-10-23 audit (docs/plugin-usage-audit-2026-10-23.md): lookups the index
+# could have answered, code-graph calls that came back empty, worktree edits.
+GREP_HEADS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
+NONCODE_EXT = {".md", ".txt", ".json", ".jsonl", ".log", ".yaml", ".yml", ".toml", ".lock", ".csv", ".html",
+               ".css", ".xml", ".ini", ".cfg", ".env", ".patch", ".diff"}
+DECL = re.compile(r"(?:export\s+)?(?:default\s+)?(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?"
+                  r"(?:def|fn|function|class|struct|enum|trait|interface|type|const|let|var|impl|func)\s+")
+IDENT = re.compile(r"[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)?")
+NOT_SYMBOLS = {"module", "external_module", "h1", "h2", "h3", "h4", "h5", "h6"}
+CG_EMPTY_OUTPUT = ("", "(Bash completed with no output)")
+WORKTREE_MARK = "/.claude/worktrees/"
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 POINTER = re.compile(r"code-graph-mcp\s+([a-z][a-z-]*)|\b(" + "|".join(MCP_TOOL_NAMES) + r")\b")
 
 
@@ -145,15 +165,199 @@ def _explicit(name, inp):
     return None
 
 
+def _alternatives(pattern):
+    """A pattern's `|` / `\\|` alternatives, one group around them all
+    unwrapped. Parentheses are not tracked otherwise: `(` is literal in a basic
+    grep pattern (`fetch_rows(\\|Store`) and a group in an extended one."""
+    m = re.fullmatch(r"\\?\((.*?)\\?\)", pattern)
+    if m:
+        pattern = m.group(1)
+    parts, cur, i = [], [], 0
+    while i < len(pattern):
+        if pattern[i] == "\\" and i + 1 < len(pattern):
+            if pattern[i + 1] == "|":
+                parts.append("".join(cur))
+                cur = []
+            else:
+                cur.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if pattern[i] == "|":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(pattern[i])
+        i += 1
+    return parts + ["".join(cur)]
+
+
+def symbol_names(pattern):
+    """The names a grep pattern searches for when it is nothing but names (a
+    definition keyword, word boundaries and a trailing `(` allowed), else None."""
+    if not pattern or len(pattern) > 200:
+        return None
+    alts = _alternatives(pattern)
+    if len(alts) > 6:
+        return None
+    names = []
+    for a in alts:
+        a = re.sub(r"\\[bB<>]|\^|\$$", "", a.strip())
+        a = re.sub(r"\s*\\?\(\s*$", "", a.replace("\\s+", " ").replace("\\s*", " ").replace("\\s", " "))
+        a = re.sub(r"^\\?\.", "", a).strip()
+        m = DECL.match(a)
+        if m:
+            a = a[m.end():].strip()
+        if len(a) < 3 or not IDENT.fullmatch(a):
+            return None
+        names.append(a)
+    return names
+
+
+def _stages_after_pipe(command):
+    """(read from a pipe, stage) per `|` / `&&` / `||` / `;` / newline stage."""
+    out, cur, quote, piped, i = [], [], None, False, 0
+    while i < len(command):
+        c = command[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"' and i + 1 < len(command):
+                cur.append(c)
+                i += 1
+                c = command[i]
+            cur.append(c)
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in "|;&\n":
+            out.append((piped, "".join(cur)))
+            cur = []
+            two = command[i:i + 2] in ("&&", "||")
+            piped = c == "|" and not two
+            i += two
+        else:
+            cur.append(c)
+        i += 1
+    out.append((piped, "".join(cur)))
+    return out
+
+
+def grep_search(name, inp):
+    """{pattern, paths, globs, icase} for a call that searches files with
+    grep/rg (the Grep tool included), else None. A grep reading a pipe or stdin
+    filters output; it searches nothing."""
+    inp = inp if isinstance(inp, dict) else {}
+    if name == "Grep":
+        return {"pattern": str(inp.get("pattern", "")), "paths": [str(inp["path"])] if inp.get("path") else [],
+                "globs": [str(inp[k]) for k in ("glob", "type") if inp.get(k)], "icase": bool(inp.get("-i"))}
+    if name != "Bash":
+        return None
+    for piped, stage in _stages_after_pipe(without_heredoc_bodies(str(inp.get("command", "")))):
+        words = command_words(stage)
+        if not words:
+            continue
+        head = os.path.basename(words[0])
+        if head == "git" and "grep" in words[1:3]:
+            words = words[words.index("grep"):]
+        elif head not in GREP_HEADS:
+            continue
+        patterns, paths, flags, globs, i, operands = [], [], set(), [], 1, False
+        while i < len(words):
+            w = words[i]
+            if operands or not w.startswith("-") or w == "-":
+                (patterns if not patterns and "-e" not in flags else paths).append(w)
+            elif w == "--":
+                operands = True
+            elif w in ("-e", "--regexp") and i + 1 < len(words):
+                flags.add("-e")
+                patterns.append(words[i + 1])
+                i += 1
+            elif w in ("-g", "--glob", "-t", "--type", "--include") and i + 1 < len(words):
+                globs.append(words[i + 1])
+                i += 1
+            elif w.startswith(("--include=", "--glob=", "--type=")):
+                globs.append(w.split("=", 1)[1])
+            elif w in ("-A", "-B", "-C", "-m", "-f", "-d", "-D", "-M", "-j", "--max-count", "--max-depth"):
+                i += 1
+            elif w.startswith("--"):
+                flags.add(w.split("=", 1)[0])
+            else:
+                flags.update("-" + ch for ch in w[1:])
+            i += 1
+        recursive = head in ("rg", "ag", "ack", "git") or bool(flags & {"-r", "-R", "--recursive"})
+        if not paths and (piped or not recursive):
+            continue
+        return {"pattern": "|".join(patterns), "paths": paths, "globs": globs,
+                "icase": bool(flags & {"-i", "--ignore-case"})}
+    return None
+
+
+def _code_target(search, root, cwd):
+    """Whether a search looks at code inside ROOT."""
+    if any(os.path.splitext(g.rstrip("*}").split(",")[0])[1].lower() in NONCODE_EXT
+           or g in ("md", "markdown", "json", "txt", "yaml", "toml") for g in search["globs"]):
+        return False
+    if not search["paths"]:
+        return True
+    for p in search["paths"]:
+        if p.startswith(("~", "$")):
+            continue
+        ap = os.path.normpath(os.path.join(cwd, p))
+        inside = ap == root or ap.startswith(root + os.sep)
+        if inside and os.path.splitext(ap)[1].lower() not in NONCODE_EXT \
+                and not any(x in ap.split(os.sep) for x in ("node_modules", ".git", "target", ".code-graph")):
+            return True
+    return False
+
+
+def index_root(cwd):
+    """The nearest directory at or above CWD holding `.code-graph/index.db`
+    (a worktree inside the project reaches the main checkout), below home."""
+    home = os.path.expanduser("~")
+    d = os.path.abspath(cwd or "/")
+    while True:
+        if os.path.isfile(os.path.join(d, ".code-graph", "index.db")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d or d == home:
+            return None
+        d = parent
+
+
+_NAMES = {}
+
+
+def index_names(root):
+    """Names the index at ROOT defines (headings and modules excluded). Opened
+    immutable: no -wal/-shm is created beside the user's index."""
+    if root not in _NAMES:
+        import sqlite3
+        names = set()
+        try:
+            c = sqlite3.connect(f"file:{os.path.join(root, '.code-graph', 'index.db')}?immutable=1", uri=True)
+            try:
+                for name, qualified, typ in c.execute("SELECT name, qualified_name, type FROM nodes"):
+                    if typ not in NOT_SYMBOLS:
+                        names.update(n for n in (name, qualified) if n)
+            finally:
+                c.close()
+        except sqlite3.Error:
+            pass
+        _NAMES[root] = names
+    return _NAMES[root]
+
+
 def scan_transcript(path, window=10):
     """Per-session counts of one transcript (see the module docstring)."""
     s = {"path": path, "kind": "subagent" if os.sep + "subagents" + os.sep in path else "main",
          "cwd": None, "start": None, "entrypoint": None, "tools": 0,
          "cg_explicit": Counter(), "mem_explicit": Counter(), "cg_inject": Counter(),
          "mem_inject": Counter(), "cg_deny": 0, "cg_rewrite": 0,
-         "pointers": 0, "pointers_followed": 0, "pointer_kinds": Counter()}
+         "pointers": 0, "pointers_followed": 0, "pointer_kinds": Counter(),
+         "symbol_greps": 0, "cg_empty": 0, "edits": 0, "worktree": False}
     events = []  # ("ptr", kind) | ("tool", is_cg), in transcript order
     cg_calls = set()  # tool_use ids of explicit code-graph calls
+    searches = []  # grep_search() of every call that greps files
 
     def inject(src, hook):
         s["cg_inject" if src == "cg" else "mem_inject"][hook or "?"] += 1
@@ -206,10 +410,14 @@ def scan_transcript(path, window=10):
                 content = msg.get("content") if isinstance(msg, dict) else None
                 if isinstance(content, list):
                     for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        text = _result_text(block.get("content"))
+                        if block.get("tool_use_id") in cg_calls:
+                            # Empty: an unindexed directory (a scratch clone) under `2>/dev/null`.
+                            s["cg_empty"] += text.strip() in CG_EMPTY_OUTPUT or "No index found" in text
                         # A code-graph command that ran and failed is not a deny.
-                        if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") \
-                                and block.get("tool_use_id") not in cg_calls \
-                                and CG_PREFIX in _result_text(block.get("content"))[:300]:
+                        elif block.get("is_error") and CG_PREFIX in text[:300]:
                             s["cg_deny"] += 1
             elif kind == "assistant":
                 msg = rec.get("message")
@@ -218,12 +426,31 @@ def scan_transcript(path, window=10):
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue
                     s["tools"] += 1
-                    hit = _explicit(str(block.get("name", "")), block.get("input"))
+                    name = str(block.get("name", ""))
+                    hit = _explicit(name, block.get("input"))
                     if hit:
                         s[hit[0] + "_explicit"][hit[1]] += 1
                     events.append(("tool", bool(hit and hit[0] == "cg")))
                     if hit and hit[0] == "cg":
                         cg_calls.add(block.get("id"))
+                    elif not hit:
+                        search = grep_search(name, block.get("input"))
+                        if search:
+                            searches.append(search)
+                    s["edits"] += name in EDIT_TOOLS
+
+    # A lookup the index could have answered: a case-sensitive grep over code
+    # inside the project for nothing but names the project's index defines. By
+    # hand, 38 of 50 such greps were symbol lookups (audit 2026-10-23).
+    root = index_root(s["cwd"]) if s["cwd"] else None
+    if root:
+        names = index_names(root)
+        for search in searches:
+            found = symbol_names(search["pattern"])
+            if found and not search["icase"] and _code_target(search, root, s["cwd"]) \
+                    and any(n in names or re.split(r"\.|::", n)[-1] in names for n in found):
+                s["symbol_greps"] += 1
+    s["worktree"] = WORKTREE_MARK in (s["cwd"] or "").replace(os.sep, "/")
 
     for i, (what, val) in enumerate(events):
         if what != "ptr":
@@ -286,6 +513,8 @@ def aggregate(sessions, splits=(), by_project=False):
     groups = defaultdict(lambda: {"sessions": 0, "tools": 0, "cg_explicit": 0, "sessions_with_cg": 0,
                                   "mem_explicit": 0, "sessions_with_mem": 0, "cg_inject": 0, "mem_inject": 0,
                                   "cg_deny": 0, "cg_rewrite": 0, "pointers": 0, "pointers_followed": 0,
+                                  "symbol_greps": 0, "cg_empty": 0, "edits": 0, "worktree_edits": 0,
+                                  "worktree_edit_impact": 0,
                                   "cg_inject_by_hook": Counter(), "mem_inject_by_hook": Counter(),
                                   "cg_explicit_by_channel": Counter(), "pointer_kinds": Counter()})
     order = {name: i for i, (_, name) in enumerate(splits)}
@@ -301,8 +530,11 @@ def aggregate(sessions, splits=(), by_project=False):
         g["sessions_with_mem"] += mem > 0
         g["cg_inject"] += sum(s["cg_inject"].values())
         g["mem_inject"] += sum(s["mem_inject"].values())
-        for k in ("cg_deny", "cg_rewrite", "pointers", "pointers_followed"):
+        for k in ("cg_deny", "cg_rewrite", "pointers", "pointers_followed", "symbol_greps", "cg_empty", "edits"):
             g[k] += s[k]
+        if s["worktree"]:
+            g["worktree_edits"] += s["edits"]
+            g["worktree_edit_impact"] += s["cg_inject"].get("PreToolUse:Edit", 0)
         g["cg_inject_by_hook"].update(s["cg_inject"])
         g["mem_inject_by_hook"].update(s["mem_inject"])
         g["cg_explicit_by_channel"].update(s["cg_explicit"])
@@ -314,8 +546,12 @@ def aggregate(sessions, splits=(), by_project=False):
         if by_project:
             row["project"] = key[2]
         row.update({k: (dict(v) if isinstance(v, Counter) else v) for k, v in g.items()})
-        for k in ("cg_explicit", "mem_explicit", "cg_inject", "mem_inject", "cg_deny", "cg_rewrite"):
+        for k in ("cg_explicit", "mem_explicit", "cg_inject", "mem_inject", "cg_deny", "cg_rewrite",
+                  "symbol_greps"):
             row[k + "_per_1k"] = round(1000 * g[k] / g["tools"], 1) if g["tools"] else None
+        # Of the lookups the index could answer, the share code-graph answered.
+        looked_up = g["cg_explicit"] + g["symbol_greps"]
+        row["structural_coverage"] = round(g["cg_explicit"] / looked_up, 3) if looked_up else None
         rows.append(row)
     return rows
 
@@ -360,15 +596,21 @@ def main(argv=None):
         json.dump(rows, sys.stdout, indent=1, ensure_ascii=False)
         print()
         return 0
-    print("per 1k tool calls; cg = code-graph, mem = claude-mem-lite")
+    print("per 1k tool calls; cg = code-graph, mem = claude-mem-lite; symG = greps for names the index "
+          "defines, cover = cg / (cg + symG), empty = cg calls with no output, wt = worktree edits with "
+          "an impact summary / worktree edits")
     print(f"{'period':<16} {'kind':<8} {'sess':>5} {'tools':>7} | {'cg':>6} {'w/cg':>7} {'deny':>5} {'rewr':>5}"
-          f" {'inject':>6} {'ptr fol/all':>11} | {'mem':>5} {'w/mem':>7} {'inject':>6}"
+          f" {'inject':>6} {'ptr fol/all':>11} {'symG':>5} {'cover':>6} {'empty':>5} {'wt':>9}"
+          f" | {'mem':>5} {'w/mem':>7} {'inject':>6}"
           + ("  project" if a.by_project else ""))
     for r in rows:
+        cover = "-" if r["structural_coverage"] is None else f"{100 * r['structural_coverage']:.1f}%"
         print(f"{r['period'][:16]:<16} {r['kind']:<8} {r['sessions']:>5} {r['tools']:>7} | "
               f"{_rate(r['cg_explicit_per_1k']):>6} {r['sessions_with_cg']:>3}/{r['sessions']:<3} "
               f"{_rate(r['cg_deny_per_1k']):>5} {_rate(r['cg_rewrite_per_1k']):>5} {_rate(r['cg_inject_per_1k']):>6} "
-              f"{r['pointers_followed']:>5}/{r['pointers']:<5} | {_rate(r['mem_explicit_per_1k']):>5} "
+              f"{r['pointers_followed']:>5}/{r['pointers']:<5} {_rate(r['symbol_greps_per_1k']):>5} {cover:>6} "
+              f"{r['cg_empty']:>5} {r['worktree_edit_impact']:>4}/{r['worktree_edits']:<4} | "
+              f"{_rate(r['mem_explicit_per_1k']):>5} "
               f"{r['sessions_with_mem']:>3}/{r['sessions']:<3} {_rate(r['mem_inject_per_1k']):>6}"
               + (f"  {r['project']}" if a.by_project else ""))
         if a.detail:
