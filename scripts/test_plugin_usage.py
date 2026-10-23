@@ -283,7 +283,18 @@ class AuditCountersTest(unittest.TestCase):
             c, answered(c, "fn g  src/g.rs:1-3  ()\n  fn g() {}"),
             d, answered(d, ""),                                           # not a code-graph call
         ])
-        self.assertEqual((s["cg_explicit"], s["cg_empty"]), ({"bash": 3}, 2))
+        # Counted apart: since the no-index line reaches stdout, a clone's call
+        # leaves `empty` for `no_index` (tasks/specs/no-index-visible.md AC5).
+        self.assertEqual((s["cg_explicit"], s["cg_empty"], s["cg_no_index"]), ({"bash": 3}, 1, 1))
+
+    def test_a_no_index_error_is_no_deny(self):
+        # A dev build run as `cargo run -- show x` is no code-graph call, and its
+        # failed result now opens with the no-index line on stdout.
+        call = bash("cargo run -q -- show x")
+        s = self.scan([header("2026-10-20T00:00:00Z"), call,
+                       answered(call, "[code-graph] No index found at /w/.code-graph/index.db. Run: "
+                                      "code-graph-mcp incremental-index\nError: No index found at …", True)])
+        self.assertEqual(s["cg_deny"], 0)
 
     def test_worktree_edits_and_their_impact(self):
         wt = "/w/app/.claude/worktrees/agent-1"

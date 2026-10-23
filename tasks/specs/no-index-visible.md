@@ -36,7 +36,7 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 - [x] AC2：`--json` 的 stdout 仍然只有那一个 JSON 对象，不多出一行文本。验证：同一用例里加断言。
 - [x] AC3：有索引时，所有命令的输出不变。验证：`cargo test --no-default-features` 全部通过。
 - [x] AC4：stderr 原有那一行不变，`--json` 的错误对象不变。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
-- [ ] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列里，副本目录中的调用不再是空输出。
+- [ ] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列（只计没有任何输出的调用）在副本目录中下降，同样的调用改记在 `no-index` 计数里。
 
 ## 方案
 
@@ -59,10 +59,19 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 - 设计收窄：最初在 main 里还加了一段"`--format json` 时不打这一行"的判断，后来删掉了。只有 `health-check` 有 `--format`，而它的 JSON 分支自己生成 `no_index` 报告，不会产生 `NoIndexError`；删掉之后测试照样通过。
 - 2026-10-23：同一轮审计里的 P1（把 SubagentStart 扩到所有代理类型）已撤回，不在本 spec 范围内。核实发现自定义代理会加载 CLAUDE.md（release-reviewer 45/45、executor 24/24、reviewer 30/30），而 daagu、gsd-lite、claudemd 的 CLAUDE.md 里都有 code-graph 的引导段落。所以 release-reviewer 31 个会话一次没用 code-graph，原因不是缺少上下文。
 
+- 2026-10-23：评审（新的子代理，一轮）没有 HIGH，处理如下：
+  - F1（MEDIUM）CHANGELOG 的 "three projects" 不对：那 9 次全部是 gsd-lite 一个项目的 3 个会话。已改。
+  - F2（MEDIUM）没有 `.git` 的目录里，提示的 `incremental-index` 会跳过、退出 0，agent 会陷入循环。`NoIndexError` 加了 `git_anchor`：没有 `.git` 时改为提示 `rebuild-index --confirm`，有 `.git` 时文字不变。测试先失败后通过。
+  - F3 读端提前关闭时 `println!` 触发 panic 钩子，退出码变 0、stderr 那行丢失。改为 `writeln!` 并忽略写入错误。测试先失败后通过。
+  - F4 措辞、F6（首次建索引期间仍只写 stderr）写进 CHANGELOG；F5 加了反向对照（被拒绝的 `.code-graph` 不进 stdout），评审员给的变异 `.is_some() || true` 现在会被测出；F7 把 `plugin_usage.py` 的空输出和"无索引"拆开计数，AC5 改成可测的写法；F8 补跑了 `doctor.test.js`；F9 修正注释；F10 `plugin_usage.py` 不再把含 "No index found" 的错误结果算成 deny。
+  - 变异：三处修复各有测试抓住。第一次对 `println!` 的变异因为留下了未使用的 `use` 而编译失败，被脚本误报成"存活"；把 `use` 一起替换后重做，确认被杀死。
+
 ## 验证记录
 
 - `cargo test --no-default-features --test cli_e2e test_cli_no_index_says_so_on_stdout`：改动前失败（`["show", "foo"]: one line on stdout, got ""`），改动后通过。
 - `cargo test --no-default-features`：通过，2342 个通过、0 失败、7 个忽略。
 - `cargo clippy --no-default-features --all-targets -- -D warnings`：通过。
 - `cargo fmt --all -- --check`：第一次失败（两处换行），`cargo fmt` 之后通过，相关测试重跑通过（3/3）。
+- 评审修复后：`cargo test --no-default-features --test cli_e2e -- test_cli_no_index …`（6 个相关用例）通过；新用例 `test_cli_no_index_without_git_names_rebuild_index`、`test_cli_no_index_line_keeps_exit_code_on_a_closed_pipe_and_stays_alone` 修复前失败（提示仍是 incremental-index；退出码 0、stderr 为空）。
+- `node --test claude-plugin/scripts/doctor.test.js`：通过（69/69）。
 - 手动核对（debug 构建，未建索引的 git 仓库）：`show foo 2>/dev/null` 的 stdout 是 `[code-graph] No index found at …/.code-graph/index.db. Run: code-graph-mcp incremental-index`，退出码 1；stderr 是 `Error: No index found at …`；`health-check --format json` 的 stdout 仍然是 JSON。

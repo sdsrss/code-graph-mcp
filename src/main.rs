@@ -535,8 +535,12 @@ fn main() -> Result<()> {
             // Text mode: the line also goes to stdout, where a query run as
             // `… 2>/dev/null | head` still shows it (tasks/specs/no-index-visible.md).
             // `health-check --format json` answers a missing index with its own
-            // report and never reaches here.
-            println!("[code-graph] {e}");
+            // report, unless the index vanishes between its check and its open.
+            // A reader that has already gone fails the write, not the command:
+            // `println!` would panic into the EPIPE hook's exit 0 and lose the
+            // stderr line.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout(), "[code-graph] {e}");
         }
     }
     result

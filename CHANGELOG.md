@@ -4,22 +4,28 @@
 
 ### A query with no index says so on stdout
 
-In a directory with no index, `show`, `callgraph`, `impact`, `refs`,
+In a directory with no index file, `show`, `callgraph`, `impact`, `refs`,
 `overview`, `search` and the other commands that read the index (19 with
 `health-check`) wrote their error to stderr only, and stdout was empty. Agents
 reviewing a scratch clone of a repository run `code-graph-mcp show X
 2>/dev/null | head -40 || grep …`: the error went to `/dev/null`, `|| grep`
 did not run because the pipeline's exit code is `head`'s, and the call came
 back with nothing. From 2026-10-16 to 2026-10-23, 3 of the 9 code-graph calls
-that subagents in three projects on the maintainer's machine made in such
-clones did.
+subagents made in such clones on the maintainer's machine did (all 9 in three
+sessions of one project).
 
-The same line, `[code-graph] No index found at <path>. Run: code-graph-mcp
-incremental-index`, now also goes to stdout. The exit code (1), the stderr line
-and `--json` output are unchanged; `health-check --format json` still answers
-with its own `no_index` report. A script that reads stdout gets this one line
-where it got nothing before. `grep` already searched without an index and is
-unchanged.
+The error's text now also goes to stdout, after `[code-graph]` where stderr
+has `Error:`. The exit code (1), the stderr line and `--json` output are
+unchanged, also when the reader of stdout has already gone;
+`health-check --format json` still answers with its own `no_index` report. A
+script that reads stdout gets this one line where it got nothing before.
+`grep` already searched without an index and is unchanged. The first index
+still being built is a different error and stays on stderr only.
+
+In a directory with no `.git` (a `git archive` copy), `incremental-index`
+skips the directory and exits 0, so the remedy the line named did nothing.
+There the line now names `code-graph-mcp rebuild-index --confirm`, which
+indexes the directory as it is; with a `.git` it is unchanged.
 
 ### Edits in a linked worktree get their impact summary and Stop check
 

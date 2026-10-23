@@ -27,8 +27,9 @@ session this counts:
   symG        greps for nothing but names the project's index defines, over code
               inside the project, case-sensitive: lookups the index could have
               answered (by hand, 38 of 50 were). cover = cg / (cg + symG)
-  empty       code-graph calls that returned no output or "No index found" (an
-              unindexed scratch clone under `2>/dev/null`)
+  empty       code-graph calls that returned no output (an unindexed scratch
+              clone under `2>/dev/null` before 0.178); with --detail, the calls
+              answered "No index found" are counted apart (cg_no_index)
   wt          in sessions whose cwd is a linked worktree (.claude/worktrees/),
               edits that got a pre-edit impact summary / all edits (D#560)
 
@@ -354,7 +355,7 @@ def scan_transcript(path, window=10):
          "cg_explicit": Counter(), "mem_explicit": Counter(), "cg_inject": Counter(),
          "mem_inject": Counter(), "cg_deny": 0, "cg_rewrite": 0,
          "pointers": 0, "pointers_followed": 0, "pointer_kinds": Counter(),
-         "symbol_greps": 0, "cg_empty": 0, "edits": 0, "worktree": False}
+         "symbol_greps": 0, "cg_empty": 0, "cg_no_index": 0, "edits": 0, "worktree": False}
     events = []  # ("ptr", kind) | ("tool", is_cg), in transcript order
     cg_calls = set()  # tool_use ids of explicit code-graph calls
     searches = []  # grep_search() of every call that greps files
@@ -414,10 +415,16 @@ def scan_transcript(path, window=10):
                             continue
                         text = _result_text(block.get("content"))
                         if block.get("tool_use_id") in cg_calls:
-                            # Empty: an unindexed directory (a scratch clone) under `2>/dev/null`.
-                            s["cg_empty"] += text.strip() in CG_EMPTY_OUTPUT or "No index found" in text
+                            # Empty: no output at all, e.g. an unindexed scratch clone under
+                            # `2>/dev/null` before the no-index line reached stdout; counted
+                            # apart from a no-index answer the model did see.
+                            if "No index found" in text:
+                                s["cg_no_index"] += 1
+                            else:
+                                s["cg_empty"] += text.strip() in CG_EMPTY_OUTPUT
                         # A code-graph command that ran and failed is not a deny.
-                        elif block.get("is_error") and CG_PREFIX in text[:300]:
+                        # Nor is the no-index line of a dev build run as `cargo run -- show x`.
+                        elif block.get("is_error") and CG_PREFIX in text[:300] and "No index found" not in text:
                             s["cg_deny"] += 1
             elif kind == "assistant":
                 msg = rec.get("message")
@@ -513,7 +520,7 @@ def aggregate(sessions, splits=(), by_project=False):
     groups = defaultdict(lambda: {"sessions": 0, "tools": 0, "cg_explicit": 0, "sessions_with_cg": 0,
                                   "mem_explicit": 0, "sessions_with_mem": 0, "cg_inject": 0, "mem_inject": 0,
                                   "cg_deny": 0, "cg_rewrite": 0, "pointers": 0, "pointers_followed": 0,
-                                  "symbol_greps": 0, "cg_empty": 0, "edits": 0, "worktree_edits": 0,
+                                  "symbol_greps": 0, "cg_empty": 0, "cg_no_index": 0, "edits": 0, "worktree_edits": 0,
                                   "worktree_edit_impact": 0,
                                   "cg_inject_by_hook": Counter(), "mem_inject_by_hook": Counter(),
                                   "cg_explicit_by_channel": Counter(), "pointer_kinds": Counter()})
@@ -530,7 +537,8 @@ def aggregate(sessions, splits=(), by_project=False):
         g["sessions_with_mem"] += mem > 0
         g["cg_inject"] += sum(s["cg_inject"].values())
         g["mem_inject"] += sum(s["mem_inject"].values())
-        for k in ("cg_deny", "cg_rewrite", "pointers", "pointers_followed", "symbol_greps", "cg_empty", "edits"):
+        for k in ("cg_deny", "cg_rewrite", "pointers", "pointers_followed", "symbol_greps", "cg_empty", "cg_no_index",
+                  "edits"):
             g[k] += s[k]
         if s["worktree"]:
             g["worktree_edits"] += s["edits"]
@@ -619,6 +627,8 @@ def main(argv=None):
                 if r[k]:
                     items = ", ".join(f"{h} {n}" for h, n in sorted(r[k].items(), key=lambda kv: -kv[1]))
                     print(f"    {label}: {items}")
+            if r["cg_no_index"]:
+                print(f"    cg no-index answers: {r['cg_no_index']}")
     if not rows:
         print("(no sessions matched)")
     return 0

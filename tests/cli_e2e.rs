@@ -9757,6 +9757,67 @@ fn test_cli_no_index_says_so_on_stdout() {
     }
 }
 
+/// Review of the no-index stdout line: in a directory with no `.git` (a
+/// `git archive` copy) `incremental-index` skips and exits 0, so the line sent
+/// an agent round in a loop. There it names the command that indexes such a
+/// directory, and that command makes the query answer.
+#[test]
+fn test_cli_no_index_without_git_names_rebuild_index() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src").join("a.rs"), "fn foo() {}\n").unwrap();
+    let (out, err, code) = run_cli(&project, &["show", "foo"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.contains("No index found") && out.contains("code-graph-mcp rebuild-index --confirm"),
+        "stdout must name the command that indexes a directory without .git, got {out:?}"
+    );
+    assert!(
+        !out.contains("Run: code-graph-mcp incremental-index"),
+        "got {out:?}"
+    );
+    assert!(err.contains("Error: No index found at"), "got {err:?}");
+    let (_out, _err, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
+    assert_eq!(code, 0);
+    let (out, _err, code) = run_cli(&project, &["show", "foo"]);
+    assert_eq!(code, 0, "the named command indexed the directory");
+    assert!(out.contains("fn foo"), "got {out:?}");
+}
+
+/// The line is the only one on stdout; when the reader has already gone the
+/// write fails, and the command still fails as it did: exit 1, stderr line.
+/// Any other failure stays off stdout (a refused `.code-graph`).
+#[test]
+fn test_cli_no_index_line_keeps_exit_code_on_a_closed_pipe_and_stays_alone() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["show", "foo"])
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err:?}");
+    assert!(err.contains("Error: No index found at"), "got {err:?}");
+
+    let refused = TempDir::new().unwrap();
+    std::fs::create_dir(refused.path().join(".git")).unwrap();
+    std::fs::write(
+        refused.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR),
+        "",
+    )
+    .unwrap();
+    let (out, err, code) = run_cli(&refused, &["show", "foo"]);
+    assert_eq!(code, 1, "stderr: {err:?}");
+    assert_eq!(out, "", "only a missing index is told on stdout");
+}
+
 #[test]
 fn test_cli_json_error_path_outside_root_emits_error_object() {
     // Same tier-3 contract, out-of-root leg (the 8 path-taking commands used
