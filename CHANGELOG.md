@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.178.0
+
+**Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the indexer is
+unchanged: the one Rust change is what a query prints when there is no index.
+Two things a user or an agent sees change. In a directory with no index, the
+query commands print one line on stdout as well as on stderr. And the plugin's
+hooks now answer for edits in a linked worktree under a hidden directory of the
+project, where they said nothing. To pin the binary back: `npm i -g
+@sdsrs/code-graph@0.177.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.177.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The worktree change
+is in the plugin's hooks, which pinning the binary does not reach;
+`CODE_GRAPH_QUIET_HOOKS=1` silences the hooks, in a worktree and everywhere
+else.
 
 ### A query with no index says so on stdout
 
