@@ -97,8 +97,18 @@ test('indexKey: a submodule, a worktree of another repo, and a key leaving the r
   const root = project(t);
   linkedDir(root, 'vendor/lib', path.join(root, '.git', 'modules', 'lib'));
   linkedDir(root, 'nested/wt', path.join(os.tmpdir(), 'elsewhere', '.git', 'worktrees', 'wt'));
+  // Under a hidden directory too, where the worktree rule looks at it: only a
+  // worktree whose main checkout is this root is mapped (review of 0.178.0).
+  linkedDir(root, '.cache/otherwt', path.join(os.tmpdir(), 'elsewhere', '.git', 'worktrees', 'otherwt'));
   assert.equal(indexKey(root, 'vendor/lib/x.js'), 'vendor/lib/x.js');
   assert.equal(indexKey(root, 'nested/wt/x.js'), 'nested/wt/x.js');
+  assert.equal(indexKey(root, '.cache/otherwt/src/a.js'), '.cache/otherwt/src/a.js');
+  // A worktree of this root outside it (`git worktree add ../wt`): its files
+  // are outside the project, and `..` must not read as a hidden directory.
+  const outside = linkedDir(path.dirname(root), path.basename(root) + '-outwt', path.join(root, '.git', 'worktrees', 'outwt'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const outKey = `../${path.basename(outside)}/src/a.js`;
+  assert.equal(indexKey(root, outKey), outKey);
   assert.equal(indexKey(root, '../wt/src/a.js'), '../wt/src/a.js');
 });
 

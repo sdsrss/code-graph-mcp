@@ -35,7 +35,7 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 - [x] AC1：在未建索引的 git 仓库里，对每个经过 `CliContext::open` 的查询命令执行 `code-graph-mcp <cmd> <arg> 2>/dev/null`，stdout 恰好一行，包含 `No index` 和 `incremental-index`，退出码 1。验证：新增 `tests/cli_e2e.rs` 用例，逐个命令检查。
 - [x] AC2：`--json` 的 stdout 仍然只有那一个 JSON 对象，不多出一行文本。验证：同一用例里加断言。
 - [x] AC3：有索引时，所有命令的输出不变。验证：`cargo test --no-default-features` 全部通过。
-- [x] AC4：stderr 原有那一行不变，`--json` 的错误对象不变。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
+- [x] AC4：stderr 原有那一行不变，`--json` 的错误对象不变（第二轮评审后撤回无 `.git` 的另一套文字，才真正成立，见决策记录）。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
 - [ ] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列（只计没有任何输出的调用）在副本目录中下降，同样的调用改记在 `no-index` 计数里。
 
 ## 方案
@@ -67,6 +67,13 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
   - 变异：三处修复各有测试抓住。第一次对 `println!` 的变异因为留下了未使用的 `use` 而编译失败，被脚本误报成"存活"；把 `use` 一起替换后重做，确认被杀死。
 
 - 2026-10-23：合入 main（快进到 133b3de7，之后是 D#560 的评审修复 2b12f713 和数字更正 732c6bff）。未发版。
+
+- 2026-10-23：发版前第二轮评审（新的子代理，只审修复提交）没有 HIGH，与本 spec 相关的处理如下：
+  - M-5：F2 的修复让无 `.git` 的目录都提示 `rebuild-index --confirm`，而 `$HOME`、装着多个仓库的目录也没有 `.git`，在那里照做会把整棵目录树建成一个索引。M-4：同一处改动也改了 stderr 和 `--json` 里的文字，CHANGELOG 和 AC4 说的"不变"因此不成立。
+  - 处理：撤回 F2（`git_anchor` 删掉），三处文字恢复 0.177.0 的原文。无 `.git` 目录里照提示运行 `incremental-index`，它会跳过，并在 stderr 上列出 `git init`、换到仓库里、`rebuild-index --confirm` 三种做法，由读者判断。新用例 `test_cli_no_index_without_git_says_what_a_repository_gets` 在撤回前失败、撤回后通过。差分：41 个命令 × 10 个目录（含 `$HOME`）共 410 次运行，去掉新增的 stdout 行后，退出码、stdout、stderr 与 0.177.0 逐字节相同（410/410），新增行出现在其中 182 次。
+  - L-1：`--json` 在读端关闭时退出码为 0、stderr 为空，0.177.0 也是如此，CHANGELOG 已写明。L-2：建索引期间 `health-check` 不拒绝请求，CHANGELOG 已写明。
+  - L-4：`plugin_usage.py` 把所有含 "No index found" 的结果都记为 `cg_no_index`，包括 0.178 之前把 stderr 一并收进来的结果。所以 AC5 的基线要用新脚本对发版前的时段重新计算，不能沿用审计报告里的数字。
+- dead-end: 在无 `.git` 的目录里让提示直接给出 `rebuild-index --confirm` —— 判断条件只看有没有 `.git`，区分不了项目副本和 `$HOME` —— 本任务不再尝试
 
 ## 验证记录
 

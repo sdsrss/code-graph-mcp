@@ -739,6 +739,45 @@ test('D#560: a same-file same-name edit whose text the main checkout lacks gets 
   assert.equal(res.stdout.trim(), '', `got: ${res.stdout}`);
 });
 
+// The main checkout's copy exists but lacks the edited text (the worktree's
+// copy has moved on): no line to count, so no guess. The definition sits
+// past the hunk's first line so that a line counted without the text would
+// land on a candidate (a definition at offset 0 counts to line 1, before both).
+test('D#560: a same-file same-name edit whose text is not in the main checkout\'s copy gets no guess', (t) => {
+  const { res } = runPreEditHook(t, {
+    worktree: 'wt', relPath: 'src/app.py', stubExec: STUB_SAME_FILE,
+    setup: (proj, workDir) => {
+      writeTwoGets(proj);
+      require('node:fs').mkdirSync(require('node:path').join(workDir, 'src'), { recursive: true });
+      require('node:fs').writeFileSync(require('node:path').join(workDir, 'src', 'app.py'),
+        TWO_GETS.replace(/return k\n$/, 'return k + 1\n'));
+    },
+    oldString: 'class B:\n    def fetch(self, k):\n        return k + 1',
+    newString: 'class B:\n    def fetch(self, k, d=None):\n        return k + 1',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `got: ${res.stdout}`);
+});
+
+// Unique in the worktree's copy, twice in the main checkout's (A's header was
+// already changed in the worktree): the first occurrence there is A's, and
+// counting from it named A.fetch's callers for an edit of B.fetch (review of
+// 0.178.0). Neither occurrence can be told to be the edited one: no guess.
+test('D#560: a same-file same-name edit whose text the main checkout holds twice gets no guess', (t) => {
+  const { res } = runPreEditHook(t, {
+    worktree: 'wt', relPath: 'src/app.py', stubExec: STUB_SAME_FILE,
+    setup: (proj, workDir) => {
+      writeTwoGets(proj);
+      require('node:fs').mkdirSync(require('node:path').join(workDir, 'src'), { recursive: true });
+      require('node:fs').writeFileSync(require('node:path').join(workDir, 'src', 'app.py'),
+        TWO_GETS.replace('def fetch(self, k):', 'def fetch(self, k, d=None):'));
+    },
+    oldString: '    def fetch(self, k):\n        return k', newString: '    def fetch(self, key):\n        return key',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '', `got: ${res.stdout}`);
+});
+
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`
 // reported 7 direct callers AND `ambiguous_callers_excluded: 32`; the CLI's text
 // prints the ⚠ line, the hook printed "7 direct callers" alone — an undercount

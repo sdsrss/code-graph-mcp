@@ -9757,31 +9757,33 @@ fn test_cli_no_index_says_so_on_stdout() {
     }
 }
 
-/// Review of the no-index stdout line: in a directory with no `.git` (a
-/// `git archive` copy) `incremental-index` skips and exits 0, so the line sent
-/// an agent round in a loop. There it names the command that indexes such a
-/// directory, and that command makes the query answer.
+/// In a directory with no `.git` (a `git archive` copy, `$HOME`) the line is
+/// the one a repository gets, on every channel: `incremental-index` skips such
+/// a directory and its own message names the ways out. Naming `rebuild-index
+/// --confirm` on the line itself named it in `$HOME` too, and changed the
+/// stderr and `--json` text (review of 0.178.0).
 #[test]
-fn test_cli_no_index_without_git_names_rebuild_index() {
+fn test_cli_no_index_without_git_says_what_a_repository_gets() {
     let project = TempDir::new().unwrap();
     std::fs::create_dir(project.path().join("src")).unwrap();
     std::fs::write(project.path().join("src").join("a.rs"), "fn foo() {}\n").unwrap();
+    let db = project.path().join(".code-graph").join("index.db");
+    let line = format!(
+        "No index found at {}. Run: code-graph-mcp incremental-index",
+        db.display()
+    );
     let (out, err, code) = run_cli(&project, &["show", "foo"]);
     assert_eq!(code, 1);
+    assert_eq!(out, format!("[code-graph] {line}\n"), "stdout");
+    assert!(err.contains(&format!("Error: {line}")), "stderr: {err:?}");
+    let (out, _err, code) = run_cli(&project, &["show", "foo", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["error"], serde_json::Value::String(line), "--json");
     assert!(
-        out.contains("No index found") && out.contains("code-graph-mcp rebuild-index --confirm"),
-        "stdout must name the command that indexes a directory without .git, got {out:?}"
+        !project.path().join(".code-graph").exists(),
+        "nothing written"
     );
-    assert!(
-        !out.contains("Run: code-graph-mcp incremental-index"),
-        "got {out:?}"
-    );
-    assert!(err.contains("Error: No index found at"), "got {err:?}");
-    let (_out, _err, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
-    assert_eq!(code, 0);
-    let (out, _err, code) = run_cli(&project, &["show", "foo"]);
-    assert_eq!(code, 0, "the named command indexed the directory");
-    assert!(out.contains("fn foo"), "got {out:?}");
 }
 
 /// The line is the only one on stdout; when the reader has already gone the

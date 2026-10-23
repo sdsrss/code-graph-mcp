@@ -218,28 +218,21 @@ pub fn serve_non_project_stub<R: BufRead, W: Write>(
 #[derive(Debug)]
 pub struct NoIndexError {
     pub db_path: PathBuf,
-    /// Whether the project root has a `.git`: without one `incremental-index`
-    /// skips the directory and exits 0 (a `git archive` copy), so the remedy
-    /// names the command that indexes it as it is.
-    pub git_anchor: bool,
 }
 
+/// The same text with or without a `.git`. Outside a git repository
+/// `incremental-index` skips the directory, and its own message names the ways
+/// out (`git init`, a git repository, `rebuild-index --confirm`). Naming
+/// `rebuild-index --confirm` here instead named it in `$HOME` too, and in a
+/// directory holding many repositories, where it indexes the whole tree
+/// (review of 0.178.0).
 impl std::fmt::Display for NoIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.git_anchor {
-            write!(
-                f,
-                "No index found at {}. Run: code-graph-mcp incremental-index",
-                self.db_path.display()
-            )
-        } else {
-            write!(
-                f,
-                "No index found at {}. This directory has no .git, which incremental-index \
-                 skips; index it as it is: code-graph-mcp rebuild-index --confirm",
-                self.db_path.display()
-            )
-        }
+        write!(
+            f,
+            "No index found at {}. Run: code-graph-mcp incremental-index",
+            self.db_path.display()
+        )
     }
 }
 
@@ -299,11 +292,7 @@ impl CliContext {
         crate::utils::owned::reject_symlinked_dir(&project_root.join(CODE_GRAPH_DIR))?;
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
-            return Err(NoIndexError {
-                db_path,
-                git_anchor: project_root.join(".git").exists(),
-            }
-            .into());
+            return Err(NoIndexError { db_path }.into());
         }
         cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
         // CLI commands behind CliContext are READERS (grep, show, callgraph,

@@ -323,6 +323,18 @@ test('stop M1: the symbol cap bounds refs queries over CHANGED symbols only; the
   assert.equal(r.lines.length, 9);
   assert.equal(r.lines[8], '  2 more changed, callers not checked: s8() in src/a.rs, s9() in src/a.rs');
   assert.equal(r.state.reported.length, 8, 'the unchecked two are not marked reported');
+
+  // The over-cap line names files as the reader sees them too (D#560: a
+  // session working in the worktree; review of 0.178.0).
+  const wtA = '.claude/worktrees/wt/src/a.rs';
+  const ww = world({ work: after });
+  ww.workText = (f) => (f === wtA ? after : null);
+  const rw = computeStopReport({
+    edits: edits.filter((e) => e.file === 'src/a.rs').map((e) => ({ ...e, file: wtA })),
+    state: EMPTY, now: 9000, ...ww,
+    displayOf: (f) => (f.startsWith('.claude/worktrees/wt/') ? f.slice('.claude/worktrees/wt/'.length) : f),
+  });
+  assert.equal(rw.lines[8], '  2 more changed, callers not checked: s8() in src/a.rs, s9() in src/a.rs');
 });
 
 test('stop M3: every repo-derived token in the text is shell-quoted', () => {

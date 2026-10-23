@@ -5,9 +5,11 @@
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the indexer is
 unchanged: the one Rust change is what a query prints when there is no index.
 Two things a user or an agent sees change. In a directory with no index, the
-query commands print one line on stdout as well as on stderr. And the plugin's
-hooks now answer for edits in a linked worktree under a hidden directory of the
-project, where they said nothing. To pin the binary back: `npm i -g
+query commands print one line on stdout as well as on stderr. And for edits in
+a linked worktree under a hidden directory of the project, the plugin's impact
+summary before an Edit and its directory overview now answer where they said
+nothing; the Stop check answers only for a worktree checked out before the
+turn began (below). To pin the binary back: `npm i -g
 @sdsrs/code-graph@0.177.0` (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.177.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -30,16 +32,23 @@ sessions of one project).
 
 The error's text now also goes to stdout, after `[code-graph]` where stderr
 has `Error:`. The exit code (1), the stderr line and `--json` output are
-unchanged, also when the reader of stdout has already gone;
-`health-check --format json` still answers with its own `no_index` report. A
-script that reads stdout gets this one line where it got nothing before.
-`grep` already searched without an index and is unchanged. The first index
-still being built is a different error and stays on stderr only.
+unchanged: on 41 commands run in ten directories, `$HOME` among them, exit
+code, stderr and stdout are byte-equal to 0.177.0's once that line is taken
+out. In text mode the exit code and the stderr line hold also when the reader
+of stdout has already gone; with `--json` and the reader gone the command
+exits 0 with nothing on stderr, as it did. `health-check --format json` still
+answers with its own `no_index` report. A script that reads stdout gets this
+one line where it got nothing before. `grep` already searched without an index
+and is unchanged. While the first index is still being built the 18 query
+commands refuse with a different error, which stays on stderr only;
+`health-check` is not refused then.
 
-In a directory with no `.git` (a `git archive` copy), `incremental-index`
-skips the directory and exits 0, so the remedy the line named did nothing.
-There the line now names `code-graph-mcp rebuild-index --confirm`, which
-indexes the directory as it is; with a `.git` it is unchanged.
+In a directory with no `.git` (a `git archive` copy) the line names
+`incremental-index` too, which skips such a directory and exits 0; its
+message, on stderr, names `git init`, a git repository, or `code-graph-mcp
+rebuild-index --confirm`, which indexes the directory as it is. The line does
+not name `rebuild-index` itself: a directory with no `.git` is also `$HOME`, or
+a directory holding many repositories, where it indexes the whole tree.
 
 ### Edits in a linked worktree get their impact summary and Stop check
 
@@ -58,12 +67,13 @@ machine were of files in such worktrees, all of them in one project.
 The hooks now ask the index for a file in a worktree under a hidden directory
 by its path from the worktree. When the file defines the edited name more
 than once, the edited definition is placed by the main checkout's copy, which
-the index describes; an edit whose text that copy lacks gets no summary
-rather than a guess. The Stop check names callers by their path through the
-worktree when it runs in the parent session, and from the worktree's top when
-the session itself works in the worktree. It reads the worktree's copies, so
-a caller already edited there is left out as in the main checkout, and a
-caller's line is looked for in the copy, from where the main checkout has it.
+the index describes; an edit whose text that copy lacks, or holds more than
+once, gets no summary rather than a guess. The Stop check names callers by
+their path through the worktree when it runs in the parent session, and from
+the worktree's top when the session itself works in the worktree. It reads
+the worktree's copies, so a caller already edited there is left out as in the
+main checkout, and a caller's line is looked for in the copy, from where the
+main checkout has it.
 Greps in a worktree run as typed, as before: the index holds the main
 checkout's text, not the worktree's.
 
@@ -74,7 +84,14 @@ Not covered, and as before:
   holds its files under their own path unless they are ignored, and the hooks
   ask by that path;
 - a project that is itself a linked worktree, and a worktree inside a
-  worktree.
+  worktree;
+- for the Stop check, a worktree checked out after the turn began (the
+  previous Stop, or the session's first edit): the check counts a caller as
+  edited this turn when its file changed since then, and checking out wrote
+  every file of the worktree, so it names none of their callers. An isolated
+  agent's worktree is checked out when the agent starts, so its edits are in
+  this case in every turn after the session's first Stop, and in a first turn
+  whose session logged an edit before the agent started.
 
 The answers come from the main checkout's index: a caller the worktree added,
 removed or moved is as the main checkout has it until the work reaches it.

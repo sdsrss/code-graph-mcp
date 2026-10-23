@@ -240,13 +240,16 @@ function runImpact(args) {
 // counted in the copy the index describes, whose start lines the candidates
 // carry: in a worktree, the main checkout's. Counted in the worktree's copy, a
 // header whose lines had moved named another same-named definition's callers
-// (review of D#560). A copy without the edited text gets no guess.
+// (review of D#560). A copy without the edited text gets no guess, and nor
+// does one that holds it twice: the Edit found it once in the worktree's copy,
+// so which occurrence is the edited one cannot be told (review of 0.178.0).
 function editedNodeId(suggestions, fileKey, total) {
   const indexedKey = indexKey(cwd, fileKey);
   let text;
   try { text = fs.readFileSync(path.join(cwd, indexedKey), 'utf8'); } catch { return null; }
   const at = text.indexOf(oldStr);
   if (at === -1) return null;
+  if (indexedKey !== fileKey && text.indexOf(oldStr, at + 1) !== -1) return null;
   const line = text.slice(0, at + symbolAt).split('\n').length;
   let best = null;
   for (const c of suggestions) {
