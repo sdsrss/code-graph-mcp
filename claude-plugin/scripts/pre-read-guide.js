@@ -36,7 +36,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
+const { resolveProjectRoot, indexKey, indexBuildInProgress } = require('./project-root');
 const { runOverviewAnswer } = require('./cg-answer');
 const { emitPreToolAllowContext } = require('./hook-emit');
 
@@ -255,10 +255,11 @@ function runMain() {
   if (!isSourceFile(filePath)) return;
 
   // Normalize to a root-relative path. Read sends absolute paths; files
-  // outside the project (other repos, ~/.claude/) stay silent.
+  // outside the project (other repos, ~/.claude/) stay silent. A linked
+  // worktree's copy counts toward the directory the index knows (D#560).
   let rel;
   try {
-    rel = path.relative(root, filePath);
+    rel = indexKey(root, path.relative(root, filePath));
   } catch { return; }
 
   const hint = trackReadAndMaybeHint(root, rel);

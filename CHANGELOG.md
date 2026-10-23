@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Edits in a linked worktree get their impact summary and Stop check
+
+An agent isolated in a worktree, and a session in Claude Code's
+`.claude/worktrees/<slug>`, works in a linked worktree inside the project
+with no index of its own, so the hooks read the main checkout's index. That
+index stores files by their path in the main checkout, and the hooks asked it
+for `.claude/worktrees/<slug>/src/a.js`, which it refuses. So for every edit
+there the impact summary before an Edit that changes a definition's header
+said nothing, the Stop check of changed signatures found no callers, and five
+reads into one directory never brought its overview. From 2026-10-16 to
+2026-10-23, 725 of the ~1,694 edits in three projects on the maintainer's
+machine were made there.
+
+The hooks now ask the index for such a file by its path from the worktree.
+The Stop check, which runs in the parent session, names the callers by their
+path through the worktree and reads the worktree's copies, so a caller the
+agent already edited is left out as in the main checkout, and the line it
+names is the copy's. Greps in a worktree run as typed, as before: the index
+holds the main checkout's text, not the worktree's.
+
+Not covered: a worktree outside the project (`git worktree add ../wt`); edits
+there are outside the project to the hooks, as before. The answers come from
+the main checkout's index, so a caller the worktree added, or a definition it
+moved, is not in them until the work reaches the main checkout.
+
 ## 0.177.0
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124. A full index is

@@ -360,6 +360,7 @@ function runPreEditHook(t, {
   extraEnv = {},
   setup = () => {},
   stubExec = null,
+  worktree = null,
 } = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
@@ -377,7 +378,18 @@ function runPreEditHook(t, {
   fs.mkdirSync(path.join(proj, '.code-graph'), { recursive: true });
   fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
   fs.mkdirSync(path.join(home, 'tmp'), { recursive: true });
-  setup(proj);
+  // `worktree`: the hook runs in a linked worktree inside the project, where
+  // Claude Code's EnterWorktree and isolated agents put it. It has no index of
+  // its own, so the hook reads the main checkout's (D#560).
+  let workDir = proj;
+  if (worktree) {
+    const gitdir = path.join(proj, '.git', 'worktrees', worktree);
+    fs.mkdirSync(gitdir, { recursive: true });
+    workDir = path.join(proj, '.claude', 'worktrees', worktree);
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.writeFileSync(path.join(workDir, '.git'), `gitdir: ${gitdir}\n`);
+  }
+  setup(proj, workDir);
 
   const preload = path.join(home, 'stub-preload.js');
   fs.writeFileSync(preload, `
@@ -396,9 +408,9 @@ function runPreEditHook(t, {
     fb.findBinary = () => ${JSON.stringify(path.join(home, 'never-executed-binary'))};
   `);
 
-  const editedFile = path.resolve(proj, relPath);
+  const editedFile = path.resolve(workDir, relPath);
   const res = spawnSync(process.execPath, ['--require', preload, path.join(__dirname, 'pre-edit-guide.js')], {
-    cwd: proj,
+    cwd: workDir,
     encoding: 'utf8',
     input: JSON.stringify({
       tool_name: 'Edit',
@@ -659,6 +671,53 @@ test('Q4: no candidate at or before the edited line → silent, never a guess', 
   });
   assert.equal(res.status, 0, res.stderr);
   assert.equal(res.stdout.trim(), '');
+});
+
+// ── D#560: edits in a linked worktree ───────────────────────────────────────
+// The index stores the main checkout's layout. From `.claude/worktrees/<slug>`
+// the hook asked for `impact X --file .claude/worktrees/<slug>/src/…`, which
+// the CLI refuses as "File not found in index" (exit 1, candidates on stdout),
+// and the hook went silent for every edit in a worktree subagent: 2026-10-16..23,
+// 725 of the neutral projects' ~1,694 edits.
+
+// Answers like the CLI: a `--file` the index does not hold is refused.
+const STUB_INDEX_KEYS = `(bin, args) => {
+  const f = args.includes('--file') ? args[args.indexOf('--file') + 1] : null;
+  if (f !== null && f !== 'src/payments.js') {
+    const e = new Error('exit 1');
+    e.status = 1;
+    e.stdout = JSON.stringify({ error: 'File not found in index', file: f, symbol: args[1],
+      candidates: [{ file_path: 'src/payments.js', name: args[1], node_id: 7, start_line: 1, type: 'function' }] });
+    throw e;
+  }
+  return JSON.stringify({ direct_callers: 2, total_callers: 3, affected_files: 2, risk: 'medium',
+    callers: [{ name: 'checkout', file: 'src/checkout.js', depth: 1 }], test_callers: [] });
+}`;
+
+test('D#560: a changed signature in a linked worktree injects the impact summary', (t) => {
+  const edit = {
+    stubExec: STUB_INDEX_KEYS,
+    oldString: 'function processPayment(order) {\n  return charge(order);',
+    newString: 'function processPayment(order, currency) {\n  return charge(order, currency);',
+  };
+  const main = runPreEditHook(t, edit);
+  assert.match(main.res.stdout, /code-graph:impact\] processPayment\(\)/, 'control: the main checkout');
+  const { res } = runPreEditHook(t, { ...edit, worktree: 'wt' });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /code-graph:impact\] processPayment\(\)[\s\S]*checkout \(src\/checkout\.js\)/,
+    `got: ${res.stdout}`);
+});
+
+test('D#560: a same-file same-name edit in a worktree is placed in the worktree\'s copy', (t) => {
+  // Only the worktree holds the file: a read from the main checkout finds
+  // nothing, and a candidate compared with the worktree-prefixed key never fits.
+  const { res } = runPreEditHook(t, {
+    worktree: 'wt', relPath: 'src/app.py', stubExec: STUB_SAME_FILE,
+    setup: (proj, workDir) => writeTwoGets(workDir),
+    oldString: 'class B:\n    def fetch(self, k):', newString: 'class B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_22/, `B.fetch starts at line 7; got: ${res.stdout}`);
 });
 
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`

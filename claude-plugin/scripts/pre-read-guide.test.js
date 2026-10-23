@@ -371,6 +371,42 @@ test('hook entry: the 5th Read emits one allow+additionalContext envelope', () =
   }
 });
 
+// D#560: reads in a linked worktree count toward the directory the index knows.
+// Keyed by the worktree-prefixed path, the fifth read of src/storage/ asked for
+// an overview of `.claude/worktrees/wt/src/storage`, which the index does not
+// hold, so the hint never fired in a worktree.
+test('hook entry: the 5th Read in a linked worktree emits the overview of the indexed dir', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-wt-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.code-graph', 'index.db'), '');
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: " + process.argv.slice(2).join(" ") + "\\n");');
+  fs.chmodSync(stub, 0o755);
+  const gitdir = path.join(root, '.git', 'worktrees', 'wt');
+  fs.mkdirSync(gitdir, { recursive: true });
+  const wt = path.join(root, '.claude', 'worktrees', 'wt');
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${gitdir}\n`);
+  try {
+    const state = loadState(root);
+    for (let i = 0; i < FANOUT_THRESHOLD; i++) recordRead(state, 'src/storage');
+    saveState(root, state);
+    const res = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'pre-read-guide.js')], {
+      cwd: wt,
+      input: JSON.stringify({ tool_input: { file_path: path.join(wt, 'src', 'storage', 'db.rs') } }),
+      encoding: 'utf8',
+      env: { ...process.env, _CG_ANSWER_BINARY: stub, CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '0' },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.notEqual(res.stdout.trim(), '', 'the fifth read of src/storage/ must fire');
+    const out = JSON.parse(res.stdout).hookSpecificOutput;
+    assert.match(out.additionalContext, /5\+ Reads into src\/storage\/[\s\S]*Module overview stub: overview src\/storage/);
+  } finally {
+    fs.rmSync(statePath(root), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('trackReadAndMaybeHint: missing binary → hint records reason:no-binary (delivered-overview dark, sibling of pre-grep)', () => {
   // Sibling-hook parity: when the binary can't be found the read-fanout hint
   // falls back to bare advice. That must be distinguishable in the funnel from a

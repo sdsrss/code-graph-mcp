@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const { cgTmpDir, cwdHash } = require('./tmp-dir');
-const { resolveProjectRoot, indexBuildInProgress } = require('./project-root');
+const { resolveProjectRoot, indexKey, indexBuildInProgress } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
@@ -203,8 +203,10 @@ if (indexBuildInProgress(cwd)) process.exit(0);
 // short generic symbol names (open, new, create, parse, from, init) resolve
 // to a unique node instead of triggering the CLI's "Ambiguous symbol" error
 // path, which previously caused silent exits for the most common edit cases.
+// D#560 — in a linked worktree the index knows the file by its path from the
+// worktree, not from the main checkout `cwd` resolved to.
 const editedFile = (input.tool_input && input.tool_input.file_path) || '';
-const relFile = editedFile ? path.relative(cwd, editedFile) : '';
+const relFile = editedFile ? indexKey(cwd, path.relative(cwd, editedFile)) : '';
 // Whatever is left of the registered 4 s, capped at this call's own 2500 ms.
 // `null` = the candidate loop above already spent the budget; running anyway is
 // what got the hook killed by Claude Code mid-Edit (audit 2026-09-05 JS-03).
@@ -234,16 +236,19 @@ function runImpact(args) {
 // the old_string is not in the file (the Edit will fail) or no candidate fits.
 // The CLI lists at most five, in source order, and says how many exist in
 // `total`: past the last listed one an unlisted definition may start, so an
-// edit there is not guessed at (pre-tag review 2026-09-29).
+// edit there is not guessed at (pre-tag review 2026-09-29). The text is the
+// edited file's own (`fileKey`, a worktree's copy included); the candidates
+// name it by its index key.
 function editedNodeId(suggestions, fileKey, total) {
   let text;
   try { text = fs.readFileSync(path.join(cwd, fileKey), 'utf8'); } catch { return null; }
   const at = text.indexOf(oldStr);
   if (at === -1) return null;
   const line = text.slice(0, at + symbolAt).split('\n').length;
+  const indexedKey = indexKey(cwd, fileKey);
   let best = null;
   for (const c of suggestions) {
-    if (!c || c.file_path !== fileKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;
+    if (!c || c.file_path !== indexedKey || !Number.isInteger(c.node_id) || !Number.isInteger(c.start_line)) continue;
     if (c.start_line <= line && (best === null || c.start_line > best.start_line)) best = c;
   }
   const lastListed = Math.max(...suggestions.map((c) => (c && Number.isInteger(c.start_line) ? c.start_line : -Infinity)));

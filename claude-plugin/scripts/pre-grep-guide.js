@@ -751,7 +751,7 @@ function rootOnlyInSearchPath(cmd, cwd, target) {
 
 // v0.48 — subdir-cwd fix; v0.49 — extracted to project-root.js so the read
 // hook shares it. Re-exported below for test/back-compat.
-const { resolveProjectRoot } = require('./project-root');
+const { resolveProjectRoot, indexKey } = require('./project-root');
 
 // v0.48 — companion to resolveProjectRoot: when the shell sits in a subdir,
 // bare relative path args (`app --include=*.py` from backend/) are
@@ -2293,7 +2293,8 @@ function runMain() {
     for (const t of sedTargets) {
       if (!readGuide.isSourceFile(t)) continue;
       const abs = path.isAbsolute(t) ? t : path.resolve(shellCwd, t);
-      const dir = readGuide.trackRead(root, path.relative(root, abs));
+      // D#560 — a linked worktree's copy counts toward the indexed directory.
+      const dir = readGuide.trackRead(root, indexKey(root, path.relative(root, abs)));
       if (dir !== null) firedDirs.push(dir);  // a dir fires once: markHint starts its cooldown
     }
     if (firedDirs.length > 0) {

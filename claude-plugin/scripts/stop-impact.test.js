@@ -257,6 +257,26 @@ test('stop: callers are capped, sorted, and the rest named with the command that
   assert.match(r.lines[0], /and 3 more \(code-graph-mcp refs compute --file src\/a\.rs\)$/);
 });
 
+// D#560: an isolated agent's edits land in its parent's log as paths through
+// the worktree, and the parent's Stop reads them from the main checkout. The
+// report names files by those paths (the parent can open them); the command it
+// suggests asks the index, which knows the file by its path in the worktree.
+test('D#560: a worktree file is reported by its path, and the command asks for its index key', () => {
+  const wtA = '.claude/worktrees/wt/src/a.rs';
+  const refs = Array.from({ length: 11 }, (_, i) =>
+    ({ file: `.claude/worktrees/wt/src/c${String(i).padStart(2, '0')}.rs`, line: 1, name: `f${i}` }));
+  const r = computeStopReport({
+    edits: EDIT_A.map((e) => ({ ...e, file: wtA })), state: EMPTY, now: 9000,
+    workText: (f) => (f === wtA ? SIG_A : null),
+    callers: () => refs,
+    mtimeMs: () => 1000,
+    indexKeyOf: (f) => f.replace(/^\.claude\/worktrees\/wt\//, ''),
+  });
+  assert.equal(r.lines.length, 1);
+  assert.ok(r.lines[0].startsWith('  compute() in .claude/worktrees/wt/src/a.rs: .claude/worktrees/wt/src/c00.rs:1'), r.lines[0]);
+  assert.match(r.lines[0], /and 3 more \(code-graph-mcp refs compute --file src\/a\.rs\)$/);
+});
+
 test('stop: one caller line per file:line; a module-level caller has no name', () => {
   const refs = [
     { file: 'src/b.rs', line: 5, name: 'caller_b' },
@@ -437,6 +457,69 @@ test('e2e: signature change with an untouched caller → exactly one b.rs:line, 
   const third = stop(sb, 'sess-3');
   assert.ok(third, 'sess-3 changed the signature this turn');
   assert.match(third.hookSpecificOutput.additionalContext, /src\/b\.rs:5/);
+});
+
+// D#560: an agent isolated in a linked worktree (`.claude/worktrees/<slug>`) has
+// no index of its own; its hooks read the main checkout's index and log its
+// edits under its parent's session id, so the parent's Stop — run from the main
+// checkout — checks them. Before the fix both the pre-edit impact and this
+// check asked the index for `.claude/worktrees/wt/src/a.rs` and got nothing.
+// b.rs plus nine more callers, c0.rs of which the agent edits: one past
+// MAX_CALLERS_LISTED remains, so the report also carries the command that
+// lists the rest — the one place it names a file to the index rather than to
+// the reader.
+const WT_FILES = { ...DEFAULT_FILES };
+WT_FILES['src/lib.rs'] = 'pub mod a;\npub mod b;\n' +
+  Array.from({ length: 9 }, (_, i) => `pub mod c${i};\n`).join('');
+for (let i = 0; i < 9; i++) {
+  WT_FILES[`src/c${i}.rs`] = `use crate::a::compute;\n\npub fn caller_c${i}() -> i32 {\n    compute(${i})\n}\n`;
+}
+
+test('e2e D#560: a signature change in a linked worktree is checked against the worktree\'s callers', { skip: e2eSkip }, (t) => {
+  const sb = sandboxRepo(t, WT_FILES);
+  execFileSync('git', ['worktree', 'add', '-q', '.claude/worktrees/wt', '-b', 'wt'],
+    { cwd: sb.repo, env: sb.env, stdio: 'pipe' });
+  const wt = path.join(sb.repo, '.claude', 'worktrees', 'wt');
+  // The worktree's copy of the caller has its call a line lower than the main
+  // checkout's (line 5), so the line reported says which copy was read.
+  const bWt = path.join(wt, 'src', 'b.rs');
+  fs.writeFileSync(bWt,
+    'use crate::a::compute;\n\npub fn caller_b() -> i32 {\n    let v = 2;\n    let w = v;\n    compute(w)\n}\n');
+  const past = new Date(Date.now() - 3600 * 1000);
+  fs.utimesSync(bWt, past, past);
+
+  const aWt = path.join(wt, 'src', 'a.rs');
+  const oldString = 'pub fn compute(x: i32) -> i32 {';
+  const newString = 'pub fn compute(x: i32, y: i32) -> i32 {';
+  const pre = spawnSync(process.execPath, [path.join(__dirname, 'pre-edit-guide.js')], {
+    input: JSON.stringify({
+      session_id: 'sess-wt', hook_event_name: 'PreToolUse', tool_name: 'Edit', cwd: wt,
+      tool_input: { file_path: aWt, old_string: oldString, new_string: newString },
+    }),
+    cwd: wt, env: sb.env, encoding: 'utf8', timeout: 20000,
+  });
+  assert.equal(pre.status, 0, pre.stderr);
+  assert.match(pre.stdout, /code-graph:impact\] compute\(\)[\s\S]*caller_b \(src\/b\.rs\)/, `pre-edit: ${pre.stdout}`);
+  fs.writeFileSync(aWt, fs.readFileSync(aWt, 'utf8').replace(oldString, newString));
+  // The agent also updates one caller, through the same hook.
+  const c0Wt = path.join(wt, 'src', 'c0.rs');
+  const preC0 = spawnSync(process.execPath, [path.join(__dirname, 'pre-edit-guide.js')], {
+    input: JSON.stringify({
+      session_id: 'sess-wt', hook_event_name: 'PreToolUse', tool_name: 'Edit', cwd: wt,
+      tool_input: { file_path: c0Wt, old_string: '    compute(0)', new_string: '    compute(0, 1)' },
+    }),
+    cwd: wt, env: sb.env, encoding: 'utf8', timeout: 20000,
+  });
+  assert.equal(preC0.status, 0, preC0.stderr);
+  fs.writeFileSync(c0Wt, fs.readFileSync(c0Wt, 'utf8').replace('    compute(0)', '    compute(0, 1)'));
+  fs.utimesSync(c0Wt, past, past);  // left out by the edit log, not by its mtime
+
+  const out = stop(sb, 'sess-wt');
+  assert.ok(out, 'expected a Stop envelope');
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /compute\(\) in \.claude\/worktrees\/wt\/src\/a\.rs: \.claude\/worktrees\/wt\/src\/b\.rs:6 \(caller_b\)/, ctx);
+  assert.doesNotMatch(ctx, /c0\.rs/, 'a caller the agent edited this turn is not listed');
+  assert.match(ctx, /and 1 more \(code-graph-mcp refs compute --file src\/a\.rs\)/, ctx);
 });
 
 // D#163: the roadmap's Stop metric ("reported, and adopted") needs both halves

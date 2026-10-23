@@ -124,6 +124,32 @@ function resolveProjectRoot(startDir, opts = {}) {
   return null;
 }
 
+function samePath(a, b) {
+  if (path.resolve(a) === path.resolve(b)) return true;
+  try { return fs.realpathSync(a) === fs.realpathSync(b); } catch { return false; }
+}
+
+// The key the index knows a file by, given its key from `root` (a path relative
+// to it). A worktree with no index of its own resolves to its main checkout
+// (above), whose index stores the main checkout's layout; a key that runs
+// through a linked worktree of `root` names the worktree's copy, which the index
+// knows by its path from the worktree's top. Built from `root`, every such key
+// carried the worktree's prefix: `impact --file .claude/worktrees/x/src/a.js`
+// was refused, and the pre-edit impact went silent for every edit in an
+// isolated agent's worktree (D#560). Any other key comes back unchanged, its
+// separators included. Only worktrees inside `root` are seen: a key leaving it
+// (`../wt/…`) is outside the project to the hooks.
+function indexKey(root, key) {
+  if (!root || !key || key.startsWith('..') || path.isAbsolute(key)) return key;
+  const sep = path.sep === '\\' ? /[\\/]/g : /\//g;
+  let m;
+  while ((m = sep.exec(key)) !== null) {
+    const main = worktreeMainRoot(path.join(root, key.slice(0, m.index)));
+    if (main && samePath(main, root)) return key.slice(m.index + 1);
+  }
+  return key;
+}
+
 // True while the MCP server's startup index is still being written for `root`.
 // The server writes `.code-graph/indexing-status.json` ({s, d, t}) and heartbeats
 // it per batch and per finalize phase, then removes it. Until then the index is
@@ -163,4 +189,4 @@ function writerAlive(p) {
   }
 }
 
-module.exports = { resolveProjectRoot, indexBuildInProgress, writerAlive, INDEXING_STALE_MS };
+module.exports = { resolveProjectRoot, indexKey, indexBuildInProgress, writerAlive, INDEXING_STALE_MS };

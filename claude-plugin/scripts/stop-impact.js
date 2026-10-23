@@ -413,8 +413,10 @@ function findCallSiteLine(text, symbol, startLine) {
  * @param {(file:string)=>string|null} a.workText  file in the working tree
  * @param {(symbol:string,file:string)=>({file:string,line:number,name:string}[]|null)} a.callers
  * @param {(file:string)=>number|null} a.mtimeMs
+ * @param {(file:string)=>string} [a.indexKeyOf]  the key the index knows a
+ *   file by: a linked worktree's copy drops the worktree's prefix (D#560)
  */
-function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
+function computeStopReport({ edits, state, now, workText, callers, mtimeMs, indexKeyOf = (f) => f }) {
   const lastStopAt = state.lastStopAt;
   const turn = edits.filter((e) => lastStopAt === null || e.ts > lastStopAt);
   const next = { lastStopAt: now, reported: [...state.reported] };
@@ -476,7 +478,7 @@ function computeStopReport({ edits, state, now, workText, callers, mtimeMs }) {
     let line = '  ' + shellQuoteArg(c.symbol) + '() in ' + shellQuoteArg(c.file) + ': ' + shown.join(', ');
     if (untouched.length > MAX_CALLERS_LISTED) {
       line += ', and ' + (untouched.length - MAX_CALLERS_LISTED) + ' more (' +
-        formatCgCommand(['refs', c.symbol, '--file', c.file]) + ')';
+        formatCgCommand(['refs', c.symbol, '--file', indexKeyOf(c.file)]) + ')';
     }
     lines.push(line);
     next.reported.push(c.key);
@@ -562,7 +564,7 @@ function runMain() {
   const input = readStdinJson();
   if (!input || !input.session_id) return;
 
-  const { resolveProjectRoot } = require('./project-root');
+  const { resolveProjectRoot, indexKey } = require('./project-root');
   const root = resolveProjectRoot(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd());
   if (root === null) return;
 
@@ -620,8 +622,13 @@ function runMain() {
       workText: (file) => {
         try { return fs.readFileSync(path.join(root, file), 'utf8'); } catch { return null; }
       },
+      // D#560 — an isolated agent's edits are logged by their path through its
+      // worktree. The index is asked by the key it knows, and the callers it
+      // names are that worktree's copies: the ones the agent's change reaches.
       callers: (symbol, file) => {
-        const raw = run(binary, ['refs', symbol, '--file', file, '--relation', 'calls',
+        const key = indexKey(root, file);
+        const worktree = file.slice(0, file.length - key.length);
+        const raw = run(binary, ['refs', symbol, '--file', key, '--relation', 'calls',
           '--min-confidence', 'inferred', '--json'], 1500);
         if (raw === null) return null;
         let parsed;
@@ -630,12 +637,14 @@ function runMain() {
         return parsed.references
           .filter((r) => r && typeof r.file_path === 'string')
           .map((r) => {
+            const caller = worktree + r.file_path;
             let text = null;
-            try { text = fs.readFileSync(path.join(root, r.file_path), 'utf8'); } catch { /* gone */ }
-            return { file: r.file_path, name: r.name, line: findCallSiteLine(text, symbol, r.start_line) };
+            try { text = fs.readFileSync(path.join(root, caller), 'utf8'); } catch { /* gone */ }
+            return { file: caller, name: r.name, line: findCallSiteLine(text, symbol, r.start_line) };
           });
       },
       mtimeMs,
+      indexKeyOf: (file) => indexKey(root, file),
     });
   }
   const rec = reportRecords(report);

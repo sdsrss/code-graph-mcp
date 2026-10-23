@@ -2806,6 +2806,34 @@ test('sed-range fanout: one dir crossing still emits its single envelope', () =>
   }
 });
 
+// D#560: a sed-range read in a linked worktree counts toward the directory the
+// index knows, as the Read hook's does (pre-read-guide.test.js).
+test('sed-range fanout: a read in a linked worktree counts toward the indexed dir', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture('process.stdout.write("overview stub " + process.argv.slice(2).join(" ") + "\\n");');
+  const gitdir = pathE2e.join(fixture.dir, '.git', 'worktrees', 'wt');
+  fsE2e.mkdirSync(gitdir, { recursive: true });
+  const wt = pathE2e.join(fixture.dir, '.claude', 'worktrees', 'wt');
+  fsE2e.mkdirSync(pathE2e.join(wt, 'lib'), { recursive: true });
+  fsE2e.writeFileSync(pathE2e.join(wt, '.git'), `gitdir: ${gitdir}\n`);
+  const root = resolveProjectRoot(wt);
+  try {
+    assert.equal(root, fixture.dir, 'precondition: the worktree reads the main index');
+    const state = readGuide.loadState(root);
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) readGuide.recordRead(state, 'lib');
+    readGuide.saveState(root, state);
+
+    const res = runHook('sed -n 1,10p lib/core.js', fixture, wt);
+    assert.equal(res.status, 0, res.stderr);
+    assert.notEqual(res.stdout.trim(), '', 'the fifth read of lib/ must fire');
+    const out = JSON.parse(res.stdout).hookSpecificOutput;
+    assert.match(out.additionalContext, /5\+ Reads into lib\/[\s\S]*overview stub overview lib/);
+  } finally {
+    fsE2e.rmSync(readGuide.statePath(root || fixture.dir), { force: true });
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test('extractSedReadTargets: pipeline sed after grep still extracted', () => {
   assert.deepEqual(
     extractSedReadTargets('grep -n "x" src/a.py | sed -n 1,5p src/b.py'),
