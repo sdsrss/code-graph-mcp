@@ -1054,6 +1054,35 @@ test('pick: the comment test reads the pick\'s line in the old text', (t) => {
   assert.equal(picked, null);
 });
 
+// 0.179.0 took a Rust `#![…]` line and a generator method written `* name (`
+// (StandardJS) for comment lines: two shapes 0.178.0 named lost their summary,
+// and the index knows both names (tasks/specs/0-179-leftovers.md C1, C2).
+for (const [label, rel, before, after, name] of [
+  ['a generator method `* name (`', 'src/store.js', '  * entries (prefix) {\n    yield 1;', '  * entries (prefix, limit) {\n    yield 1;', 'entries'],
+  ['a Rust inner attribute', 'src/lib.rs', '#![allow(dead_code)] fn helper(a: u8) {\n}', '#![allow(dead_code)] fn helper(a: u8, b: u8) {\n}', 'helper'],
+]) {
+  test(`pick: ${label} is no comment line and keeps its summary`, (t) => {
+    assert.equal(pickOf(t, rel, before, after).picked, name);
+  });
+}
+
+// What stays without one (C3-C6): comments in each language, and a JS line
+// opening with `#` or `;`, which opens no comment but holds no definition the
+// index knows by the pick's name: it names a private method `#parse`, so
+// asking for `parse` finds nothing or another `parse` in the file, and has no
+// node for the function expression of `;(function main (`. 0.178.0 asked.
+test('pick: a comment line, a JS private method and a named IIFE get no summary', (t) => {
+  for (const [rel, before, after] of [
+    ['src/app.py', '# def helper(a):\nlimit = 1', '# def helper(a, b):\nlimit = 1'],
+    ['src/limits.ts', '/**\n * this function already caps it\n */\nconst limit = 1;', '/**\n * this function always caps it\n */\nconst limit = 1;'],
+    ['src/a.rs', '// fn helper(a: u8) {\nconst LIMIT: u8 = 1;', '// fn helper(a: u8, b: u8) {\nconst LIMIT: u8 = 1;'],
+    ['src/parser.js', '  #parse(text) {\n    return text;', '  #parse(text, opts) {\n    return text;'],
+    ['src/cli.js', ';(function main (argv) {\n  run(argv);', ';(function main (argv, env) {\n  run(argv);'],
+  ]) {
+    assert.equal(pickOf(t, rel, before, after).picked, null, `${rel}: ${before}`);
+  }
+});
+
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`
 // reported 7 direct callers AND `ambiguous_callers_excluded: 32`; the CLI's text
 // prints the ⚠ line, the hook printed "7 direct callers" alone — an undercount

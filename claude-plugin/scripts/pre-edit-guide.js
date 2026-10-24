@@ -203,9 +203,14 @@ const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
 // The pick is no definition when its line opens a comment that has not closed
 // before it, or, in Rust and Python, when its name does not follow `fn` /
 // `def`. A comment here is not stop-impact.js's COMMENT_LINE, which takes any
-// line opening with `*` or `#`: `*entries(prefix) {` is a JS generator method,
-// `#[inline] pub fn` a Rust definition; a doc comment's `*` is followed by a
-// space, a `/` or the line's end.
+// line opening with `*` or `#`: `*entries(prefix) {` and StandardJS's
+// `* entries (prefix) {` are JS generator methods, `#[inline] pub fn` and
+// `#![allow(…)] fn` Rust definitions; a doc comment's `*` is followed by a
+// space, a `/` or the line's end, and never directly by the pick. A JS line
+// opening with `#` or `;` is taken for a comment too, though it opens none:
+// the pick there is no definition the index knows by that name (it names a
+// private method `#parse`, so asking for `parse` finds nothing or another
+// `parse`; `;(function main (` names a function expression, which has no node).
 //
 // Only in the extensions of the reader's languages that corpus had hunks in
 // (not C: 2 hunks). Elsewhere the reader misread shapes no hunk there had
@@ -215,10 +220,12 @@ const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
 // own verdict, as in 0.178.0; so does a hunk the reader has no reading of (a
 // header past its cap).
 const READER_MEASURED = new Set(['.rs', '.py', '.js', '.mjs', '.cjs', '.ts']);
-const OPENS_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
+const OPENS_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!!?\[)|--|;)/;
 function onComment(line, nameCol) {
   const closed = /^\s*(?:\/\*.*?\*\/\s*)+/.exec(line.slice(0, nameCol));
-  return OPENS_A_COMMENT.test(closed ? line.slice(closed[0].length) : line);
+  const from = closed ? closed[0].length : 0;
+  if (/^\s*\*\s+$/.test(line.slice(from, nameCol))) return false; // `* entries (`
+  return OPENS_A_COMMENT.test(line.slice(from));
 }
 function changedDefinition() {
   const ext = path.extname(editedAbs).toLowerCase();
