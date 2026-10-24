@@ -115,11 +115,23 @@ function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Every run a definition pattern can scan from one start position is bounded,
+// or a read is quadratic: `[^)\n]*` re-scanned the rest of a line from every
+// `const a = (`, Go `func (` and Kotlin `fun <` on it, and a modifier run
+// crossing newlines re-read every following line from each line of a run of
+// `async` lines (D#572: 100 KB took 2.8 s per read; pre-edit-guide reads a hunk
+// twice within a 4 s budget). A bracket's contents stop at MAX_SIGNATURE_CHARS,
+// past which the header has no reading anyway; such a definition is now not
+// found rather than unread. Methods take at most four modifiers, as many as a
+// valid TypeScript method has (an access modifier, `static`, `override`,
+// `async` or `get`/`set`).
+const BRACKETED = `{0,${MAX_SIGNATURE_CHARS}}`;
+
 // What comes before a definition's name: the keyword, Go's receiver, Kotlin's
 // type parameters.
 function keywordLead(lang) {
-  const receiver = lang.receiver ? '(?:\\([^)\\n]*\\)\\s*)?' : '';
-  const typeParams = lang.typeParams ? '(?:<[^>\\n]*>\\s*)?' : '';
+  const receiver = lang.receiver ? `(?:\\([^)\\n]${BRACKETED}\\)\\s*)?` : '';
+  const typeParams = lang.typeParams ? `(?:<[^>\\n]${BRACKETED}>\\s*)?` : '';
   return `\\b(?:${lang.keyword})\\s+${receiver}${typeParams}`;
 }
 
@@ -129,8 +141,8 @@ function definitionPatterns(S, lang) {
     out.push({ re: new RegExp(`${keywordLead(lang)}${S}\\b`, 'g') });
   }
   if (lang.jsForms) {
-    out.push({ re: new RegExp(`\\b(?:const|let|var)\\s+${S}\\s*=\\s*(?:async\\s+)?(?:function\\b|\\([^)\\n]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`, 'g') });
-    out.push({ re: new RegExp(`^[ \\t]*(?:(?:async|static|get|set|public|private|protected|readonly|override)\\s+)*\\*?${S}\\s*\\([^()\\n]*\\)\\s*(?::\\s*[^{;=\\n]+)?\\{[ \\t]*$`, 'gm') });
+    out.push({ re: new RegExp(`\\b(?:const|let|var)\\s+${S}\\s*=\\s*(?:async\\s+)?(?:function\\b|\\([^)\\n]${BRACKETED}\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`, 'g') });
+    out.push({ re: new RegExp(`^[ \\t]*(?:(?:async|static|get|set|public|private|protected|readonly|override)\\s+){0,4}\\*?${S}\\s*\\([^()\\n]*\\)\\s*(?::\\s*[^{;=\\n]+)?\\{[ \\t]*$`, 'gm') });
   }
   if (lang.typed) {
     out.push({ re: new RegExp(`^[ \\t]*((?:[A-Za-z_][\\w<>\\[\\],.*&:?]*[ \\t]+)+)${S}[ \\t]*\\(`, 'gm'), typed: true });

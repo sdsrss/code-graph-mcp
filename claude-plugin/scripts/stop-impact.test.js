@@ -184,6 +184,57 @@ test('definitionHeaders: keywordLeads reads the keyword right before a name', ()
   assert.equal(definitionHeaders('', '.cpp').keywordLeads('static int '), false, 'no keyword in C-family');
 });
 
+// D#572 and 0.179.0's "Not covered": a definition pattern that scanned the rest
+// of a line, or the lines after it, from every start position made a read
+// quadratic. Measured before the fix, one definitionHeaders read: 100 KB of
+// `async` lines 2,782 ms, a 320 KB line of `const a = (` 2,781 ms
+// (pre-edit-guide reads a hunk twice: 5.4 s, past its 4 s budget); 160 KB lines
+// of Go `func (` and Kotlin `fun <` 1.3-1.5 s, which extractSignatures (the
+// Stop check, an edit's baseline) paid too. The ratio test of
+// pre-edit-guide.test.js SEC-04: 4x the input costs ~4x when every scan is
+// bounded and ~16x when one is not, on any box.
+const READ_GROWTH_LIMIT = 8;
+const READ_CEILING_MS = 5000;
+for (const [label, unit, ext] of [
+  ['lines of `async`', 'async\n', '.js'],
+  ['lines of `static` between blank lines', '  static\n\n', '.ts'],
+  ['one line of `const a = (`', 'const a = (', '.js'],
+  ['one line of Go `func (`', 'func (', '.go'],
+  ['one line of Kotlin `fun <`', 'fun <', '.kt'],
+]) {
+  test(`definition reads are linear: ${label}`, () => {
+    const cpuMs = (bytes) => {
+      const text = unit.repeat(Math.ceil(bytes / unit.length));
+      const t0 = process.cpuUsage();
+      definitionHeaders(text, ext);
+      extractSignatures(text, 'abc', ext);
+      const d = process.cpuUsage(t0);
+      return (d.user + d.system) / 1e3;
+    };
+    cpuMs(8 * 1024); // warm-up: don't bill regex compilation to the small sample
+    let small = Infinity;
+    let large = Infinity;
+    for (let i = 0; i < 3; i++) {
+      small = Math.min(small, cpuMs(16 * 1024));
+      const sample = cpuMs(64 * 1024);
+      large = Math.min(large, sample);
+      if (sample >= READ_CEILING_MS) break;
+    }
+    const growth = large / Math.max(small, 1);
+    assert.ok(growth < READ_GROWTH_LIMIT,
+      `4x the input cost ${growth.toFixed(1)}x the time (16 KB ${small.toFixed(1)} ms -> 64 KB ${large.toFixed(1)} ms)`);
+    assert.ok(large < READ_CEILING_MS, `64 KB took ${large.toFixed(1)} ms`);
+  });
+}
+
+test('definition reads: the bounds keep a modifier on its own line and four modifiers', () => {
+  const text = 'class K {\n  static\n  make(a) {\n  }\n  public static override async load(a: T) {\n  }\n}\n';
+  assert.deepEqual(extractSignatures(text, 'make', '.ts'), ['staticmake(a)']);
+  assert.deepEqual(extractSignatures(text, 'load', '.ts'), ['publicstaticoverrideasyncload(a:T)']);
+  assert.deepEqual(extractSignatures('func (s *Server) Run(a int) {\n}\n', 'Run', '.go'), ['func(s*Server)Run(aint)']);
+  assert.deepEqual(extractSignatures('fun <T> wrap(a: T) {\n}\n', 'wrap', '.kt'), ['fun<T>wrap(a:T)']);
+});
+
 test('definitionHeaders: no reading when any header has none, the language is not read, or a line is over-long', () => {
   assert.equal(definitionHeaders('fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n', '.rs'), null);
   assert.equal(definitionHeaders('function f() {}\n', '.sh'), null);
