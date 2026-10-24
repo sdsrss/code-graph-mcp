@@ -9,43 +9,66 @@ that definition's callers. It took the definition from the first of eight
 patterns that matched the edited text, and called the header changed when the
 text from the definition up to its first `{`, `=>` or line-ending `:` was no
 longer in the new text. On every Edit in the Claude Code transcripts on the
-maintainer's machine (4,066 distinct hunks), run through the hook of 0.178.0
-with a stub binary that answers every name, that asked about 102 hunks; in 27
-of them the name was no definition there: a Rust call such as `match
-parse_with_deadline(…) {` or `if !dirty.is_empty() {`, a definition written
-inside a string literal, a comment's "the function already…". And it said
-nothing for 24 hunks that changed a definition's header: a `{` inside the
-parameters (`function f(root, { slug })`) ended the header early, or the hunk's
-first definition was unchanged and a later one had changed.
+maintainer's machine (4,118 distinct hunks), run through the hook of 0.178.0
+with a stub binary that answers every name, that asked about 103 hunks; in 35
+of them the name was no definition there: a call such as `match
+parse_with_deadline(…) {` or `if !dirty.is_empty() {` (16), a definition
+written inside a string literal (9), a comment's "the function already…" (8),
+a word in Markdown prose (2). And it said nothing for 24 hunks that changed a
+definition's header: the hunk's first definition was unchanged and a later one
+had changed (9), a `{` inside the parameters (`function f(root, { slug })`)
+ended the header early (7), the old header was still inside the new one
+because `export` or `async` went before it or a return type after it (7), or
+the hunk ended inside the parameter list (1).
 
 For the languages the Stop check reads (Rust, Python, Go, JavaScript and
 TypeScript, PHP, C, C++, Java, C#, Kotlin, Scala, Ruby, Lua), the hook now reads
 each definition of the old and the new text as the Stop check does and takes
-the one whose header the edit changed: the picked name's, placed at the
-definition that changed when the hunk holds two of that name; else the first
-changed definition, which the Stop check then checks too. A pick that is no
-definition gets no summary where that can be told: on a comment line, and in
-Rust, Python, Go, PHP, Scala, Ruby and Lua, where every definition carries its
-keyword. In JavaScript, TypeScript, Kotlin and the C family such a pick keeps
-its summary as before, because the reader does not read every definition
-there (a method whose parameters span lines, a generator method). Other
-languages, and a hunk with a header past 600 characters or a line past 2,000,
-are as before.
+the one whose header the edit changed:
 
-On the same 4,066 hunks, with the hook of 0.178.0 and of this release: 77
-summaries name the same definition; 24 are gone (20 Rust call sites or string
-literals, 4 picks on JavaScript comment lines); 1 names the changed definition
-instead of a comment's word; 26 are new. Of the new ones, 22 change
+- the picked name's, placed at the definition that changed when the hunk holds
+  two of that name. Two with one old header pair in order; when the hunk adds
+  or removes one of them, which one changed is not in the text, and the hook
+  says nothing;
+- else the first changed definition, which the Stop check then checks too.
+  Not in the C family, where a statement such as `std::vector<int>
+  buffer(n);` reads as a definition: there only the picked name is named.
+
+A pick that is no definition gets no summary where that can be told: on a line
+that opens a comment not closed before the name, and in Rust, Python, Go, PHP,
+Scala, Ruby and Lua when the name does not follow the language's definition
+keyword (`fn`, `def`, `func`, `function`; `class` and `trait` too). In
+JavaScript, TypeScript, Kotlin and the C family such a pick keeps its summary
+as before, because a definition there need not follow a keyword (a method, a C
+function). Other languages, and a hunk with a header past 600 characters or a
+definition on a line past 2,000, are as before.
+
+On the same 4,118 hunks, with the hook of 0.178.0 and of this release: 78
+summaries name the same definition; 24 are gone (15 Rust call sites, 3 Rust
+string literals, 2 Rust and 4 JavaScript comment lines); 1 names the changed
+definition instead of a comment's word; 26 are new. Of the new ones, 22 change
 parameters, a return type or `async`, or remove the definition; 2 only add
 `export`; 2 read a definition inside a Rust string literal (a test fixture),
 and for both the index holds no definition of that name, so the hook says
-nothing. The pick costs 2.7 ms to load the reader and under 1.2 ms to read a
-132 KB hunk twice.
+nothing. Of the 78 kept, 10 still name no definition (6 string literals, a
+JavaScript call, a shell comment, 2 Markdown lines). Loading the reader costs
+about 2.7 ms. Reading a hunk's old and new text took at most 0.75 ms on these
+hunks (p99 0.03 ms), and 3–8 ms on 132 KB packed with definitions, where the
+whole hook took 43–65 ms against 24–37 ms for 0.178.0.
 
-Not covered: what the reader cannot read is as before, so a TypeScript `export
-const f: T = (…) =>` or a method whose parameters span lines is still judged
-by the first-match rule, and a pick inside a JavaScript string literal keeps
-its summary.
+Not covered:
+
+- what the reader cannot read is as before, so a TypeScript `export const f:
+  T = (…) =>` or a method whose parameters span lines is still judged by the
+  first-match rule;
+- a pick inside a string literal keeps its summary in every language, and a
+  definition written inside a string or a Python docstring can be named when
+  its text changes;
+- a hunk of tens of KB made only of lines such as `async` or `static` reads in
+  quadratic time (40 KB: 0.4 s per read, two reads per edit);
+- the 4,118 hunks hold Rust, Python, JavaScript, TypeScript and 2 C hunks,
+  and no Go, PHP, Scala, Ruby, Lua, C++, Java, C# or Kotlin: those languages'
+  rules are checked by tests only.
 
 ## 0.178.0
 

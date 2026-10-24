@@ -89,9 +89,11 @@ const NOT_A_TYPE = new Set([
 //            initializers, C# `: base(…)` — body, not signature)
 //   closeParen  the parameter list's `)` ends it (Ruby, Lua: no return types,
 //            and a one-line body may follow on the same line)
-//   keywordOnly  every definition carries `keyword` on its name's line, so a
-//            name these rules do not find is not a definition (pre-edit-guide
-//            reads that; Kotlin's `fun String.x()` keeps it off Kotlin)
+//   keywordOnly  every definition has `keyword` right before its name (Go:
+//            after the receiver), so a name without it is no definition
+//            (pre-edit-guide reads that; these rules do not find every such
+//            definition: a line opening with `#[` or `/* … */`, a second one
+//            on a line; Kotlin's `fun String.x()` keeps it off Kotlin)
 const LANGS = new Map();
 function defineLang(exts, profile) {
   for (const e of exts) LANGS.set(e, profile);
@@ -113,12 +115,18 @@ function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// What comes before a definition's name: the keyword, Go's receiver, Kotlin's
+// type parameters.
+function keywordLead(lang, keyword = lang.keyword) {
+  const receiver = lang.receiver ? '(?:\\([^)\\n]*\\)\\s*)?' : '';
+  const typeParams = lang.typeParams ? '(?:<[^>\\n]*>\\s*)?' : '';
+  return `\\b(?:${keyword})\\s+${receiver}${typeParams}`;
+}
+
 function definitionPatterns(S, lang) {
   const out = [];
   if (lang.keyword) {
-    const receiver = lang.receiver ? '(?:\\([^)\\n]*\\)\\s*)?' : '';
-    const typeParams = lang.typeParams ? '(?:<[^>\\n]*>\\s*)?' : '';
-    out.push({ re: new RegExp(`\\b(?:${lang.keyword})\\s+${receiver}${typeParams}${S}\\b`, 'g') });
+    out.push({ re: new RegExp(`${keywordLead(lang)}${S}\\b`, 'g') });
   }
   if (lang.jsForms) {
     out.push({ re: new RegExp(`\\b(?:const|let|var)\\s+${S}\\s*=\\s*(?:async\\s+)?(?:function\\b|\\([^)\\n]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`, 'g') });
@@ -190,10 +198,15 @@ function allSignatures(text, ext = '') {
  * Every definition in `text`, in text order, with the line it starts on and
  * its signature key (as allSignatures reads it) — for pre-edit-guide, which
  * must tell which of a hunk's definitions an edit changed and where it sits.
- * `keywordOnly`: the language's every definition is found here (LANGS). null
- * when there is no exact reading of the whole text: the language is not in
- * LANGS, a definition sits on an over-long line, or any header has no reading.
- * @returns {{ defs: {name:string, at:number, key:string}[], keywordOnly: boolean }|null}
+ * `keywordOnly` (LANGS) with `keywordLeads`, which tests the text before a
+ * name on its line: a name it is false for is no definition in this language
+ * (`class`, `trait` too: a Scala class's parameters are its constructor's).
+ * `typed`: C-family, where a statement `Type name(args);` reads as a
+ * definition here too. null when there is no exact reading of the whole text:
+ * the language is not in LANGS, a definition sits on an over-long line, or
+ * any header has no reading.
+ * @returns {{ defs: {name:string, at:number, key:string}[], keywordOnly: boolean,
+ *   keywordLeads: (before: string) => boolean, typed: boolean }|null}
  */
 function definitionHeaders(text, ext = '') {
   const lang = LANGS.get(String(ext).toLowerCase());
@@ -209,7 +222,13 @@ function definitionHeaders(text, ext = '') {
     }
   }
   defs.sort((x, y) => x.at - y.at);
-  return { defs, keywordOnly: lang.keywordOnly === true };
+  const lead = lang.keyword ? new RegExp(`${keywordLead(lang, `${lang.keyword}|class|trait`)}$`) : null;
+  return {
+    defs,
+    keywordOnly: lang.keywordOnly === true,
+    keywordLeads: (before) => lead !== null && lead.test(before),
+    typed: lang.typed === true,
+  };
 }
 
 /**

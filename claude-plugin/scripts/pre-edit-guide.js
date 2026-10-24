@@ -145,11 +145,12 @@ const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 // counts lines from here. That moves no name, only the line.
 let symbol = null;
 let symbolAt = -1;
+let nameAt = -1;
 for (const pat of fnPatterns) {
   const m = scanned.match(new RegExp(pat.source, `${pat.flags}d`));
   if (m) {
     symbol = m[1] || m[2];
-    const nameAt = (m.indices[1] || m.indices[2])[0];
+    nameAt = (m.indices[1] || m.indices[2])[0];
     symbolAt = Math.max(m.index, scanned.lastIndexOf('\n', nameAt - 1) + 1);
     break;
   }
@@ -185,45 +186,81 @@ const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
 
 // Which definition the edit changed, where the Stop check's per-language reader
 // (stop-impact.js LANGS) reads this file: a definition of the hunk whose
-// signature key the new text no longer has. The pick above sent 27 of its 95
+// signature key the new text no longer has. The pick above sent 35 of its 103
 // impact queries for names that are no definition there (a Rust `match f(…)
-// {`, a comment's "function already") and missed 24 changed headers (a `{`
-// inside the parameters, a later definition), measured on every Edit hunk in
-// this machine's transcripts (tasks/specs/pre-edit-pick-by-reader.md).
+// {`, a comment's "function already", a string) and missed 24 changed headers
+// (a later definition, a `{` inside the parameters, an old header still inside
+// the new one), measured on every Edit hunk in this machine's transcripts
+// (tasks/specs/pre-edit-pick-by-reader.md).
 //   - a changed definition of the picked name → it, placed where it starts;
 //   - the pick's header changed and the pick may be a definition the reader
-//     cannot see (JS/TS, C-family: a method whose parameters span lines) → the
-//     pick, as before;
-//   - else the first changed definition, logged for the Stop check too;
+//     cannot see (a method whose parameters span lines, a definition after
+//     `#[inline]` on its line) → the pick, as before;
+//   - else the first changed definition, logged for the Stop check too — not
+//     in C-family files, where `std::vector<int> buffer(n);` reads as one;
 //   - else none.
-// The pick is no definition when its line is a comment, or when the language
-// keys every definition with a keyword the reader reads (`keywordOnly`). No
-// reading of the hunk (a language not in LANGS, a header past its cap) leaves
-// the pick's own verdict. A comment here is not stop-impact.js's COMMENT_LINE,
-// which takes any line opening with `*`: that is a JS generator method
-// (`*entries(prefix) {`) too, a definition; a doc comment's `*` is followed by
-// a space, a `/` or the line's end. `#[` is a Rust attribute.
-const PICK_ON_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
+// The pick is no definition when its line opens a comment that has not closed
+// before it, or when the language's every definition has its keyword right
+// before its name and the pick has none (`keywordOnly`). No reading of the
+// hunk (a language not in LANGS, a header past its cap) leaves the pick's own
+// verdict. A comment here is not stop-impact.js's COMMENT_LINE, which takes any
+// line opening with `*` or `#`: `*entries(prefix) {` is a JS generator method,
+// `#[inline] pub fn` a Rust definition; a doc comment's `*` is followed by a
+// space, a `/` or the line's end.
+const OPENS_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
+function onComment(line, nameCol) {
+  const closed = /^\s*(?:\/\*.*?\*\/\s*)+/.exec(line.slice(0, nameCol));
+  return OPENS_A_COMMENT.test(closed ? line.slice(closed[0].length) : line);
+}
 function changedDefinition() {
   const ext = path.extname(editedAbs).toLowerCase();
   const before = definitionHeaders(oldStr, ext);
   const after = before && definitionHeaders(newStr, ext);
   if (!before || !after) return bodyOnly ? null : { name: symbol, at: symbolAt };
-  const left = new Map();
-  for (const d of after.defs) left.set(`${d.name}\0${d.key}`, (left.get(`${d.name}\0${d.key}`) || 0) + 1);
-  const changed = [];
+  const count = (defs) => {
+    const m = new Map();
+    for (const d of defs) m.set(`${d.name}\0${d.key}`, (m.get(`${d.name}\0${d.key}`) || 0) + 1);
+    return m;
+  };
+  const has = count(after.defs);
+  const left = new Map(has);
+  let changed = [];
   for (const d of before.defs) {
     const k = `${d.name}\0${d.key}`;
     if (left.get(k) > 0) left.set(k, left.get(k) - 1);
     else changed.push(d);
   }
+  // The count matches headers, not definitions: of two definitions of one name
+  // with one old header, one kept, it marks the later, whichever the edit
+  // changed. Such a name's definitions pair in order when the hunk keeps their
+  // number; otherwise which one changed is not in the text, and none is named.
+  const twinned = new Set(changed
+    .filter((c) => (has.get(`${c.name}\0${c.key}`) || 0) > 0)
+    .map((c) => c.name));
+  if (twinned.size) {
+    const byName = (defs) => {
+      const m = new Map();
+      for (const d of defs) if (twinned.has(d.name)) (m.get(d.name) || m.set(d.name, []).get(d.name)).push(d);
+      return m;
+    };
+    const olds = byName(before.defs);
+    const news = byName(after.defs);
+    changed = changed.filter((d) => !twinned.has(d.name));
+    for (const [name, o] of olds) {
+      const n = news.get(name) || [];
+      if (o.length === n.length) changed.push(...o.filter((d, i) => d.key !== n[i].key));
+    }
+  }
+  changed.sort((x, y) => x.at - y.at);
   const same = changed.find((d) => d.name === symbol);
   if (same) return { name: symbol, at: same.at };
-  const lineStart = scanned.lastIndexOf('\n', symbolAt - 1) + 1;
-  const lineEnd = scanned.indexOf('\n', symbolAt);
+  const lineStart = scanned.lastIndexOf('\n', nameAt - 1) + 1;
+  const lineEnd = scanned.indexOf('\n', nameAt);
   const pickLine = scanned.slice(lineStart, lineEnd === -1 ? scanned.length : lineEnd);
-  if (!bodyOnly && !before.keywordOnly && !PICK_ON_A_COMMENT.test(pickLine)) return { name: symbol, at: symbolAt };
-  return changed.length ? { name: changed[0].name, at: changed[0].at } : null;
+  const notADefinition = onComment(pickLine, nameAt - lineStart)
+    || (before.keywordOnly && !before.keywordLeads(scanned.slice(lineStart, nameAt)));
+  if (!bodyOnly && !notADefinition) return { name: symbol, at: symbolAt };
+  return changed.length && !before.typed ? { name: changed[0].name, at: changed[0].at } : null;
 }
 const edited = changedDefinition();
 if (!edited) process.exit(0);

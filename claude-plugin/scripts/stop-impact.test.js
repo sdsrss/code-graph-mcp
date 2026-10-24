@@ -145,6 +145,32 @@ test('definitionHeaders: keywordOnly only where every definition carries the key
   }
 });
 
+test('definitionHeaders: text order across names, not grouped by name', () => {
+  const text = 'fn alpha(a: u8) {}\nfn beta(b: u8) {}\nfn alpha(c: u16) {}\n';
+  assert.deepEqual(definitionHeaders(text, '.rs').defs.map((d) => d.name), ['alpha', 'beta', 'alpha']);
+});
+
+test('definitionHeaders: keywordLeads reads the keyword right before a name', () => {
+  const rs = definitionHeaders('', '.rs');
+  for (const before of ['fn ', '    pub(crate) async fn ', '#[inline] pub fn ', 'impl Conv for Cfg { fn ', '"fn ']) {
+    assert.equal(rs.keywordLeads(before), true, before);
+  }
+  for (const before of ['    match ', '    if !x.', '    let v = ', '', 'fnord ', 'xfn ']) {
+    assert.equal(rs.keywordLeads(before), false, before);
+  }
+  assert.equal(definitionHeaders('', '.go').keywordLeads('func (s *Server) '), true, 'Go receiver');
+  assert.equal(definitionHeaders('', '.go').keywordLeads('go '), false);
+  assert.equal(definitionHeaders('', '.scala').keywordLeads('class '), true, 'a Scala class constructor');
+  assert.equal(definitionHeaders('', '.rb').keywordLeads('items.'), false, 'a call with a block');
+  assert.equal(definitionHeaders('', '.php').keywordLeads('#[Route("/x")] public function '), true);
+  assert.equal(definitionHeaders('', '.cpp').keywordLeads('static int '), false, 'no keyword in C-family');
+});
+
+test('definitionHeaders: typed only for the C-family profile', () => {
+  for (const ext of ['.c', '.h', '.cpp', '.hpp', '.java', '.cs']) assert.equal(definitionHeaders('', ext).typed, true, ext);
+  for (const ext of ['.rs', '.py', '.js', '.ts', '.go', '.kt', '.rb']) assert.equal(definitionHeaders('', ext).typed, false, ext);
+});
+
 test('definitionHeaders: no reading when any header has none, the language is not read, or a line is over-long', () => {
   assert.equal(definitionHeaders('fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n', '.rs'), null);
   assert.equal(definitionHeaders('function f() {}\n', '.sh'), null);

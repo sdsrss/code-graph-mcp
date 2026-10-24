@@ -797,10 +797,11 @@ test('Q4: a main-checkout edit whose text the file holds twice (replace_all) kee
 // tasks/specs/pre-edit-pick-by-reader.md, shapes S1-S9. The first pattern to
 // match names the pick; where stop-impact.js reads the file's language, its
 // reader decides which definition's header the edit changed. Measured on every
-// Edit hunk in this machine's transcripts: the pick sent 27 of its 95 impact
-// queries for names that are no definition there (a Rust `match f(…) {`, a
-// comment's "function already"), and missed 24 hunks whose definition header
-// changed (a `{` inside the parameters, a later definition).
+// Edit hunk in this machine's transcripts (4,118): the pick sent 35 of its 103
+// impact queries for names that are no definition there (a Rust `match f(…)
+// {`, a comment's "function already", a string), and missed 24 hunks whose
+// definition header changed (a later definition, a `{` inside the parameters,
+// an old header still inside the new one).
 
 // Answers for any name, so the summary says which name was asked for.
 const STUB_BY_NAME = `(bin, args) => JSON.stringify({ direct_callers: 1, total_callers: 1,
@@ -891,6 +892,105 @@ test('pick S9: a pick on a comment line with no changed definition: no summary',
   const { picked } = pickOf(t, 'src/limits.js',
     '// a function wrapping head under\nconst limit = 1;',
     '// a function wrapping it under\nconst limit = 1;');
+  assert.equal(picked, null);
+});
+
+// Pre-tag review of 0.179.0, H1: two definitions of one name with one old
+// header were matched by count, which credited an edit of the first to the
+// second (a real index: `impl Alpha { fn make() }` edited, Beta's callers).
+test('pick: of two same-named definitions with one old header, the first one changed is placed', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: TWO_GETS,
+    newString: TWO_GETS.replace('    def fetch(self, k):', '    def fetch(self, k, default=None):'),
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_11/, `A.fetch starts at line 2; got: ${res.stdout}`);
+});
+
+test('pick: one of two same-named definitions with one old header removed: no guess', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: TWO_GETS,
+    newString: TWO_GETS.replace('    def fetch(self, k):\n        return k\n', ''),
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.doesNotMatch(res.stdout, /caller_of_/, 'which of the two went is not in the text');
+});
+
+// Review M1: a definition that is not the first thing on its line — the
+// reader skips the line (`#`, `/*`) or reads its header from the line's start
+// (`impl X {`) — kept 0.178.0's summary through the pick.
+test('pick: a definition after an attribute, a closed comment or an `impl {` on its line keeps its summary', (t) => {
+  const cases = [
+    ['src/a.rs', '#[inline] pub fn widen(a: u8) -> u8 {\n    a', '#[inline] pub fn widen(a: u8, b: u8) -> u8 {\n    a', 'widen'],
+    ['src/a.rs', '/* fast path */ pub fn quick(a: u8) {\n}', '/* fast path */ pub fn quick(a: u8, b: u8) {\n}', 'quick'],
+    ['src/a.rs', 'impl Conv for Cfg { fn convert(&self, a: u8) -> u8 { a } }',
+      'impl Conv for Cfg { fn convert(&self, a: u16) -> u16 { a } }', 'convert'],
+    ['src/a.php', '#[Route("/x")] public function show($id) {\n}', '#[Route("/x")] public function show($id, $fmt) {\n}', 'show'],
+    ['src/q.js', '/* istanbul ignore next */ function flushQueue(q) {\n}', '/* istanbul ignore next */ function flushQueue(q, n) {\n}', 'flushQueue'],
+    ['src/n.ts', '/** @internal */ export function getNodeId(node: Node) {\n}', '/** @internal */ export function getNodeId(node: Node, at: number) {\n}', 'getNodeId'],
+    ['src/f.c', '/* hot */ static int fold(int a) {\n}', '/* hot */ static int fold(int a, int b) {\n}', 'fold'],
+  ];
+  for (const [rel, before, after, name] of cases) {
+    assert.equal(pickOf(t, rel, before, after).picked, name, `${rel}: ${before}`);
+  }
+});
+
+// Review M2: a C++ statement `Type name(args);` reads as a definition. The
+// edit is in `total`'s body; `buffer` is a variable, whatever the index holds.
+test('pick: a C-family statement the reader takes for a definition is not named instead', (t) => {
+  for (const [before, after] of [
+    ['static int total(const C& c) {\n  std::vector<int> buffer(c.n);', 'static int total(const C& c) {\n  std::vector<int> buffer(c.n * 2);'],
+    ['void Spin::step(int a) {\n  emit valueChanged(a + 1);', 'void Spin::step(int a) {\n  emit valueChanged(a + 2);'],
+  ]) {
+    const { picked, home } = pickOf(t, 'src/w.cpp', before, after, { sessionId: 'sess-cpp' });
+    assert.equal(picked, null, before);
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const dir = path.join(home, 'tmp', 'code-graph-mcp');
+    const log = fs.readdirSync(dir).find((f) => f.endsWith('-sess-cpp.jsonl'));
+    const symbols = fs.readFileSync(path.join(dir, log), 'utf8').split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l).symbol).filter(Boolean);
+    assert.deepEqual(symbols, [before.startsWith('static') ? 'total' : 'step'], 'the Stop check gets the pick only');
+  }
+});
+
+test('pick: a changed definition of the picked name wins over an earlier changed one', (t) => {
+  const { picked } = pickOf(t, 'src/app.py',
+    'def fetch(self):\n    pass\n\ndef other(a):\n    pass\n\ndef fetch(self, k):\n    pass',
+    'def fetch(self):\n    pass\n\ndef other(a, b):\n    pass\n\ndef fetch(self, k, d):\n    pass');
+  assert.equal(picked, 'fetch');
+});
+
+test('pick: of several changed definitions, the first in the hunk', (t) => {
+  const { picked } = pickOf(t, 'src/lib.rs',
+    'fn keep_one() {\n}\nfn second_one(a: u8) {\n}\nfn third_one(a: u8) {\n}',
+    'fn keep_one() {\n}\nfn second_one(a: u16) {\n}\nfn third_one(a: u16) {\n}');
+  assert.equal(picked, 'second_one');
+});
+
+test('pick: a changed definition past the first 8 KB of the hunk is read', (t) => {
+  const body = '    let x = 1;\n'.repeat(700);
+  assert.ok(body.length > 8192);
+  const { picked } = pickOf(t, 'src/lib.rs',
+    `fn keep_one() {\n${body}}\nfn far_one(a: u8) {\n}`,
+    `fn keep_one() {\n${body}}\nfn far_one(a: u16) {\n}`);
+  assert.equal(picked, 'far_one');
+});
+
+test('pick: a pick inside a block comment that closes after it is on a comment', (t) => {
+  const { picked } = pickOf(t, 'src/limits.js',
+    '/* this function already caps it */\nconst limit = 1;',
+    '/* this function always caps it */\nconst limit = 1;');
+  assert.equal(picked, null);
+});
+
+test('pick: the comment test reads the pick\'s line in the old text', (t) => {
+  // The new text has code where the old one had the comment line.
+  const { picked } = pickOf(t, 'src/limits.js',
+    '// a function wrapping head under\nconst limit = 1;',
+    'const limit = 2;\n// a function wrapping it under');
   assert.equal(picked, null);
 });
 

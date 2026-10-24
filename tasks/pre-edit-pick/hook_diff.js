@@ -1,13 +1,16 @@
 // The real pre-edit-guide.js of two trees, run on every Edit hunk of the corpus with a
 // stub binary that answers `impact` for any name: which name does each one ask about?
 // usage: node hook_diff.js <edits.jsonl> <scriptsDirA> <scriptsDirB> <workDir>
+// ALL=1 lists the hunks both name the same definition for too.
 const fs = require('fs'); const path = require('path'); const { spawnSync } = require('child_process');
 const [corpus, dirA, dirB, work] = process.argv.slice(2);
 const proj = path.join(work, 'proj'); const tmp = path.join(work, 'tmp'); const home = path.join(work, 'home');
 for (const d of [path.join(proj, '.code-graph'), path.join(proj, 'src'), tmp, home]) fs.mkdirSync(d, { recursive: true });
 fs.writeFileSync(path.join(proj, '.code-graph', 'index.db'), '');
-const preload = (dir) => {
-  const f = path.join(work, `preload-${path.basename(path.dirname(dir))}.js`);
+// One preload per arm, by arm: named after the tree, two trees whose scripts both sit
+// at */claude-plugin/scripts shared one file, and arm A ran with arm B's stub.
+const preload = (arm, dir) => {
+  const f = path.join(work, `preload-${arm}.js`);
   fs.writeFileSync(f, `'use strict';
 const cp = require('child_process');
 cp.execFileSync = (bin, args) => JSON.stringify({ direct_callers: 1, total_callers: 1, affected_files: 1,
@@ -16,7 +19,7 @@ require(${JSON.stringify(path.join(dir, 'find-binary.js'))}).findBinary = () => 
 `);
   return f;
 };
-const pre = { A: preload(dirA), B: preload(dirB) };
+const pre = { A: preload('A', dirA), B: preload('B', dirB) };
 function run(arm, dir, d) {
   for (const f of fs.readdirSync(path.join(tmp, 'code-graph-mcp'), { withFileTypes: true }).filter(() => true) || []) {
     if (f.name.startsWith('.cg-impact-')) fs.rmSync(path.join(tmp, 'code-graph-mcp', f.name), { force: true });
@@ -40,7 +43,7 @@ for (const line of fs.readFileSync(corpus, 'utf8').split('\n')) {
   if (a.status !== 0 || b.status !== 0) { cls.nonzero = (cls.nonzero || 0) + 1; rows.push(['NONZERO', a.status, b.status, a.err, b.err]); continue; }
   const k = a.name === b.name ? (a.name ? 'same_summary' : 'same_none') : !a.name ? 'added' : !b.name ? 'removed' : 'switched';
   cls[k] = (cls[k] || 0) + 1;
-  if (k !== 'same_summary' && k !== 'same_none') rows.push([k, d.proj.replace('-home-ai-dev-', ''), path.extname(d.file_path), a.name, '->', b.name, key]);
+  if (k !== 'same_none' && (k !== 'same_summary' || process.env.ALL === '1')) rows.push([k, d.proj.replace('-home-ai-dev-', ''), path.extname(d.file_path), a.name, '->', b.name, key]);
 }
 console.log(JSON.stringify(cls));
 for (const r of rows) console.log(r.join(' '));
