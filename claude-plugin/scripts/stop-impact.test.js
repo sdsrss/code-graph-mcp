@@ -147,6 +147,11 @@ test('definitionHeaders: keywordOnly only where it was measured: Rust and Python
   }
 });
 
+test('definitionHeaders: a keyword needs whitespace before the name', () => {
+  assert.deepEqual(definitionHeaders('x = defect(1)\nfnord(2)\n', '.py').defs, []);
+  assert.deepEqual(definitionHeaders('let x = fnord(2);\n', '.rs').defs, []);
+});
+
 test('definitionHeaders: text order across names, not grouped by name', () => {
   const text = 'fn alpha(a: u8) {}\nfn beta(b: u8) {}\nfn alpha(c: u16) {}\n';
   assert.deepEqual(definitionHeaders(text, '.rs').defs.map((d) => d.name), ['alpha', 'beta', 'alpha']);

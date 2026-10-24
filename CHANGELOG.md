@@ -22,14 +22,15 @@ because `export` or `async` went before it or a return type after it (7), or
 the hunk ended inside the parameter list (1).
 
 For Rust, Python, JavaScript and TypeScript (`.rs`, `.py`, `.js`, `.mjs`,
-`.cjs`, `.ts`: the extensions those hunks hold), the hook now reads each
-definition of the old and the new text as the Stop check does and takes the
-one whose header the edit changed:
+`.cjs`, `.ts`, in any letter case: the extensions those hunks hold), the hook
+now reads each definition of the old and the new text as the Stop check does
+and takes the one whose header the edit changed:
 
 - the picked name's, placed at the definition that changed when the hunk holds
-  two of that name. Two with one old header pair in order; when the hunk adds
-  or removes one of them, or moves them, which one changed is not in the text,
-  and the reader names none of them;
+  two of that name. Two with one old header pair in order; when pairing in
+  order and counting disagree (one of them was added or removed, or the hunk
+  moved them), which one changed is not in the text, and the reader names none
+  of them (the next rule can still name the pick);
 - else, when the picked name's header changed as the first-match rule reads
   it and the pick is not shown to be no definition, the pick, as before;
 - else the first changed definition, which the Stop check then checks too.
@@ -37,8 +38,8 @@ one whose header the edit changed:
 A pick is no definition when its line opens a comment that has not closed
 before the name, and, in Rust and Python, when the name does not follow `fn`
 or `def`. Every other language, and a hunk with a header past 600 characters
-or a definition on a line past 2,000, is judged as in 0.178.0. Those
-languages had no hunk here, or 2 (C), and in Kotlin, PHP and C++ the reader
+or a definition on a line past 2,000, is judged as in 0.178.0. The reader's
+other languages had no hunk here, or 2 (C), and in Kotlin, PHP and C++ it
 misread shapes a review found: Kotlin's `fun Config.validate(` reads as a
 definition of `Config`, PHP's `function &name(` puts `&` before the name, a
 C++ statement `std::vector<int> buffer(n);` reads as a definition.
@@ -54,9 +55,11 @@ nothing. Of the 78 kept, 10 still name no definition (6 string literals, a
 JavaScript call, a shell comment, 2 Markdown lines); the 35 above count jq and
 awk definitions inside shell strings as definitions. The hook now loads the
 reader on every Edit, which adds 0.65–0.69 ms (0.178.0 loaded it once a name
-was picked); reading a hunk's old and new text took 0.03 ms at the 99th
-percentile on these hunks, and 3–8 ms on 132 KB packed with definitions, where
-the whole hook took 41–52 ms against 24–41 ms for 0.178.0.
+was picked). Reading a hunk's old and new text, in a fresh process as the hook
+runs, took 0.49 ms at the median and 1.08 ms at the 99th percentile on the
+2,615 hunks in these extensions (at most 1.67 ms); on 132 KB of Rust or
+JavaScript packed with definitions the whole hook took 41–52 ms against 24–41
+ms for 0.178.0.
 
 Not covered:
 
@@ -71,9 +74,13 @@ Not covered:
 - a pick inside a string literal can keep its summary, and a definition
   written inside a string or a Python docstring can be named when its text
   changes;
-- some inputs read in quadratic time: tens of KB of lines holding only words
-  such as `async` or `static` (40 KB: 0.4 s per read, two reads per edit), or
-  one line repeating `const a = (` with no `)` (40 KB: 48 ms);
+- a Rust `#![allow(…)] fn f(` on one line reads as a comment line and loses
+  0.178.0's summary (rustfmt puts an inner attribute on its own line);
+- some inputs read in quadratic time, and the hook then runs past its 4 s
+  budget with no summary: 100 KB of lines holding only words such as `async`
+  or `static` took the whole hook 5.4 s (40 KB: 0.85 s), one 320 KB line
+  repeating `const a = (` with no `)` took 5.3 s (160 KB: 1.3 s), where
+  0.178.0 took under 40 ms on the same hunks;
 - the 4,118 hunks hold 2,615 in these extensions (`.rs` 541, `.py` 459, `.js`
   683, `.mjs` 904, `.cjs` 9, `.ts` 19) and 2 C hunks; `.tsx`, `.jsx`, `.pyi`
   and the other languages keep 0.178.0's rule until hunks of them are

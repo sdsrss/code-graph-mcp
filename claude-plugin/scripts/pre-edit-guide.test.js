@@ -811,6 +811,9 @@ const STUB_BY_NAME = `(bin, args) => JSON.stringify({ direct_callers: 1, total_c
 function pickOf(t, relPath, oldString, newString, extra = {}) {
   const run = runPreEditHook(t, { relPath, oldString, newString, stubExec: STUB_BY_NAME, ...extra });
   assert.equal(run.res.status, 0, run.res.stderr);
+  // A throw exits 0 through hook-fail-open, and prints here: "no summary"
+  // must not pass for a crash.
+  assert.equal(run.res.stderr, '', 'the hook wrote to stderr');
   const m = /caller_of_(\w+)/.exec(run.res.stdout);
   return { picked: m ? m[1] : null, ...run };
 }
@@ -974,6 +977,27 @@ test('pick: a language without measured hunks keeps 0.178.0\'s verdict', (t) => 
   ];
   for (const [rel, before, after, name] of cases) {
     assert.equal(pickOf(t, rel, before, after).picked, name, `${rel}: ${before}`);
+  }
+});
+
+// The gate is by extension, lower-cased as the Stop check does: a hunk whose
+// first definition is unchanged and whose second changed is named in the
+// measured extensions, and gets 0.178.0's silence in the others.
+test('pick: the reader decides in .rs .py .js .mjs .cjs .ts only', (t) => {
+  const js = ['function keepOne() {\n}\nfunction secondOne(a) {\n}', 'function keepOne() {\n}\nfunction secondOne(a, b) {\n}', 'secondOne'];
+  const rs = ['fn keep_one() {\n}\nfn second_one(a: u8) {\n}', 'fn keep_one() {\n}\nfn second_one(a: u16) {\n}', 'second_one'];
+  const py = ['def keep_one(a):\n    pass\n\ndef second_one(b):\n    pass', 'def keep_one(a):\n    pass\n\ndef second_one(b, c):\n    pass', 'second_one'];
+  const cf = ['void keepOne() {\n}\nvoid secondOne(int a) {\n}', 'void keepOne() {\n}\nvoid secondOne(int a, int b) {\n}', null];
+  const cases = [
+    ['src/a.ts', ...js], ['src/a.cjs', ...js], ['src/a.mjs', ...js], ['src/a.rs', ...rs], ['src/A.RS', ...rs], ['src/a.py', ...py],
+    ['src/a.tsx', js[0], js[1], null], ['src/a.jsx', js[0], js[1], null], ['src/a.mts', js[0], js[1], null],
+    ['src/a.pyi', py[0], py[1], null], ['src/a.php', js[0].replace('(a)', '($a)'), js[1].replace('(a, b)', '($a, $b)'), null],
+    ['lib/a.rb', 'def keep_one\nend\ndef second_one(a)\nend', 'def keep_one\nend\ndef second_one(a, b)\nend', null],
+    ['src/a.lua', 'function keep_one()\nend\nfunction second_one(a)\nend', 'function keep_one()\nend\nfunction second_one(a, b)\nend', null],
+    ['src/A.java', ...cf], ['src/a.c', ...cf],
+  ];
+  for (const [rel, before, after, name] of cases) {
+    assert.equal(pickOf(t, rel, before, after).picked, name, rel);
   }
 });
 

@@ -42,6 +42,8 @@ for (const line of fs.readFileSync(corpus, 'utf8').split('\n')) {
   if (seen.has(key)) continue; seen.add(key);
   const a = run('A', dirA, d), b = run('B', dirB, d);
   if (a.status !== 0 || b.status !== 0) { cls.nonzero = (cls.nonzero || 0) + 1; rows.push(['NONZERO', a.status, b.status, a.err, b.err]); continue; }
+  // hook-fail-open exits 0 on a throw and says so on stderr.
+  if (a.err || b.err) { cls.stderr = (cls.stderr || 0) + 1; rows.push(['STDERR', key, a.err, '|', b.err]); continue; }
   const k = a.name === b.name ? (a.name ? 'same_summary' : 'same_none') : !a.name ? 'added' : !b.name ? 'removed' : 'switched';
   cls[k] = (cls[k] || 0) + 1;
   if (k !== 'same_none' && (k !== 'same_summary' || process.env.ALL === '1')) rows.push([k, d.proj.replace('-home-ai-dev-', ''), path.extname(d.file_path), a.name, '->', b.name, key]);

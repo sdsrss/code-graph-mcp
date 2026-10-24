@@ -1,5 +1,5 @@
-// The line each named hunk's pick sits on (the first-match rule of the given pre-edit-guide.js), old
-// and new, for classifying a differential's rows by hand.
+// The old line each named hunk's pick sits on (the first-match rule of the given pre-edit-guide.js),
+// for classifying a differential's rows by hand.
 // usage: node hunk_lines.js <edits.jsonl> <pre-edit-guide.js> <name>@<id:k>...
 const fs = require('fs'); const path = require('path');
 const [corpus, guide, ...rows] = process.argv.slice(2);

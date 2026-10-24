@@ -207,12 +207,13 @@ const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
 // `#[inline] pub fn` a Rust definition; a doc comment's `*` is followed by a
 // space, a `/` or the line's end.
 //
-// Only in the languages that corpus had hunks in. Elsewhere the reader misread
-// shapes no hunk there had (pre-tag review of 0.179.0: Kotlin's `fun
-// Config.validate(` reads as `Config`, PHP's `function &name(` has no keyword
-// before the name, a C++ statement `Type name(args);` reads as a definition),
-// so the pick keeps its own verdict, as in 0.178.0; so does a hunk the reader
-// has no reading of (a header past its cap).
+// Only in the extensions of the reader's languages that corpus had hunks in
+// (not C: 2 hunks). Elsewhere the reader misread shapes no hunk there had
+// (pre-tag review of 0.179.0: Kotlin's `fun Config.validate(` reads as
+// `Config`, PHP's `function &name(` has no keyword before the name, a C++
+// statement `Type name(args);` reads as a definition), so the pick keeps its
+// own verdict, as in 0.178.0; so does a hunk the reader has no reading of (a
+// header past its cap).
 const READER_MEASURED = new Set(['.rs', '.py', '.js', '.mjs', '.cjs', '.ts']);
 const OPENS_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
 function onComment(line, nameCol) {
@@ -241,8 +242,9 @@ function changedDefinition() {
   // with one old header, one kept, it marks the later, whichever the edit
   // changed. Such a name's definitions pair in order when the hunk keeps their
   // number and pairing finds as many changed as the count; otherwise which one
-  // changed is not in the text (one went, or the hunk moved them), and none of
-  // that name is named.
+  // changed is not in the text (one went or came, or the hunk moved them), and
+  // the reader names none of that name (the rule below can still keep the
+  // pick).
   const twinned = new Set(changed
     .filter((c) => (has.get(`${c.name}\0${c.key}`) || 0) > 0)
     .map((c) => c.name));
