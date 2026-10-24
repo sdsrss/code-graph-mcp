@@ -45,6 +45,20 @@ test.after(() => {
   try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
+// Third variable: PATH. The repair pass runs doctor.js from this repository,
+// which is dev mode wherever target/ exists (not on CI, which builds none):
+// when src/ is newer than target/release/code-graph-mcp its binary-stale arm
+// ran a real `cargo build --release` in the repository, replacing the binary a
+// developer's installed plugin runs with the working tree's (D#564, reached
+// through tests/hardening.rs on every `cargo test` after a Rust edit). A
+// `cargo` first on PATH that does nothing keeps the arm reachable and the
+// build out, for every spawn site at once.
+const FAKE_CARGO_BIN = path.join(TMP_SANDBOX, 'fake-bin');
+fs.mkdirSync(FAKE_CARGO_BIN, { recursive: true });
+fs.writeFileSync(path.join(FAKE_CARGO_BIN, 'cargo'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+fs.writeFileSync(path.join(FAKE_CARGO_BIN, 'cargo.cmd'), '@exit /b 0\r\n');
+process.env.PATH = FAKE_CARGO_BIN + path.delimiter + (process.env.PATH || '');
+
 // Per-test cleanup PLUS a run-end sweep. The per-test `t.after` alone left
 // exactly one `code-graph-e2e-*` directory behind per run — 154 had accumulated
 // in ~/.claude/tmp/ — and the survivor held only

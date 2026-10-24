@@ -858,6 +858,21 @@ const ENTRY_POINTS = [
   { label: 'lifecycle.js doctor', argv: (args) => [path.join(__dirname, 'lifecycle.js'), 'doctor', ...args] },
 ];
 
+// The repair pass runs from this repository, which is dev mode: when src/ is
+// newer than target/release/code-graph-mcp (any Rust edit not yet built) its
+// binary-stale arm ran a real `cargo build --release` in the repository, and
+// that binary is the one a developer's installed plugin runs (D#564: every
+// `cargo test` after a Rust edit rebuilt it from the working tree, through
+// tests/hardening.rs running this suite). A `cargo` first on PATH that does
+// nothing keeps the arm reachable and the build out.
+function fakeCargoPath(homeDir) {
+  const bin = path.join(homeDir, 'fake-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'cargo'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'cargo.cmd'), '@exit /b 0\r\n');
+  return bin + path.delimiter + (process.env.PATH || '');
+}
+
 function runDoctorCli(homeDir, args, entry = ENTRY_POINTS[0]) {
   try {
     const stdout = execFileSync(process.execPath, entry.argv(args), {
@@ -867,7 +882,10 @@ function runDoctorCli(homeDir, args, entry = ENTRY_POINTS[0]) {
       // for any developer who exports it. The `no arguments still repairs` case
       // below runs the full repair pass, which is what would land in their real
       // config. Same fix as tests/cli_e2e.rs; this JS sibling was missed.
-      env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude') },
+      env: {
+        ...process.env, HOME: homeDir, USERPROFILE: homeDir, CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude'),
+        PATH: fakeCargoPath(homeDir),
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     }).toString();
     return { code: 0, stdout, stderr: '' };
