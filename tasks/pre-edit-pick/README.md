@@ -26,3 +26,9 @@ hunk with a stub binary and classifies each hunk by the name each asks about
 
     node hook_diff.js <scratch>/edits.jsonl <treeA>/claude-plugin/scripts <treeB>/claude-plugin/scripts <scratch>/work
     node hunk_lines.js <scratch>/edits.jsonl <treeA>/claude-plugin/scripts/pre-edit-guide.js <name>@<id:k>...
+
+`reader_diff.js` compares the reader (`definitionHeaders`, `allSignatures`,
+and `extractSignatures` per name found) of two script trees on every source
+file of the given extensions under the given roots (0.179.1: Go and Kotlin):
+
+    node reader_diff.js <treeA>/claude-plugin/scripts <treeB>/claude-plugin/scripts .go <root>...

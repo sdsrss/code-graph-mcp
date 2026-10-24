@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.179.1
+
+**Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the Rust source
+is 0.179.0's apart from the version number. Only the plugin's hooks change:
+the impact summary before an Edit comes back for the two shapes 0.178.0 named
+and 0.179.0 did not, and the inputs below that took seconds to read take
+milliseconds. Pinning the binary does not reach the plugin's hooks;
+`CODE_GRAPH_QUIET_HOOKS=1` silences the summary and the Stop check. To pin the
+binary back anyway: `npm i -g @sdsrs/code-graph@0.179.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.179.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0.
 
 ### The pre-edit impact summary: two shapes back, no input past the budget
 
@@ -21,9 +33,12 @@ Three items of 0.179.0's "Not covered" list:
   characters, past which a header had no reading anyway; such a definition is
   now not found rather than found without a reading. The reader's output is
   the same before and after on every distinct text of the Edit hunks in the
-  maintainer's transcripts (5,193: Rust, Python, JavaScript, TypeScript, C) and
-  on 16,076 Rust, JavaScript and TypeScript source files; no Go or Kotlin
-  corpus was at hand.
+  maintainer's transcripts (5,193: Rust, Python, JavaScript, TypeScript, C), on
+  16,076 Rust, JavaScript and TypeScript source files, and on 10,088 Go files
+  (gin and the Go 1.23.0 source tree: 24,012 lines with `func (`) and 3,670
+  Kotlin files (kotlinx.coroutines 1.9.0, ktor 3.0.0, okhttp: 1,174 lines with
+  `fun <`); on the Go and Kotlin files, so is the answer of looking up each
+  name found (103,347 lookups).
 - A JavaScript generator method written `* entries (prefix) {` (StandardJS
   spacing) and a Rust `#![allow(…)] fn f(` on one line were taken for comment
   lines and got no summary; both get 0.178.0's again. A JSDoc line written

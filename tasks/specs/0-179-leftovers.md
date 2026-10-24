@@ -60,7 +60,8 @@ revision: 2
 - v0.178.0 上跑新测试：C1、C2 出摘要（与表一致）；"不出摘要"组在 Python 注释处失败（0.178.0 会选 `helper`）。
 - 读法耗时（一次读取）：100 KB `async` 行 2,782→2.0 ms；320 KB `const a = (` 2,781→25.7 ms；160 KB Go `func (` 1,278→21.6 ms，Kotlin `fun <` 1,541→24.9 ms。倍增扫描（12 种扩展名 × 47 种单元，8→32 KB）修改后没有超过 20 ms 的组合。`extractSignatures` 160 KB：v0.178.0 1.10–1.48 s，HEAD 1.13–1.49 s，修改后 1.3–25.7 ms。
 - 钩子整体（冷进程、存根二进制、3 次中位数）：100 KB `async` 行 HEAD 5,305 ms 无摘要 → 31 ms 出摘要（v0.178.0 27 ms）；320 KB `const a = (` 5,327 ms 无摘要 → 78 ms（v0.178.0 30 ms）；40 KB 876→29 ms；160 KB 1,348→52 ms。
-- 等价性：语料 5,193 段不同文本（.mjs 1,818、.js 1,368、.rs 1,054、.py 893、.ts 38、.cjs 18、.c 4）与 16,076 个真实源文件（cargo 注册表的 .rs 6,000，本机 node_modules 的 .js 6,778、.ts 2,806、.cjs 309、.mjs 183）上，HEAD 与修改后的 `definitionHeaders` + `allSignatures` 输出 0 处不同。Go、Kotlin 没有语料，只有单元测试里的形式。
+- 等价性：语料 5,193 段不同文本（.mjs 1,818、.js 1,368、.rs 1,054、.py 893、.ts 38、.cjs 18、.c 4）与 16,076 个真实源文件（cargo 注册表的 .rs 6,000，本机 node_modules 的 .js 6,778、.ts 2,806、.cjs 309、.mjs 183）上，HEAD 与修改后的 `definitionHeaders` + `allSignatures` 输出 0 处不同。Go、Kotlin 当时没有语料，只有单元测试里的形式。
+- 等价性补测（2026-10-24，发 0.179.1 前；v0.179.0 对 HEAD 26fd43d8 的 `stop-impact.js`，md5 e9cc0b20… / b95a0277…）：Go 10,088 个文件（gin 75ccf94d、golang/go go1.23.0 6885bad7；含 `func (` 的行 24,012），Kotlin 3,670 个文件（kotlinx.coroutines 1.9.0 d8d6f8f3、ktor 3.0.0 6d55f8b4、okhttp c3179301；含 `fun <` 的行 1,174）。`definitionHeaders` + `allSignatures` 逐文件 0 处不同（读出定义 Go 88,911、Kotlin 24,094）；对两边读出的每个名字再调 `extractSignatures`，Go 82,525 次、Kotlin 20,822 次，0 处不同。脚本：`tasks/pre-edit-pick/reader_diff.js`（两边的 scripts 目录取自 `git archive`）。
 - 真实钩子差分（hook_diff.js，HEAD 对修改后）：4,159 个不同片段，same_none 4,053、same_summary 106，新增 / 去掉 / 换名 0，非零退出 0，stderr 0。
 - 全部 51 个 JS 测试文件（含 install-e2e）在同一个沙箱 HOME 下：1,829 个，1,825 通过、0 失败、4 跳过。
 - 真实 HOME 下跑 CI 的 JS 列表（所有修复之后）：1,786 个，1,783 通过、0 失败、3 跳过；`~/.cache/code-graph` 下 14 个文件路径、修改时间、大小前后一致。`os.tmpdir()` 下沙箱目录残留 0。
