@@ -89,22 +89,25 @@ const NOT_A_TYPE = new Set([
 //            initializers, C# `: base(…)` — body, not signature)
 //   closeParen  the parameter list's `)` ends it (Ruby, Lua: no return types,
 //            and a one-line body may follow on the same line)
+//   keywordOnly  every definition carries `keyword` on its name's line, so a
+//            name these rules do not find is not a definition (pre-edit-guide
+//            reads that; Kotlin's `fun String.x()` keeps it off Kotlin)
 const LANGS = new Map();
 function defineLang(exts, profile) {
   for (const e of exts) LANGS.set(e, profile);
 }
-defineLang(['.rs'], { keyword: 'fn', ends: '{;' });
-defineLang(['.py', '.pyi'], { keyword: 'def', ends: ':' });
-defineLang(['.go'], { keyword: 'func', receiver: true, ends: '{;\n' });
+defineLang(['.rs'], { keyword: 'fn', ends: '{;', keywordOnly: true });
+defineLang(['.py', '.pyi'], { keyword: 'def', ends: ':', keywordOnly: true });
+defineLang(['.go'], { keyword: 'func', receiver: true, ends: '{;\n', keywordOnly: true });
 defineLang(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'],
   { keyword: 'function\\*?', jsForms: true, ends: '{;', arrowEnds: true, angles: true });
-defineLang(['.php'], { keyword: 'function', ends: '{;' });
+defineLang(['.php'], { keyword: 'function', ends: '{;', keywordOnly: true });
 defineLang(['.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx', '.java', '.cs'],
   { typed: true, ends: '{;', arrowEnds: true, afterParams: true });
 defineLang(['.kt', '.kts'], { keyword: 'fun', typeParams: true, ends: '{=\n' });
-defineLang(['.scala', '.sc'], { keyword: 'def', ends: '{=\n' });
-defineLang(['.rb'], { keyword: 'def', ends: ';=\n', closeParen: true });
-defineLang(['.lua'], { keyword: 'function', ends: '\n', closeParen: true });
+defineLang(['.scala', '.sc'], { keyword: 'def', ends: '{=\n', keywordOnly: true });
+defineLang(['.rb'], { keyword: 'def', ends: ';=\n', closeParen: true, keywordOnly: true });
+defineLang(['.lua'], { keyword: 'function', ends: '\n', closeParen: true, keywordOnly: true });
 
 function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -181,6 +184,32 @@ function allSignatures(text, ext = '') {
     if (sigs && sigs.length > 0) out.set(name, sigs);
   }
   return out;
+}
+
+/**
+ * Every definition in `text`, in text order, with the line it starts on and
+ * its signature key (as allSignatures reads it) — for pre-edit-guide, which
+ * must tell which of a hunk's definitions an edit changed and where it sits.
+ * `keywordOnly`: the language's every definition is found here (LANGS). null
+ * when there is no exact reading of the whole text: the language is not in
+ * LANGS, a definition sits on an over-long line, or any header has no reading.
+ * @returns {{ defs: {name:string, at:number, key:string}[], keywordOnly: boolean }|null}
+ */
+function definitionHeaders(text, ext = '') {
+  const lang = LANGS.get(String(ext).toLowerCase());
+  if (!lang || typeof text !== 'string') return null;
+  const starts = definitionStarts(text, lang, ANY_NAME, null);
+  if (starts === null) return null;
+  const defs = [];
+  for (const [name, lineStarts] of starts) {
+    for (const at of lineStarts) {
+      const header = readHeader(text, at, lang);
+      if (header === null) return null;
+      defs.push({ name, at, key: signatureKey(header) });
+    }
+  }
+  defs.sort((x, y) => x.at - y.at);
+  return { defs, keywordOnly: lang.keywordOnly === true };
 }
 
 /**
@@ -670,6 +699,6 @@ function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
-  extractSignatures, allSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
+  extractSignatures, allSignatures, definitionHeaders, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext,
   followUpOf, reportRecords, MAX_SYMBOLS_CHECKED, MAX_CALLERS_LISTED, MAX_FOLLOWUP_FILES,
 };

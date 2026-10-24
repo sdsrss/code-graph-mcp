@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### The impact summary before an Edit names the definition the edit changed
+
+Before an Edit that changes a definition's header, the plugin's hook injects
+that definition's callers. It took the definition from the first of eight
+patterns that matched the edited text, and called the header changed when the
+text from the definition up to its first `{`, `=>` or line-ending `:` was no
+longer in the new text. On every Edit in the Claude Code transcripts on the
+maintainer's machine (4,066 distinct hunks), run through the hook of 0.178.0
+with a stub binary that answers every name, that asked about 102 hunks; in 27
+of them the name was no definition there: a Rust call such as `match
+parse_with_deadline(…) {` or `if !dirty.is_empty() {`, a definition written
+inside a string literal, a comment's "the function already…". And it said
+nothing for 24 hunks that changed a definition's header: a `{` inside the
+parameters (`function f(root, { slug })`) ended the header early, or the hunk's
+first definition was unchanged and a later one had changed.
+
+For the languages the Stop check reads (Rust, Python, Go, JavaScript and
+TypeScript, PHP, C, C++, Java, C#, Kotlin, Scala, Ruby, Lua), the hook now reads
+each definition of the old and the new text as the Stop check does and takes
+the one whose header the edit changed: the picked name's, placed at the
+definition that changed when the hunk holds two of that name; else the first
+changed definition, which the Stop check then checks too. A pick that is no
+definition gets no summary where that can be told: on a comment line, and in
+Rust, Python, Go, PHP, Scala, Ruby and Lua, where every definition carries its
+keyword. In JavaScript, TypeScript, Kotlin and the C family such a pick keeps
+its summary as before, because the reader does not read every definition
+there (a method whose parameters span lines, a generator method). Other
+languages, and a hunk with a header past 600 characters or a line past 2,000,
+are as before.
+
+On the same 4,066 hunks, with the hook of 0.178.0 and of this release: 77
+summaries name the same definition; 24 are gone (20 Rust call sites or string
+literals, 4 picks on JavaScript comment lines); 1 names the changed definition
+instead of a comment's word; 26 are new. Of the new ones, 22 change
+parameters, a return type or `async`, or remove the definition; 2 only add
+`export`; 2 read a definition inside a Rust string literal (a test fixture),
+and for both the index holds no definition of that name, so the hook says
+nothing. The pick costs 2.7 ms to load the reader and under 1.2 ms to read a
+132 KB hunk twice.
+
+Not covered: what the reader cannot read is as before, so a TypeScript `export
+const f: T = (…) =>` or a method whose parameters span lines is still judged
+by the first-match rule, and a pick inside a JavaScript string literal keeps
+its summary.
+
 ## 0.178.0
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the indexer is

@@ -12,8 +12,8 @@ const { spawnSync, execFileSync } = require('node:child_process');
 delete process.env.CLAUDE_CONFIG_DIR;
 
 const {
-  extractSignatures, allSignatures, signatureChanged, findCallSiteLine, computeStopReport, formatStopContext, followUpOf,
-  reportRecords, MAX_FOLLOWUP_FILES,
+  extractSignatures, allSignatures, definitionHeaders, signatureChanged, findCallSiteLine, computeStopReport,
+  formatStopContext, followUpOf, reportRecords, MAX_FOLLOWUP_FILES,
 } = require('./stop-impact');
 
 // --- extractSignatures ------------------------------------------------------
@@ -117,6 +117,38 @@ test('allSignatures: a header with no reading leaves out that name only', () => 
   const text = 'fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n';
   assert.equal(extractSignatures(text, 'compute', '.rs'), null);
   assert.deepEqual([...allSignatures(text, '.rs')], [['other', ['fnother(x:u8)']]]);
+});
+
+// pre-edit-guide reads which of a hunk's definitions an edit changed, and
+// where each starts (tasks/specs/pre-edit-pick-by-reader.md).
+test('definitionHeaders: every definition in text order, with its line start and key', () => {
+  const text = 'class A:\n    def fetch(self, k):\n        return k\nclass B:\n    def fetch(self, k, d=None):\n';
+  const r = definitionHeaders(text, '.py');
+  assert.deepEqual(r.defs, [
+    { name: 'fetch', at: text.indexOf('    def fetch(self, k)'), key: 'deffetch(self,k)' },
+    { name: 'fetch', at: text.indexOf('    def fetch(self, k, d'), key: 'deffetch(self,k,d=None)' },
+  ]);
+  assert.equal(r.keywordOnly, true);
+  for (const [name, sigs] of allSignatures(text, '.py')) {
+    assert.deepEqual(r.defs.filter((d) => d.name === name).map((d) => d.key).sort(), sigs, 'the keys allSignatures reads');
+  }
+});
+
+test('definitionHeaders: keywordOnly only where every definition carries the keyword', () => {
+  for (const ext of ['.rs', '.py', '.pyi', '.go', '.php', '.scala', '.sc', '.rb', '.lua']) {
+    assert.equal(definitionHeaders('', ext).keywordOnly, true, ext);
+  }
+  // JS/TS read one-line methods only; C-family has no keyword; Kotlin's
+  // `fun String.x()` is not read.
+  for (const ext of ['.js', '.ts', '.tsx', '.mjs', '.c', '.cpp', '.java', '.cs', '.kt', '.kts']) {
+    assert.equal(definitionHeaders('', ext).keywordOnly, false, ext);
+  }
+});
+
+test('definitionHeaders: no reading when any header has none, the language is not read, or a line is over-long', () => {
+  assert.equal(definitionHeaders('fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n', '.rs'), null);
+  assert.equal(definitionHeaders('function f() {}\n', '.sh'), null);
+  assert.equal(definitionHeaders('function abc(t){return t+1}' + 'var a=1;'.repeat(400), '.js'), null);
 });
 
 test('allSignatures: no reading for an unsupported language or a one-line bundle', () => {

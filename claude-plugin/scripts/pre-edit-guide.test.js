@@ -361,6 +361,7 @@ function runPreEditHook(t, {
   setup = () => {},
   stubExec = null,
   worktree = null,
+  sessionId = null,
 } = {}) {
   const fs = require('node:fs');
   const os = require('node:os');
@@ -414,6 +415,7 @@ function runPreEditHook(t, {
     encoding: 'utf8',
     input: JSON.stringify({
       tool_name: 'Edit',
+      ...(sessionId ? { session_id: sessionId } : {}),
       tool_input: { file_path: editedFile, old_string: oldString, new_string: newString },
     }),
     env: {
@@ -789,6 +791,107 @@ test('Q4: a main-checkout edit whose text the file holds twice (replace_all) kee
   });
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /caller_of_11/, `A.fetch, the first occurrence; got: ${res.stdout}`);
+});
+
+// ── Which definition the hunk changed: the Stop check's reader ─────────────
+// tasks/specs/pre-edit-pick-by-reader.md, shapes S1-S9. The first pattern to
+// match names the pick; where stop-impact.js reads the file's language, its
+// reader decides which definition's header the edit changed. Measured on every
+// Edit hunk in this machine's transcripts: the pick sent 27 of its 95 impact
+// queries for names that are no definition there (a Rust `match f(…) {`, a
+// comment's "function already"), and missed 24 hunks whose definition header
+// changed (a `{` inside the parameters, a later definition).
+
+// Answers for any name, so the summary says which name was asked for.
+const STUB_BY_NAME = `(bin, args) => JSON.stringify({ direct_callers: 1, total_callers: 1,
+  affected_files: 1, risk: 'low', callers: [{ name: 'caller_of_' + args[1], file: 'src/use.x', depth: 1 }],
+  test_callers: [] })`;
+
+function pickOf(t, relPath, oldString, newString, extra = {}) {
+  const run = runPreEditHook(t, { relPath, oldString, newString, stubExec: STUB_BY_NAME, ...extra });
+  assert.equal(run.res.status, 0, run.res.stderr);
+  const m = /caller_of_(\w+)/.exec(run.res.stdout);
+  return { picked: m ? m[1] : null, ...run };
+}
+
+test('pick S1: a Rust call site `match f(…) {` is no definition: no summary', (t) => {
+  const { picked } = pickOf(t, 'src/lib.rs',
+    '    match parse_with_deadline(parser, source, timeout) {\n        Ok(t) => t,',
+    '    match parse_with_deadline(parser, &parsed, timeout) {\n        Ok(t) => t,');
+  assert.equal(picked, null);
+});
+
+test('pick S2: past a comment\'s "function already", the definition the edit changed', (t) => {
+  const { picked } = pickOf(t, 'lib/db.mjs',
+    '/**\n * a second call to recover a number this function already had\n */\nexport function dbUnusableRemedy(dbPath, err) {',
+    '/**\n * a second call to recover a number this function already had\n */\nexport function dbUnusableRemedy(dbPath, err, { afterRepair = false } = {}) {');
+  assert.equal(picked, 'dbUnusableRemedy');
+});
+
+test('pick S3: a `{` inside the parameters does not end the header', (t) => {
+  const { picked } = pickOf(t, 'lib/steer.mjs',
+    'export function writeLocalSteering(root, { slug, version }) {\n  return slug;',
+    'export function writeLocalSteering(root, { slug, version, cwd = root }) {\n  return slug;');
+  assert.equal(picked, 'writeLocalSteering');
+});
+
+test('pick S4: the later definition the edit changed, recorded for the Stop check', (t) => {
+  const { picked, home } = pickOf(t, 'src/resolve.rs',
+    'fn resolve_pending_calls(db: &Db) -> usize {\n    resolve_pending_calls_touching(db, &mut Vec::new())\n}\n\n' +
+    'fn resolve_pending_calls_touching(db: &Db, touched: &mut Vec<u32>) -> usize {',
+    'fn resolve_pending_calls(db: &Db) -> usize {\n    resolve_pending_calls_touching(db, &mut Vec::new(), &mut Vec::new())\n}\n\n' +
+    'fn resolve_pending_calls_touching(db: &Db, touched: &mut Vec<u32>, seen: &mut Vec<u32>) -> usize {',
+    { sessionId: 'sess-pick-s4' });
+  assert.equal(picked, 'resolve_pending_calls_touching');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = path.join(home, 'tmp', 'code-graph-mcp');
+  const log = fs.readdirSync(dir).find((f) => f.startsWith('.cg-edits-') && f.endsWith('-sess-pick-s4.jsonl'));
+  assert.ok(log, `no edit log in ${dir}`);
+  const symbols = fs.readFileSync(path.join(dir, log), 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l).symbol);
+  assert.ok(symbols.includes('resolve_pending_calls_touching'), `logged: ${symbols}`);
+});
+
+test('pick S5: of two same-named definitions in the hunk, the changed one is placed', (t) => {
+  const { res } = runPreEditHook(t, {
+    relPath: 'src/app.py', setup: writeTwoGets, stubExec: STUB_SAME_FILE,
+    oldString: 'class A:\n    def fetch(self, k):\n        return k\n\n\nclass B:\n    def fetch(self, k):',
+    newString: 'class A:\n    def fetch(self, k):\n        return k\n\n\nclass B:\n    def fetch(self, k, default=None):',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /caller_of_22/, `B.fetch starts at line 7; got: ${res.stdout}`);
+});
+
+test('pick S6: a JS method whose parameters span lines keeps its summary', (t) => {
+  // stop-impact.js reads one-line method headers only; the pick reads this one.
+  const { picked } = pickOf(t, 'src/svc.js',
+    '  async charge(order,\n    currency) {\n    return 1;',
+    '  async charge(order,\n    currency, opts) {\n    return 1;');
+  assert.equal(picked, 'charge');
+});
+
+test('pick S7: a language the reader does not read keeps the pick', (t) => {
+  const { picked } = pickOf(t, 'scripts/deploy.sh',
+    'function deploy_app() {\n  echo hi',
+    'deploy_app() {\n  echo hi');
+  assert.equal(picked, 'deploy_app');
+});
+
+test('pick S8: a header the reader cannot read keeps the pick, in a keyword language too', (t) => {
+  const params = Array.from({ length: 80 }, (_, i) => `p${i}: u32`).join(', ');
+  assert.ok(params.length > 600, 'longer than stop-impact.js MAX_SIGNATURE_CHARS');
+  const { picked } = pickOf(t, 'src/big.rs',
+    `fn big_one(${params}) -> u32 {\n    0`,
+    `fn big_one(${params.replace('p0: u32', 'q0: u64')}) -> u32 {\n    0`);
+  assert.equal(picked, 'big_one');
+});
+
+test('pick S9: a pick on a comment line with no changed definition: no summary', (t) => {
+  const { picked } = pickOf(t, 'src/limits.js',
+    '// a function wrapping head under\nconst limit = 1;',
+    '// a function wrapping it under\nconst limit = 1;');
+  assert.equal(picked, null);
 });
 
 // E2E 2026-10-16 (plugin-user QA, P1): on flask `url_for`, `impact --json`

@@ -28,6 +28,7 @@ const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolContext } = require('./hook-emit');
 const { hidden } = require('./proc-opts');
 const { remainingMs } = require('./hook-fail-open');
+const { definitionHeaders } = require('./stop-impact');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu
@@ -135,8 +136,9 @@ const scanned = oldStr.length > 8192 ? oldStr.slice(0, 8192) : oldStr;
 // matches — 0.163.0's rule. Three replacements (the earliest match, then an
 // allow-list of what may precede a method name, then keyword-anchored arms
 // first) each fixed shapes and broke others, and three review rounds found a
-// regression in each (pre-tag review 2026-09-29), so the released rule stays
-// until a per-language design with a corpus for each language replaces it.
+// regression in each (pre-tag review 2026-09-29), so this rule still names the
+// pick; the Stop check's per-language reader decides below, where it reads the
+// language, which definition the edit changed.
 //
 // Where the definition starts is its name's line: `// TODO: make this
 // async\nfn f(` matches from the comment line, and the same-file pick below
@@ -179,7 +181,57 @@ function headerAt(text, at) {
     .filter((i) => i >= 0);
   return ends.length ? rest.slice(0, Math.min(...ends)) : rest.split('\n', 1)[0];
 }
-if (newStr.includes(headerAt(scanned, symbolAt))) process.exit(0);
+const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
+
+// Which definition the edit changed, where the Stop check's per-language reader
+// (stop-impact.js LANGS) reads this file: a definition of the hunk whose
+// signature key the new text no longer has. The pick above sent 27 of its 95
+// impact queries for names that are no definition there (a Rust `match f(…)
+// {`, a comment's "function already") and missed 24 changed headers (a `{`
+// inside the parameters, a later definition), measured on every Edit hunk in
+// this machine's transcripts (tasks/specs/pre-edit-pick-by-reader.md).
+//   - a changed definition of the picked name → it, placed where it starts;
+//   - the pick's header changed and the pick may be a definition the reader
+//     cannot see (JS/TS, C-family: a method whose parameters span lines) → the
+//     pick, as before;
+//   - else the first changed definition, logged for the Stop check too;
+//   - else none.
+// The pick is no definition when its line is a comment, or when the language
+// keys every definition with a keyword the reader reads (`keywordOnly`). No
+// reading of the hunk (a language not in LANGS, a header past its cap) leaves
+// the pick's own verdict. A comment here is not stop-impact.js's COMMENT_LINE,
+// which takes any line opening with `*`: that is a JS generator method
+// (`*entries(prefix) {`) too, a definition; a doc comment's `*` is followed by
+// a space, a `/` or the line's end. `#[` is a Rust attribute.
+const PICK_ON_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
+function changedDefinition() {
+  const ext = path.extname(editedAbs).toLowerCase();
+  const before = definitionHeaders(oldStr, ext);
+  const after = before && definitionHeaders(newStr, ext);
+  if (!before || !after) return bodyOnly ? null : { name: symbol, at: symbolAt };
+  const left = new Map();
+  for (const d of after.defs) left.set(`${d.name}\0${d.key}`, (left.get(`${d.name}\0${d.key}`) || 0) + 1);
+  const changed = [];
+  for (const d of before.defs) {
+    const k = `${d.name}\0${d.key}`;
+    if (left.get(k) > 0) left.set(k, left.get(k) - 1);
+    else changed.push(d);
+  }
+  const same = changed.find((d) => d.name === symbol);
+  if (same) return { name: symbol, at: same.at };
+  const lineStart = scanned.lastIndexOf('\n', symbolAt - 1) + 1;
+  const lineEnd = scanned.indexOf('\n', symbolAt);
+  const pickLine = scanned.slice(lineStart, lineEnd === -1 ? scanned.length : lineEnd);
+  if (!bodyOnly && !before.keywordOnly && !PICK_ON_A_COMMENT.test(pickLine)) return { name: symbol, at: symbolAt };
+  return changed.length ? { name: changed[0].name, at: changed[0].at } : null;
+}
+const edited = changedDefinition();
+if (!edited) process.exit(0);
+if (edited.name !== symbol) {
+  symbol = edited.name;
+  logEdit(symbol);
+}
+symbolAt = edited.at;
 
 if (process.env.CODE_GRAPH_QUIET_HOOKS === '1') process.exit(0);
 
