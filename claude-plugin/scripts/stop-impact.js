@@ -115,16 +115,16 @@ function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Every run a definition pattern can scan from one start position is bounded,
-// or a read is quadratic: `[^)\n]*` re-scanned the rest of a line from every
-// `const a = (`, Go `func (` and Kotlin `fun <` on it, and a modifier run
-// crossing newlines re-read every following line from each line of a run of
-// `async` lines (D#572: 100 KB took 2.8 s per read; pre-edit-guide reads a hunk
-// twice within a 4 s budget). A bracket's contents stop at MAX_SIGNATURE_CHARS,
-// past which the header has no reading anyway; such a definition is now not
-// found rather than unread. Methods take at most four modifiers, as many as a
-// valid TypeScript method has (an access modifier, `static`, `override`,
-// `async` or `get`/`set`).
+// Two kinds of run made a read quadratic and are bounded: a bracket's contents
+// (`[^)\n]*` re-scanned the rest of a line from every `const a = (`, Go
+// `func (` and Kotlin `fun <` on it), and a modifier run crossing newlines
+// (it re-read every following line from each line of a run of `async` lines;
+// D#572: 100 KB took 2.8 s per read; pre-edit-guide reads a hunk twice within
+// a 4 s budget). A bracket's contents stop at MAX_SIGNATURE_CHARS, readHeader's
+// own cap: a definition with a longer run is not found (0.179.0 found it and
+// read no header for it, or one cut short at a `;` or `{` before its name).
+// Methods take at most four modifiers, as many as a valid TypeScript method
+// has (an access modifier, `static`, `override`, `async` or `get`/`set`).
 const BRACKETED = `{0,${MAX_SIGNATURE_CHARS}}`;
 
 // What comes before a definition's name: the keyword, Go's receiver, Kotlin's
