@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.179.0
+
+**Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the Rust source
+is 0.178.0's apart from the version number. What changes is the plugin's
+impact summary before an Edit of a `.rs`, `.py`, `.js`, `.mjs`, `.cjs` or
+`.ts` file: it now appears for some edits that change a definition's header
+where it said nothing, it is gone for some names that were no definition, and
+the Stop check also checks a definition named this way (below). Pinning the
+binary does not reach the plugin's hooks; `CODE_GRAPH_QUIET_HOOKS=1` silences
+the summary and the Stop check. To pin the binary back anyway: `npm i -g
+@sdsrs/code-graph@0.178.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.178.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
 
 ### The impact summary before an Edit names the definition the edit changed
 
