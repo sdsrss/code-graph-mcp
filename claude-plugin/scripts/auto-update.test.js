@@ -29,6 +29,18 @@ for (const k of GIT_ENV_VARS) delete process.env[k];
 // covers every spawn site at once; the few tests that need the variable set it
 // explicitly in their own child env, which still wins.
 delete process.env.CLAUDE_CONFIG_DIR;
+
+// HOME names a sandbox for this whole file, set before the require below loads
+// find-binary.js, which fixes its `~/.cache/code-graph` path at require time:
+// the in-process self-heal tests clear that cache, and a run deleted the
+// developer's binary cache (D#571; tests/hardening.rs checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 function cleanGitEnv() {
   const e = { ...process.env };
   for (const k of GIT_ENV_VARS) delete e[k];

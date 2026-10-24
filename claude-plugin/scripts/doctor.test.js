@@ -6,6 +6,20 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// HOME names a sandbox for this whole file, set before the requires below:
+// find-binary.js fixes its `~/.cache/code-graph` path at require time, so a
+// test body redirecting HOME comes too late, and the in-process
+// runDiagnostics calls rewrote the developer's binary cache to this
+// checkout's target/release, which the installed plugin then ran (D#571;
+// tests/hardening.rs js_test_suite_leaves_the_shared_tmp_dir_intact).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+process.env.CLAUDE_CONFIG_DIR = path.join(HOME_SANDBOX, '.claude');
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const { runDiagnostics, formatReport, surveyHookCoverage } = require('./doctor');
 const { buildSettingsHookEntries } = require('./lifecycle');
 

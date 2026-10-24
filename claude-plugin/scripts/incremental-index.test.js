@@ -6,6 +6,18 @@ const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
 
+// HOME names a sandbox for this whole file, set before find-binary.js fixes
+// its `~/.cache/code-graph` path at require time: findBinary() below rewrote
+// the developer's binary cache to this checkout's target/release, which the
+// installed plugin then ran (D#571; tests/hardening.rs checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+process.env.CLAUDE_CONFIG_DIR = path.join(HOME_SANDBOX, '.claude');
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const { findBinary } = require('./find-binary');
 const { shouldRun } = require('./incremental-index');
 

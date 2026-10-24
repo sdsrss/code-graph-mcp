@@ -16,8 +16,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+
+// HOME names a sandbox for this whole file: the launchers spawned here inherit
+// it, and their findBinary() rewrote the developer's `~/.cache/code-graph`
+// binary cache to this checkout's target/release, which the installed plugin
+// then ran (D#571; tests/hardening.rs checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+process.env.CLAUDE_CONFIG_DIR = path.join(HOME_SANDBOX, '.claude');
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const REPO_ROOT = path.resolve(PLUGIN_ROOT, '..');

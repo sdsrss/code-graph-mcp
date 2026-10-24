@@ -69,6 +69,18 @@ test.after(() => {
   try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
+// HOME too, for the spawns that inherit it (`{ ...process.env }`): their
+// findBinary() rewrote the developer's `~/.cache/code-graph` binary cache to
+// this checkout's target/release, which the installed plugin then ran (D#571;
+// the same hardening.rs test checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-install-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+process.env.CLAUDE_CONFIG_DIR = path.join(HOME_SANDBOX, '.claude');
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
 // Sandbox HOMEs are removed when the run ends — under Claude Code $TMPDIR is
 // ~/.claude/tmp, and leaked mkdtemp dirs accumulate there (223 observed before
 // this cleanup existed).

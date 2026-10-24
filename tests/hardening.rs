@@ -3246,6 +3246,14 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     let canary_settings = canary_cfg.join("settings.json");
     fs::write(&canary_settings, b"{\"canary\":true}").unwrap();
 
+    // HOME's own cache, seeded with a stand-in for the developer's binary cache
+    // so that a test deleting or rewriting it shows, not only one writing
+    // beside it (the fourth axis below).
+    let home_cache = sandbox.path().join(".cache").join("code-graph");
+    fs::create_dir_all(&home_cache).unwrap();
+    let home_sentinel = home_cache.join("binary-path");
+    fs::write(&home_sentinel, b"sentinel").unwrap();
+
     // Output goes to FILES, not pipes: this reads the child's exit with a
     // deadline below, and a piped stdout that nobody drains deadlocks the child
     // once the pipe buffer fills — which would turn a hang-guard into a hang.
@@ -3472,6 +3480,29 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
          above; this assertion exists because an in-place rewrite leaves the \
          path listing identical.",
         canary_settings.display()
+    );
+
+    // Fourth axis: HOME itself. The sandbox is the HOME every file inherits, so
+    // what happens under its `.cache/code-graph` happens, in a developer's own
+    // run, to the installed plugin's cache. Measured before this assertion
+    // (D#571): seven files rewrote `binary-path` there to this checkout's
+    // `target/release`, which the installed plugin's hooks then ran, and
+    // auto-update.test.js deleted it. Some did it in process (find-binary.js
+    // fixes the path at require time, so a HOME redirected inside a test body
+    // comes too late), the others through spawns that inherit HOME.
+    let mut home_tree = Vec::new();
+    walk(&home_cache, &home_cache, &mut home_tree);
+    home_tree.sort();
+    let sentinel_now = fs::read_to_string(&home_sentinel).unwrap_or_else(|_| "<gone>".into());
+    assert!(
+        home_tree == ["binary-path"] && sentinel_now == "sentinel",
+        "the JS test suite changed $HOME/.cache/code-graph, which in a \
+         developer's own run is the installed plugin's cache: it now holds [{}] \
+         and binary-path reads {:?}. Point HOME and USERPROFILE at a \
+         `mkdtempSync` sandbox at MODULE scope in the offending file, before the \
+         require that pulls in find-binary.js, and delete it in a `test.after`.",
+        home_tree.join(", "),
+        sentinel_now
     );
 }
 

@@ -11,6 +11,17 @@ const { spawnSync, execFileSync } = require('node:child_process');
 // module load so every spawn below inherits the sandbox, not the live dir.
 delete process.env.CLAUDE_CONFIG_DIR;
 
+// HOME names a sandbox for the spawns that do not redirect it: their
+// findBinary() rewrote the developer's `~/.cache/code-graph` binary cache to
+// this checkout's target/release, which the installed plugin then ran (D#571;
+// tests/hardening.rs checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const {
   extractSignatures, allSignatures, definitionHeaders, signatureChanged, findCallSiteLine, computeStopReport,
   formatStopContext, followUpOf, reportRecords, MAX_FOLLOWUP_FILES,

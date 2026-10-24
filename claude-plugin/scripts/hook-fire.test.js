@@ -12,6 +12,20 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+
+// HOME names a sandbox for this whole file, set before the requires below
+// load find-binary.js, which fixes its `~/.cache/code-graph` path at require
+// time; the spawns that do not redirect HOME inherit it too. With the real
+// HOME a run rewrote the developer's binary cache to this checkout's
+// target/release, which the installed plugin then ran (D#571;
+// tests/hardening.rs checks it).
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-test-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
 const { verifyHooksFire } = require('./lifecycle');
 const { hookFireWarning, analyzeHookDark } = require('./session-init');
 
