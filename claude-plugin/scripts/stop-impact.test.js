@@ -134,13 +134,15 @@ test('definitionHeaders: every definition in text order, with its line start and
   }
 });
 
-test('definitionHeaders: keywordOnly only where every definition carries the keyword', () => {
-  for (const ext of ['.rs', '.py', '.pyi', '.go', '.php', '.scala', '.sc', '.rb', '.lua']) {
+test('definitionHeaders: keywordOnly only where it was measured: Rust and Python', () => {
+  for (const ext of ['.rs', '.py', '.pyi']) {
     assert.equal(definitionHeaders('', ext).keywordOnly, true, ext);
   }
-  // JS/TS read one-line methods only; C-family has no keyword; Kotlin's
-  // `fun String.x()` is not read.
-  for (const ext of ['.js', '.ts', '.tsx', '.mjs', '.c', '.cpp', '.java', '.cs', '.kt', '.kts']) {
+  // JS/TS methods and C functions have no keyword; Kotlin's `fun String.x()`
+  // and PHP's `function &x()` put something between the keyword and the name;
+  // Go, Scala, Ruby and Lua had no hunk to measure on.
+  for (const ext of ['.js', '.ts', '.tsx', '.mjs', '.c', '.cpp', '.java', '.cs', '.kt', '.kts',
+    '.go', '.php', '.scala', '.sc', '.rb', '.lua']) {
     assert.equal(definitionHeaders('', ext).keywordOnly, false, ext);
   }
 });
@@ -155,20 +157,15 @@ test('definitionHeaders: keywordLeads reads the keyword right before a name', ()
   for (const before of ['fn ', '    pub(crate) async fn ', '#[inline] pub fn ', 'impl Conv for Cfg { fn ', '"fn ']) {
     assert.equal(rs.keywordLeads(before), true, before);
   }
-  for (const before of ['    match ', '    if !x.', '    let v = ', '', 'fnord ', 'xfn ']) {
+  for (const before of ['    match ', '    if !x.', '    let v = ', '', 'fnord ', 'xfn ', 'fn main() { let v = ']) {
     assert.equal(rs.keywordLeads(before), false, before);
   }
+  assert.equal(definitionHeaders('', '.py').keywordLeads('def run(): return '), false, 'the keyword must end right at the name');
   assert.equal(definitionHeaders('', '.go').keywordLeads('func (s *Server) '), true, 'Go receiver');
   assert.equal(definitionHeaders('', '.go').keywordLeads('go '), false);
-  assert.equal(definitionHeaders('', '.scala').keywordLeads('class '), true, 'a Scala class constructor');
   assert.equal(definitionHeaders('', '.rb').keywordLeads('items.'), false, 'a call with a block');
   assert.equal(definitionHeaders('', '.php').keywordLeads('#[Route("/x")] public function '), true);
   assert.equal(definitionHeaders('', '.cpp').keywordLeads('static int '), false, 'no keyword in C-family');
-});
-
-test('definitionHeaders: typed only for the C-family profile', () => {
-  for (const ext of ['.c', '.h', '.cpp', '.hpp', '.java', '.cs']) assert.equal(definitionHeaders('', ext).typed, true, ext);
-  for (const ext of ['.rs', '.py', '.js', '.ts', '.go', '.kt', '.rb']) assert.equal(definitionHeaders('', ext).typed, false, ext);
 });
 
 test('definitionHeaders: no reading when any header has none, the language is not read, or a line is over-long', () => {

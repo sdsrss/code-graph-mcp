@@ -925,6 +925,7 @@ test('pick: a definition after an attribute, a closed comment or an `impl {` on 
   const cases = [
     ['src/a.rs', '#[inline] pub fn widen(a: u8) -> u8 {\n    a', '#[inline] pub fn widen(a: u8, b: u8) -> u8 {\n    a', 'widen'],
     ['src/a.rs', '/* fast path */ pub fn quick(a: u8) {\n}', '/* fast path */ pub fn quick(a: u8, b: u8) {\n}', 'quick'],
+    ['src/a.rs', '/* a */ /* b */ fn helper(a: u8) {\n}', '/* a */ /* b */ fn helper(a: u8, b: u8) {\n}', 'helper'],
     ['src/a.rs', 'impl Conv for Cfg { fn convert(&self, a: u8) -> u8 { a } }',
       'impl Conv for Cfg { fn convert(&self, a: u16) -> u16 { a } }', 'convert'],
     ['src/a.php', '#[Route("/x")] public function show($id) {\n}', '#[Route("/x")] public function show($id, $fmt) {\n}', 'show'],
@@ -954,6 +955,41 @@ test('pick: a C-family statement the reader takes for a definition is not named 
       .map((l) => JSON.parse(l).symbol).filter(Boolean);
     assert.deepEqual(symbols, [before.startsWith('static') ? 'total' : 'step'], 'the Stop check gets the pick only');
   }
+});
+
+// Pre-tag review of 0.179.0, round 2: in languages the corpus had no hunk
+// in, the reader misread shapes (Kotlin's `fun Config.validate(` reads as
+// `Config`, PHP's `function &name(` has no keyword before the name, a C++
+// statement `Type step(…);` reads as `step`'s definition). There the pick keeps
+// 0.178.0's verdict, wrong or right.
+test('pick: a language without measured hunks keeps 0.178.0\'s verdict', (t) => {
+  const cases = [
+    ['src/Config.kt', 'fun helper(a: Int) {\n}\nfun Config.validate(strict: Boolean) {\n}',
+      'fun helper(a: Int) {\n}\nfun Config.validate(strict: Boolean, deep: Boolean) {\n}', null],
+    ['src/inst.php', 'function &get_instance($a) {\n}', 'function &get_instance($a, $b) {\n}', 'get_instance'],
+    ['src/w.cpp', 'void Spin::step(int a) {\n  emit step(a + 1);', 'void Spin::step(int a) {\n  emit step(a + 2);', null],
+    ['src/C.scala', 'enum Color(val rgb: Int) {\n}', 'enum Color(val rgb: Long) {\n}', 'Color'],
+    ['src/a.go', 'func keepOne() {\n}\nfunc secondOne(a int) {\n}', 'func keepOne() {\n}\nfunc secondOne(a int64) {\n}', null],
+    ['lib/p.rb', 'class P\n  def self.parse(b)\n    b\n  end', 'class P\n  def self.parse(b, c)\n    b\n  end', 'self'],
+  ];
+  for (const [rel, before, after, name] of cases) {
+    assert.equal(pickOf(t, rel, before, after).picked, name, `${rel}: ${before}`);
+  }
+});
+
+test('pick: two same-named definitions with one old header moved in the hunk: no guess', (t) => {
+  // In order, the first and last changed; by count, one did. The hunk moved them.
+  const { picked } = pickOf(t, 'src/app.py',
+    'def fetch(self, k):\n    pass\n\ndef fetch(self, k):\n    pass\n\ndef fetch(self, j):\n    pass',
+    'def fetch(self, j):\n    pass\n\ndef fetch(self, k):\n    pass\n\ndef fetch(self, k, d):\n    pass');
+  assert.equal(picked, null);
+});
+
+test('pick: a definition the hunk removes is named', (t) => {
+  const { picked } = pickOf(t, 'src/app.py',
+    'def keep_me(a):\n    pass\n\ndef gone_one(b):\n    pass',
+    'def keep_me(a):\n    pass\n');
+  assert.equal(picked, 'gone_one');
 });
 
 test('pick: a changed definition of the picked name wins over an earlier changed one', (t) => {

@@ -20,8 +20,9 @@ The scripts read `claude-plugin/scripts/pre-edit-guide.js` and
 against the BASE tree when comparing after the change.
 
 `hook_diff.js` runs the real pre-edit-guide.js of two script trees on every
-hunk with a stub binary and classifies each hunk (same / added / removed /
-switched); `hunk_lines.js` prints the pick's line, old and new, for rows of it.
+hunk with a stub binary and classifies each hunk by the name each asks about
+(same / added / removed / switched; where a name is placed is not compared);
+`hunk_lines.js` prints the pick's line for rows of it.
 
     node hook_diff.js <scratch>/edits.jsonl <treeA>/claude-plugin/scripts <treeB>/claude-plugin/scripts <scratch>/work
     node hunk_lines.js <scratch>/edits.jsonl <treeA>/claude-plugin/scripts/pre-edit-guide.js <name>@<id:k>...

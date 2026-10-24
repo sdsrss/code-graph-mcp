@@ -89,27 +89,27 @@ const NOT_A_TYPE = new Set([
 //            initializers, C# `: base(…)` — body, not signature)
 //   closeParen  the parameter list's `)` ends it (Ruby, Lua: no return types,
 //            and a one-line body may follow on the same line)
-//   keywordOnly  every definition has `keyword` right before its name (Go:
-//            after the receiver), so a name without it is no definition
-//            (pre-edit-guide reads that; these rules do not find every such
-//            definition: a line opening with `#[` or `/* … */`, a second one
-//            on a line; Kotlin's `fun String.x()` keeps it off Kotlin)
+//   keywordOnly  every function definition's name follows `keyword`, so a
+//            name without it is none (pre-edit-guide reads that; Rust and
+//            Python only, the languages it was measured on. These rules do not
+//            find every such definition: a line opening with `#[` or `/* … */`,
+//            a second one on a line)
 const LANGS = new Map();
 function defineLang(exts, profile) {
   for (const e of exts) LANGS.set(e, profile);
 }
 defineLang(['.rs'], { keyword: 'fn', ends: '{;', keywordOnly: true });
 defineLang(['.py', '.pyi'], { keyword: 'def', ends: ':', keywordOnly: true });
-defineLang(['.go'], { keyword: 'func', receiver: true, ends: '{;\n', keywordOnly: true });
+defineLang(['.go'], { keyword: 'func', receiver: true, ends: '{;\n' });
 defineLang(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'],
   { keyword: 'function\\*?', jsForms: true, ends: '{;', arrowEnds: true, angles: true });
-defineLang(['.php'], { keyword: 'function', ends: '{;', keywordOnly: true });
+defineLang(['.php'], { keyword: 'function', ends: '{;' });
 defineLang(['.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx', '.java', '.cs'],
   { typed: true, ends: '{;', arrowEnds: true, afterParams: true });
 defineLang(['.kt', '.kts'], { keyword: 'fun', typeParams: true, ends: '{=\n' });
-defineLang(['.scala', '.sc'], { keyword: 'def', ends: '{=\n', keywordOnly: true });
-defineLang(['.rb'], { keyword: 'def', ends: ';=\n', closeParen: true, keywordOnly: true });
-defineLang(['.lua'], { keyword: 'function', ends: '\n', closeParen: true, keywordOnly: true });
+defineLang(['.scala', '.sc'], { keyword: 'def', ends: '{=\n' });
+defineLang(['.rb'], { keyword: 'def', ends: ';=\n', closeParen: true });
+defineLang(['.lua'], { keyword: 'function', ends: '\n', closeParen: true });
 
 function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -117,10 +117,10 @@ function escapeRe(s) {
 
 // What comes before a definition's name: the keyword, Go's receiver, Kotlin's
 // type parameters.
-function keywordLead(lang, keyword = lang.keyword) {
+function keywordLead(lang) {
   const receiver = lang.receiver ? '(?:\\([^)\\n]*\\)\\s*)?' : '';
   const typeParams = lang.typeParams ? '(?:<[^>\\n]*>\\s*)?' : '';
-  return `\\b(?:${keyword})\\s+${receiver}${typeParams}`;
+  return `\\b(?:${lang.keyword})\\s+${receiver}${typeParams}`;
 }
 
 function definitionPatterns(S, lang) {
@@ -199,14 +199,12 @@ function allSignatures(text, ext = '') {
  * its signature key (as allSignatures reads it) — for pre-edit-guide, which
  * must tell which of a hunk's definitions an edit changed and where it sits.
  * `keywordOnly` (LANGS) with `keywordLeads`, which tests the text before a
- * name on its line: a name it is false for is no definition in this language
- * (`class`, `trait` too: a Scala class's parameters are its constructor's).
- * `typed`: C-family, where a statement `Type name(args);` reads as a
- * definition here too. null when there is no exact reading of the whole text:
- * the language is not in LANGS, a definition sits on an over-long line, or
- * any header has no reading.
+ * name on its line: where both hold, a name it is false for is no definition.
+ * null when there is no exact reading of the whole text: the language is not
+ * in LANGS, a definition sits on an over-long line, or any header has no
+ * reading.
  * @returns {{ defs: {name:string, at:number, key:string}[], keywordOnly: boolean,
- *   keywordLeads: (before: string) => boolean, typed: boolean }|null}
+ *   keywordLeads: (before: string) => boolean }|null}
  */
 function definitionHeaders(text, ext = '') {
   const lang = LANGS.get(String(ext).toLowerCase());
@@ -222,12 +220,11 @@ function definitionHeaders(text, ext = '') {
     }
   }
   defs.sort((x, y) => x.at - y.at);
-  const lead = lang.keyword ? new RegExp(`${keywordLead(lang, `${lang.keyword}|class|trait`)}$`) : null;
+  const lead = lang.keyword ? new RegExp(`${keywordLead(lang)}$`) : null;
   return {
     defs,
     keywordOnly: lang.keywordOnly === true,
     keywordLeads: (before) => lead !== null && lead.test(before),
-    typed: lang.typed === true,
   };
 }
 

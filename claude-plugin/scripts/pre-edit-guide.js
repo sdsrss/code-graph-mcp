@@ -193,20 +193,27 @@ const bodyOnly = newStr.includes(headerAt(scanned, symbolAt));
 // the new one), measured on every Edit hunk in this machine's transcripts
 // (tasks/specs/pre-edit-pick-by-reader.md).
 //   - a changed definition of the picked name → it, placed where it starts;
-//   - the pick's header changed and the pick may be a definition the reader
-//     cannot see (a method whose parameters span lines, a definition after
-//     `#[inline]` on its line) → the pick, as before;
-//   - else the first changed definition, logged for the Stop check too — not
-//     in C-family files, where `std::vector<int> buffer(n);` reads as one;
+//   - the pick's header changed as the first-match rule reads it, and the pick
+//     is not proven no definition → the pick, as before. The reader may not
+//     see it (a method whose parameters span lines, `#[inline] fn` on one
+//     line); where it reads it unchanged, the old reading can have run into
+//     the next definition, which 0.178.0 did too;
+//   - else the first changed definition, logged for the Stop check too;
 //   - else none.
 // The pick is no definition when its line opens a comment that has not closed
-// before it, or when the language's every definition has its keyword right
-// before its name and the pick has none (`keywordOnly`). No reading of the
-// hunk (a language not in LANGS, a header past its cap) leaves the pick's own
-// verdict. A comment here is not stop-impact.js's COMMENT_LINE, which takes any
+// before it, or, in Rust and Python, when its name does not follow `fn` /
+// `def`. A comment here is not stop-impact.js's COMMENT_LINE, which takes any
 // line opening with `*` or `#`: `*entries(prefix) {` is a JS generator method,
 // `#[inline] pub fn` a Rust definition; a doc comment's `*` is followed by a
 // space, a `/` or the line's end.
+//
+// Only in the languages that corpus had hunks in. Elsewhere the reader misread
+// shapes no hunk there had (pre-tag review of 0.179.0: Kotlin's `fun
+// Config.validate(` reads as `Config`, PHP's `function &name(` has no keyword
+// before the name, a C++ statement `Type name(args);` reads as a definition),
+// so the pick keeps its own verdict, as in 0.178.0; so does a hunk the reader
+// has no reading of (a header past its cap).
+const READER_MEASURED = new Set(['.rs', '.py', '.js', '.mjs', '.cjs', '.ts']);
 const OPENS_A_COMMENT = /^\s*(?:\/\/|\/\*|\*(?=\s|\/|$)|#(?!\[)|--|;)/;
 function onComment(line, nameCol) {
   const closed = /^\s*(?:\/\*.*?\*\/\s*)+/.exec(line.slice(0, nameCol));
@@ -214,7 +221,7 @@ function onComment(line, nameCol) {
 }
 function changedDefinition() {
   const ext = path.extname(editedAbs).toLowerCase();
-  const before = definitionHeaders(oldStr, ext);
+  const before = READER_MEASURED.has(ext) ? definitionHeaders(oldStr, ext) : null;
   const after = before && definitionHeaders(newStr, ext);
   if (!before || !after) return bodyOnly ? null : { name: symbol, at: symbolAt };
   const count = (defs) => {
@@ -233,11 +240,15 @@ function changedDefinition() {
   // The count matches headers, not definitions: of two definitions of one name
   // with one old header, one kept, it marks the later, whichever the edit
   // changed. Such a name's definitions pair in order when the hunk keeps their
-  // number; otherwise which one changed is not in the text, and none is named.
+  // number and pairing finds as many changed as the count; otherwise which one
+  // changed is not in the text (one went, or the hunk moved them), and none of
+  // that name is named.
   const twinned = new Set(changed
     .filter((c) => (has.get(`${c.name}\0${c.key}`) || 0) > 0)
     .map((c) => c.name));
   if (twinned.size) {
+    const counted = new Map();
+    for (const d of changed) if (twinned.has(d.name)) counted.set(d.name, (counted.get(d.name) || 0) + 1);
     const byName = (defs) => {
       const m = new Map();
       for (const d of defs) if (twinned.has(d.name)) (m.get(d.name) || m.set(d.name, []).get(d.name)).push(d);
@@ -248,7 +259,8 @@ function changedDefinition() {
     changed = changed.filter((d) => !twinned.has(d.name));
     for (const [name, o] of olds) {
       const n = news.get(name) || [];
-      if (o.length === n.length) changed.push(...o.filter((d, i) => d.key !== n[i].key));
+      const paired = o.length === n.length ? o.filter((d, i) => d.key !== n[i].key) : [];
+      if (paired.length === counted.get(name)) changed.push(...paired);
     }
   }
   changed.sort((x, y) => x.at - y.at);
@@ -260,7 +272,7 @@ function changedDefinition() {
   const notADefinition = onComment(pickLine, nameAt - lineStart)
     || (before.keywordOnly && !before.keywordLeads(scanned.slice(lineStart, nameAt)));
   if (!bodyOnly && !notADefinition) return { name: symbol, at: symbolAt };
-  return changed.length && !before.typed ? { name: changed[0].name, at: changed[0].at } : null;
+  return changed.length ? { name: changed[0].name, at: changed[0].at } : null;
 }
 const edited = changedDefinition();
 if (!edited) process.exit(0);

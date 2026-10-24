@@ -1,7 +1,8 @@
 // The real pre-edit-guide.js of two trees, run on every Edit hunk of the corpus with a
 // stub binary that answers `impact` for any name: which name does each one ask about?
 // usage: node hook_diff.js <edits.jsonl> <scriptsDirA> <scriptsDirB> <workDir>
-// ALL=1 lists the hunks both name the same definition for too.
+// ALL=1 lists the hunks both ask about the same name for too. Names only: the line
+// a name is placed at is not compared.
 const fs = require('fs'); const path = require('path'); const { spawnSync } = require('child_process');
 const [corpus, dirA, dirB, work] = process.argv.slice(2);
 const proj = path.join(work, 'proj'); const tmp = path.join(work, 'tmp'); const home = path.join(work, 'home');
