@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### The pre-edit impact summary: two shapes back, no input past the budget
+
+Three items of 0.179.0's "Not covered" list:
+
+- Reading a hunk's definitions took time quadratic in the input for a few
+  shapes, and the hook reads a hunk twice. Measured on the whole hook, a fresh
+  process per run with a stub binary, median of three: 100 KB of lines holding
+  only `async` took 5.3 s and gave no summary, now 31 ms (0.178.0: 27 ms); one
+  320 KB line repeating `const a = (` took 5.3 s, now 78 ms (0.178.0: 30 ms).
+  The Stop check, and the baseline the hook records for an edited name, read
+  whole files with the same reader: on 160 KB of Go `func (` or Kotlin
+  `fun <` repeated on one line, or of `async` lines, one read took 1.1–1.5 s in
+  0.178.0 and 0.179.0, now 1–26 ms. Each run a definition pattern scans from
+  one position is now bounded: a method takes at most four modifiers, as many
+  as a valid TypeScript method has, and a bracketed run (a `const f = (…) =>`
+  parameter list, a Go receiver, Kotlin type parameters) at most 600
+  characters, past which a header had no reading anyway; such a definition is
+  now not found rather than found without a reading. The reader's output is
+  the same before and after on every distinct text of the Edit hunks in the
+  maintainer's transcripts (5,193: Rust, Python, JavaScript, TypeScript, C) and
+  on 16,076 Rust, JavaScript and TypeScript source files; no Go or Kotlin
+  corpus was at hand.
+- A JavaScript generator method written `* entries (prefix) {` (StandardJS
+  spacing) and a Rust `#![allow(…)] fn f(` on one line were taken for comment
+  lines and got no summary; both get 0.178.0's again. A JSDoc line written
+  like such a method, `* entries(prefix) {`, is named too, as in 0.178.0. A
+  JavaScript line that opens with `#` or `;` still gets none, now on purpose:
+  the index names a private method `#parse`, so asking for `parse` found
+  nothing or another `parse` in the file (0.178.0 asked), and it has no node
+  for the function expression of `;(function main (`.
+
+On the 4,159 distinct Edit hunks of those transcripts, run through the hook of
+0.179.0 and of this change with a stub binary that answers every name, every
+hunk asks about the same name or none (106 and 4,053): none of them holds
+either shape.
+
+The JS test suite no longer changes the developer's own
+`~/.cache/code-graph/binary-path`. Seven test files rewrote it to the
+checkout's `target/release`, which the installed plugin's hooks then ran, and
+`auto-update.test.js` deleted it: modules that resolve the path at require time
+were loaded under the real HOME, and spawned hooks inherited it. Each file now
+points HOME at a sandbox at module scope, and `tests/hardening.rs` seeds a
+stand-in cache in the HOME it gives the suite and fails when the suite
+changes it.
+
 ## 0.179.0
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the Rust source
