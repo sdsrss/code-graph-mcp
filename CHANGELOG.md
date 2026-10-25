@@ -25,8 +25,8 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
   test that rewrites `binary-path` and puts the same bytes back; one that
   deletes `bin/` and `update-state.json`; one that leaves a detached child
   writing into the cache 1 s after the runner exits; one that leaves a
-  detached child running for 45 s. The first three together left 0.179.1's
-  guard green.
+  detached child, with the environment it inherited, running for 45 s. The
+  first three together left 0.179.1's guard green.
 - `scripts/release-smoke.test.js` points HOME at a sandbox before its opt-in
   network test (`CODE_GRAPH_AUTO_UPDATE_E2E=1`) loads the updater. With every
   request answered 403, a stand-in HOME's `update-state.json` now stays
@@ -44,12 +44,15 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 - The wait for processes that outlive the suite runs on Linux only, where it
   reads `/proc/<pid>/environ`; on macOS and Windows the guard still does not
   see a write by such a process. Nor does it wait for a process that holds
-  none of those values, such as one started with an environment built from
-  scratch, or one carrying a test file's own sandbox, whose writes land
-  outside the three directories the guard checks. The pre-tag review measured
-  `lifecycle.e2e.test.js`'s updater re-creating that test's removed sandbox
-  under TMPDIR (in a developer's own run, the real tmp dir) with the 44 MB
-  binary it was downloading.
+  none of those values byte for byte: one started with an environment built
+  from scratch, one carrying a test file's own sandbox in all six, or one
+  holding a value spelled differently (`<sandbox>/`). What such a process
+  writes after the runner exits is not checked, and can land after the guard
+  has removed its sandbox. The pre-tag review measured one: in a copy of the
+  repository without `target/`, `lifecycle.e2e.test.js`'s updater re-created
+  that test's removed sandbox under TMPDIR, the 44 MB binary it was
+  downloading included. Where `target/` sits beside `Cargo.toml`, as in a
+  normal checkout, the updater takes dev mode and sends no request.
 - A test deleting a cache file the guard does not seed is still not seen:
   for example the binary at `bin/code-graph-mcp`, `install-manifest.json`,
   `statusline-registry.json` or `hook-fire-state.json`. Nor is a test that

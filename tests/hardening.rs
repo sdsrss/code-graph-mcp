@@ -2995,7 +2995,9 @@ fn js_test_files() -> Vec<std::path::PathBuf> {
 /// Processes whose environment holds one of `vars` exactly (`KEY=value`), as
 /// `pid: argv`. A child inherits its parent's environment unless its spawn
 /// replaces it, so for values made fresh for one spawn these are that spawn's
-/// live descendants that kept one, detached or not.
+/// live descendants that kept one, detached or not. The environment is the one
+/// each process started with: `/proc/<pid>/environ` does not show a change the
+/// process makes later.
 #[cfg(target_os = "linux")]
 fn processes_carrying(vars: &[(&str, &std::path::Path)]) -> Vec<String> {
     use std::os::unix::ffi::OsStrExt;
@@ -3463,12 +3465,14 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     // (a child inherits them, detached or not), and fail if one is still
     // running after 30 s: in a developer's own run those values are their real
     // HOME, tmp dir and Claude config. Exact values, not paths under the
-    // sandbox: each test file's own sandbox sits under TMPDIR, and a child that
-    // carries one writes there, into nothing checked below. lifecycle.e2e's
-    // updater is such a child; downloading the binary, it was measured alive
-    // 17.6 s after the runner exited (D#575 review). Linux only, where /proc
-    // shows a process's environment; elsewhere the list is empty and this
-    // waits for nothing.
+    // sandbox: each test file's own sandbox sits under TMPDIR, and a child
+    // whose six values all name one writes there, into nothing checked below.
+    // lifecycle.e2e's updater is such a child. In a copy of the repository
+    // without target/ it downloads the binary and was measured alive 17.6 s
+    // after the runner exited (D#575 review); with target/ beside Cargo.toml
+    // it takes dev mode and sends no request. Linux only, where /proc shows a
+    // process's environment; elsewhere the list is empty and this waits for
+    // nothing.
     let settle = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut survivors = processes_carrying(&guard_env);
     while !survivors.is_empty() && std::time::Instant::now() < settle {
@@ -3482,8 +3486,7 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
          CLAUDE_CONFIG_DIR this guard set. In a developer's own run those are \
          their real HOME, tmp dir and Claude config, and what these processes \
          write next lands there after this guard has looked. Wait for the child \
-         in the test that spawns it, or give it the test's own sandbox in every \
-         one of those variables:\n  {}",
+         in the test that spawns it:\n  {}",
         survivors.len(),
         survivors.join("\n  ")
     );
