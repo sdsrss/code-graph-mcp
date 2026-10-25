@@ -116,13 +116,15 @@ function escapeRe(s) {
 }
 
 // Two kinds of run made a read quadratic and are bounded: a bracket's contents
-// (`[^)\n]*` re-scanned the rest of a line from every `const a = (`, Go
-// `func (` and Kotlin `fun <` on it), and a modifier run crossing newlines
-// (it re-read every following line from each line of a run of `async` lines;
-// D#572: 100 KB took 2.8 s per read; pre-edit-guide reads a hunk twice within
-// a 4 s budget). A bracket's contents stop at MAX_SIGNATURE_CHARS, readHeader's
-// own cap: a definition with a longer run is not found (0.179.0 found it and
-// read no header for it, or one cut short at a `;` or `{` before its name).
+// (`[^)\n]*`, and Kotlin's `<[^>\n]*>`, re-scanned the rest of a line from
+// every `const a = (`, Go `func (` and Kotlin `fun <` on it), and a modifier
+// run crossing newlines (it re-read every following line from each line of a
+// run of `async` lines; D#572: 100 KB took 2.8 s per read; pre-edit-guide
+// reads a hunk twice within a 4 s budget). A bracket's contents stop at
+// MAX_SIGNATURE_CHARS, readHeader's own cap: a definition with a longer run is
+// not found. What 0.179.0 read for it varied: no header, a header cut short
+// before its name, or, on a line over MAX_DEFINITION_LINE_CHARS, nothing in
+// the whole file.
 // Methods take at most four modifiers, as many as a valid TypeScript method
 // has (an access modifier, `static`, `override`, `async` or `get`/`set`).
 const BRACKETED = `{0,${MAX_SIGNATURE_CHARS}}`;

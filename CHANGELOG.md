@@ -4,9 +4,9 @@
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the binary is
 built from 0.179.0's code apart from the version number. Only the plugin's
-hooks change: the impact summary before an Edit comes back for the two shapes
-0.178.0 named and 0.179.0 did not, and the inputs below that took seconds to
-read take milliseconds. Pinning the binary does not reach the plugin's hooks;
+hooks change: the impact summary before an Edit comes back for the lines below
+that 0.178.0 named and 0.179.0 did not, and the inputs below that took seconds
+to read take milliseconds. Pinning the binary does not reach the plugin's hooks;
 `CODE_GRAPH_QUIET_HOOKS=1` silences the summary and the Stop check. To pin the
 binary back anyway: `npm i -g @sdsrs/code-graph@0.179.0` (or, from source,
 `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
@@ -25,23 +25,24 @@ Three items of 0.179.0's "Not covered" list:
   320 KB line repeating `const a = (` took 5.3 s, now 78 ms (0.178.0: 30 ms).
   The Stop check, and the baseline the hook records for an edited name, read
   whole files with the same reader: on 160 KB of Go `func (` or Kotlin
-  `fun <` repeated on one line, or of `async` lines, one read took 1.1–8.7 s
-  in 0.178.0 and 0.179.0 (6.9–8.7 s for reading every name of the `async`
+  `fun <` repeated on one line, or of `async` lines, one read took 1.1–7.1 s
+  in 0.178.0 and 0.179.0 (6.7–7.1 s for reading every name of the `async`
   lines at once, as the baseline does before a Write or a `sed -i` of the
-  file), now 3–40 ms (median of five, a fresh process per read). The two
-  kinds of run that made a read quadratic are now bounded: a method takes at most four modifiers, as many as a valid
-  TypeScript method has, and a bracketed run (a `const f = (…) =>` parameter
-  list, a Go receiver, Kotlin type parameters) at most 600 characters, the
-  reader's cap on a header. A definition with a longer run is now not found.
-  0.179.0 found it, and what it read varied: no header, a header cut short
-  before the name (`a()` from `a(); g := func (…) Name() {`), or, with the run
-  on a line over 2,000 characters, nothing in the whole file. The reader's
-  output is the same before and after on every distinct text of the Edit
-  hunks in the maintainer's transcripts (5,193: Rust, Python, JavaScript,
-  TypeScript, C), on 16,076 Rust, JavaScript and TypeScript source files, and
-  on 10,088 Go files (gin and the Go 1.23.0 source tree: 24,012 lines with
-  `func (`) and 3,670 Kotlin files (kotlinx.coroutines 1.9.0, ktor 3.0.0,
-  okhttp: 1,167 lines with `fun <`); on the Go and Kotlin files, so is the
+  file), now 1.4–27 ms (five runs each, a fresh process per read, on an idle
+  machine). The two kinds of run that made a read quadratic are now bounded:
+  a method takes at most four modifiers, as many as a valid TypeScript method
+  has, and a bracketed run (a `const f = (…) =>` parameter list, a Go
+  receiver, Kotlin type parameters) at most 600 characters, the reader's cap
+  on a header. A definition with a longer run is now not found. 0.179.0 found
+  it, and what it read varied: no header, a header cut short before the name
+  (`a()` from `a(); g := func (…) Name() {`), or, with the run on a line over
+  2,000 characters, nothing in the whole file. The reader's output is the
+  same before and after on every distinct text of the Edit hunks in the
+  maintainer's transcripts (5,193: Rust, Python, JavaScript, TypeScript, C),
+  on 16,076 Rust, JavaScript and TypeScript source files, and on 10,088 Go
+  files (gin and the Go 1.23.0 source tree: 24,012 lines with `func (`) and
+  3,670 Kotlin files (kotlinx.coroutines 1.9.0, ktor 3.0.0 and okhttp
+  together: 1,167 lines with `fun <`); on the Go and Kotlin files, so is the
   answer of looking up each name found (103,347 lookups).
 - A JavaScript generator method written `* entries (prefix) {` (StandardJS
   spacing) and a Rust `#![allow(…)] fn f(` on one line were taken for comment
@@ -77,10 +78,12 @@ its directory.
 - `scripts/release-smoke.test.js`, which runs only with
   `CODE_GRAPH_AUTO_UPDATE_E2E=1`, keeps the real HOME: a GitHub 403 there
   writes `rateLimited` into the real `~/.cache/code-graph/update-state.json`,
-  which holds the installed plugin's updater back for an hour.
-- No test pins the 600-character bound from below: the reader's output on
-  bracketed runs up to 600 characters is checked by the corpus comparison
-  above (`tasks/pre-edit-pick/reader_diff.js`), not by the suite.
+  which holds the installed plugin's updater back until an hour after its
+  last check.
+- Nothing pins the 600-character bound from below: with it lowered to 60 the
+  reader's tests still pass, and with it lowered to 130 so does the Go and
+  Kotlin comparison above, whose longest bracketed run is 125 characters (a Go
+  receiver; Kotlin type parameters: 77).
 
 ## 0.179.0
 
