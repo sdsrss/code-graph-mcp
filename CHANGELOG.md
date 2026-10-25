@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.179.2
+
+**Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). The binary is
+built from 0.179.1's code and the plugin's hooks and scripts are 0.179.1's,
+apart from version numbers; what changes is the test suite, which now covers
+the three items under 0.179.1's "Not covered". To pin the binary back anyway:
+`npm i -g @sdsrs/code-graph@0.179.1` (or, from source, `cargo install --locked
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.179.1 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### Tests for 0.179.1's "Not covered"
+
+- `js_test_suite_leaves_the_shared_tmp_dir_intact` runs the JS suite with HOME
+  pointed at a seeded sandbox. Beside `binary-path` it now seeds
+  `update-state.json` (as `{}`, what the updater reads for a missing file) and
+  a stand-in file in `bin/`, and compares each one's modification time as well
+  as its bytes. On Linux it then waits up to 30 s for every process whose
+  environment names a path in the sandbox, and fails if one is still running.
+  Run with one throwaway test file at a time, each of these turns it red: a
+  test that rewrites `binary-path` and puts the same bytes back; one that
+  deletes `bin/` and `update-state.json`; one that leaves a detached child
+  writing into the cache 1 s after the runner exits; one that leaves a
+  detached child running for 45 s. The first three together left 0.179.1's
+  guard green.
+- `scripts/release-smoke.test.js` points HOME at a sandbox before its opt-in
+  network test (`CODE_GRAPH_AUTO_UPDATE_E2E=1`) loads the updater. With every
+  request answered 403, a stand-in HOME's `update-state.json` now stays
+  `{"rateLimited":false}`; before, it became `{"rateLimited":true}`.
+- The definition reader's tests read a bracketed run of 586 characters (a
+  `const f = (…) =>` parameter list, a Go receiver, Kotlin type parameters) and
+  find nothing for one of 601. With the bound lowered to 60 or 585, or raised
+  to 601, these three tests fail and every other test in `stop-impact.test.js`
+  and `pre-edit-guide.test.js` passes; with no bound, the three linear-read
+  tests fail too. 586 is the longest run whose header still ends within the
+  600-character cap in the test's JavaScript line (Go 587, Kotlin 588).
+
+### Not covered
+
+- The wait for processes that outlive the suite runs on Linux only, where it
+  reads `/proc/<pid>/environ`; on macOS and Windows the guard still does not
+  see a write by such a process. Nor does it find a process whose environment
+  names no path in the sandbox, such as one started with an environment built
+  from scratch.
+- A test deleting a cache file the guard does not seed is still not seen:
+  for example the binary at `bin/code-graph-mcp`, `install-manifest.json`,
+  `statusline-registry.json` or `hook-fire-state.json`.
+
 ## 0.179.1
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays at 124, and the binary is
