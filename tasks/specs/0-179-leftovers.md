@@ -1,5 +1,5 @@
 ---
-status: done (local commits on main, not released)
+status: released in 0.179.1 (tag v0.179.1 at f8cc5843, 2026-10-25)
 revision: 2
 ---
 
@@ -71,3 +71,4 @@ revision: 2
 - 全部 51 个 JS 测试文件（含 install-e2e）在同一个沙箱 HOME 下：1,829 个，1,825 通过、0 失败、4 跳过。
 - 真实 HOME 下跑 CI 的 JS 列表（所有修复之后）：1,786 个，1,783 通过、0 失败、3 跳过；`~/.cache/code-graph` 下 14 个文件路径、修改时间、大小前后一致。`os.tmpdir()` 下沙箱目录残留 0。
 - `cargo fmt --check` 通过；`git ls-files '*.js' | xargs -n1 node --check` 通过。
+- 发版（2026-10-25 UTC）：main CI 7/7（run 40165003815；新 JS 测试在 Plugin 任务里通过，`js_test_suite_leaves_the_shared_tmp_dir_intact` 在 Linux/macOS/Windows 均 ok）；Release 10/10（run 40165909584，34 分钟）；说明 5,224 字符，14 个附件；6 个 npm 包 0.179.1，`_npmUser` 仍是 `sdsrs`；实装 2 个包，linux-x64 二进制 44,497,432 B、`--version` 0.179.1；npm 包里 claude-plugin 47 个文件与 tag 逐字节一致；用已发布的包跑 C1/C2 等 9 个写法与表一致，160 KB 读取 async 3.3 ms、Go 21.8 ms。
