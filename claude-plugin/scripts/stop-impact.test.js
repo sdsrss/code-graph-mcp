@@ -235,6 +235,27 @@ test('definition reads: the bounds keep a modifier on its own line and four modi
   assert.deepEqual(extractSignatures('fun <T> wrap(a: T) {\n}\n', 'wrap', '.kt'), ['fun<T>wrap(a:T)']);
 });
 
+// The bracketed-run bound from below (0.179.1's "Not covered"): with it lowered
+// to 60 every test above stayed green. A run stops at 600 characters, the
+// header cap, so a run whose header still ends inside the cap is read: 586
+// characters is the longest that does in the JavaScript row (Go 587, Kotlin
+// 588). 601 is the first past the bound and, as that release's notes say, not
+// found. In between the header runs past the cap and there is no reading.
+for (const [kind, ext, name, lead, rest, ch, keyOf] of [
+  ['a `const f = (…) =>` parameter list', '.js', 'f', 'const f = (', ') => {\n}\n', 'a', (run) => `constf=(${run})`],
+  ['a Go receiver', '.go', 'F', 'func (', ') F() {\n}\n', 'S', (run) => `func(${run})F()`],
+  ['Kotlin type parameters', '.kt', 'f', 'fun <', '> f() {\n}\n', 'T', (run) => `fun<${run}>f()`],
+]) {
+  test(`definition reads: ${kind} of 586 characters is read, of 601 is not found`, () => {
+    const read = lead + ch.repeat(586) + rest;
+    assert.deepEqual(extractSignatures(read, name, ext), [keyOf(ch.repeat(586))]);
+    assert.deepEqual(definitionHeaders(read, ext).defs.map((d) => d.key), [keyOf(ch.repeat(586))]);
+    const past = lead + ch.repeat(601) + rest;
+    assert.deepEqual(extractSignatures(past, name, ext), []);
+    assert.deepEqual(definitionHeaders(past, ext).defs, []);
+  });
+}
+
 test('definitionHeaders: no reading when any header has none, the language is not read, or a line is over-long', () => {
   assert.equal(definitionHeaders('fn compute(' + 'a: u8, '.repeat(120) + ') {}\nfn other(x: u8) {}\n', '.rs'), null);
   assert.equal(definitionHeaders('function f() {}\n', '.sh'), null);
