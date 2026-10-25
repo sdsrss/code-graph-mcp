@@ -2,7 +2,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+// HOME names a sandbox for the opt-in network test at the bottom: on a GitHub
+// 403 the real fetchLatestRelease() saves `rateLimited` into
+// `~/.cache/code-graph/update-state.json`, which held the installed plugin's
+// updater back until an hour after its last check (D#575). Module scope, so it
+// is set before that test requires auto-update.js.
+const HOME_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-release-smoke-home-'));
+process.env.HOME = HOME_SANDBOX;
+process.env.USERPROFILE = HOME_SANDBOX;
+process.env.CLAUDE_CONFIG_DIR = path.join(HOME_SANDBOX, '.claude');
+test.after(() => {
+  try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 const root = path.resolve(__dirname, '..');
 const platformPackages = [
