@@ -2992,6 +2992,49 @@ fn js_test_files() -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Processes whose environment names `dir` or a path under it, as `pid: argv`.
+/// A child inherits its parent's environment, detached or not, so for a fresh
+/// tempdir handed to one spawn this is that spawn's live descendants.
+#[cfg(target_os = "linux")]
+fn processes_carrying(dir: &std::path::Path) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = dir.as_os_str().as_bytes();
+    let names_dir = |value: &[u8]| {
+        value
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
+    };
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    procs
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            // Unreadable (another user's process, or one that just exited) is
+            // not ours.
+            fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+                env.split(|&b| b == 0).any(|kv| {
+                    kv.iter()
+                        .position(|&b| b == b'=')
+                        .is_some_and(|i| names_dir(&kv[i + 1..]))
+                })
+            })
+        })
+        .map(|pid| {
+            let argv = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            format!(
+                "{pid}: {}",
+                String::from_utf8_lossy(&argv).replace('\0', " ").trim()
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn processes_carrying(_dir: &std::path::Path) -> Vec<String> {
+    Vec::new()
+}
+
 #[test]
 fn js_test_files_neutralize_claude_config_dir() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3248,11 +3291,32 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
 
     // HOME's own cache, seeded with a stand-in for the developer's binary cache
     // so that a test deleting or rewriting it shows, not only one writing
-    // beside it (the fourth axis below).
+    // beside it (the fourth axis below). `update-state.json` and a file in
+    // `bin/` are seeded too, and both are inert, so the suite takes the paths
+    // it takes on an empty cache: `{}` is what readState() returns for a
+    // missing state file, and nothing resolves `bin/sentinel` as a binary (a
+    // file at `bin/code-graph-mcp` findBinary() would try to run). Their
+    // mtimes are kept as well: a test that rewrites a file and puts the bytes
+    // back leaves the listing and the contents as they were.
     let home_cache = sandbox.path().join(".cache").join("code-graph");
-    fs::create_dir_all(&home_cache).unwrap();
-    let home_sentinel = home_cache.join("binary-path");
-    fs::write(&home_sentinel, b"sentinel").unwrap();
+    fs::create_dir_all(home_cache.join("bin")).unwrap();
+    let home_seed = [
+        ("binary-path", "sentinel"),
+        ("bin/sentinel", "sentinel"),
+        ("update-state.json", "{}"),
+    ];
+    for (name, body) in home_seed {
+        fs::write(home_cache.join(name), body).unwrap();
+    }
+    let home_mtimes: Vec<std::time::SystemTime> = home_seed
+        .iter()
+        .map(|(name, _)| {
+            fs::metadata(home_cache.join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+        })
+        .collect();
 
     // Output goes to FILES, not pipes: this reads the child's exit with a
     // deadline below, and a piped stdout that nobody drains deadlocks the child
@@ -3388,6 +3452,33 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
         }
     );
 
+    // What outlives the runner. A test can leave a process behind (session-init
+    // spawns its updater and indexer detached), and what that process writes
+    // after the runner exits lands after the checks below have run: unseen
+    // here, and in a developer's own run, in their real HOME. So wait for every
+    // process still carrying this sandbox in its environment (a detached child
+    // inherits HOME and TMPDIR) to exit, and fail if one is still running after
+    // 30 s, since its later writes cannot be checked. Measured when this was
+    // added (D#575): no such process from the runner's exit to 41 s after it.
+    // Linux only, where /proc shows a process's environment; elsewhere the list
+    // is empty and this waits for nothing.
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut survivors = processes_carrying(sandbox.path());
+    while !survivors.is_empty() && std::time::Instant::now() < settle {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        survivors = processes_carrying(sandbox.path());
+    }
+    assert!(
+        survivors.is_empty(),
+        "{} process(es) started by the JS suite were still running 30 s after it \
+         finished, carrying its HOME or TMPDIR; whatever they write next lands \
+         after this guard has looked, and in a developer's own run in their real \
+         HOME. Wait for the child in the test that spawns it, or give it an env \
+         that dies with the test's own sandbox:\n  {}",
+        survivors.len(),
+        survivors.join("\n  ")
+    );
+
     assert!(
         sentinel.exists(),
         "running the JS test suite deleted {}, a path that stands in for the \
@@ -3493,16 +3584,35 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     let mut home_tree = Vec::new();
     walk(&home_cache, &home_cache, &mut home_tree);
     home_tree.sort();
-    let sentinel_now = fs::read_to_string(&home_sentinel).unwrap_or_else(|_| "<gone>".into());
+    let changed: Vec<String> = home_seed
+        .iter()
+        .zip(&home_mtimes)
+        .filter_map(|((name, body), mtime)| {
+            let p = home_cache.join(name);
+            match fs::read_to_string(&p) {
+                Err(_) => Some(format!("{name} is gone")),
+                Ok(now) if now != *body => Some(format!("{name} reads {now:?}")),
+                Ok(_) if fs::metadata(&p).and_then(|m| m.modified()).ok() != Some(*mtime) => {
+                    Some(format!("{name} was rewritten with the same bytes"))
+                }
+                Ok(_) => None,
+            }
+        })
+        .collect();
     assert!(
-        home_tree == ["binary-path"] && sentinel_now == "sentinel",
+        home_tree == ["bin", "bin/sentinel", "binary-path", "update-state.json"]
+            && changed.is_empty(),
         "the JS test suite changed $HOME/.cache/code-graph, which in a \
-         developer's own run is the installed plugin's cache: it now holds [{}] \
-         and binary-path reads {:?}. Point HOME and USERPROFILE at a \
-         `mkdtempSync` sandbox at MODULE scope in the offending file, before the \
-         require that pulls in find-binary.js, and delete it in a `test.after`.",
+         developer's own run is the installed plugin's cache: it now holds [{}]{}. \
+         Point HOME and USERPROFILE at a `mkdtempSync` sandbox at MODULE scope in \
+         the offending file, before the require that pulls in find-binary.js, and \
+         delete it in a `test.after`.",
         home_tree.join(", "),
-        sentinel_now
+        if changed.is_empty() {
+            String::new()
+        } else {
+            format!(", and {}", changed.join(", "))
+        }
     );
 }
 
