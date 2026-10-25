@@ -17,8 +17,10 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
   pointed at a seeded sandbox. Beside `binary-path` it now seeds
   `update-state.json` (as `{}`, what the updater reads for a missing file) and
   a stand-in file in `bin/`, and compares each one's modification time as well
-  as its bytes. On Linux it then waits up to 30 s for every process whose
-  environment names a path in the sandbox, and fails if one is still running.
+  as its bytes. On Linux it then waits up to 30 s for every process that still
+  has one of the HOME, USERPROFILE, TMPDIR, TMP, TEMP and CLAUDE_CONFIG_DIR
+  values the guard set (in a developer's own run, their real HOME, tmp dir and
+  Claude config), and fails if one is still running.
   Run with one throwaway test file at a time, each of these turns it red: a
   test that rewrites `binary-path` and puts the same bytes back; one that
   deletes `bin/` and `update-state.json`; one that leaves a detached child
@@ -41,12 +43,18 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 
 - The wait for processes that outlive the suite runs on Linux only, where it
   reads `/proc/<pid>/environ`; on macOS and Windows the guard still does not
-  see a write by such a process. Nor does it find a process whose environment
-  names no path in the sandbox, such as one started with an environment built
-  from scratch.
+  see a write by such a process. Nor does it wait for a process that holds
+  none of those values, such as one started with an environment built from
+  scratch, or one carrying a test file's own sandbox, whose writes land
+  outside the three directories the guard checks. The pre-tag review measured
+  `lifecycle.e2e.test.js`'s updater re-creating that test's removed sandbox
+  under TMPDIR (in a developer's own run, the real tmp dir) with the 44 MB
+  binary it was downloading.
 - A test deleting a cache file the guard does not seed is still not seen:
   for example the binary at `bin/code-graph-mcp`, `install-manifest.json`,
-  `statusline-registry.json` or `hook-fire-state.json`.
+  `statusline-registry.json` or `hook-fire-state.json`. Nor is a test that
+  renames a seeded file away and back, which restores its bytes and its
+  modification time.
 
 ## 0.179.1
 

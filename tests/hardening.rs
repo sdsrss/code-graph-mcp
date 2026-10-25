@@ -2992,18 +2992,22 @@ fn js_test_files() -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Processes whose environment names `dir` or a path under it, as `pid: argv`.
-/// A child inherits its parent's environment, detached or not, so for a fresh
-/// tempdir handed to one spawn this is that spawn's live descendants.
+/// Processes whose environment holds one of `vars` exactly (`KEY=value`), as
+/// `pid: argv`. A child inherits its parent's environment unless its spawn
+/// replaces it, so for values made fresh for one spawn these are that spawn's
+/// live descendants that kept one, detached or not.
 #[cfg(target_os = "linux")]
-fn processes_carrying(dir: &std::path::Path) -> Vec<String> {
+fn processes_carrying(vars: &[(&str, &std::path::Path)]) -> Vec<String> {
     use std::os::unix::ffi::OsStrExt;
-    let dir = dir.as_os_str().as_bytes();
-    let names_dir = |value: &[u8]| {
-        value
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.is_empty() || rest[0] == b'/')
-    };
+    let wanted: Vec<Vec<u8>> = vars
+        .iter()
+        .map(|(key, value)| {
+            let mut kv = key.as_bytes().to_vec();
+            kv.push(b'=');
+            kv.extend_from_slice(value.as_os_str().as_bytes());
+            kv
+        })
+        .collect();
     let Ok(procs) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -3013,11 +3017,8 @@ fn processes_carrying(dir: &std::path::Path) -> Vec<String> {
             // Unreadable (another user's process, or one that just exited) is
             // not ours.
             fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
-                env.split(|&b| b == 0).any(|kv| {
-                    kv.iter()
-                        .position(|&b| b == b'=')
-                        .is_some_and(|i| names_dir(&kv[i + 1..]))
-                })
+                env.split(|&b| b == 0)
+                    .any(|kv| wanted.iter().any(|w| w == kv))
             })
         })
         .map(|pid| {
@@ -3031,7 +3032,7 @@ fn processes_carrying(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn processes_carrying(_dir: &std::path::Path) -> Vec<String> {
+fn processes_carrying(_vars: &[(&str, &std::path::Path)]) -> Vec<String> {
     Vec::new()
 }
 
@@ -3357,18 +3358,21 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
     // TTY-dependent (`spec` on a terminal, `tap` otherwise), and the assert
     // below looks for a specific marker — reading it out of a format that
     // changes with where the output happens to land is not a check.
+    let guard_env = [
+        ("HOME", sandbox.path()),
+        ("USERPROFILE", sandbox.path()),
+        ("TMPDIR", sandbox.path()),
+        ("TMP", sandbox.path()),
+        ("TEMP", sandbox.path()),
+        ("CLAUDE_CONFIG_DIR", canary_cfg.as_path()),
+    ];
     let spawned = std::process::Command::new("node")
         .arg("--test")
         .arg("--test-concurrency=1")
         .arg("--test-reporter=tap")
         .args(&files)
         .current_dir(root)
-        .env("HOME", sandbox.path())
-        .env("USERPROFILE", sandbox.path())
-        .env("TMPDIR", sandbox.path())
-        .env("TMP", sandbox.path())
-        .env("TEMP", sandbox.path())
-        .env("CLAUDE_CONFIG_DIR", &canary_cfg)
+        .envs(guard_env)
         .stdout(stdout)
         .stderr(stderr)
         .spawn();
@@ -3454,27 +3458,32 @@ fn js_test_suite_leaves_the_shared_tmp_dir_intact() {
 
     // What outlives the runner. A test can leave a process behind (session-init
     // spawns its updater and indexer detached), and what that process writes
-    // after the runner exits lands after the checks below have run: unseen
-    // here, and in a developer's own run, in their real HOME. So wait for every
-    // process still carrying this sandbox in its environment (a detached child
-    // inherits HOME and TMPDIR) to exit, and fail if one is still running after
-    // 30 s, since its later writes cannot be checked. Measured when this was
-    // added (D#575): no such process from the runner's exit to 41 s after it.
-    // Linux only, where /proc shows a process's environment; elsewhere the list
-    // is empty and this waits for nothing.
+    // after the runner exits lands after the checks below have run. So wait for
+    // every process that still holds one of `guard_env` with the value set here
+    // (a child inherits them, detached or not), and fail if one is still
+    // running after 30 s: in a developer's own run those values are their real
+    // HOME, tmp dir and Claude config. Exact values, not paths under the
+    // sandbox: each test file's own sandbox sits under TMPDIR, and a child that
+    // carries one writes there, into nothing checked below. lifecycle.e2e's
+    // updater is such a child; downloading the binary, it was measured alive
+    // 17.6 s after the runner exited (D#575 review). Linux only, where /proc
+    // shows a process's environment; elsewhere the list is empty and this
+    // waits for nothing.
     let settle = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut survivors = processes_carrying(sandbox.path());
+    let mut survivors = processes_carrying(&guard_env);
     while !survivors.is_empty() && std::time::Instant::now() < settle {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        survivors = processes_carrying(sandbox.path());
+        survivors = processes_carrying(&guard_env);
     }
     assert!(
         survivors.is_empty(),
         "{} process(es) started by the JS suite were still running 30 s after it \
-         finished, carrying its HOME or TMPDIR; whatever they write next lands \
-         after this guard has looked, and in a developer's own run in their real \
-         HOME. Wait for the child in the test that spawns it, or give it an env \
-         that dies with the test's own sandbox:\n  {}",
+         finished, with the HOME, USERPROFILE, TMPDIR, TMP, TEMP or \
+         CLAUDE_CONFIG_DIR this guard set. In a developer's own run those are \
+         their real HOME, tmp dir and Claude config, and what these processes \
+         write next lands there after this guard has looked. Wait for the child \
+         in the test that spawns it, or give it the test's own sandbox in every \
+         one of those variables:\n  {}",
         survivors.len(),
         survivors.join("\n  ")
     );
