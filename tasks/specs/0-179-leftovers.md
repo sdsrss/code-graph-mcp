@@ -1,5 +1,5 @@
 ---
-status: released in 0.179.1 (tag v0.179.1 at f8cc5843, 2026-10-25)
+status: released in 0.179.1 (tag v0.179.1 at f8cc5843); D#575 tests released in 0.179.2 (tag v0.179.2 at 909c3409), 2026-10-25
 revision: 2
 ---
 
@@ -76,3 +76,4 @@ revision: 2
 - `cargo fmt --check` 通过；`git ls-files '*.js' | xargs -n1 node --check` 通过。
 - 发版（2026-10-25 UTC）：main CI 7/7（run 40165003815；新 JS 测试在 Plugin 任务里通过，`js_test_suite_leaves_the_shared_tmp_dir_intact` 在 Linux/macOS/Windows 均 ok）；Release 10/10（run 40165909584，34 分钟）；说明 5,224 字符，14 个附件；6 个 npm 包 0.179.1，`_npmUser` 仍是 `sdsrs`；实装 2 个包，linux-x64 二进制 44,497,432 B、`--version` 0.179.1；npm 包里 claude-plugin 47 个文件与 tag 逐字节一致；用已发布的包跑 C1/C2 等 9 个写法与表一致，160 KB 读取 async 3.3 ms、Go 21.8 ms。
 - D#575（2026-10-25）：旧守卫同时打开 M3（改写后写回原字节）、M4（删 `bin/` 和 `update-state.json`）、M9（runner 退出 1 秒后 detached 子进程写入）→ 1/1 通过；新守卫逐个打开 → 都失败，M9b（子进程活 45 秒）也失败；不带变异 70.65 s 通过。改守卫前实测：runner 退出到其后 41 秒，没有带沙箱路径的进程。release-smoke：替身 HOME + 403 预加载，修复前 `update-state.json` 变成 `{"rateLimited":true}`，修复后不变；真实网络 4/4。`BRACKETED` 改为 `{0,60}`、`{0,585}`、`{0,601}` 时 198/201（只有新测试失败），去掉上限 195/201，原样 201/201。CI 的 JS 列表 1,789 个，1,786 通过、0 失败、3 跳过；`cargo test` 全量通过（pre-commit）。
+- 发版 0.179.2（2026-10-25 UTC）：main CI 7/7（run 40186551778；`js_test_suite_leaves_the_shared_tmp_dir_intact` 在 Linux/macOS/Windows 均 ok，三个 586/601 读法测试在 Plugin 任务里通过）；Release 10/10（run 40187431254，26.5 分钟）；说明 3,705 字符，14 个附件；6 个 npm 包 0.179.2，`_npmUser` 仍是 `sdsrs`；实装 2 个包，linux-x64 二进制 44,497,432 B、`--version` 0.179.2；npm 包里 claude-plugin 47 个文件与 tag 逐字节一致；相对 v0.179.1，claude-plugin 下除测试文件外只有 2 个文件变了（版本号）。
