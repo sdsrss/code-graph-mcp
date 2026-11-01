@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.179.3
+
+**Upgrading: nothing to do** (`INDEX_VERSION` stays at 124, the snapshot
+schema at 10). The binary is built from 0.179.2's source, unchanged apart from
+the version, against newer zstd crates. The plugin's hooks and scripts are
+0.179.2's, apart from version numbers. To pin the binary back anyway:
+`npm i -g @sdsrs/code-graph@0.179.2` (or, from source, `cargo install --locked
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.179.2 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### Security: zstd 0.14.3
+
+Four advisories published on 2026-10-16 affect the zstd crates 0.179.2 was
+built with. `cargo audit` failed all six scheduled CI runs on `main` from
+2026-10-27 to 2026-11-01:
+
+| Advisory | Crate | 0.179.2 had | Patched in | 0.179.3 has |
+|---|---|---|---|---|
+| RUSTSEC-2026-0391 | zstd | 0.13.3 | >= 0.14.3 | 0.14.3 |
+| RUSTSEC-2026-0398 | zstd-safe | 7.2.4 | >= 8.2.0 | 8.2.0 |
+| RUSTSEC-2026-0403 | zstd-safe | 7.2.4 | >= 8.2.0 | 8.2.0 |
+| RUSTSEC-2026-0410 | zstd-sys | 2.0.16 | >= 2.1.2 | 2.1.2 |
+
+The ten `unsound` warnings `cargo audit` listed against zstd-safe 7.2.4 are
+gone too. Five allowed warnings remain, as before: paste, anyhow, memmap2,
+rand and tokio. Both zstd-sys versions bundle the zstd 1.5.7 C library.
+
+The binary uses zstd in two places: `snapshot create`, which writes a
+`.db.zst`, and the decoder that `snapshot inspect` runs, which also unpacks
+a snapshot fetched by `reindex --from-snapshot` or at MCP startup. Tested on a
+115-file corpus, each version's `snapshot create` output was read by the other
+version's `snapshot inspect`, and both versions printed the same JSON for the
+same file. Four damaged inputs got identical errors from both versions: a
+truncated `.db.zst`, a file holding only the zstd magic, the magic followed by
+random bytes, and a short file with a SQLite header.
+
+CI and release builds now use `Swatinem/rust-cache` 2.9.3 (was 2.9.2).
+
+### Not covered
+
+- Whether any of the four advisories could be reached through
+  code-graph-mcp's use of zstd was not analysed. This release moves past
+  their patched versions rather than ruling them out.
+- The install path (`reindex --from-snapshot`, MCP startup) was not run
+  across versions. It takes only an `https://` source, so it cannot be tested
+  offline. It decodes with the same function `snapshot inspect` calls; that
+  comes from reading the source, not from a run.
+
 ## 0.179.2
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). The binary is
