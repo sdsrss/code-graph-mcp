@@ -1149,6 +1149,88 @@ fn inspect_stages_a_journal_only_when_it_is_a_regular_file() {
     }
 }
 
+/// A `-wal` from ANOTHER database, its frames not yet checkpointed: a stray WAL
+/// that SQLite applies to whatever file it finds it beside.
+fn foreign_wal(into: &std::path::Path) {
+    let dir = TempDir::new().unwrap();
+    let other = dir.path().join("other.db");
+    let conn = Connection::open(&other).unwrap();
+    conn.query_row("PRAGMA journal_mode = wal", [], |r| r.get::<_, String>(0))
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_autocheckpoint = 0; CREATE TABLE z(a);")
+        .unwrap();
+    for _ in 0..50 {
+        conn.execute("INSERT INTO z(a) VALUES (?1)", ["y".repeat(500)])
+            .unwrap();
+    }
+    std::fs::copy(dir.path().join("other.db-wal"), into).unwrap();
+}
+
+/// D#637. SQLite opens `<file>-wal` whenever there is something there it
+/// counts as one (anything but an empty regular file), whatever the header
+/// says, and a read-only connection then creates a `-shm` beside the user's
+/// file that it cannot remove. 0.180.0 left one beside a non-WAL snapshot for a
+/// FIFO at that name and for another database's WAL, and applied that WAL's
+/// frames: the snapshot read as having no `meta` and was refused. The copy
+/// leaves the `-wal` behind, as the WAL arm does. Through a link too, whose
+/// side files SQLite looks for beside the target. In a thread with a deadline,
+/// for the FIFO.
+#[cfg(unix)]
+#[test]
+fn inspect_reads_a_non_wal_file_past_a_stray_wal() {
+    for shape in ["another database's WAL", "FIFO"] {
+        for via_link in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let raw = dir.path().join("snapshot.db");
+            raw_snapshot_fixture(&raw, "delete", 1);
+            let side = dir.path().join("snapshot.db-wal");
+            if shape == "FIFO" {
+                let made = Command::new("mkfifo").arg(&side).status().unwrap();
+                assert!(made.success(), "mkfifo {}", side.display());
+            } else {
+                foreign_wal(&side);
+            }
+            let wal_before = (shape != "FIFO").then(|| std::fs::read(&side).unwrap());
+            let link_dir = TempDir::new().unwrap();
+            let named = if via_link {
+                let link = link_dir.path().join("link.db");
+                std::os::unix::fs::symlink(&raw, &link).unwrap();
+                link
+            } else {
+                raw.clone()
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    crate::snapshot::inspect(&named)
+                        .map(|m| m.tool_version)
+                        .map_err(|e| format!("{e:#}")),
+                );
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("{shape} (link: {via_link}): inspect blocked"));
+            assert_eq!(got.as_deref(), Ok("9.9.9"), "{shape} (link: {via_link})");
+            let mut left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left,
+                ["snapshot.db", "snapshot.db-wal"],
+                "{shape} (link: {via_link}): inspect added or removed files beside the snapshot"
+            );
+            if let Some(before) = wal_before {
+                assert!(
+                    std::fs::read(&side).unwrap() == before,
+                    "{shape} (link: {via_link}): inspect changed the -wal"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn inspect_reads_a_snapshot_whose_file_is_read_only() {

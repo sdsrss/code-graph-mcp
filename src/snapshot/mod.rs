@@ -287,8 +287,24 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // already failed the in-place read and reached the same copy through the
         // fallback below (measured: each of them errors on `inspect tempdir`
         // when TMPDIR does not exist).
-        let odd_journal = std::fs::metadata(journal_beside(file)).is_ok_and(|m| !m.is_file());
-        if wal_mode || odd_journal {
+        //
+        // So does a `<file>-wal` SQLite would open: anything there but an empty
+        // regular file, links followed, which is SQLite's own test
+        // (`unixAccess`). It opens such a WAL whatever the header says, and the
+        // read-only connection then creates a `-shm` beside the user's file that
+        // it cannot remove: 0.180.0 left one for a FIFO and for a non-empty file
+        // there (D#637). The copy leaves the `-wal` behind, as the WAL arm does,
+        // so the main file is what is read. Measured on 0.180.0, a WAL from
+        // another database was applied in place and the snapshot refused for
+        // having no `meta` (sqlite3 too: "no such table: meta"); a WAL holding
+        // this file's own unchecked frames was read. SQLite does not leave the
+        // second beside a rollback header (it deletes the WAL before it rewrites
+        // the header), and sqlite3 still reads it.
+        let odd_journal =
+            std::fs::metadata(side_file_of(file, "-journal")).is_ok_and(|m| !m.is_file());
+        let stray_wal = std::fs::metadata(side_file_of(file, "-wal"))
+            .is_ok_and(|m| !m.is_file() || m.len() > 0);
+        if wal_mode || odd_journal || stray_wal {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
             let staged = stage_copy(file, tmp.path())?;
             let opened = open_staged(&staged, file)?;
@@ -415,9 +431,9 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// Copy `file` into `dir` for a writable open, with its rollback journal. A hot
 /// `-journal` records what an unfinished transaction overwrote, and SQLite
 /// rolls it back before it reads; a copy without it reads that transaction's
-/// pages (D#630). Only a regular file at [`journal_beside`] is copied: a
-/// directory is no journal, and copying a FIFO would block. The `-wal` is
-/// deliberately left behind (see the WAL arm).
+/// pages (D#630). Only a regular file at [`side_file_of`] `-journal` is
+/// copied: a directory is no journal, and copying a FIFO would block. The
+/// `-wal` is deliberately left behind (see the WAL arm).
 ///
 /// Both copies are new files rather than `fs::copy`s, which carry the source's
 /// mode over: rolling a hot journal back writes the copy and opens the journal
@@ -434,25 +450,28 @@ fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
     }
     let staged = dir.join("snapshot.db");
     copy_writable(file, &staged).context("stage snapshot for inspect")?;
-    let journal = journal_beside(file);
+    let journal = side_file_of(file, "-journal");
     if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
-        copy_writable(&journal, &journal_of(&staged))
+        copy_writable(&journal, &with_suffix(&staged, "-journal"))
             .context("stage snapshot journal for inspect")?;
     }
     Ok(staged)
 }
 
-fn journal_of(db: &Path) -> std::path::PathBuf {
+fn with_suffix(db: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = db.as_os_str().to_owned();
-    name.push("-journal");
+    name.push(suffix);
     name.into()
 }
 
-/// Where SQLite looks for `file`'s rollback journal: it names the journal after
-/// the path it opened with links resolved, so a link's journal is the one
+/// Where SQLite looks for `file`'s `-journal` or `-wal`: it names them after
+/// the path it opened with links resolved, so a link's side files are the ones
 /// beside its target.
-fn journal_beside(file: &Path) -> std::path::PathBuf {
-    journal_of(&std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()))
+fn side_file_of(file: &Path, suffix: &str) -> std::path::PathBuf {
+    with_suffix(
+        &std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()),
+        suffix,
+    )
 }
 
 /// Open a staged copy as a READER (D#629): an indexer open's INDEX_VERSION
