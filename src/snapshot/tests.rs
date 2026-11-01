@@ -1054,6 +1054,51 @@ fn inspect_rolls_back_a_hot_journal_as_sqlite_does() {
     );
 }
 
+/// The same hot-journal pairs, read-only. Rolling back happens in the staged
+/// copy, and `fs::copy` carried the source's 0444 over to it, so SQLite could
+/// not write the copy and `inspect` failed with "attempt to write a readonly
+/// database" where the 0644 pair read the last commit. The journal is 0444 too:
+/// SQLite opens a hot journal read-write to roll it back.
+#[cfg(unix)]
+#[test]
+fn inspect_rolls_back_a_hot_journal_beside_a_read_only_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let committed_dir = TempDir::new().unwrap();
+    let committed = committed_dir.path().join("committed.db");
+    raw_snapshot_fixture(&committed, "delete", 1);
+    let dir = TempDir::new().unwrap();
+    let hot = dir.path().join("hot.db");
+    let journal = hot_journal_pair(&committed, &hot);
+    let flipped = dir.path().join("flipped.db");
+    let mut header_says_wal = std::fs::read(&hot).unwrap();
+    header_says_wal[18] = 2;
+    header_says_wal[19] = 2;
+    std::fs::write(&flipped, &header_says_wal).unwrap();
+    let flipped_journal = dir.path().join("flipped.db-journal");
+    std::fs::copy(&journal, &flipped_journal).unwrap();
+    for f in [&hot, &journal, &flipped, &flipped_journal] {
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    let before: Vec<_> = [&hot, &journal, &flipped, &flipped_journal]
+        .iter()
+        .map(|f| std::fs::read(f).unwrap())
+        .collect();
+
+    for (name, file) in [("non-WAL", &hot), ("header says WAL", &flipped)] {
+        let meta = crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(
+            meta.tool_version, "9.9.9",
+            "{name}: read the unfinished transaction instead of the last commit"
+        );
+    }
+    let after: Vec<_> = [&hot, &journal, &flipped, &flipped_journal]
+        .iter()
+        .map(|f| std::fs::read(f).unwrap())
+        .collect();
+    assert!(before == after, "inspect changed a file it was pointed at");
+}
+
 /// The WAL arm stages a `-journal` with the file now (D#630), and 0.180.0 read
 /// a WAL-mode snapshot whatever sat at that name. A directory there must not
 /// turn into a copy error, nor a FIFO into a copy that blocks forever, so only

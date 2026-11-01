@@ -418,12 +418,25 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// pages (D#630). Only a regular file at [`journal_beside`] is copied: a
 /// directory is no journal, and copying a FIFO would block. The `-wal` is
 /// deliberately left behind (see the WAL arm).
+///
+/// Both copies are new files rather than `fs::copy`s, which carry the source's
+/// mode over: rolling a hot journal back writes the copy and opens the journal
+/// read-write, so a 0444 pair failed with "attempt to write a readonly
+/// database" where the same pair at 0644 read the last commit.
 fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
+    fn copy_writable(from: &Path, to: &Path) -> std::io::Result<u64> {
+        let mut src = std::fs::File::open(from)?;
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        std::io::copy(&mut src, &mut dst)
+    }
     let staged = dir.join("snapshot.db");
-    std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
+    copy_writable(file, &staged).context("stage snapshot for inspect")?;
     let journal = journal_beside(file);
     if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
-        std::fs::copy(&journal, journal_of(&staged))
+        copy_writable(&journal, &journal_of(&staged))
             .context("stage snapshot journal for inspect")?;
     }
     Ok(staged)
