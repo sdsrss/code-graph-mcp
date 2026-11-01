@@ -242,7 +242,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         //
         // A non-WAL raw file is opened in place and READ-ONLY (but see the
         // `-journal` paragraph below) rather than staged
-        // through `fs::copy` first. That copy was the last cost in this arm
+        // through a copy first. That copy was the last cost in this arm
         // proportional to the file, for a command that reads seven meta rows and
         // two `COUNT(*)`s, and on the many systems where TMPDIR is a tmpfs the
         // copy is RAM. Measured against a 164 MB raw snapshot in `delete` mode:

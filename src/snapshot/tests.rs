@@ -754,7 +754,8 @@ fn inspect_bounds_the_decompressed_payload() {
     // second version: the first required the cap here too, which refuses this
     // repository's own 163 MB `.code-graph/index.db` and breaks
     // `create --out x.db` -> `inspect`. SURF-25 is about decompression
-    // amplification; a raw `.db` has none, this arm is `fs::copy`, and
+    // amplification; a raw `.db` has none (this arm reads the file in place or
+    // copies it byte for byte), and
     // `try_install` only ever consumes `.db.zst`, so there is no install-side
     // ceiling for it to match. A file far over the cap must get PAST the
     // ceiling and fail later on its content, if at all.
