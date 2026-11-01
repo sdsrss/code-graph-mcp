@@ -54,3 +54,5 @@ revision: 1
 ## 进展
 
 - 2026-11-01：用户授权按建议执行（"需要我拍板的也按你的建议执行"），按 L3 处理（已发布产物的默认行为变化）。复现 S1–S5，见上表。
+- 2026-11-01：实现并提交 36ede5af。6 个 Rust 测试 + 2 个 JS 测试修复前失败、修复后通过；8 个变异（两个打开入口、CLI 上下文、incremental-index 入口、health JSON、grep 说明、去掉 -wal、去掉非普通文件分支）各至少让 1 个测试失败。实现时删掉了 `try_open` 和 MCP `from_project_root` 两处检查：数据库打开那一层已经拒绝，变异显示它们没有可观察的作用。
+- 2026-11-01：逐入口实测（0.179.4 发布二进制 d5a6c861 对 HEAD f5cb6fa3），8 种形态 × show / health-check（两种格式）/ grep / incremental-index / MCP serve，外加 statusline、doctor、rebuild-index 补救；结果写进 CHANGELOG 0.180.0。与 D#611（64dfe9a1）一起发 0.180.0。

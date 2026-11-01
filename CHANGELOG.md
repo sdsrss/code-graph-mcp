@@ -1,6 +1,101 @@
 # Changelog
 
-## Unreleased
+## 0.180.0
+
+**Upgrading: nothing to do unless a project's `.code-graph/index.db`,
+`index.db-wal` or `index.db-shm` is a symlink, or its `index.db` is not a
+regular file** (`INDEX_VERSION` stays at 124). The commands that read or write
+such an index now refuse it (exit 1), `grep` falls back to plain grep, and the
+MCP server exits at startup with the same message. Through a symlinked
+`index.db` they used to answer from, and write, the database the link points
+at. If you linked `index.db` elsewhere on purpose, `code-graph-mcp
+rebuild-index --confirm` replaces the link with an index inside `.code-graph`
+and leaves the link's target alone. To pin the binary back: `npm i -g
+@sdsrs/code-graph@0.179.4` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.179.4 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. That pins the
+binary only: the statusline and doctor come with the plugin.
+
+### A symlinked `index.db` is refused, not followed
+
+0.170.1 refused a symlinked `.code-graph` and listed a symlinked `index.db`
+inside a real one as not covered. SQLite resolves every link in the path it is
+given and opens the target. Measured on 0.179.4, with `index.db` linked to
+another project's index:
+
+- `show`, `health-check` (both formats), `grep` and the MCP server answered
+  from that project's index; `health-check` reported it healthy, with its
+  counts.
+- `incremental-index` re-indexed it as this project: the other project's
+  index went from 5 files to this project's 4.
+
+With a dangling link, the query commands said `No index found`, and
+`incremental-index` exited 0 after creating a database at the link's target,
+with `index-run.lock` beside it. With a link to another program's SQLite file,
+`incremental-index` switched that file to WAL mode and added this tool's
+tables to it (44 entries in its `sqlite_master`, where it had 1).
+
+The query commands, `health-check` and `incremental-index` now exit 1 with
+`refusing to use a symlinked <path> — remove it and re-run`, and the link's
+target is left as it was. `health-check --format json` (and `--json`) prints a
+report with `"reason": "refused"`. `grep` prints its plain-grep results and
+says why they carry no AST context. The MCP server exits 1 at startup with the
+message.
+
+The same holds for a symlinked `index.db-wal` or `index.db-shm`. SQLite
+already refused to open those through a link, with `unable to open database
+file`; the message now names the file. An `index.db` that is a FIFO (`disk I/O
+error`) or a directory (`unable to open database file`) is refused with
+`<path> exists and is not a regular file — remove it and re-run`.
+
+The plugin follows suit. For these shapes the statusline shows `code-graph: ✗
+.code-graph refused (see health-check)`. With 0.179.4 it showed the link
+target's counts for a linked index (`✓ 10 nodes | 5 files`), and `offline` for
+a FIFO or a linked `-wal`. doctor's Index line shows the message. With 0.179.4
+it was `✅` with the target's counts for a linked index, and `health-check
+failed` for a FIFO. Its repair step prints the message, where it said
+`.code-graph is a symlink or not a directory`.
+
+A hard-linked `index.db` is still opened, as before. Git cannot carry a hard
+link. After `cp -al` of a project, the original's `index.db` has two links as
+well, so refusing would lock the user out of their own index.
+
+### Snapshot install refuses what `snapshot inspect` refuses
+
+`reindex --from-snapshot` and the MCP server's startup install a snapshot
+through one function. It checked the decoded snapshot only for a newer
+schema; `snapshot inspect` also checks the zstd framing and the snapshot
+metadata. Measured through that function with a `file://` URL, each of these
+streams installed over an existing `.code-graph/index.db`:
+
+- an empty zstd frame;
+- a skippable frame followed by an empty frame;
+- a compressed file that is not a database.
+
+Each of these installed an empty index (0 nodes, where the index it replaced
+had 3). A compressed SQLite file without snapshot metadata was installed too.
+A skippable frame followed by a real snapshot installed that snapshot, although
+`inspect` calls the stream not a code-graph snapshot. These last two can carry
+a usable index, and are refused now as well.
+
+The install now runs `inspect`'s two checks, through the same code. All five
+streams are refused, and the existing index is left byte-identical. In a
+release, this needs an artifact that passes the blake3 check against its
+published sidecar, that is, one the publisher put there. `snapshot create`
+writes a single standard frame with the metadata, so its artifacts install as
+before.
+
+`snapshot inspect` on a file shorter than the SQLite header warned that
+`index.db is 34 bytes … wiping`, about its own staging copy. The warning now
+names the file it wipes.
+
+### Not covered
+
+- The plugin's hooks and statusline still decide whether a project has an
+  index with checks that follow a symlinked `index.db` (D#365).
+- The check and the open are two steps. A link put in place between them, by a
+  process writing to the project at that moment, is opened.
 
 ### Release process: no npm token
 
