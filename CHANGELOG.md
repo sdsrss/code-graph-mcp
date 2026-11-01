@@ -13,8 +13,8 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 
 ### Security: zstd 0.14.3
 
-Four advisories published on 2026-10-16 affect the zstd crates 0.179.2 was
-built with. `cargo audit` failed all six scheduled CI runs on `main` from
+Four advisories dated 2026-10-16, and added to the RustSec database on
+2026-10-26, affect the zstd crates 0.179.2 was built with. `cargo audit` failed all six scheduled CI runs on `main` from
 2026-10-27 to 2026-11-01:
 
 | Advisory | Crate | 0.179.2 had | Patched in | 0.179.3 has |
@@ -34,8 +34,9 @@ the advisories and the source, not from a test:
 
 - RUSTSEC-2026-0391 covers the `with_context` constructors, which reuse a
   context the caller passes in. Neither call takes one.
-- RUSTSEC-2026-0398 covers `Seekable::decompress`, behind zstd-safe's
-  `seekable` feature, which this build does not enable.
+- RUSTSEC-2026-0398 covers `Seekable::decompress` and
+  `AdvancedSeekable::decompress`, in zstd-safe's `seekable` module, which is
+  compiled only with the `seekable` feature. This build does not enable it.
 - RUSTSEC-2026-0403 names `zstd::stream::read::Decoder` as not affected.
   `zstd::Decoder` is that type.
 - RUSTSEC-2026-0410 covers wasm32 only. No release target is wasm32.
@@ -56,8 +57,9 @@ startup. Tested on a 115-file corpus:
 - Four damaged inputs got the same errors from both versions, through
   `snapshot inspect` and through the install function: a truncated
   `.db.zst`, a file holding only the zstd magic, the magic followed by random
-  bytes, and a short file with a SQLite header. `snapshot inspect` refuses
-  the last two before decoding; the install function decodes all four.
+  bytes, and a short file with a SQLite header. `snapshot inspect` never
+  passes the magic-only file (under 16 bytes) or the SQLite-header file to
+  the decoder; the install function decodes all four.
 
 CI and release builds now use `Swatinem/rust-cache` 2.9.3 (was 2.9.2).
 
