@@ -599,6 +599,76 @@ fn inspect_reads_through_a_link_as_it_reads_the_file() {
     }
 }
 
+/// D#629 (0.180.0 pre-tag review R2): the arms that read a staged COPY (the
+/// `.db.zst` arm, the WAL-mode raw arm and the read-only fallback) opened it
+/// with the indexer's `Database::open`, whose INDEX_VERSION sweep deleted the
+/// copy's nodes and edges. A snapshot one INDEX_VERSION behind printed
+/// node_count 0 and `clearing + rebuilding`, while the in-place arm printed
+/// the real counts for the same bytes. One version ahead kept its counts but
+/// told the user to delete `.code-graph/index.db*`; it is here so that
+/// direction stays covered too.
+#[test]
+fn inspect_counts_another_index_versions_snapshot_alike_on_every_arm() {
+    let fixture = init_git_fixture();
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    let current = crate::snapshot::inspect(&raw_db).unwrap();
+    assert!(
+        current.node_count > 0 && current.edge_count > 0,
+        "fixture must carry nodes and edges, or a sweep has nothing to delete"
+    );
+
+    for stored in [
+        crate::domain::INDEX_VERSION - 1,
+        crate::domain::INDEX_VERSION + 1,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let in_place = dir.path().join("delete.db");
+        std::fs::copy(&raw_db, &in_place).unwrap();
+        Connection::open(&in_place)
+            .unwrap()
+            .pragma_update(None, "application_id", stored)
+            .unwrap();
+        let wal = dir.path().join("wal.db");
+        std::fs::copy(&in_place, &wal).unwrap();
+        {
+            let c = Connection::open(&wal).unwrap();
+            let mode: String = c
+                .query_row("PRAGMA journal_mode = wal", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+        }
+        let zst = dir.path().join("snapshot.db.zst");
+        let raw = std::fs::read(&in_place).unwrap();
+        std::fs::write(&zst, zstd::encode_all(&raw[..], 3).unwrap()).unwrap();
+        // A hot journal is what makes the in-place read fail and fall back to
+        // a staged copy, the third place a copy is opened.
+        let fallback = dir.path().join("fallback.db");
+        hot_journal_pair(&in_place, &fallback);
+
+        for (arm, file, write_version) in [
+            ("in place", &in_place, Some(1u8)),
+            ("WAL staging", &wal, Some(2)),
+            ("zstd", &zst, None),
+            ("read-only fallback", &fallback, Some(1)),
+        ] {
+            if let Some(v) = write_version {
+                let head = std::fs::read(file).unwrap();
+                assert_eq!(head[18], v, "v{stored} {arm}: fixture takes another arm");
+                let app_id = i32::from_be_bytes(head[68..72].try_into().unwrap());
+                assert_eq!(app_id, stored, "v{stored} {arm}: fixture's INDEX_VERSION");
+            }
+            let meta =
+                crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("v{stored} {arm}: {e:#}"));
+            assert_eq!(
+                (meta.node_count, meta.edge_count),
+                (current.node_count, current.edge_count),
+                "v{stored} {arm}: counts differ from the same bytes read at the current version"
+            );
+        }
+    }
+}
+
 /// 0.180.0 pre-tag review R2: the planted-file refusal (D#363) reached
 /// `snapshot inspect`, so a regular snapshot with a linked or directory
 /// `<file>-journal` / `-wal` beside it was refused; 0.179.4 read it. The
@@ -865,52 +935,157 @@ fn inspect_refuses_a_live_index_that_has_meta_but_no_snapshot_rows() {
     );
 }
 
-#[test]
-fn inspect_reads_a_non_wal_db_with_a_hot_rollback_journal() {
-    // A non-WAL database with a hot `-journal` beside it — what any writer that
-    // died mid-transaction leaves, including a crashed `snapshot create` —
-    // cannot be opened read-only: SQLite has to roll the journal back first, and
-    // a read-only connection may not write. The first version of the in-place
-    // arm swallowed that error in an `unwrap_or(0)` and told the user the file
-    // was corrupt, while the staging copy reads it perfectly, because the copy
-    // is opened writable and the rollback simply happens.
-    //
-    // Pre-ship review demonstrated the two arms disagreeing on identical bytes
-    // by flipping header byte 18 alone. `inspect` now falls back to staging when
-    // the in-place probe errors, so this must succeed.
-    let dir = TempDir::new().unwrap();
-    let src = dir.path().join("src.db");
-    raw_snapshot_fixture(&src, "delete", 1);
-
-    // Open a transaction and copy BOTH files while it is live: the copy then has
-    // a journal that a fresh opener must roll back.
-    let hot = dir.path().join("hot.db");
-    {
-        let conn = rusqlite::Connection::open(&src).unwrap();
-        conn.execute_batch("PRAGMA journal_mode = delete;").unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('x', 'y')",
-            [],
+/// Make `db` a copy of `committed`, a non-WAL snapshot, taken in the middle of
+/// a write transaction, plus its hot `-journal`: what a writer leaves when it
+/// dies mid-transaction. The transaction rewrites the tool version to `torn`,
+/// then outgrows a 10-page cache writing another table, so SQLite spills the
+/// page it dirtied first, the one holding `torn`, into the main file. Without
+/// the journal those bytes read as the unfinished transaction (or as a torn
+/// b-tree); with it SQLite rolls back to the last commit. The spill order is
+/// SQLite's to choose, so the precondition below reads the main file alone
+/// rather than trusting it. Returns the journal's path.
+fn hot_journal_pair(committed: &std::path::Path, db: &std::path::Path) -> std::path::PathBuf {
+    let src_dir = TempDir::new().unwrap();
+    let src = src_dir.path().join("src.db");
+    std::fs::copy(committed, &src).unwrap();
+    let src_journal = src_dir.path().join("src.db-journal");
+    let journal = std::path::PathBuf::from(format!("{}-journal", db.display()));
+    let tool_version = |c: &Connection| -> rusqlite::Result<String> {
+        c.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [META_SNAPSHOT_TOOL_VERSION],
+            |r| r.get(0),
         )
+    };
+
+    let conn = Connection::open(&src).unwrap();
+    let last_commit = tool_version(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE pad(v TEXT); PRAGMA cache_size = 10; BEGIN IMMEDIATE;")
         .unwrap();
-        let src_journal = dir.path().join("src.db-journal");
-        assert!(
-            src_journal.exists(),
-            "precondition: an open write transaction leaves a rollback journal"
-        );
-        std::fs::copy(&src, &hot).unwrap();
-        std::fs::copy(&src_journal, dir.path().join("hot.db-journal")).unwrap();
-        conn.execute_batch("ROLLBACK;").unwrap();
+    conn.execute(
+        "UPDATE meta SET value = 'torn' WHERE key = ?1",
+        [META_SNAPSHOT_TOOL_VERSION],
+    )
+    .unwrap();
+    for _ in 0..400 {
+        conn.execute("INSERT INTO pad(v) VALUES (?1)", ["x".repeat(400)])
+            .unwrap();
     }
     assert!(
-        dir.path().join("hot.db-journal").exists(),
-        "precondition: the fixture carries a hot journal"
+        std::fs::metadata(&src_journal).unwrap().len() > 0,
+        "precondition: the open transaction has a non-empty rollback journal"
     );
+    std::fs::copy(&src, db).unwrap();
+    std::fs::copy(&src_journal, &journal).unwrap();
+    conn.execute_batch("ROLLBACK;").unwrap();
 
-    let meta = crate::snapshot::inspect(&hot)
-        .expect("a non-WAL db with a hot rollback journal must still inspect");
-    assert_eq!(meta.tool_version, "9.9.9");
+    let alone = src_dir.path().join("alone.db");
+    std::fs::copy(db, &alone).unwrap();
+    let read_alone = Connection::open(&alone).and_then(|c| tool_version(&c));
+    assert!(
+        !matches!(&read_alone, Ok(v) if *v == last_commit),
+        "precondition: without its journal the main file must not read as the last \
+         commit, or the journal is not needed and this fixture proves nothing ({read_alone:?})"
+    );
+    journal
+}
+
+/// D#630 (0.180.0 pre-tag review R2). A non-WAL file with a hot journal cannot
+/// be read in place read-only (SQLite must roll the journal back first, and a
+/// read-only connection may not write), so `inspect` falls back to a writable
+/// copy. That copy was the main file alone: the journal stayed behind, the copy
+/// kept the unfinished transaction's pages, and `inspect` printed "database
+/// disk image is malformed" where `sqlite3` reads the last commit. The test
+/// this replaces passed only because its transaction never reached the main
+/// file. Three ways in: the read-only fallback (non-WAL), the WAL arm (a crash
+/// while switching a file to WAL leaves the header saying WAL beside a hot
+/// journal, and SQLite rolls that back first too), and a link, whose journal
+/// SQLite looks for beside the TARGET.
+#[test]
+fn inspect_rolls_back_a_hot_journal_as_sqlite_does() {
+    let committed_dir = TempDir::new().unwrap();
+    let committed = committed_dir.path().join("committed.db");
+    raw_snapshot_fixture(&committed, "delete", 1);
+    let dir = TempDir::new().unwrap();
+    let hot = dir.path().join("hot.db");
+    let journal = hot_journal_pair(&committed, &hot);
+    let flipped = dir.path().join("flipped.db");
+    let mut header_says_wal = std::fs::read(&hot).unwrap();
+    header_says_wal[18] = 2;
+    header_says_wal[19] = 2;
+    std::fs::write(&flipped, &header_says_wal).unwrap();
+    std::fs::copy(&journal, dir.path().join("flipped.db-journal")).unwrap();
+
+    let files = |dir: &std::path::Path| {
+        let mut all: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let bytes = std::fs::read(e.path()).unwrap();
+                (e.file_name().to_string_lossy().into_owned(), bytes)
+            })
+            .collect();
+        all.sort();
+        all
+    };
+    let check = |name: &str, file: &std::path::Path| {
+        let meta = crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(
+            meta.tool_version, "9.9.9",
+            "{name}: read the unfinished transaction instead of the last commit"
+        );
+    };
+
+    #[cfg(unix)]
+    let link = {
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&hot, &link).unwrap();
+        link
+    };
+    let before = files(dir.path());
+    check("non-WAL", &hot);
+    check("header says WAL", &flipped);
+    #[cfg(unix)]
+    check("link", &link);
+    assert_eq!(
+        files(dir.path()),
+        before,
+        "inspect rolled back, or otherwise touched, the files it was pointed at"
+    );
+}
+
+/// The WAL arm stages a `-journal` with the file now (D#630), and 0.180.0 read
+/// a WAL-mode snapshot whatever sat at that name. A directory there must not
+/// turn into a copy error, nor a FIFO into a copy that blocks forever, so only
+/// a regular file is staged. In a thread with a deadline: a FIFO that slips
+/// through hangs the suite rather than failing it.
+#[cfg(unix)]
+#[test]
+fn inspect_stages_a_journal_only_when_it_is_a_regular_file() {
+    for shape in ["directory", "FIFO"] {
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, "wal", 2);
+        let side = dir.path().join("snapshot.db-journal");
+        if shape == "directory" {
+            std::fs::create_dir(&side).unwrap();
+        } else {
+            let made = Command::new("mkfifo").arg(&side).status().unwrap();
+            assert!(made.success(), "mkfifo {}", side.display());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                crate::snapshot::inspect(&raw)
+                    .map(|m| m.tool_version)
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{shape}: inspect blocked on the side file"));
+        assert_eq!(got.as_deref(), Ok("9.9.9"), "{shape}");
+    }
 }
 
 #[cfg(unix)]

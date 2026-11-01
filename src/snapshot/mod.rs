@@ -224,7 +224,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         let tmp = tempfile::tempdir().context("inspect tempdir")?;
         let decompressed = tmp.path().join("snapshot.db");
         install::decompress_with_cap(file, &decompressed, cap).context("zstd decode")?;
-        let opened = Database::open(&decompressed)?;
+        let opened = open_staged(&decompressed, file)?;
         _staging_dir = Some(tmp);
         opened
     } else if head.starts_with(b"SQLite format 3\0") {
@@ -255,9 +255,10 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // in-place open MINTS `-wal` and `-shm` beside the user's file and a
         // read-only connection cannot clean them up on close. Measured — two
         // files left behind, on a command whose whole job is to look. Staging
-        // also preserves the semantics this arm has always had: `fs::copy` takes
+        // also preserves the semantics this arm has always had: the copy takes
         // the main database file and not its `-wal`, so `inspect` reports the
-        // last checkpointed state and never disturbs a live index.
+        // last checkpointed state and never disturbs a live index. It does take
+        // a `-journal` (see `stage_copy`).
         //
         // The split costs nothing in practice: `snapshot create` emits through
         // `VACUUM INTO`, and its output is `journal_mode = delete` (measured on
@@ -277,9 +278,8 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // in different shapes.
         if wal_mode {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
-            let staged = tmp.path().join("snapshot.db");
-            std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
-            let opened = Database::open(&staged)?;
+            let staged = stage_copy(file, tmp.path())?;
+            let opened = open_staged(&staged, file)?;
             _staging_dir = Some(tmp);
             opened
         } else {
@@ -296,7 +296,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         );
     };
     // A file with no schema at all must be called the same thing whichever arm
-    // read it. The staged arm gets `Database::open`'s bootstrap, so a file that
+    // read it. The staged arm gets `open_staged`'s bootstrap, so a file that
     // clears the 16-byte magic check while holding nothing else still opens onto
     // an empty `meta` and reaches the `schema_version == 0` verdict below.
     // Opening in place creates nothing, so the same file would instead surface
@@ -322,30 +322,29 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // by any writer that died mid-transaction, including a crashed
     // `snapshot create` — cannot be opened read-only at all, because SQLite must
     // roll the journal back first and a read-only connection may not write.
-    // `unwrap_or(0)` swallowed that and reported the file corrupt, while the
-    // staging copy reads it perfectly: the copy is opened writable, so the
-    // rollback just happens. Pre-ship review demonstrated the two arms
-    // disagreeing on identical bytes by flipping header byte 18 alone.
+    // `unwrap_or(0)` swallowed that and reported the file corrupt. The fallback
+    // below opens a writable copy, where the rollback can happen, and only
+    // because the copy carries the journal: without it the copy keeps whatever
+    // pages the unfinished transaction already wrote, and reads as "database
+    // disk image is malformed" or as uncommitted values (D#630). An earlier
+    // version of this comment said the bare copy "reads it perfectly"; the test
+    // behind that claim passed only because its transaction had not yet reached
+    // the main file.
     //
     // This is the same misdiagnosis the WAL split exists to prevent — telling a
     // user their snapshot is corrupt when the real problem is that we chose an
     // access mode the file does not permit. Falling back to the copy costs a
-    // staging write on a path that was already going to fail, and restores the
-    // pre-0.147.0 behaviour exactly.
+    // staging write on a path that was already going to fail.
     if probe.is_err() && opened_in_place {
         let tmp = tempfile::tempdir().context("inspect tempdir")?;
-        let staged = tmp.path().join("snapshot.db");
-        std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
-        db = Database::open(&staged)?;
+        let staged = stage_copy(file, tmp.path())?;
+        db = open_staged(&staged, file)?;
         _staging_dir = Some(tmp);
         probe = db.conn().query_row(META_PROBE, [], |r| r.get(0));
     }
 
     if probe.unwrap_or(0) <= 0 {
-        anyhow::bail!(
-            "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
-            file.display()
-        );
+        return Err(invalid_snapshot(file));
     }
     let conn = db.conn();
 
@@ -365,10 +364,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // this guard, `inspect` would return a fake "valid empty snapshot" with
     // zeroed fields. Real snapshots always carry a non-zero schema_version.
     if !is_snapshot_meta(schema_version, &source_commit, &tool_version) {
-        anyhow::bail!(
-            "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
-            file.display()
-        );
+        return Err(invalid_snapshot(file));
     }
     let includes_vec = meta::read_meta(conn, meta::META_SNAPSHOT_INCLUDES_VEC)?
         .map(|s| s == "true")
@@ -392,5 +388,55 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         node_count,
         edge_count,
         file_size_bytes,
+    })
+}
+
+/// `inspect`'s verdict on a file that is not a readable snapshot, whichever
+/// check refused it.
+fn invalid_snapshot(file: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
+        file.display()
+    )
+}
+
+/// Copy `file` into `dir` for a writable open, with its rollback journal. A hot
+/// `-journal` records what an unfinished transaction overwrote, and SQLite
+/// rolls it back before it reads; a copy without it reads that transaction's
+/// pages (D#630). SQLite names the journal after the path it opened with links
+/// resolved, so a link's journal is looked for beside the target. Only a
+/// regular file there is copied: a directory is no journal, and copying a FIFO
+/// would block. The `-wal` is deliberately left behind (see the WAL arm).
+fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
+    fn journal_of(db: &Path) -> std::path::PathBuf {
+        let mut name = db.as_os_str().to_owned();
+        name.push("-journal");
+        name.into()
+    }
+    let staged = dir.join("snapshot.db");
+    std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
+    let journal = journal_of(&std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()));
+    if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
+        std::fs::copy(&journal, journal_of(&staged))
+            .context("stage snapshot journal for inspect")?;
+    }
+    Ok(staged)
+}
+
+/// Open a staged copy as a READER (D#629): an indexer open's INDEX_VERSION
+/// sweep emptied the copy of a snapshot built by another version, so the
+/// staging arms printed node_count 0 where the in-place arm printed the real
+/// counts. The reader open still migrates and bootstraps the copy, which is
+/// what the meta probe relies on. Its corrupt-file refusal is put in
+/// `inspect`'s own words: it names `rebuild-index` and the temp copy's path,
+/// and neither is anything a user inspecting a snapshot can act on.
+fn open_staged(staged: &Path, file: &Path) -> Result<crate::storage::db::Database> {
+    use crate::storage::db::Database;
+    Database::open_nondestructive(staged).map_err(|e| {
+        if Database::is_corrupt_index_error(&e) {
+            invalid_snapshot(file)
+        } else {
+            e
+        }
     })
 }
