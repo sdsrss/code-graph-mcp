@@ -1,5 +1,5 @@
 ---
-status: in progress
+status: done (shipped in 0.180.0, 2026-11-01)
 revision: 1
 ---
 
@@ -58,3 +58,4 @@ revision: 1
 - 2026-11-01：逐入口实测（0.179.4 发布二进制 md5 d5a6c861 对 HEAD 二进制 md5 f5cb6fa3，由之后提交为 64dfe9a1 的工作区构建），8 种形态 × show / health-check（两种格式）/ grep / incremental-index / MCP serve，外加 statusline、doctor、rebuild-index 补救；结果写进 CHANGELOG 0.180.0。与 D#611（64dfe9a1）一起发 0.180.0。
 - 2026-11-01：发版前评审第 1 轮（HIGH 0 / MEDIUM 2 / LOW 11）。修复：M-1（`snapshot inspect` 拒绝用户自己给的符号链接 → 链接输入走复制分支）、M-2（`-journal` 加入检查）、L-6（`is_snapshot_meta` 真值表测试）、L-7（doctor 措辞）、L-8（rustdoc 位置）；其余 LOW 写进 CHANGELOG 的说明和 Not covered。修复的 6 个变异（去掉 -journal、链接不走复制、判定式 4 种）各让 1 个测试失败。
 - 2026-11-01：增量评审第 2 轮（2df21182；本次修复引入 MEDIUM 2 / LOW 6，另有既有 MEDIUM 1 / LOW 1）。两个 MEDIUM 都出在 M-1 的修法上：链接输入走"复制后打开"，复制件按写打开，只读目标报错，旧 INDEX_VERSION 的计数被清空。按停止线不再补丁：撤回这个修法，inspect 改用不做拒绝检查的只读打开（`open_readonly_named`），回到 0.179.4 的行为；`.code-graph` 的检查保留在其他入口。证据是差分，不开第 3 轮：评审的 26 种 inspect 形态，在新版与 0.179.4 上逐行一致（退出码、节点数、提交号、错误文本、旁边的残留）；66 行 CLI 形态矩阵，在新版与 2df21182 上退出码和错误文本一致。LOW 5/6/7 改 CHANGELOG 措辞，LOW 8 给 FIFO journal 用例加 20 秒期限。既有问题（旧 INDEX_VERSION 的 .db.zst 在 inspect 里计数为 0；hot journal 注释不实）另记待办。
+- 2026-11-01：发版 0.180.0。tag v0.180.0 在 df3cb9c3；main CI 41322563155 7/7；Release 41323916486 10/10；npm 六个包 `_npmUser` 均为 GitHub Actions；npm 真实安装的二进制拒绝链接的 index.db，链接目标不变。
