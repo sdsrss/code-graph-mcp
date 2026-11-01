@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Release process: no npm token
+
+`release.yml` no longer passes an npm token to the publish step. 0.179.4
+showed that all six packages publish through trusted publishing (each one's
+`_npmUser` is `GitHub Actions`). With the token still present, npm 11 would
+fall back to it whenever the OIDC exchange failed, and the job would stay
+green; now such a failure fails the publish step.
+`scripts/release-smoke.test.js` fails if `NPM_TOKEN` or `NODE_AUTH_TOKEN`
+appears outside a comment in `release.yml`.
+
 ## 0.179.4
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). The binary is

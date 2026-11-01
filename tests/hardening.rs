@@ -2823,10 +2823,11 @@ fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
 ///
 /// A mutable tag (`@v6`) is a standing write-authority grant to whoever can move
 /// that tag — and these workflows run with `contents: write` and, in the publish
-/// job, an `NPM_TOKEN`. The repo already SHA-pinned all 13 third-party uses and
-/// left all 21 first-party `actions/*` ones on major tags, which is the harder
-/// half to justify: `actions/checkout` runs first in every job, including the
-/// one holding the npm token.
+/// job, `id-token: write`, which npm exchanges for a publish token (trusted
+/// publishing; an `NPM_TOKEN` secret until 0.179.4). The repo already SHA-pinned
+/// all 13 third-party uses and left all 21 first-party `actions/*` ones on major
+/// tags, which is the harder half to justify: `actions/checkout` runs first in
+/// every job, including the one that can publish to npm.
 ///
 /// Enforced here rather than by review because the audit flagged this twice
 /// (07-24 #17, 07-27 P2-25) and nothing changed either time. The 40-hex check
@@ -2907,7 +2908,8 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
         unpinned.is_empty(),
         "{} workflow action(s) are on a mutable ref instead of a 40-hex commit \
          SHA. Whoever can move that tag can run code in a job that holds \
-         `contents: write` (and, in publish, NPM_TOKEN):\n  {}",
+         `contents: write` (and, in publish, `id-token: write`, which can mint \
+         an npm publish token):\n  {}",
         unpinned.len(),
         unpinned.join("\n  ")
     );

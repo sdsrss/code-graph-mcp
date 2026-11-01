@@ -90,7 +90,10 @@ test('npm packages are published only through scripts/npm-publish.js, inside a l
   const job = release.match(/\n {2}publish:\n([\s\S]*?)\n {2}[a-z][\w-]*:\n/);
   assert.ok(job, 'release.yml has a `publish` job');
   // The step exactly: no continue-on-error, no budget override, no step bound
-  // shorter than the waits, and the token npm authenticates with.
+  // shorter than the waits, and no token. npm authenticates through trusted
+  // publishing (OIDC); with a token in the environment, a failed exchange
+  // would publish with the token and the job would still pass (npm 11
+  // `lib/commands/publish.js` tries OIDC first and falls back silently).
   const step = job[1].match(/\n( {6}- name: Publish to npm[^\n]*\n(?: {8}[^\n]*\n)*)/);
   assert.ok(step, 'the publish job has the "Publish to npm" step');
   assert.deepEqual(
@@ -98,11 +101,11 @@ test('npm packages are published only through scripts/npm-publish.js, inside a l
     [
       '- name: Publish to npm (platform packages first, main package last)',
       'run: node scripts/npm-publish.js "$VERSION"',
-      'env:',
-      'NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}',
     ],
   );
-  assert.match(job[1], /\n {6}id-token: write\n/, '--provenance needs id-token: write');
+  const live = release.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  assert.doesNotMatch(live, /NPM_TOKEN|NODE_AUTH_TOKEN/, 'release.yml publishes through trusted publishing, not a token');
+  assert.match(job[1], /\n {6}id-token: write\n/, 'trusted publishing and --provenance need id-token: write');
   const bound = job[1].match(/^ {4}timeout-minutes: (\d+)$/m);
   assert.ok(bound, 'the publish job sets timeout-minutes');
   const { WAIT_SECONDS, MAIN_WAIT_SECONDS } = require('./npm-publish');

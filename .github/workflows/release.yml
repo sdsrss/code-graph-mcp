@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
   # Manual re-run of a failed release on an existing tag. Use when publish
-  # broke (NPM_TOKEN expired, transient registry 5xx, etc.) and you don't
+  # broke (a trusted-publishing exchange failed, transient registry 5xx, etc.) and you don't
   # want to bump a new version just to re-trigger the pipeline. Dispatch from
   # the default branch; each job checks out `inputs.tag` instead of the
   # default-branch HEAD so the build/publish matches that tag's source.
@@ -439,16 +439,13 @@ jobs:
 
       # Node 24, not 20: npm trusted publishing (OIDC) needs npm >= 11.5.1 and
       # Node >= 22.14 (docs.npmjs.com/trusted-publishers), and Node 22 still
-      # bundles npm 10. With the id-token permission above, npm tries OIDC first
-      # and falls back to NODE_AUTH_TOKEN while a package has no trusted
-      # publisher configured, so publishing keeps using the token (D#290). One
-      # npm 11 difference: without --tag (npm-publish.js passes none) it
+      # bundles npm 10. The id-token permission above is what npm exchanges for
+      # a short-lived publish token per package (D#290; see the publish step).
+      # One npm 11 difference: without --tag (npm-publish.js passes none) it
       # refuses a version lower than the highest published one that is neither
       # a prerelease nor deprecated ('Cannot implicitly apply the "latest" tag'),
       # where npm 10 tagged it `latest`. A tag pushed out of version order now
-      # fails here, after the GitHub Release step. Once all six
-      # packages trust release.yml, remove NODE_AUTH_TOKEN below so a failed
-      # OIDC exchange fails the job instead of using the token.
+      # fails here, after the GitHub Release step.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -663,10 +660,17 @@ jobs:
       # tarball back to the workflow run and commit that built it, for packages
       # that ship NATIVE BINARIES. Requires the `id-token: write` above; without
       # it the publish fails loudly instead of shipping unsigned.
+      #
+      # No token: npm authenticates each package through trusted publishing
+      # (OIDC), configured on npmjs.com for every one of the six packages as
+      # GitHub `sdsrss/code-graph-mcp`, workflow `release.yml`, no environment,
+      # direct `npm publish` allowed. 0.179.4 was the first release published
+      # this way (each package's `_npmUser` is `GitHub Actions`). With a token
+      # in the environment, npm 11 falls back to it silently whenever the OIDC
+      # exchange fails, so a broken trust configuration would still publish and
+      # the job would stay green; without one, it fails here instead.
       - name: Publish to npm (platform packages first, main package last)
         run: node scripts/npm-publish.js "$VERSION"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Post-publish verification: in a clean env on each OS, install the JUST-
   # PUBLISHED package from the npm registry and assert the binary runs and

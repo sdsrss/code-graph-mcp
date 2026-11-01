@@ -127,7 +127,7 @@ function publishOne(pkg, version, { publish, log }) {
   const kind = classifyPublish(result);
   if (kind === 'error') {
     log(result.output.trimEnd());
-    log(`::error::${pkg.name}@${version} publish failed (not "already published" or "previously staged") — check NPM_TOKEN / the registry`);
+    log(`::error::${pkg.name}@${version} publish failed (not "already published" or "previously staged") — check the package's trusted publisher on npmjs.com (GitHub sdsrss/code-graph-mcp, release.yml, direct publish allowed) / the registry`);
     return false;
   }
   if (kind === 'published') log(result.output.trimEnd());
