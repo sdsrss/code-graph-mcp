@@ -434,12 +434,18 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// rolls it back before it reads; a copy without it reads that transaction's
 /// pages (D#630). Only a regular file at [`side_file_of`] `-journal` is
 /// copied: a directory is no journal, and copying a FIFO would block. And only
-/// a hot one, whose first byte is not 0: that byte is what SQLite reads to
-/// decide (`hasHotJournal`), it ignores any other journal, and copying one cost
-/// a write as large as the journal (pre-tag review: 1 GiB of zeros, and under a
-/// file-size limit a SIGXFSZ that left the copy behind). A journal that cannot
-/// be read is refused, naming it, as `sqlite3` refuses it. The `-wal` is
-/// deliberately left behind (see the WAL arm).
+/// one SQLite would roll something back from. An empty one SQLite treats as
+/// absent (`unixAccess`). It calls a journal hot when its first byte is not 0
+/// (`hasHotJournal`), and then plays nothing back from one whose first header
+/// does not start with its journal magic (`readJournalHdr` returns
+/// SQLITE_DONE), so without the magic the copy reads as the main file alone
+/// either way. Copying such a journal cost a write as large as it is (pre-tag
+/// review: 1 GiB, first byte 0 and then first byte 1, and under a file-size
+/// limit a SIGXFSZ that left the copy behind). A journal that does carry the
+/// magic is copied whole: how much it holds is the dead transaction's, not
+/// bounded by the snapshot's size. A non-empty journal that cannot be read is
+/// refused, naming it, as `sqlite3` refuses it. The `-wal` is deliberately left
+/// behind (see the WAL arm).
 ///
 /// Both copies are new files rather than `fs::copy`s, which carry the source's
 /// mode over: rolling a hot journal back writes the copy and opens the journal
@@ -459,18 +465,22 @@ fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
     copy_writable(file, &staged)
         .with_context(|| format!("stage a copy of '{}' for inspect", file.display()))?;
     let journal = side_file_of(file, "-journal");
-    if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
+    if std::fs::metadata(&journal).is_ok_and(|m| m.is_file() && m.len() > 0) {
         let context = || format!("stage '{}' for inspect", journal.display());
-        let mut first = [0u8; 1];
-        let read = std::fs::File::open(&journal)
-            .and_then(|mut f| f.read(&mut first))
+        let mut head = Vec::with_capacity(JOURNAL_MAGIC.len());
+        std::fs::File::open(&journal)
+            .and_then(|f| f.take(JOURNAL_MAGIC.len() as u64).read_to_end(&mut head))
             .with_context(context)?;
-        if read == 1 && first[0] != 0 {
+        if head == JOURNAL_MAGIC {
             copy_writable(&journal, &with_suffix(&staged, "-journal")).with_context(context)?;
         }
     }
     Ok(staged)
 }
+
+/// The first eight bytes of every rollback journal header SQLite writes
+/// (`aJournalMagic` in sqlite3.c).
+const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 
 fn with_suffix(db: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = db.as_os_str().to_owned();

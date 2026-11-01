@@ -1248,33 +1248,50 @@ fn inspect_reads_a_non_wal_file_past_a_stray_wal() {
     }
 }
 
-/// The staged copy takes a `-journal` only when SQLite would roll it back: its
-/// first byte is not 0 (`hasHotJournal`). A journal that is not hot is ignored
-/// by SQLite, and copying it cost a write as large as it is (pre-tag review: a
-/// 1 GiB sparse journal of zeros beside a WAL-mode snapshot was copied into
-/// TMPDIR, and under a 256 MiB file-size limit inspect died of SIGXFSZ and left
-/// the copy behind, where 0.180.0 exited 0).
+/// The staged copy takes a `-journal` only when SQLite would roll something back
+/// from it: non-empty and starting with SQLite's journal magic. SQLite calls a
+/// journal hot when its first byte is not 0, then plays nothing back from one
+/// whose first header lacks the magic, so without it the file reads as the main
+/// file alone either way. Copying such a journal cost a write as large as it is
+/// (pre-tag review: 1 GiB beside a WAL-mode snapshot, first byte 0 and then
+/// first byte 1, was copied into TMPDIR, and under a 256 MiB file-size limit
+/// inspect died of SIGXFSZ and left the copy behind, where 0.180.0 exited 0).
 #[test]
-fn stage_copy_takes_a_journal_only_when_it_is_hot() {
+fn stage_copy_takes_a_journal_only_when_it_has_something_to_roll_back() {
     let committed_dir = TempDir::new().unwrap();
     let committed = committed_dir.path().join("committed.db");
     raw_snapshot_fixture(&committed, "delete", 1);
     let dir = TempDir::new().unwrap();
     let hot = dir.path().join("hot.db");
     hot_journal_pair(&committed, &hot);
-    let cold = dir.path().join("cold.db");
-    std::fs::copy(&committed, &cold).unwrap();
-    std::fs::write(dir.path().join("cold.db-journal"), vec![0u8; 64 * 1024]).unwrap();
-
-    for (name, file, copied) in [("hot", &hot, true), ("first byte 0", &cold, false)] {
+    let mut no_magic = vec![0u8; 64 * 1024];
+    no_magic[0] = 1;
+    let shapes: [(&str, Option<Vec<u8>>, bool); 4] = [
+        ("hot", None, true),
+        ("first byte 0", Some(vec![0u8; 64 * 1024]), false),
+        ("first byte 1, no magic", Some(no_magic), false),
+        ("empty", Some(Vec::new()), false),
+    ];
+    for (name, journal_bytes, copied) in shapes {
+        let file = match journal_bytes {
+            None => hot.clone(),
+            Some(bytes) => {
+                let file = dir
+                    .path()
+                    .join(format!("{}.db", name.replace([' ', ','], "_")));
+                std::fs::copy(&committed, &file).unwrap();
+                std::fs::write(format!("{}-journal", file.display()), bytes).unwrap();
+                file
+            }
+        };
         let into = TempDir::new().unwrap();
-        let staged = super::stage_copy(file, into.path()).unwrap();
+        let staged = super::stage_copy(&file, into.path()).unwrap();
         let journal = into.path().join("snapshot.db-journal");
         assert_eq!(staged, into.path().join("snapshot.db"), "{name}");
         assert_eq!(journal.exists(), copied, "{name}: journal copied?");
+        let meta = crate::snapshot::inspect(&file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(meta.tool_version, "9.9.9", "{name}");
     }
-    let meta = crate::snapshot::inspect(&cold).unwrap();
-    assert_eq!(meta.tool_version, "9.9.9");
 }
 
 /// Every arm refuses a snapshot whose schema is newer than this binary's with
@@ -1317,12 +1334,29 @@ fn inspect_says_a_newer_schema_is_newer_on_every_arm() {
 /// ("unable to open database file"): it may hold what the main file needs to
 /// read as its last commit. The refusal names the file, so the user knows which
 /// one to fix; the first version said only "stage snapshot journal for inspect:
-/// Permission denied" (pre-tag review).
+/// Permission denied" (pre-tag review). An EMPTY one is no journal to SQLite
+/// (`unixAccess` counts a regular file as there only when it has bytes), so it
+/// is read past, unreadable or not, as 0.180.0 and `sqlite3` read past it.
 #[cfg(unix)]
 #[test]
 fn inspect_names_a_journal_it_cannot_read() {
     use std::os::unix::fs::PermissionsExt;
 
+    for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, mode, write_version);
+        let journal = dir.path().join("snapshot.db-journal");
+        std::fs::write(&journal, []).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = crate::snapshot::inspect(&raw).map(|m| m.tool_version);
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            got.map_err(|e| format!("{e:#}")).as_deref(),
+            Ok("9.9.9"),
+            "{mode}: an empty journal is none"
+        );
+    }
     for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
         let dir = TempDir::new().unwrap();
         let raw = dir.path().join("snapshot.db");

@@ -83,10 +83,12 @@ SQLite. Measured on five more inputs, 0.180.0 against 0.181.0:
   inspect` … `Permission denied (os error 13)` (exit 1), as `sqlite3` refuses
   it with `unable to open database file`.
 
-A `-journal` whose first byte is 0 is not hot, and SQLite does not apply it;
-`inspect` leaves it out of the copy. With a 1 GiB journal of zeros beside a
-snapshot in WAL mode and a 256 MiB file-size limit, 0.180.0 and 0.181.0 both
-exit 0 and leave nothing in TMPDIR.
+A `-journal` SQLite would roll nothing back from is left out of the copy: an
+empty one, or one that does not start with SQLite's journal header. With 1 GiB
+of such a journal beside a snapshot (first byte 0, WAL mode; first byte 1, WAL
+and rollback mode) and a 256 MiB file-size limit, 0.180.0 and 0.181.0 both exit
+0 and leave nothing in TMPDIR. An empty `-journal` that cannot be read (mode
+000) is read past, by 0.180.0, 0.181.0 and `sqlite3` alike.
 
 ### Not covered
 
@@ -107,6 +109,11 @@ exit 0 and leave nothing in TMPDIR.
   resolving links, while `inspect` looks for `-journal` and `-wal` beside a
   link's target. Through a file symlink the two can disagree. This is read
   from SQLite's source and not run: there is no Windows machine here.
+- A `-journal` that does start with SQLite's journal header is copied whole
+  into TMPDIR before it is rolled back, however large it is. A 1 GiB one (the
+  header, then zeros) beside a 168 KiB snapshot in WAL mode, under a 256 MiB
+  file-size limit, got `inspect` killed (SIGXFSZ, exit 153) with 268,607,488
+  bytes left in TMPDIR; 0.180.0, which did not apply journals, exited 0.
 - `inspect` looks at the `-journal` and `-wal` beside the file before SQLite
   opens it. A FIFO put there between the two, by another process at that
   moment, still blocks it.
