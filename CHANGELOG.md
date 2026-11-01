@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.179.4
+
+**Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). The binary is
+built from 0.179.3's source, unchanged apart from the version. The plugin's
+hooks and scripts are 0.179.3's, apart from version numbers. To pin back
+anyway: `npm i -g @sdsrs/code-graph@0.179.3` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.179.3
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### Release process: npm trusted publishing
+
+This release changes no code. It was cut so that a publish exercises the npm
+trusted-publisher configuration (GitHub Actions, `release.yml`) set up for the
+six npm packages on 2026-11-01. 0.179.3 was published by `release.yml` with an
+npm token stored as a GitHub secret; its `_npmUser` is the account `sdsrs`.
+The registry records which path published each package:
+`npm view @sdsrs/code-graph@0.179.4 _npmUser`.
+
 ## 0.179.3
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124, the snapshot
