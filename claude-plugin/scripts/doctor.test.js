@@ -616,6 +616,29 @@ test('a refused .code-graph is reported with its whole message, not as a broken 
   assert.equal(byName.Embeddings.status, 'skip');
 });
 
+test('a refused index.db is described as the file the binary named, not as .code-graph', () => {
+  // D#363: the binary also refuses an index.db (or -wal/-shm) inside a real
+  // .code-graph that is a symlink or not a regular file, with the same
+  // reason "refused". The repair arm said ".code-graph is a symlink or not a
+  // directory" for it, which names the wrong file.
+  const { classifyHealthReport, runRepairs } = require('./doctor');
+  const issue = 'refusing to use a symlinked /p/.code-graph/index.db — remove it and re-run';
+  const rows = classifyHealthReport({ healthy: false, reason: 'refused', issue, nodes: 0, files: 0 });
+  const index = rows.find((r) => r.name === 'Index');
+  assert.equal(index.fixId, 'code-graph-dir-refused');
+  const logged = [];
+  const origLog = console.log;
+  console.log = (...a) => logged.push(a.join(' '));
+  try {
+    assert.equal(runRepairs([index]), 0);
+  } finally {
+    console.log = origLog;
+  }
+  const out = logged.join('\n');
+  assert.ok(out.includes('/p/.code-graph/index.db'), out);
+  assert.ok(!out.includes('not a directory'), out);
+});
+
 test('an index whose last run did not finish routes to the index rebuild', () => {
   // E2E 2026-10-16 round 2: the partial index a dead startup build left read as
   // `Index ✅ 3294 nodes … 506 files`. health-check reports reason

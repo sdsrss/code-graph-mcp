@@ -92,6 +92,10 @@ impl Database {
     /// migrations or table creation happens — secondary relies entirely on
     /// the primary's bootstrap.
     pub fn open_readonly(path: &Path) -> Result<Self> {
+        // Before SQLite sees the path: it follows a symlinked index.db to the
+        // target, and a read-only open of a WAL database still writes its
+        // -shm/-wal there (D#363; see `reject_unowned_db`).
+        crate::utils::owned::reject_unowned_db(path)?;
         register_sqlite_vec();
         let conn = Connection::open_with_flags(
             path,
@@ -166,6 +170,11 @@ impl Database {
     /// verdict, and doctor's `index-corrupt` repair does the rebuild under a
     /// caller that actually rebuilds.
     fn open_impl(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
+        // Every read and write open, ahead of the size guard (whose metadata
+        // call follows links): a symlinked index.db is opened at its TARGET by
+        // SQLite, and an indexer open then rewrites or creates a database
+        // outside the project (D#363; see `reject_unowned_db`).
+        crate::utils::owned::reject_unowned_db(path)?;
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
         // Without this, post-crash residue (0-byte main + stale .wal/.shm,
@@ -3071,5 +3080,153 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1); // exact match first
+    }
+
+    /// D#363: a symlinked `index.db` inside a real `.code-graph`. SQLite resolves
+    /// every link in the path and opens the TARGET, so a cloned repo's
+    /// `index.db -> ../../x` had each open write there: another project's index
+    /// re-indexed as this one, a foreign SQLite file switched to WAL with 43 of
+    /// this tool's schema objects added, and a dangling link created a database
+    /// (plus `index-run.lock`) outside the project. Every constructor refuses the
+    /// link and leaves the target byte-identical, or uncreated.
+    #[cfg(unix)]
+    #[test]
+    fn every_open_refuses_a_symlinked_index_db_and_leaves_the_target_alone() {
+        type Opener = fn(&Path) -> Result<Database>;
+        let openers: [(&str, Opener); 5] = [
+            ("open", Database::open),
+            ("open_with_vec", Database::open_with_vec),
+            ("open_nondestructive", Database::open_nondestructive),
+            (
+                "open_nondestructive_with_vec",
+                Database::open_nondestructive_with_vec,
+            ),
+            ("open_readonly", Database::open_readonly),
+        ];
+        let listing = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        for (name, open) in openers {
+            let dir = TempDir::new().unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let foreign = outside.join("foreign.sqlite");
+            {
+                let c = Connection::open(&foreign).unwrap();
+                c.execute_batch(
+                    "CREATE TABLE bookmarks(id INTEGER PRIMARY KEY, url TEXT);
+                     INSERT INTO bookmarks VALUES (1, 'x');",
+                )
+                .unwrap();
+            }
+            let bytes = std::fs::read(&foreign).unwrap();
+            let names = listing(&outside);
+
+            let cg = dir.path().join("live");
+            std::fs::create_dir(&cg).unwrap();
+            let link = cg.join("index.db");
+            std::os::unix::fs::symlink(&foreign, &link).unwrap();
+            let err = open(&link)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a symlink"));
+            assert!(
+                err.to_string().contains("refusing to use a symlinked"),
+                "{name}: {err}"
+            );
+            assert_eq!(std::fs::read(&foreign).unwrap(), bytes, "{name}: target");
+            assert_eq!(listing(&outside), names, "{name}: beside the target");
+
+            let cg = dir.path().join("dangling");
+            std::fs::create_dir(&cg).unwrap();
+            let never = outside.join("never.db");
+            std::os::unix::fs::symlink(&never, cg.join("index.db")).unwrap();
+            let err = open(&cg.join("index.db"))
+                .err()
+                .unwrap_or_else(|| panic!("{name}: a dangling symlink"));
+            assert!(
+                err.to_string().contains("refusing to use a symlinked"),
+                "{name}: {err}"
+            );
+            assert!(!never.exists(), "{name}: created the link's target");
+            assert_eq!(listing(&outside), names, "{name}: beside the target");
+        }
+    }
+
+    /// D#363, the shapes the refusal must NOT reach. A link ABOVE the database's
+    /// own name (a project reached through a symlinked directory, macOS's
+    /// `/var -> /private/var` temp dirs) is the user's path, not a planted file.
+    /// A hard link stays accepted on purpose: git cannot carry one, and after a
+    /// `cp -al` of the project the ORIGINAL's index.db has two links as well, so
+    /// refusing would lock the user out of their own index. Plus the sidecar and
+    /// non-regular shapes that are refused.
+    #[cfg(unix)]
+    #[test]
+    fn open_refusal_judges_the_database_name_and_its_sidecars_only() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        Database::open(&real.join("index.db")).unwrap();
+        let via = dir.path().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        Database::open_nondestructive(&via.join("index.db"))
+            .expect("a symlinked parent directory is not a planted index.db");
+        let other = dir.path().join("hard.db");
+        std::fs::hard_link(real.join("index.db"), &other).unwrap();
+        Database::open_nondestructive(&real.join("index.db"))
+            .expect("a hard-linked index.db is accepted (see the doc above)");
+        Database::open_readonly(&real.join("index.db")).expect("readonly, hard link");
+
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep\n").unwrap();
+        for (shape, why) in [
+            ("-wal", "refusing to use a symlinked"),
+            ("-shm", "refusing to use a symlinked"),
+            ("fifo", "exists and is not a regular file"),
+            ("dir", "exists and is not a regular file"),
+        ] {
+            let cg = dir.path().join(format!("shape{shape}"));
+            std::fs::create_dir(&cg).unwrap();
+            let db = cg.join("index.db");
+            let named = match shape {
+                "fifo" => {
+                    let made = std::process::Command::new("mkfifo")
+                        .arg(&db)
+                        .status()
+                        .unwrap();
+                    assert!(made.success());
+                    db.clone()
+                }
+                "dir" => {
+                    std::fs::create_dir(&db).unwrap();
+                    db.clone()
+                }
+                sidecar => {
+                    Database::open(&db).unwrap();
+                    let side = cg.join(format!("index.db{sidecar}"));
+                    let _ = std::fs::remove_file(&side);
+                    std::os::unix::fs::symlink(&victim, &side).unwrap();
+                    side
+                }
+            };
+            let err = Database::open_nondestructive(&db)
+                .err()
+                .unwrap_or_else(|| panic!("{shape} must be refused"));
+            let msg = err.to_string();
+            assert!(msg.contains(why), "{shape}: {msg}");
+            assert!(
+                msg.contains(&named.display().to_string()),
+                "{shape}: must name the file: {msg}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "keep\n",
+                "{shape}"
+            );
+        }
     }
 }

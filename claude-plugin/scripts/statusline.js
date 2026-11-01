@@ -301,4 +301,11 @@ function renderSessionCounts() {
   } catch { return ''; }
 }
 
+// A refusal is not an empty index: the binary would not open index.db (a
+// symlink or not a regular file inside a real .code-graph, D#363) and read
+// nothing, so it renders like the directory-level refusal above.
+if (report && report.reason === 'refused') {
+  process.stdout.write('code-graph: ✗ .code-graph refused (see health-check)');
+  process.exit(0);
+}
 process.stdout.write(report ? renderHealth(report) + renderSessionCounts() : statusUnavailable(errText));

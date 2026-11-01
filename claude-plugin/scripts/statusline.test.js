@@ -345,6 +345,24 @@ test('a refused .code-graph says so — not offline, and not the link target\'s 
   // finds no root and the segment stays empty, as for any unindexed project.
 });
 
+test('a refused index.db says so — not "0 nodes"', (t) => {
+  // D#363. The binary refuses an index.db (or -wal/-shm) inside a real
+  // .code-graph that is a symlink or not a regular file, and health-check
+  // answers {"healthy":false,"reason":"refused"} with exit 1. The directory is
+  // a real one, so the D#358 gate above does not fire, and the report rendered
+  // as an empty index: "✗ 0 nodes | 0 files".
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, {
+    report: {
+      healthy: false, reason: 'refused', nodes: 0, files: 0,
+      issue: `refusing to use a symlinked ${path.join(project, '.code-graph', 'index.db')} — remove it and re-run`,
+    },
+    exitCode: 1,
+  });
+  assert.equal(runStatusline(home, project), 'code-graph: ✗ .code-graph refused (see health-check)');
+});
+
 // ── This session's code-graph activity (tasks/specs/statusline-session-counts.md) ──
 // The user could not see code-graph working: its answers reach the model
 // silently. The segment now ends with what this session got: answers a hook

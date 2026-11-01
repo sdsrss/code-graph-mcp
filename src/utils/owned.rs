@@ -40,13 +40,16 @@
 //!   `truncate` on its open, which is the pattern [`Intent`] exists to make
 //!   unspellable. Not fixed here; it is the Windows leg, which this dev box
 //!   never compiles and which no test in this file reaches.
-//! * `index.db` does not come through this module at all — rusqlite opens it,
-//!   follows symlinks, and gets none of the three layers. [`ensure_owned_dir`]
-//!   guards the *directory*, which closes the relocated-`.code-graph` vector but
-//!   not a planted `index.db`. So "everything under `.code-graph/`" above
-//!   describes what this module MEDIATES — telemetry JSONL, the repo's
-//!   `.gitignore`, the index lock — not literally every write under that
-//!   directory.
+//! * `index.db` is opened by SQLite, not through [`open_owned`], so it gets
+//!   layer one only: [`reject_unowned_db`], which `Database`'s constructors
+//!   call before every open (D#363). SQLite itself resolves every symlink in
+//!   the path and opens the target, so the lstat there is the whole defence
+//!   against a planted `index.db`; it opens the `-wal`/`-shm` sidecars with
+//!   `O_NOFOLLOW`. A hard link is accepted there on purpose — see that
+//!   function. So "everything under `.code-graph/`" above describes what this
+//!   module MEDIATES — telemetry JSONL, the repo's `.gitignore`, the index
+//!   lock, and that one check for the database — not literally every write
+//!   under that directory.
 //!
 //! The hardlink half is also Unix-only, and deliberately differs from the JS
 //! twin there — see [`refuse_unowned_handle`] for the reason and for what is
@@ -310,6 +313,57 @@ pub(crate) fn reject_symlinked_dir(path: &Path) -> io::Result<()> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Refuse a database file — or its `-wal` / `-shm` sidecar — that is a symlink
+/// (live or dangling) or exists and is not a regular file. Absent is fine: the
+/// open creates it. Judges the final path component only, like
+/// [`refuse_non_regular`]: a symlinked directory ABOVE the name is the user's
+/// own path (a project reached through a link, macOS's `/var` temp dirs);
+/// `.code-graph` itself is [`reject_symlinked_dir`]'s.
+///
+/// SQLite resolves every link in the path it is given and opens the target, so
+/// a cloned repo's `index.db -> ../../x` sent every open there (D#363): another
+/// project's index re-indexed as this one, a foreign SQLite file switched to
+/// WAL with this tool's schema added to it, and a dangling link created a
+/// database outside the project. The sidecars are opened `O_NOFOLLOW` by SQLite
+/// and failed with "unable to open database file"; checked here so the message
+/// names the file.
+///
+/// A hard link is NOT refused. git cannot carry one and `tar` links only to its
+/// own members; the shape that exists is the user's `cp -al` of a project,
+/// which leaves the ORIGINAL's `index.db` with two links as well, so refusing
+/// would lock the user out of their own index. The cost of accepting it is two
+/// copies sharing one rebuildable cache. The lstat-then-open race is not closed
+/// either: it needs a concurrent local writer, not a cloned file.
+pub(crate) fn reject_unowned_db(db_path: &Path) -> io::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = Path::new(&name);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to use a symlinked {} — remove it and re-run",
+                        path.display()
+                    ),
+                ))
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} exists and is not a regular file — remove it and re-run",
+                        path.display()
+                    ),
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Ensure `path` is a directory this tool may write into, creating it if absent.

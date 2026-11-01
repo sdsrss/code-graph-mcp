@@ -13593,6 +13593,184 @@ fn test_cli_refuses_a_code_graph_that_is_not_a_directory() {
     }
 }
 
+/// D#363: a real `.code-graph` whose `index.db` is a symlink to another
+/// project's index — the half D#358 left (0.170.1 Not covered). SQLite opens the
+/// link's target, so `health-check` reported that index as healthy and
+/// `incremental-index` re-indexed it as this project (5 files there → this
+/// project's 4). Every door that refuses a symlinked `.code-graph` refuses this.
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_symlinked_index_db_holding_another_index() {
+    let other = setup_indexed_project();
+    let outside = other.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    // Positive control, as in the D#358 test: the index answers as its own.
+    let (stdout, stderr, code) = run_cli(&other, &["show", "validateToken"]);
+    assert_eq!(code, 0, "control: {stdout}{stderr}");
+    let before = dir_snapshot(&outside);
+
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/only_here.ts"),
+        "export function onlyHere(): number { return 1; }\n",
+    )
+    .unwrap();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir(&cg).unwrap();
+    std::os::unix::fs::symlink(outside.join("index.db"), cg.join("index.db")).unwrap();
+
+    let refused: &[&[&str]] = &[
+        &["show", "validateToken"],
+        &["callgraph", "validateToken"],
+        &["impact", "validateToken"],
+        &["search", "validateToken"],
+        &["similar", "validateToken"],
+        &["health-check"],
+        &["health-check", "--format", "json"],
+        &["incremental-index", "--no-embed"],
+    ];
+    for args in refused {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?} must refuse: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("refusing to use a symlinked"),
+            "{args:?} must name the reason: {stdout}{stderr}"
+        );
+    }
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "onlyHere"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("only_here.ts"), "{stdout}");
+    assert!(stderr.contains("refusing to use a symlinked"), "{stderr}");
+    assert!(!stderr.contains("corrupt"), "{stderr}");
+    assert_health_json_refused(&project, "refusing to use a symlinked");
+
+    let after = dir_snapshot(&outside);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "a command created or removed a file outside the project"
+    );
+    for (name, bytes) in &before {
+        assert!(
+            after[name] == *bytes,
+            "{name} outside the project was rewritten"
+        );
+    }
+}
+
+/// D#363, the dangling-link half: `index.db -> ../outside/new.db` with nothing
+/// there. `incremental-index` exited 0 having CREATED a full database at the
+/// link's target (and `index-run.lock` beside it); a query said "No index found".
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_dangling_symlinked_index_db() {
+    let dir = TempDir::new().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let project = TempDir::new_in(dir.path()).unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("a.ts"),
+        "export function onlyHere(): number { return 1; }\n",
+    )
+    .unwrap();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir(&cg).unwrap();
+    std::os::unix::fs::symlink(outside.join("new.db"), cg.join("index.db")).unwrap();
+
+    for args in [
+        &["incremental-index", "--no-embed"][..],
+        &["show", "onlyHere"][..],
+        &["health-check"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?} must refuse: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("refusing to use a symlinked"),
+            "{args:?} must name the reason: {stdout}{stderr}"
+        );
+    }
+    // Refused at the door, not after announcing a build it then cannot open.
+    let (stdout, stderr, _) = run_cli(&project, &["incremental-index", "--no-embed"]);
+    assert!(
+        !format!("{stdout}{stderr}").contains("creating full index"),
+        "{stdout}{stderr}"
+    );
+    assert_health_json_refused(&project, "refusing to use a symlinked");
+    let created: Vec<_> = std::fs::read_dir(&outside).unwrap().collect();
+    assert!(created.is_empty(), "files created outside: {created:?}");
+}
+
+/// D#363, the shapes that were refused only by accident, with a message that
+/// named nothing: a FIFO `index.db` ("disk I/O error"), a directory, and a
+/// symlinked `-wal` / `-shm` beside a real index ("unable to open database
+/// file" — SQLite opens its sidecars `O_NOFOLLOW`). And the one shape that stays
+/// accepted: a hard-linked `index.db` (after `cp -al` the ORIGINAL has two links
+/// too).
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_an_index_db_or_sidecar_that_is_not_a_regular_file() {
+    let victim_dir = TempDir::new().unwrap();
+    let victim = victim_dir.path().join("victim.txt");
+    std::fs::write(&victim, "keep\n").unwrap();
+    for (shape, why) in [
+        ("fifo", "exists and is not a regular file"),
+        ("dir", "exists and is not a regular file"),
+        ("-wal", "refusing to use a symlinked"),
+        ("-shm", "refusing to use a symlinked"),
+    ] {
+        let project = setup_indexed_project();
+        let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+        let db = cg.join("index.db");
+        let named = match shape {
+            "fifo" | "dir" => {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(cg.join(format!("index.db{suffix}")));
+                }
+                if shape == "dir" {
+                    std::fs::create_dir(&db).unwrap();
+                } else {
+                    let made = Command::new("mkfifo").arg(&db).status().unwrap();
+                    assert!(made.success(), "mkfifo {}", db.display());
+                }
+                "index.db".to_string()
+            }
+            sidecar => {
+                let side = cg.join(format!("index.db{sidecar}"));
+                let _ = std::fs::remove_file(&side);
+                std::os::unix::fs::symlink(&victim, &side).unwrap();
+                format!("index.db{sidecar}")
+            }
+        };
+        let (stdout, stderr, code) = run_cli(&project, &["show", "validateToken"]);
+        assert_ne!(code, 0, "{shape}: {stdout}{stderr}");
+        assert!(stderr.contains(why), "{shape}: {stderr}");
+        assert!(
+            stderr.contains(&named),
+            "{shape}: must name {named}: {stderr}"
+        );
+        assert_health_json_refused(&project, why);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep\n",
+            "{shape}"
+        );
+    }
+
+    let project = setup_indexed_project();
+    let db = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    std::fs::hard_link(&db, victim_dir.path().join("second-link.db")).unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["show", "validateToken"]);
+    assert_eq!(
+        code, 0,
+        "a hard-linked index.db is accepted: {stdout}{stderr}"
+    );
+}
+
 /// E2E 2026-10-16 (CLI-user QA, P0): on leveldb every `affected` answered
 /// "0 test file(s) to re-run" — `util/coding_test.cc` among them — because
 /// `is_test_path` knows no C/C++ test file naming. The gtest cases in those

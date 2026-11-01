@@ -248,7 +248,11 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         // the no_index answer (D#358) — and answered with a report, not a bail:
         // a bail left stdout empty, which doctor read as a broken binary and the
         // statusline as "offline". Exit 1 after it, like a corrupt index.
-        let refusal = crate::utils::owned::reject_symlinked_dir(&cg_dir).err();
+        // The database file and its sidecars too (D#363): a symlinked index.db
+        // was reported healthy with the link target's counts.
+        let refusal = crate::utils::owned::reject_symlinked_dir(&cg_dir)
+            .and_then(|()| crate::utils::owned::reject_unowned_db(&db_path))
+            .err();
         if refusal.is_some() || !db_path.exists() {
             let (reason, issue) = match &refusal {
                 Some(e) => ("refused", e.to_string()),

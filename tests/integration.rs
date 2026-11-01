@@ -4580,3 +4580,47 @@ fn mcp_tools_agree_that_a_file_path_is_not_a_symbol() {
         "qualified call-graph lookup must survive the module exclusion: {ok}"
     );
 }
+
+/// D#363: the MCP server's door. `from_project_root` refused a symlinked
+/// `.code-graph` (SEC-03) but opened a symlinked `index.db` inside a real one —
+/// SQLite follows it, so the server would index into, and answer from, the
+/// link's target. A dangling link made it create a database there.
+#[cfg(unix)]
+#[test]
+fn mcp_server_refuses_a_symlinked_index_db() {
+    let dir = TempDir::new().unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let target = outside.join("index.db");
+    Database::open(&target).unwrap();
+    let bytes = fs::read(&target).unwrap();
+
+    for (shape, link_to) in [
+        ("live", target.clone()),
+        ("dangling", outside.join("new.db")),
+    ] {
+        let project = TempDir::new_in(dir.path()).unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let cg = project.path().join(".code-graph");
+        fs::create_dir(&cg).unwrap();
+        std::os::unix::fs::symlink(&link_to, cg.join("index.db")).unwrap();
+        let err = McpServer::from_project_root(project.path())
+            .err()
+            .unwrap_or_else(|| panic!("{shape}: a symlinked index.db must be refused"));
+        assert!(
+            format!("{err:#}").contains("refusing to use a symlinked"),
+            "{shape}: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            bytes,
+            "{shape}: target rewritten"
+        );
+        let mut names: Vec<_> = fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["index.db"], "{shape}: files created outside");
+    }
+}
