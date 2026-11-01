@@ -28,26 +28,48 @@ The ten `unsound` warnings `cargo audit` listed against zstd-safe 7.2.4 are
 gone too. Five allowed warnings remain, as before: paste, anyhow, memmap2,
 rand and tokio. Both zstd-sys versions bundle the zstd 1.5.7 C library.
 
+What each advisory covers, by its own text, set against what code-graph-mcp
+calls (`zstd::encode_all` and `zstd::Decoder::new`). This comes from reading
+the advisories and the source, not from a test:
+
+- RUSTSEC-2026-0391 covers the `with_context` constructors, which reuse a
+  context the caller passes in. Neither call takes one.
+- RUSTSEC-2026-0398 covers `Seekable::decompress`, behind zstd-safe's
+  `seekable` feature, which this build does not enable.
+- RUSTSEC-2026-0403 names `zstd::stream::read::Decoder` as not affected.
+  `zstd::Decoder` is that type.
+- RUSTSEC-2026-0410 covers wasm32 only. No release target is wasm32.
+
 The binary uses zstd in two places: `snapshot create`, which writes a
-`.db.zst`, and the decoder that `snapshot inspect` runs, which also unpacks
-a snapshot fetched by `reindex --from-snapshot` or at MCP startup. Tested on a
-115-file corpus, each version's `snapshot create` output was read by the other
-version's `snapshot inspect`, and both versions printed the same JSON for the
-same file. Four damaged inputs got identical errors from both versions: a
-truncated `.db.zst`, a file holding only the zstd magic, the magic followed by
-random bytes, and a short file with a SQLite header.
+`.db.zst`, and one decoding function, which `snapshot inspect` calls and
+which also unpacks a snapshot fetched by `reindex --from-snapshot` or at MCP
+startup. Tested on a 115-file corpus:
+
+- Each version's `snapshot create` output was read by the other version's
+  `snapshot inspect`, and both versions printed the same JSON for the same
+  file.
+- The install function behind `reindex --from-snapshot` and MCP startup was
+  called directly, from a test program built against each version, with a
+  `file://` source. Both versions installed the same database from each of
+  the two snapshots: `sqlite3 .dump` was equal once the two rows recording
+  when and from where it was fetched were left out.
+- Four damaged inputs got the same errors from both versions, through
+  `snapshot inspect` and through the install function: a truncated
+  `.db.zst`, a file holding only the zstd magic, the magic followed by random
+  bytes, and a short file with a SQLite header. `snapshot inspect` refuses
+  the last two before decoding; the install function decodes all four.
 
 CI and release builds now use `Swatinem/rust-cache` 2.9.3 (was 2.9.2).
 
 ### Not covered
 
-- Whether any of the four advisories could be reached through
-  code-graph-mcp's use of zstd was not analysed. This release moves past
-  their patched versions rather than ruling them out.
-- The install path (`reindex --from-snapshot`, MCP startup) was not run
-  across versions. It takes only an `https://` source, so it cannot be tested
-  offline. It decodes with the same function `snapshot inspect` calls; that
-  comes from reading the source, not from a run.
+- The binary's own install path was not run across versions.
+  `reindex --from-snapshot` and MCP startup take their source from
+  `.code-graph.toml`, where it must be an `https://` URL, or from the
+  project's GitHub release. The download and its `.blake3` checksum check
+  were therefore not exercised; only the function they call was, as above.
+- Builds for macOS, Windows and linux-arm64 were not compared with
+  0.179.2's. Every comparison above ran on linux-x64.
 
 ## 0.179.2
 
