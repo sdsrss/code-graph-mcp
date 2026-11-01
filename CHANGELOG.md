@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.181.0
+
+**Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
+inspect` changes: it reads snapshot files it printed as empty, refused or hung
+on, and it no longer leaves a `<file>-shm` beside the file it reads. For the
+inputs below its exit code goes from 1, or a hang, to 0. To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.180.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.180.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### `snapshot inspect` reads the files it could not
+
+Measured on 25 inputs, each one snapshot (120 nodes, 40 edges) in a different
+state, 0.180.0 against 0.181.0. Ten print the same output with the same exit
+code; two of those ten no longer leave a `-shm` (below). The others:
+
+- A snapshot built by the previous `INDEX_VERSION` (123), compressed or raw in
+  WAL mode, printed `node_count` 0 and `edge_count` 0, with `Index version
+  mismatch (stored v123 ≠ binary v124): clearing + rebuilding` on stderr, about
+  its own temporary copy. It now prints 120 and 40 and no message. A raw
+  snapshot in rollback mode printed 120 and 40 already.
+- A snapshot whose writer died in the middle of a transaction, leaving a hot
+  `<file>-journal` beside it, failed with `database disk image is malformed`
+  (exit 1): named directly, through a link, or with a header that says WAL.
+  The last commit is now read, as `sqlite3` reads those pairs. With both files
+  at mode 0444 it failed with `attempt to write a readonly database` (header
+  says rollback) or `malformed` (header says WAL); these read the last commit
+  too. With the `-journal` a symlink to the real journal it failed with
+  `malformed`; it now reads the last commit through the link, where `sqlite3`
+  refuses that pair with `unable to open database file`.
+- A FIFO at `<file>-journal` beside a snapshot in rollback mode made `inspect`
+  hang until killed (0.180.0 listed it as not covered). It now reads the
+  snapshot and leaves the FIFO where it is.
+- A FIFO or a non-empty file at `<file>-wal` beside a snapshot in rollback mode
+  made `inspect` leave a `<file>-shm` there: 4 of the 25 inputs (a FIFO, 4 KiB
+  of text, another database's WAL, and the snapshot's own WAL described
+  below). Another database's WAL was also applied to the snapshot, which was
+  then refused as `not a valid code-graph snapshot` (exit 1; `sqlite3` says
+  `no such table: meta`). No `-shm` is left now, and the `-wal` is not read:
+  the snapshot reads as itself, the way `inspect` already treated the `-wal` of
+  a file in WAL mode. One input reads differently from `sqlite3` because of
+  it: a `-wal` holding the snapshot's own frames, put beside its rollback
+  header by hand for this measurement, used to be read (`tool_version` came
+  from the WAL) and now the main file is. SQLite deletes a WAL before it
+  rewrites the header to rollback mode, so it does not leave that pair itself.
+- stderr only. A snapshot built by a newer `INDEX_VERSION` (125), compressed or
+  in WAL mode, no longer adds `Index was built by a NEWER code-graph … delete
+  .code-graph/index.db* first`, advice about a project's own index; its counts
+  were and are 120 and 40. A file holding only a SQLite header, raw or
+  compressed, no longer warns
+  `Database corrupt (/tmp/…/snapshot.db), deleting for rebuild`, about the
+  temporary copy; it is still refused with `not a valid code-graph snapshot`.
+
+On both versions the 25 inputs keep their bytes; the copies `inspect` makes for
+these reads are temporary.
+
+### Not covered
+
+- A snapshot built by a newer `INDEX_VERSION` still prints `WARN [index] index
+  built by a newer code-graph (v125 > binary v124); leaving it intact, not
+  rebuilding` when it is compressed or in WAL mode, and nothing when it is raw
+  in rollback mode. The counts are the same on both.
+- `inspect` looks at the `-journal` and `-wal` beside the file before SQLite
+  opens it. A FIFO put there between the two, by another process at that
+  moment, still blocks it.
+
 ## 0.180.0
 
 **Upgrading: nothing to do unless a project's `.code-graph/index.db`, or its
