@@ -1057,34 +1057,49 @@ fn inspect_rolls_back_a_hot_journal_as_sqlite_does() {
 /// The WAL arm stages a `-journal` with the file now (D#630), and 0.180.0 read
 /// a WAL-mode snapshot whatever sat at that name. A directory there must not
 /// turn into a copy error, nor a FIFO into a copy that blocks forever, so only
-/// a regular file is staged. In a thread with a deadline: a FIFO that slips
+/// a regular file is staged. The non-WAL arm blocked on the FIFO without any
+/// copy (D#636): opening in place, SQLite's hot-journal probe opens
+/// `<file>-journal`, and opening a FIFO waits for a writer; 0.180.0 was killed
+/// by `timeout 10` (rc=124). In a thread with a deadline: a FIFO that slips
 /// through hangs the suite rather than failing it.
 #[cfg(unix)]
 #[test]
 fn inspect_stages_a_journal_only_when_it_is_a_regular_file() {
-    for shape in ["directory", "FIFO"] {
-        let dir = TempDir::new().unwrap();
-        let raw = dir.path().join("snapshot.db");
-        raw_snapshot_fixture(&raw, "wal", 2);
-        let side = dir.path().join("snapshot.db-journal");
-        if shape == "directory" {
-            std::fs::create_dir(&side).unwrap();
-        } else {
-            let made = Command::new("mkfifo").arg(&side).status().unwrap();
-            assert!(made.success(), "mkfifo {}", side.display());
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(
-                crate::snapshot::inspect(&raw)
-                    .map(|m| m.tool_version)
-                    .map_err(|e| format!("{e:#}")),
+    for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
+        for shape in ["directory", "FIFO"] {
+            let dir = TempDir::new().unwrap();
+            let raw = dir.path().join("snapshot.db");
+            raw_snapshot_fixture(&raw, mode, write_version);
+            let side = dir.path().join("snapshot.db-journal");
+            if shape == "directory" {
+                std::fs::create_dir(&side).unwrap();
+            } else {
+                let made = Command::new("mkfifo").arg(&side).status().unwrap();
+                assert!(made.success(), "mkfifo {}", side.display());
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    crate::snapshot::inspect(&raw)
+                        .map(|m| m.tool_version)
+                        .map_err(|e| format!("{e:#}")),
+                );
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("{mode} {shape}: inspect blocked on the side file"));
+            assert_eq!(got.as_deref(), Ok("9.9.9"), "{mode} {shape}");
+            let mut left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left,
+                ["snapshot.db", "snapshot.db-journal"],
+                "{mode} {shape}: inspect added or removed files beside the snapshot"
             );
-        });
-        let got = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("{shape}: inspect blocked on the side file"));
-        assert_eq!(got.as_deref(), Ok("9.9.9"), "{shape}");
+        }
     }
 }
 

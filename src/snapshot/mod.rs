@@ -214,8 +214,9 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     //
     // Three ways in, and two of them materialise a staging copy: the compressed
     // arm always (decompression has to land somewhere, and `decompress_with_cap`
-    // is what bounds where), the raw arm when the file is WAL-mode or when an
-    // in-place read turns out to be impossible. This binding keeps whichever
+    // is what bounds where), the raw arm when the file is WAL-mode, when its
+    // `-journal` is not a regular file, or when an in-place read turns out to be
+    // impossible. This binding keeps whichever
     // tempdir was used alive for as long as `db` holds a path inside it, and is
     // declared BEFORE `db` so it drops after it.
     let mut _staging_dir: Option<tempfile::TempDir> = None;
@@ -239,7 +240,8 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // install-side precedent to match: `try_install` only ever consumes
         // `.db.zst` release assets, so `install` has no raw arm.
         //
-        // A non-WAL raw file is opened in place and READ-ONLY rather than staged
+        // A non-WAL raw file is opened in place and READ-ONLY (but see the
+        // `-journal` paragraph below) rather than staged
         // through `fs::copy` first. That copy was the last cost in this arm
         // proportional to the file, for a command that reads seven meta rows and
         // two `COUNT(*)`s, and on the many systems where TMPDIR is a tmpfs the
@@ -276,7 +278,17 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // wrapping demoted it to a `Caused by:` line on this arm while the
         // staging arm printed it bare, so the two arms answered the same input
         // in different shapes.
-        if wal_mode {
+        //
+        // A `<file>-journal` that is there but is not a regular file also takes
+        // the copy, which leaves it behind (`stage_copy`). Opening in place,
+        // SQLite's hot-journal probe opens it, and opening a FIFO waits for a
+        // writer: 0.180.0 blocked until `timeout 10` killed it (D#636). A
+        // directory, a socket or a link to anything but a regular file there
+        // already failed the in-place read and reached the same copy through the
+        // fallback below (measured: each of them errors on `inspect tempdir`
+        // when TMPDIR does not exist).
+        let odd_journal = std::fs::metadata(journal_beside(file)).is_ok_and(|m| !m.is_file());
+        if wal_mode || odd_journal {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
             let staged = stage_copy(file, tmp.path())?;
             let opened = open_staged(&staged, file)?;
@@ -403,24 +415,31 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// Copy `file` into `dir` for a writable open, with its rollback journal. A hot
 /// `-journal` records what an unfinished transaction overwrote, and SQLite
 /// rolls it back before it reads; a copy without it reads that transaction's
-/// pages (D#630). SQLite names the journal after the path it opened with links
-/// resolved, so a link's journal is looked for beside the target. Only a
-/// regular file there is copied: a directory is no journal, and copying a FIFO
-/// would block. The `-wal` is deliberately left behind (see the WAL arm).
+/// pages (D#630). Only a regular file at [`journal_beside`] is copied: a
+/// directory is no journal, and copying a FIFO would block. The `-wal` is
+/// deliberately left behind (see the WAL arm).
 fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
-    fn journal_of(db: &Path) -> std::path::PathBuf {
-        let mut name = db.as_os_str().to_owned();
-        name.push("-journal");
-        name.into()
-    }
     let staged = dir.join("snapshot.db");
     std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
-    let journal = journal_of(&std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()));
+    let journal = journal_beside(file);
     if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
         std::fs::copy(&journal, journal_of(&staged))
             .context("stage snapshot journal for inspect")?;
     }
     Ok(staged)
+}
+
+fn journal_of(db: &Path) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push("-journal");
+    name.into()
+}
+
+/// Where SQLite looks for `file`'s rollback journal: it names the journal after
+/// the path it opened with links resolved, so a link's journal is the one
+/// beside its target.
+fn journal_beside(file: &Path) -> std::path::PathBuf {
+    journal_of(&std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()))
 }
 
 /// Open a staged copy as a READER (D#629): an indexer open's INDEX_VERSION
