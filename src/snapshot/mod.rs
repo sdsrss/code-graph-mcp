@@ -129,19 +129,16 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     Ok(())
 }
 
-/// Open a snapshot file and read its meta. Accepts both zstd-compressed
-/// (`.db.zst`, what producers/consumers exchange) and raw SQLite (`.db`,
-/// the direct output of [`create`] before zstd compression). The format is
-/// detected from the file's magic bytes, not the extension.
 /// First four bytes of a zstd frame. `snapshot create` writes exactly one
-/// standard frame, so a stream that starts any other way (a skippable frame,
-/// raw bytes) is not one of ours; `inspect` and `try_install` both refuse it.
+/// standard frame, so a compressed stream that starts any other way (a
+/// skippable frame) is not one of ours. `try_install` refuses anything else;
+/// `inspect` also accepts a raw SQLite file, which install never consumes.
 pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Does a database carry a snapshot's meta? The one verdict `inspect` and
 /// `try_install` share (D#611: install used to skip it, so a stream decoding to
 /// an empty file — bootstrapped into a fresh schema by the open — installed an
-/// EMPTY index over the user's). Real snapshots always carry a non-zero schema
+/// EMPTY index). Real snapshots always carry a non-zero schema
 /// version; the other two fields keep a snapshot written before that key
 /// existed.
 pub(crate) fn is_snapshot_meta(
@@ -152,6 +149,10 @@ pub(crate) fn is_snapshot_meta(
     schema_version != 0 || !source_commit.is_empty() || !tool_version.is_empty()
 }
 
+/// Open a snapshot file and read its meta. Accepts both zstd-compressed
+/// (`.db.zst`, what producers/consumers exchange) and raw SQLite (`.db`,
+/// the direct output of [`create`] before zstd compression). The format is
+/// detected from the file's magic bytes, not the extension.
 pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     inspect_with_cap(file, install::MAX_DECOMPRESSED_BYTES)
 }
@@ -274,7 +275,13 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // wrapping demoted it to a `Caused by:` line on this arm while the
         // staging arm printed it bare, so the two arms answered the same input
         // in different shapes.
-        if wal_mode {
+        // A symlink the user names is staged too: `open_readonly` refuses a
+        // symlinked database (D#363, aimed at a planted `.code-graph/index.db`),
+        // and `fs::copy` follows the link the user chose (pre-tag review M-1).
+        let named_through_link = std::fs::symlink_metadata(file)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if wal_mode || named_through_link {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
             let staged = tmp.path().join("snapshot.db");
             std::fs::copy(file, &staged).context("stage snapshot for inspect")?;

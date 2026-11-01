@@ -2,18 +2,20 @@
 
 ## 0.180.0
 
-**Upgrading: nothing to do unless a project's `.code-graph/index.db`,
-`index.db-wal` or `index.db-shm` is a symlink, or its `index.db` is not a
+**Upgrading: nothing to do unless a project's `.code-graph/index.db`, or its
+`index.db-wal`, `index.db-shm` or `index.db-journal`, is a symlink or not a
 regular file** (`INDEX_VERSION` stays at 124). The commands that read or write
 such an index now refuse it (exit 1), `grep` falls back to plain grep, and the
 MCP server exits at startup with the same message. Through a symlinked
 `index.db` they used to answer from, and write, the database the link points
-at. If you linked `index.db` elsewhere on purpose, `code-graph-mcp
-rebuild-index --confirm` replaces the link with an index inside `.code-graph`
-and leaves the link's target alone. To pin the binary back: `npm i -g
-@sdsrs/code-graph@0.179.4` (or, from source, `cargo install --locked --git
-https://github.com/sdsrss/code-graph-mcp --tag v0.179.4 --features
-embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+at. A symlinked `index.db-journal` did not stop 0.179.4 (`show` and
+`incremental-index` exited 0) and is refused now too. If you linked `index.db`
+elsewhere on purpose, `code-graph-mcp rebuild-index --confirm` replaces the
+link with an index inside `.code-graph` and leaves the link's target alone;
+for the other shapes, remove the file the message names. To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.179.4` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.179.4
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. That pins the
 binary only: the statusline and doctor come with the plugin.
 
@@ -47,27 +49,35 @@ The same holds for a symlinked `index.db-wal` or `index.db-shm`. SQLite
 already refused to open those through a link, with `unable to open database
 file`; the message now names the file. An `index.db` that is a FIFO (`disk I/O
 error`) or a directory (`unable to open database file`) is refused with
-`<path> exists and is not a regular file — remove it and re-run`.
+`<path> exists and is not a regular file — remove it and re-run`, and so is
+any of the three side files in that shape. A FIFO at `index.db-journal` made
+`show` and `incremental-index` hang until killed, with 0.179.4 as well; it is
+refused now.
 
-The plugin follows suit. For these shapes the statusline shows `code-graph: ✗
+The plugin follows suit. For an `index.db` linked to an index that exists, a
+FIFO `index.db` and a linked `-wal`, the statusline shows `code-graph: ✗
 .code-graph refused (see health-check)`. With 0.179.4 it showed the link
-target's counts for a linked index (`✓ 10 nodes | 5 files`), and `offline` for
-a FIFO or a linked `-wal`. doctor's Index line shows the message. With 0.179.4
+target's counts for the linked index (`✓ 10 nodes | 5 files`), and `offline`
+for the other two. For a dangling `index.db` link it stays empty, as for a
+project with no index. doctor's Index line shows the message. With 0.179.4
 it was `✅` with the target's counts for a linked index, and `health-check
 failed` for a FIFO. Its repair step prints the message, where it said
 `.code-graph is a symlink or not a directory`.
 
-A hard-linked `index.db` is still opened, as before. Git cannot carry a hard
-link. After `cp -al` of a project, the original's `index.db` has two links as
-well, so refusing would lock the user out of their own index.
+A hard-linked `index.db` or `-wal` is still opened and written, as with
+0.179.4. Git cannot carry a hard link. After `cp -al` of a project, the
+original's files have two links as well, so refusing would lock the user out
+of their own index. Writes reach every name of the file: the other copy's
+index, or, for a `-wal` hard-linked to an unrelated file, that file (one of 5
+bytes grew to 12,392 bytes).
 
-### Snapshot install refuses what `snapshot inspect` refuses
+### Snapshot install checks the framing and metadata that `snapshot inspect` checks
 
 `reindex --from-snapshot` and the MCP server's startup install a snapshot
 through one function. It checked the decoded snapshot only for a newer
 schema; `snapshot inspect` also checks the zstd framing and the snapshot
 metadata. Measured through that function with a `file://` URL, each of these
-streams installed over an existing `.code-graph/index.db`:
+streams was installed, replacing an index already there:
 
 - an empty zstd frame;
 - a skippable frame followed by an empty frame;
@@ -79,9 +89,13 @@ A skippable frame followed by a real snapshot installed that snapshot, although
 `inspect` calls the stream not a code-graph snapshot. These last two can carry
 a usable index, and are refused now as well.
 
-The install now runs `inspect`'s two checks, through the same code. All five
-streams are refused, and the existing index is left byte-identical. In a
-release, this needs an artifact that passes the blake3 check against its
+The install now runs these two checks of `inspect`'s, through the same code.
+All five streams are refused, and an index already there is left
+byte-identical. Neither caller has one at that moment: `reindex
+--from-snapshot` removes it first, and the MCP server installs only when there
+is none. Both then index the project, as after any failed install
+(`reindex` prints `Snapshot install failed (…), falling back to full index`).
+In a release, this needs an artifact that passes the blake3 check against its
 published sidecar, that is, one the publisher put there. `snapshot create`
 writes a single standard frame with the metadata, so its artifacts install as
 before.
@@ -93,7 +107,22 @@ names the file it wipes.
 ### Not covered
 
 - The plugin's hooks and statusline still decide whether a project has an
-  index with checks that follow a symlinked `index.db` (D#365).
+  index with checks that follow a symlinked `index.db` (D#365). The
+  statusline's blank segment for a dangling link is one of them.
+- A dangling `index.db` link reads as no index on three paths before the
+  check runs. In a linked worktree, the query commands and `health-check`
+  answer from the main checkout's index, as they do for a worktree with no
+  index of its own. Outside a git repository, `incremental-index` skips the
+  project and exits 0. With a trusted snapshot source configured, the MCP
+  server installs the snapshot in place of the link and starts. None of them
+  writes to the link's target.
+- `rebuild-index --confirm` replaces a refused `index.db` that is a link, a
+  FIFO or a socket. It leaves a dangling `-wal`/`-shm` link, or a directory in
+  their place, where it was (the project stays refused), and for a directory
+  at `index.db` it fails with `Is a directory (os error 21)`.
+- `snapshot inspect` also refuses a snapshot whose `snapshot_created_at`,
+  `snapshot_includes_vec`, `snapshot_source_url` or `snapshot_fetched_at` is
+  stored as a blob; the install accepts it.
 - The check and the open are two steps. A link put in place between them, by a
   process writing to the project at that moment, is opened.
 

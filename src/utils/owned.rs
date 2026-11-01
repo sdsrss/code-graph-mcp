@@ -328,16 +328,20 @@ pub(crate) fn reject_symlinked_dir(path: &Path) -> io::Result<()> {
 /// WAL with this tool's schema added to it, and a dangling link created a
 /// database outside the project. The sidecars are opened `O_NOFOLLOW` by SQLite
 /// and failed with "unable to open database file"; checked here so the message
-/// names the file.
+/// names the file. `-journal` too: every open probes it for a hot journal, and
+/// a FIFO there blocked that `open()` — every command hung (0.180.0 pre-tag
+/// review M-2).
 ///
-/// A hard link is NOT refused. git cannot carry one and `tar` links only to its
-/// own members; the shape that exists is the user's `cp -al` of a project,
-/// which leaves the ORIGINAL's `index.db` with two links as well, so refusing
-/// would lock the user out of their own index. The cost of accepting it is two
-/// copies sharing one rebuildable cache. The lstat-then-open race is not closed
-/// either: it needs a concurrent local writer, not a cloned file.
+/// A hard link is NOT refused, for the database or a sidecar. git cannot carry
+/// one; the shape seen in practice is the user's `cp -al` of a project, which
+/// leaves the ORIGINAL's files with two links as well, so refusing would lock
+/// the user out of their own index. Accepting it is not free: writes go to the
+/// shared inode, so the other name changes too — the other copy's index, or,
+/// for a sidecar hard-linked to an unrelated file, that file (a `-wal` linked
+/// to a 5-byte file grew it to 12,392 bytes of WAL frames). The lstat-then-open
+/// race is not closed either: it needs a concurrent local writer.
 pub(crate) fn reject_unowned_db(db_path: &Path) -> io::Result<()> {
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut name = db_path.as_os_str().to_os_string();
         name.push(suffix);
         let path = Path::new(&name);

@@ -542,6 +542,46 @@ fn inspect_accepts_raw_db_when_no_zstd_magic() {
     assert!(!meta.includes_vec);
 }
 
+/// 0.180.0 pre-tag review M-1: `open_readonly` refuses a symlinked database
+/// (D#363, aimed at a planted `.code-graph/index.db`), and inspect's in-place
+/// arm opened the user's own file through it, so `snapshot inspect link.db`
+/// with `link.db -> snapshot.db` was refused where 0.179.4 printed the meta. A
+/// path the user names is theirs to follow; the zstd arm already did.
+#[cfg(unix)]
+#[test]
+fn inspect_follows_a_symlink_the_user_names() {
+    let fixture = init_git_fixture();
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    let bytes = std::fs::read(&raw_db).unwrap();
+    let link = fixture.path().join("link.db");
+    std::os::unix::fs::symlink(&raw_db, &link).unwrap();
+    let direct = crate::snapshot::inspect(&raw_db).unwrap();
+    let through = crate::snapshot::inspect(&link).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(through.source_commit, direct.source_commit);
+    assert_eq!(through.node_count, direct.node_count);
+    assert_eq!(
+        std::fs::read(&raw_db).unwrap(),
+        bytes,
+        "inspect must not write"
+    );
+}
+
+/// 0.180.0 pre-tag review L-6: no test pinned a condition of the shared
+/// verdict. `&&` for `||` would refuse every snapshot made outside a git
+/// repository (its `source_commit` is empty) and still pass the install tests.
+#[test]
+fn snapshot_meta_verdict_needs_any_one_of_its_three_fields() {
+    use crate::snapshot::is_snapshot_meta;
+    assert!(!is_snapshot_meta(0, "", ""), "nothing: not a snapshot");
+    assert!(
+        is_snapshot_meta(10, "", ""),
+        "schema only (made outside git)"
+    );
+    assert!(is_snapshot_meta(0, "abc", ""), "commit only");
+    assert!(is_snapshot_meta(0, "", "0.1.0"), "tool version only");
+}
+
 #[test]
 fn inspect_rejects_truncated_sqlite_header() {
     // Regression: a file just long enough to pass the SQLite magic check

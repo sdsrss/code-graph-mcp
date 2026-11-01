@@ -33,13 +33,13 @@ revision: 1
 
 - git 不能带来硬链接；`tar` 的硬链接条目只能指向归档内的成员。
 - 能产生的场景是用户自己 `cp -al` 复制项目：原项目和副本的 index.db 共享 inode，nlink 都是 2。按 nlink>1 拒绝会让**原项目**也打不开自己的索引。
-- 共享 inode 的后果是两个副本互相覆盖缓存（索引是可重建的缓存），不写到任何别的文件。
+- 共享 inode 的后果是写入会到达这个文件的每个名字：另一个副本的索引；sidecar 硬链接到无关文件时就是那个文件（评审实测：一个 5 字节的文件被 `-wal` 写成 12,392 字节）。git 带不来硬链接。
 - 测试固定这个决定（硬链接的 index.db 照常可查询），并写进 CHANGELOG 的 Not covered。
 
 ### 不做
 
 - lstat 和 SQLite 打开之间的竞争窗口（需要本机并发写入者；克隆来的仓库是静态的）。
-- `-journal`：WAL 模式下不创建；链接时 SQLite 自己带 `O_NOFOLLOW` 拒绝。
+- ~~`-journal`：WAL 模式下不创建；链接时 SQLite 自己带 `O_NOFOLLOW` 拒绝。~~ 评审 M-2 证伪：每次打开都会探测 hot journal，FIFO 会让 `open()` 一直阻塞（0.179.4 同样挂起）。已加入检查。
 - JS 钩子对 `index.db` 的存在性/mtime 读取（D#365 的范围）。
 
 ## 验收
@@ -55,4 +55,5 @@ revision: 1
 
 - 2026-11-01：用户授权按建议执行（"需要我拍板的也按你的建议执行"），按 L3 处理（已发布产物的默认行为变化）。复现 S1–S5，见上表。
 - 2026-11-01：实现并提交 36ede5af。6 个 Rust 测试 + 2 个 JS 测试修复前失败、修复后通过；8 个变异（两个打开入口、CLI 上下文、incremental-index 入口、health JSON、grep 说明、去掉 -wal、去掉非普通文件分支）各至少让 1 个测试失败。实现时删掉了 `try_open` 和 MCP `from_project_root` 两处检查：数据库打开那一层已经拒绝，变异显示它们没有可观察的作用。
-- 2026-11-01：逐入口实测（0.179.4 发布二进制 d5a6c861 对 HEAD f5cb6fa3），8 种形态 × show / health-check（两种格式）/ grep / incremental-index / MCP serve，外加 statusline、doctor、rebuild-index 补救；结果写进 CHANGELOG 0.180.0。与 D#611（64dfe9a1）一起发 0.180.0。
+- 2026-11-01：逐入口实测（0.179.4 发布二进制 md5 d5a6c861 对 HEAD 二进制 md5 f5cb6fa3，由之后提交为 64dfe9a1 的工作区构建），8 种形态 × show / health-check（两种格式）/ grep / incremental-index / MCP serve，外加 statusline、doctor、rebuild-index 补救；结果写进 CHANGELOG 0.180.0。与 D#611（64dfe9a1）一起发 0.180.0。
+- 2026-11-01：发版前评审第 1 轮（HIGH 0 / MEDIUM 2 / LOW 11）。修复：M-1（`snapshot inspect` 拒绝用户自己给的符号链接 → 链接输入走复制分支）、M-2（`-journal` 加入检查）、L-6（`is_snapshot_meta` 真值表测试）、L-7（doctor 措辞）、L-8（rustdoc 位置）；其余 LOW 写进 CHANGELOG 的说明和 Not covered。修复的 6 个变异（去掉 -journal、链接不走复制、判定式 4 种）各让 1 个测试失败。

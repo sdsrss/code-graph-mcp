@@ -1383,7 +1383,7 @@ function runRepairs(results, {
       // path: `.code-graph` itself (D#358) or its index.db / -wal / -shm (D#363).
       case 'code-graph-dir-refused': {
         console.log(`\n  ${issue.detail || 'refusing to use .code-graph: a symlink or not a directory'}`);
-        console.log('  doctor removes nothing here: the link may be yours. If you moved the real one elsewhere on purpose, move it back into the project.');
+        console.log('  doctor removes nothing here, since it may be yours: remove or replace it yourself, then re-run.');
         break;
       }
 

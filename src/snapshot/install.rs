@@ -617,7 +617,7 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
         .unwrap_or(0);
     // `inspect`'s verdict (D#611). The open above bootstraps a fresh schema
     // over a stream that decoded to nothing or to a non-database, so without
-    // this an EMPTY index passed and was renamed over the user's.
+    // this an EMPTY index passed and was renamed into place.
     let source_commit =
         super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();
     let tool_version =

@@ -3188,8 +3188,13 @@ mod tests {
         for (shape, why) in [
             ("-wal", "refusing to use a symlinked"),
             ("-shm", "refusing to use a symlinked"),
+            // Pre-tag review M-2: SQLite opens `-journal` (hot-journal probe)
+            // on every open, so a FIFO there blocked every command forever.
+            ("-journal", "refusing to use a symlinked"),
             ("fifo", "exists and is not a regular file"),
             ("dir", "exists and is not a regular file"),
+            ("journal-dir", "exists and is not a regular file"),
+            ("journal-fifo", "exists and is not a regular file"),
         ] {
             let cg = dir.path().join(format!("shape{shape}"));
             std::fs::create_dir(&cg).unwrap();
@@ -3206,6 +3211,22 @@ mod tests {
                 "dir" => {
                     std::fs::create_dir(&db).unwrap();
                     db.clone()
+                }
+                "journal-dir" => {
+                    Database::open(&db).unwrap();
+                    let side = cg.join("index.db-journal");
+                    std::fs::create_dir(&side).unwrap();
+                    side
+                }
+                "journal-fifo" => {
+                    Database::open(&db).unwrap();
+                    let side = cg.join("index.db-journal");
+                    let made = std::process::Command::new("mkfifo")
+                        .arg(&side)
+                        .status()
+                        .unwrap();
+                    assert!(made.success());
+                    side
                 }
                 sidecar => {
                     Database::open(&db).unwrap();
