@@ -85,7 +85,7 @@ jobs:
       #     on entries that are readable. Only the main-branch warm job writes.
       # If warm-gate has not run recently the restore simply misses and this job
       # compiles cold (~5-9 min), which is what it did before caching existed.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-gate
           save-if: false
@@ -345,7 +345,7 @@ jobs:
       # built cold ("No cache found" on all 5 targets) despite a green priming
       # run. shared-key replaces the job-bound portion, making the main-branch
       # warm cache restorable here. Must stay identical in cache-warm.yml.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-${{ matrix.target }}
 
