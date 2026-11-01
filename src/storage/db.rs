@@ -264,8 +264,10 @@ impl Database {
             return;
         }
         tracing::warn!(
-            "[db] index.db is {} bytes (< {} SQLite header); wiping main+wal+shm for clean recovery",
-            size, SQLITE_HEADER_SIZE
+            "[db] {} is {} bytes (< {} SQLite header); wiping main+wal+shm for clean recovery",
+            path.display(),
+            size,
+            SQLITE_HEADER_SIZE
         );
         std::fs::remove_file(path).ok();
         let wal_path = path.with_extension("db-wal");

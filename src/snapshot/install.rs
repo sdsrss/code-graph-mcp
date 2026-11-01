@@ -303,6 +303,17 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
         download(url, &zst_partial)?;
         // Verify integrity BEFORE decompressing — never decode untrusted bytes.
         verify_checksum(url, &zst_partial)?;
+        // The framing `inspect` accepts, checked here too (D#611): the decoder
+        // itself skips a leading skippable frame that `inspect` refuses.
+        let mut magic = [0u8; 4];
+        let head_ok = std::fs::File::open(&zst_partial)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+            .is_ok();
+        if !head_ok || magic != super::ZSTD_MAGIC {
+            anyhow::bail!(
+                "{url} is not a code-graph snapshot — expected one zstd-compressed (.db.zst) stream"
+            );
+        }
         decompress_with_cap(&zst_partial, &db_partial, MAX_DECOMPRESSED_BYTES)?;
         validate(&db_partial, root)?;
 
@@ -604,6 +615,18 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
     let snap_schema: i32 = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SCHEMA_VERSION)?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // `inspect`'s verdict (D#611). The open above bootstraps a fresh schema
+    // over a stream that decoded to nothing or to a non-database, so without
+    // this an EMPTY index passed and was renamed over the user's.
+    let source_commit =
+        super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();
+    let tool_version =
+        super::meta::read_meta(conn, super::meta::META_SNAPSHOT_TOOL_VERSION)?.unwrap_or_default();
+    if !super::is_snapshot_meta(snap_schema, &source_commit, &tool_version) {
+        anyhow::bail!(
+            "not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)"
+        );
+    }
     if snap_schema > SCHEMA_VERSION {
         anyhow::bail!(
             "snapshot schema v{snap_schema} newer than binary v{SCHEMA_VERSION}, \
@@ -612,7 +635,10 @@ fn validate(db_path: &Path, root: &Path) -> Result<()> {
     }
 
     // Warn (not fail) if snapshot commit is not in local history
-    if let Some(commit) = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)? {
+    // The commit read for the verdict above; an absent key is "", which
+    // `is_commit_id` refuses, as `None` skipped this block before.
+    {
+        let commit = source_commit;
         // SEC-06 (audit 2026-08-29). `commit` comes out of the snapshot database
         // being verified — attacker-controlled if the snapshot is — and went
         // straight into an argv position with no `--` separator, so a value

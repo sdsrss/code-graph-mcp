@@ -438,6 +438,82 @@ fn install_rejects_corrupt_archive() {
     }
 }
 
+/// D#611: `try_install` accepted streams `snapshot inspect` refuses, and
+/// replaced the user's index with an EMPTY one. An empty zstd frame decodes to
+/// 0 bytes, the indexer open bootstraps a fresh schema over them, and
+/// `validate` only refused a NEWER schema, so the empty database passed and was
+/// renamed over `index.db`. A stream that starts with a skippable frame, a
+/// compressed SQLite file with no snapshot meta (a live index) and a
+/// compressed non-database went the same way. Each row is first shown refused
+/// by `inspect` (the parity this asserts), then by `try_install`, with the
+/// existing index byte-identical afterwards.
+#[test]
+fn install_refuses_every_stream_inspect_refuses() {
+    let fixture = init_git_fixture();
+    let real = build_local_snapshot(&fixture);
+    let real_bytes = std::fs::read(&real).unwrap();
+    // A plain index, not a snapshot: has `meta`, holds no snapshot_* rows.
+    let live_dir = TempDir::new().unwrap();
+    let live = live_dir.path().join("index.db");
+    Database::open(&live).unwrap();
+    let live_bytes = std::fs::read(&live).unwrap();
+    // A skippable frame (magic 0x184D2A50, little-endian), 4 payload bytes.
+    let skippable: Vec<u8> = [0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3, 4].to_vec();
+    let empty_frame = zstd::encode_all(&[][..], 1).unwrap();
+    let shapes: Vec<(&str, Vec<u8>)> = vec![
+        ("empty frame", empty_frame.clone()),
+        (
+            "skippable + empty frame",
+            [skippable.clone(), empty_frame].concat(),
+        ),
+        (
+            "skippable + real snapshot",
+            [skippable, real_bytes].concat(),
+        ),
+        (
+            "live index, no snapshot meta",
+            zstd::encode_all(&live_bytes[..], 1).unwrap(),
+        ),
+        (
+            "not a database",
+            zstd::encode_all(&[7u8; 4096][..], 1).unwrap(),
+        ),
+    ];
+
+    let target_root = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(target_root.path())
+        .status()
+        .unwrap();
+    let url = format!("file://{}", real.display());
+    try_install(&url, target_root.path()).unwrap();
+    let installed = target_root.path().join(".code-graph").join("index.db");
+    let before = std::fs::read(&installed).unwrap();
+
+    let streams = TempDir::new().unwrap();
+    for (name, bytes) in shapes {
+        let path = streams.path().join("x.db.zst");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            crate::snapshot::inspect(&path).is_err(),
+            "{name}: precondition — inspect refuses it"
+        );
+        let err = try_install(&format!("file://{}", path.display()), target_root.path())
+            .err()
+            .unwrap_or_else(|| panic!("{name}: install must refuse what inspect refuses"));
+        assert!(
+            err.to_string().contains("not a")
+                || format!("{err:#}").contains("not a valid code-graph snapshot"),
+            "{name}: {err:#}"
+        );
+        assert!(
+            std::fs::read(&installed).unwrap() == before,
+            "{name}: the installed index was replaced"
+        );
+    }
+}
+
 #[test]
 fn resolve_rejects_http_url_from_toml() {
     let dir = TempDir::new().unwrap();

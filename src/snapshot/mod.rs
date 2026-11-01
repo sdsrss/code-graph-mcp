@@ -133,6 +133,25 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
 /// (`.db.zst`, what producers/consumers exchange) and raw SQLite (`.db`,
 /// the direct output of [`create`] before zstd compression). The format is
 /// detected from the file's magic bytes, not the extension.
+/// First four bytes of a zstd frame. `snapshot create` writes exactly one
+/// standard frame, so a stream that starts any other way (a skippable frame,
+/// raw bytes) is not one of ours; `inspect` and `try_install` both refuse it.
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Does a database carry a snapshot's meta? The one verdict `inspect` and
+/// `try_install` share (D#611: install used to skip it, so a stream decoding to
+/// an empty file — bootstrapped into a fresh schema by the open — installed an
+/// EMPTY index over the user's). Real snapshots always carry a non-zero schema
+/// version; the other two fields keep a snapshot written before that key
+/// existed.
+pub(crate) fn is_snapshot_meta(
+    schema_version: i32,
+    source_commit: &str,
+    tool_version: &str,
+) -> bool {
+    schema_version != 0 || !source_commit.is_empty() || !tool_version.is_empty()
+}
+
 pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     inspect_with_cap(file, install::MAX_DECOMPRESSED_BYTES)
 }
@@ -200,7 +219,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // declared BEFORE `db` so it drops after it.
     let mut _staging_dir: Option<tempfile::TempDir> = None;
     let mut opened_in_place = false;
-    let mut db = if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    let mut db = if head.starts_with(&ZSTD_MAGIC) {
         let tmp = tempfile::tempdir().context("inspect tempdir")?;
         let decompressed = tmp.path().join("snapshot.db");
         install::decompress_with_cap(file, &decompressed, cap).context("zstd decode")?;
@@ -341,7 +360,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // empty schema and every meta lookup returns None → defaults. Without
     // this guard, `inspect` would return a fake "valid empty snapshot" with
     // zeroed fields. Real snapshots always carry a non-zero schema_version.
-    if schema_version == 0 && source_commit.is_empty() && tool_version.is_empty() {
+    if !is_snapshot_meta(schema_version, &source_commit, &tool_version) {
         anyhow::bail!(
             "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
             file.display()
