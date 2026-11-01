@@ -8,7 +8,7 @@ regular file** (`INDEX_VERSION` stays at 124). The commands that read or write
 such an index now refuse it (exit 1), `grep` falls back to plain grep, and the
 MCP server exits at startup with the same message. Through a symlinked
 `index.db` they used to answer from, and write, the database the link points
-at. A symlinked `index.db-journal` did not stop 0.179.4 (`show` and
+at. A dangling `index.db-journal` link did not stop 0.179.4 (`show` and
 `incremental-index` exited 0) and is refused now too. If you linked `index.db`
 elsewhere on purpose, `code-graph-mcp rebuild-index --confirm` replaces the
 link with an index inside `.code-graph` and leaves the link's target alone;
@@ -51,8 +51,10 @@ file`; the message now names the file. An `index.db` that is a FIFO (`disk I/O
 error`) or a directory (`unable to open database file`) is refused with
 `<path> exists and is not a regular file — remove it and re-run`, and so is
 any of the three side files in that shape. A FIFO at `index.db-journal` made
-`show` and `incremental-index` hang until killed, with 0.179.4 as well; it is
-refused now.
+`show`, `health-check`, `grep`, `incremental-index` and the MCP server hang
+until killed, with 0.179.4 as well; it is refused now. A live
+`index.db-journal` link made 0.179.4 fail with `unable to open database file`;
+the message now names it.
 
 The plugin follows suit. For an `index.db` linked to an index that exists, a
 FIFO `index.db` and a linked `-wal`, the statusline shows `code-graph: ✗
@@ -117,9 +119,14 @@ names the file it wipes.
   server installs the snapshot in place of the link and starts. None of them
   writes to the link's target.
 - `rebuild-index --confirm` replaces a refused `index.db` that is a link, a
-  FIFO or a socket. It leaves a dangling `-wal`/`-shm` link, or a directory in
-  their place, where it was (the project stays refused), and for a directory
-  at `index.db` it fails with `Is a directory (os error 21)`.
+  FIFO or a socket. It leaves an `index.db-journal` in any refused shape, and
+  a dangling `-wal`/`-shm` link or a directory in their place, where they were
+  (the project stays refused). For a directory at `index.db` it fails with
+  `Is a directory (os error 21)`.
+- `snapshot inspect <file>` answers as 0.179.4 did for a file you name
+  through a link, and for links, FIFOs and directories at its `-wal`, `-shm`
+  and `-journal` (26 shapes compared); the refusal is for `.code-graph`. A
+  FIFO named `<file>-journal` beside it still makes it hang, as with 0.179.4.
 - `snapshot inspect` also refuses a snapshot whose `snapshot_created_at`,
   `snapshot_includes_vec`, `snapshot_source_url` or `snapshot_fetched_at` is
   stored as a blob; the install accepts it.

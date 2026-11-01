@@ -96,6 +96,16 @@ impl Database {
         // target, and a read-only open of a WAL database still writes its
         // -shm/-wal there (D#363; see `reject_unowned_db`).
         crate::utils::owned::reject_unowned_db(path)?;
+        Self::open_readonly_named(path)
+    }
+
+    /// [`Database::open_readonly`] without the planted-file refusal, for a file
+    /// the USER named on the command line (`snapshot inspect <file>`): a link
+    /// there is the user's own, and SQLite follows it as 0.179.4 did. The
+    /// refusal is for the tool's own `.code-graph/index.db`. Staging a linked
+    /// input instead (the first repair) read a read-only target as an error and
+    /// let the copy's INDEX_VERSION sweep zero the counts (0.180.0 review R2).
+    pub(crate) fn open_readonly_named(path: &Path) -> Result<Self> {
         register_sqlite_vec();
         let conn = Connection::open_with_flags(
             path,
@@ -3236,10 +3246,22 @@ mod tests {
                     side
                 }
             };
-            let err = Database::open_nondestructive(&db)
-                .err()
+            // In a thread with a deadline: a FIFO side file that slips past the
+            // check blocks SQLite's open() forever, which would hang the suite
+            // rather than fail it (review R2).
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe = db.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    Database::open_nondestructive(&probe)
+                        .err()
+                        .map(|e| e.to_string()),
+                );
+            });
+            let msg = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{shape}: the open hung"))
                 .unwrap_or_else(|| panic!("{shape} must be refused"));
-            let msg = err.to_string();
             assert!(msg.contains(why), "{shape}: {msg}");
             assert!(
                 msg.contains(&named.display().to_string()),

@@ -275,13 +275,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // wrapping demoted it to a `Caused by:` line on this arm while the
         // staging arm printed it bare, so the two arms answered the same input
         // in different shapes.
-        // A symlink the user names is staged too: `open_readonly` refuses a
-        // symlinked database (D#363, aimed at a planted `.code-graph/index.db`),
-        // and `fs::copy` follows the link the user chose (pre-tag review M-1).
-        let named_through_link = std::fs::symlink_metadata(file)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if wal_mode || named_through_link {
+        if wal_mode {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
             let staged = tmp.path().join("snapshot.db");
             std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
@@ -290,7 +284,10 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
             opened
         } else {
             opened_in_place = true;
-            Database::open_readonly(file)?
+            // The user named this file, so no planted-file refusal: a link to
+            // it, or odd side files beside it, read as they did on 0.179.4
+            // (D#363 review M-1/R2; see `open_readonly_named`).
+            Database::open_readonly_named(file)?
         }
     } else {
         anyhow::bail!(

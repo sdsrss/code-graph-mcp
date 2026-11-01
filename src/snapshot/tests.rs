@@ -567,6 +567,60 @@ fn inspect_follows_a_symlink_the_user_names() {
     );
 }
 
+/// 0.180.0 pre-tag review R2: the first M-1 repair staged a linked input and
+/// opened the copy writable, so a read-only target (Nix store, Bazel outputs)
+/// failed with "attempt to write a readonly database", and an index one
+/// INDEX_VERSION behind had its counts zeroed by the copy's version sweep.
+/// 0.179.4 read both through the link. So does this.
+#[cfg(unix)]
+#[test]
+fn inspect_reads_through_a_link_as_it_reads_the_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = init_git_fixture();
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    let older = fixture.path().join("older.db");
+    std::fs::copy(&raw_db, &older).unwrap();
+    {
+        let c = Connection::open(&older).unwrap();
+        c.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+            .unwrap();
+    }
+    for (name, file) in [("read-only", &raw_db), ("older INDEX_VERSION", &older)] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let link = fixture.path().join(format!("link-{}.db", name.len()));
+        std::os::unix::fs::symlink(file, &link).unwrap();
+        let direct = crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert!(direct.node_count > 0, "{name}: fixture has nodes");
+        let through = crate::snapshot::inspect(&link).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(through.node_count, direct.node_count, "{name}");
+        assert_eq!(through.edge_count, direct.edge_count, "{name}");
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+/// 0.180.0 pre-tag review R2: the planted-file refusal (D#363) reached
+/// `snapshot inspect`, so a regular snapshot with a linked or directory
+/// `<file>-journal` / `-wal` beside it was refused; 0.179.4 read it. The
+/// refusal is for `.code-graph/index.db`, not for a file the user names.
+#[cfg(unix)]
+#[test]
+fn inspect_reads_a_named_file_whatever_sits_beside_it() {
+    let fixture = init_git_fixture();
+    let raw_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &raw_db, false).unwrap();
+    let victim = fixture.path().join("victim.txt");
+    std::fs::write(&victim, "keep\n").unwrap();
+    for suffix in ["-journal", "-wal"] {
+        let side = fixture.path().join(format!("snapshot.db{suffix}"));
+        std::os::unix::fs::symlink(&victim, &side).unwrap();
+        let meta = crate::snapshot::inspect(&raw_db).unwrap_or_else(|e| panic!("{suffix}: {e:#}"));
+        assert!(meta.node_count > 0, "{suffix}");
+        std::fs::remove_file(&side).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+}
+
 /// 0.180.0 pre-tag review L-6: no test pinned a condition of the shared
 /// verdict. `&&` for `||` would refuse every snapshot made outside a git
 /// repository (its `source_commit` is empty) and still pass the install tests.
