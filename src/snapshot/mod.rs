@@ -215,8 +215,9 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // Three ways in, and two of them materialise a staging copy: the compressed
     // arm always (decompression has to land somewhere, and `decompress_with_cap`
     // is what bounds where), the raw arm when the file is WAL-mode, when its
-    // `-journal` is not a regular file, or when an in-place read turns out to be
-    // impossible. This binding keeps whichever
+    // `-journal` is not a regular file, when SQLite would open a `-wal` beside
+    // it, or when an in-place read turns out to be impossible. This binding
+    // keeps whichever
     // tempdir was used alive for as long as `db` holds a path inside it, and is
     // declared BEFORE `db` so it drops after it.
     let mut _staging_dir: Option<tempfile::TempDir> = None;
@@ -241,7 +242,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // `.db.zst` release assets, so `install` has no raw arm.
         //
         // A non-WAL raw file is opened in place and READ-ONLY (but see the
-        // `-journal` paragraph below) rather than staged
+        // `-journal` and `-wal` paragraphs below) rather than staged
         // through a copy first. That copy was the last cost in this arm
         // proportional to the file, for a command that reads seven meta rows and
         // two `COUNT(*)`s, and on the many systems where TMPDIR is a tmpfs the
@@ -324,10 +325,10 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         );
     };
     // A file with no schema at all must be called the same thing whichever arm
-    // read it. The staged arm gets `open_staged`'s bootstrap, so a file that
-    // clears the 16-byte magic check while holding nothing else still opens onto
-    // an empty `meta` and reaches the `schema_version == 0` verdict below.
-    // Opening in place creates nothing, so the same file would instead surface
+    // read it. On the staged arms the reader open refuses a file that clears the
+    // 16-byte magic check while holding nothing else, as a corrupt database, and
+    // `open_staged` puts that in `invalid_snapshot`'s words. Opening in place
+    // refuses nothing and creates nothing, so the same file would instead surface
     // SQLite's `no such table: meta` from the first read. `open_readonly` cannot
     // report it — its `user_version` and `sqlite_master` probes are both
     // `unwrap_or`, so it returns Ok on a file it cannot actually read. Hence
@@ -432,14 +433,20 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// `-journal` records what an unfinished transaction overwrote, and SQLite
 /// rolls it back before it reads; a copy without it reads that transaction's
 /// pages (D#630). Only a regular file at [`side_file_of`] `-journal` is
-/// copied: a directory is no journal, and copying a FIFO would block. The
-/// `-wal` is deliberately left behind (see the WAL arm).
+/// copied: a directory is no journal, and copying a FIFO would block. And only
+/// a hot one, whose first byte is not 0: that byte is what SQLite reads to
+/// decide (`hasHotJournal`), it ignores any other journal, and copying one cost
+/// a write as large as the journal (pre-tag review: 1 GiB of zeros, and under a
+/// file-size limit a SIGXFSZ that left the copy behind). A journal that cannot
+/// be read is refused, naming it, as `sqlite3` refuses it. The `-wal` is
+/// deliberately left behind (see the WAL arm).
 ///
 /// Both copies are new files rather than `fs::copy`s, which carry the source's
 /// mode over: rolling a hot journal back writes the copy and opens the journal
 /// read-write, so a 0444 pair failed with "attempt to write a readonly
 /// database" where the same pair at 0644 read the last commit.
 fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
+    use std::io::Read;
     fn copy_writable(from: &Path, to: &Path) -> std::io::Result<u64> {
         let mut src = std::fs::File::open(from)?;
         let mut dst = std::fs::OpenOptions::new()
@@ -449,11 +456,18 @@ fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
         std::io::copy(&mut src, &mut dst)
     }
     let staged = dir.join("snapshot.db");
-    copy_writable(file, &staged).context("stage snapshot for inspect")?;
+    copy_writable(file, &staged)
+        .with_context(|| format!("stage a copy of '{}' for inspect", file.display()))?;
     let journal = side_file_of(file, "-journal");
     if std::fs::metadata(&journal).is_ok_and(|m| m.is_file()) {
-        copy_writable(&journal, &with_suffix(&staged, "-journal"))
-            .context("stage snapshot journal for inspect")?;
+        let context = || format!("stage '{}' for inspect", journal.display());
+        let mut first = [0u8; 1];
+        let read = std::fs::File::open(&journal)
+            .and_then(|mut f| f.read(&mut first))
+            .with_context(context)?;
+        if read == 1 && first[0] != 0 {
+            copy_writable(&journal, &with_suffix(&staged, "-journal")).with_context(context)?;
+        }
     }
     Ok(staged)
 }
@@ -475,7 +489,7 @@ fn side_file_of(file: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 /// Open a staged copy as a READER (D#629): an indexer open's INDEX_VERSION
-/// sweep emptied the copy of a snapshot built by another version, so the
+/// sweep emptied the copy of a snapshot built by an older version, so the
 /// staging arms printed node_count 0 where the in-place arm printed the real
 /// counts. The reader open still migrates and bootstraps the copy, which is
 /// what the meta probe relies on. Its corrupt-file refusal is put in

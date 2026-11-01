@@ -3,13 +3,16 @@
 ## 0.181.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
-inspect` changes: it reads snapshot files it printed as empty, refused or hung
-on, and it no longer leaves a `<file>-shm` beside the file it reads. For the
-inputs below its exit code goes from 1, or a hang, to 0. To pin the binary
-back: `npm i -g @sdsrs/code-graph@0.180.0` (or, from source, `cargo install
---locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.180.0
---features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
-and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+inspect` changes. It reads snapshot files that it printed as empty, refused,
+read wrong or hung on, and for the inputs below it no longer leaves a
+`<file>-shm` beside the file it reads. It now also applies a hot
+`<file>-journal`, as `sqlite3` does, where it used to ignore it, so a journal
+that does not belong to the file can change what it prints or make it refuse
+the file (see below). To pin the binary back: `npm i -g
+@sdsrs/code-graph@0.180.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.180.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
 
 ### `snapshot inspect` reads the files it could not
 
@@ -21,41 +24,69 @@ code; two of those ten no longer leave a `-shm` (below). The others:
   WAL mode, printed `node_count` 0 and `edge_count` 0, with `Index version
   mismatch (stored v123 ≠ binary v124): clearing + rebuilding` on stderr, about
   its own temporary copy. It now prints 120 and 40 and no message. A raw
-  snapshot in rollback mode printed 120 and 40 already.
+  snapshot in rollback mode printed 120 and 40 already. Exit 0 on both.
 - A snapshot whose writer died in the middle of a transaction, leaving a hot
-  `<file>-journal` beside it, failed with `database disk image is malformed`
-  (exit 1): named directly, through a link, or with a header that says WAL.
-  The last commit is now read, as `sqlite3` reads those pairs. With both files
-  at mode 0444 it failed with `attempt to write a readonly database` (header
-  says rollback) or `malformed` (header says WAL); these read the last commit
-  too. With the `-journal` a symlink to the real journal it failed with
-  `malformed`; it now reads the last commit through the link, where `sqlite3`
-  refuses that pair with `unable to open database file`.
+  `<file>-journal` beside it, was read without its journal: depending on the
+  pages the transaction had written, 0.180.0 failed with `database disk image
+  is malformed` (exit 1) or printed the unfinished transaction's values (exit
+  0). On the fixture measured here it failed, named directly, through a link,
+  or with a header that says WAL. The last commit is now read (exit 0), as
+  `sqlite3` reads those pairs. With both files at mode 0444 the fixture failed
+  with `attempt to write a readonly database` (header says rollback) or
+  `malformed` (header says WAL); these read the last commit too. With the
+  `-journal` a symlink to the real journal it failed with `malformed`; it now
+  reads the last commit through the link, where `sqlite3` refuses that pair
+  with `unable to open database file`.
 - A FIFO at `<file>-journal` beside a snapshot in rollback mode made `inspect`
   hang until killed (0.180.0 listed it as not covered). It now reads the
-  snapshot and leaves the FIFO where it is.
+  snapshot (exit 0) and leaves the FIFO where it is.
 - A FIFO or a non-empty file at `<file>-wal` beside a snapshot in rollback mode
   made `inspect` leave a `<file>-shm` there: 4 of the 25 inputs (a FIFO, 4 KiB
   of text, another database's WAL, and the snapshot's own WAL described
   below). Another database's WAL was also applied to the snapshot, which was
-  then refused as `not a valid code-graph snapshot` (exit 1; `sqlite3` says
-  `no such table: meta`). No `-shm` is left now, and the `-wal` is not read:
-  the snapshot reads as itself, the way `inspect` already treated the `-wal` of
-  a file in WAL mode. One input reads differently from `sqlite3` because of
-  it: a `-wal` holding the snapshot's own frames, put beside its rollback
-  header by hand for this measurement, used to be read (`tool_version` came
-  from the WAL) and now the main file is. SQLite deletes a WAL before it
-  rewrites the header to rollback mode, so it does not leave that pair itself.
+  then refused as `not a valid code-graph snapshot` (exit 1). No `-shm` is
+  left now, and the `-wal` is not read: the snapshot reads as itself (exit 0),
+  the way `inspect` already treated the `-wal` of a file in WAL mode. Two of
+  these inputs now read differently from `sqlite3`, which still applies the
+  `-wal`: the other database's WAL (`sqlite3` says `no such table: meta`), and
+  a `-wal` holding the snapshot's own frames, put beside its rollback header by
+  hand for this measurement, which used to be read (`tool_version` came from
+  the WAL) and is not now. SQLite deletes a WAL before it rewrites the header
+  to rollback mode, so it does not leave that second pair itself.
 - stderr only. A snapshot built by a newer `INDEX_VERSION` (125), compressed or
   in WAL mode, no longer adds `Index was built by a NEWER code-graph … delete
   .code-graph/index.db* first`, advice about a project's own index; its counts
   were and are 120 and 40. A file holding only a SQLite header, raw or
-  compressed, no longer warns
-  `Database corrupt (/tmp/…/snapshot.db), deleting for rebuild`, about the
-  temporary copy; it is still refused with `not a valid code-graph snapshot`.
+  compressed, no longer warns `Database corrupt (/tmp/…/snapshot.db), deleting
+  for rebuild`, about the temporary copy; it is still refused with `not a valid
+  code-graph snapshot`.
 
 On both versions the 25 inputs keep their bytes; the copies `inspect` makes for
 these reads are temporary.
+
+### A hot `-journal` is applied, whoever left it
+
+Reading the last commit means rolling a hot journal back, and `inspect` cannot
+tell a journal that belongs to the file from one that does not; neither can
+SQLite. Measured on five more inputs, 0.180.0 against 0.181.0:
+
+- A hot journal left by a transaction on an earlier version of the file, the
+  file then replaced: 0.180.0 printed the file's own values, 0.181.0 prints the
+  values the journal restores (exit 0 on both; `sqlite3` prints the same as
+  0.181.0).
+- A hot journal of an unrelated database beside a clean snapshot, with a
+  rollback or a WAL header: 0.180.0 ignored it (exit 0); 0.181.0 refuses the
+  snapshot as `not a valid code-graph snapshot` (exit 1; `sqlite3` says
+  `database disk image is malformed`).
+- A non-empty `-journal` that cannot be read (mode 000), either header: 0.180.0
+  ignored it (exit 0); 0.181.0 refuses with `stage '<path of the journal>' for
+  inspect` … `Permission denied (os error 13)` (exit 1), as `sqlite3` refuses
+  it with `unable to open database file`.
+
+A `-journal` whose first byte is 0 is not hot, and SQLite does not apply it;
+`inspect` leaves it out of the copy. With a 1 GiB journal of zeros beside a
+snapshot in WAL mode and a 256 MiB file-size limit, 0.180.0 and 0.181.0 both
+exit 0 and leave nothing in TMPDIR.
 
 ### Not covered
 
@@ -63,6 +94,19 @@ these reads are temporary.
   built by a newer code-graph (v125 > binary v124); leaving it intact, not
   rebuilding` when it is compressed or in WAL mode, and nothing when it is raw
   in rollback mode. The counts are the same on both.
+- A file in WAL mode is read as of its last checkpoint: frames committed to its
+  `-wal` but not checkpointed are not read (`sqlite3` reads them), as with
+  0.180.0.
+- A header whose bytes 18 and 19 are 1 and 2, which SQLite does not write,
+  still makes `inspect` leave a `-wal` and a `-shm` beside the file, as 0.180.0
+  and a read-only `sqlite3` open do.
+- A file whose name begins with `file:` is opened as a SQLite URI: `inspect
+  file:x.db` read `x.db` (and its `-wal`) and left a `-shm` beside it, as
+  0.180.0 did.
+- On Windows, SQLite names the side files after the path as given, without
+  resolving links, while `inspect` looks for `-journal` and `-wal` beside a
+  link's target. Through a file symlink the two can disagree. This is read
+  from SQLite's source and not run: there is no Windows machine here.
 - `inspect` looks at the `-journal` and `-wal` beside the file before SQLite
   opens it. A FIFO put there between the two, by another process at that
   moment, still blocks it.
