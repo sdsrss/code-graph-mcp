@@ -1,5 +1,5 @@
 # 无索引目录里的查询不再静默返回空（P0-b）
-状态：已完成（只剩发版后的 AC5 监测）
+状态：已完成（AC5 已于 2026-11-01 测量，样本不足以下结论，见 AC5）
 
 ## 背景与目标
 
@@ -36,7 +36,8 @@ code-graph-mcp show X 2>/dev/null | head -40 || grep -n "function X" -A40 src/
 - [x] AC2：`--json` 的 stdout 仍然只有那一个 JSON 对象，不多出一行文本。验证：同一用例里加断言。
 - [x] AC3：有索引时，所有命令的输出不变。验证：`cargo test --no-default-features` 全部通过。
 - [x] AC4：stderr 原有那一行不变，`--json` 的错误对象不变（第二轮评审后撤回无 `.git` 的另一套文字，才真正成立，见决策记录）。验证：`tests/cli_e2e.rs` 的 `test_cli_json_error_no_index_emits_error_object` 和 `claude-plugin/scripts/doctor.test.js` 的现有断言通过；新用例另外断言 stderr 那一行还在。
-- [ ] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列（只计没有任何输出的调用）在副本目录中下降，同样的调用改记在 `no-index` 计数里。
+- [x] AC5（发版后监测）：`python3 scripts/plugin_usage.py` 的 `empty` 列（只计没有任何输出的调用）在副本目录中下降，同样的调用改记在 `no-index` 计数里。
+  - 2026-11-01 测量：`python3 -I scripts/plugin_usage.py --since 2026-10-09T00:00:00 --split 2026-10-23T15:59:16=0.178+ --detail`（切分点是 v0.178.0 的 tag 时间；0.178.0 的插件缓存目录已不在，取不到安装时间）。`empty`：发版前 5 次（main 1 + subagent 4，约 468 次 cg 调用，按每千次工具调用的 cg 次数 × 工具调用数算），发版后 0 次（约 106 次 cg 调用）；发版后 `no-index answers` 6 次（main 4 + subagent 2）。按发版前约 1.1% 的比例，发版后预计约 1.1 次，看到 0 次的概率约 33%，所以只能说"方向一致"，不能算证据。脚本不按副本目录拆分，"副本目录中"这一半没有单独的数字。
 
 ## 方案
 
