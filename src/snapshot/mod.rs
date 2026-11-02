@@ -107,7 +107,11 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     // connection, not a long-lived reader during a concurrent VACUUM — but keeps a
     // future nonzero SQLITE_DEFAULT_MMAP_SIZE from silently re-enabling mmap anywhere.
     conn.execute_batch("PRAGMA mmap_size = 0;")?;
-    let target_str = vacuum_target.to_string_lossy().replace('\'', "''");
+    // Absolute, so SQLite cannot read a raw `--out` that begins with `file:` as
+    // a URI and write another file (see `Database::open_readonly_named`, D#638).
+    let target_str = std::path::absolute(&vacuum_target)?
+        .to_string_lossy()
+        .replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{target_str}';"))
         .with_context(|| format!("VACUUM INTO '{}'", vacuum_target.display()))?;
 

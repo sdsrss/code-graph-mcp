@@ -278,6 +278,34 @@ fn cli_snapshot_inspect_reads_a_file_whose_name_begins_with_file_colon() {
     assert_eq!(names, ["file:x.db", "x.db"], "inspect left side files");
 }
 
+/// D#638's other door: a raw `--out` goes to `VACUUM INTO`, whose file name
+/// SQLite parses as a URI the same way, so `create --out file:x.db` wrote `x.db`.
+#[cfg(unix)]
+#[test]
+fn cli_snapshot_create_writes_the_out_path_it_is_given_when_it_begins_with_file_colon() {
+    let repo = init_git_repo();
+    let dir = TempDir::new().unwrap();
+    let status = Command::new(cli_bin())
+        .current_dir(dir.path())
+        .args([
+            "snapshot",
+            "create",
+            "--out",
+            "file:x.db",
+            "--quiet",
+            "--root",
+        ])
+        .arg(repo.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "create failed");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["file:x.db"], "create wrote somewhere else");
+}
+
 // clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
 // clap owns --help for the parent and each sub, plus no-subcommand /
 // unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]
