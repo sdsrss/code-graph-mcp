@@ -2582,15 +2582,18 @@ fn ci_schedule_runs_only_the_audit_job() {
 /// major, the one package allowed to depend on that crate, and its version).
 /// The version too: the source read is that release's (pre-tag review). An ignore is a
 /// claim that the vulnerable code is unreachable from here, and the claim is
-/// about one dependent: the zip advisories (2026-10-09/10, all in
-/// `ZipArchive::extract` / `ZipStreamReader::extract`) hold for candle-core
-/// 0.9.2, which only opens archives by name and writes `.npz` files, and which
-/// this crate uses for safetensors alone. No candle release depends on zip 9
-/// yet (0.11.0 asks for `^8.6.0`), and no 7.x or 8.x release carries the fix.
+/// about one dependent: the zip advisories (2026-10-09/10 and 2026-10-22, all
+/// in `ZipArchive::extract` / `ZipStreamReader::extract`; 0429 is extract's
+/// symlink-target allocation) hold for candle-core 0.9.2, which only opens
+/// archives by name and writes `.npz` files (`ZipArchive::new` and `ZipWriter`;
+/// no `extract` call in its source), and which this crate uses for safetensors
+/// alone. No candle release depends on zip 9 yet (0.11.0 asks for `^8.6.0`),
+/// and no 7.x or 8.x release carries the fix.
 const AUDIT_IGNORES: &[(&str, &str, u64, &str, &str)] = &[
     ("RUSTSEC-2026-0367", "zip", 9, "candle-core", "0.9.2"),
     ("RUSTSEC-2026-0368", "zip", 9, "candle-core", "0.9.2"),
     ("RUSTSEC-2026-0369", "zip", 9, "candle-core", "0.9.2"),
+    ("RUSTSEC-2026-0429", "zip", 9, "candle-core", "0.9.2"),
 ];
 
 /// An audit ignore stays only while its reason does. The ignore cannot go
