@@ -2114,8 +2114,8 @@ fn test_typed_receiver_incremental_matches_rebuild() {
     );
 }
 
-/// D#370(g): `C.m()` on the file's own class binds C's method, else the one C
-/// inherits — in its file or another — and no other class's. Before, it was an
+/// D#370(g): `C.m()` on the file's own class binds the method C's MRO reaches
+/// first, when the file decides it, and no other class's. Before, it was an
 /// untyped member call and bound every same-named method of the file (stdlib
 /// tkinter: `Widget.__init__(self)` → every `__init__` there).
 const OWN_CLASS_BASE_PY: &str = "class Remote:\n    def close(self):\n        pass\n";
@@ -2162,20 +2162,63 @@ fn test_call_on_the_files_own_class_binds_that_class_method() {
         ("Label.__init__", vec!["w.py:BaseWidget.__init__"]),
         // The named class's own method, not the override beside it.
         ("BaseWidget.destroy", vec!["w.py:Misc.destroy"]),
-        // A base in another file, not the same-named method of this one.
-        ("Local.go", vec!["base.py:Remote.close"]),
-        // `super()` onto this file's `Widget`, not ttk's.
-        ("Sub.__init__", vec!["w.py:BaseWidget.__init__"]),
     ] {
         assert_eq!(calls(caller), want, "calls of {caller}");
     }
-    // A class whose method comes from outside the project keeps the old
-    // resolution, but never another file's same-named class's method.
+    // A class whose method comes from outside the file (`Local`'s imported
+    // base, `Error`'s `Exception`) keeps the old resolution, which never
+    // reached another file's same-named class's method here.
     assert!(
         !calls("ProtocolError.__init__").contains(&"ttk.py:Error.__init__".to_string()),
         "{:?}",
         calls("ProtocolError.__init__")
     );
+}
+
+/// What the file cannot decide resolves as before 22350fe2's review: Python's
+/// MRO is depth-first (C3), a base the file imports is not followed into a
+/// same-named class elsewhere, and `super()` binds as it always did.
+#[test]
+fn test_call_on_the_files_own_class_follows_the_mro_or_declines() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "mro.py",
+            "class Base1:\n    def m(self):\n        pass\n\nclass A(Base1):\n    pass\n\n\
+             class B:\n    def m(self):\n        pass\n\nclass C(A, B):\n    def go(self):\n        C.m(self)\n",
+        ),
+        (
+            "a.py",
+            "from external_pkg import Base\n\nclass C2(Base):\n    def f(self):\n        C2.close(self)\n",
+        ),
+        ("b.py", "class Base:\n    def close(self):\n        pass\n"),
+        (
+            "compat.py",
+            "try:\n    from fastlib import Base\nexcept ImportError:\n    class Base(object):\n        pass\n\n\
+             class D(Base):\n    def run(self):\n        super().run()\n",
+        ),
+        ("fastlib.py", "class Base:\n    def run(self):\n        pass\n"),
+    ]);
+    let calls = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT DISTINCT ft.path || ':' || COALESCE(nt.qualified_name, nt.name) FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND ns.qualified_name = ?1 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    // MRO C, A, Base1, B: `Base1.m`, not `B.m` one level up.
+    assert_eq!(calls("C.go"), vec!["mro.py:Base1.m"]);
+    // `Base` is external_pkg's: b.py's namesake is not C2's base.
+    assert_eq!(calls("C2.f"), Vec::<String>::new());
+    // `Base` may be fastlib's: `super()` keeps binding it.
+    assert_eq!(calls("D.run"), vec!["fastlib.py:Base.run"]);
 }
 
 /// The same binding after an incremental run equals a rebuild's: the class's

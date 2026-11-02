@@ -51,9 +51,9 @@ thread_local! {
     /// Python names that hold one module everywhere in the file, and that
     /// module ([`py_module_names`]). Per file: reset by `reset_import_bound`.
     static PY_MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    /// Python classes the file defines at module level and never rebinds
-    /// ([`py_class_names`]). Per file: reset by `reset_import_bound`.
-    static PY_CLASS_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// The file's Python classes for `C.m()` calls ([`py_class_names`]). Per
+    /// file: reset by `reset_import_bound`.
+    static PY_CLASSES: RefCell<PyClasses> = RefCell::new(PyClasses::default());
     /// The (module, attribute) of each `P.X()` call [`python_module_call_meta`]
     /// marked, in the order met: one synthetic import each
     /// ([`take_python_attr_imports`]).
@@ -79,9 +79,9 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     let classes = if family == "python" {
         py_class_names(root, source)
     } else {
-        HashSet::new()
+        PyClasses::default()
     };
-    PY_CLASS_NAMES.with(|c| *c.borrow_mut() = classes);
+    PY_CLASSES.with(|c| *c.borrow_mut() = classes);
     PY_ATTR_IMPORTS.with(|a| a.borrow_mut().clear());
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
@@ -1183,42 +1183,178 @@ fn is_node(field: Option<tree_sitter::Node>, node: tree_sitter::Node) -> bool {
 }
 
 /// Metadata of a Python call `C.m()` on a class the file defines at module
-/// level and never rebinds ([`PY_CLASS_NAMES`], D#370): Python looks `m` up in
-/// `C` and its bases, never in another class and never in a subclass, which is
-/// what the `super()` qualifier binds (`recv_type_targets` without dispatch).
-/// Before it, such a call was an untyped member call and bound every
-/// same-named method of the file (`Widget.__init__(self)` → every `__init__`).
+/// level and never rebinds (D#370). Python looks `m` up along `C`'s MRO, so the
+/// call runs the first class in it that defines `m` — never another class of
+/// the file and never a subclass's override. When that class is decided inside
+/// this file ([`py_class_lookup`]), the call carries the `super()` qualifier
+/// naming it, which binds that class's own method (`recv_type_targets` without
+/// dispatch, the caller's file's among same-named classes), and `"own":1`: no
+/// other file can move that answer. Anything the file
+/// cannot decide keeps the old untyped member call. Before, such a call bound
+/// every same-named method of the file (`Widget.__init__(self)` → every
+/// `__init__`).
 pub(super) fn python_class_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
         return None;
     }
     let object = function.child_by_field_name("object")?;
-    if object.kind() != "identifier" {
+    let method = function.child_by_field_name("attribute")?;
+    if object.kind() != "identifier" || method.kind() != "identifier" {
         return None;
     }
-    let name = node_text(&object, source);
-    PY_CLASS_NAMES
-        .with(|c| c.borrow().contains(name))
-        .then(|| serde_json::json!({ "q": "super", "v": name }).to_string())
+    let (class, method) = (node_text(&object, source), node_text(&method, source));
+    let owner = PY_CLASSES.with(|c| {
+        let mut c = c.borrow_mut();
+        let key = (class.to_string(), method.to_string());
+        if let Some(hit) = c.lookups.get(&key) {
+            return hit.clone();
+        }
+        let hit = py_class_lookup(&c, class, method);
+        c.lookups.insert(key, hit.clone());
+        hit
+    })?;
+    // `recv_type_targets` reads a `std` path as Rust's standard library.
+    if owner == "std" {
+        return None;
+    }
+    // `own`: decided by this file alone — the class-structure drift that
+    // re-reads typed calls after another file's class changes leaves it out.
+    Some(serde_json::json!({ "q": "super", "v": owner, "own": 1 }).to_string())
 }
 
-/// The classes a Python file defines at module level (under `if` / `try` /
-/// `with` / a decorator too, not in a `def` or another class) whose name holds
-/// that class everywhere in the file: every other identifier occurrence of the
-/// name only reads it ([`py_class_name_is_read`]), and no `from … import *`
-/// follows the class's last definition. Anything that binds the name — an
-/// assignment, a parameter, a loop / `with` / `except … as` / match-capture
-/// target, an import, `global`, `del`, a `def` or a class of that name in
-/// another scope, a type parameter — leaves the class out, so `C.m()` keeps
-/// its old resolution wherever `C` might be something else.
+/// One module-level class of the current Python file, for [`py_class_lookup`].
+struct PyClass {
+    /// Its positional bases as written: a name, or `""` for any other
+    /// expression (`mod.Base`, `Generic[T]`, `*bases`), which no class has.
+    bases: Vec<String>,
+    /// A `metaclass=` (or any) keyword among its bases: the metaclass can
+    /// answer `C.m` before the class's own `m` does.
+    keywords: bool,
+    /// Names the body binds once, by a `def` directly in it.
+    methods: HashSet<String>,
+    /// Every other name the body may bind: a second `def`, a nested class, an
+    /// assignment, anything under `if` / `for` / `try` / `with` in the body.
+    other: HashSet<String>,
+}
+
+/// The current file's Python classes for [`python_class_call_meta`]. Per file:
+/// reset by `reset_import_bound`.
+#[derive(Default)]
+struct PyClasses {
+    /// Module-level classes whose name holds the class everywhere in the file
+    /// ([`py_class_names`]).
+    classes: HashMap<String, PyClass>,
+    /// `(C, m)` where the file assigns or deletes `C.m` (`C.m = f`).
+    patched: HashSet<(String, String)>,
+    /// [`py_class_lookup`]'s answers.
+    lookups: HashMap<(String, String), Option<String>>,
+}
+
+/// The class whose `m` a call `C.m()` runs, decided inside this file: the
+/// first class of `C`'s MRO (Python's C3 linearization) whose body defines `m`
+/// with one `def` and binds it no other way. None — keep the old resolution —
+/// when `C` is not a class of [`py_class_names`], when the MRO cannot be
+/// computed, when it reaches a class this file does not define (an import, a
+/// builtin, `object`, a rebound name) or a class binding `m` some other way
+/// before finding the `def`, when a class on the way has `m` assigned from
+/// outside (`C.m = f`), and when `C` has a keyword base (a metaclass). A class
+/// defining `m` itself answers whatever its bases are.
+fn py_class_lookup(state: &PyClasses, class: &str, method: &str) -> Option<String> {
+    let c = state.classes.get(class)?;
+    if c.keywords {
+        return None;
+    }
+    let patched = |x: &str| state.patched.contains(&(x.to_string(), method.to_string()));
+    if c.methods.contains(method) && !c.other.contains(method) {
+        return (!patched(class)).then(|| class.to_string());
+    }
+    for x in py_mro(state, class, 0)? {
+        let Some(k) = state.classes.get(&x).filter(|k| !k.keywords) else {
+            return None; // a class this file does not decide
+        };
+        if patched(&x) || k.other.contains(method) {
+            return None;
+        }
+        if k.methods.contains(method) {
+            return Some(x);
+        }
+    }
+    None // `object`'s, or none: no project method
+}
+
+/// C3 linearization of `class`, one of the file's classes, over them. A base
+/// the file does not define is a leaf named for its class and position, so
+/// two of them are never merged into one (two imports of `Base` may be two
+/// classes); [`py_class_lookup`] stops at the first. `object` is left out.
+/// None on an inconsistent order (Python refuses the class) or a hierarchy
+/// deeper than 32, which a cycle reaches.
+fn py_mro(state: &PyClasses, class: &str, depth: usize) -> Option<Vec<String>> {
+    if depth > 32 {
+        return None;
+    }
+    let c = state.classes.get(class)?;
+    let bases: Vec<String> = c
+        .bases
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if b != class && state.classes.contains_key(b) {
+                b.clone()
+            } else {
+                format!("\0{class}.{i}")
+            }
+        })
+        .collect();
+    let mut lists: Vec<Vec<String>> = Vec::new();
+    for b in &bases {
+        lists.push(if state.classes.contains_key(b) {
+            py_mro(state, b, depth + 1)?
+        } else {
+            vec![b.clone()]
+        });
+    }
+    lists.push(bases);
+    let mut out = vec![class.to_string()];
+    loop {
+        lists.retain(|l| !l.is_empty());
+        if lists.is_empty() {
+            return Some(out);
+        }
+        let head = lists
+            .iter()
+            .map(|l| &l[0])
+            .find(|h| !lists.iter().any(|l| l[1..].contains(h)))?
+            .clone();
+        for l in &mut lists {
+            if l[0] == head {
+                l.remove(0);
+            }
+        }
+        out.push(head);
+    }
+}
+
+/// The module-level classes of a Python file whose name holds that one class
+/// everywhere in it, with each one's bases and body bindings, and the class
+/// attributes the file assigns from outside. A class qualifies when the file
+/// defines it once, as a plain statement of the module (not under `if` /
+/// `try` / `with`, not decorated — a decorator may return something else),
+/// no `from … import *` follows it, and every other identifier occurrence of
+/// the name only reads it ([`py_class_name_is_read`]). Anything that binds the
+/// name — an assignment, a parameter, a loop / `with` / `except … as` /
+/// match-capture target, an import, `global`, `del`, a `def` or a class of
+/// that name in another scope, a type parameter — leaves the class out, so
+/// `C.m()` keeps its old resolution wherever `C` might be something else.
 ///
-/// Two cursor walks, no recursion: a deep expression cannot overflow them.
-fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
-    // Module-level class definitions (the walk does not enter a def, a class
-    // or a lambda) and the last wildcard import.
-    let mut defs: HashMap<String, usize> = HashMap::new();
+/// Cursor walks, no recursion: a deep expression cannot overflow them.
+fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
+    // Class definitions in module scope (the walk does not enter a def, a
+    // class or a lambda) and the last wildcard import.
+    let mut defs: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut found: HashMap<String, PyClass> = HashMap::new();
     let mut module_defs: HashSet<usize> = HashSet::new();
+    let mut rejected: HashSet<String> = HashSet::new();
     let mut last_star: Option<usize> = None;
     let mut cursor = root.walk();
     loop {
@@ -1226,11 +1362,16 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
         let enter = match node.kind() {
             "class_definition" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    let pos = defs
-                        .entry(node_text(&name, source).to_string())
-                        .or_default();
-                    *pos = (*pos).max(node.start_byte());
-                    module_defs.insert(node.id());
+                    let name = node_text(&name, source).to_string();
+                    if node.parent().is_some_and(|p| p.kind() == "module") {
+                        defs.entry(name.clone())
+                            .or_default()
+                            .push(node.start_byte());
+                        module_defs.insert(node.id());
+                        found.insert(name, py_class_shape(node, source));
+                    } else {
+                        rejected.insert(name);
+                    }
                 }
                 false
             }
@@ -1253,26 +1394,38 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
             break;
         }
     }
-    let mut rejected: HashSet<String> = defs
-        .iter()
-        .filter(|(_, pos)| last_star.is_some_and(|s| s > **pos))
-        .map(|(name, _)| name.clone())
-        .collect();
-    if defs.len() == rejected.len() {
-        return HashSet::new();
+    for (name, at) in &defs {
+        if at.len() != 1 || last_star.is_some_and(|s| s > at[0]) {
+            rejected.insert(name.clone());
+        }
     }
-    // Every occurrence of a candidate name.
+    let mut state = PyClasses::default();
+    if defs.keys().all(|n| rejected.contains(n)) {
+        return state;
+    }
+    // Every occurrence of a candidate name, and `C.m = …` on one.
     let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         if node.kind() == "identifier" {
             let name = node_text(&node, source);
-            if defs.contains_key(name)
-                && !rejected.contains(name)
-                && !py_class_name_is_read(node, &ancestors, &module_defs)
-            {
-                rejected.insert(name.to_string());
+            if defs.contains_key(name) && !rejected.contains(name) {
+                if !py_class_name_is_read(node, &ancestors, &module_defs) {
+                    rejected.insert(name.to_string());
+                } else if let Some(&attr) = ancestors.last() {
+                    let head = &ancestors[..ancestors.len() - 1];
+                    if attr.kind() == "attribute"
+                        && is_node(attr.child_by_field_name("object"), node)
+                        && !py_class_name_is_read(attr, head, &module_defs)
+                    {
+                        if let Some(field) = attr.child_by_field_name("attribute") {
+                            state
+                                .patched
+                                .insert((name.to_string(), node_text(&field, source).to_string()));
+                        }
+                    }
+                }
             }
         }
         if cursor.goto_first_child() {
@@ -1281,12 +1434,111 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
-                return defs
-                    .into_keys()
-                    .filter(|name| !rejected.contains(name))
+                state.classes = found
+                    .into_iter()
+                    .filter(|(name, _)| !rejected.contains(name))
                     .collect();
+                return state;
             }
             ancestors.pop();
+        }
+    }
+}
+
+/// A module-level class's bases and what its body binds, for [`PyClass`].
+fn py_class_shape(class: tree_sitter::Node, source: &str) -> PyClass {
+    let mut shape = PyClass {
+        bases: Vec::new(),
+        keywords: false,
+        methods: HashSet::new(),
+        other: HashSet::new(),
+    };
+    if let Some(args) = class.child_by_field_name("superclasses") {
+        for i in 0..args.named_child_count() {
+            let Some(b) = args.named_child(i) else {
+                continue;
+            };
+            match b.kind() {
+                "identifier" => shape.bases.push(node_text(&b, source).to_string()),
+                "keyword_argument" | "dictionary_splat" => shape.keywords = true,
+                "comment" => {}
+                _ => shape.bases.push(String::new()),
+            }
+        }
+    }
+    let Some(body) = class.child_by_field_name("body") else {
+        return shape;
+    };
+    let mut defs: HashMap<String, usize> = HashMap::new();
+    for i in 0..body.named_child_count() {
+        let Some(stmt) = body.named_child(i) else {
+            continue;
+        };
+        let def = match stmt.kind() {
+            "decorated_definition" => stmt.child_by_field_name("definition"),
+            _ => Some(stmt),
+        };
+        match def.map(|d| (d.kind(), d.child_by_field_name("name"))) {
+            Some(("function_definition", Some(name))) => {
+                *defs
+                    .entry(node_text(&name, source).to_string())
+                    .or_default() += 1;
+            }
+            _ => py_names_in(stmt, source, &mut shape.other),
+        }
+    }
+    for (name, n) in defs {
+        if n == 1 {
+            shape.methods.insert(name);
+        } else {
+            shape.other.insert(name);
+        }
+    }
+    shape
+}
+
+/// Every name a class-body statement may bind: each variable-like identifier
+/// in it (not an attribute name `o.x`, not a keyword `f(x=1)`), and the name of
+/// a `def` or class under it, whose body is not entered. An over-count only
+/// makes [`py_class_lookup`] decline.
+fn py_names_in(stmt: tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
+    let mut cursor = stmt.walk();
+    loop {
+        let node = cursor.node();
+        let mut enter = true;
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    out.insert(node_text(&name, source).to_string());
+                }
+                enter = false;
+            }
+            "lambda" => enter = false,
+            "identifier" => {
+                let skip = node.parent().is_some_and(|p| {
+                    (p.kind() == "attribute" && is_node(p.child_by_field_name("attribute"), node))
+                        || (p.kind() == "keyword_argument"
+                            && is_node(p.child_by_field_name("name"), node))
+                });
+                if !skip {
+                    out.insert(node_text(&node, source).to_string());
+                }
+            }
+            _ => {}
+        }
+        if enter && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.node().id() == stmt.id() {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
         }
     }
 }
@@ -1295,9 +1547,10 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
 /// leaves the name holding the class: the module-level definition itself, an
 /// attribute's object (`C.m`, `C.x = 1`), a callee, an argument or base class,
 /// an assignment's value, an annotation, an operand, a decorator, an
-/// `except C` / `case C()` class. An attribute name (`o.C`) and a keyword
-/// (`f(C=1)`) are no occurrence of the variable. Tuples, lists and parentheses
-/// are climbed first, so `del a, C` is the `del` it is. Everything else counts
+/// `except C` / `with C as x` / `case C()` class. An attribute name (`o.C`)
+/// and a keyword (`f(C=1)`) are no occurrence of the variable. Tuples, lists,
+/// sets, dicts, parentheses and `*` / `**` are climbed first, so `del a, C`
+/// and `with f() as (a, *C)` are the binding they are. Everything else counts
 /// as a binding: an allow-list, so a shape not listed only keeps the old
 /// resolution.
 fn py_class_name_is_read(
@@ -1310,7 +1563,14 @@ fn py_class_name_is_read(
     while at > 0
         && matches!(
             ancestors[at - 1].kind(),
-            "expression_list" | "tuple" | "list" | "set" | "parenthesized_expression"
+            "expression_list"
+                | "tuple"
+                | "list"
+                | "set"
+                | "dictionary"
+                | "parenthesized_expression"
+                | "list_splat"
+                | "dictionary_splat"
         )
     {
         at -= 1;
@@ -1330,7 +1590,11 @@ fn py_class_name_is_read(
         "for_statement" | "for_in_clause" => is("right"),
         "lambda" => is("body"),
         "except_clause" => is("value"),
-        "as_pattern" => !is("alias"),
+        // `except C as e` / `with C as x` read C; `case D() as C` captures it.
+        "as_pattern" => {
+            is_node(parent.named_child(0), child)
+                && grandparent.is_some_and(|g| matches!(g.kind(), "except_clause" | "with_item"))
+        }
         "type" => grandparent.is_some_and(|g| {
             matches!(
                 g.kind(),
@@ -1356,8 +1620,6 @@ fn py_class_name_is_read(
         | "decorator"
         | "interpolation"
         | "pair"
-        | "list_splat"
-        | "dictionary_splat"
         | "assert_statement"
         | "raise_statement"
         | "if_statement"

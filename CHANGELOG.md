@@ -7,49 +7,55 @@ because some Python call edges bind differently (below). The MCP server
 rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does.
 
-### Python: `C.m()` on the file's own class binds that class's method
+### Python: `C.m()` on the file's own class binds the method Python runs
 
 A call that names a class explicitly, `Widget.__init__(self, …)` or
 `ExpatBuilder.reset(self)`, was resolved as a call on an untyped object, so
-it bound every same-named method in the caller's file. When `C` is a class the
-file defines at module level, and every other occurrence of the name in the
-file is one of the reads the parser recognises (a call, an argument or base
-class, an attribute, an annotation, an assignment's value, an operand,
-`except C`, `case C()`, …), the call now binds `C`'s own `m`. Any other
-occurrence keeps the old resolution: an assignment, a parameter, an import, a
-loop, `with … as` or `except … as` target, `del`, `global`, another `def` or
-`class` of that name, a `from … import *` after the class, or a position the
-parser does not list. If `C` has no `m`, it binds the one
-`C` inherits from its nearest project base, in its own file or another. It no
-longer binds another class of the file, a subclass's override (an explicit
-`C.m(self)` never dispatches), or a same-named class in another file. A class
-whose `m` comes from outside the project (`Exception.__init__`) resolves as
-before.
+it bound every same-named method in the caller's file. Python looks `m` up
+along `C`'s MRO, and an explicit `C.m(self)` never dispatches to a subclass.
+The call now binds one method: that of the first class in `C`'s MRO (Python's
+C3 order) whose body defines `m` with one `def`. This happens only when the
+caller's file decides that class:
 
-The same rule now settles `super().m()` when the first base is a class the
-caller's file defines. In asyncio's `transports.py`, `super().__init__(extra)`
-in `_FlowControlMixin(Transport)` bound `xmlrpc/client.py`'s unrelated
-`Transport.__init__`. It now binds `BaseTransport.__init__`, which
-`Transport` inherits.
+- `C` and every class before the one defining `m` are classes of this file.
+  Each is defined once, as a plain statement of the module (not under `if`,
+  `try` or `with`, and not decorated), with no keyword base such as
+  `metaclass=` and no `from … import *` after it.
+- Every other occurrence of each of those names is one of the reads the
+  parser recognises: a call, an argument or base class, an attribute, an
+  annotation, an assignment's value, an operand, `except C`, `case C()`, and
+  so on.
+- None of those classes binds `m` any other way (a class attribute, a second
+  `def`, a `def` under `if`), and the file never assigns or deletes `C.m` from
+  outside.
+
+A class that defines `m` itself is decided whatever its bases are. Any other
+call resolves as before. That includes an `m` that comes from an imported
+base, a builtin (`Exception.__init__`) or `object`. `super()` calls are
+unchanged.
 
 Measured with the SCIP call oracle (`scripts/scip_oracle`) against 0.182.0's
 source build, on edges at the default `inferred` floor:
 
-- Python 3.14 standard library: 4,824 → 2,824 wrong edges; precision
-  11,003/15,827 (69.5%) → 10,994/13,818 (79.6%). The edge set lost 2,011
-  edges and gained 1 (the asyncio one above). The oracle counts 10 lost edges
-  as right, and every one is a subclass override reached from an explicit
-  base-class call, such as `ExpatBuilder.install(self, parser)` →
-  `InternalSubsetExtractor.install`. The oracle credits an override for any
-  call to a method. The call still binds `ExpatBuilder.install`.
+- Python 3.14 standard library: 4,824 → 2,832 wrong edges; precision
+  11,003/15,827 (69.5%) → 10,993/13,825 (79.5%); recall unchanged
+  (10,764/12,375). The edge set lost 2,003 `extracted` same-file edges and
+  gained none. 10 edges the oracle counts as right left the default floor:
+  8 were removed and 2 remain as `ambiguous` (bound from another call). Every
+  one is a subclass override reached from an explicit base-class call, such
+  as `ExpatBuilder.install(self, parser)` → `InternalSubsetExtractor.install`.
+  The oracle credits an override for any call to a method. The call still
+  binds `ExpatBuilder.install`.
 - flask 3.1.0, hono 4.6.14, leveldb 1.23, gin 1.10.0, cobra 1.8.1: edge sets
   identical.
 - In tkinter, `impact Label.__init__ --file tkinter/__init__.py` said `Risk:
   HIGH`, 24 direct callers (`StringVar.__init__`, `Button.__init__`, …), none
   of which calls it. It now finds no caller and says so (`Risk: UNKNOWN` with
   the not-in-the-call-graph warning).
-- Full index of the standard library (569 files, 3 runs each, `--no-embed`):
-  user CPU median 5.52 s → 5.55 s.
+- Full index of the standard library (569 files, `--no-embed`, 3 runs each):
+  user CPU median 5.48 s → 5.64 s (+2.9%), wall 3.37 s → 3.35 s. An
+  incremental run after a class-structure edit re-reads the same typed callers
+  as before (tkinter `Widget.__init__` toggled 4 times: 1 caller file each).
 
 ## 0.182.0
 
