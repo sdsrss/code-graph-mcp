@@ -1129,8 +1129,8 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
             wrong.push(format!("{label}: {got:?}, want {want:?}"));
         }
     }
-    // A chain longer than the 32 the walk once stopped at, and one past the
-    // longest MRO decided (64 classes).
+    // The longest MRO decided is 64 classes (once a walk stopped at 32): a
+    // chain of 64 is decided, one of 65 is not.
     let chain = |n: usize| {
         let mut code = String::from("class K0:\n    def m(self): pass\n");
         for i in 1..=n {
@@ -1138,7 +1138,7 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
         }
         code + &format!("def f(x):\n    K{n}.m(x)\n")
     };
-    for (n, want) in [(40, Some("K0")), (70, None)] {
+    for (n, want) in [(63, Some("K0")), (64, None)] {
         let got = owner_of_m(&chain(n));
         if got.as_deref() != want {
             wrong.push(format!("a chain of {}: {got:?}, want {want:?}", n + 1));
