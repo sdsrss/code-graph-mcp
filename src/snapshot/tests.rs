@@ -1209,7 +1209,7 @@ fn inspect_reads_a_read_only_snapshot_on_every_arm() {
 /// through fails the test instead of hanging the suite.
 #[cfg(unix)]
 #[test]
-fn inspect_stages_a_journal_only_when_it_is_a_regular_file() {
+fn inspect_reads_past_a_journal_that_is_not_a_regular_file() {
     for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
         for shape in ["directory", "FIFO"] {
             for via_link in [false, true] {
@@ -1435,7 +1435,10 @@ fn inspect_does_not_delete_a_file_a_journal_names() {
         std::fs::write(&journal, hot_looking_journal(Some(&victim))).unwrap();
 
         // Control: the pair as the withdrawn staging opened it — a writable
-        // copy with the journal beside it — deletes the victim.
+        // copy with the journal beside it — deletes the victim. Hard on unix,
+        // where it was measured; elsewhere a VFS that does not delete the named
+        // file makes the assertion below vacuous rather than wrong, and failing
+        // there would be a claim about the platform, so it says so instead.
         {
             let control_dir = TempDir::new().unwrap();
             let control = control_dir.path().join("snapshot.db");
@@ -1443,11 +1446,19 @@ fn inspect_does_not_delete_a_file_a_journal_names() {
             std::fs::copy(&journal, control_dir.path().join("snapshot.db-journal")).unwrap();
             let _ = Connection::open(&control)
                 .and_then(|c| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)));
+            let control_fired = !victim.exists();
+            #[cfg(unix)]
             assert!(
-                !victim.exists(),
+                control_fired,
                 "{header}: control did not fire — this journal does not name a file SQLite \
                  deletes, so the assertion below would pass on any code"
             );
+            if !control_fired {
+                eprintln!(
+                    "{header}: this platform's SQLite left the file the journal names, so the \
+                     assertion below proves nothing here"
+                );
+            }
             plant_victim();
         }
 

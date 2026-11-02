@@ -4,10 +4,12 @@
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
 inspect` changes. It reads snapshot files that it printed as empty, refused or
-hung on; it no longer leaves a `<file>-shm` beside the file it reads; and it
-reads a file past a stray `<file>-wal` instead of applying that WAL. Nothing
-about what it does to the files it is pointed at changes: it writes to none of
-them, as before. To pin the binary back: `npm i -g @sdsrs/code-graph@0.180.0`
+hung on; where a stray `<file>-wal` made it leave a `<file>-shm` behind, it
+leaves none and reads the file past that WAL instead of applying it. Two
+shapes still get side files written beside them, both as in 0.180.0, and both
+are under Not covered. On the 44 inputs measured for this release it writes to
+no file it was pointed at and deletes nothing.
+To pin the binary back: `npm i -g @sdsrs/code-graph@0.180.0`
 (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.180.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -59,8 +61,8 @@ output with the same exit code; two of those fifteen no longer leave a `-shm`
   still refused with `not a valid code-graph snapshot`.
 
 On both versions the 25 inputs keep their bytes; the copies `inspect` makes for
-these reads are temporary. 0.180.0 added four `-shm` files to the inputs'
-directories, this version adds none.
+these reads are temporary. Across these 25 inputs 0.180.0 added four `-shm`
+files to their directories and this version added none.
 
 ### Not covered
 
@@ -89,12 +91,25 @@ directories, this version adds none.
   another file made `inspect` print the snapshot's metadata, exit 0, and delete
   that named file (both headers); with a FIFO at the named path it blocked
   instead, 30 s to a SIGKILL, leaving 172,032 bytes in TMPDIR; and an
-  8,192-byte journal whose header claimed 2,097,152 pages of 4,096 bytes
-  (8,589,934,592 bytes of apparent size) ended in exit 153 with 180,224 bytes
-  of residue under a 256 MiB file-size limit. `sqlite3` does all three on the
-  same inputs, because it opens a database in order to use it; `inspect` was
-  told to describe a file. On all five of those inputs 0.180.0 and this version
-  print the snapshot (exit 0), delete nothing and leave nothing in TMPDIR.
+  8,192-byte journal whose header claimed 2,097,152 pages of 4,096 bytes ended
+  in exit 153 with 180,224 bytes of residue under a 256 MiB file-size limit.
+  `sqlite3` 3.46.1 deletes the named file and blocks on the FIFO too; on the
+  third it exits 0, having grown the file it was pointed at to 8,589,934,592
+  bytes of apparent size (sparse: 24 allocated blocks). It is opening a
+  database in order to use it, where `inspect` was told to describe a file. On
+  all five of those inputs 0.180.0 and this version print the snapshot
+  (exit 0), delete nothing and leave nothing in TMPDIR.
+- **`inspect` reads snapshots that `sqlite3` refuses to open at all**, and this
+  is what the two items above buy. Reproduced with `sqlite3` 3.46.1, each pair
+  read as the snapshot (exit 0) here and refused there: a `-journal` that is a
+  directory (`disk I/O error`, exit 10), a unix socket, a symlink to a regular
+  file, a symlink to a FIFO, or unreadable at mode 000 (`unable to open
+  database file`, exit 14); a `-journal` belonging to an unrelated database
+  (`database disk image is malformed`, exit 11, after `sqlite3` truncated the
+  snapshot from 172,032 bytes to 73,728); a `-journal` whose trailer names a
+  directory (exit 10); and a `-wal` that is a directory, a socket, a symlink, a
+  symlink to a FIFO, or at mode 000 (exit 14). Those are the shapes measured,
+  not a complete list of the ways the two can disagree.
 - A snapshot built by a newer `INDEX_VERSION` still prints `WARN [index] index
   built by a newer code-graph (v125 > binary v124); leaving it intact, not
   rebuilding` when it is compressed or in WAL mode, and nothing when it is raw

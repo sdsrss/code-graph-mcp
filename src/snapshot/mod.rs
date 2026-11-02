@@ -357,10 +357,15 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // rolled back because the journal is not there. The user's own pair is left
     // exactly as it was, and what the copy reads is whatever the main file
     // alone says: the last commit if the dead transaction never reached it, the
-    // unfinished values or "database disk image is malformed" if it did, where
-    // `sqlite3` would read the last commit in every case. Copying the journal
-    // so that SQLite could roll it back was tried for 0.181.0 and withdrawn at
-    // the pre-tag review — it deletes a path the journal names (`stage_copy`).
+    // unfinished values or "database disk image is malformed" if it did. What
+    // `sqlite3` answers on the same pair varies and is not always the last
+    // commit: measured on 3.46.1, it rolled an unrelated database's journal
+    // into the snapshot and then refused it as malformed (exit 11), having
+    // truncated the file from 172,032 bytes to 73,728; it refuses an unreadable
+    // journal (exit 14) and a directory at that name (exit 10); and with the
+    // journal naming a FIFO it blocks. Copying the journal so that SQLite could
+    // roll it back was tried for 0.181.0 and withdrawn at the pre-tag review —
+    // it deletes a path the journal names (`stage_copy`).
     //
     // This is the same misdiagnosis the WAL split exists to prevent — telling a
     // user their snapshot is corrupt when the real problem is that we chose an
@@ -445,16 +450,19 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
 /// the playback ends (61912 -> 61542). So a `-journal` holds a path for
 /// whoever opens it to delete, and `inspect` is pointed at bytes nobody has
 /// vouched for yet — the same reason the decompression cap exists above.
-/// Measured on a 568-byte `-journal` (the journal magic, zeros, and a trailer
-/// naming another file) beside a 184,320-byte snapshot: `inspect` printed the
-/// snapshot's metadata, exited 0, and deleted the named file. With a FIFO at
-/// that path it blocked instead, 30 s to a SIGKILL, leaving the copy in TMPDIR.
-/// And the page count in the journal's own header drives `pager_truncate`
-/// (61817), so an 8,192-byte journal grew the staged copy to 8,589,934,592
-/// bytes of apparent size, which is SIGXFSZ (exit 153) under a file-size limit.
-/// `sqlite3` does all three on the same pairs, because it is opening a database
-/// to use it. `inspect` is reading a file to describe it, and a command that
-/// describes a file deletes nothing.
+/// Measured on a `-journal` of the journal magic, 504 zeros and a trailer
+/// naming another file (its length is 528 bytes plus that path), beside a
+/// 172,032-byte snapshot: `inspect` printed the snapshot's metadata, exited 0,
+/// and deleted the named file. With a FIFO at that path it blocked instead,
+/// 30 s to a SIGKILL, leaving the 172,032-byte copy in TMPDIR. And the page
+/// count in the journal's own header drives `pager_truncate` (61817): an
+/// 8,192-byte journal claiming 2,097,152 pages of 4,096 bytes ended in SIGXFSZ
+/// (exit 153) under a 256 MiB file-size limit, with the copy and the journal
+/// left behind. `sqlite3` 3.46.1 deletes the named file and blocks on the FIFO
+/// too; on the third it exits 0, having grown the user's own file to
+/// 8,589,934,592 bytes of apparent size (sparse, 24 allocated blocks) — it is
+/// opening a database in order to use it. `inspect` is reading a file to
+/// describe it, and a command that describes a file deletes nothing.
 ///
 /// A hot journal is therefore read past, as in 0.180.0 and before: such a
 /// snapshot reads as its own pages say — the unfinished transaction's values,
