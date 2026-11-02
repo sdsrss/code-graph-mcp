@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 124 → 125
+because some Python call edges bind differently (below). The MCP server
+rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does.
+
+### Python: `C.m()` on the file's own class binds that class's method
+
+A call that names a class explicitly, `Widget.__init__(self, …)` or
+`ExpatBuilder.reset(self)`, was resolved as a call on an untyped object, so
+it bound every same-named method in the caller's file. When `C` is a class the
+file defines at module level, and every other occurrence of the name in the
+file is one of the reads the parser recognises (a call, an argument or base
+class, an attribute, an annotation, an assignment's value, an operand,
+`except C`, `case C()`, …), the call now binds `C`'s own `m`. Any other
+occurrence keeps the old resolution: an assignment, a parameter, an import, a
+loop, `with … as` or `except … as` target, `del`, `global`, another `def` or
+`class` of that name, a `from … import *` after the class, or a position the
+parser does not list. If `C` has no `m`, it binds the one
+`C` inherits from its nearest project base, in its own file or another. It no
+longer binds another class of the file, a subclass's override (an explicit
+`C.m(self)` never dispatches), or a same-named class in another file. A class
+whose `m` comes from outside the project (`Exception.__init__`) resolves as
+before.
+
+The same rule now settles `super().m()` when the first base is a class the
+caller's file defines. In asyncio's `transports.py`, `super().__init__(extra)`
+in `_FlowControlMixin(Transport)` bound `xmlrpc/client.py`'s unrelated
+`Transport.__init__`. It now binds `BaseTransport.__init__`, which
+`Transport` inherits.
+
+Measured with the SCIP call oracle (`scripts/scip_oracle`) against 0.182.0's
+source build, on edges at the default `inferred` floor:
+
+- Python 3.14 standard library: 4,824 → 2,824 wrong edges; precision
+  11,003/15,827 (69.5%) → 10,994/13,818 (79.6%). The edge set lost 2,011
+  edges and gained 1 (the asyncio one above). The oracle counts 10 lost edges
+  as right, and every one is a subclass override reached from an explicit
+  base-class call, such as `ExpatBuilder.install(self, parser)` →
+  `InternalSubsetExtractor.install`. The oracle credits an override for any
+  call to a method. The call still binds `ExpatBuilder.install`.
+- flask 3.1.0, hono 4.6.14, leveldb 1.23, gin 1.10.0, cobra 1.8.1: edge sets
+  identical.
+- In tkinter, `impact Label.__init__ --file tkinter/__init__.py` said `Risk:
+  HIGH`, 24 direct callers (`StringVar.__init__`, `Button.__init__`, …), none
+  of which calls it. It now finds no caller and says so (`Risk: UNKNOWN` with
+  the not-in-the-call-graph warning).
+- Full index of the standard library (569 files, 3 runs each, `--no-embed`):
+  user CPU median 5.52 s → 5.55 s.
+
 ## 0.182.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot

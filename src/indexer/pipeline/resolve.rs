@@ -32,8 +32,11 @@ pub(super) enum CalleeMeta {
     /// type, JS `new T()` / TS `: T` (parser `relations/receiver.rs`). Payload is
     /// the class, as a `::` path when written so. See [`recv_type_targets`].
     RecvType(String),
-    /// `super().f()` (Python): the first base class, bound like `RecvType` but
-    /// without its subclasses' overrides — `super()` names one implementation.
+    /// A Python call that names its class: `super().f()` (the first base
+    /// class) or `C.f()` on a module-level class of the caller's file
+    /// (parser `member::python_class_call_meta`, D#370). Bound like `RecvType`
+    /// but without subclasses' overrides — the call names one implementation —
+    /// and, when the caller's file defines the class, to that class only.
     SuperType(String),
     Receiver(String),
     Chain,
@@ -5367,6 +5370,32 @@ pub(super) fn recv_type_targets(
             nested.push(id);
         } else {
             exact.push(id);
+        }
+    }
+    // A class named explicitly (`dispatch` false: Python `super()` and `C.m()`)
+    // that the caller's own file defines at the top level is that class, so a
+    // method of another file's class of the same name is not its own (D#370):
+    // tkinter's `Widget` inherits `__init__`, ttk's `Widget` defines one, and
+    // `Widget.__init__(self)` in tkinter bound ttk's. A miss then walks up from
+    // that class, as `inherited_or_overridden` already starts from the caller's
+    // file's class among same-named ones.
+    if !dispatch && want.len() == 1 {
+        let anchors: Vec<i64> = classes
+            .file_ids
+            .get(caller_path)
+            .map(|fid| {
+                by_last
+                    .get(last)
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| c.file_id == *fid && !c.nested)
+                    .map(|c| c.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !anchors.is_empty() {
+            exact.retain(|&id| owners(id).1.iter().any(|c| anchors.contains(&c.id)));
+            nested.clear();
         }
     }
     let known = by_last.contains_key(last);

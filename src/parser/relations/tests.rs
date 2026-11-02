@@ -773,6 +773,178 @@ fn test_member_call_on_an_object_is_marked_member() {
     assert_eq!(meta_of(&c, "read"), None);
 }
 
+// D#370(g): `C.m()` on a class the file defines at module level and never
+// rebinds names C's own attribute, which Python looks up in C and its bases —
+// never in another class of the file and never in a subclass. It carries the
+// `super()` qualifier, whose binding is exactly that. Measured on the Python
+// stdlib by the SCIP oracle (0.182.0): 2,057 wrong edges from `Widget.__init__
+// (self)`-style calls, each bound to every same-file `__init__`.
+//
+// The shape table: every case is one file; the call checked is `C.m(…)`.
+// Accepted shapes read C anywhere; a declined one binds C, defines a second C
+// in another scope, or reaches `m` through something other than C itself.
+#[test]
+fn test_python_call_on_a_module_level_class_carries_that_class() {
+    const CLASS_C: &str = "class B:\n    def m(self): pass\nclass C(B):\n    def m(self): pass\n";
+    const SUPER_C: &str = r#"{"q":"super","v":"C"}"#;
+    let meta_of_m = |code: &str| -> Option<String> {
+        let calls = call_meta(code, "python");
+        meta_of(&calls, "m").map(str::to_string)
+    };
+    let accepted: &[(&str, &str)] = &[
+        (
+            "a method of a subclass",
+            "class D(C):\n    def m(self):\n        C.m(self)\n",
+        ),
+        ("a function", "def f(x):\n    C.m(x)\n"),
+        ("module level", "C.m(None)\n"),
+        (
+            "a nested function",
+            "def f():\n    def g():\n        C.m(None)\n",
+        ),
+        ("a lambda", "f = lambda x: C.m(x)\n"),
+        ("a comprehension", "y = [C.m(v) for v in z]\n"),
+        ("a class body", "class D:\n    x = C.m(None)\n"),
+        (
+            "reads of C",
+            "c = C()\nisinstance(c, C)\nisinstance(c, (C, int))\nclass D(C, metaclass=M): pass\n\
+             x: C = c\ndef f(a: C) -> C:\n    return C\nE = C\nf(key=C)\nC[int]\nC is None\n\
+             [C, E]\n{C: C}\nf(*C)\nprint(f'{C}')\nassert C\nif C:\n    pass\nraise C() from C\n\
+             @C\ndef h(): pass\nC.attr = 1\ndef g():\n    C.m(None)\n",
+        ),
+        (
+            "an except clause",
+            "try:\n    pass\nexcept C:\n    C.m(None)\n",
+        ),
+        (
+            "a class pattern",
+            "match x:\n    case C():\n        C.m(x)\n",
+        ),
+        (
+            "a star import before it",
+            "from x import *\nclass C:\n    def m(self): pass\nC.m(None)\n",
+        ),
+    ];
+    for (label, body) in accepted {
+        let code = format!("{CLASS_C}{body}");
+        assert_eq!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // The class need not be the file's first statement or a bare one.
+    for (label, code) in [
+        (
+            "under if/else",
+            "if X:\n    class C:\n        def m(self): pass\nelse:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        ("under try", "try:\n    class C:\n        def m(self): pass\nexcept E:\n    pass\nC.m(None)\n"),
+        ("decorated", "@dataclass\nclass C:\n    def m(self): pass\nC.m(None)\n"),
+    ] {
+        assert_eq!(meta_of_m(code).as_deref(), Some(SUPER_C), "{label}:\n{code}");
+    }
+
+    let declined: &[(&str, &str)] = &[
+        ("module-level assignment", "C = wrap(C)\nC.m(None)\n"),
+        (
+            "local assignment",
+            "def f():\n    C = make()\n    C.m(None)\n",
+        ),
+        ("tuple target", "a, C = x\nC.m(None)\n"),
+        ("list target", "[C] = x\nC.m(None)\n"),
+        ("starred target", "a, *C = x\nC.m(None)\n"),
+        ("annotated target", "C: type = X\nC.m(None)\n"),
+        ("augmented assignment", "C += 1\nC.m(None)\n"),
+        ("parameter", "def f(C):\n    C.m(None)\n"),
+        ("star parameter", "def f(*C):\n    C.m(None)\n"),
+        ("default parameter", "def f(C=1):\n    C.m(None)\n"),
+        ("typed parameter", "def f(C: int):\n    C.m(None)\n"),
+        ("keyword-only parameter", "def f(*, C):\n    C.m(None)\n"),
+        ("lambda parameter", "f = lambda C: C.m(None)\n"),
+        ("for target", "for C in xs:\n    C.m(None)\n"),
+        ("comprehension target", "y = [C.m(None) for C in xs]\n"),
+        ("with target", "with f() as C:\n    C.m(None)\n"),
+        (
+            "except target",
+            "try:\n    pass\nexcept E as C:\n    C.m(None)\n",
+        ),
+        ("import", "import C\nC.m(None)\n"),
+        ("import as", "import a as C\nC.m(None)\n"),
+        ("from import", "from x import C\nC.m(None)\n"),
+        ("from import as", "from x import y as C\nC.m(None)\n"),
+        ("global", "def f():\n    global C\n    C.m(None)\n"),
+        (
+            "nonlocal",
+            "def f():\n    def g():\n        nonlocal C\n        C.m(None)\n",
+        ),
+        ("del", "del C\nC.m(None)\n"),
+        ("del in a tuple", "del a, C\nC.m(None)\n"),
+        ("walrus", "if (C := f()):\n    C.m(None)\n"),
+        ("a def of the name", "def C(): pass\nC.m(None)\n"),
+        (
+            "a method of the name",
+            "class D:\n    def C(self): pass\nC.m(None)\n",
+        ),
+        (
+            "a nested class of the name",
+            "def f():\n    class C:\n        def m(self): pass\n    C.m(None)\n",
+        ),
+        (
+            "a class-level class of the name",
+            "class D:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        (
+            "a capture pattern",
+            "match x:\n    case C:\n        C.m(None)\n",
+        ),
+        ("a type parameter", "def f[C](x):\n    C.m(x)\n"),
+        ("a type alias", "type C = int\nC.m(None)\n"),
+        ("a star import after it", "from x import *\nC.m(None)\n"),
+        (
+            "a class-level attribute of the name",
+            "class D:\n    C = int\nC.m(None)\n",
+        ),
+    ];
+    for (label, body) in declined {
+        let code = format!("{CLASS_C}{body}");
+        assert_ne!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // Receivers that are not the class itself.
+    for (label, body) in [
+        (
+            "an attribute of self",
+            "class D:\n    def f(self):\n        self.C.m(None)\n",
+        ),
+        ("an attribute of the class", "C.D.m(None)\n"),
+        ("an instance", "C().m()\n"),
+        ("an attribute of a name", "x.C.m(None)\n"),
+    ] {
+        let code = format!("{CLASS_C}{body}");
+        assert_ne!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // A class the file does not define, and `super()`, as before.
+    assert_ne!(
+        meta_of_m("class C(B):\n    def f(self):\n        B.m(self)\n").as_deref(),
+        Some(r#"{"q":"super","v":"B"}"#)
+    );
+    assert_eq!(
+        meta_of_m(&format!(
+            "{CLASS_C}class D(C):\n    def f(self):\n        super().m()\n"
+        ))
+        .as_deref(),
+        Some(SUPER_C)
+    );
+}
+
 // Review of D#370(a): a name a file imports from more than one module carries
 // how many (`"n"`), so the resolver can tell a re-export with an arm it cannot
 // see from one it sees whole. Counted over the exported name (an `as`), not

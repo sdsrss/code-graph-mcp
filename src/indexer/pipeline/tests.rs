@@ -2114,6 +2114,128 @@ fn test_typed_receiver_incremental_matches_rebuild() {
     );
 }
 
+/// D#370(g): `C.m()` on the file's own class binds C's method, else the one C
+/// inherits — in its file or another — and no other class's. Before, it was an
+/// untyped member call and bound every same-named method of the file (stdlib
+/// tkinter: `Widget.__init__(self)` → every `__init__` there).
+const OWN_CLASS_BASE_PY: &str = "class Remote:\n    def close(self):\n        pass\n";
+const OWN_CLASS_W_PY: &str = "from base import Remote\n\n\
+     class Misc:\n    def destroy(self):\n        pass\n\n    def close(self):\n        pass\n\n\
+     class BaseWidget(Misc):\n    def __init__(self):\n        pass\n\n    def destroy(self):\n        Misc.destroy(self)\n\n\
+     class Widget(BaseWidget):\n    pass\n\n\
+     class Button(Widget):\n    def __init__(self):\n        Widget.__init__(self)\n\n    def destroy(self):\n        pass\n\n\
+     class Label(Widget):\n    def __init__(self):\n        Widget.__init__(self)\n\n\
+     class Local(Remote):\n    def go(self):\n        Local.close(self)\n\n\
+     class Error(Exception):\n    pass\n\n\
+     class ProtocolError(Error):\n    def __init__(self):\n        Error.__init__(self)\n\n\
+     class Sub(Widget):\n    def __init__(self):\n        super().__init__()\n";
+/// Another file's classes of the same names: ttk's `Widget` defines the
+/// `__init__` tkinter's inherits, configparser's `Error` the one xmlrpc's lacks.
+const OWN_CLASS_TTK_PY: &str = "class Widget:\n    def __init__(self):\n        pass\n\n\
+     class Error(Exception):\n    def __init__(self):\n        pass\n";
+
+#[test]
+fn test_call_on_the_files_own_class_binds_that_class_method() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("base.py", OWN_CLASS_BASE_PY),
+        ("ttk.py", OWN_CLASS_TTK_PY),
+        ("w.py", OWN_CLASS_W_PY),
+    ]);
+    let calls = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT DISTINCT ft.path || ':' || COALESCE(nt.qualified_name, nt.name) FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND ns.qualified_name = ?1 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([caller], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    };
+    for (caller, want) in [
+        // Inherited from the nearest base defining it, not Button's or Label's own.
+        ("Button.__init__", vec!["w.py:BaseWidget.__init__"]),
+        ("Label.__init__", vec!["w.py:BaseWidget.__init__"]),
+        // The named class's own method, not the override beside it.
+        ("BaseWidget.destroy", vec!["w.py:Misc.destroy"]),
+        // A base in another file, not the same-named method of this one.
+        ("Local.go", vec!["base.py:Remote.close"]),
+        // `super()` onto this file's `Widget`, not ttk's.
+        ("Sub.__init__", vec!["w.py:BaseWidget.__init__"]),
+    ] {
+        assert_eq!(calls(caller), want, "calls of {caller}");
+    }
+    // A class whose method comes from outside the project keeps the old
+    // resolution, but never another file's same-named class's method.
+    assert!(
+        !calls("ProtocolError.__init__").contains(&"ttk.py:Error.__init__".to_string()),
+        "{:?}",
+        calls("ProtocolError.__init__")
+    );
+}
+
+/// The same binding after an incremental run equals a rebuild's: the class's
+/// base gains or loses the method, or is renamed, in a file the caller's file
+/// never imports again.
+#[test]
+fn test_call_on_the_files_own_class_incremental_matches_rebuild() {
+    let before: &[(&str, &str)] = &[
+        ("base.py", OWN_CLASS_BASE_PY),
+        ("ttk.py", OWN_CLASS_TTK_PY),
+        ("w.py", OWN_CLASS_W_PY),
+    ];
+    // The base loses the method, gets it back, or is renamed away.
+    assert_incremental_matches_rebuild(before, &[("base.py", Some("class Remote:\n    pass\n"))]);
+    assert_incremental_matches_rebuild(
+        &[
+            ("base.py", "class Remote:\n    pass\n"),
+            ("ttk.py", OWN_CLASS_TTK_PY),
+            ("w.py", OWN_CLASS_W_PY),
+        ],
+        &[("base.py", Some(OWN_CLASS_BASE_PY))],
+    );
+    assert_incremental_matches_rebuild(
+        before,
+        &[(
+            "base.py",
+            Some("class Other:\n    def close(self):\n        pass\n"),
+        )],
+    );
+    // The caller's own class gains the method, or the file stops defining the
+    // class it names (the call keeps its old resolution then).
+    assert_incremental_matches_rebuild(
+        before,
+        &[(
+            "w.py",
+            Some(&OWN_CLASS_W_PY.replace(
+                "class Widget(BaseWidget):\n    pass\n",
+                "class Widget(BaseWidget):\n    def __init__(self):\n        pass\n",
+            )),
+        )],
+    );
+    assert_incremental_matches_rebuild(
+        before,
+        &[("w.py", Some(&format!("{OWN_CLASS_W_PY}Widget = None\n")))],
+    );
+    // The other file's same-named class appears, vanishes, or loses its method.
+    assert_incremental_matches_rebuild(before, &[("ttk.py", None)]);
+    assert_incremental_matches_rebuild(
+        &[("base.py", OWN_CLASS_BASE_PY), ("w.py", OWN_CLASS_W_PY)],
+        &[("ttk.py", Some(OWN_CLASS_TTK_PY))],
+    );
+    assert_incremental_matches_rebuild(
+        before,
+        &[(
+            "ttk.py",
+            Some("class Widget:\n    pass\n\nclass Error(Exception):\n    pass\n"),
+        )],
+    );
+}
+
 // D#97 M-N3: a typed call binds by the whole project's class structure — which
 // classes carry its receiver's name, which are nested, which subclass which, and
 // which of those define the method. An edit that changes that structure changes

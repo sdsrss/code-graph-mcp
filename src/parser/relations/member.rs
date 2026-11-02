@@ -51,6 +51,9 @@ thread_local! {
     /// Python names that hold one module everywhere in the file, and that
     /// module ([`py_module_names`]). Per file: reset by `reset_import_bound`.
     static PY_MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Python classes the file defines at module level and never rebinds
+    /// ([`py_class_names`]). Per file: reset by `reset_import_bound`.
+    static PY_CLASS_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// The (module, attribute) of each `P.X()` call [`python_module_call_meta`]
     /// marked, in the order met: one synthetic import each
     /// ([`take_python_attr_imports`]).
@@ -73,6 +76,12 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
         HashMap::new()
     };
     PY_MODULE_NAMES.with(|m| *m.borrow_mut() = modules);
+    let classes = if family == "python" {
+        py_class_names(root, source)
+    } else {
+        HashSet::new()
+    };
+    PY_CLASS_NAMES.with(|c| *c.borrow_mut() = classes);
     PY_ATTR_IMPORTS.with(|a| a.borrow_mut().clear());
     IMPORT_BOUND.with(|b| *b.borrow_mut() = names);
     RENAMED_IMPORTS.with(|r| *r.borrow_mut() = renamed);
@@ -1171,4 +1180,189 @@ fn py_name_occurrence(
 
 fn is_node(field: Option<tree_sitter::Node>, node: tree_sitter::Node) -> bool {
     field.is_some_and(|f| f.id() == node.id())
+}
+
+/// Metadata of a Python call `C.m()` on a class the file defines at module
+/// level and never rebinds ([`PY_CLASS_NAMES`], D#370): Python looks `m` up in
+/// `C` and its bases, never in another class and never in a subclass, which is
+/// what the `super()` qualifier binds (`recv_type_targets` without dispatch).
+/// Before it, such a call was an untyped member call and bound every
+/// same-named method of the file (`Widget.__init__(self)` → every `__init__`).
+pub(super) fn python_class_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&object, source);
+    PY_CLASS_NAMES
+        .with(|c| c.borrow().contains(name))
+        .then(|| serde_json::json!({ "q": "super", "v": name }).to_string())
+}
+
+/// The classes a Python file defines at module level (under `if` / `try` /
+/// `with` / a decorator too, not in a `def` or another class) whose name holds
+/// that class everywhere in the file: every other identifier occurrence of the
+/// name only reads it ([`py_class_name_is_read`]), and no `from … import *`
+/// follows the class's last definition. Anything that binds the name — an
+/// assignment, a parameter, a loop / `with` / `except … as` / match-capture
+/// target, an import, `global`, `del`, a `def` or a class of that name in
+/// another scope, a type parameter — leaves the class out, so `C.m()` keeps
+/// its old resolution wherever `C` might be something else.
+///
+/// Two cursor walks, no recursion: a deep expression cannot overflow them.
+fn py_class_names(root: tree_sitter::Node, source: &str) -> HashSet<String> {
+    // Module-level class definitions (the walk does not enter a def, a class
+    // or a lambda) and the last wildcard import.
+    let mut defs: HashMap<String, usize> = HashMap::new();
+    let mut module_defs: HashSet<usize> = HashSet::new();
+    let mut last_star: Option<usize> = None;
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let enter = match node.kind() {
+            "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let pos = defs
+                        .entry(node_text(&name, source).to_string())
+                        .or_default();
+                    *pos = (*pos).max(node.start_byte());
+                    module_defs.insert(node.id());
+                }
+                false
+            }
+            "function_definition" | "lambda" => false,
+            "wildcard_import" => {
+                last_star = last_star.max(Some(node.start_byte()));
+                false
+            }
+            _ => true,
+        };
+        if enter && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break;
+            }
+        }
+        if cursor.node().id() == root.id() {
+            break;
+        }
+    }
+    let mut rejected: HashSet<String> = defs
+        .iter()
+        .filter(|(_, pos)| last_star.is_some_and(|s| s > **pos))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if defs.len() == rejected.len() {
+        return HashSet::new();
+    }
+    // Every occurrence of a candidate name.
+    let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier" {
+            let name = node_text(&node, source);
+            if defs.contains_key(name)
+                && !rejected.contains(name)
+                && !py_class_name_is_read(node, &ancestors, &module_defs)
+            {
+                rejected.insert(name.to_string());
+            }
+        }
+        if cursor.goto_first_child() {
+            ancestors.push(node);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return defs
+                    .into_keys()
+                    .filter(|name| !rejected.contains(name))
+                    .collect();
+            }
+            ancestors.pop();
+        }
+    }
+}
+
+/// Whether one identifier occurrence of a class name, for [`py_class_names`],
+/// leaves the name holding the class: the module-level definition itself, an
+/// attribute's object (`C.m`, `C.x = 1`), a callee, an argument or base class,
+/// an assignment's value, an annotation, an operand, a decorator, an
+/// `except C` / `case C()` class. An attribute name (`o.C`) and a keyword
+/// (`f(C=1)`) are no occurrence of the variable. Tuples, lists and parentheses
+/// are climbed first, so `del a, C` is the `del` it is. Everything else counts
+/// as a binding: an allow-list, so a shape not listed only keeps the old
+/// resolution.
+fn py_class_name_is_read(
+    node: tree_sitter::Node,
+    ancestors: &[tree_sitter::Node],
+    module_defs: &HashSet<usize>,
+) -> bool {
+    let mut child = node;
+    let mut at = ancestors.len();
+    while at > 0
+        && matches!(
+            ancestors[at - 1].kind(),
+            "expression_list" | "tuple" | "list" | "set" | "parenthesized_expression"
+        )
+    {
+        at -= 1;
+        child = ancestors[at];
+    }
+    let Some(parent) = at.checked_sub(1).map(|i| ancestors[i]) else {
+        return false;
+    };
+    let grandparent = at.checked_sub(2).map(|i| ancestors[i]);
+    let is = |field: &str| is_node(parent.child_by_field_name(field), child);
+    match parent.kind() {
+        "class_definition" => is("name") && module_defs.contains(&parent.id()),
+        "attribute" | "keyword_argument" => true,
+        "call" => is("function"),
+        "assignment" | "augmented_assignment" => is("right"),
+        "named_expression" => is("value"),
+        "for_statement" | "for_in_clause" => is("right"),
+        "lambda" => is("body"),
+        "except_clause" => is("value"),
+        "as_pattern" => !is("alias"),
+        "type" => grandparent.is_some_and(|g| {
+            matches!(
+                g.kind(),
+                "assignment"
+                    | "typed_parameter"
+                    | "typed_default_parameter"
+                    | "function_definition"
+            )
+        }),
+        // `case C():` reads C; `case C:` (a bare name) captures it.
+        "dotted_name" => grandparent.is_some_and(|g| g.kind() == "class_pattern"),
+        "argument_list"
+        | "subscript"
+        | "comparison_operator"
+        | "boolean_operator"
+        | "binary_operator"
+        | "unary_operator"
+        | "not_operator"
+        | "conditional_expression"
+        | "await"
+        | "return_statement"
+        | "expression_statement"
+        | "decorator"
+        | "interpolation"
+        | "pair"
+        | "list_splat"
+        | "dictionary_splat"
+        | "assert_statement"
+        | "raise_statement"
+        | "if_statement"
+        | "elif_clause"
+        | "while_statement" => true,
+        _ => false,
+    }
 }
