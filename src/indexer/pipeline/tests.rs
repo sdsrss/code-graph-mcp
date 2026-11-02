@@ -2488,6 +2488,45 @@ fn test_override_of_a_shared_class_name_is_no_drift() {
     assert_eq!(drift(false), vec!["user.py".to_string()], "control");
 }
 
+/// A Python `C.m()` the parser decided inside its file (`"own"`, D#370) binds
+/// that file's method whatever another file adds, so a new class of the same
+/// name elsewhere pulls no such caller into the fan-out round. Control: the
+/// same edit pulls a caller typed by that name the ordinary way.
+#[test]
+fn test_a_call_decided_in_its_file_is_no_class_drift() {
+    let (project, _d, db) = fresh_index_of(&[
+        (
+            "own.py",
+            "class Base:\n    def m(self):\n        pass\n\nclass C(Base):\n    pass\n\n\
+             def h(x):\n    C.m(x)\n",
+        ),
+        (
+            "typed.py",
+            "from own import Base\n\ndef g():\n    b = Base()\n    b.m()\n",
+        ),
+    ]);
+    let paths = vec!["sub.py".to_string()];
+    fs::write(
+        project.path().join("sub.py"),
+        "class Base:\n    def m(self):\n        pass\n",
+    )
+    .unwrap();
+    super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let typed = super::resolve::typed_callers_of_class_drift(db.conn()).unwrap();
+    super::resolve::drop_fanout_temps(db.conn()).unwrap();
+    assert_eq!(typed, vec!["typed.py".to_string()]);
+}
+
 /// A class whose name another class shares gains the method, turned from a free
 /// function of the same file: `assemble`'s count is unchanged (no D#24 round) and
 /// the caller's edge went to another file (nothing to restore), yet a rebuild

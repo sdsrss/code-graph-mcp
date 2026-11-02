@@ -1051,11 +1051,157 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
         ),
         // A `std` path is Rust's standard library to the resolver.
         ("a class named std", "class std:\n    def m(self): pass\nclass C(std): pass\n", None),
+        // Review round 2 of D#370(g). A `class` statement reads its bases when
+        // it runs: a class defined further down is not the base yet.
+        (
+            "a base defined further down",
+            "class C(A): pass\nclass A:\n    def m(self): pass\n",
+            None,
+        ),
+        // A metaclass is inherited, and can answer `C.m` before C's body.
+        (
+            "a metaclass on a base",
+            "class B(metaclass=M): pass\nclass C(B):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "a metaclass two bases up",
+            "class A(metaclass=M): pass\nclass B(A): pass\nclass C(B):\n    def m(self): pass\n",
+            None,
+        ),
+        // Python refuses the class: there is no `C.m` to run.
+        (
+            "an inconsistent MRO, own m",
+            "class A: pass\nclass B(A): pass\nclass C(A, B):\n    def m(self): pass\n",
+            None,
+        ),
+        // A walrus in a def's or a class's header binds in the class body.
+        (
+            "a walrus in a default",
+            "class C:\n    def m(self): pass\n    def z(self, a=(m := f)): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a decorator",
+            "class C:\n    def m(self): pass\n    @(m := deco)\n    def z(self): pass\n",
+            None,
+        ),
+        (
+            "a walrus in an annotation",
+            "class C:\n    def m(self): pass\n    def z(self) -> (m := int): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a nested class's bases",
+            "class C:\n    def m(self): pass\n    class I((m := object)): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a base's default",
+            "class A:\n    def m(self): pass\n    def z(self, a=(m := f)): pass\nclass C(A): pass\n",
+            None,
+        ),
+        ("assigned in parentheses", "class C:\n    def m(self): pass\n(C).m = f\n", None),
+        ("deleted in parentheses", "class C:\n    def m(self): pass\ndel (C).m\n", None),
+        (
+            "a base assigned in parentheses",
+            "class A:\n    def m(self): pass\nclass C(A): pass\n((A)).m = f\n",
+            None,
+        ),
+        // Controls: a walrus elsewhere in a def binds in the def's own scope;
+        // a metaclass below the class is not its metaclass.
+        (
+            "a walrus in a body",
+            "class C:\n    def m(self): pass\n    def z(self):\n        (m := f)\n",
+            Some("C"),
+        ),
+        (
+            "a metaclass on a subclass",
+            "class C:\n    def m(self): pass\nclass D(C, metaclass=M): pass\n",
+            Some("C"),
+        ),
     ];
+    let mut wrong: Vec<String> = Vec::new();
     for (label, classes, want) in cases {
         let code = format!("{classes}def f(x):\n    C.m(x)\n");
-        assert_eq!(owner_of_m(&code).as_deref(), *want, "{label}:\n{code}");
+        let got = owner_of_m(&code);
+        if got.as_deref() != *want {
+            wrong.push(format!("{label}: {got:?}, want {want:?}"));
+        }
     }
+    // A chain longer than the 32 the walk once stopped at, and one past the
+    // longest MRO decided (64 classes).
+    let chain = |n: usize| {
+        let mut code = String::from("class K0:\n    def m(self): pass\n");
+        for i in 1..=n {
+            code += &format!("class K{i}(K{}): pass\n", i - 1);
+        }
+        code + &format!("def f(x):\n    K{n}.m(x)\n")
+    };
+    for (n, want) in [(40, Some("K0")), (70, None)] {
+        let got = owner_of_m(&chain(n));
+        if got.as_deref() != want {
+            wrong.push(format!("a chain of {}: {got:?}, want {want:?}", n + 1));
+        }
+    }
+    // Python mangles `__x` in a class body (`C.__m` → `C._A__m` inside `A`),
+    // so a name written that way is not the def it spells. A dunder is not.
+    let owner_of = |code: &str, method: &str| -> Option<String> {
+        let calls = call_meta(code, "python");
+        let meta: serde_json::Value = serde_json::from_str(meta_of(&calls, method)?).ok()?;
+        (meta["own"] == 1).then(|| meta["v"].as_str().unwrap().to_string())
+    };
+    let mangled: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "a mangled method",
+            "class C:\n    def __m(self): pass\nclass A:\n    def run(self):\n        C.__m(self)\n",
+            "__m",
+            None,
+        ),
+        (
+            "a mangled class",
+            "class __C:\n    def m(self): pass\nclass A:\n    def run(self):\n        __C.m(self)\n",
+            "m",
+            None,
+        ),
+        (
+            "a dunder",
+            "class C:\n    def __init__(self): pass\nclass A:\n    def run(self):\n        C.__init__(self)\n",
+            "__init__",
+            Some("C"),
+        ),
+    ];
+    for (label, code, method, want) in mangled {
+        let got = owner_of(code, method);
+        if got.as_deref() != *want {
+            wrong.push(format!("{label}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// Review round 2 of D#370(g): each class's MRO is merged once. The walk that
+// merged every base's MRO again for each path to it doubled with each class
+// of `Ki(K(i-1), …, K0)` (22 classes: 0.6 s, 26: 10 s); 30 is hours.
+#[test]
+fn test_python_class_mro_costs_one_merge_per_class() {
+    let mut code = String::from("class K0:\n    def m(self): pass\n");
+    for i in 1..=30usize {
+        let bases: Vec<String> = (0..i).rev().map(|j| format!("K{j}")).collect();
+        code += &format!("class K{i}({}): pass\n", bases.join(", "));
+    }
+    code += "def f(x):\n    K30.m(x)\n";
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(call_meta(&code, "python"));
+    });
+    let calls = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("30 overlapping classes took over 60 s");
+    assert_eq!(
+        meta_of(&calls, "m"),
+        Some(r#"{"own":1,"q":"super","v":"K0"}"#)
+    );
 }
 
 // Review of D#370(a): a name a file imports from more than one module carries
