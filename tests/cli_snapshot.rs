@@ -306,6 +306,42 @@ fn cli_snapshot_create_writes_the_out_path_it_is_given_when_it_begins_with_file_
     assert_eq!(names, ["file:x.db"], "create wrote somewhere else");
 }
 
+/// `VACUUM INTO` takes its file name as SQL text. Making a relative `--out`
+/// absolute before that put the current directory through a lossy UTF-8
+/// conversion, so under a directory whose name is not UTF-8 SQLite wrote into
+/// the U+FFFD twin, or nowhere. Linux only: macOS refuses such a name.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_snapshot_create_writes_a_relative_out_under_a_non_utf8_directory() {
+    use std::os::unix::ffi::OsStrExt;
+    let repo = init_git_repo();
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir"));
+    let twin = dir.path().join("bad\u{FFFD}dir");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&twin).unwrap();
+    let out = Command::new(cli_bin())
+        .current_dir(&cwd)
+        .args(["snapshot", "create", "--out", "x.db", "--quiet", "--root"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        cwd.join("x.db").is_file(),
+        "x.db is not in the current directory"
+    );
+    assert_eq!(
+        std::fs::read_dir(&twin).unwrap().count(),
+        0,
+        "create wrote into the U+FFFD twin"
+    );
+}
+
 // clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
 // clap owns --help for the parent and each sub, plus no-subcommand /
 // unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]

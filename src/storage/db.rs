@@ -26,6 +26,25 @@ const SQLITE_HEADER_SIZE: u64 = 100;
 /// threaded through `CliContext`.
 const CORRUPT_INDEX_PREFIX: &str = "index database is corrupt";
 
+/// A file name the USER typed, in a form SQLite takes as a path. SQLite reads
+/// three kinds of name as something other than a file: `:memory:`, the empty
+/// name (a temporary database), and, because the bundled build is compiled with
+/// SQLITE_USE_URI (libsqlite3-sys build.rs), any name beginning with `file:`,
+/// whatever the open flags say. So `snapshot inspect file:x.db` read `x.db`
+/// (D#638). All three are relative, and `./` in front makes each a path in the
+/// current directory, which SQLite resolves as it resolved the bare name. Not
+/// `std::path::absolute`: `VACUUM INTO` takes its name as SQL text, and an
+/// absolute path would put the current directory through a lossy UTF-8
+/// conversion as well (0.182.0 pre-tag review F1). An absolute name is returned
+/// as it is.
+pub(crate) fn sqlite_file_name(path: &Path) -> std::path::PathBuf {
+    if path.is_relative() {
+        Path::new(".").join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init has the exact C ABI signature expected by
@@ -107,13 +126,8 @@ impl Database {
     /// let the copy's INDEX_VERSION sweep zero the counts (0.180.0 review R2).
     pub(crate) fn open_readonly_named(path: &Path) -> Result<Self> {
         register_sqlite_vec();
-        // A path, never a URI. The bundled SQLite is compiled with
-        // SQLITE_USE_URI (libsqlite3-sys build.rs), so it parses any name that
-        // begins with `file:` as a URI whatever the open flags say, and
-        // `snapshot inspect file:x.db` read `x.db` (D#638). An absolute path
-        // cannot begin with `file:`. `absolute` resolves no links; SQLite still
-        // does that itself, as it did before.
-        let path = std::path::absolute(path)?;
+        // A path, never a URI or `:memory:` (D#638; see `sqlite_file_name`).
+        let path = sqlite_file_name(path);
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // PRAGMA query_only is belt-and-suspenders on top of the flag —
         // any accidental write attempt errors out at the SQL layer.
@@ -1031,6 +1045,26 @@ impl Drop for UncheckedSavepoint<'_> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The three relative names SQLite reads as something other than a file
+    /// become paths in the current directory; an absolute name is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_file_name_makes_every_special_name_a_path() {
+        for (given, want) in [
+            ("file:x.db", "./file:x.db"),
+            (":memory:", "./:memory:"),
+            ("", "./"),
+            ("x.db", "./x.db"),
+            ("/abs/file:x.db", "/abs/file:x.db"),
+        ] {
+            assert_eq!(
+                sqlite_file_name(Path::new(given)),
+                Path::new(want),
+                "{given:?}"
+            );
+        }
+    }
 
     /// E2E 2026-10-16 round 3: every open, readers included, re-stamped
     /// `user_version`, a committed write. A writer that had read inside its

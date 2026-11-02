@@ -107,9 +107,9 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     // connection, not a long-lived reader during a concurrent VACUUM — but keeps a
     // future nonzero SQLITE_DEFAULT_MMAP_SIZE from silently re-enabling mmap anywhere.
     conn.execute_batch("PRAGMA mmap_size = 0;")?;
-    // Absolute, so SQLite cannot read a raw `--out` that begins with `file:` as
-    // a URI and write another file (see `Database::open_readonly_named`, D#638).
-    let target_str = std::path::absolute(&vacuum_target)?
+    // So that SQLite cannot read a raw `--out` such as `file:x.db` or `:memory:`
+    // as something other than a file and write elsewhere or nowhere (D#638).
+    let target_str = crate::storage::db::sqlite_file_name(&vacuum_target)
         .to_string_lossy()
         .replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{target_str}';"))
@@ -190,11 +190,13 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // 2 = WAL). SQLite opens the WAL when byte 19 is 2 (`lockBtree`), and always
     // writes the two bytes together; a header that splits them is crafted, and
     // 1/2 read in place left a `-wal` and a `-shm` beside the file (D#639). So
-    // either byte saying WAL takes the copy: byte 19 because that is what SQLite
-    // acts on, byte 18 so that no header leaves the copy arm it took before. A
-    // file of 16..=18 bytes carries neither byte and reads as non-WAL; a 19-byte
-    // file carries byte 18 only. Harmless either way — nothing that short
-    // survives the checks below.
+    // either byte saying WAL takes the copy (`header_says_wal`): byte 19 because
+    // that is what SQLite acts on, byte 18 so that every header that took the
+    // copy in 0.181.0 still does. No header measured reads differently on the two
+    // arms, so only `header_says_wal`'s own test pins the byte-18 half. A file of
+    // 16..=18 bytes carries neither byte and reads as non-WAL; a 19-byte file
+    // carries byte 18 only. Harmless either way — nothing that short survives the
+    // checks below.
     let mut head = [0u8; 20];
     let head: &[u8] = if file_size_bytes >= 16 {
         use std::io::Read;
@@ -215,7 +217,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     } else {
         &[]
     };
-    let wal_mode = head.get(18) == Some(&2) || head.get(19) == Some(&2);
+    let wal_mode = header_says_wal(head);
 
     // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
     //
@@ -432,6 +434,13 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         edge_count,
         file_size_bytes,
     })
+}
+
+/// Whether `inspect` reads a raw file through a copy as WAL-mode, from the
+/// first bytes of its header: either version byte (18, 19) being 2. See the
+/// comment where `inspect_with_cap` reads `head` (D#639).
+fn header_says_wal(head: &[u8]) -> bool {
+    head.get(18) == Some(&2) || head.get(19) == Some(&2)
 }
 
 /// `inspect`'s verdict on a file that is not a readable snapshot, whichever

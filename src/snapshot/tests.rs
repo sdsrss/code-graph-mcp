@@ -871,7 +871,8 @@ fn inspect_leaves_no_side_files_beside_the_file_it_reads() {
 /// version, is 2 (`lockBtree`: `page1[19]==2`); byte 18 is the write version.
 /// SQLite always writes the two together, so only a crafted header splits them,
 /// and 1/2 took the in-place arm and left a `-wal` and a `-shm` beside the file.
-/// 2/1 is here because the predicate it passes through is the one that changed.
+/// 2/1 reads alike on either arm, so this test cannot tell which one it took;
+/// `header_says_wal_reads_either_version_byte` pins that.
 #[test]
 fn inspect_keys_wal_mode_on_the_header_byte_sqlite_reads() {
     for (write_version, read_version) in [(1u8, 2u8), (2, 1)] {
@@ -921,6 +922,39 @@ fn inspect_keys_wal_mode_on_the_header_byte_sqlite_reads() {
         assert!(
             residue.is_empty(),
             "{shape}: inspect left files beside the snapshot: {residue:?}"
+        );
+    }
+}
+
+/// Either version byte being 2 takes the copy: byte 19 is what SQLite acts on,
+/// byte 18 keeps every header that took the copy in 0.181.0 on it. A header
+/// whose byte 18 alone says WAL reads alike on both arms, so no end-to-end test
+/// can see that half; this one does.
+#[test]
+fn header_says_wal_reads_either_version_byte() {
+    for (len, write_version, read_version, want) in [
+        (20, 1u8, 1u8, false),
+        (20, 2, 2, true),
+        (20, 1, 2, true),
+        (20, 0, 2, true),
+        (20, 2, 1, true),
+        (20, 2, 0, true),
+        (20, 3, 1, false),
+        (19, 2, 0, true),
+        (19, 1, 0, false),
+        (18, 0, 0, false),
+    ] {
+        let mut head = vec![0u8; len];
+        if len > 18 {
+            head[18] = write_version;
+        }
+        if len > 19 {
+            head[19] = read_version;
+        }
+        assert_eq!(
+            super::header_says_wal(&head),
+            want,
+            "{len} bytes, 18/19 = {write_version}/{read_version}"
         );
     }
 }
